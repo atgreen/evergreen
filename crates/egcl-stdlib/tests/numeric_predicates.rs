@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use egcl_rt::bignum::alloc_ratio_cli;
 use egcl_rt::error::EgclError;
 use egcl_rt::value::{NIL, EgclVal};

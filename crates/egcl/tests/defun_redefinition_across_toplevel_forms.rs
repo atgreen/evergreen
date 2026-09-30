@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A redefinition arriving as a SEPARATE top-level form replaces a hot function
 //! (bliss-a0ki1).
 //!

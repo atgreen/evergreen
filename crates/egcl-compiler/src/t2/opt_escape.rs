@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P4e — Escape analysis + scalar replacement / stack allocation (spec §4.5
 //! R4.33, §4.5.5; deopt preservation §4.10 R4.60).
 //!

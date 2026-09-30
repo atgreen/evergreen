@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! AAPCS64 scalar foreign calls (spec §4.7.5.2, R4.44).
 //!
 //! The targets are `extern "C"` functions defined right here: on AArch64 they

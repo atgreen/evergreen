@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;; Runs without the prelude, with every allocation stressed, then compared
 ;; byte-for-byte with a non-stress execution of this same file.
 (defun portable-check (condition)

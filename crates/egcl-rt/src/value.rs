@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Tagged value representation — `EgclVal`.
 //!
 //! Every Common Lisp value in EGCL is a 64-bit tagged word.

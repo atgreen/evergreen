@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! CLI entry point — argument parsing, REPL driver, and image-load entry.
 //! See spec §6.1 (REPL), §7.4 (deployment modes), §2.8 (CLI args).
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A DEFINE-CONDITION `:report` is honoured wherever a condition is rendered.
 //!
 //! The report machinery existed but had no caller, so every `:report` form printed

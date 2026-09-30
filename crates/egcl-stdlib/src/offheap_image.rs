@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Composite off-heap-body image hooks (bliss-x0f2 M3).
 //!
 //! egcl-rt's image loader accepts ONE (serialize, allocate, populate) hook

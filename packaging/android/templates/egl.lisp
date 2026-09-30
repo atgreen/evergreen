@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; Minimal EGL lifecycle, with all foreign calls in Lisp.
 (defpackage :egcl-egl (:use :cl) (:export :with-window :clear :swap))
 (in-package :egcl-egl)

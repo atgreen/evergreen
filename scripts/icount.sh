@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Instructions retired for one egcl run — the reliable perf metric on this box.
 #
 # Wall clock here is unusable below ~10%: the same binary on the same workload

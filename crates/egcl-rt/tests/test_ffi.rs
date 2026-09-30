@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! C-ABI FFI tests: require a dynamic loader, so they run only with the
 //! `c-ffi` feature (bliss-bca.5). Marshalling is also covered by spec_runtime_core.
 #![cfg(feature = "c-ffi")]

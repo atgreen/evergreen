@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A DEFCONSTANT compiled in a file must be recognised as a constant for the
 //! rest of that compilation (CLHS 3.2.2.3, bliss-vhr6e). Seeding only its value
 //! left the name bound but not constant, so alexandria's DEFINE-CONSTANT — which

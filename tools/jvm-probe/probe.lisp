@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 (defparameter *bridge* (egcl-ffi:load-foreign-library
   (concatenate 'string (egcl-ext:getenv "EGCL_JVM_PROBE_DIR") "/libprobe.so")))
 (defun bridge (name result types args)

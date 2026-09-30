@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Exercise generated adapters against independently compiled C-ABI functions.
 //! R2.11 and the scalar outbound subset of R2.14; this suite does not certify
 //! aggregate or callback support.

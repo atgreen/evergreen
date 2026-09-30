@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Lisp-facing foreign types and memory operations. Native byte access and
 //! allocation ownership live in egcl-rt; public lambda lists live in boot.lisp.
 use egcl_rt::ffi::{AlienType, marshal_to_c, memory::ForeignPointer, unmarshal_from_c};

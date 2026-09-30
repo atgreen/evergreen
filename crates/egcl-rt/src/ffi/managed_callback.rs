@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Rooted Lisp callback ownership and containment above the native entry ABI.
 use super::{AlienType, callback::CallbackAdapter, marshal_to_c, unmarshal_from_c};
 use crate::{EgclError, EgclVal, gc::CrossThreadRoot, value::NIL};

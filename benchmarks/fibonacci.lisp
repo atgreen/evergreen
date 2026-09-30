@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; No type declarations: identical general-integer recursion on both runtimes.
 (defun fibonacci (n)
   (if (< n 2) n (+ (fibonacci (- n 1)) (fibonacci (- n 2)))))

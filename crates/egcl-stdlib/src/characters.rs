@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Character comparison and case conversion (CLHS 13.2).
 //!
 //! These live here rather than in `lib/boot.lisp` because they are hot and

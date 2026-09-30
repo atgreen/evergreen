@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The 978 external symbol names specified by ANSI Common Lisp.
 //!
 //! This table is bootstrap data, not an implementation inventory: names whose

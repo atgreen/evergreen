@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 call-site inlining policy and compiler-known function metadata.
 //!
 //! This is deliberately separate from the SSA builder.  The builder asks this

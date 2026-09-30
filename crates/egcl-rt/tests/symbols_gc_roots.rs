@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Symbol registry × GC interaction (bliss-jtc.6 Stage A/C).
 //!
 //! These exercise `full_gc`, which is stop-the-world but *not* safe to run

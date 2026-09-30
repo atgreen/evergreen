@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Garbage collector — generational, region-based, concurrent old-gen marking.
 //!
 //! Inspired by HotSpot G1 and ZGC. See §3 of the spec.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Private ownership of values while a control transfer is paused for cleanup.
 //! Catch/block tokens identify destinations, not individual throws. Keeping a
 //! paused transfer in the shared token map lets a later throw overwrite it.

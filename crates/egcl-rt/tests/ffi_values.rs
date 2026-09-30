@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Exact Lisp/C scalar conversion, including values outside the fixnum range.
 use egcl_rt::{
     bignum::{BigInt, bigint_from_val},

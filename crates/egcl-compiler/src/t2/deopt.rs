@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P7 — FrameState metadata lowering & deopt runtime (spec §4.10 A4.14, §4.6 A4.04).
 //!
 //! **Parcel P7. Owner: (sub-agent).** Lower each deoptimising instruction's

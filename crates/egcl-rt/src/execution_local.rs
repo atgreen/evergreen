@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Host evaluator state owned by a Lisp execution, independent of its carrier.
 //! Native callers must register with `current_thread_id()` before using these
 //! slots; runtime thread teardown retires them. Lisp execution does this already.

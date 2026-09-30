@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # scripts/egcl-limited.sh — run a command under a hard memory cap + timeout.
 #
 # Runaway egcl runs (ASDF recursion-to-OOM bugs like bliss-hlsa, hot loops)

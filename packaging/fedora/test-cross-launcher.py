@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 """Check cross launchers preserve target paths and application arguments."""
 import os
 from pathlib import Path

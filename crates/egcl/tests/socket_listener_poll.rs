@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A listener can be polled without blocking (bliss-1ebb1).
 //!
 //! `%SOCKET-ACCEPT` blocks, and a listener is an id into a table rather than a

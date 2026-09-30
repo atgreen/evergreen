@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Execution tests for the ELFv2 foreign-call path: call real C functions on
 //! ppc64le and check the values that come back.
 //!

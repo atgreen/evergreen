@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! C layouts shared by x86-64 targets, plus SysV AMD64 argument placement.
 //! SysV classification follows psABI §3.2.3. There are no vector or x87 descriptors,
 //! so aggregates above two eightbytes use MEMORY rather than SSEUP registers.

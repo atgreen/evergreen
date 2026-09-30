@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! AAPCS64 foreign calls (spec §4.7.5.2, R4.44).
 //!
 //! The x86-64 path JITs one adapter per signature, because SysV placement

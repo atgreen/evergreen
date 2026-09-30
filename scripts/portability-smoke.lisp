@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;; Cross-architecture CLI regression: interpreter, bytecode, default tiering,
 ;; and moving-GC stress must produce identical observable output.
 (assert (= (+ (expt 2 90) 17) 1237940039285380274899124241))

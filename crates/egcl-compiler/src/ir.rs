@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Sea-of-nodes SSA intermediate representation.
 //!
 //! Inspired by HotSpot C2 and Graal. See spec §4.3.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use egcl_compiler::control_scope::ScopeMap;
 use egcl_compiler::control_scope::{ControlScope, Ownership, ScopeKind};
 use egcl_compiler::native_unwind::{NativeUnwindStep, SelectedTarget, next_unwind_step};

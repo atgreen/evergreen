@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Native inbound scalar adapters. These preserve the C ABI while converting
 //! arguments to raw slots for a dispatcher; they do not themselves enter Lisp.
 //! Closure rooting, runtime transitions and error containment belong to the

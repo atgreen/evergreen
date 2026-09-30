@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! POWER (ppc64le) instruction encoding for the native compiler.
 //!
 //! A self-contained assembler, as the System Z one is, rather than an extension of

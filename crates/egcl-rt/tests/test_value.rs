@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Comprehensive tests for `EgclVal` — the 64-bit tagged value type.
 
 use egcl_rt::object::{ObjectHeader, type_id};

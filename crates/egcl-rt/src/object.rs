@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Object header and heap object layouts.
 //!
 //! Every heap-allocated object begins with an 8-byte `ObjectHeader`.

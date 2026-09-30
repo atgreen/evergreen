@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! On-stack replacement (OSR) differential tests (bliss-izt.1/izt.2).
 //!
 //! A function that is one long-running loop is promoted into native T1 code

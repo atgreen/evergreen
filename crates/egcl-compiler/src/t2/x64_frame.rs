@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Final value homes shared by the rich x86 emitter and transfer metadata.
 //! Regalloc's split locations are inputs to this policy, not the locations the
 //! rich templates ultimately use. Keep that distinction explicit.

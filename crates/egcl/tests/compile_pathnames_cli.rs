@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! COMPILE-FILE must capture source paths, not the translated FASL location.
 use std::fs;
 use std::path::{Path, PathBuf};

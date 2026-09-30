@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Shared Win64 adapter frames: shadow space, guard-page probing and unwind data.
 use crate::{EgclError, jit::JitBuffer};
 

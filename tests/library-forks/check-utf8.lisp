@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; Multibyte UTF-8 through both decoders. Run after check.lisp, preserving the
 ;;;; same environment/cache; loading check.lisp here supplies Babel and Flexi.
 ;;;;

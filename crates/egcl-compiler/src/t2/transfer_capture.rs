@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Owned saved words for a transfer whose physical frame is still available.
 //! Reserve storage before native entry, capture without collecting, then root
 //! saved tagged words while rebuilding logical frames. Physical save recipes,

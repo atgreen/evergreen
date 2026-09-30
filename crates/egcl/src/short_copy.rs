@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Short memcpy calls in the static musl CLI avoid REP MOVSQ setup latency.
 //!
 //! The linker wraps only this binary's memcpy references. Copies above 64 bytes

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use super::super::native_transfer_entry::{TransferCode, take_native_cleanup_count};
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

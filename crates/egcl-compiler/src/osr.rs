@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! On-Stack Replacement (OSR) and deoptimisation.
 //!
 //! OSR entry transfers execution from T0/T1 into T2 at loop back-edges.

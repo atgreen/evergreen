@@ -1,0 +1,73 @@
+                    EVERGREEN COMMON LISP — LICENSE EXCEPTION
+
+Evergreen Common Lisp is licensed under the GNU General Public License,
+version 3 or (at your option) any later version, as found in the file LICENSE,
+WITH the following exception — the "Classpath Exception", the same exception
+OpenJDK applies to the Java class library:
+
+
+                              THE EXCEPTION
+
+Linking this library statically or dynamically with other modules is making a
+combined work based on this library.  Thus, the terms and conditions of the GNU
+General Public License cover the whole combination.
+
+As a special exception, the copyright holders of this library give you
+permission to link this library with independent modules to produce an
+executable, regardless of the license terms of these independent modules, and
+to copy and distribute the resulting executable under terms of your choice,
+provided that you also meet, for each linked independent module, the terms and
+conditions of the license of that module.  An independent module is a module
+which is not derived from or based on this library.  If you modify this
+library, you may extend this exception to your version of the library, but you
+are not obligated to do so.  If you do not wish to do so, delete this exception
+statement from your version.
+
+
+                      WHAT THIS MEANS IN PRACTICE
+
+The following is explanation, not an additional grant or restriction.  The
+grant is the text above.
+
+Evergreen Common Lisp is a language implementation: its runtime, its compiler
+and its standard library are combined with your program to run it, and
+SAVE-LISP-AND-DIE and the delivery tooling emit a single executable containing
+both.  Without the exception above, the GNU General Public License would reach
+that combined executable and your application would have to be licensed under
+the GPL.  The exception is what prevents that.
+
+So:
+
+  * Your program is yours.  Writing Common Lisp that Evergreen runs, compiles,
+    or dumps into a saved image or a delivered executable does not place your
+    program under the GPL, and you may license and sell it on whatever terms
+    you choose.
+
+  * Changes to Evergreen itself are covered.  If you modify the runtime, the
+    compiler, the standard library or the tooling in this repository and
+    distribute the result, those changes are covered by the GPL and must be
+    offered under it.
+
+The line is the one the exception draws: an "independent module" is code that
+is not derived from or based on this implementation.  Your application is such
+a module.  A patched copy of the compiler is not.
+
+
+                       THIRD-PARTY COMPONENTS
+
+Parts of this repository are not ours and are NOT under the above terms.  They
+keep the licences their authors gave them, and they carry no Evergreen SPDX
+header:
+
+  lib/asdf.lisp   ASDF, under the MIT/X Consortium licence (notice in-file)
+  lib/slynk/      slynk, from the SLY project — placed in the public domain by
+                  its authors, with individual copyright notices in-file
+  ports/          adaptations intended for third-party upstream forks; each
+                  file belongs to the licence of the project it patches
+
+Evergreen also builds against third-party Rust crates that are not distributed
+in this repository.  Every one of them is GPLv3-compatible: most are available
+under the MIT licence, and those offered only under Apache-2.0 are compatible
+with version 3 of the GNU General Public License (its section 7 permits the
+additional terms Apache-2.0 imposes) though NOT with version 2 — which is why
+Evergreen uses GPLv3 rather than the GPLv2 that OpenJDK uses.

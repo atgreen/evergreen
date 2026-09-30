@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P4b — Loop-invariant code motion (spec §4.5 R4.34, §4.5.6).
 //!
 //! **Parcel P4b.** Detect natural loops via back-edge analysis over the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Opt-in runtime entry for the tagged Invoke emitter. Normal installation is
 //! still gated on complete helper/poll/scope coverage. Own code and definitions,
 //! capture into rooted snapshots, enter native cleanup for selected throws, and

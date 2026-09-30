@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # event-viewer.sh — render a egcl run's JIT/GC event stream as a self-contained,
 # JITWatch-style HTML page (bliss-3gme, profiling epic bliss-bfxm).
 #

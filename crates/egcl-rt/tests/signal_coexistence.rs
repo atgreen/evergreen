@@ -1,4 +1,7 @@
 #![cfg(unix)]
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use std::sync::{Arc, Barrier};
 use egcl_rt::runtime::install_signal_handlers;
 

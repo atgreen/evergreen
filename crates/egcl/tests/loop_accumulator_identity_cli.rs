@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A LOOP SUM or COUNT accumulator is readable from the first iteration and
 //! starts at its identity, not NIL — including from clauses that appear before
 //! the accumulating one (bliss-vhr6e). split-sequence's :count path is exactly

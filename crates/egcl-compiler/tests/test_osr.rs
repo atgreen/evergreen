@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Tests for OSR (on-stack replacement) and deoptimisation — osr.rs
 
 use egcl_compiler::osr::{DeoptConfig, DeoptLog, DeoptReason, deoptimize, osr_entry};

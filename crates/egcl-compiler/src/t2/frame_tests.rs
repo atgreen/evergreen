@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Execute frame shapes and independently ask the OS to unwind every decoded
 //! instruction boundary, including stack probes and temporary helper storage.
 use super::*;

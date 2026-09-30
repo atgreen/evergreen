@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # flamegraph.sh — CPU flamegraph of a egcl run, symbolicating JIT'd (T1/T2/OSR)
 # native frames (bliss-0ivo, profiling epic bliss-bfxm).
 #

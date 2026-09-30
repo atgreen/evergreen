@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! GC-managed handles for stable, Rust-owned synchronization primitives.
 use std::sync::Arc;
 use std::time::Duration;

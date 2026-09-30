@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Native mutex handles retain stable ownership across moving GC and images.
 use std::sync::Arc;
 use egcl_rt::sync::EgclMutex;

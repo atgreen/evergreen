@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Generated inbound scalar ABI adapters, independently called by C fixtures.
 //! R2.12/R2.14: this tests the machine-code boundary, not Lisp callback dispatch.
 #![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]

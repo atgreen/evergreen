@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A small, fast, deterministic FxHash-style hasher for internal maps whose
 //! keys are short byte strings or integers (symbol names, interned string
 //! bytes, indices).

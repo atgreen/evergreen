@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Debug-checked global runtime lock ordering (D13.01, R13.05–R13.06).
 //!
 //! Long-lived subsystem locks use these wrappers.  User-visible mutexes and

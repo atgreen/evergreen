@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Stable handles to Lisp values across the Python boundary (bliss-lbkd0).
 //!
 //! No CPython here, deliberately: the handle table is the side of the bridge that

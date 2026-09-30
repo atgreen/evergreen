@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T1 baseline code generation for AArch64.
 //!
 //! This is the sibling of `emit_native`, not a rewrite of it. The two share

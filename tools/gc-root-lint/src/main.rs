@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! gc-root-lint — flag bare `EgclVal` locals read across allocating calls
 //! (bliss-jaf; docs/design/gc-rooting.md Part B rung 1).
 //!

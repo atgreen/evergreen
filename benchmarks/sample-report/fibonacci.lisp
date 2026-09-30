@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 #+egcl (egcl-ext:setenv "EGCL_NATIVE_TRANSFER" "0" t)
 (declaim (optimize (speed 3) (safety 1) (debug 0)))
 ;;; No type declarations: identical general-integer recursion on both runtimes.

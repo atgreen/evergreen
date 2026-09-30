@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Gabriel TAKL — TAK over unary list numbers; cons-heavy compares (bliss-jpd0).
 (load (merge-pathnames "prelude.lisp" *load-truename*))
 

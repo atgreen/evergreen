@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Real hardware faults must return through generated recovery code, then the
 //! segment landing, without skipping any live Rust helper or its destructor.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]

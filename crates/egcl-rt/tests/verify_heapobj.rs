@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 // Verify whether a TAG_HEAP_OBJECT value (EgclVal → header) survives a moving GC.
 use egcl_rt::object::{ObjectHeader, type_id};
 use egcl_rt::value::{TAG_HEAP_OBJECT, TAG_MASK, EgclVal};

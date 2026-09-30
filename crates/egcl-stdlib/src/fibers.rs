@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Runtime operations for the public Lisp fiber library in lib/fibers.lisp.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

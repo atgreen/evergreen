@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! GETF and LIST are builtins, and stay correct (bliss-kr8pp).
 //!
 //! GETF was a DEFUN in boot.lisp — a DO loop plus an &optional — and LIST had

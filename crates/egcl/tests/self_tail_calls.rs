@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A self tail call reuses the frame instead of growing the stack (bliss-ieajy.3).
 //!
 //! `(defun count-down (n acc) (if (zerop n) acc (count-down (1- n) (1+ acc))))`

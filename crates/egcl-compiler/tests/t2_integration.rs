@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Wave-1 cross-parcel integration: P1 (build) → P2 (verify) → P3 (infer).
 //!
 //! Each parcel was unit-tested in isolation against hand-built IR. This proves

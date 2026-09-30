@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! One shared Winsock readiness thread; waiting fibers never own helper threads.
 //! Registry snapshots own duplicate sockets until WSAPoll has finished with them.
 use super::{BlockingMode, IoInterest, blocking_mode, timer};

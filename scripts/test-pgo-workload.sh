@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Run from the repository root; wrap this script in egcl-limited.sh.
 set -euo pipefail
 binary=${1:?usage: bash scripts/test-pgo-workload.sh EGCL_OR_SBCL [sbcl]}

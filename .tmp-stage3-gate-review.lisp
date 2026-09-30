@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 (let* ((text (format nil "~A-~D" 'egcl 3))
        (numbers '(1 3 5))
        (table (make-hash-table :test 'equal))

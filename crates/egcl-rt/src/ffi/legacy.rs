@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Existing bootstrap dispatcher, retained on targets awaiting JIT ABI adapters.
 //! Do not extend this path; new FFI support belongs in the generated adapters.
 

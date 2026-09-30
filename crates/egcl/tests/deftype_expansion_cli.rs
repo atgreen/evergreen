@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A DEFTYPE must be expanded wherever a type specifier is interpreted,
 //! including when it names another DEFTYPE or sits in an element-type position
 //! (bliss-hfn71). Babel defines (deftype unicode-string () '(vector unicode-char

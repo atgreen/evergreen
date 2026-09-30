@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Local instrumentation PGO, used by `make image`. No installation.
 # All build/profile artifacts are retained in a fresh directory for diagnosis.
 set -euo pipefail

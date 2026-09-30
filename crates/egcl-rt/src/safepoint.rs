@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Safepoint mechanism — polling-page-based cooperative suspension.
 //!
 //! A single page is allocated page-aligned. Generated code performs a load

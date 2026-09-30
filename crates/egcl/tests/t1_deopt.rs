@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T1 speculative deoptimization (bliss-jtc.27) — the second half of the S5
 //! gate: "an invalidated speculation deoptimizes and still returns the correct
 //! result."

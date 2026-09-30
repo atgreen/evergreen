@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 // Microbench: StackRoot (mutex + registry) vs rooted! (intrusive, lock-free).
 // Simulates the walk_cons pattern: N nested scopes, 4 roots each, LIFO drops.
 use std::time::Instant;

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Prove the Completions stack makes a real HTTP round trip on EGCL: fetch the
 # pinned sources (including the atgreen compatibility forks by immutable commit),
 # then run Dexador and Completions against an Ollama-shaped local server.

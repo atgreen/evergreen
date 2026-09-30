@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Unified `-Xlog`-style tag/level logging (bliss-89rd, epic bliss-bfxm).
 //!
 //! HotSpot's `-Xlog` gives one control surface — `-Xlog:gc=debug,compilation=info`

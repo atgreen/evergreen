@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Differential testing for the T0 bytecode backend (bliss-nmq.1).
 //!
 //! The bytecode backend (`EGCL_BACKEND=bytecode`) must be observationally

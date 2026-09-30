@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! End-to-end moving-GC evacuation: interconnected objects rooted on a CL frame
 //! survive BOTH a minor (nursery→old) and a major (old-gen compaction) collection
 //! with their structure and identity intact — every internal reference and root

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! One ObjectHeader-compatible layout contract for every GC-managed object
 //! (bliss-jtc.19). Asserts header field offsets, the size/type_id encoding, and
 //! forwarding/pinning behavior across conses, strings, vectors, CLOS instances,

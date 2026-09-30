@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Foreign storage is outside the moving Lisp heap. Owned allocations have
 //! explicit lifetimes: dropping a pointer does not free memory C may retain.
 //! Imported addresses are borrowed and cannot be freed by this allocator.

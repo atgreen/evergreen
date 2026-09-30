@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A generic function's :ARGUMENT-PRECEDENCE-ORDER decides which method runs
 //! (CLHS 7.6.6.1.2, bliss-nj6id). CFFI relies on it: its foreign-type argument,
 //! not the Lisp value, must pick the translator.

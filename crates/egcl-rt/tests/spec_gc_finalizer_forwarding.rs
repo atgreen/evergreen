@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! egcl-jtc.7f: GC finalizer-registry keys and weak-pointer referents must
 //! survive object evacuation. A live object that is promoted/evacuated by a
 //! collection must NOT have its finalizer fired (its key is forwarded to the new

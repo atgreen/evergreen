@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Precise CL-stack GC: objects held only in interpreter/compiled frames are
 //! marked precisely and relocate correctly across a collection (bliss-nmq.3),
 //! using the unified spec `ObjectHeader` forwarding contract (bliss-jtc.19).

@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; EGCL Android runtime API v1. The host runs one interpreter per Activity.
 (defpackage :egcl-android
   (:use :cl) (:nicknames :android)

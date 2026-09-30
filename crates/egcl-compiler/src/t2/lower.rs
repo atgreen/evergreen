@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P5 — Lowering / x86-64 instruction selection (spec §4.7 R4.42, §4.7.2).
 //!
 //! **Parcel P5. Owner: (sub-agent).** Lower a block-based SSA [`Function`] to a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Lisp-aware statistical profiler (bliss-sc4t). A `perf`/flamegraph of egcl
 //! shows only the interpreter's Rust frames while code tree-walks or runs
 //! bytecode — the actual Lisp functions are invisible. This samples a **shadow

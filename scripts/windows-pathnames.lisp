@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;; Windows physical pathnames: components and namestrings must agree.
 (defun check-windows-path (text host device directory name type)
   (let ((p (parse-namestring text)))

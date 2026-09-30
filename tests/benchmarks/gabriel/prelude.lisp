@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Shared benchmark protocol (bliss-jpd0, spec R10.09/R10.10/R10.59).
 ;;;
 ;;; Each benchmark file loads this, defines its workload, then calls

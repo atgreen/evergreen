@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Global heap-resident symbol table (§1.7, D1.08).
 //!
 //! This is the single runtime registry for Lisp symbols (bliss-jtc.6). Every

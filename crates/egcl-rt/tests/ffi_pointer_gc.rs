@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Per R8.05, a foreign pointer has a distinct, precisely traced Lisp wrapper.
 use egcl_rt::ffi::memory::ForeignPointer;
 

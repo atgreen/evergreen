@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Fiber-aware synchronization and waiting primitives (spec §13.9).
 //!
 //! An unpinned managed fiber publishes its roots and unmounts from the carrier.

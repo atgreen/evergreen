@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The CLI's short-copy primitive must access exactly its supplied byte ranges.
 #![cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
 

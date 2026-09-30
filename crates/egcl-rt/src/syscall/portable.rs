@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Linux ABI adaptation for non-x86-64 hosts. Keep the runtime's negative-errno
 //! convention even though libc syscall wrappers return -1 and set errno.
 use super::*;

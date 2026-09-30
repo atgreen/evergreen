@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Owned TCP streams: R5.113, R5.121–R5.124, on Unix and Windows.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

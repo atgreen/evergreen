@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! egcl-jtc.7a: a file stream that becomes unreachable without an explicit
 //! `close` has its file descriptor released by the GC finalizer, and composite
 //! streams survive the GC trace/finalize path (their components are traced

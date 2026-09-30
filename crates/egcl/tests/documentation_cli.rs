@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A definition's docstring must be recorded where DOCUMENTATION can find it
 //! (bliss-jre1u). CFFI's DEFCFUN passes its docstring through to DEFUN.
 use std::process::Command;

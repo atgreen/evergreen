@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Portable fiber context switch (no libc `ucontext`), bliss-bca.5.
 //!
 //! The fiber scheduler needs to switch a CPU between the carrier (scheduler)

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # sprof-flamegraph.sh — a self-contained HTML flamegraph of a egcl run's LISP
 # call stacks, across tiers (treewalk / T0 bytecode / T1 / T2), from the
 # Lisp-aware sampler (bliss-sc4t). Needs no external tools — unlike perf +

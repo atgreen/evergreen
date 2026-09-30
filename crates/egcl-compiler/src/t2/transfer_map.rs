@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Resolve exception capture at the throwing call, before physical frames retire.
 //! These maps name machine instruction indices and location keys, NOT
 //! emitted PCs or hardware save offsets. Emission must translate both and retain

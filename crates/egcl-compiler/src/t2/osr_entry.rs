@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P8 — OSR entry region in the IR (spec §4.6 A4.03, §4.10 R4.66).
 //!
 //! **Parcel P8. Owner: (sub-agent).** Model on-stack-replacement entry as a

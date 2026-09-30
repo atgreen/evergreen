@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Per R8.01 and R8.05, both direct and function-value FFI paths deny sandbox access.
 //! Per R8.19, pointer addresses and scalar memory values round-trip without loss.
 use std::process::Command;

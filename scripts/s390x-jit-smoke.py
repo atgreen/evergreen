@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 """Verify s390x native execution, OSR and moving-GC safety through the CLI.
 
 Run under scripts/egcl-limited.sh, passing the binary or QEMU command after --.

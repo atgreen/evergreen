@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! AArch64 emission for the optimized SSA pipeline.
 //!
 //! Structured as the System Z emitter is, and for the same reasons: register

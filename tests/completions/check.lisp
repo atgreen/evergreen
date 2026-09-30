@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; A real HTTP round trip through the pinned Completions stack. No implicit
 ;;;; downloads. The fixture (fake-ollama.py) runs an Ollama-shaped server on
 ;;;; EGCL_OLLAMA_PORT and echoes the prompt back, so a wrong request or a

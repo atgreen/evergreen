@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The Lisp execution context that generated code reaches through a reserved
 //! register (spec §2.3.1, R4.72/R4.73; ABI settled on `bliss-q861`).
 //!

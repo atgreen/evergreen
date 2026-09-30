@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T1 codegen-execution tests (bliss-nmq.2): hot bytecode functions compile to
 //! native code, are called through the i2c adapter, call back into the
 //! interpreter via c2i, and produce results identical to pure interpretation.

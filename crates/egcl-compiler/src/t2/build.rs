@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P1 — Bytecode → block-based SSA builder (spec §4.3.5).
 //!
 //! **Parcel P1.** `build_from_bytecode` abstractly interprets a

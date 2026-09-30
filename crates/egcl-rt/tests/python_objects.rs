@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The Lisp↔Python object model: conversions, calls, and proxy lifetime
 //! (bliss-dk3nr).
 //!

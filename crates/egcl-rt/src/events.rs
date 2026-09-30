@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! JFR-style unified event stream — engine core (bliss-ai8n / bliss-u3h0).
 //!
 //! A low-overhead ring buffer of **typed, `Copy` events** — no heap value, no

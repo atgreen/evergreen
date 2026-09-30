@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Tier-differential corpus (bliss-19tm).
 ;;;
 ;;; Run under EGCL_FORCE_TIER=interp|t0|t1|t2; every run must produce

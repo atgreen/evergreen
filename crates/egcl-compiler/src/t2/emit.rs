@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 machine-code emission — MachFunc → executable x86-64 bytes (spec §4.7).
 //!
 //! The final lowering stage: after P5 selected `MachInst`s and P6 assigned every

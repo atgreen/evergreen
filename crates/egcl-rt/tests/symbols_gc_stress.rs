@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Symbol allocation under allocation-time GC stress.
 //!
 //! This lives in its own test binary so `EGCL_GC_STRESS` is set before any

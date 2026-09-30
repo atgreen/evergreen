@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Linux `perf` symbol-map emission for T1 native code (bliss-jtc.10).
 //!
 //! When EGCL_PERF_MAP is set, each installed T1 function appends a line

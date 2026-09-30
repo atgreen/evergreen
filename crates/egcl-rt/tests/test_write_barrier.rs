@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Authoritative generational write barrier + remembered set (bliss-jtc.21).
 //!
 //! Reference stores route through the shared `store_ref`/`write_barrier`

@@ -1,4 +1,6 @@
 #![cfg(all(target_arch = "x86_64", windows))]
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 use egcl_rt::native_transfer::{self, NativeExit};
 

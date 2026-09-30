@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 """jitrec — record a egcl JIT/GC event stream into SQLite and explore it.
 
 The static HTML viewer (tools/event-viewer) embeds a whole run in one page, which

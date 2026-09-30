@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # SessionStart orientation banner for EGCL.
 # Injected into agent context by the SessionStart hook in .claude/settings.json.
 # Deterministically reminds the agent of the AGENTS.md startup step so it is

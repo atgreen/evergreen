@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Compiled foreign-call adapters. Scalar slots contain raw C value bits,
 //! never Lisp heap references. The caller owns rooting and native transitions.
 

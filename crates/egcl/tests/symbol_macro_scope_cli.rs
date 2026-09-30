@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! DEFINE-SYMBOL-MACRO is a global definition and SYMBOL-MACROLET a lexical one
 //! (bliss-cb3c7). CFFI's DEFCVAR defines its accessor as a symbol macro, and
 //! CFFI-TESTS defines some of those through EVAL at load time.

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Benchmark runner: egcl vs SBCL (bliss-jpd0; spec G2 / R10.09 / R10.10).
 #
 #   tests/benchmarks/run.sh [bench...]      # default: every gabriel/*.lisp

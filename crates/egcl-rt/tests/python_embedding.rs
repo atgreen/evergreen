@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! End-to-end tests for the embedded CPython layer (spec §2.7.8).
 //!
 //! ONE TEST, DELIBERATELY. An embedded CPython is a process singleton that cannot

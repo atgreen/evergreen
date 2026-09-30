@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The elf_loader FFI backend (bliss-bca.5): load a shared library at runtime
 //! and call into it — with no `dlopen`/`ld.so`, so it works in a fully static
 //! binary. Runs on the default build; the `c-ffi` build uses dlopen instead.

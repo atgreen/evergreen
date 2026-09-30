@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Per R2.12, Lisp closures are callable through generated C entries, with
 //! contained exits and native-thread admission. Per R8.01, sandbox denies entry.
 #![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]

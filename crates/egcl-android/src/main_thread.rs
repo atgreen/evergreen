@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Running a C call on the Android main thread, and waiting for the answer.
 //!
 //! Android's view hierarchy has thread affinity: touch a View from anywhere but

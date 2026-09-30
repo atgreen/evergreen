@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Bind final frame maps to exact emitted return PCs. These tables do not own
 //! executable memory or bytecode definitions: the installed-code owner must
 //! retain both, check architecture/ABI compatibility, and publish complete site

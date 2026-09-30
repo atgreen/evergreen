@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Hash-table storage is traced by the runtime GC (bliss-jtc.8).
 //!
 //! A hash table's entries live in a Rust Vec outside the GC heap; the stdlib

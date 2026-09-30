@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Linux `perf inject --jit` jitdump emission for installed native code.
 //!
 //! The test drives the real binary with `EGCL_PERF_JITDUMP` pointing at an

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Windows DLL ownership. Handles exposed to Lisp are registry tokens, never
 //! raw HMODULEs, so a stale token cannot close a newly loaded library.
 use crate::error::EgclError;

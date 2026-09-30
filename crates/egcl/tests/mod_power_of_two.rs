@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! MOD by a constant power of two is a mask, not a call (bliss-enp58).
 //!
 //! `(mod i 8)` cost 320 ns/iter against a 151.5 ns empty-loop floor, so the

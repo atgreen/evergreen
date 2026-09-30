@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! `(setf (compiler-macro-function name) fn)` is how CLHS 3.2.2.1 says a
 //! compiler macro is installed, and how a library aliases one — iolib's DEFALIAS
 //! copies a compiler macro from one name to another that way (bliss-vhr6e).

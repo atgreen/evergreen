@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Machine boundary for native-only transfers. A segment may discard generated
 //! frames only after runtime helpers have returned normally. Lisp cleanup, root
 //! publication and EgclStack retirement are the caller's separate obligations.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 machine-level IR — the lowering/regalloc interface (spec §4.7).
 //!
 //! **Phase-0 foundation / frozen contract.** Lowering (P5) turns the block-based

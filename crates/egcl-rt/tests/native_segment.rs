@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Physical segment exits must abandon generated frames only, never Rust frames.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 

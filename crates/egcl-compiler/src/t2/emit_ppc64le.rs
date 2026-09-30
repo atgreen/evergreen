@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! ppc64le emission for the optimized SSA pipeline.
 //!
 //! The fourth backend of this shape, and structured like the other three:

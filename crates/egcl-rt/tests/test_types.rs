@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Comprehensive tests for type predicates in egcl-rt.
 //!
 //! Tests all primary predicates (tag-only, O(1)) and secondary predicates

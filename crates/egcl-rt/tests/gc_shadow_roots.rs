@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Precise host-language shadow roots for the tree-walker (bliss-6b2.1).
 
 use std::sync::{Mutex, OnceLock};

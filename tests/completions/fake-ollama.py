@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 """Run an Ollama-shaped /api/chat server, then run the command under test.
 
 Usage: fake-ollama.py COMMAND [ARG...]

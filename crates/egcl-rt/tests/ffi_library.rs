@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Explicit library lifetime and global symbol lookup for the CFFI backend.
 #![cfg(target_os = "linux")]
 use std::process::Command;

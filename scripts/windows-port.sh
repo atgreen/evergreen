@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 # Cross-build a Windows x86-64 CLI on Linux; optionally exercise it under Wine.
 set -euo pipefail
 cd "$(dirname "$0")/.."

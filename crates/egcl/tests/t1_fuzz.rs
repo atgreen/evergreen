@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Differential fuzzing of the T1 speculative codegen (bliss-jtc.27).
 //!
 //! The invariant the whole hotspot engine must preserve is: running a function

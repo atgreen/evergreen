@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Executable memory for JIT-compiled code (§4.7 codegen → execution).
 //!
 //! A `JitBuffer` owns a page-aligned mapping that holds machine code emitted by

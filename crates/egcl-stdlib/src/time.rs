@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! CL universal-time / decoded-time arithmetic.
 //!
 //! Universal time is the number of seconds since 1900-01-01 00:00:00 GMT (CLHS

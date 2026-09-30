@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! R2.14: Lisp calls use native aggregate ABI adapters; R8.01: sandbox denial.
 #![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use std::process::Command;

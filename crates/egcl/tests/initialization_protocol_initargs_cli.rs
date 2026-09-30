@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! INITIALIZE-INSTANCE and SHARED-INITIALIZE receive the initargs the caller
 //! supplied, under the names the caller used (CLHS 7.1.2). MAKE-INSTANCE keyed
 //! them by SLOT NAME instead, so a method's `&key components` saw NIL whenever

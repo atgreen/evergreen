@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Capability selection and matching-runtime builds for saved-image delivery.
 use crate::runtime_contract::Contract;
 pub(super) fn contract() -> Contract {

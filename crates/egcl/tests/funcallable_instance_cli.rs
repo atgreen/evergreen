@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Funcallable instances: a class whose metaclass is FUNCALLABLE-STANDARD-CLASS
 //! produces instances that ARE functions and whose function is installed after
 //! the fact (AMOP; bliss-cr53).

@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; Dependency-free PGO inputs, not performance benchmarks.
 ;;;; Run each phase in a fresh --no-init process from the checkout root.
 ;;;; EGCL_PGO_WORK names a private directory; phases: prepare, load, runtime.

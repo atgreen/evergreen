@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Public stackful fibers, separate from OS-backed EGCL-THREAD objects.
 (in-package "EGCL-FIBER")
 (export '(fiber fiber-p make-fiber current-fiber list-all-fibers

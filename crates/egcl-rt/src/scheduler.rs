@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Public fiber scheduler-group lifecycle.
 //!
 //! Scheduling mechanics live in `thread.rs`: one internal deque per exposed

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! End-to-end hash-table protocol tests through the full CLI (bliss-jtc.8),
 //! including the boot.lisp WITH-HASH-TABLE-ITERATOR macro. Each program is a
 //! single top-level form whose value `--eval` echoes.

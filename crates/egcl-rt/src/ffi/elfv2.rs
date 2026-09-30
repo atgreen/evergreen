@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! ELFv2 (ppc64le) foreign calls.
 //!
 //! Structured like the AAPCS64 path and for the same reason: placement is simple

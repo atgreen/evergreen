@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! R2.13/R2.14: native struct-by-value adapters checked against C compilation.
 #![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 use egcl_rt::ffi::{AlienType, ffi_call_buffered};

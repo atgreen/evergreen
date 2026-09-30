@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;;; Offline client check: all sources must already be installed from ocicl.csv.
 (require :asdf)
 (asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))

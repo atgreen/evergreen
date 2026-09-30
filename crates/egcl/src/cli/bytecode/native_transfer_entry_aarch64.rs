@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! AArch64 native-segment entry for the first safe rollout slice.
 //!
 //! The x86 installer owns the complete native cleanup/capture protocol.  AArch64

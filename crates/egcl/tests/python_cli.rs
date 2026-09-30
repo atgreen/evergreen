@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The `PY` package: calling Python from Lisp (spec §2.7.8, bliss-dk3nr).
 //!
 //! Driven through the CLI rather than as a library test, because what is being

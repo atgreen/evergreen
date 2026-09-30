@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Hash tables — Robin Hood hashing with open addressing.
 //!
 //! Robin Hood hashing: on insert, each entry tracks its probe distance

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! CL Reader — converts character streams into Lisp objects.
 //!
 //! Implements the CLHS §2.2 reader algorithm. See spec §4.1.

@@ -316,4 +316,25 @@ after building the release binary. Results report whichever runtime is faster.
 
 ## License
 
-The workspace is licensed under `MIT OR Apache-2.0`.
+Evergreen Common Lisp is licensed under the **GNU General Public License,
+version 3 or later, with the Classpath Exception** — the same arrangement
+OpenJDK uses for the Java class library:
+
+```
+GPL-3.0-or-later WITH Classpath-exception-2.0
+```
+
+**Your programs are yours.** Evergreen combines its runtime with your code to
+run it, and `SAVE-LISP-AND-DIE` emits one executable containing both. The
+Classpath Exception is what keeps the GPL from reaching that executable: you may
+license and sell an application Evergreen compiles or delivers on whatever terms
+you choose. Modifications to Evergreen *itself* stay under the GPL.
+
+See [LICENSE](LICENSE) for the licence and
+[LICENSE.classpath-exception](LICENSE.classpath-exception) for the exception,
+which also lists the third-party components that keep their own licences
+(`lib/asdf.lisp`, `lib/slynk/`, `ports/`).
+
+Version 3 rather than OpenJDK's version 2 because Evergreen links a register
+allocator offered only under Apache-2.0, which is compatible with GPLv3 but not
+with GPLv2.

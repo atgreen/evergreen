@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Physical ELF64 s390x probes for the native-transfer boundary.
 #![cfg(all(target_arch = "s390x", unix))]
 

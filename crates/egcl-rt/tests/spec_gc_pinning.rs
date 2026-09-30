@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Precise pinning + non-moving large-object policy (bliss-jtc.18): a pinned
 //! object keeps its address across collections, references to it from moved
 //! objects stay valid, and large objects are never copied.

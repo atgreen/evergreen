@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use super::*;
 use egcl_compiler::t2::emit::TransferCallRequest;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};

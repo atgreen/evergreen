@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 #[path = "src/runtime_contract.rs"]
 mod runtime_contract;
 use std::{env, fs, path::Path, process::Command};

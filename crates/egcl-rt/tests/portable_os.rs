@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Exercise OS ABI boundaries on the host and under QEMU on foreign targets.
 use egcl_rt::syscall as os;
 

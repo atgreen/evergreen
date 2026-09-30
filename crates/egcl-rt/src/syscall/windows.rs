@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Windows implementations of the runtime's OS services. No Linux syscall
 //! numbers or Unix signal/context layouts are used in a Windows process.
 use windows_sys::Win32::{

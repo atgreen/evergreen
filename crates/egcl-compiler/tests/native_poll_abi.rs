@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Regression tests for the split native poll/return contract.
 //!
 //! The poll-enabled native-transfer emitter must carry an independent poll

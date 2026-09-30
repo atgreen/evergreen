@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 pipeline driver — bytecode → executable native code (spec §4.4, §4.7).
 //!
 //! Composes the whole T2 tier front-to-back: build SSA from bytecode (P1) →

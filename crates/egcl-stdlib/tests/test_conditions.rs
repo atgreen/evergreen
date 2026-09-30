@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Tests for egcl-stdlib conditions module (spec §5.4).
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{

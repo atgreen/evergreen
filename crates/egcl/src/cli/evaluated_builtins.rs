@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Builtin operations on evaluated arguments. Source-form evaluation belongs
 //! to the caller; keeping it outside this dispatch lets delivery select native
 //! implementations without retaining the tree-walking operator dispatcher.

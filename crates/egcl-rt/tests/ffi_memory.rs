@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Native memory semantics underlying EGCL-FFI and the CFFI backend.
 //! Per R8.04, tracked storage rejects invalid lifetimes, bounds and null access.
 use egcl_rt::ffi::{AlienType, memory::ForeignPointer};

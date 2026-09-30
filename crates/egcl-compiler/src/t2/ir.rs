@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 block-based SSA IR — core types (spec §4.3).
 //!
 //! **Phase-0 foundation / frozen contract.** Every T2 parcel builds against the

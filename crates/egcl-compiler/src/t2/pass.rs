@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 optimisation-pass contract (spec §4.5).
 //!
 //! **Phase-0 foundation / frozen contract.** Every optimisation parcel (P3, P4a–f)

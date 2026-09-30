@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A function reached only through its OBJECT — `(funcall #'f x)`, `(mapcar #'f
 //! l)`, a function held in a variable or a slot — must tier up like one called
 //! in operator position, and must keep answering correctly once it does

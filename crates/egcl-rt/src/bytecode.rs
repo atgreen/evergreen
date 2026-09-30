@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! EGCL bytecode — the portable instruction stream and function record.
 //!
 //! This is the **canonical coordinate system** shared by every execution tier

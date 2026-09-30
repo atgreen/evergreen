@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! s390x ELF64 native-segment boundary.
 //!
 //! The generated entry receives `(slots, stack, anchor)` in r2-r4. The fixed

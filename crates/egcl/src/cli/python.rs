@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The `PY` package's primitives: the thin layer between Lisp forms and
 //! `egcl_rt::python` (bliss-dk3nr).
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 speculative type lowering — profile-guided, single-type (spec §4.5, §4.10).
 //!
 //! Given static operand proofs (declarations/inference) or the operand-type

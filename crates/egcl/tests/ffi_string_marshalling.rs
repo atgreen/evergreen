@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! `%ffi-call` `:string` marshalling (bliss-124): a Lisp string argument is
 //! passed as a fresh NUL-terminated `char*`, NIL as a null pointer, and a
 //! `:string` return is read back into a Lisp string. Exercises the CLI builtin

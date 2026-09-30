@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ; Shared host/s390x oracle: OSR enters with interpreter handlers already live.
 (defun jit-check (x) (if x t (error "OSR trap check failed")))
 (defun jit-protected-loop (initial)

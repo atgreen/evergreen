@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A SETF place is not an expression: a compiler macro must not rewrite it
 //! (CLHS 3.2.2.1, 5.1.2.7; bliss-msyk). CFFI's WITH-FOREIGN-SLOTS binds a symbol
 //! macro standing for an accessor that has both a compiler macro and a SETF

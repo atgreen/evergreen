@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A tiny label-based x86-64 assembler, shared by the T1 baseline emitter
 //! (`egcl` crate) and the T2 optimising emitter (`egcl-compiler`). It lives in
 //! `egcl-rt` so both tiers emit through the same assembler without a dependency

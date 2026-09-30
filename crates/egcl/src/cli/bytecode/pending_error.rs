@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Execution-owned error slot with a conservative process-wide summary.
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};

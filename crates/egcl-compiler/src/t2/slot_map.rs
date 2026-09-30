@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The single per-safepoint source of truth for `{which slots are live, each
 //! slot's representation}` (bliss-ht4; spec §4.6 D4.09, §4.10 D4.15).
 //!

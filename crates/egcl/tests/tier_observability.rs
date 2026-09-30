@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Tiering observability through the real binary (bliss-jtc.10).
 //!
 //! The stage-5 gate requires that "a hot loop is observably promoted through

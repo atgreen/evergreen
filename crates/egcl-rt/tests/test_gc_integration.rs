@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! GC integration tests — full GC lifecycle through real public APIs.
 //! Red-phase TDD: expected to fail until implementation is wired up.
 //!

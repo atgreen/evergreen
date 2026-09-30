@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! MULTIPLE-VALUE-PROG1's trailing forms must survive its first form (bliss-c0a).
 //!
 //! The interpreter read `(multiple-value-prog1 <first> <rest>…)` apart into two

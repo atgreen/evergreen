@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Heap-resident interpreted function objects with per-function tiering metadata
 //! (bliss-jtc.6.8; D1.17 + FnMeta §4.4.3).
 //!

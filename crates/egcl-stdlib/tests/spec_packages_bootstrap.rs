@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Spec-derived tests for package bootstrap and registry semantics.
 //!
 //! These tests target the real `egcl_stdlib::packages` public API and cite

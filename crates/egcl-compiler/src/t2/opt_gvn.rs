@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P4a — Global value numbering / CSE (spec §4.5).
 //!
 //! **Parcel P4a. Owner: (sub-agent).** Deduplicate pure instructions computing

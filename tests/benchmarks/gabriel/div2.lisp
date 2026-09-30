@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Gabriel DIV2 (iterative + recursive) — cdr-chasing over a 200-element list
 ;;; (bliss-jpd0).
 (load (merge-pathnames "prelude.lisp" *load-truename*))

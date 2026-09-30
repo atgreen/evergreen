@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P3 — Type / range / representation inference (spec §4.5 R4.31, §4.10 §4.5).
 //!
 //! **Parcel P3.** A sparse-conditional (SCCP-family) *forward* propagation over

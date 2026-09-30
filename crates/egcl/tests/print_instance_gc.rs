@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Printing a CLOS instance must survive a moving GC (bliss-phgt).
 //!
 //! Both printers — the stdlib formatter (`FORMAT ~A/~S`, and so

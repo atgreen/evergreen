@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! A program is entitled to its own definition of a name EGCL also uses for an
 //! image-control builtin. Reading SAVE-IMAGE bare inside another package handed
 //! back CL-USER's symbol, so `(export 'save-image :its-package)` reported the

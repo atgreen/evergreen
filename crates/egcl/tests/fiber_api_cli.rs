@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Public Lisp fibers run on actual runtime carriers (R9.42, R9.43, R13.18).
 #![cfg(all(target_arch = "x86_64", any(unix, windows)))]
 use std::process::Command;

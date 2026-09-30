@@ -1,3 +1,6 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 ;;; Extracted unchanged from Ironclad src/math.lisp at
 ;;; f6519450b47a7648f837126e9f269857033e352a. See LICENSE.ironclad.
 ;;; Only the package form is omitted; the two upstream functions are unchanged.

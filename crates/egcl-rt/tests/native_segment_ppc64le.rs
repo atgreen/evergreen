@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! ELFv2 physical segment probes for the ppc64le native-transfer boundary.
 #![cfg(all(
     target_arch = "powerpc64",

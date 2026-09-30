@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! EGCL FASL (`.bfasl`) portable compiled-artifact container (bliss-lb6.6).
 //!
 //! See spec §6.11. This module implements the *container* — the header, the

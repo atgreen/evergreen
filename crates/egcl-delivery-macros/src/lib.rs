@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Expr, Ident, ItemFn, Lit, LitStr, Pat, parse_macro_input, visit_mut::VisitMut};

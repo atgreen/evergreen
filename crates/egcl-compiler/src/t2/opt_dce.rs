@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P4c — Deopt-aware dead-code elimination + rematerialisation (spec §4.5 R4.35,
 //! §4.10 A4.13, R4.60/R4.62).
 //!

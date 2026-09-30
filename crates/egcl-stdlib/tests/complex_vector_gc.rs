@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! GC-rooting regressions for the COMPLEX_ARRAY grow paths (bliss-ez7w).
 //!
 //! `vector_push_extend` and `adjust_complex_vector` replace a complex vector's

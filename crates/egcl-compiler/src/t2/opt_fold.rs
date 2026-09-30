@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P4f — Constant folding + strength reduction (spec §4.5 R4.36).
 //!
 //! **Parcel P4f. Owner: (sub-agent).** Fold instructions with constant operands

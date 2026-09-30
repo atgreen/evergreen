@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! SysV machine adapters for the native transfer ABI. These adapters are not
 //! installed by the legacy T2 pipeline; call-site capture and landing metadata
 //! must be supplied by the new ABI's installer.

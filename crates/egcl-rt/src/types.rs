@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! CL type lattice and type predicates.
 //!
 //! Maps the CL type hierarchy onto EgclVal tag + ObjectHeader type_id.

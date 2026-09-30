@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Global package registry with heap-resident PACKAGE objects (§1.12, D1.20).
 //!
 //! One runtime registry for Lisp packages (bliss-jtc.6 Stage D): every package

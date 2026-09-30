@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 optimising compiler — block-based SSA (spec §4.3–§4.10).
 //!
 //! This module tree is the block-based-SSA T2 pipeline. It supersedes the older

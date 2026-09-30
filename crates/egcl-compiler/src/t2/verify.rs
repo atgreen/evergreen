@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! P2 — IR verifier, algorithm A4.07 (spec §4.3.8).
 //!
 //! **Parcel P2.** `verify` checks the well-formedness rules V1–V10 from spec

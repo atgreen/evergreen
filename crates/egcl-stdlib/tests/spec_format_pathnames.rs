@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Spec-derived tests for FORMAT/printer APIs (§5.9) and pathnames (§5.8).
 //! Coverage umbrella: R5.35, R5.36, R5.37, R5.38, R5.39, R5.40, R5.41,
 //! R5.42, R5.43, R5.181, R5.183, R5.188, R5.195, R5.201.

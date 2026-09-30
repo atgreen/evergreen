@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! T2 deoptimisation frame state — the keystone metadata (spec §4.10).
 //!
 //! **Phase-0 foundation / frozen contract.** A `FrameState` is the abstract

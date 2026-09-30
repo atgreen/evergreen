@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Win64 physical boundary. The same instructions are compiled for Linux unit
 //! probes using Rust's `win64` ABI; only COFF unwind directives are omitted there.
 

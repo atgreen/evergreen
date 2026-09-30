@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! The T2 trace explains a decline under ONE function name (bliss-ieajy.1).
 //!
 //! The information was always there; it was unusable. A single function's trace

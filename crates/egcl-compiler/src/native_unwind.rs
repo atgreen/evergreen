@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+// SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
 //! Select the next logical unwind action inside one retained native frame.
 //!
 //! This is not condition signaling or dynamic target search. The runtime must
