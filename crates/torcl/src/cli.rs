@@ -15693,7 +15693,12 @@ fn symbol_function_object_ex(
     if !name_sym.is_symbol() {
         return None;
     }
-    let fn_name = sym_name(name_sym);
+    // `Rc<str>` from the per-symbol name cache, not an owned String: `#'f`
+    // evaluated in a loop reaches here once per iteration, and sampling the
+    // allocator on `(funcall #'f i)` put HALF of all Rust heap allocations in
+    // `sym_name` called from this function (bliss-fyofj). Every helper below
+    // takes `&str`, so nothing needs the copy.
+    let fn_name = sym_name_rc(name_sym);
     if !skip_lexical && let Some(c) = local_fn_closure(env, &fn_name) {
         return Some(c);
     }
@@ -15713,8 +15718,9 @@ fn symbol_function_object_ex(
     if let Some(f) = global_fn(&fn_name) {
         return Some(f);
     }
-    let bare = symbol_bare_name(&fn_name);
     if is_builtin_function(&fn_name) {
+        // Cached bare name too, and only on the branch that needs it.
+        let bare = sym_bare_name_rc(name_sym);
         return Some(builtin_fn_wrapper(env, name_sym, &bare));
     }
     if fn_bound(env, &fn_name) {
@@ -15727,7 +15733,7 @@ fn symbol_function_object_ex(
     // (functionp #'gf) NIL where SBCL says T. Reify the same apply-by-name
     // wrapper used for builtins; dispatch still happens per call, so a method
     // added later is still picked up.
-    let is_generic = env.generics.contains_key(&fn_name) || env.methods.contains_key(&fn_name);
+    let is_generic = env.generics.contains_key(&*fn_name) || env.methods.contains_key(&*fn_name);
     if is_generic {
         // Key the wrapper by the FULL name, not the bare one: that is the
         // env.generics/env.methods key, so builtin_wrapper_name() round-trips
@@ -34057,10 +34063,39 @@ fn apply_function(
         // registered for their global name.
         let function_name = torcl_rt::function::name(fn_val);
         if function_name.is_symbol() {
-            if let Some(result) =
-                bytecode::call_registered(function_name.as_symbol_index(), args, fn_val, env)
-            {
+            let name_index = function_name.as_symbol_index();
+            if let Some(result) = bytecode::call_registered(name_index, args, fn_val, env) {
                 return result;
+            }
+            // Nothing registered for this name yet: lazy-compile when hot,
+            // exactly as the SYMBOL branch above does (bliss-fyofj). Without
+            // this a function only ever reached through its OBJECT —
+            // `(funcall #'f x)`, `(mapcar #'f l)`, a function held in a variable
+            // or a slot, which is how a metaprogram built out of higher-order
+            // calls works — never entered the registry at all, so it ran the
+            // tree-walker forever, binding each parameter into a name-keyed
+            // frame map (a String allocation per parameter per call): 17 Rust
+            // heap allocations for `(funcall #'f i)` against 1 for `(f i)`.
+            //
+            // Both guards are index-keyed reads of state we already hold, and
+            // the second is a correctness condition, not an optimization: this
+            // object must still BE what its symbol names, or compiling its body
+            // under that symbol would install a STALE definition — the shape
+            // `(let ((old #'f)) (defun f …) (funcall old …))` produces. A
+            // retained older object, and a CLOS effective method (whose object
+            // is not its symbol's global definition either), stay interpreted.
+            if !cfg!(torcl_no_tree_walker)
+                && torcl_rt::function::invoke_count(fn_val) >= bytecode::lazy_compile_threshold()
+                && torcl_rt::symbols::symbol_function(name_index) == Some(fn_val)
+            {
+                let mut params = torcl_rt::function::lambda_list(fn_val);
+                let mut src = torcl_rt::function::body(fn_val);
+                torcl_rt::rooted_ref!(_params_root = &mut params);
+                torcl_rt::rooted_ref!(_src_root = &mut src);
+                maybe_lazy_compile(&sym_name_rc(function_name), params, src, env);
+                if let Some(result) = bytecode::call_registered(name_index, args, fn_val, env) {
+                    return result;
+                }
             }
         }
         let params_form = torcl_rt::function::lambda_list(fn_val);
