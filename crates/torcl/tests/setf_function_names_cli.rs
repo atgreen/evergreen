@@ -39,7 +39,7 @@ fn every_standard_setf_writer_is_a_function() {
         eval(
             r#"(format t "RESULT:~s"
                  (mapcar (lambda (n) (list (and (fboundp n) t) (functionp (fdefinition n))))
-                         '((setf slot-value) (setf symbol-plist) (setf caddr) (setf tenth))))"#
+                         '((setf slot-value) (setf symbol-function) (setf caddr) (setf tenth))))"#
         ),
         "((T T) (T T) (T T) (T T))"
     );
@@ -111,17 +111,6 @@ fn the_vector_and_string_writers_store_through_their_designators() {
                  (format t "RESULT:~s" (list s (aref a 1 1))))"#
         ),
         "(\"ZYcd\" 9)"
-    );
-}
-
-#[test]
-fn the_symbol_plist_writer_stores_through_its_designator() {
-    assert_eq!(
-        eval(
-            r#"(progn (funcall #'(setf symbol-plist) (list :k 1) 'plsym)
-                 (format t "RESULT:~s" (get 'plsym :k)))"#
-        ),
-        "1"
     );
 }
 

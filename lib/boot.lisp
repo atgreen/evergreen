@@ -3107,7 +3107,11 @@
 (defun (setf symbol-function) (new symbol)
   (torcl::set-symbol-function symbol new)
   new)
-(defun (setf symbol-plist) (new symbol) (torcl::set-symbol-plist symbol new) new)
+;; No (SETF SYMBOL-PLIST) here, though TORCL::SET-SYMBOL-PLIST exists for it:
+;; defining it regressed ironclad-text and pure-tls, which then failed with
+;; FLEXI-STREAMS::+BUFFER-SIZE+ unbound whenever flexi-streams' fasls had been
+;; compiled by a drakma- or cl+ssl-driven load. Bisected to this one line and
+;; reverted pending a cause (bliss-rpo1w).
 (defun (setf char) (new string index) (torcl::set-aref string index new) new)
 (defun (setf schar) (new string index) (torcl::set-aref string index new) new)
 (defun (setf row-major-aref) (new array index)
