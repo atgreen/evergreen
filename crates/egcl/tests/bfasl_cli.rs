@@ -3296,25 +3296,45 @@ fn asdf_bfasl_load_asd_runs_under_bytecode() {
     // explicit LOAD-ASD path is the smallest stable slice of the Babel/OCICL
     // corruption: it fails before system lookup needs the user OCICL runtime.
     let root = repo_root();
-    let asdf = root.join("lib/asdf.bfasl");
-    let babel_asd = root.join("ocicl/babel-20250905-4eaf3f2/babel.asd");
-    assert!(
-        asdf.exists(),
-        "missing bundled ASDF bfasl: {}",
-        asdf.display()
-    );
-    assert!(
-        babel_asd.exists(),
-        "missing bundled Babel asd: {}",
-        babel_asd.display()
-    );
+    // SELF-CONTAINED, deliberately. This used to read `lib/asdf.bfasl` and an
+    // ocicl-fetched `babel.asd`, neither of which is tracked — .gitignore excludes
+    // `*.bfasl` and `ocicl/`, and neither has ever been in git. So it asserted a
+    // working tree only a provisioned machine has, and failed on every clean
+    // checkout, taking the `test` and `test-ffi-gnu` CI jobs down with a missing
+    // FILE rather than a broken loader (bliss-d3smh).
+    //
+    // Both inputs are now built from tracked sources, so the test runs everywhere
+    // instead of being skipped or red: ASDF is compiled from `lib/asdf.lisp` (~7s)
+    // into the test's own directory, and the .asd it loads is this repository's
+    // own `egcl-jvm.asd`. The bliss-a27 claim is unchanged — ASDF loaded from a
+    // BFASL must behave under the bytecode backend as it does under the
+    // tree-walker — and compiling it here exercises that bfasl being produced as
+    // well as consumed.
+    let dir = workdir("asdf-load-asd");
+    let asdf_src = root.join("lib/asdf.lisp");
+    let asdf = dir.join("asdf.bfasl");
+    let target_asd = root.join("lib/egcl-jvm/egcl-jvm.asd");
+    assert!(asdf_src.is_file(), "tracked source missing: {}", asdf_src.display());
+    assert!(target_asd.is_file(), "tracked asd missing: {}", target_asd.display());
 
+    let compiled = run(&format!(
+        "(compile-file {asdf_src:?} :output-file {asdf:?})"
+    ));
+    assert!(
+        compiled.status.success(),
+        "compiling ASDF failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(asdf.is_file(), "no bfasl produced at {}", asdf.display());
+
+    // Separate top-level forms, NOT a progn: `asdf:load-asd` must be READ after
+    // ASDF exists, and one form is read in full before any of it is evaluated.
     let form = format!(
         "#-asdf (load #P\"{asdf}\") \
-         (asdf:load-asd #P\"{babel_asd}\" :name \"babel\") \
+         (asdf:load-asd #P\"{target_asd}\" :name \"egcl-jvm\") \
          (format t \"LOAD-ASD-OK\")",
         asdf = asdf.display(),
-        babel_asd = babel_asd.display()
+        target_asd = target_asd.display()
     );
     let output = Command::new(BIN)
         .env("EGCL_T1_THRESHOLD", "999999999")
@@ -3332,6 +3352,7 @@ fn asdf_bfasl_load_asd_runs_under_bytecode() {
         stdout.contains("LOAD-ASD-OK"),
         "missing success marker\nstdout: {stdout}\nstderr: {stderr}"
     );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 /// A compiled `(setf (slot-value o 's) v)` must lower to the internal store
