@@ -3046,6 +3046,37 @@ impl<'e> Lowerer<'e> {
         if nargs > u16::MAX as usize {
             return Err(Bail);
         }
+        // `(accessor obj)` for a DEFCLASS :accessor/:reader or a DEFSTRUCT
+        // accessor -> EGCL::GET-ACCESSOR-SLOT (instance, accessor-symbol), the
+        // mirror of the SET-ACCESSOR-SLOT store arm. Accessors are installed as
+        // real generic methods so that #'reader, funcall and mapcar work
+        // (bliss-aid), which meant a plain `(ball-x b)` paid full generic dispatch
+        // in compiled code: 4.06us, against 1.26us for the `(slot-value b 'x)` it
+        // amounts to (bliss-fskhm).
+        //
+        // Placed HERE, immediately before the generic CallNamed and after the
+        // flet/labels lookup returned early, so it can only ever replace a generic
+        // dispatch — never a lexical binding, a macro or a special operator. The
+        // existence of the mapping is the only thing decided at compile time; WHICH
+        // slot, and whether the shortcut applies to the actual argument at all, is
+        // the primitive's business at run time, and it defers to real dispatch when
+        // the object's own class does not declare the accessor.
+        if nargs == 1
+            && super::accessor_slot_name(self.env, name).is_some()
+            && let Some(getter) = resolve_sym("EGCL::GET-ACCESSOR-SLOT")
+        {
+            self.lower_expr(args[0])?;
+            let c = self.add_const(op);
+            self.emit(Instr::Const(c));
+            self.push_n(1);
+            self.emit(Instr::CallNamed {
+                sym: getter.as_symbol_index(),
+                nargs: 2,
+            });
+            self.pop_n(2);
+            self.push_n(1);
+            return Ok(());
+        }
         for i in 0..nargs {
             self.lower_expr(args[i])?;
         }

@@ -18797,3 +18797,56 @@ fn setf_through_a_shared_accessor_name_writes_the_instances_own_slot() {
         ),
     ]);
 }
+
+/// A compiled `(accessor obj)` lowers to the direct slot-read primitive, and that
+/// shortcut must not change any answer (bliss-fskhm).
+///
+/// Accessors are installed as real generic methods so `#'reader`, FUNCALL and
+/// MAPCAR work (bliss-aid), which meant compiled code paid full generic dispatch
+/// for what is a field read. The lowerer now emits EGCL::GET-ACCESSOR-SLOT, which
+/// resolves against the INSTANCE's own class chain and defers to real dispatch
+/// when that chain does not declare the accessor.
+///
+/// The cases here are the ways the shortcut could be wrong rather than slow, and
+/// each runs twice — the harness evaluates every case compiled and tree-walked:
+///   * two classes sharing one accessor name must each read their OWN slot;
+///   * an FLET binding of the accessor name must win over the shortcut;
+///   * the accessor must remain a real function value for FUNCALL/MAPCAR;
+///   * an inherited accessor must still resolve through the precedence list.
+#[test]
+fn a_compiled_accessor_read_keeps_generic_dispatch_semantics() {
+    run_expression_cases(&[
+        (
+            "(progn (defclass ar-a () ((ar-x :initform 'from-a :accessor ar-get)))
+                    (defclass ar-b () ((ar-y :initform 'from-b :accessor ar-get)))
+                    (defun ar-read (o) (ar-get o))
+                    (list (ar-read (make-instance 'ar-a))
+                          (ar-read (make-instance 'ar-b))))",
+            "(FROM-A FROM-B)",
+        ),
+        (
+            "(progn (defstruct ar-s (ar-v 7))
+                    (defun ar-shadow (s)
+                      (flet ((ar-s-ar-v (z) (declare (ignore z)) 'shadowed))
+                        (ar-s-ar-v s)))
+                    (list (ar-s-ar-v (make-ar-s)) (ar-shadow (make-ar-s))))",
+            "(7 SHADOWED)",
+        ),
+        (
+            "(progn (defstruct ar-f (ar-w 3))
+                    (let ((o (make-ar-f)))
+                      (list (funcall #'ar-f-ar-w o)
+                            (mapcar #'ar-f-ar-w (list o o))
+                            (apply #'ar-f-ar-w (list o)))))",
+            "(3 (3 3) 3)",
+        ),
+        (
+            "(progn (defclass ar-base () ((ar-i :initform 'inherited :accessor ar-inh)))
+                    (defclass ar-sub (ar-base) ())
+                    (defclass ar-far () ((ar-j :initform 'far :accessor ar-inh)))
+                    (defun ar-rd (o) (ar-inh o))
+                    (list (ar-rd (make-instance 'ar-sub)) (ar-rd (make-instance 'ar-far))))",
+            "(INHERITED FAR)",
+        ),
+    ]);
+}

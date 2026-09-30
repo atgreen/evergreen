@@ -1969,6 +1969,34 @@ fn resolve(name: &str) -> Option<Handler> {
             store_slot_value(instance, slot, val, env)
         }),
 
+        "EGCL::GET-ACCESSOR-SLOT" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            // Read primitive for bytecode-lowered `(accessor obj)` where ACCESSOR
+            // is a DEFCLASS :accessor/:reader or a DEFSTRUCT accessor. The mirror
+            // of SET-ACCESSOR-SLOT, and resolved at run time for the same reasons:
+            // a function can be compiled before the class it touches exists, and
+            // the class can be redefined afterwards.
+            //
+            // Exists because `(ball-x b)` otherwise lowered to a generic CallNamed
+            // and paid full dispatch — 4.06us against 1.26us for the bare
+            // `(slot-value b 'x)` it amounts to (bliss-fskhm).
+            let instance = args.first().copied().unwrap_or(NIL);
+            let accessor = args.get(1).copied().unwrap_or(NIL);
+            let name = sym_name(accessor);
+            // STRICT: only this instance's own class chain counts. If it does not
+            // declare the accessor, this is not the simple case the lowerer bet on
+            // — an EQL-specialized method, a user method on another class, a
+            // non-instance argument — and real dispatch has to run. Guessing a
+            // slot by name would read the wrong one silently.
+            match accessor_slot_name_in_class_chain(env, instance, &name) {
+                Some(slot_name) => {
+                    let slot = resolve_sym(&slot_name).unwrap_or(NIL);
+                    read_slot_value(instance, slot, env)
+                }
+                None => invoke_generic_function(&name, &[instance], env),
+            }
+        }),
+
         "EGCL::SET-ACCESSOR-SLOT" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
             // Store primitive for bytecode-lowered `(setf (accessor obj) v)`

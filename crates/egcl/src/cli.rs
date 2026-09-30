@@ -1471,6 +1471,22 @@ pub(in crate::cli) fn accessor_slot_name_for_instance(
     instance: EgclVal,
     accessor: &str,
 ) -> Option<String> {
+    accessor_slot_name_in_class_chain(env, instance, accessor)
+        .or_else(|| accessor_slot_name(env, accessor))
+}
+
+/// The slot an accessor names on this instance, searching ONLY the instance's
+/// class precedence list — no name-only fallback.
+///
+/// This is the strict question a compiled direct slot read must ask: "does this
+/// object's own class actually declare this accessor?". A name-only answer would
+/// be a guess, and a guess here reads the wrong slot silently, so the caller
+/// defers to real generic dispatch when this returns None (bliss-fskhm).
+pub(in crate::cli) fn accessor_slot_name_in_class_chain(
+    env: &Env,
+    instance: EgclVal,
+    accessor: &str,
+) -> Option<String> {
     let bare = symbol_bare_name(accessor);
     let name_matches = |n: &str| n == accessor || symbol_bare_name(n) == bare;
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
@@ -1493,7 +1509,7 @@ pub(in crate::cli) fn accessor_slot_name_for_instance(
             return found;
         }
     }
-    accessor_slot_name(env, accessor)
+    None
 }
 
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
@@ -20278,6 +20294,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::SET-SYMBOL-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SYMBOL-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::GET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-CAR" | "EGCL::SET-CDR" => {
                 // Store primitives for bytecode-lowered `(setf (car|cdr place)
