@@ -2234,6 +2234,35 @@ pub fn slot_value(instance: EgclVal, slot_name: EgclVal) -> Result<EgclVal, Egcl
     }
 }
 
+/// [`slot_value`], but distinguishing "not an instance slot" from "unbound".
+///
+/// `None` means the slot is not in this instance's inline layout — it may be an
+/// `:allocation :class` slot, which lives in the owning class's cell and is the
+/// caller's problem. `Some(Err(UnboundVariable))` means it IS an instance slot and
+/// is unbound.
+///
+/// Exists so a caller can make that distinction with ONE layout lookup. Asking
+/// [`slot_present_p`] and then [`slot_value`] answers it with two — two
+/// `update_if_obsolete` calls and two hash lookups for one question (bliss-51m0l).
+pub fn slot_value_if_present(
+    instance: EgclVal,
+    slot_name: EgclVal,
+) -> Option<Result<EgclVal, EgclError>> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        let idx = instance_slot_index(instance, slot_name)?;
+        let v = *slot_cell(instance, idx);
+        Some(if v == UNBOUND {
+            Err(EgclError::UnboundVariable(slot_name))
+        } else {
+            Ok(v)
+        })
+    }
+}
+
 /// Set a slot value ((SETF SLOT-VALUE)).
 pub fn set_slot_value(
     instance: EgclVal,

@@ -5798,14 +5798,15 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
     // Worth a guard because the slow path opens by rebuilding the class name as a
     // String and then walks the precedence list comparing strings, per call, for
     // every slot read in the system — SLOT-VALUE reaches here too, not just
-    // accessors. `slot_present_p` is a hash lookup on the symbol and calls
-    // `update_if_obsolete` itself, so it answers about the instance's CURRENT
-    // shape rather than a stale layout (bliss-51m0l).
+    // accessors. ONE layout lookup answers both halves: `slot_value_if_present`
+    // returns None when the slot is not an instance slot, and calls
+    // `update_if_obsolete` itself, so it describes the instance's CURRENT shape
+    // rather than a stale layout (bliss-51m0l).
     //
     // A non-instance answers false and falls through, preserving the NIL that
     // ASDF's readers rely on at the end of this function (bliss-lb6.14).
-    if egcl_stdlib::slot_present_p(instance, slot) {
-        return egcl_stdlib::slot_value(instance, slot);
+    if let Some(result) = egcl_stdlib::slot_value_if_present(instance, slot) {
+        return result;
     }
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
