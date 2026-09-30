@@ -9,6 +9,26 @@
 Writes a core image of the live Lisp world and terminates the saving process.
 `save-image-and-die` is an accepted alias.
 
+!!! note "Which package the name lives in"
+
+    These operators belong to `EGCL-EXT`, the way SBCL's belong to `SB-EXT`, and
+    `COMMON-LISP-USER` sees them unqualified. The examples here are written for a
+    script evaluated in `CL-USER`, where the bare name is what you want.
+
+    Inside your own package they are not visible bare — `(defpackage :my-app
+    (:use :cl))` inherits `COMMON-LISP` and nothing else, so a bare
+    `save-lisp-and-die` there names a fresh, undefined symbol in `MY-APP`.
+    Qualify it, or use the package:
+
+    ```lisp
+    (egcl-ext:save-lisp-and-die "app.core")            ; from any package
+    (defpackage :my-app (:use :cl :egcl-ext))          ; or inherit it
+    ```
+
+    This is ordinary Common Lisp package behaviour (CLHS 11.1.2), not an EGCL
+    quirk: a program is entitled to define its own `SAVE-IMAGE`, and one does —
+    slynk's backend interface.
+
 | Argument | Meaning |
 | --- | --- |
 | `pathname` | Output pathname designator |

@@ -22688,7 +22688,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return egcl_stdlib::set_file_position(*stream, spec);
             }
-            "SAVE-IMAGE" => {
+            "SAVE-IMAGE" | "EGCL-EXT:SAVE-IMAGE" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
                 let path = val_as_str(path_val);
@@ -22713,7 +22713,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     .map_err(|e| EgclError::FileError(format!("save-image: {}", e)))?;
                 return Ok(T);
             }
-            "SAVE-LISP-AND-DIE" | "SAVE-IMAGE-AND-DIE" => {
+            "SAVE-LISP-AND-DIE"
+            | "SAVE-IMAGE-AND-DIE"
+            | "EGCL-EXT:SAVE-LISP-AND-DIE"
+            | "EGCL-EXT:SAVE-IMAGE-AND-DIE" => {
                 // (save-lisp-and-die pathname &key executable toplevel …) —
                 // `save-image-and-die` is an accepted alias.
                 // Write a heap-snapshot CORE of the whole live world (SBCL
@@ -22795,7 +22798,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 save_core_and_die(&path, executable, env)?;
                 unreachable!("save_core_and_die exits the process");
             }
-            "%SAVE-CORE" => {
+            "%SAVE-CORE" | "EGCL-EXT:%SAVE-CORE" => {
                 // (%save-core path &key executable) — write a heap-snapshot CORE
                 // image (bliss-x0f2 M3) and terminate. Unlike SAVE-LISP-AND-DIE's
                 // source-form .bfasl, this captures the live GC heap byte-for-byte
@@ -34243,6 +34246,24 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            // The image-control operators. 66b2396d stopped a BARE read of these
+            // resolving to CL-USER's identity from inside another package, so that
+            // a program could define its own SAVE-IMAGE — swank/backend does
+            // (bliss-zfwfo). That left them reachable ONLY as `cl-user::save-lisp-
+            // and-die`, a legacy accident rather than an API: a delivery script
+            // written in its own package had no supported spelling at all, which
+            // is what broke 13 delivery tests (bliss-icy71). Giving them the same
+            // qualified identity every other extension builtin has restores that
+            // without giving back the bare-from-anywhere reading. SBCL is the
+            // model: sb-ext:save-lisp-and-die, invisible to a plain (:use :cl).
+            | "EGCL-EXT:SAVE-IMAGE"
+            | "EGCL-EXT::SAVE-IMAGE"
+            | "EGCL-EXT:SAVE-LISP-AND-DIE"
+            | "EGCL-EXT::SAVE-LISP-AND-DIE"
+            | "EGCL-EXT:SAVE-IMAGE-AND-DIE"
+            | "EGCL-EXT::SAVE-IMAGE-AND-DIE"
+            | "EGCL-EXT:%SAVE-CORE"
+            | "EGCL-EXT::%SAVE-CORE"
             | "EGCL-EXT:FINALIZE"
             | "EGCL-EXT::FINALIZE"
             | "EGCL-EXT:CANCEL-FINALIZATION"

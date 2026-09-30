@@ -95,7 +95,7 @@ fn check_bootstrap_delivery(specialized: bool, whole_world: bool) {
         BIN,
         &[
             "--eval",
-            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+            &format!("(load {fasl:?}) (egcl-ext:save-lisp-and-die {core:?})"),
         ],
     ));
     fs::remove_file(&source).unwrap();
@@ -189,7 +189,7 @@ fn delivery_preserves_implicit_bootstrap_protocol_calls() {
                   (let ((x (list 0)) (y (list 0)))
                     (setf (values (car x) (car y)) (values 3 4))
                     (format t "~D ~D~%" (car x) (car y))))
-                (save-lisp-and-die {core:?} :toplevel 'main)
+                (egcl-ext:save-lisp-and-die {core:?} :toplevel 'main)
                 "#
             ),
         ],
@@ -240,7 +240,7 @@ fn check_named_function_delivery(warm: bool, specialized: bool) {
         (defun main () (compile-only))
         (set '*saved* #'main)
         {warmup}
-        (save-lisp-and-die {core:?})
+        (egcl-ext:save-lisp-and-die {core:?})
     "#
     );
     ok(Command::new(BIN)
@@ -315,7 +315,7 @@ fn delivery_prunes_compile_time_dependencies_of_compiled_methods() {
         (defmacro compile-only (x) (list '+ x 1))
         (defmethod answer ((x t)) (compile-only x))
         (defun main () (write-line (if (= 42 (answer 41)) "METHOD-OK" "WRONG")))
-        (save-lisp-and-die {core:?})
+        (egcl-ext:save-lisp-and-die {core:?})
     "#
             ),
         ],
@@ -371,7 +371,7 @@ fn saved_entry_preserves_class_instances_under_gc_stress() {
                      (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
                      t)
                 "GENERIC-SHAKE-OK" "WRONG"))))
-      (save-lisp-and-die {core:?} :toplevel (quote generic-shake::main))
+      (egcl-ext:save-lisp-and-die {core:?} :toplevel (quote generic-shake::main))
     "#
     );
     ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
@@ -416,7 +416,7 @@ fn delivery_prepares_source_functions_and_preserves_builtin_dependencies() {
             &[
                 "--no-bootstrap",
                 "--eval",
-                &format!("(load {input:?}) {setup} (save-lisp-and-die {core:?})"),
+                &format!("(load {input:?}) {setup} (egcl-ext:save-lisp-and-die {core:?})"),
             ],
         ));
         let report = ok(run(
@@ -464,7 +464,7 @@ fn delivery_retains_hidden_source_binders_and_methods() {
             &[
                 "--no-bootstrap",
                 "--eval",
-                &format!("(load {fasl:?}) {setup} (save-lisp-and-die {core:?})"),
+                &format!("(load {fasl:?}) {setup} (egcl-ext:save-lisp-and-die {core:?})"),
             ],
         ));
         fs::write(&spec, format!("version = 1\nentry = HIDDEN-WALKER::{entry}\nprune-package = HIDDEN-WALKER\nruntime = specialized\ndynamic = explicit\n")).unwrap();
@@ -529,7 +529,7 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
             "--no-bootstrap",
             "--eval",
             &format!(
-                "(load {fasl:?}) (set 'closure-shake::*saved* (closure-shake::make-live #'closure-shake::live-target)) (closure-shake::make-dead #'closure-shake::dead-captured-target) (save-lisp-and-die {core:?})"
+                "(load {fasl:?}) (set 'closure-shake::*saved* (closure-shake::make-live #'closure-shake::live-target)) (closure-shake::make-dead #'closure-shake::dead-captured-target) (egcl-ext:save-lisp-and-die {core:?})"
             ),
         ],
     ));
@@ -621,7 +621,7 @@ fn delivery_keeps_saved_macro_expanders_and_removes_unused_definitions() {
                      (= 43 (macroexpand-1 (list (intern "KEPT" :macro-handles))))
                      (null (macro-function (intern "UNUSED" :macro-handles))))
                 "MACRO-HANDLES-OK" "WRONG")))
-        (save-lisp-and-die {core:?})
+        (egcl-ext:save-lisp-and-die {core:?})
     "#
     );
     ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
@@ -712,7 +712,7 @@ fn delivery_prunes_setf_writers_and_preserves_saved_writer_functions() {
             "--no-init",
             "--no-bootstrap",
             "--eval",
-            &format!("(load {input:?}) (save-lisp-and-die {core:?})"),
+            &format!("(load {input:?}) (egcl-ext:save-lisp-and-die {core:?})"),
         ]);
         if !compiled {
             save.env("EGCL_BACKEND", "tree-walker")
@@ -774,7 +774,7 @@ fn delivery_preserves_legacy_writer_with_an_ambiguous_package_owner() {
       (defpackage :out (:use :cl) (:intern ".X"))
       (defun egcl-internal::%setf-writer-out...x (value target) (eval value))
       (defun out::main () (write-line "OK"))
-      (save-lisp-and-die {core:?})
+      (egcl-ext:save-lisp-and-die {core:?})
     "#
     );
     ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
@@ -821,7 +821,7 @@ fn native_delivery_ignores_eval_in_an_unreachable_setf_writer() {
             "--no-bootstrap",
             "--eval",
             &format!(
-                "(load {fasl:?}) (defun (setf writer-shake::unused) (value target) (eval value)) (save-lisp-and-die {core:?})"
+                "(load {fasl:?}) (defun (setf writer-shake::unused) (value target) (eval value)) (egcl-ext:save-lisp-and-die {core:?})"
             ),
         ],
     ));
@@ -894,7 +894,7 @@ fn native_delivery_ignores_eval_in_an_unreachable_macro() {
             "--no-bootstrap",
             "--eval",
             &format!(
-                "(load {fasl:?}) (defmacro macro-shake::unused (form) (eval form)) (save-lisp-and-die {core:?})"
+                "(load {fasl:?}) (defmacro macro-shake::unused (form) (eval form)) (egcl-ext:save-lisp-and-die {core:?})"
             ),
         ],
     ));
@@ -960,7 +960,7 @@ fn native_delivery_prunes_unused_bytecode_macro() {
         &[
             "--no-bootstrap",
             "--eval",
-            &format!("(load {fasl:?}) (save-lisp-and-die {core:?})"),
+            &format!("(load {fasl:?}) (egcl-ext:save-lisp-and-die {core:?})"),
         ],
     ));
     fs::write(&spec, "version = 1\nentry = COMPILED-MACROS::MAIN\nprune-package = COMPILED-MACROS\ndynamic = explicit\nruntime = specialized\n").unwrap();
@@ -1027,7 +1027,7 @@ fn native_delivery_ignores_eval_in_an_unreachable_method() {
         (defmethod unused ((form t)) (eval form))
         (defgeneric start ())
         (defmethod start () (write-line "GENERIC-ENTRY-OK"))
-        (save-lisp-and-die {core:?})
+        (egcl-ext:save-lisp-and-die {core:?})
     "#
             ),
         ],
@@ -1112,7 +1112,7 @@ fn delivery_prunes_generic_owners_but_keeps_methods_and_class_accessors() {
                      (= 9 (funcall (intern "READ-VALUE" :generic-shake) box))
                      (not (fboundp (intern "UNUSED" :generic-shake))))
                 "GENERIC-SHAKE-OK" "WRONG"))))
-      (save-lisp-and-die {core:?})
+      (egcl-ext:save-lisp-and-die {core:?})
     "#
     );
     ok(run(BIN, &["--no-bootstrap", "--eval", &program]));
@@ -1214,7 +1214,7 @@ fn delivery_traces_source_closures_only_from_reachable_handles() {
                                (= 1 (funcall *sibling*))
                                (eq *saved* *alias*))
                           "SOURCE-CLOSURE-OK" "WRONG")))
-        (save-lisp-and-die {core:?})
+        (egcl-ext:save-lisp-and-die {core:?})
         "#
     );
     ok(Command::new(BIN)
@@ -1301,7 +1301,7 @@ fn delivery_prunes_unreachable_functions_and_keeps_data_and_explicit_roots() {
         (assert (eq :table (funcall (gethash :entry *table*))))
         (assert (not (fboundp (intern "DEAD-A" :delivery-test))))
         (format t "DELIVERED-OK~%"))
-      (save-lisp-and-die {image:?} :toplevel (lambda () (error "Input entry must not run")))
+      (egcl-ext:save-lisp-and-die {image:?} :toplevel (lambda () (error "Input entry must not run")))
     "#
     );
     ok(run(BIN, &["--eval", &save]));
@@ -1349,14 +1349,14 @@ fn resaving_an_executable_replaces_the_previous_embedded_image() {
         BIN,
         &[
             "--eval",
-            &format!("(save-lisp-and-die {first:?} :executable t)"),
+            &format!("(egcl-ext:save-lisp-and-die {first:?} :executable t)"),
         ],
     ));
     ok(run(
         &first,
         &[
             "--eval",
-            &format!("(save-lisp-and-die {second:?} :executable t)"),
+            &format!("(egcl-ext:save-lisp-and-die {second:?} :executable t)"),
         ],
     ));
     fn prefix(path: &str) -> usize {
@@ -1423,7 +1423,7 @@ fn delivery_of_source_free_code_keeps_closures_methods_and_unwind_paths() {
         &[
             "--eval",
             &format!(
-                "(load {fasl:?}) (defparameter delivery-code::*saved-closure* (delivery-code::closure-maker 41)) (save-lisp-and-die {image:?})"
+                "(load {fasl:?}) (defparameter delivery-code::*saved-closure* (delivery-code::closure-maker 41)) (egcl-ext:save-lisp-and-die {image:?})"
             ),
         ],
     ));
@@ -1456,7 +1456,7 @@ fn delivery_defaults_to_preserving_dynamic_targets_and_rejects_bad_specs() {
       (defun delivery-policy::main ()
         (assert (= 19 (funcall (intern "TARGET" :delivery-policy))))
         (format t "DYNAMIC-OK~%"))
-      (save-lisp-and-die {image:?})"#
+      (egcl-ext:save-lisp-and-die {image:?})"#
             ),
         ],
     ));
@@ -1532,7 +1532,7 @@ fn failed_publication_preserves_the_existing_manifest() {
         BIN,
         &[
             "--eval",
-            &format!("(defun main () 42) (save-lisp-and-die {image:?})"),
+            &format!("(defun main () 42) (egcl-ext:save-lisp-and-die {image:?})"),
         ],
     ));
     fs::write(&spec, "version = 1\nentry = CL-USER::MAIN\n").unwrap();
@@ -1563,7 +1563,7 @@ fn delivery_reduces_the_embedded_core_when_unused_code_has_large_constants() {
       (defun unused () "{}")
       (defun main () (format t "SMALL-OK~%"))
       (assert (> (length (unused)) 100000))
-      (save-lisp-and-die {image:?})
+      (egcl-ext:save-lisp-and-die {image:?})
     "#,
             "unreachable payload ".repeat(10000)
         ),
@@ -1614,7 +1614,7 @@ fn saved_images_validate_native_requirements_before_restore() {
     let core = f.path("contract.core");
     ok(run(
         BIN,
-        &["--eval", &format!("(save-lisp-and-die {core:?})")],
+        &["--eval", &format!("(egcl-ext:save-lisp-and-die {core:?})")],
     ));
     let mut bytes = fs::read(&core).unwrap();
     let marker = b"schema=3\nsource=";
@@ -1647,7 +1647,7 @@ fn native_delivery_capabilities_follow_reachable_symbols_and_dynamic_policy() {
         (defun inspect-main () (disassemble 'main))
         (defun eval-main (form) (eval form))
         (defun load-main () (load "later.lisp"))
-        (save-lisp-and-die {core:?})"#
+        (egcl-ext:save-lisp-and-die {core:?})"#
             ),
         ],
     ));
@@ -1765,7 +1765,7 @@ fn check_native_delivery_tier(max_tier: &str) {
             "--no-bootstrap",
             "--eval",
             &format!(
-                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (defmacro walker-free::unused-macro (x) (eval x)) (save-lisp-and-die {core:?})"
+                "(load {fasl:?}) (defgeneric walker-free::unused (x)) (defmethod walker-free::unused ((x t)) (eval x)) (defmacro walker-free::unused-macro (x) (eval x)) (egcl-ext:save-lisp-and-die {core:?})"
             ),
         ],
     ));
@@ -1867,7 +1867,7 @@ fn native_delivery_builds_and_runs_without_decoder() {
         (defun main ()
           (dotimes (i 1000) (add-one i))
           (write-line (if (= (add-one 1.5) 2.5) "NATIVE-OK" "WRONG")))
-        (save-lisp-and-die {core:?})"#
+        (egcl-ext:save-lisp-and-die {core:?})"#
             ),
         ],
     ));
@@ -1948,7 +1948,7 @@ fn explicit_image_overrides_a_saved_executables_embedded_core() {
         &[
             "--eval",
             &format!(
-                r#"(defun embedded-main () (format t "EMBEDDED~%")) (save-lisp-and-die {exe:?} :executable t :toplevel 'embedded-main)"#
+                r#"(defun embedded-main () (format t "EMBEDDED~%")) (egcl-ext:save-lisp-and-die {exe:?} :executable t :toplevel 'embedded-main)"#
             ),
         ],
     ));
@@ -1957,7 +1957,7 @@ fn explicit_image_overrides_a_saved_executables_embedded_core() {
         &[
             "--eval",
             &format!(
-                r#"(defun explicit-main () (format t "EXPLICIT~%")) (save-lisp-and-die {core:?} :toplevel 'explicit-main)"#
+                r#"(defun explicit-main () (format t "EXPLICIT~%")) (egcl-ext:save-lisp-and-die {core:?} :toplevel 'explicit-main)"#
             ),
         ],
     ));
@@ -2001,7 +2001,7 @@ fn check_raw_lambda_delivery(dynamic: bool, build_runtime: bool) {
       (defun helper () 42)
       (defun unused () (disassemble 'unused))
       (defun main () (write-line (if (= 42 (funcall *fn*)) "RAW-LAMBDA-OK" "WRONG")))
-      (save-lisp-and-die {core:?})"#
+      (egcl-ext:save-lisp-and-die {core:?})"#
             ),
         ],
     ));
