@@ -1,5 +1,20 @@
 # Evergreen Common Lisp — User Manual
 
+!!! warning "This is an experiment, not a product. It probably does not work."
+
+    Evergreen is under active development. Most of it is likely broken at any
+    given moment, and the parts that do work may not behave the way this manual
+    says they should. It may never work.
+
+    This manual documents what Evergreen is *trying* to be. Where it and the
+    implementation disagree, the implementation is what you actually get — and
+    neither is a promise. Do not depend on it for anything that matters.
+
+    That is the point rather than an apology for it: Evergreen exists to find out
+    whether a real language implementation — a tiered JIT, a moving generational
+    collector, a standard library — can be built through AI-driven development.
+    The answer is not in yet.
+
 This manual describes EGCL's implementation of Common Lisp and its extensions.
 It concentrates on behavior specific to EGCL: startup, compilation, debugging,
 memory, foreign calls, Java integration, concurrency, and application delivery.

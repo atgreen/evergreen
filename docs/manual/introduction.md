@@ -1,5 +1,11 @@
 # Introduction
 
+!!! warning "Evergreen is an experiment and probably does not work."
+
+    Under active development: most of it is likely broken at any given moment,
+    and what works may not match this manual. It may never work. Everything here
+    describes what Evergreen is trying to be, not something to depend on.
+
 Evergreen Common Lisp (EGCL) implements Common Lisp with a Rust bootstrap
 runtime and a tiered native compiler. This manual describes the behavior
 specific to EGCL: how a Lisp process starts, how code is compiled, which
