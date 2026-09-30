@@ -2,6 +2,22 @@
   <img src="docs/assets/evergreen-banner2x.png" alt="Evergreen Common Lisp" width="1280">
 </p>
 
+> [!WARNING]
+> **This is an experiment, not a product. It probably does not work.**
+>
+> Evergreen is under active development. Most of it is likely broken at any given
+> moment. The parts that do work may not behave the way you expect, or the way
+> the standard says they should. It may never work.
+>
+> Everything below describes what Evergreen is *trying* to be. Read it as a
+> statement of intent, not as a description of something you can depend on. Do
+> not put it anywhere near anything that matters.
+>
+> That is the point rather than an apology for it: Evergreen exists to find out
+> whether a real language implementation — a tiered JIT, a moving generational
+> collector, a standard library — can be built through AI-driven development. The
+> answer is not in yet. See [Authorship & Governance](#authorship--governance).
+
 **Evergreen Common Lisp (EGCL) is Common Lisp with a HotSpot-inspired native
 runtime**, built from scratch in Rust. It starts executing in bytecode, compiles
 hot code to native instructions, and specializes dynamically typed programs as
