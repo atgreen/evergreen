@@ -18346,7 +18346,10 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         .filter(|&v| torcl_rt::function::is_interpreted_function(v));
     mark_fresh_promotion(done.sym);
     publish_native(done.sym, fn_obj, &nc);
-    t2_log_write(format_args!("{}: background T2 result published", bf.name));
+    t2_log_write(format_args!(
+        "{}: background T2 result published",
+        display_fn_name(&bf.name)
+    ));
     Some(nc)
 }
 
@@ -20496,6 +20499,23 @@ fn t2_log_target() -> Option<&'static T2LogTarget> {
     .as_ref()
 }
 
+/// Expand an `EmitError` tag into something a reader can act on.
+///
+/// `emit::op_tag` encodes a refused opcode as `op as u32 | 0x1000`, so the log
+/// said only `UnsupportedOp(4110)` — a number that names nothing. The opcode
+/// INDEX is what identifies it against the `Opcode` enum in t2/ir.rs. Tags
+/// without the 0x1000 bit are the emitter's hand-picked codes (an operand with
+/// no register, a missing frame base) and are left as they are.
+fn describe_emit_error(e: &torcl_compiler::t2::emit::EmitError) -> String {
+    use torcl_compiler::t2::emit::EmitError;
+    match e {
+        EmitError::UnsupportedOp(tag) if tag & 0x1000 != 0 => {
+            format!(" [refused Opcode #{} in t2/ir.rs]", tag & 0xFFF)
+        }
+        _ => String::new(),
+    }
+}
+
 fn t2_log_write(msg: std::fmt::Arguments) {
     use std::io::Write;
     match t2_log_target() {
@@ -20565,7 +20585,13 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // deopt. That is no longer needed: emit_framed now lowers SetSymbolValue and
     // gives every guard precise state-transfer deopt (bliss-izt.3, bliss-mzp), so
     // a global-accumulator loop optimises at T2 without double-applying its store.)
-    let name = bf.name.clone();
+    // The SAME spelling every other T2 line uses. sym_label() routes through
+    // display_fn_name, which prints a CL-USER-homed name bare; bf.name keeps the
+    // package qualifier. Using both meant one function's trace appeared under two
+    // names -- "VARSHIFT: queued for background T2 compilation" and then
+    // "COMMON-LISP-USER::VARSHIFT: emit_framed failed: ..." -- so grepping the log
+    // by function name silently dropped the half that says WHY T2 was declined.
+    let name = display_fn_name(&bf.name).to_string();
     t2_log!("{name}: considering for T2 (arity {})", bf.arity);
     if t2_log_target().is_some() {
         for (bcp, p) in &input.type_profiles {
@@ -20699,7 +20725,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     ) {
         Ok(fc) => fc,
         Err(e) => {
-            t2_log!("{name}: emit_framed failed: {e:?} (shape beyond emitter) => stay T1");
+            t2_log!(
+                "{name}: emit_framed failed: {e:?}{} (shape beyond emitter) => stay T1",
+                describe_emit_error(&e)
+            );
             return None;
         }
     };
