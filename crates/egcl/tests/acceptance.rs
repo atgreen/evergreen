@@ -18850,3 +18850,39 @@ fn a_compiled_accessor_read_keeps_generic_dispatch_semantics() {
         ),
     ]);
 }
+
+/// Redefining a class must invalidate the accessor slot cache (bliss-1qjmm).
+///
+/// `(class-name symbol, accessor symbol) -> slot symbol` is memoized, so the
+/// answer outlives the class definition that produced it unless something drops
+/// it. A generation counter bumped on every class registration does that; without
+/// it, a reader keeps returning the slot the class used to have.
+///
+/// The second case is the one a single global counter could still get wrong: two
+/// classes share an accessor name, one is redefined, and the OTHER must be
+/// unaffected — reading them alternately afterwards must not cross over.
+#[test]
+fn redefining_a_class_invalidates_the_accessor_slot_cache() {
+    run_expression_cases(&[
+        (
+            "(progn (defclass ic-r () ((ic-old :initform 'old :accessor ic-get)))
+                    (defun ic-read (o) (ic-get o))
+                    (let ((before (ic-read (make-instance 'ic-r))))
+                      (defclass ic-r () ((ic-new :initform 'new :accessor ic-get)))
+                      (list before (ic-read (make-instance 'ic-r)))))",
+            "(OLD NEW)",
+        ),
+        (
+            "(progn (defclass ic-a () ((ic-u :initform 'a1 :accessor ic-sh)))
+                    (defclass ic-b () ((ic-v :initform 'b1 :accessor ic-sh)))
+                    (defun ic-rd (o) (ic-sh o))
+                    (let ((warm (list (ic-rd (make-instance 'ic-a))
+                                      (ic-rd (make-instance 'ic-b)))))
+                      (defclass ic-a () ((ic-w :initform 'a2 :accessor ic-sh)))
+                      (append warm (list (ic-rd (make-instance 'ic-a))
+                                         (ic-rd (make-instance 'ic-b))
+                                         (ic-rd (make-instance 'ic-a))))))",
+            "(A1 B1 A2 B1 A2)",
+        ),
+    ]);
+}

@@ -1982,18 +1982,14 @@ fn resolve(name: &str) -> Option<Handler> {
             // `(slot-value b 'x)` it amounts to (bliss-fskhm).
             let instance = args.first().copied().unwrap_or(NIL);
             let accessor = args.get(1).copied().unwrap_or(NIL);
-            let name = sym_name(accessor);
             // STRICT: only this instance's own class chain counts. If it does not
             // declare the accessor, this is not the simple case the lowerer bet on
             // — an EQL-specialized method, a user method on another class, a
             // non-instance argument — and real dispatch has to run. Guessing a
             // slot by name would read the wrong one silently.
-            match accessor_slot_name_in_class_chain(env, instance, &name) {
-                Some(slot_name) => {
-                    let slot = resolve_sym(&slot_name).unwrap_or(NIL);
-                    read_slot_value(instance, slot, env)
-                }
-                None => invoke_generic_function(&name, &[instance], env),
+            match accessor_slot_symbol_cached(env, instance, accessor) {
+                Some(slot) => read_slot_value(instance, slot, env),
+                None => invoke_generic_function(&sym_name(accessor), &[instance], env),
             }
         }),
 
@@ -2017,6 +2013,12 @@ fn resolve(name: &str) -> Option<Handler> {
             // classes may give the same accessor name to differently-named
             // slots, and the name-only search returns an arbitrary one of them
             // (bliss-i6ga1).
+            // The memo answers for the store side too: same (class, accessor) ->
+            // slot question, same per-call string round trip avoided (bliss-1qjmm).
+            if let Some(slot) = accessor_slot_symbol_cached(env, instance, accessor) {
+                write_slot_value(instance, slot, val, env)?;
+                return Ok(val);
+            }
             let Some(slot_name) =
                 accessor_slot_name_for_instance(env, instance, &sym_name(accessor))
             else {

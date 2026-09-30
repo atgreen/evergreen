@@ -1475,6 +1475,88 @@ pub(in crate::cli) fn accessor_slot_name_for_instance(
         .or_else(|| accessor_slot_name(env, accessor))
 }
 
+/// Bumped whenever a class is defined or redefined, invalidating the accessor
+/// slot cache below. Same shape as bytecode.rs's DIRECT_CALL_GEN, which does this
+/// for function identities; redefinition is rare, so a single global counter that
+/// drops every entry is the right trade (bliss-1qjmm).
+static ACCESSOR_SLOT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(in crate::cli) fn bump_accessor_slot_gen() {
+    ACCESSOR_SLOT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// (class-name symbol, accessor symbol) -> slot symbol, with the generation it
+    /// was built at.
+    ///
+    /// Every entry is a symbol INDEX, never a heap pointer. That is deliberate:
+    /// interned symbols have stable indices and do not move, so this cache holds
+    /// nothing the collector can relocate and needs no rooting. Keying on the class
+    /// OBJECT's address would have been cheaper to obtain and quietly wrong — the
+    /// class is a heap value the moving collector can relocate, so its address is
+    /// not an identity.
+    static ACCESSOR_SLOT_CACHE: RefCell<(u64, HashMap<(u32, u32), u32>)> =
+        RefCell::new((0, HashMap::new()));
+}
+
+/// The symbol naming a class, when there is one — a stable key for the cache.
+fn class_name_symbol(class: EgclVal) -> Option<u32> {
+    if class.is_symbol() {
+        return Some(class.as_symbol_index());
+    }
+    let name = egcl_stdlib::class_name(class);
+    name.is_symbol().then(|| name.as_symbol_index())
+}
+
+/// [`accessor_slot_name_in_class_chain`] as a slot SYMBOL, memoized per
+/// (class, accessor).
+///
+/// The uncached path spends its time turning symbols into strings and back: the
+/// accessor symbol becomes a String, accessor names are compared as strings down
+/// the precedence list, and the matching slot name is interned back into the
+/// symbol it began as. The answer is identical for every instance of a class, so
+/// it is computed once. Measured 2370ns -> the numbers in bliss-1qjmm.
+///
+/// Returns None when the class has no naming symbol, leaving the caller on the
+/// uncached path rather than guessing.
+pub(in crate::cli) fn accessor_slot_symbol_cached(
+    env: &Env,
+    instance: EgclVal,
+    accessor: EgclVal,
+) -> Option<EgclVal> {
+    let class_sym = class_name_symbol(egcl_stdlib::class_of(instance))?;
+    if !accessor.is_symbol() {
+        return None;
+    }
+    let key = (class_sym, accessor.as_symbol_index());
+    let generation = ACCESSOR_SLOT_GEN.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(hit) = ACCESSOR_SLOT_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != generation {
+            c.0 = generation;
+            c.1.clear();
+        }
+        c.1.get(&key).copied()
+    }) {
+        return Some(EgclVal::from_symbol_index(hit));
+    }
+    // Miss: resolve the slow way, then remember it. The borrow above is released
+    // before this runs, because resolving interns (and so can allocate).
+    let name = sym_name(accessor);
+    let slot_name = accessor_slot_name_in_class_chain(env, instance, &name)?;
+    let slot = resolve_sym(&slot_name)?;
+    if slot.is_symbol() {
+        let idx = slot.as_symbol_index();
+        ACCESSOR_SLOT_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.0 == generation {
+                c.1.insert(key, idx);
+            }
+        });
+    }
+    Some(slot)
+}
+
 /// The slot an accessor names on this instance, searching ONLY the instance's
 /// class precedence list — no name-only fallback.
 ///
@@ -3874,6 +3956,8 @@ fn drain_pending_host_generics(env: &Env) {
     let classes = PENDING_HOST_CLASSES.with(|p| std::mem::take(&mut *p.borrow_mut()));
     for (name, def) in classes {
         env.classes.borrow_mut().insert(name, def);
+        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
+        bump_accessor_slot_gen();
     }
 }
 
@@ -32219,6 +32303,8 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             default_initargs,
         },
     );
+    // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
+    bump_accessor_slot_gen();
     let direct_supers: Result<Vec<EgclVal>, EgclError> = super_list
         .iter()
         .map(|super_name| resolve_class_metaobject(env, *super_name))
@@ -38173,12 +38259,16 @@ mod class_slot_owner_tests {
             "B".into(),
             class(&["A", "OWNER"], Some(SlotAllocation::Instance)),
         );
+        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
+        bump_accessor_slot_gen();
         assert_eq!(class_slot_owner(&env, "A", "SHARED"), None);
         // Borrowed traversal must observe new metadata, not a cached answer.
         env.classes.borrow_mut().insert(
             "B".into(),
             class(&["A", "OWNER"], Some(SlotAllocation::Class)),
         );
+        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
+        bump_accessor_slot_gen();
         assert_eq!(class_slot_owner(&env, "A", "SHARED").as_deref(), Some("B"));
     }
 }
@@ -38428,6 +38518,8 @@ mod env_gc_root_tests {
                 default_initargs: Vec::new(),
             },
         );
+        // Any class (re)definition invalidates the accessor slot cache (bliss-1qjmm).
+        bump_accessor_slot_gen();
         env.generics.borrow_mut().insert(
             "ROOT-GENERIC".into(),
             GenericDef {
