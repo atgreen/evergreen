@@ -24,6 +24,7 @@ exercises these forks:
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `0251844d5e9482eb5fc91fa4686a05aacd24d9b4` |
 | precise-time | https://github.com/atgreen/precise-time | `deadbdeb95ee98cd743c538e649880181e8416f7` |
 | fset | https://github.com/atgreen/fset | `60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa` |
+| cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `8fc4b2b439525e87795efdfb848a1761869adc2a` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
@@ -58,7 +59,23 @@ ocicl install git+https://github.com/atgreen/trivial-garbage@0bb7ebd89ec5c824551
 ocicl install git+https://github.com/atgreen/usocket@5f8ba3596b4be3b3962a26957ff5508d4d02cbcc
 ocicl install git+https://github.com/atgreen/bordeaux-threads@0251844d5e9482eb5fc91fa4686a05aacd24d9b4
 ocicl install git+https://github.com/atgreen/precise-time@deadbdeb95ee98cd743c538e649880181e8416f7
+ocicl install git+https://github.com/atgreen/cffi@8fc4b2b439525e87795efdfb848a1761869adc2a
 ```
+
+The CFFI fork adds `src/cffi-torcl.lisp` (the CFFI-SYS backend over `TORCL-FFI`)
+and `src/cffi-torcl-fsbv.lisp`, which passes and returns structures by value
+through `TORCL-FFI:FOREIGN-CALL-BUFFERED` — so **no libffi and no C compiler are
+needed for structures by value**, and `cffi-tests` does not depend on
+`cffi-libffi` on TorCL. The runtime lays a structure out from a description of
+its fields, so that description is checked against the layout CFFI computed
+(size, alignment and every field offset) and a structure it cannot describe is
+reported rather than called with invented padding, which would change the
+structure's ABI classification. CFFI's own suite passes 342 of 344 tests on
+x86-64 Linux; the fork's `TORCL.md` names the two failures and the seven TorCL
+conformance bugs the port turned up (bliss-nj6id, bliss-cb3c7, bliss-msyk,
+bliss-hfn71, bliss-jre1u, bliss-06l4z, bliss-bpjw6). `cffi-grovel`,
+`cffi-toolchain`, `cffi-libffi`, `cffi-uffi-compat`, `uffi` and `cffi-examples`
+load unchanged, and the examples run.
 
 The trivial-garbage fork uses TorCL's deferred Lisp finalizers and its native
 weak hash tables (`:key`, `:value`, `:key-and-value`, reported through
