@@ -80,6 +80,9 @@ ocicl/
 # Local-only standing goal prompt (kept out of the repo per owner)
 GOAL.md
 
+# one-off gate probes and scratch: five of these were committed by accident
+.tmp-*
+
 # stray build artifact (static egcl copy)
 hellos
 target-android/
