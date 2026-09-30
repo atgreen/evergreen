@@ -43,6 +43,52 @@ fn public_foreign_memory_api_checks_ownership_and_preserves_values() {
 }
 
 #[test]
+fn an_allocation_can_be_freed_through_a_pointer_read_back_out_of_memory() {
+    // Storing a pointer in foreign memory and reading it back is ordinary FFI
+    // practice — CFFI's DEFCVAR of a :string does it — and the value that comes
+    // back no longer carries the allocation's identity. FOREIGN-FREE frees by
+    // address when the address is a live allocation's base (bliss-06l4z).
+    let program = r#"
+      (let ((slot (torcl-ffi:foreign-alloc 8))
+            (owned (torcl-ffi:foreign-alloc 16)))
+        (setf (torcl-ffi:mem-ref slot :pointer) owned)
+        (let ((reread (torcl-ffi:mem-ref slot :pointer)))
+          (assert (torcl-ffi:pointer-eq reread owned))
+          (torcl-ffi:foreign-free reread)
+          ;; Freed once and only once: the identity is gone with the storage.
+          (assert (handler-case (progn (torcl-ffi:foreign-free reread) nil)
+                    (torcl-ffi:ffi-error () t)))
+          (assert (handler-case (progn (torcl-ffi:foreign-free owned) nil)
+                    (torcl-ffi:ffi-error () t))))
+        (torcl-ffi:foreign-free slot))
+      ;; An address this allocator never handed out is still refused: Rust's
+      ;; deallocator must never be given C's storage.
+      (assert (handler-case (progn (torcl-ffi:foreign-free (torcl-ffi:make-pointer 4096)) nil)
+                (torcl-ffi:ffi-error () t)))
+      ;; An interior address is not a base address.
+      (let ((p (torcl-ffi:foreign-alloc 16)))
+        (assert (handler-case
+                    (progn (torcl-ffi:foreign-free
+                            (torcl-ffi:make-pointer (+ 8 (torcl-ffi:pointer-address p))))
+                           nil)
+                  (torcl-ffi:ffi-error () t)))
+        (torcl-ffi:foreign-free p))
+      (format t "FREE-BY-ADDRESS-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_torcl"))
+        .args(["--no-init", "--eval", program])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FREE-BY-ADDRESS-OK"));
+}
+
+#[test]
 fn foreign_memory_is_denied_in_sandbox_even_through_funcall() {
     for form in [
         "(torcl-ffi:foreign-alloc 8)",

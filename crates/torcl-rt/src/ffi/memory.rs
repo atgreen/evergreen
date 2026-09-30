@@ -28,6 +28,10 @@ struct Allocation {
 struct Allocations {
     last_id: u64,
     live: HashMap<u64, Allocation>,
+    /// Base address -> identity, for freeing by address (see `free`). An address
+    /// is only ever in this map while its allocation is live, so a reused
+    /// address always resolves to its current owner.
+    by_address: HashMap<usize, u64>,
 }
 
 fn allocations() -> &'static Mutex<Allocations> {
@@ -125,6 +129,7 @@ impl ForeignPointer {
                 layout,
             },
         );
+        allocations.by_address.insert(address, id);
         Ok(Self {
             address,
             allocation: id,
@@ -143,23 +148,41 @@ impl ForeignPointer {
 
     /// Free an allocation made by `allocate`. Reject interior, borrowed and
     /// already-freed pointers. A borrowed null pointer is a harmless no-op.
+    /// Release an allocation this allocator owns.
+    ///
+    /// A pointer that carries its allocation identity must name that
+    /// allocation's base. A pointer without one — read back out of foreign
+    /// memory with MEM-REF, or handed over by C — is freed by ADDRESS when that
+    /// address is the base of a live tracked allocation: round-tripping a
+    /// pointer through memory is ordinary FFI practice, and CFFI's contract for
+    /// FOREIGN-FREE is about an address, not about which wrapper reached it
+    /// (bliss-06l4z).
+    ///
+    /// An address this allocator never handed out is still refused. That is the
+    /// point of the check: passing storage that C malloc'd to Rust's
+    /// deallocator is undefined behaviour, so it must not be attempted.
     pub fn free(self) -> Result<(), TorclError> {
-        if self.allocation == 0 {
-            return if self.address == 0 {
-                Ok(())
-            } else {
-                Err(invalid("cannot free a borrowed foreign pointer"))
-            };
+        if self.address == 0 && self.allocation == 0 {
+            return Ok(());
         }
         let mut allocations = allocations().lock().unwrap();
+        let identity = if self.allocation == 0 {
+            *allocations
+                .by_address
+                .get(&self.address)
+                .ok_or_else(|| invalid("cannot free a borrowed foreign pointer"))?
+        } else {
+            self.allocation
+        };
         let allocation = allocations
             .live
-            .get(&self.allocation)
+            .get(&identity)
             .ok_or_else(|| invalid("foreign allocation has already been freed"))?;
         if allocation.address != self.address {
             return Err(invalid("cannot free an interior foreign pointer"));
         }
-        let allocation = allocations.live.remove(&self.allocation).unwrap();
+        let allocation = allocations.live.remove(&identity).unwrap();
+        allocations.by_address.remove(&allocation.address);
         // SAFETY: this is the original allocation address and layout. Removing
         // its unique identity under the lock prevents double-free and excludes
         // accesses made through tracked aliases while deallocation occurs.
