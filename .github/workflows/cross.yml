@@ -58,11 +58,6 @@ jobs:
             run_tests: true
           - target: s390x-unknown-linux-gnu
             run_tests: true
-          # Android: build only. The shim is an rlib in the workspace and the .so
-          # is produced with `cargo rustc --crate-type cdylib`, so a plain
-          # workspace test run is not the artifact that matters here.
-          - target: aarch64-linux-android
-            run_tests: false
     name: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +74,60 @@ jobs:
       - name: run the runtime suite under qemu
         if: matrix.run_tests
         run: cross test -p egcl-rt --release --target ${{ matrix.target }}
-      - name: build the Android NativeActivity shim as a cdylib
-        if: matrix.target == 'aarch64-linux-android'
-        run: cross rustc -p egcl-android --release --target ${{ matrix.target }} --crate-type cdylib
+
+  # Android, built through packaging/android/build-runtime.py — the same script
+  # the RPM's %build calls (packaging/fedora/egcl.spec). A hand-rolled
+  # `cross rustc --crate-type cdylib` was wrong in every detail that matters:
+  #
+  #   * ONE ABI instead of two. HOSTS in that script is
+  #     {aarch64-linux-android: arm64-v8a, x86_64-linux-android: x86_64} —
+  #     ARM64 phones AND x86-64 emulators. The RPM's target-android subpackage
+  #     ships both; building one produces a package that cannot run on an
+  #     emulator.
+  #   * No 16 KiB page alignment. The script links with
+  #     -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384, which recent
+  #     Android requires, and then VERIFIES the load/RELRO layout in check_elf.
+  #     A .so without it is the wrong artifact even for the ABI it did build.
+  #   * The wrong linker. It must be the NDK's <host>28-clang — API 28 is the
+  #     min_sdk the generator writes into app.json — not cross's container
+  #     toolchain.
+  #   * No metadata. The script records api version 4 (which must match
+  #     egcl_android_api_version in crates/egcl-android), the workspace version,
+  #     min_sdk, the NDK's source.properties and a per-ABI sha256;
+  #     egcl-android-new checks app.json against it.
+  #
+  # The runner's preinstalled NDK is used rather than a downloaded one, and
+  # --offline is deliberately NOT passed: that flag is for the RPM's vendored
+  # crates, and there is no vendor/ directory here.
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - name: add both Android ABIs
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android
+      - name: report which NDK this runner ships
+        run: |
+          echo "ANDROID_NDK_LATEST_HOME=$ANDROID_NDK_LATEST_HOME"
+          cat "$ANDROID_NDK_LATEST_HOME/source.properties"
+      - name: build both application runtimes
+        run: |
+          python3 packaging/android/build-runtime.py             --ndk "$ANDROID_NDK_LATEST_HOME"             --stage "$RUNNER_TEMP/android-stage"
+      # The RPM's %check runs these three; a generator that disagrees with the
+      # runtime metadata breaks APK builds on a user's machine, not here.
+      - name: generator and packaging contracts
+        run: |
+          python3 packaging/android/test_generator.py
+          python3 packaging/android/test_build.py
+          python3 packaging/android/test_install_tools.py
+      - name: keep the staged runtimes
+        uses: actions/upload-artifact@v4
+        with:
+          name: egcl-android-runtimes
+          path: ${{ runner.temp }}/android-stage/usr/
+          if-no-files-found: error
