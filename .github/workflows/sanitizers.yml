@@ -27,6 +27,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Backtraces on panic. Free — printed only when something fails — and it pays
+  # for itself on unwrap()/expect() failures inside shared helpers, where the
+  # reported file:line is the helper rather than the caller. It would NOT have
+  # helped the failures that prompted it: those were assert! calls whose own
+  # messages already said everything (e.g. "missing bundled ASDF bfasl: <path>").
+  # `1`, not `full`: full adds pages of runtime frames and buries the useful ones.
+  RUST_BACKTRACE: 1
   CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
