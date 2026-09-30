@@ -338,6 +338,18 @@ impl Emitter<'_> {
         self.asm.jcc(Cc::Ne, deopt);
     }
 
+    /// A tagged cons carries tag 1 in its low three bits. Mirrors emit.rs's
+    /// `emit_cons_guard`; the guard passes the value through, so the caller
+    /// stores the unchanged operand as the guard's result.
+    fn guard_cons(&mut self, register: a64::Reg, deopt: torcl_rt::asm::Label) {
+        self.asm
+            .word(a64::and_imm(T0, register, 7).expect("7 is a logical immediate"));
+        self.asm.word(
+            a64::cmp_imm(T0, torcl_rt::value::TAG_CONS).expect("1 is an add-immediate"),
+        );
+        self.asm.jcc(Cc::Ne, deopt);
+    }
+
     fn float_operand(
         &mut self,
         value: Value,
@@ -600,13 +612,21 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
             {
+                // CONS matters as much as the numeric tags: build.rs emits a
+                // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
+                // refusing it cost the whole function its T2 code for any use of
+                // CAR or CDR -- which is most Lisp code (bliss-2yews).
                 let deopt = self.deopt_label(data)?;
-                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM) {
-                    self.guard_fixnum(W0, deopt);
-                } else {
-                    self.guard_single_float(W0, deopt);
+                match &data.aux {
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM => {
+                        self.guard_fixnum(W0, deopt)
+                    }
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => {
+                        self.guard_cons(W0, deopt)
+                    }
+                    _ => self.guard_single_float(W0, deopt),
                 }
             }
             FloatAdd | FloatSub | FloatMul => {
@@ -661,6 +681,22 @@ impl Emitter<'_> {
                     }
                 }
                 self.asm.jcc(Cc::O, deopt);
+            }
+            Car | Cdr => {
+                // A cons cell is HEADERLESS and its tagged pointer differs from
+                // the cell address only in the low three bits, so masking them
+                // off gives the base and the two slots sit at +0 and +8. Mirrors
+                // emit.rs, including its refusal of the guarded form: this is the
+                // fast path for a cons whose type the IR has already proven, and
+                // a Car still carrying a guard, an effect or a FrameState needs
+                // the general path instead.
+                if data.flags.guard || data.flags.effectful || data.frame_state.is_some() {
+                    return Err(unsupported());
+                }
+                self.asm
+                    .word(a64::and_imm(W0, W0, !7u64).ok_or_else(unsupported)?);
+                let offset = if data.opcode == Car { 0 } else { 8 };
+                self.load_at(W0, W0, offset)?;
             }
             LogAnd | LogOr | LogXor => {
                 // Exact on the tagged representation, exactly as the x86 emitter

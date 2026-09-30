@@ -85,6 +85,53 @@ fn bitwise_and_shift_agree_at_every_tier() {
 }
 
 #[test]
+fn car_and_cdr_are_compiled_and_still_handle_a_non_cons() {
+    // CAR and CDR need TWO opcodes the AArch64 emitter lacked: Opcode::Car/Cdr
+    // themselves, and the separate Guard(TypeTag(CONS)) that build.rs emits ahead
+    // of each one. Missing either cost the WHOLE FUNCTION its T2 code, so any use
+    // of CAR or CDR -- most Lisp code -- was pinned to T1 off x86-64 (bliss-2yews).
+    //
+    // The interesting case is NIL, which is not a cons: the guard must deopt to
+    // the generic path and answer NIL, not fault on a masked pointer. A non-list
+    // must still signal a type error.
+    let program = r#"
+      (defun f-car  (a) (car a))
+      (defun f-cdr  (a) (cdr a))
+      (defun f-cadr (a) (car (cdr a)))
+      (defun f-mix  (a) (logand (car a) 3))
+      (dotimes (i 3000) (f-car '(1 2)) (f-cdr '(1 2)) (f-cadr '(1 2)) (f-mix '(7 2)))
+      (dolist (l '((1 2 3) (9) (-4 -5) nil))
+        (format t "~s ~s ~s ~s~%" l (f-car l) (f-cdr l) (f-cadr l)))
+      (format t "MIX ~s ~s~%" (f-mix '(7 2)) (f-mix '(-1 0)))
+      (format t "ATOM ~a~%" (handler-case (f-car 5) (error () :type-error)))
+    "#;
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let out = Command::new(BIN)
+            .args(["--no-init", "--eval", program])
+            .env("TORCL_FORCE_TIER", tier)
+            .output()
+            .expect("run torcl");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "tier={tier}: {stdout}\n{stderr}");
+        for line in [
+            "(1 2 3) 1 (2 3) 2",
+            "(9) 9 NIL NIL",
+            "(-4 -5) -4 (-5) -5",
+            // NIL is not a cons; the guard deopts and the generic path answers.
+            "NIL NIL NIL NIL",
+            "MIX 3 3",
+            "ATOM TYPE-ERROR",
+        ] {
+            assert!(
+                stdout.lines().any(|l| l.trim() == line),
+                "tier={tier}: missing {line:?} in:\n{stdout}\n{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_left_shift_that_leaves_fixnum_range_still_answers() {
     // The overflow path. A left shift can exceed fixnum range, and unlike add/sub
     // there is no flag for it on AArch64 — the emitter shifts back and compares,
