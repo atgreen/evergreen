@@ -20,9 +20,17 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
-# Build-only: publication must be authorized and configured separately.
+# Publishes to GitHub Pages from Actions. Permissions are per-job: the build only
+# reads the repository, and only the deploy job gets pages:write and the id-token
+# it needs to prove the artifact came from this workflow.
 permissions:
   contents: read
+
+# One Pages deployment at a time, and DON'T cancel in progress — cancelling a
+# half-finished deployment can leave the site serving a partial build.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -37,8 +45,30 @@ jobs:
       - run: pip install -r requirements-docs.txt
       - run: python3 scripts/test_docs.py
       - run: mkdocs build --strict
+      # Kept for PRs: a reviewer can download the built site without a deployment.
       - uses: actions/upload-artifact@v4
         with:
           name: egcl-manual
           path: site/
           if-no-files-found: error
+      # The Pages-shaped artifact the deploy job consumes.
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+  # Only from main, and only on a push: a pull_request run has no business
+  # replacing the published manual, and Pages deployments are not previewable
+  # per-branch anyway.
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

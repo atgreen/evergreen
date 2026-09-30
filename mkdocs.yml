@@ -1,10 +1,13 @@
-site_name: EGCL
+site_name: Evergreen Common Lisp
 site_description: Common Lisp with a tiered JIT, saved applications, and cross-target tooling.
-# Intended address; publication is not enabled by this configuration.
-site_url: https://atgreen.github.io/egcl/
-repo_url: https://cave.moxielogic.com/atgreen/bliss
-repo_name: EGCL source
-edit_uri: _edit/main/docs/manual/
+site_url: https://atgreen.github.io/evergreen/
+# The public mirror, so "edit this page" works for a reader. The development
+# remote is cave.moxielogic.com/atgreen/bliss, which a visitor cannot reach.
+repo_url: https://github.com/atgreen/evergreen
+repo_name: atgreen/evergreen
+# GitHub's edit path. Gitea uses _edit, which is what this was while the manual
+# pointed at cave.
+edit_uri: edit/main/docs/manual/
 docs_dir: docs/manual
 site_dir: site
 strict: true
