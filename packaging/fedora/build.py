@@ -49,7 +49,12 @@ def build(args):
                ('ppc64le-linux', 'powerpc64le-unknown-linux-gnu'),
                ('windows', 'x86_64-pc-windows-gnu'),
                ('android', 'aarch64-linux-android')]
-    provenance = {'git': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+    # `git rev-parse HEAD` alone names a commit the payload may not correspond
+    # to: a build from a dirty tree would claim provenance it does not have, and
+    # build.json is the only record of what went into the RPM. Mark it.
+    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    dirty = subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT).returncode != 0
+    provenance = {'git': f'{head}-dirty' if dirty else head,
                   'rustc': subprocess.check_output(['rustc', '--version'], text=True, env=env).strip(),
                   'sysroot_release': args.sysroot_release,
                   'android_ndk': (ndk / 'source.properties').read_text(), 'artifacts': {}}

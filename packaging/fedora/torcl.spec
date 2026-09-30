@@ -11,7 +11,7 @@
 
 Name: torcl
 Version: %{torcl_version}
-Release: 5%{?dist}
+Release: 6%{?dist}
 Summary: Common Lisp with a tiered JIT and saved executable images
 License: MIT OR Apache-2.0
 URL: https://github.com/atgreen/torcl
