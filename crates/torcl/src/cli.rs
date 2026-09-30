@@ -11018,6 +11018,15 @@ fn seed_compile_time_definitions(form: TorclVal, env: &mut Env) {
                 return;
             }
             "DEFPARAMETER" | "DEFCONSTANT" => {
+                // CLHS 3.2.2.3: a DEFCONSTANT compiled in a file is recognised as
+                // a constant for the rest of that compilation, so seeding its
+                // value is not enough — the name must be MARKED. Seeding it as an
+                // ordinary variable left it bound but not constant, and
+                // alexandria's DEFINE-CONSTANT, which asks CONSTANTP before
+                // re-evaluating, then reported "already bound non-constant
+                // variable" when the fasl loaded. That is what stopped iolib
+                // loading (bliss-vhr6e).
+                let constant = symbol_leaf_name(&op_name) == "DEFCONSTANT";
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() {
                     if rest.is_cons() {
@@ -11028,9 +11037,15 @@ fn seed_compile_time_definitions(form: TorclVal, env: &mut Env) {
                         // makes it permanent (bliss-2pmq).
                         if let Ok(value) = eval_form(cp(rest).0, env) {
                             seed_compile_time_binding(env, symbol, value);
+                            if constant {
+                                mark_constant_name(symbol);
+                            }
                         }
                     } else {
                         seed_compile_time_binding(env, symbol, NIL);
+                        if constant {
+                            mark_constant_name(symbol);
+                        }
                     }
                 }
                 return;
@@ -11045,6 +11060,12 @@ fn seed_compile_time_definitions(form: TorclVal, env: &mut Env) {
         seed_compile_time_definitions(item, env);
         cursor = rest;
     }
+}
+
+/// Record SYMBOL as a DEFCONSTANT name, so CONSTANTP answers for it. The same
+/// registry the `%DEFCONSTANT` primitive writes.
+fn mark_constant_name(symbol: TorclVal) {
+    with_constant_vars(|c| c.borrow_mut().insert(sym_name(symbol)));
 }
 
 fn seed_compile_time_binding(env: &mut Env, symbol: TorclVal, value: TorclVal) {
