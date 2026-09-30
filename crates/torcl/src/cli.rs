@@ -12182,7 +12182,61 @@ fn plist_entry(list: TorclVal, key: &str) -> Option<TorclVal> {
     None
 }
 
+/// Expand a type specifier through the DEFTYPE registry.
+///
+/// A DEFTYPE may expand to the name of another DEFTYPE, and a compound
+/// specifier may name one in its element-type position — Babel's
+/// `(deftype unicode-string () '(vector unicode-char *))` does both, since
+/// UNICODE-CHAR is itself a DEFTYPE. Expanding once left the result an
+/// unrecognised name, so `(typep p 'an-alias)` answered NIL and
+/// `(coerce "ab" 'babel:unicode-string)` answered a general vector that was not
+/// a STRING (bliss-hfn71).
 fn resolve_type_spec(env: &Env, type_spec: TorclVal) -> TorclVal {
+    let mut spec = type_spec;
+    // A DEFTYPE chain is short; the bound only stops a circular definition from
+    // expanding forever.
+    for _ in 0..64 {
+        let expanded = resolve_type_spec_once(env, spec);
+        if expanded == spec {
+            return expand_type_spec_arguments(env, spec);
+        }
+        spec = expanded;
+    }
+    spec
+}
+
+/// Expand the type arguments of a compound specifier whose head takes one, so an
+/// element type named by a DEFTYPE is recognised. Only these heads are walked:
+/// the argument of `SATISFIES` is a function name, of `EQL`/`MEMBER` a value, and
+/// of `INTEGER` a bound — none of them a type to expand.
+fn expand_type_spec_arguments(env: &Env, spec: TorclVal) -> TorclVal {
+    if !spec.is_cons() {
+        return spec;
+    }
+    let (head, rest) = cp(spec);
+    if !head.is_symbol() || !rest.is_cons() {
+        return spec;
+    }
+    if !matches!(
+        sym_bare_name_rc(head).as_ref(),
+        "VECTOR" | "ARRAY" | "SIMPLE-ARRAY" | "SIMPLE-VECTOR"
+    ) {
+        return spec;
+    }
+    let (element, tail) = cp(rest);
+    if !element.is_symbol() {
+        return spec;
+    }
+    let expanded = resolve_type_spec(env, element);
+    if expanded == element {
+        return spec;
+    }
+    // Rebuild `(head expanded . tail)`; each cons is rooted before the next.
+    torcl_rt::rooted!(new_rest = arena_cons(expanded, tail));
+    arena_cons(head, *new_rest)
+}
+
+fn resolve_type_spec_once(env: &Env, type_spec: TorclVal) -> TorclVal {
     if type_spec.is_symbol() {
         // A symbol that names a CLOS class is a class type and must NOT be
         // expanded through the DEFTYPE registry: the registry is keyed by bare
