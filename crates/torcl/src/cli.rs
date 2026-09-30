@@ -2147,17 +2147,26 @@ struct FunDef {
     params_form: TorclVal,
     body: TorclVal,
     /// The function-namespace in which this function's BODY is evaluated, when
-    /// it must differ from the caller's (bliss-ayq8). FLET captures an OWNED
-    /// snapshot of the ENCLOSING funs here, so a FLET function's body sees neither
-    /// its siblings nor itself (CLHS 3.1.2.1) — non-recursive. `None` means
-    /// "inherit the caller's funs", correct for LABELS (recursive within its own
-    /// scope) and for global/lambda functions. Owned (not `Rc`) so `FunDef` stays
-    /// `Send` — frozen macro-captures store `FunDef`s in a cross-thread global.
-    /// `env.funs` holds only lexical local functions (globals live in the symbol
-    /// table), so this snapshot is typically empty or tiny.
-    // Keep the common no-snapshot case pointer-sized inside every FunDef.
-    #[allow(clippy::box_collection)]
-    def_funs: Option<Box<HashMap<String, FunDef>>>,
+    /// it must differ from the caller's (bliss-ayq8). FLET captures the ENCLOSING
+    /// funs here, so a FLET function's body sees neither its siblings nor itself
+    /// (CLHS 3.1.2.1) — non-recursive. `None` means "inherit the caller's funs",
+    /// correct for LABELS (recursive within its own scope) and for global/lambda
+    /// functions.
+    ///
+    /// SHARED — the same `Arc<SharedCell<…>>` handle `Env::funs` and
+    /// `Closure::captured_funs` hold — not an owned copy. It used to be an owned
+    /// `Box<HashMap<…>>`, and since every FunDef inside such a map carries its
+    /// own owned snapshot, cloning one deep-copied the whole nest: once per FLET
+    /// entry, once per `#'name`, and once PER CALL of a local function. On
+    /// parsonic's expander that recursive clone was 83% of every Rust heap
+    /// allocation the expansion made (bliss-fyofj).
+    ///
+    /// Sharing keeps the snapshot semantics the copy was there to provide,
+    /// because `funs_mut` is copy-on-write: a later mutation of the enclosing
+    /// scope forks its map, leaving this handle's contents exactly as they were
+    /// when captured. `Arc` (not `Rc`) keeps `FunDef` `Send`, which frozen
+    /// macro-captures in a cross-thread global require.
+    def_funs: Option<Arc<SharedCell<HashMap<String, FunDef>>>>,
     /// The `#'name` value for THIS binding instance, minted on first reference
     /// and reused. CLHS 5.3: within the scope of one FLET/LABELS binding, `#'name`
     /// denotes the single function that binding established, so `(eq #'f #'f)` is
@@ -7139,9 +7148,14 @@ fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut TorclVal)) {
     // defining env (an escaped FLET closure). def_funs always points to a
     // strictly-older scope, so the parent chain is acyclic and this terminates;
     // the maps are distinct from the one being scanned, so the borrow is safe.
-    if let Some(scope) = &mut def.def_funs {
-        for inner in scope.values_mut() {
-            visit_fun_def_roots(inner, visit);
+    if let Some(scope) = &def.def_funs {
+        // Same policy as `visit_fun_map_roots`, which walks these maps when they
+        // are reached as a closure's captured namespace: `try_borrow_mut`, and no
+        // deduplication by address — a map reachable twice is simply walked twice.
+        if let Ok(mut scope) = scope.try_borrow_mut() {
+            for inner in scope.values_mut() {
+                visit_fun_def_roots(inner, visit);
+            }
         }
     }
 }
@@ -8662,26 +8676,18 @@ fn eval_named_call_ex(
     let _fiber_frame = torcl_rt::thread::FiberCallFrame::enter(name);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
-    // Clone the FLET function's captured scope out (releasing the env.funs
-    // borrow) and, if present, run the body with env.funs pointing at a fresh Rc
-    // over that snapshot, restoring afterward. The snapshot is small (local funs
-    // only), so the per-call clone is cheap.
+    // Take the FLET function's captured scope (a shared handle, so this is a
+    // refcount bump and not a copy of the map) out from under the env.funs
+    // borrow, and if present run the body with env.funs pointing at it,
+    // restoring afterward.
     let def_scope = if is_local {
-        env.funs
-            .borrow()
-            .get(name)
-            .and_then(|f| f.def_funs.as_ref().map(|b| (**b).clone()))
+        env.funs.borrow().get(name).and_then(|f| f.def_funs.clone())
     } else {
         None
     };
     match def_scope {
-        Some(scope_map) => {
-            torcl_rt::rooted!(
-                saved = SuspendedFunsRoot(std::mem::replace(
-                    &mut env.funs,
-                    Arc::new(SharedCell::new(scope_map)),
-                ))
-            );
+        Some(scope) => {
+            torcl_rt::rooted!(saved = SuspendedFunsRoot(std::mem::replace(&mut env.funs, scope)));
             // Keep the swapped-out funs (holding this FLET function's FunDef body,
             // no longer reachable via env.funs) GC-scanned for the call, or a minor
             // GC during the body frees the body and a later call reads poison
@@ -28788,17 +28794,14 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<TorclVal> {
                 f.params_form,
                 f.body,
                 f.closure_ref,
-                f.def_funs.as_ref().map(|scope| (**scope).clone()),
+                f.def_funs.clone(),
                 f.defining_blocks.clone(),
             )
         })?;
     if let Some(existing) = cached {
         return Some(existing);
     }
-    let captured_funs = Some(match flet_scope {
-        Some(scope) => Arc::new(SharedCell::new(scope)),
-        None => Arc::clone(&env.funs),
-    });
+    let captured_funs = Some(flet_scope.unwrap_or_else(|| Arc::clone(&env.funs)));
     let closure = Closure {
         params_form,
         body,
@@ -28862,14 +28865,17 @@ fn local_reference_test_pause(name: &str) {
 fn eval_flet(cdr: TorclVal, env: &mut Env, recursive: bool) -> Result<TorclVal, TorclError> {
     let (defs_form, mut body) = cp(cdr);
     torcl_rt::rooted_ref!(_body_root = &mut body);
-    // Snapshot the ENCLOSING function-namespace. FLET's function bodies evaluate
-    // in this scope (siblings + self invisible; bliss-ayq8); LABELS' bodies
-    // inherit the recursive child scope instead. env.funs isn't mutated here (the
-    // inserts below copy-on-write child_env.funs), so this stays the pre-FLET map.
-    let parent_snapshot: HashMap<String, FunDef> = if recursive {
-        HashMap::new() // LABELS: unused
+    // SHARE the ENCLOSING function-namespace. FLET's function bodies evaluate in
+    // this scope (siblings + self invisible; bliss-ayq8); LABELS' bodies inherit
+    // the recursive child scope instead. env.funs isn't mutated here (the inserts
+    // below copy-on-write child_env.funs) and `funs_mut` forks any map whose Arc
+    // is shared, so this handle keeps the pre-FLET contents for as long as a
+    // FunDef holds it — the snapshot semantics a copy was there to provide,
+    // without copying the map per function per entry (bliss-fyofj).
+    let parent_funs: Option<Arc<SharedCell<HashMap<String, FunDef>>>> = if recursive {
+        None // LABELS: bodies inherit the recursive child scope instead
     } else {
-        env.funs.borrow().clone()
+        Some(Arc::clone(&env.funs))
     };
     let mut child_env = env.child();
     // Root the forked child Env as a GC root BEFORE building the local functions,
@@ -28947,11 +28953,7 @@ fn eval_flet(cdr: TorclVal, env: &mut Env, recursive: bool) -> Result<TorclVal, 
                     // FLET (recursive=false): body sees the enclosing funs, not
                     // its siblings or itself. LABELS (recursive=true): inherit the
                     // recursive child scope (bliss-ayq8).
-                    def_funs: if recursive {
-                        None
-                    } else {
-                        Some(Box::new(parent_snapshot.clone()))
-                    },
+                    def_funs: parent_funs.clone(),
                     // Minted lazily on the first `#'name` in this scope, then
                     // reused so the reference is EQ-stable (bliss-1e8t).
                     closure_ref: None,
@@ -38224,10 +38226,10 @@ mod env_gc_root_tests {
                         params_form: marker(36),
                         body: marker(37),
                         closure_ref: Some(marker(38)),
-                        def_funs: Some(Box::new(HashMap::from([(
+                        def_funs: Some(Arc::new(SharedCell::new(HashMap::from([(
                             "NESTED".to_string(),
                             FunDef::plain(Vec::new(), marker(39), marker(40)),
-                        )]))),
+                        )])))),
                         defining_blocks: None,
                     },
                 )])))),
