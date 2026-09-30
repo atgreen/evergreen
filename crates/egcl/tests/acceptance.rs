@@ -18729,3 +18729,71 @@ fn environment_variables_can_be_set_and_unset() {
     ];
     run_expression_cases(&cases);
 }
+
+/// SETF through an accessor name shared by two classes must store into the slot
+/// of the INSTANCE's class, not into whichever class the accessor map happened
+/// to yield first (bliss-i6ga1).
+///
+/// The mapping used by both the tree-walker's store path and the lowered
+/// `EGCL::SET-ACCESSOR-SLOT` primitive searched `env.classes` by accessor NAME
+/// alone and returned the first match. Giving one accessor name to differently
+/// named slots on two classes is ordinary CLOS style, and it broke two ways:
+/// a crash when the foreign slot was absent from the instance's layout, and —
+/// worse — a silent store into the wrong slot when it was present.
+///
+/// Both cases run here, and each runs twice: the harness evaluates every case
+/// compiled and again tree-walked, which is what this needs, since the two
+/// tiers deliberately share the mapping and so shared the bug.
+#[test]
+fn setf_through_a_shared_accessor_name_writes_the_instances_own_slot() {
+    run_expression_cases(&[
+        // The foreign slot is ABSENT from the instance's layout: this used to
+        // fail outright with "slot not present in class layout: XSLOT".
+        (
+            "(progn (defclass sa-a () ((xslot :initform 'a-init :accessor sa-sh)))
+                    (defclass sa-b () ((yslot :initform 'b-init :accessor sa-sh)))
+                    (let ((o (make-instance 'sa-b)))
+                      (setf (sa-sh o) 'stored)
+                      (list (slot-value o 'yslot) (sa-sh o))))",
+            "(STORED STORED)",
+        ),
+        // The foreign slot is PRESENT, so a wrong store cannot crash. This is
+        // the dangerous shape: it silently wrote SB-X and left SB-Y alone, so
+        // the value read back was the stale initform and an unrelated slot had
+        // been clobbered — with no error anywhere.
+        (
+            "(progn (defclass sb-a () ((sb-x :initform 'ax :accessor sb-sh) (sb-y :initform 'ay)))
+                    (defclass sb-b () ((sb-y :initform 'by :accessor sb-sh) (sb-x :initform 'bx)))
+                    (defun sb-store (o v) (setf (sb-sh o) v))
+                    (let ((o (make-instance 'sb-b)))
+                      (sb-store o 'new)
+                      (list (sb-sh o) (slot-value o 'sb-y) (slot-value o 'sb-x))))",
+            "(NEW NEW BX)",
+        ),
+        // An accessor inherited from a superclass still resolves, so the
+        // instance-first search must fall through the precedence list rather
+        // than stopping at the instance's own class.
+        (
+            "(progn (defclass sc-base () ((sc-v :initform 'base :accessor sc-sh)))
+                    (defclass sc-derived (sc-base) ())
+                    (defclass sc-other () ((sc-w :initform 'other :accessor sc-sh)))
+                    (let ((o (make-instance 'sc-derived)))
+                      (setf (sc-sh o) 'inherited)
+                      (list (sc-sh o) (slot-value o 'sc-v))))",
+            "(INHERITED INHERITED)",
+        ),
+        // READING through a shared accessor name is broken by the same root
+        // cause at a DIFFERENT site: the accessor read fast-path scans every
+        // class by name and keeps the LAST hit. Pinned separately from the
+        // write, because the two use different code and the write can be
+        // correct while the read is not — which is exactly how this was found.
+        (
+            "(progn (defclass sd-base () ((sd-v :initform 'base :accessor sd-sh)))
+                    (defclass sd-derived (sd-base) ())
+                    (defclass sd-other () ((sd-w :initform 'other :accessor sd-sh)))
+                    (list (sd-sh (make-instance 'sd-derived))
+                          (sd-sh (make-instance 'sd-other))))",
+            "(BASE OTHER)",
+        ),
+    ]);
+}

@@ -1985,7 +1985,13 @@ fn resolve(name: &str) -> Option<Handler> {
             let instance = args.first().copied().unwrap_or(NIL);
             let accessor = args.get(1).copied().unwrap_or(NIL);
             let val = args.get(2).copied().unwrap_or(NIL);
-            let Some(slot_name) = accessor_slot_name(env, &sym_name(accessor)) else {
+            // Resolved against THIS instance's class, not by name alone: two
+            // classes may give the same accessor name to differently-named
+            // slots, and the name-only search returns an arbitrary one of them
+            // (bliss-i6ga1).
+            let Some(slot_name) =
+                accessor_slot_name_for_instance(env, instance, &sym_name(accessor))
+            else {
                 return Err(EgclError::Internal(format!(
                     "SETF: {} does not name a slot accessor",
                     format_val(accessor)

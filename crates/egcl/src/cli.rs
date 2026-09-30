@@ -1449,6 +1449,53 @@ pub(in crate::cli) fn accessor_slot_name(env: &Env, accessor: &str) -> Option<St
     })
 }
 
+/// The slot an accessor names ON A PARTICULAR INSTANCE, searching that
+/// instance's class precedence list before falling back to the name-only
+/// [`accessor_slot_name`].
+///
+/// The name-only search returns the FIRST slot in `env.classes` whose accessor
+/// list matches, which is arbitrary when two classes give the same accessor name
+/// to slots with DIFFERENT names — ordinary CLOS style. SETF through such an
+/// accessor then resolved to the other class's slot: it crashed outright when
+/// that slot was absent from the instance's layout ("slot not present in class
+/// layout"), and would have stored into the wrong slot silently when it was
+/// present (bliss-i6ga1). Reads were never affected — they go through real
+/// generic dispatch on the instance's class.
+///
+/// The fallback matters: the mapping is also consulted for values that are not
+/// instances of a known class, and for accessors reached before their class is
+/// registered. Keeping the old search there preserves every case that worked,
+/// so this can only turn a wrong answer into a right one.
+pub(in crate::cli) fn accessor_slot_name_for_instance(
+    env: &Env,
+    instance: EgclVal,
+    accessor: &str,
+) -> Option<String> {
+    let bare = symbol_bare_name(accessor);
+    let name_matches = |n: &str| n == accessor || symbol_bare_name(n) == bare;
+    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    // Most-specific-first, so a subclass that renames the slot behind an
+    // inherited accessor wins over its superclass.
+    for candidate in class_precedence_names(env, &class_name) {
+        let found = env.classes.borrow().get(&candidate).and_then(|class| {
+            class.slots.iter().find_map(|slot| {
+                let matches = slot
+                    .accessor
+                    .as_ref()
+                    .map(|acc| name_matches(acc))
+                    .unwrap_or(false)
+                    || slot.readers.iter().any(|reader| name_matches(reader))
+                    || slot.writers.iter().any(|writer| name_matches(writer));
+                matches.then(|| slot.name.clone())
+            })
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    accessor_slot_name(env, accessor)
+}
+
 pub(super) fn env_has_setf_writer(place_name: &str) -> bool {
     let key = format!("(SETF {place_name})");
     if with_global_setf_fns(|m| m.borrow().contains_key(&key)) {
@@ -19149,9 +19196,21 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 // (asdf:load-system :split-sequence).
                                 let reader_slot = accessor_slot_name(env, other);
                                 if let Some(slot_name) = reader_slot {
-                                    let tgt = eval_form(tgt_form, env)?;
+                                    egcl_rt::rooted!(tgt = eval_form(tgt_form, env)?);
+                                    // The gate above is name-only on purpose, so
+                                    // which BRANCH is taken is unchanged. Only the
+                                    // slot is re-resolved, now that the instance is
+                                    // in hand: two classes may give one accessor
+                                    // name to differently-named slots, and the
+                                    // name-only answer is an arbitrary one of them
+                                    // (bliss-i6ga1). Falls back to that answer when
+                                    // the target is not an instance of a class that
+                                    // declares the accessor.
+                                    let slot_name =
+                                        accessor_slot_name_for_instance(env, *tgt, other)
+                                            .unwrap_or(slot_name);
                                     write_slot_value(
-                                        tgt,
+                                        *tgt,
                                         resolve_sym(&slot_name).unwrap_or(NIL),
                                         *val,
                                         env,
@@ -23907,6 +23966,17 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // and Rust evaluates a call's first argument BEFORE the second — so
             // resolve the slot symbol first and read INST back through its root
             // afterwards, rather than handing over a copy taken beforehand.
+            // Re-resolved against THIS instance's class. The scan above matches
+            // by NAME across every class and keeps the LAST hit, so when two
+            // classes give one accessor name to differently-named slots it is
+            // arbitrary which slot is read — it returned another class's slot,
+            // or died "slot not present in class layout" when that slot was
+            // absent from this instance (bliss-i6ga1). The gate is untouched, so
+            // which branch runs here is unchanged; only the slot is re-resolved.
+            // This runs BEFORE resolve_sym for the reason the comment above
+            // gives: it takes no EgclVal across an interning allocation.
+            let slot_name =
+                accessor_slot_name_for_instance(env, *inst, &name).unwrap_or(slot_name);
             let slot_sym = resolve_sym(&slot_name).unwrap_or(NIL);
             return read_slot_value(*inst, slot_sym, env);
         }
