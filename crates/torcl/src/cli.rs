@@ -20125,6 +20125,7 @@ fn eval_list(mut form: TorclVal, env: &mut Env) -> Result<TorclVal, TorclError> 
             }
             "TORCL::SET-FDEFINITION" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-SYMBOL-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
+            "TORCL::SET-SYMBOL-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
             "TORCL::SET-CAR" | "TORCL::SET-CDR" => {

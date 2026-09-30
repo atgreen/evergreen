@@ -3053,6 +3053,67 @@
 (defun (setf cddr) (new x) (rplacd (cdr x) new) new)
 (defun (setf second) (new x) (rplaca (cdr x) new) new)
 (defun (setf third) (new x) (rplaca (cddr x) new) new)
+(defun (setf caaar) (new x) (rplaca (caar x) new) new)
+(defun (setf caadr) (new x) (rplaca (cadr x) new) new)
+(defun (setf cadar) (new x) (rplaca (cdar x) new) new)
+(defun (setf caddr) (new x) (rplaca (cddr x) new) new)
+(defun (setf cdaar) (new x) (rplacd (caar x) new) new)
+(defun (setf cdadr) (new x) (rplacd (cadr x) new) new)
+(defun (setf cddar) (new x) (rplacd (cdar x) new) new)
+(defun (setf cdddr) (new x) (rplacd (cddr x) new) new)
+(defun (setf caaaar) (new x) (rplaca (caaar x) new) new)
+(defun (setf caaadr) (new x) (rplaca (caadr x) new) new)
+(defun (setf caadar) (new x) (rplaca (cadar x) new) new)
+(defun (setf caaddr) (new x) (rplaca (caddr x) new) new)
+(defun (setf cadaar) (new x) (rplaca (cdaar x) new) new)
+(defun (setf cadadr) (new x) (rplaca (cdadr x) new) new)
+(defun (setf caddar) (new x) (rplaca (cddar x) new) new)
+(defun (setf cadddr) (new x) (rplaca (cdddr x) new) new)
+(defun (setf cdaaar) (new x) (rplacd (caaar x) new) new)
+(defun (setf cdaadr) (new x) (rplacd (caadr x) new) new)
+(defun (setf cdadar) (new x) (rplacd (cadar x) new) new)
+(defun (setf cdaddr) (new x) (rplacd (caddr x) new) new)
+(defun (setf cddaar) (new x) (rplacd (cdaar x) new) new)
+(defun (setf cddadr) (new x) (rplacd (cdadr x) new) new)
+(defun (setf cdddar) (new x) (rplacd (cddar x) new) new)
+(defun (setf cddddr) (new x) (rplacd (cdddr x) new) new)
+(defun (setf fourth) (new x) (rplaca (nthcdr 3 x) new) new)
+(defun (setf fifth) (new x) (rplaca (nthcdr 4 x) new) new)
+(defun (setf sixth) (new x) (rplaca (nthcdr 5 x) new) new)
+(defun (setf seventh) (new x) (rplaca (nthcdr 6 x) new) new)
+(defun (setf eighth) (new x) (rplaca (nthcdr 7 x) new) new)
+(defun (setf ninth) (new x) (rplaca (nthcdr 8 x) new) new)
+(defun (setf tenth) (new x) (rplaca (nthcdr 9 x) new) new)
+(defun (setf nth) (new n list) (rplaca (nthcdr n list) new) new)
+;; Writers for places whose store SETF handles in the evaluator. The PLACE always
+;; worked; the function NAME did not exist, so handing it to anything that takes a
+;; function designator — #'(setf slot-value), FDEFINITION, APPLY, a FUNCTION type
+;; check — got the bare (SETF x) cons and signalled a TYPE-ERROR. kitchen-sink
+;; does exactly that with (SETF SLOT-VALUE) (bliss-6buay).
+;;
+;; Every writer here stores through a PRIMITIVE (or RPLACA/RPLACD). None is
+;; written as `(setf (place …) new)`, and that is a hard rule, not a style
+;; preference: whether the lowerer emits a direct store for a place or a CALL to
+;; that place's writer function depends on the surrounding form, so a writer
+;; whose body mentions its own place recurses into itself in whichever context
+;; takes the call route. Measured — `(setf (find-class 'x) c)` at the top level
+;; of a loaded file takes the direct store, and the SAME form inside a LET takes
+;; the writer call and overflows the stack. The names still missing for want of a
+;; store primitive are tracked in bliss-rwpmq; a wrapper for any of them would
+;; also BREAK places that work today, which is how this rule was found.
+(defun (setf slot-value) (new object slot-name)
+  (torcl::set-slot-value object slot-name new)
+  new)
+(defun (setf symbol-function) (new symbol)
+  (torcl::set-symbol-function symbol new)
+  new)
+(defun (setf symbol-plist) (new symbol) (torcl::set-symbol-plist symbol new) new)
+(defun (setf char) (new string index) (torcl::set-aref string index new) new)
+(defun (setf schar) (new string index) (torcl::set-aref string index new) new)
+(defun (setf row-major-aref) (new array index)
+  ;; TORCL::SET-AREF indexes in row-major order already.
+  (torcl::set-aref array index new)
+  new)
 ;; TORCL::SET-AREF takes a single ROW-MAJOR index, so a multidimensional store
 ;; must flatten the subscripts first — passing them through verbatim silently
 ;; stored nothing and broke (setf (aref a 1 2) 99).

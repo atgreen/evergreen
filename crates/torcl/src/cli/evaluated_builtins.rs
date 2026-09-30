@@ -1933,6 +1933,30 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(val)
         }),
 
+        "TORCL::SET-SYMBOL-PLIST" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // Store primitive behind the `(setf symbol-plist)` writer function
+            // (bliss-6buay). The writer cannot be `(setf (symbol-plist s) new)`:
+            // whether the lowerer emits a direct store or a call to the writer
+            // depends on the surrounding form, so such a body recurses into
+            // itself in whichever context takes the call route. Args arrive
+            // evaluated (symbol, plist); the SETF arm's TYPE-ERROR on a
+            // non-symbol is kept so both routes reject the same inputs.
+            let sym = args.first().copied().unwrap_or(NIL);
+            let plist = args.get(1).copied().unwrap_or(NIL);
+            if !sym.is_symbol() {
+                return Err(TorclError::TypeError {
+                    datum: sym,
+                    expected: "SYMBOL".to_string(),
+                });
+            }
+            if let Some(idx) = sym.symbol_index() {
+                torcl_rt::symbols::set_symbol_plist(idx, plist);
+            }
+            Ok(plist)
+        }),
+
         "TORCL::SET-SLOT-VALUE" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
