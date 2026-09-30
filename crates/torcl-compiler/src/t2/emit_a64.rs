@@ -662,6 +662,80 @@ impl Emitter<'_> {
                 }
                 self.asm.jcc(Cc::O, deopt);
             }
+            LogAnd | LogOr | LogXor => {
+                // Exact on the tagged representation, exactly as the x86 emitter
+                // does it: both operands carry the same zero tag, so
+                // tagged(a) OP tagged(b) = (a OP b)<<3 = tagged(a OP b). No untag,
+                // no retag, no overflow.
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.guard_fixnum(W1, deopt);
+                match data.opcode {
+                    LogAnd => self.asm.word(a64::and(W0, W0, W1)),
+                    LogOr => self.asm.word(a64::orr(W0, W0, W1)),
+                    _ => self.asm.word(a64::eor(W0, W0, W1)),
+                }
+            }
+            LogNot => {
+                // NOT leaves the tag bits set, so they must be cleared again:
+                // ~(x<<3) has its low three bits all 1, and masking them off
+                // yields ~(x<<3) - 7 = (~x)<<3, which is tagged(~x).
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.asm.word(a64::mvn(W0, W0));
+                self.asm
+                    .word(a64::and_imm(W0, W0, !7u64).ok_or_else(unsupported)?);
+            }
+            FixnumShl | FixnumShr => {
+                // (ash x n) for a CONSTANT n; a variable amount declines. The
+                // constants map holds TAGGED bits, so the shift count is
+                // recovered by untagging it.
+                let deopt = self.deopt_label(data)?;
+                let amount = *data.args.get(1).ok_or_else(unsupported)?;
+                let tagged = *self.constants.get(&amount).ok_or_else(unsupported)?;
+                let n = (tagged as i64) >> 3;
+                self.guard_fixnum(W0, deopt);
+                // DIRECTION, mirroring emit.rs and easy to get backwards: on
+                // FixnumShl a NEGATIVE constant is a RIGHT shift, because that is
+                // how `(ash x -2)` lowers -- ASH becomes FixnumShl whatever the
+                // sign, and the emitter reads the constant to choose. FixnumShr is
+                // always a right shift. Inverting this is not a crash, it is a
+                // wrong number: it made `(ash -17 -2)` answer -68 (a left shift by
+                // two) instead of -5, and only differential testing against x86-64
+                // showed it.
+                let shift_right = if data.opcode == FixnumShr {
+                    Some(n.max(0))
+                } else if n < 0 {
+                    Some(-n)
+                } else {
+                    None
+                };
+                if let Some(right) = shift_right {
+                    // Right shift: untag, shift arithmetically, retag. Cannot
+                    // overflow. Saturated at 60 because shifting a 61-bit payload
+                    // further only ever yields 0 or -1, which the shift already
+                    // gives, and AArch64 requires the amount below the width.
+                    let k = right.min(60) as u32;
+                    self.asm.word(a64::asr_imm(W0, W0, 3 + k));
+                    self.asm.word(a64::lsl_imm(W0, W0, 3));
+                } else {
+                    // Left shift by n: tagged(x)<<n = tagged(x<<n), but it can
+                    // leave fixnum range, and unlike add/sub there is no flag for
+                    // that. Shift back and compare: if the value does not survive
+                    // the round trip it overflowed, so deopt and let the generic
+                    // path produce a bignum.
+                    let k = n as u32;
+                    if k > 60 {
+                        return Err(unsupported());
+                    }
+                    self.asm.word(a64::lsl_imm(T0, W0, k));
+                    self.asm.word(a64::asr_imm(T1, T0, k));
+                    self.asm.word(a64::cmp(T1, W0));
+                    self.asm.jcc(Cc::Ne, deopt);
+                    self.asm.word(a64::mov(W0, T0));
+                }
+            }
             _ => return Err(unsupported()),
         }
         // Do not overwrite any allocated home until every guard has passed: a
