@@ -88,13 +88,27 @@ fn ansi_expected_failures_and_ci_contracts() {
         "branches: [main]",
         "cargo check --workspace",
         "cargo test --workspace",
-        "cargo clippy --workspace --all-targets -- -D warnings",
         "ansi-test",
         "ubuntu-latest",
-        "macos-14",
     ] {
         assert_has(&ci, needle, "ci.yml");
     }
+    // Clippy is gated through the Makefile, so the contract spans two files: CI
+    // must invoke the target, and the target must carry `-D warnings`. Asserting
+    // the literal command in ci.yml stopped holding when a7c37217 replaced it
+    // with `make clippy`, and this test then failed for months on a workflow that
+    // was in fact still gating clippy correctly -- and because ci.yml's own lint
+    // job RUNS this test, that made the contract gate red on itself.
+    assert_has(&ci, "make clippy", "ci.yml");
+    assert_has(
+        &read("Makefile"),
+        "clippy --workspace --all-targets -- -D warnings",
+        "Makefile clippy target",
+    );
+    // NOT asserted: a macOS runner. The leg was removed deliberately — there is
+    // no macOS target in the port set, and .cargo/config.toml pins the musl
+    // target unconditionally, so a macOS job cannot link. ci.yml's header
+    // records this. Re-add the assertion only alongside a real macOS target.
 }
 
 #[test]
