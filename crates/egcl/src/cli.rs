@@ -32606,11 +32606,38 @@ fn define_condition_portable(
 }
 
 // ── DEFSTRUCT ────────────────────────────────────────────────────
-/// A minimal `defstruct` implemented on top of CLOS: it expands to a `defclass`
-/// plus a `make-NAME` keyword constructor, a `NAME-P` predicate, a `copy-NAME`
-/// copier, and `NAME-slot` accessors, then evaluates those forms. Structure
-/// options (e.g. `:conc-name`, `:constructor`) are accepted but ignored; the
-/// standard default names are used.
+// Convert the existing positional structure constructor into a sequence
+// constructor when :TYPE requests a list or vector representation.
+fn typed_struct_constructor(call: EgclVal, representation: EgclVal) -> EgclVal {
+    egcl_rt::rooted!(parts = list_to_vec(call));
+    egcl_rt::rooted!(representation = representation);
+    let sym = |name: &str| resolve_sym(name).unwrap_or(NIL);
+    parts.drain(..2); // %MAKE-STRUCT and the quoted structure name
+    let len = parts.len();
+    parts.insert(0, sym("LIST"));
+    egcl_rt::rooted!(contents = vec_to_list(&parts));
+    if representation.is_symbol() && sym_bare_name_rc(*representation).as_ref() == "LIST" {
+        return *contents;
+    }
+    let element = if representation.is_cons() {
+        cp(cp(*representation).1).0
+    } else {
+        T
+    };
+    egcl_rt::rooted!(element = element);
+    egcl_rt::rooted!(quoted_element = vec_to_list(&[sym("QUOTE"), *element]));
+    vec_to_list(&[
+        sym("MAKE-ARRAY"),
+        EgclVal::from_fixnum(len as i64),
+        sym(":ELEMENT-TYPE"),
+        *quoted_element,
+        sym(":INITIAL-CONTENTS"),
+        *contents,
+    ])
+}
+
+/// Define structure constructors, accessors, predicates and copiers. Ordinary
+/// structures use CLOS storage; unnamed :TYPE structures use sequence storage.
 fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     invalidate_gf_dispatch_cache(); // new struct class (bliss-x5y.20)
     let (name_spec, slots_form) = cp(cdr);
@@ -32625,8 +32652,10 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
 
     // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
     // :conc-name (accessor prefix), :constructor (custom / BOA / suppressed),
-    // :include (single-inheritance). Others (:print-function/-object, :predicate,
-    // :copier, :type, :named) are accepted and ignored.
+    // :include (single-inheritance), :predicate, :copier, and unnamed :type.
+    // Printer options are currently ignored.
+    egcl_rt::rooted!(representation = None::<EgclVal>);
+    let mut named_or_offset = false;
     let mut conc_name = format!("{name_str}-");
     let mut include_parent: Option<EgclVal> = None;
     // `:include`'s trailing slot-override specs — `(slot [new-default . opts])` —
@@ -32659,6 +32688,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // Only `:conc-name` changes behaviour here; the rest are ignored, as
             // are the list forms below (ansi-test struct-test-07/34) (egcl struct).
             if !opt.is_cons() {
+                if opt.is_symbol() && sym_bare_name_rc(opt).as_ref() == "NAMED" {
+                    named_or_offset = true;
+                }
                 if opt.is_symbol() && sym_bare_name_rc(opt).as_ref() == "CONC-NAME" {
                     conc_name = String::new();
                 }
@@ -32671,6 +32703,10 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 continue;
             };
             match oname.as_ref() {
+                "TYPE" => {
+                    *representation = Some(cp(orest).0);
+                }
+                "NAMED" | "INITIAL-OFFSET" => named_or_offset = true,
                 "CONC-NAME" => {
                     let v = if orest.is_cons() { cp(orest).0 } else { NIL };
                     conc_name = if v == NIL {
@@ -32736,6 +32772,28 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
     }
 
+    if let Some(rep) = *representation {
+        let head = if rep.is_cons() { cp(rep).0 } else { rep };
+        if !head.is_symbol() || !matches!(sym_bare_name_rc(head).as_ref(), "LIST" | "VECTOR") {
+            return Err(EgclError::ProgramError(
+                "DEFSTRUCT :TYPE requires LIST or VECTOR".into(),
+            ));
+        }
+        if named_or_offset || include_parent.is_some() {
+            return Err(EgclError::ProgramError(
+                "Named, offset, and included typed structures are not yet supported".into(),
+            ));
+        }
+        if matches!(predicate_spec, NameSpec::Custom(_)) {
+            return Err(EgclError::ProgramError(
+                "An unnamed typed structure cannot have a predicate".into(),
+            ));
+        }
+        predicate_spec = NameSpec::Suppressed;
+    }
+
+    egcl_rt::rooted_ref!(_constructors_root = &mut constructors);
+
     // Parse each slot: (slot-symbol default-form . slot-options) or a bare symbol.
     struct StructSlot {
         slot_sym: EgclVal,
@@ -32745,7 +32803,13 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         /// A `:read-only t` slot gets only a reader (no `(setf accessor)` writer).
         read_only: bool,
     }
+    impl egcl_rt::gc::TraceHostRoots for StructSlot {
+        fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+            visit(&mut self.default);
+        }
+    }
     let mut slots: Vec<StructSlot> = Vec::new();
+    egcl_rt::rooted_ref!(_slots_root = &mut slots);
     for slot_form in list_to_vec(slots_form) {
         let (slot_sym, default, options) = if slot_form.is_cons() {
             let (sn, rest) = cp(slot_form);
@@ -32831,6 +32895,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             .map(|s| sym_bare_name_rc(s.slot_sym).to_string())
             .collect();
         let mut inherited: Vec<StructSlot> = Vec::new();
+        egcl_rt::rooted_ref!(_inherited_root = &mut inherited);
         for i in 0..inh_names.len() {
             let sname = &inh_names[i];
             if own.contains(sname) {
@@ -32915,46 +32980,69 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let quote = |value: EgclVal| vec_to_list(&[sym("QUOTE"), value]);
     let obj = sym("%STRUCT-OBJECT%");
 
-    // (defclass NAME (parent?) ((slot :initarg :slot :initform default
-    //                                 :accessor conc-slot) ...))
-    // Defaults live as :initform so inherited slots (via :include) and the
-    // apply-#'make-instance constructor get them without enumerating parents.
-    // Root every movable cons intermediate: a clause already in the Vec (or an
-    // already-built sub-form) that sits unrooted while the next allocating
-    // sym()/vec_to_list() call fires a minor GC would go stale, corrupting the
-    // DEFCLASS form so its accessors never register (bliss-bjue).
-    egcl_rt::rooted!(slot_clauses = Vec::<EgclVal>::new());
-    for s in &slots {
-        egcl_rt::rooted!(default = s.default);
-        // A read-only slot gets only a :READER (no writer), so `(setf accessor)`
-        // is unbound as CLHS requires (ansi-test struct-test-NN/12).
-        let accessor_kw = if s.read_only { ":READER" } else { ":ACCESSOR" };
-        let clause = vec_to_list(&[
-            s.slot_sym,
-            sym(":INITARG"),
-            s.initarg,
-            sym(":INITFORM"),
-            *default,
-            sym(accessor_kw),
-            s.accessor,
-        ]);
-        slot_clauses.push(clause);
-    }
-    egcl_rt::rooted!(
-        supers = match include_parent {
-            Some(p) => vec_to_list(&[p]),
-            None => NIL,
-        }
-    );
     egcl_rt::rooted!(name_sym_r = name_sym);
-    egcl_rt::rooted!(clauses_list = vec_to_list(&slot_clauses));
-    let defclass_form = vec_to_list(&[sym("DEFCLASS"), *name_sym_r, *supers, *clauses_list]);
-    eval_form(defclass_form, env)?;
-    // Mark this class as a structure so EQUALP descends its instances, TYPEP
-    // answers STRUCTURE-OBJECT, and it prints in #S(...) syntax — none of which
-    // holds for a plain DEFCLASS standard-object (bliss-rup1/ta0a/i1i9).
-    if let Some(class) = egcl_stdlib::find_class(*name_sym_r) {
-        egcl_stdlib::set_structure_class(class);
+    if representation.is_some() {
+        // Typed structures are sequences, not CLOS classes. ELT and its SETF
+        // function handle both supported representations through stdlib.
+        let value = sym("%STRUCT-VALUE%");
+        for (index, slot) in slots.iter().enumerate() {
+            egcl_rt::rooted!(params = vec_to_list(&[obj]));
+            egcl_rt::rooted!(
+                place = vec_to_list(&[sym("ELT"), obj, EgclVal::from_fixnum(index as i64),])
+            );
+            egcl_rt::rooted!(
+                reader = vec_to_list(&[sym("DEFUN"), slot.accessor, *params, *place,])
+            );
+            eval_form(*reader, env)?;
+            if !slot.read_only {
+                egcl_rt::rooted!(writer_name = vec_to_list(&[sym("SETF"), slot.accessor]));
+                egcl_rt::rooted!(writer_params = vec_to_list(&[value, obj]));
+                egcl_rt::rooted!(body = vec_to_list(&[sym("SETF"), *place, value]));
+                let writer = vec_to_list(&[sym("DEFUN"), *writer_name, *writer_params, *body]);
+                eval_form(writer, env)?;
+            }
+        }
+    } else {
+        // (defclass NAME (parent?) ((slot :initarg :slot :initform default
+        //                                 :accessor conc-slot) ...))
+        // Defaults live as :initform so inherited slots (via :include) and the
+        // apply-#'make-instance constructor get them without enumerating parents.
+        // Root every movable cons intermediate: a clause already in the Vec (or an
+        // already-built sub-form) that sits unrooted while the next allocating
+        // sym()/vec_to_list() call fires a minor GC would go stale, corrupting the
+        // DEFCLASS form so its accessors never register (bliss-bjue).
+        egcl_rt::rooted!(slot_clauses = Vec::<EgclVal>::new());
+        for s in &slots {
+            egcl_rt::rooted!(default = s.default);
+            // A read-only slot gets only a :READER (no writer), so `(setf accessor)`
+            // is unbound as CLHS requires (ansi-test struct-test-NN/12).
+            let accessor_kw = if s.read_only { ":READER" } else { ":ACCESSOR" };
+            let clause = vec_to_list(&[
+                s.slot_sym,
+                sym(":INITARG"),
+                s.initarg,
+                sym(":INITFORM"),
+                *default,
+                sym(accessor_kw),
+                s.accessor,
+            ]);
+            slot_clauses.push(clause);
+        }
+        egcl_rt::rooted!(
+            supers = match include_parent {
+                Some(p) => vec_to_list(&[p]),
+                None => NIL,
+            }
+        );
+        egcl_rt::rooted!(clauses_list = vec_to_list(&slot_clauses));
+        let defclass_form = vec_to_list(&[sym("DEFCLASS"), *name_sym_r, *supers, *clauses_list]);
+        eval_form(defclass_form, env)?;
+        // Mark this class as a structure so EQUALP descends its instances, TYPEP
+        // answers STRUCTURE-OBJECT, and it prints in #S(...) syntax — none of which
+        // holds for a plain DEFCLASS standard-object (bliss-rup1/ta0a/i1i9).
+        if let Some(class) = egcl_stdlib::find_class(*name_sym_r) {
+            egcl_stdlib::set_structure_class(class);
+        }
     }
 
     // Constructors. A keyword constructor forwards every initarg to
@@ -32993,6 +33081,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 egcl_rt::rooted!(kw_lambda = vec_to_list(&params));
                 egcl_rt::rooted!(kw_body = vec_to_list(&call));
+                if let Some(rep) = *representation {
+                    *kw_body = typed_struct_constructor(*kw_body, rep);
+                }
                 vec_to_list(&[sym("DEFUN"), *ctor_name, *kw_lambda, *kw_body])
             }
             Some(params) => {
@@ -33130,9 +33221,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         i += 2;
                     }
                 }
-                egcl_rt::rooted!(
-                    positional = vec![sym("EGCL::%MAKE-STRUCT"), quote(name_sym)]
-                );
+                egcl_rt::rooted!(positional = vec![sym("EGCL::%MAKE-STRUCT"), quote(name_sym)]);
                 for slot_spec in &slots {
                     let mut supplied = None;
                     let mut i = 0;
@@ -33153,6 +33242,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 egcl_rt::rooted!(boa_lambda = vec_to_list(&new_params));
                 egcl_rt::rooted!(boa_body = vec_to_list(&positional));
+                if let Some(rep) = *representation {
+                    *boa_body = typed_struct_constructor(*boa_body, rep);
+                }
                 vec_to_list(&[sym("DEFUN"), *ctor_name, *boa_lambda, *boa_body])
             }
         };
@@ -33199,6 +33291,9 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
         egcl_rt::rooted!(copy_params = vec_to_list(&[obj]));
         egcl_rt::rooted!(copy_body = vec_to_list(&copy_call));
+        if representation.is_some() {
+            *copy_body = vec_to_list(&[sym("COPY-SEQ"), obj]);
+        }
         let copy_defun = vec_to_list(&[sym("DEFUN"), *copy_name_r, *copy_params, *copy_body]);
         eval_form(copy_defun, env)?;
     }
