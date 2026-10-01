@@ -2958,6 +2958,63 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
 }
 
 #[test]
+fn local_macros_compile_in_each_forms_package() {
+    let dir = workdir("local-macro-package");
+    let src = dir.join("local-macro.lisp");
+    let out = dir.join("local-macro.bfasl");
+    fs::write(
+        &src,
+        r#"
+(defpackage :local-macro-one (:use :cl) (:export :via-function :via-method))
+(defpackage :local-macro-two (:use :cl) (:export :via-function))
+(in-package :local-macro-one)
+(defun helper () 42)
+(defun via-function ()
+  (macrolet ((call-helper () (list (intern "HELPER")))) (call-helper)))
+(defmethod via-method ((x t))
+  (declare (ignore x))
+  (flet ((inner ()
+           (macrolet ((call-helper () (list (intern "HELPER")))) (call-helper))))
+    (inner)))
+(in-package :local-macro-two)
+(defun helper () 17)
+(defun via-function ()
+  (macrolet ((call-helper () (list (intern "HELPER")))) (call-helper)))
+"#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "(compile-file {:?} {:?})",
+        src.to_str().unwrap(),
+        out.to_str().unwrap()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"(progn (load {:?})
+      (list (eval (read-from-string "(local-macro-one:via-function)"))
+            (eval (read-from-string "(local-macro-one:via-method nil)"))
+            (eval (read-from-string "(local-macro-two:via-function)"))
+            (package-name *package*)))"#,
+        out.to_str().unwrap()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(42 42 17 \"COMMON-LISP-USER\")"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn loaded_compiler_macro_uses_definition_package_without_leaking_it() {
     let dir = workdir("compiler-macro-package");
     let src = dir.join("package-macro.lisp");

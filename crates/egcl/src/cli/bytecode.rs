@@ -4280,6 +4280,10 @@ impl<'e> Lowerer<'e> {
                             pre.push(form_list(&[s("SETQ")?, var, ctr]));
                             let mut limit: Option<(EgclVal, &str)> = None;
                             match kw(*forms.get(i + 4).unwrap_or(&NIL)).as_deref() {
+                                Some("TO") if down => {
+                                    limit = Some((*forms.get(i + 5).ok_or(Bail)?, ">="));
+                                    adv = 6;
+                                }
                                 Some("TO") | Some("UPTO") => {
                                     limit = Some((*forms.get(i + 5).ok_or(Bail)?, "<="));
                                     adv = 6;
@@ -4671,10 +4675,11 @@ impl<'e> Lowerer<'e> {
         // form_list/lower_* calls (moving GC; bliss-wlf).
         let mut start = forms[3];
         egcl_rt::rooted_ref!(_start_root = &mut start);
-        // The LIMIT keyword decides direction: below/to/upto ascend, downto/above
-        // descend (CL writes `from N downto M`, so direction comes from here).
+        // TO follows the starting direction; the other limit keywords specify
+        // their own direction (including FROM N DOWNTO M).
         let (cmp, descending) = match kw(forms[4]).as_deref() {
             Some("BELOW") => ("<", false),
+            Some("TO") if kw_is(forms[2], "DOWNFROM") => (">=", true),
             Some("TO") | Some("UPTO") => ("<=", false),
             Some("ABOVE") => (">", true),
             Some("DOWNTO") => (">=", true),
@@ -9481,7 +9486,21 @@ pub fn build_bbu_from_forms(
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
 
+    // Reading/compile-time evaluation has already restored the caller's
+    // package. Local macros still expand during lowering, so restore each
+    // form's recorded package for INTERN and other dynamic *PACKAGE* users.
+    let package_symbol = resolve_sym("*PACKAGE*")
+        .ok_or_else(|| bbu_error("compile-file: missing *PACKAGE*"))?;
+    let package_value = env.lookup_var("*PACKAGE*").unwrap_or(NIL);
+    egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, package_value));
+    let mut compilation_env = env.child();
+    egcl_rt::rooted_ref!(_compilation_env_root = &mut compilation_env);
     for form_index in 0..forms.len() {
+        compilation_env.current_package = definition_packages[form_index].clone();
+        let package = super::package_object(&compilation_env.current_package);
+        compilation_env.define_local("*PACKAGE*", package);
+        super::sync_package_value_cell(&compilation_env.current_package);
+        let env = &compilation_env;
         let mut form = forms[form_index];
         egcl_rt::rooted_ref!(_form_root = &mut form);
         let mut done = false;

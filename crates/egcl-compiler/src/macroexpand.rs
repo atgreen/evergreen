@@ -2706,6 +2706,18 @@ fn walk_cons(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
 }
 type MacroFn = dyn Fn(EgclVal, &Environment) -> Result<EgclVal, EgclError> + Send + Sync;
 
+/// A hosting Lisp evaluator can execute arbitrary local macro bodies. The
+/// standalone compiler keeps its small evaluator when no host is installed.
+pub type LocalMacroEvaluator = fn(EgclVal, EgclVal, EgclVal, &Environment, &Environment)
+    -> Result<EgclVal, EgclError>;
+thread_local! {
+    static LOCAL_MACRO_EVALUATOR: Cell<Option<LocalMacroEvaluator>> = const { Cell::new(None) };
+}
+
+pub fn set_local_macro_evaluator(evaluator: LocalMacroEvaluator) {
+    LOCAL_MACRO_EVALUATOR.with(|hook| hook.set(Some(evaluator)));
+}
+
 fn make_local_macrolet_expander(
     mut def: EgclVal,
     mut defining_env: Environment,
@@ -2737,6 +2749,9 @@ fn expand_local_macro_call(
 ) -> Result<EgclVal, EgclError> {
     // Root body across the allocating bind_macrolet_lambda_list (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_body_root = &mut body);
+    if let Some(evaluate) = LOCAL_MACRO_EVALUATOR.with(Cell::get) {
+        return evaluate(whole_form, params, body, defining_env, call_env);
+    }
     let arg_forms = if whole_form.is_cons() {
         unsafe { cons_cdr(whole_form) }
     } else {

@@ -2196,6 +2196,18 @@ fn mutations_inside_restart_functions_persist() {
 /// — previously the numeric sub-keywords weren't recognized so these were dead
 /// code, and `downto` infinite-looped. (bliss-2pt LOOP completeness.)
 #[test]
+fn loop_downfrom_to_uses_a_descending_inclusive_bound() {
+    run_expression_cases_batched(&[
+        ("(loop for n downfrom 3 to 0 collect n)", "(3 2 1 0)"),
+        ("(loop for n downfrom 6 to 0 by 2 collect n)", "(6 4 2 0)"),
+        ("(loop for n downfrom 0 to 0 collect n)", "(0)"),
+        ("(loop for n downfrom -1 to 0 collect n)", "NIL"),
+        ("(let ((sum 0)) (loop for n downfrom 3 to 0 do (incf sum n)) sum)", "6"),
+        ("(loop for n from 0 to 3 collect n)", "(0 1 2 3)"),
+    ]);
+}
+
+#[test]
 fn loop_numeric_iteration_and_accumulation() {
     let cases = [
         ("(loop for i from 1 to 5 collect i)", "(1 2 3 4 5)"),

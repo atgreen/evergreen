@@ -8243,6 +8243,7 @@ impl Env {
     }
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
+        compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = egcl_stdlib::bootstrap_clos();
@@ -32048,6 +32049,40 @@ fn eval_macroexpand(
     };
     env.set_mv(vec![expanded, if expanded_p { T } else { NIL }]);
     Ok(expanded)
+}
+
+fn eval_compiler_local_macro(
+    whole: EgclVal,
+    params: EgclVal,
+    body: EgclVal,
+    defining_env: &MacroexpandEnv,
+    call_env: &MacroexpandEnv,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(whole = whole);
+    egcl_rt::rooted!(params = params);
+    egcl_rt::rooted!(body = body);
+    let mut defining_env = defining_env.clone();
+    egcl_rt::rooted_ref!(_defining_env_root = &mut defining_env);
+    let mut call_env = call_env.clone();
+    egcl_rt::rooted_ref!(_call_env_root = &mut call_env);
+    let _scope = MacroexpandEnvScope::new();
+    let mut env = Env::new_for_macro_expansion(false);
+    egcl_rt::rooted_ref!(_env_root = &mut env);
+    egcl_rt::rooted!(args = list_to_vec(cp(*whole).1));
+    bind_macro_lambda_list(
+        *params,
+        &args,
+        &mut env,
+        Some(&call_env),
+        Some(*whole),
+        Some(cp(*whole).1),
+    )?;
+    // Respect macros visible where MACROLET was defined, including enclosing
+    // local macros. Execute the resulting body with the full Lisp evaluator;
+    // falling back to invocation-time expansion loses the compilation package.
+    egcl_rt::rooted!(form = arena_cons(resolve_sym("PROGN").unwrap_or(NIL), *body));
+    egcl_rt::rooted!(expanded = compiler_macroexpand::macroexpand_all(*form, &defining_env)?);
+    eval_form(*expanded, &mut env)
 }
 
 fn eval_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
