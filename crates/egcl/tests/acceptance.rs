@@ -13316,6 +13316,24 @@ fn multiple_value_setq_assigns_to_an_uninterned_variable() {
 /// wrong: the result must be indistinguishable from the vector the old
 /// list-then-apply path produced.
 #[test]
+fn make_array_numeric_defaults_support_read_modify_write() {
+    run_expression_cases_batched(&[
+        ("(make-array 4 :element-type '(unsigned-byte 8))", "#(0 0 0 0)"),
+        ("(make-array '(2) :element-type '(signed-byte 32))", "#(0 0)"),
+        ("(make-array '(2 2) :element-type '(unsigned-byte 32))", "#2A((0 0) (0 0))"),
+        ("(aref (make-array nil :element-type 'integer))", "0"),
+        ("(aref (make-array 2 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 1) 1)", "0"),
+        ("(let ((a (make-array 4 :element-type '(unsigned-byte 8)))) (setf (ldb (byte 8 0) (aref a 0)) 255) a)", "#(255 0 0 0)"),
+        ("(let ((a (make-array 1 :element-type '(unsigned-byte 32)))) (setf (ldb (byte 8 8) (aref a 0)) 171) (setf (ldb (byte 8 0) (aref a 0)) 205) (aref a 0))", "43981"),
+        ("(let ((x (aref (make-array 1 :element-type 'single-float) 0))) (and (typep x 'single-float) (zerop x)))", "T"),
+        ("(let ((x (aref (make-array 1 :element-type 'double-float) 0))) (and (typep x 'double-float) (zerop x)))", "T"),
+        ("(make-array 2 :element-type '(unsigned-byte 8) :initial-element 17)", "#(17 17)"),
+        ("(make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(3 4))", "#(3 4)"),
+        ("(make-array 2 :initial-element nil)", "#(NIL NIL)"),
+    ]);
+}
+
+#[test]
 fn make_array_builds_a_plain_simple_vector() {
     let cases = [
         ("(make-array 3)", "#(NIL NIL NIL)"),

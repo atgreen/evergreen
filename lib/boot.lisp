@@ -1744,6 +1744,18 @@
          (ic-cell (member :initial-contents keys))
          (et-cell (member :element-type keys))
          (et (if et-cell (car (cdr et-cell)) t))
+         ;; Numeric storage is currently general storage (upgraded to T), but
+         ;; use numeric zero rather than NIL for common numeric requests. This
+         ;; lets read-modify-write users such as (SETF LDB) work without an
+         ;; explicit initializer. ANSI leaves uninitialized reads undefined;
+         ;; this is an EGCL convenience, not specialized array storage.
+         (et-kind (if (consp et) (car et) et))
+         (iel (cond (iel-cell (car (cdr iel-cell)))
+                    ((member et-kind '(short-float single-float float)) 0.0f0)
+                    ((member et-kind '(double-float long-float)) 0.0d0)
+                    ((member et-kind '(bit integer fixnum signed-byte unsigned-byte
+                                      mod rational real number)) 0)
+                    (t nil)))
          ;; A (VECTOR NIL) is a STRING subtype (CLHS 15.1.2.2): an
          ;; :element-type of NIL holds no elements, so a length-0 one is
          ;; SXHASH-similar to "" (ansi sxhash.8). Classify it as a string so
@@ -1773,24 +1785,22 @@
          (%make-displaced-array base offset size fpn (and adjustable t)
                                 (and stringp (not bitp) t) (and fp t) (and bitp t))))
       (mdp
-       (let ((arr (%make-md-array dimensions (if iel-cell (car (cdr iel-cell)) nil))))
+       (let ((arr (%make-md-array dimensions iel)))
          (when ic-cell
            (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
          arr))
       ;; Rank-0 array (dimensions = NIL): a single-element MD array. Its lone
       ;; element is the :initial-contents object itself (not a sequence) when
-      ;; given, else the :initial-element, else NIL (bliss-30be: ansi-test
+      ;; given, else the :initial-element or default (bliss-30be: ansi-test
       ;; universe.lsp builds (make-array nil)).
       ((null dimensions)
        (%make-md-array nil (cond (ic-cell (car (cdr ic-cell)))
-                                 (iel-cell (car (cdr iel-cell)))
-                                 (t nil))))
+                                 (t iel))))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
       ((or fp adjustable)
-       (let* ((iel (if iel-cell (car (cdr iel-cell)) (if bitp 0 nil)))
-              (fpn (cond ((eq fp t) size)
+       (let* ((fpn (cond ((eq fp t) size)
                          ((integerp fp) fp)
                          (t size)))
               ;; A fill pointer exists only if the user passed a non-NIL
@@ -1824,7 +1834,7 @@
       ;; so the whole content is supplied at construction). Default fill 0.
       (bitp
        (%bit-vector-from-bits
-        (make-list size :initial-element (if iel-cell (car (cdr iel-cell)) 0))))
+        (make-list size :initial-element iel)))
       ;; The plain simple-vector case — by far the most common MAKE-ARRAY —
       ;; allocates its storage in one step. It used to build a SIZE-element
       ;; list with MAKE-LIST and then `(apply #'vector …)` it, which cost a
@@ -1832,7 +1842,7 @@
       ;; (make-array 100000) took ~980ms, ~11x the 100k-iteration loop that
       ;; fills it (bliss-3o0r).
       (t
-       (%make-simple-vector size (if iel-cell (car (cdr iel-cell)) nil))))))
+       (%make-simple-vector size iel)))))
 
 ;; ADJUST-ARRAY array new-dimensions &key fill-pointer initial-element — grow (or
 ;; shrink) a rank-1 fill-pointer/adjustable vector in place. cl-ppcre grows its
