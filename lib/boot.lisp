@@ -4273,3 +4273,11 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   "Declared type of SLOT. Always T: DEFCLASS discards :type (bliss-52ze)."
   (declare (ignore slot))
   t)
+
+;;; Image lifecycle hooks belong to the implementation; libraries register here.
+(defvar egcl-ext::*init-hooks* nil
+  "Functions called without arguments, in list order, after image restoration
+and process-state initialization, before init files or user code. Hooks are not
+called on a cold start. A snapshot of the list is used for each restoration;
+a hook error aborts startup.")
+(export '(egcl-ext::*init-hooks*) :egcl-ext)

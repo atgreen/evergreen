@@ -42,6 +42,30 @@ The current implementation accepts some additional SBCL-style keywords,
 including `:compression` and `:save-runtime-options`, without implementing
 their effects. Do not rely on them to change the output format or startup.
 
+## `egcl-ext:*init-hooks*`
+
+A list of functions or function names called without arguments when a saved
+image starts. Register process-specific reinitialization before saving:
+
+```lisp
+(defun reconnect-services ()
+  ;; Reopen resources that cannot survive an image save.
+  ...)
+(pushnew 'reconnect-services egcl-ext:*init-hooks*)
+```
+
+Hooks run in list order, once per startup, after restoring the image and setting
+up the current process's streams and arguments. They finish before the user
+init file, `--eval`, `--load`, scripts, or the saved `:toplevel` function.
+`--no-init` skips the user init file, not these hooks. A cold start without an
+image does not run them. Startup uses a snapshot of the list, so changes made by
+a hook affect future saves/restores; an unhandled hook error aborts startup.
+
+Bundled UIOP registers its `call-image-restore-hook` dispatcher here. This
+refreshes ASDF's user cache and UIOP's temporary directory, streams, and command
+line for the current user instead of retaining the image builder's values.
+Images built before this integration must be rebuilt to include the registration.
+
 ## Artifacts
 
 | Artifact | Consumer | Contents |

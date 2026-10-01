@@ -22822,7 +22822,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:RAW-COMMAND-LINE-ARGUMENTS" => {
                 // The process argv as a list of strings (program name first),
                 // matching SBCL's sb-ext:*posix-argv*, for ASDF (#+egcl).
-                let argv: Vec<EgclVal> = std::env::args().map(|a| arena_str(&a)).collect();
+                egcl_rt::rooted!(argv = Vec::<EgclVal>::new());
+                for argument in std::env::args() {
+                    let value = arena_str(&argument);
+                    argv.push(value);
+                }
                 return Ok(vec_to_list(&argv));
             }
             "READ-LINE" => return eval_builtin_arguments(&name, cdr, env),
@@ -37512,6 +37516,25 @@ fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), EgclError> {
     Ok(())
 }
 
+/// Run a snapshot of the implementation's saved startup hooks after the image
+/// and current process state are ready. Library-specific restoration stays in
+/// Lisp (UIOP registers its own dispatcher on this list).
+fn run_image_init_hooks(env: &mut Env) -> Result<(), EgclError> {
+    let Some((symbol, _)) = find_symbol_in_package(env, "EGCL-EXT", "*INIT-HOOKS*") else {
+        return Ok(()); // Older images and raw --no-bootstrap images have no hooks.
+    };
+    let value = egcl_rt::symbols::symbol_value(symbol.as_symbol_index()).unwrap_or(NIL);
+    if value == egcl_rt::value::UNBOUND {
+        return Ok(());
+    }
+    egcl_rt::rooted!(hooks = list_to_vec(value));
+    egcl_rt::rooted_ref!(_env_root = &mut *env);
+    for index in 0..hooks.len() {
+        apply_function(hooks[index], &[], env)?;
+    }
+    Ok(())
+}
+
 /// Re-open the standard stream specials with fresh handles bound to this
 /// process's file descriptors. Called after a core load (their snapshot values
 /// reference dead off-heap bodies) and mirrors the seeding in `Env::new`.
@@ -37730,9 +37753,13 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
 
     // Set *command-line-args* (issue #4)
     if !ca.cl_args.is_empty() {
-        let args_list: Vec<EgclVal> = ca.cl_args.iter().map(|s| arena_str(s)).collect();
-        let args_val = vec_to_list(&args_list);
-        env.define_local("*COMMAND-LINE-ARGS*", args_val);
+        egcl_rt::rooted!(args_list = Vec::<EgclVal>::new());
+        for argument in &ca.cl_args {
+            let value = arena_str(argument);
+            args_list.push(value);
+        }
+        egcl_rt::rooted!(args_val = vec_to_list(&args_list));
+        env.define_local("*COMMAND-LINE-ARGS*", *args_val);
     } else {
         env.define_local("*COMMAND-LINE-ARGS*", NIL);
     }
@@ -37769,6 +37796,25 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         }
     }
 
+    // Load image if specified (issue #8). A CORE image (EGCLIMG) was already
+    // restored by the fast path above; only the legacy .bfasl/text formats fall
+    // through to here.
+    if let (false, Some(image_path)) = (core_loaded, ca.image.as_ref()) {
+        let bytes = std::fs::read(image_path)
+            .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
+        // A binary image is a `.bfasl` unit (save-lisp-and-die); a legacy text
+        // image is a `.lisp` transcript restored by evaluation.
+        if bytes.starts_with(&egcl_rt::bfasl::BFASL_MAGIC) {
+            load_bfasl_into_env(&bytes, &mut env)?;
+        } else if let Ok(contents) = String::from_utf8(bytes) {
+            read_eval_all_env(&contents, &mut env)?;
+        }
+    }
+
+    if core_loaded || embedded.is_some() || ca.image.is_some() {
+        run_image_init_hooks(&mut env)?;
+    }
+
     // Load the user init file (~/.egclrc, or $EGCL_INIT_FILE) when starting an
     // interactive REPL. Batch modes (--eval, --load, a script) run without it, so
     // they stay hermetic and reproducible (spec: an explicit --eval overrides
@@ -37783,27 +37829,12 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // with MISSING-COMPONENT (SBCL's saved REPL images read ~/.sbclrc too).
     if !cfg!(egcl_no_dynamic_code)
         && !ca.no_init
-        && (embedded.is_none() || image_toplevel().is_none())
+        && ((embedded.is_none() && ca.image.is_none()) || image_toplevel().is_none())
         && ca.eval_forms.is_empty()
         && ca.load.is_none()
         && ca.script.is_none()
     {
         load_init_file(&mut env);
-    }
-
-    // Load image if specified (issue #8). A CORE image (EGCLIMG) was already
-    // restored by the fast path above; only the legacy .bfasl/text formats fall
-    // through to here.
-    if let (false, Some(image_path)) = (core_loaded, ca.image.as_ref()) {
-        let bytes = std::fs::read(image_path)
-            .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
-        // A binary image is a `.bfasl` unit (save-lisp-and-die); a legacy text
-        // image is a `.lisp` transcript restored by evaluation.
-        if bytes.starts_with(&egcl_rt::bfasl::BFASL_MAGIC) {
-            load_bfasl_into_env(&bytes, &mut env)?;
-        } else if let Ok(contents) = String::from_utf8(bytes) {
-            read_eval_all_env(&contents, &mut env)?;
-        }
     }
 
     let _sandbox_cpu_deadline = SandboxCpuDeadlineGuard::start(ca.sandbox_cpu_ms)?;

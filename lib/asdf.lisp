@@ -5162,6 +5162,12 @@ or COMPRESSION on SBCL, and APPLICATION-TYPE on SBCL/Windows."
               build-args)))))
 
 
+;;; EGCL restores preloaded REPL images as well as saved applications through
+;;; its implementation hooks. Register a symbol so UIOP upgrades replace the
+;;; dispatcher without leaving a stale function object or duplicate entry.
+#+egcl
+(pushnew 'call-image-restore-hook egcl-ext:*init-hooks*)
+
 ;;; Some universal image restore hooks
 (with-upgradability ()
   (map () 'register-image-restore-hook
