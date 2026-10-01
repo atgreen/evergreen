@@ -2112,6 +2112,75 @@ pub fn make_synonym_stream(symbol: EgclVal) -> Result<EgclVal, EgclError> {
 
 // ── Stream queries ─────────────────────────────────────────────────
 
+/// Snapshot remaining text without advancing a string or regular file stream.
+/// Reader callbacks must run after this returns, with no stream lock held.
+/// Other transports and large files keep their incremental input path.
+pub fn input_text_snapshot(stream: EgclVal) -> Result<Option<Vec<char>>, EgclError> {
+    let mut result = None;
+    with_stream(stream, |guard| {
+        guard.check_input()?;
+        if guard.element_type != StreamElementType::Character {
+            return Ok(());
+        }
+        match &mut guard.inner {
+            StreamInner::StringInput {
+                chars,
+                position,
+                end,
+                unread,
+                ..
+            } => {
+                result = Some(
+                    unread
+                        .iter()
+                        .copied()
+                        .chain(chars[*position..*end].iter().copied())
+                        .collect(),
+                );
+            }
+            StreamInner::FileInput {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                unread,
+                external_format: ExternalFormat::Utf8 | ExternalFormat::Ascii,
+                ..
+            } => {
+                // Do not turn reading one small form from a huge file into an
+                // unbounded allocation, or read ahead on devices and pipes.
+                let Ok(metadata) = file.metadata() else {
+                    return Ok(());
+                };
+                if !metadata.is_file() {
+                    return Ok(());
+                }
+                let offset = file
+                    .stream_position()
+                    .map_err(|e| EgclError::StreamError(e.to_string()))?;
+                let pending = *buf_fill - *buf_pos;
+                if metadata.len().saturating_sub(offset) + pending as u64 > 16 * 1024 * 1024 {
+                    return Ok(());
+                }
+                let mut bytes = read_buf[*buf_pos..*buf_fill].to_vec();
+                let read = file.read_to_end(&mut bytes);
+                let restore = file.seek(std::io::SeekFrom::Start(offset));
+                restore.map_err(|e| EgclError::StreamError(e.to_string()))?;
+                read.map_err(|e| EgclError::StreamError(e.to_string()))?;
+                // Invalid bytes later in the file must not prevent an earlier
+                // valid form from being read. Let ordinary stream reads report
+                // that error when they actually reach it.
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    result = Some(unread.iter().copied().chain(text.chars()).collect());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(result)
+}
+
 pub fn open_stream_p(stream: EgclVal) -> bool {
     with_stream(stream, |guard| Ok(guard.open)).unwrap_or(false)
 }

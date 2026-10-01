@@ -1078,6 +1078,21 @@ fn read_one_form_from_stream_ws(
 ) -> Result<Option<EgclVal>, EgclError> {
     let mut stream = stream;
     egcl_rt::rooted_ref!(_stream_root = &mut stream);
+    if is_stream(stream)
+        && let Some(chars) = egcl_stdlib::streams::input_text_snapshot(stream)?
+    {
+        // Parse once: retrying after every input character repeats #. and
+        // custom reader side effects, and is especially costly for #h vectors.
+        let (form, mut consumed) = read_chars_in_env(&chars, env)?;
+        egcl_rt::rooted!(form = form);
+        if !preserve_whitespace && chars.get(consumed).is_some_and(|c| c.is_whitespace()) {
+            consumed += 1;
+        }
+        for _ in 0..consumed {
+            stream_next_char(stream, env)?;
+        }
+        return Ok(if *form == EOF { None } else { Some(*form) });
+    }
     let mut buffer = String::new();
     loop {
         match stream_next_char(stream, env)? {
@@ -11163,6 +11178,12 @@ fn sync_reader_float_format(env: &Env) {
 /// `ASDF:FIND-SYSTEM`, homed in ASDF/SYSTEM) is mis-interned as a fresh symbol
 /// homed in PKG, with an empty function cell (egcl).
 fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(EgclVal, usize), EgclError> {
+    let chars: Vec<char> = source.chars().collect();
+    reader::check_nesting(&chars)?;
+    read_chars_in_env(&chars, env)
+}
+
+fn read_chars_in_env(chars: &[char], env: &mut Env) -> Result<(EgclVal, usize), EgclError> {
     // Honour the reader specials. `*READ-EVAL*` defaults to T (so `#.` works in a
     // runtime READ, as in CL), and `*READ-BASE*` to 10.
     let read_eval = env
@@ -11183,7 +11204,7 @@ fn read_from_string_in_env(source: &str, env: &mut Env) -> Result<(EgclVal, usiz
         .unwrap_or(false);
     reader::set_read_suppress_flag(suppress);
     let prev = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
-    let result = reader::read_from_string_with_base(source, read_base, read_eval);
+    let result = reader::read_form_at(chars, 0, read_base, read_eval);
     READ_EVAL_ENV.with(|c| c.set(prev));
     reader::set_read_suppress_flag(false);
     result

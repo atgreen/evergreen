@@ -56,3 +56,54 @@ fn original_character_handler_remains_callable_after_override() {
       (format t "DISPATCH-OK~%")
     "##);
 }
+
+#[test]
+fn stream_read_executes_each_reader_macro_once() {
+    run(r##"
+      (let ((*readtable* (copy-readtable nil)) (calls 0))
+        (set-dispatch-macro-character #\# #\h
+          (lambda (s c n)
+            (declare (ignore c n))
+            (incf calls)
+            (read s)))
+        (with-input-from-string (s "(#h\"abc\" #h\"def\") 9")
+          (assert (equal (read s) '("abc" "def")))
+          (assert (= calls 2))
+          (assert (= (read s) 9))
+          (assert (eq (read s nil :eof) :eof))))
+      (with-input-from-string (s "123 456")
+        (assert (= (read-preserving-whitespace s) 123))
+        (assert (char= (read-char s) #\Space))
+        (unread-char #\Space s)
+        (assert (= (read s) 456)))
+      (defvar *reader-side-effects* 0)
+      (with-input-from-string (s "(#.(incf *reader-side-effects*) 2) 7")
+        (assert (equal (read s) '(1 2)))
+        (assert (= *reader-side-effects* 1))
+        (assert (= (read s) 7)))
+      (with-input-from-string (s "#+(and egcl (not egcl)) ignored ; comment")
+        (assert (eq (read s nil :eof) :eof)))
+      (format t "DISPATCH-OK~%")
+    "##);
+}
+
+#[test]
+fn file_read_executes_each_reader_macro_once() {
+    let path = std::env::temp_dir().join(format!("egcl-reader-once-{}.lisp", std::process::id()));
+    std::fs::write(&path, "(#h\"abc\" #h\"def\") 9").unwrap();
+    run(&format!(r##"
+      (let ((*readtable* (copy-readtable nil)) (calls 0))
+        (set-dispatch-macro-character #\# #\h
+          (lambda (s c n)
+            (declare (ignore c n))
+            (incf calls)
+            (read s)))
+        (with-open-file (s {:?})
+          (assert (equal (read s) '("abc" "def")))
+          (assert (= calls 2))
+          (assert (= (read s) 9))
+          (assert (eq (read s nil :eof) :eof))))
+      (format t "DISPATCH-OK~%")
+    "##, path.to_str().unwrap()));
+    std::fs::remove_file(path).unwrap();
+}
