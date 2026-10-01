@@ -8,11 +8,20 @@ egcl=$(realpath "${EGCL_BIN:-$repo/target/egcl}")
 runtime=$(realpath "${OCICL_RUNTIME:-${XDG_DATA_HOME:-$HOME/.local/share}/ocicl/ocicl-runtime.lisp}")
 work=$(mktemp -d "${TMPDIR:-/tmp}/egcl-ironclad-test.XXXXXX")
 echo "Ironclad test artifacts: $work"
-cp -- "$repo/tests/ironclad/ocicl.csv" "$repo/tests/ironclad/check.lisp" "$work/"
+cp -- "$repo/tests/ironclad/ocicl.csv" "$repo/tests/ironclad/check.lisp" "$repo/tests/ironclad/load-order.lisp" "$work/"
 cd "$work"
 export OCICL_LOCAL_ONLY=1 EGCL_PORT_RUNTIME="$runtime" EGCL_PORT_CACHE="$work/cache/"
 "$repo/scripts/egcl-limited.sh" "$ocicl" install >install.log 2>&1
 cmp -- "$repo/tests/ironclad/ocicl.csv" ocicl.csv
+for order in 0 1; do
+  for pass in fresh cached; do
+    EGCL_PPCRE_FIRST="$order" EGCL_PORT_CACHE="$work/order-$order/" \
+      EGCL_MEM_MAX="${EGCL_MEM_MAX:-8G}" EGCL_TIMEOUT="${EGCL_TIMEOUT:-2400}" \
+      "$repo/scripts/egcl-limited.sh" "$egcl" --no-init --load load-order.lisp \
+      >"order-$order-$pass.log" 2>&1
+    grep -Fxq 'LOAD-ORDER-OK' "order-$order-$pass.log"
+  done
+done
 EGCL_MEM_MAX="${EGCL_MEM_MAX:-8G}" EGCL_TIMEOUT="${EGCL_TIMEOUT:-2400}" \
   "$repo/scripts/egcl-limited.sh" "$egcl" --no-init --load check.lisp >tests.log 2>&1
 grep -Fxq 'IRONCLAD-WHIRLPOOL-OK' tests.log

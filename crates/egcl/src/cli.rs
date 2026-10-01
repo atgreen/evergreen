@@ -1433,19 +1433,16 @@ fn alternate_qualified_spelling(name: &str) -> Option<String> {
 /// Used by the portable SETF lowering to recognize a user setf-function place.
 /// The slot that a class accessor / reader / writer names, if any.
 ///
-/// Matches by BARE name as well as the printed one: at a SETF site in a package
-/// that only imports (or references qualified) the accessor symbol, the place
-/// head arrives package-qualified (`ASDF/COMPONENT:%FOO`) while the slot
-/// recorded the bare accessor name (`%FOO`). Without the bare comparison e.g.
-/// ASDF's `(push … (%additional-input-files c))` raised "SETF: unsupported
-/// place" (bliss-d0b family).
+/// Accessor names are symbol registry keys, as returned by `sym_name`.
+/// Compare the complete key: imported symbols retain their defining identity,
+/// while equally spelled symbols in different packages are different functions.
+/// Bare-name matching miscompiled CL-PPCRE::GROUP as IRONCLAD::GROUP's reader.
 ///
 /// Shared by the tree-walker's SETF store path and the `EGCL::SET-ACCESSOR-SLOT`
 /// store primitive the bytecode lowerer emits, so the two tiers cannot drift
 /// apart on which slot an accessor names (bliss-ljmj).
 pub(in crate::cli) fn accessor_slot_name(env: &Env, accessor: &str) -> Option<String> {
-    let bare = symbol_bare_name(accessor);
-    let name_matches = |n: &str| n == accessor || symbol_bare_name(n) == bare;
+    let name_matches = |n: &str| n == accessor;
     env.classes.borrow().values().find_map(|class| {
         class.slots.iter().find_map(|slot| {
             let matches_reader = slot
@@ -1597,8 +1594,7 @@ pub(in crate::cli) fn accessor_slot_name_in_class_chain(
     instance: EgclVal,
     accessor: &str,
 ) -> Option<String> {
-    let bare = symbol_bare_name(accessor);
-    let name_matches = |n: &str| n == accessor || symbol_bare_name(n) == bare;
+    let name_matches = |n: &str| n == accessor;
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     // Most-specific-first, so a subclass that renames the slot behind an
     // inherited accessor wins over its superclass.
@@ -7140,15 +7136,10 @@ fn run_standard_from_ids(
 /// FUNCALL/APPLY or compiled `CallNamed` reaches the generic through
 /// `invoke_generic_function`, which would otherwise signal no-applicable-method.
 fn generic_is_slot_reader(env: &Env, name: &str) -> bool {
-    let bare = symbol_bare_name(name);
     env.classes.borrow().values().any(|c| {
         c.slots.iter().any(|s| {
-            s.accessor
-                .as_ref()
-                .is_some_and(|a| a == name || symbol_bare_name(a) == bare)
-                || s.readers
-                    .iter()
-                    .any(|r| r == name || symbol_bare_name(r) == bare)
+            s.accessor.as_ref().is_some_and(|a| a == name)
+                || s.readers.iter().any(|r| r == name)
         })
     })
 }
@@ -24200,22 +24191,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             return res;
         }
 
-        // Check accessor functions (from DEFCLASS). Match by full name or bare
-        // name so a package-qualified call resolves to a reader stored under its
-        // defining-package spelling (bliss-lb6.14).
+        // Check DEFCLASS accessors by their complete symbol registry key.
         let mut accessor_slot_name: Option<String> = None;
-        let bare_op = symbol_bare_name(&name);
         for class in env.classes.borrow().values() {
             for slot in &class.slots {
                 let reader_match = slot
                     .accessor
                     .as_ref()
-                    .map(|acc| acc == &name || symbol_bare_name(acc) == bare_op)
+                    .map(|acc| acc == &name)
                     .unwrap_or(false)
                     || slot
                         .readers
                         .iter()
-                        .any(|reader| reader == &name || symbol_bare_name(reader) == bare_op);
+                        .any(|reader| reader == &name);
                 if reader_match {
                     accessor_slot_name = Some(slot.name.clone());
                 }
@@ -24258,29 +24246,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // A reader on a non-instance defers to an applicable explicit method
             // (e.g. ASDF's system-source-file on STRING/SYMBOL); read_slot_value
             // itself yields NIL for a non-instance rather than crashing. The
-            // accessor above matched by full OR bare name, so resolve the
-            // methods-table key just as loosely: a package-qualified call must
-            // find designator methods registered under the defining package's
-            // spelling, or the defer check silently misses and the reader
-            // returns NIL (bliss-d0b: ASDF:SYSTEM-SOURCE-FILE on :quri).
+            // accessor and its explicit methods use the same symbol key.
             if !egcl_stdlib::is_instance(*inst) {
                 let mut args = vec![*inst];
                 egcl_rt::rooted_ref!(_args_root = &mut args);
-                let method_key = {
-                    let methods = env.methods.borrow();
-                    if methods.contains_key(&name) {
-                        Some(name.clone())
-                    } else {
-                        methods
-                            .keys()
-                            .find(|k| symbol_bare_name(k) == bare_op)
-                            .cloned()
-                    }
-                };
-                if let Some(key) = method_key {
-                    if has_applicable_method(env, &key, &args) {
-                        return invoke_generic_function(&key, &args, env);
-                    }
+                if has_applicable_method(env, &name, &args) {
+                    return invoke_generic_function(&name, &args, env);
                 }
             }
             // RESOLVE_SYM interns, which can allocate and therefore move INST,

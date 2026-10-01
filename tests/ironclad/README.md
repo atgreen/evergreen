@@ -4,7 +4,10 @@ The pinned dependency graph exercises compilation and loading through ASDF,
 Whirlpool's nested local macros, and all six upstream EAX, ETM and GCM vector
 groups (whole-message and incremental operations).
 The runner installs dependencies into a temporary directory and uses a fresh
-FASL cache. It preserves that directory and logs for diagnosis.
+FASL cache. It also checks both CL-PPCRE/Ironclad load orders, first with
+fresh compilation and then cached FASLs in a new process. Both the parser
+function and Ironclad's key-group reader must remain callable. It preserves
+that directory and logs for diagnosis.
 
 Run against an installed or saved-image executable:
 
