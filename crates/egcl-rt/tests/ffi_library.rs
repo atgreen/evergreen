@@ -24,6 +24,16 @@ fn library_imports_real_host_math_symbols_with_global_pointer_identity() {
         "#,
     )
     .unwrap();
+    // The system loader needs an explicit libm dependency. The custom ELF
+    // loader instead resolves sqrt from its host-symbol table.
+    let math_libraries: &[&str] = if cfg!(any(
+        feature = "c-ffi",
+        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    )) {
+        &["-lm"]
+    } else {
+        &[]
+    };
     assert!(
         // The C compiler comes from $EGCL_TEST_CC when set, so a cross/emulated run can
         // build the fixture for the TARGET: the container's plain `cc` targets the host and
@@ -34,6 +44,7 @@ fn library_imports_real_host_math_symbols_with_global_pointer_identity() {
         Command::new(std::env::var("EGCL_TEST_CC").as_deref().unwrap_or("cc"))
             .args(["-shared", "-fPIC", "-fno-builtin", "-fno-stack-protector"])
             .arg(&source)
+            .args(math_libraries)
             .arg("-o")
             .arg(&library)
             .status()
