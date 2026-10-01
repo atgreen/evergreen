@@ -26106,10 +26106,6 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     }
     let mut ret: Option<EgclVal> = None;
 
-    for f in &initially {
-        eval_form(*f, env)?;
-    }
-
     // `repeat N`: evaluate the count once (negative/NIL → 0 iterations).
     let mut repeat_remaining = eval_loop_repeat_remaining(repeat_form, env)?;
 
@@ -26122,6 +26118,9 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     egcl_rt::rooted_ref!(_states_root = &mut states);
     if for_clauses.is_empty() && !has_terminator && repeat_remaining.is_none() {
         // No driver at all: run the body once (when/collect-only loops).
+        for f in &initially {
+            eval_form(*f, env)?;
+        }
         let mut terminate = false;
         match loop_exec_clauses(&body, env, &mut accs, &mut ret, &mut terminate) {
             Ok(()) => {}
@@ -26158,6 +26157,7 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                         }
                         None => list_to_vec_with_tail(*list),
                     };
+                    loop_bind(*pat, NIL, env);
                     states.push(ForState::In {
                         pat: *pat,
                         items,
@@ -26179,6 +26179,7 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                         None => None,
                     };
                     let list = *list_r;
+                    loop_bind(*pat, if pat.is_cons() { NIL } else { list }, env);
                     states.push(ForState::On {
                         pat: *pat,
                         tail: list,
@@ -26186,11 +26187,14 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     });
                     has_stepping_driver = true;
                 }
-                ForClause::Eq { pat, init, then } => states.push(ForState::Eq {
-                    pat: *pat,
-                    init: *init,
-                    then: *then,
-                }),
+                ForClause::Eq { pat, init, then } => {
+                    loop_bind(*pat, NIL, env);
+                    states.push(ForState::Eq {
+                        pat: *pat,
+                        init: *init,
+                        then: *then,
+                    });
+                }
                 ForClause::From {
                     pat,
                     start,
@@ -26278,6 +26282,7 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     // the stdlib's ELT/LENGTH, so a non-string vector is iterated
                     // by element rather than mis-read as its printed string form.
                     let items = seq_elements(seq)?;
+                    loop_bind(*pat, NIL, env);
                     states.push(ForState::Across {
                         pat: *pat,
                         items,
@@ -26332,6 +26337,7 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                             (vals, keys)
                         }
                     };
+                    loop_bind(*pat, NIL, env);
                     states.push(ForState::Being {
                         pat: *pat,
                         items,
@@ -26340,6 +26346,7 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     // A `using` variable steps in lockstep over the paired list;
                     // both lists have equal length, so they exhaust together.
                     if let Some(uvar) = using {
+                        loop_bind(*uvar, NIL, env);
                         states.push(ForState::In {
                             pat: *uvar,
                             items: paired,
@@ -26351,6 +26358,11 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     has_stepping_driver = true;
                 }
             }
+        }
+        // Driver bindings and source forms belong to the prologue, before
+        // INITIALLY. Empty sequences still establish their lexical variables.
+        for f in &initially {
+            eval_form(*f, env)?;
         }
         // repeat/while/until are terminating drivers too, so the runaway cap
         // (which only guards driverless loops) should not misfire on them.
@@ -26391,6 +26403,12 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                         *idx += 1;
                     }
                     ForState::On { pat, tail, step } => {
+                        // A simple ON variable is the cursor itself; FINALLY
+                        // sees the terminating tail. Destructured variables
+                        // retain the values from the last nonempty tail.
+                        if !pat.is_cons() {
+                            loop_bind(*pat, *tail, env);
+                        }
                         if !tail.is_cons() {
                             exhausted = true;
                             break;
@@ -40257,5 +40275,31 @@ mod cons_type_tests {
             "the predicate must actually move the cons"
         );
         assert_eq!(val_as_str(cp(cp(*object).1).0), "tail");
+    }
+}
+
+#[cfg(test)]
+mod loop_initialization_tests {
+    use super::*;
+
+    #[test]
+    fn initially_preserves_a_relocated_on_cursor() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = reader::read_from_string(
+            "(loop for tail on gc-loop-source initially (%force-minor-gc-for-test) (return tail))"
+        ).unwrap().0);
+        egcl_rt::rooted!(source = arena_cons(EgclVal::from_fixnum(42), NIL));
+        env.set_var("GC-LOOP-SOURCE", *source);
+        let before = source.to_raw();
+        egcl_rt::rooted!(result = eval_form(*form, &mut env).unwrap());
+        assert_ne!(
+            source.to_raw(),
+            before,
+            "INITIALLY must actually move the cursor"
+        );
+        assert_eq!(*result, *source);
+        assert_eq!(cp(*result).0, EgclVal::from_fixnum(42));
     }
 }

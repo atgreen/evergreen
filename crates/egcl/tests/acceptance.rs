@@ -19139,3 +19139,22 @@ fn typep_compound_cons_checks_both_parts() {
         ("(typep '(1 . 2) '(cons (satisfies oddp) (satisfies evenp)))", "T"),
     ]);
 }
+
+#[test]
+fn loop_driver_bindings_exist_before_initially_and_after_empty_iteration() {
+    run_expression_cases(&[
+        ("(loop for (v . tail) on nil finally (return (list v tail)))", "(NIL NIL)"),
+        ("(loop for (v . tail) in nil finally (return (list v tail)))", "(NIL NIL)"),
+        ("(let ((tail :outer)) (list (loop for (v . tail) on nil finally (return tail)) tail))", "(NIL :OUTER)"),
+        ("(loop for (v . tail) on '(1 2) finally (return (list v tail)))", "(2 NIL)"),
+        ("(loop for tail on '(1 2) finally (return tail))", "NIL"),
+        ("(loop for (v . tail) on '(1 2) initially (return (list v tail)))", "(NIL NIL)"),
+        ("(loop for tail on '(1 2) initially (return tail))", "(1 2)"),
+        ("(loop for x in '(1 2) initially (return x))", "NIL"),
+        ("(loop for x from 7 below 9 initially (return x))", "7"),
+        ("(loop for x = 42 initially (return x))", "NIL"),
+        ("(loop for x across #() finally (return x))", "NIL"),
+        ("(loop for k being the hash-keys of (make-hash-table) using (hash-value v) finally (return (list k v)))", "(NIL NIL)"),
+        ("(let ((xs '(1 2))) (loop for xs on xs initially (return xs)))", "(1 2)"),
+    ]);
+}

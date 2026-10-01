@@ -4198,13 +4198,22 @@ impl<'e> Lowerer<'e> {
                             egcl_rt::rooted_ref!(_end_test_root = &mut end_test);
                             let mut go_form = form_list(&[s("GO")?, end]);
                             egcl_rt::rooted_ref!(_go_form_root = &mut go_form);
+                            let simple_on = on && var.is_symbol() && var != NIL;
+                            if simple_on {
+                                // The named ON cursor is visible in INITIALLY,
+                                // and its terminating tail remains in FINALLY.
+                                bindings.push(form_list(&[var, lst]));
+                                pre.push(form_list(&[s("SETQ")?, var, lst]));
+                            }
                             pre.push(form_list(&[s("WHEN")?, end_test, go_form]));
                             let cur = if on {
                                 lst
                             } else {
                                 form_list(&[s("CAR")?, lst])
                             };
-                            loop_pattern_assign(var, cur, &mut bindings, &mut pre)?;
+                            if !simple_on {
+                                loop_pattern_assign(var, cur, &mut bindings, &mut pre)?;
+                            }
                             steps.push(form_list(&[s("SETQ")?, lst, step_expr]));
                             i += adv;
                         }
