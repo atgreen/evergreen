@@ -31,8 +31,8 @@ exercises these forks:
 | fset | https://github.com/atgreen/fset | `553d6a75f6520ef4435748f16b0f619e71988628` |
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `ee7e4ea5238efce6ce4be7d6f0f29699884ad791` |
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
-| swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
-| slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332e` — the EGCL backend, moved out of `lib/slynk/` |
+| swank (in the slime tree, branch `torcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
+| slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
@@ -57,20 +57,27 @@ deliberately left unbound rather than stubbed, so a caller's own `FBOUNDP`
 guard — Serapeum's `macro-tools` uses one — sees the truth. This is what lets
 Trivia load.
 
-For an existing ocicl project, run there:
+Install all twelve forks into an existing project with the
+[installer](../scripts/install-library-forks.sh):
 
 ```sh
-ocicl install git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f
-ocicl install git+https://github.com/atgreen/trivial-gray-streams@0554d306864d252985c23923ef872a1b177894a6
-ocicl install git+https://github.com/atgreen/trivial-cltl2@cf3253050711277e847a9dc445a45fa7170dc9cb
-ocicl install git+https://github.com/atgreen/trivial-garbage@3c4f9c86d4d3454dcd4f8d19113b4101c3add032
-ocicl install git+https://github.com/atgreen/usocket@9c88be9854200183d7e8e5d3f52fd314743c3ee4
-ocicl install git+https://github.com/atgreen/bordeaux-threads@2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f
-ocicl install git+https://github.com/atgreen/precise-time@045df7c4cddc84d775610cbecf47b462aaea29d6
-ocicl install git+https://github.com/atgreen/cffi@ee7e4ea5238efce6ce4be7d6f0f29699884ad791
-ocicl install git+https://github.com/atgreen/iolib@57bc68250f498d48a6d0a3d07ccd2b36b8a561ea
-ocicl install git+https://github.com/atgreen/slime@a1d235181efa139eb0f51feffbe74f784842c1b3
+/path/to/evergreen/scripts/install-library-forks.sh /path/to/your/project
 ```
+
+Omit the project directory to install into the current directory. Preview the
+commands with `--dry-run` (before the optional project directory). The script
+requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
+on the first failed install, and fetches each fork's default branch, except
+SLIME (`torcl` branch) and SLY (`egcl` branch), where their ports live. No commit revisions
+are specified. It creates `ocicl.csv` if needed so installation stays in the
+selected directory. ocicl records the resolved commits in that file;
+commit it in your project for reproducibility. The script downloads and
+registers systems; it does not load or compile them in EGCL.
+
+When adding a port, update both the table above and the installer's library
+list. The table records previously tested revisions; the installer fetches
+the current branch tips. `trivial-garbage` is the GC portability library;
+Swank and Slynk are installed from the `slime` and `sly` repositories.
 
 The CFFI fork adds `src/cffi-egcl.lisp` (the CFFI-SYS backend over `EGCL-FFI`)
 and `src/cffi-egcl-fsbv.lisp`, which passes and returns structures by value
@@ -98,7 +105,7 @@ starts at its identity. The last two were silent wrong answers in core CL. All o
 iolib loads: syscalls, multiplex, streams, zstreams, sockets, pathnames, over the
 CFFI backend above, with groveling and libfixposix.
 
-The swank fork lives on the slime tree's `egcl` branch and adds
+The swank fork lives on the slime tree's `torcl` branch and adds
 `swank/egcl.lisp` — the backend interface over EGCL's sockets, process and Gray
 streams at communication style NIL — plus its registration in `swank.asd` and
 `swank-loader.lisp`. One capability is declined rather than faked: EGCL exports

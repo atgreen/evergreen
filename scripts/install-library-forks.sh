@@ -1,0 +1,66 @@
+#!/bin/sh
+# Library inventory: docs/library-forks.md.
+set -eu
+
+usage() {
+    cat <<'EOF'
+Usage: install-library-forks.sh [--dry-run] [PROJECT-DIRECTORY]
+
+Install all documented EGCL library ports using ocicl git+https sources.
+Defaults to the current directory. Requires ocicl with Git-source support
+and git on PATH. Updates the destination's ocicl.csv and downloads sources.
+Commit that ocicl.csv to preserve the selected revisions.
+
+  --dry-run   Print the ocicl commands without installing anything
+  -h, --help  Show this help
+EOF
+}
+
+dry_run=false
+case "${1-}" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) dry_run=true; shift ;;
+esac
+if [ "$#" -gt 1 ]; then
+    usage >&2
+    exit 2
+fi
+case "${1-}" in
+    -*) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+esac
+if [ "$#" -eq 1 ]; then
+    cd -- "$1"
+fi
+
+if [ "$dry_run" = false ]; then
+    for tool in ocicl git; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            printf 'Required command not found: %s\n' "$tool" >&2
+            exit 127
+        }
+    done
+    # Anchor ocicl here instead of inheriting a parent directory's collection.
+    touch ocicl.csv
+fi
+
+# Install protocol dependencies first, before their consumers.
+while read -r library; do
+    source="git+https://github.com/atgreen/$library"
+    printf 'ocicl install %s\n' "$source"
+    if [ "$dry_run" = false ]; then
+        ocicl install "$source" </dev/null
+    fi
+done <<'EOF'
+trivial-features
+trivial-gray-streams
+trivial-cltl2
+trivial-garbage
+bordeaux-threads
+usocket
+precise-time
+fset
+cffi
+iolib
+slime@torcl
+sly@egcl
+EOF
