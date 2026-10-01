@@ -55,3 +55,32 @@ fn input_is_bounded_and_pause_is_observable() {
     assert_eq!(events.len(), 64);
     assert_eq!(events.last().unwrap().0, 999);
 }
+
+#[test]
+fn key_backlog_keeps_recent_events_in_order() {
+    let state = ActivityState::default();
+    assert_eq!(state.poll_key(), None);
+    for code in 0..100 {
+        state.key(1, code, 2);
+    }
+    let events: Vec<_> = std::iter::from_fn(|| state.poll_key()).collect();
+    assert_eq!(events, (36..100).map(|code| (1, code, 2)).collect::<Vec<_>>());
+    assert_eq!(state.poll_key(), None);
+}
+
+#[test]
+fn saved_and_restored_state_are_independent_owned_snapshots() {
+    let state = ActivityState::default();
+    let mut input = vec![1, 2, 3];
+    state.set_restored(&input);
+    input[0] = 9;
+    state.set_saved(&input);
+    assert_eq!(state.restored(), vec![1, 2, 3]);
+    assert_eq!(state.saved(), vec![9, 2, 3]);
+    let mut returned = state.saved();
+    returned.clear();
+    assert_eq!(state.saved(), vec![9, 2, 3]);
+    state.set_saved(&[]);
+    assert!(state.saved().is_empty());
+    assert_eq!(state.restored(), vec![1, 2, 3]);
+}

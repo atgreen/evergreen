@@ -1750,6 +1750,7 @@ impl BaselineCompiler {
     }
 
     /// Original simple emit methods (for compile() with raw EgclVal).
+    #[cfg(not(target_arch = "aarch64"))]
     fn emit_body_x86_64(&self, c: &mut Vec<u8>, form: EgclVal) {
         // Prologue
         c.push(0x55); // push rbp

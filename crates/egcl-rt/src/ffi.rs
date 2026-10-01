@@ -66,6 +66,10 @@ pub use elfv2::{ffi_call, ffi_call_variadic};
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 pub(crate) fn ffi_profile_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -74,6 +78,10 @@ pub(crate) fn ffi_profile_enabled() -> bool {
 
 /// Accumulate the four phases and report every 2000 calls, to stderr — which on
 /// Android is the logcat tag `egcl-err`.
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix)
+))]
 pub(crate) fn ffi_profile_record(adapter_ns: u64, enter_ns: u64, invoke_ns: u64, leave_ns: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);

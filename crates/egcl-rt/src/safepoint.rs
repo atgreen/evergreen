@@ -237,6 +237,7 @@ impl ForeignStateScope {
         )
     }
 
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     pub(crate) fn lisp() -> Self {
         Self::enter(
             crate::thread::current_thread_for_foreign_entry(),

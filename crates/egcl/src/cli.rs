@@ -7950,8 +7950,12 @@ fn install_evaluator_global_root_scanner() {
 /// the function itself is architecture-independent and the embedded-Python export
 /// path (bliss-89axw) calls it directly on every target — that path needs no
 /// trampoline, because all its exports share one static C entry point and carry the
-/// Lisp function in a handle rather than in generated code. Hence no `cfg` here;
-/// only the registration below has one.
+/// Lisp function in a handle rather than in generated code. Compile this runner
+/// when either the native trampoline or embedded Python needs it.
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    feature = "python"
+))]
 fn foreign_callback_runner(
     entry: EgclVal,
     arguments: &[EgclVal],

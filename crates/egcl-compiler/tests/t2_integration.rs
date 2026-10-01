@@ -19,9 +19,14 @@ use egcl_compiler::t2::opt_licm::Licm;
 use egcl_compiler::t2::pass::PassManager;
 use egcl_compiler::t2::regalloc::allocate;
 use egcl_compiler::t2::verify::verify;
-use egcl_rt::bytecode::{BytecodeFunction, Instr, typep_class};
+use egcl_rt::bytecode::{BytecodeFunction, Instr};
+#[cfg(all(target_arch = "x86_64", unix))]
+use egcl_rt::bytecode::typep_class;
+#[cfg(all(target_arch = "x86_64", unix))]
 use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{NIL, EgclVal};
+#[cfg(all(target_arch = "x86_64", unix))]
+use egcl_rt::value::T;
 
 fn bytecode_fn(
     name: &str,

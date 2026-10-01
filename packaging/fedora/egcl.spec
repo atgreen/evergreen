@@ -300,3 +300,7 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %{_libexecdir}/egcl/android
 %license %{_datadir}/licenses/egcl-target-android
 %endif
+
+%changelog
+* Thu Oct 01 2026 Anthony Green <green@moxielogic.com> - 0.0.1-6
+- Initial Fedora packaging for native and cross-target EGCL runtimes.

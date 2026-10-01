@@ -52,7 +52,7 @@ jobs:
           - san: memory
     name: ${{ matrix.san }}sanitizer
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install nightly with rust-src (build-std needs the source)
         run: |
           rustup toolchain install nightly --component rust-src --profile minimal
@@ -76,7 +76,7 @@ jobs:
     # transfer assembly, so the runtime and interpreter crates are out of scope
     # for it by construction. Point it at the crates that are pure Rust.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install nightly with miri
         run: |
           rustup toolchain install nightly --component miri --profile minimal

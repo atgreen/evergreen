@@ -5677,8 +5677,11 @@ mod tests {
         assert_eq!(f(), (1..=N as u64).sum::<u64>());
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(all(target_arch = "x86_64", unix))]
     static DEOPTED: AtomicBool = AtomicBool::new(false);
+    #[cfg(all(target_arch = "x86_64", unix))]
     extern "C" fn mock_c2i_deopt() {
         DEOPTED.store(true, Ordering::SeqCst);
     }
@@ -6053,6 +6056,7 @@ mod tests {
         f
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
     }
@@ -6230,6 +6234,7 @@ mod tests {
 
     /// Build `(x) -> x <op> c` as a float-speculated op: single-float param `x`,
     /// a fixnum constant `c` (coerced by contagion), guard-flagged float op.
+    #[cfg(all(target_arch = "x86_64", unix))]
     fn build_float_arith(op: crate::t2::ir::Opcode, c: i64) -> crate::t2::ir::Function {
         use crate::t2::ir::{
             AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,

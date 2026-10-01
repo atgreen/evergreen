@@ -69,7 +69,7 @@ jobs:
             cc: s390x-linux-gnu-gcc
     name: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: taiki-e/install-action@v2
@@ -146,7 +146,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - name: add both Android ABIs

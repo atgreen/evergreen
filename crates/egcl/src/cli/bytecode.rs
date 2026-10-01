@@ -17014,15 +17014,25 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
 /// Installed T1 native code for a function. Its CL activation (locals + operand
 /// stack) lives in a EgclStack frame that the i2c adapter pushes; the native
 /// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
+// Direct-call contract fields remain part of installed metadata on all targets.
+// Only the x86-64 emitter currently consumes them for direct native calls.
 struct NativeCode {
     /// The exact metadata and constant slots this machine code was built from.
     /// Only synthetic signal-recovery test adapters have no bytecode body.
     body: Option<Arc<BytecodeFunction>>,
     /// Transfer contract used by direct native calls. Versioned explicitly so
     /// a future unchecked-return ABI cannot be mixed with legacy checked code.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", any(unix, windows))),
+        allow(dead_code)
+    )]
     transfer_abi_version: u16,
     /// Machine target encoded separately from the transfer version. Saved or
     /// cached code must never become a direct target on another ISA.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", any(unix, windows))),
+        allow(dead_code)
+    )]
     transfer_abi_arch: u16,
     /// A baked direct call can already be active when its name is redefined.
     /// Keep that exact callee (and its transitive dependencies) alive.
@@ -17056,6 +17066,10 @@ struct NativeCode {
     /// True if the code contains a speculation-guard deopt point. A callee with
     /// no deopt point is eligible for a direct native→native call (bliss-zhvn)
     /// with no post-call deopt handling. Conservatively true when unknown.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", any(unix, windows))),
+        allow(dead_code)
+    )]
     has_deopt: bool,
     /// Owns original T2 constant slots and every deoptimization scope's body.
     /// T1 uses the original `body` retained above.
@@ -17081,6 +17095,7 @@ const NATIVE_TRANSFER_ARCH: u16 = 0xa390;
 const NATIVE_TRANSFER_ARCH: u16 = 0;
 
 #[inline]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
     code.transfer_abi_version == NATIVE_TRANSFER_ABI_VERSION
         && code.transfer_abi_arch == NATIVE_TRANSFER_ARCH
@@ -17930,6 +17945,7 @@ pub(super) fn profiling_disabled() -> bool {
 /// Direct native→native calls (bliss-zhvn) — ON by default now that the fast
 /// path is hardened (stability + bounds guards, non-deopting callees only, c2i
 /// fallback). Set EGCL_NN_DIRECT=0 to disable (e.g. to A/B the win).
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn nn_direct_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -20210,6 +20226,7 @@ fn emit_native(
 /// to a handler. Deliberately conservative: SIGNAL returns when unhandled,
 /// CERROR returns when the continue restart is taken, and WARN returns
 /// normally, so none of them belong here.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn is_always_signalling(sym: u32) -> bool {
     matches!(
         egcl_rt::symbols::symbol_name(sym)
@@ -20274,11 +20291,16 @@ static FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
 };
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 static UNARY_FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
     RefCell<Vec<Option<Option<UnaryFixnumOp>>>>,
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(Vec::new()) })
 };
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 static FIXNUM_PRED_MEMO: egcl_rt::execution_local::ExecutionLocal<
     RefCell<Vec<Option<Option<FixnumPred>>>>,
 > = unsafe {
@@ -20308,12 +20330,20 @@ fn inlinable_fixnum_op_uncached(sym: u32) -> Option<FixnumOp> {
 /// representation (n<<3) these are add/sub of 1<<3 and a two's-complement negate,
 /// each guarded by `jo` for the fixnum-overflow boundary.
 #[derive(Clone, Copy)]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 enum UnaryFixnumOp {
     Incr, // 1+
     Decr, // 1-
     Neg,  // - (unary)
 }
 
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
     memoized_by_sym(
         &UNARY_FIXNUM_OP_MEMO,
@@ -20322,6 +20352,10 @@ fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
     )
 }
 
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 fn inlinable_unary_fixnum_op_uncached(sym: u32) -> Option<UnaryFixnumOp> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
         Some("1+") => Some(UnaryFixnumOp::Incr),
@@ -20335,6 +20369,7 @@ fn inlinable_unary_fixnum_op_uncached(sym: u32) -> Option<UnaryFixnumOp> {
 /// and parity tests that gate loop conditions. Each guards a fixnum operand,
 /// sets flags, and materialises T/NIL with cmov — no branch, no c2i.
 #[derive(Clone, Copy)]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 enum FixnumPred {
     Zerop,
     Plusp,
@@ -20343,10 +20378,12 @@ enum FixnumPred {
     Oddp,
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn inlinable_fixnum_pred(sym: u32) -> Option<FixnumPred> {
     memoized_by_sym(&FIXNUM_PRED_MEMO, sym, inlinable_fixnum_pred_uncached)
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn inlinable_fixnum_pred_uncached(sym: u32) -> Option<FixnumPred> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
         Some("ZEROP") => Some(FixnumPred::Zerop),
@@ -20360,6 +20397,7 @@ fn inlinable_fixnum_pred_uncached(sym: u32) -> Option<FixnumPred> {
 
 /// car (offset 0) or cdr (offset 8) — the cons-cell field an inlined accessor
 /// loads (bliss-jtc.27). A headerless 16-byte cons {car@0, cdr@8} is tagged 001.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn inlinable_cons_accessor(sym: u32) -> Option<i8> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
         Some("CAR") | Some("FIRST") => Some(0),
@@ -20388,10 +20426,12 @@ fn inlinable_cons_accessor(sym: u32) -> Option<i8> {
 /// NULL and NOT stay: NIL is NIL under any representation, so they really are
 /// total.
 #[derive(Clone, Copy)]
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 enum TotalUnaryPred {
     Null, // null / not: x is NIL
 }
 
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn inlinable_total_unary(sym: u32) -> Option<TotalUnaryPred> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
         Some("NULL") | Some("NOT") => Some(TotalUnaryPred::Null),
@@ -20404,6 +20444,7 @@ fn inlinable_total_unary(sym: u32) -> Option<TotalUnaryPred> {
 /// it inlines as a compare + cmov with no guard and no deopt (bliss-jtc.27).
 /// EQL is deliberately excluded: two distinct bignums with equal value are EQL
 /// but not bit-equal.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn is_inlinable_eq(sym: u32) -> bool {
     egcl_rt::symbols::symbol_name(sym).as_deref() == Some("EQ")
 }

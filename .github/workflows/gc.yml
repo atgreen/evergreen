@@ -70,7 +70,7 @@ jobs:
             env: EGCL_GC_VERIFY=1 EGCL_GC_STRESS=1
     name: ${{ matrix.name }} (subset)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
@@ -118,7 +118,7 @@ jobs:
             env: EGCL_GC_VERIFY=1 EGCL_GC_STRESS=1
     name: ${{ matrix.name }} (full)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
