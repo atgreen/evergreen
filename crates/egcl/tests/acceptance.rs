@@ -2338,7 +2338,7 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
         // signal it yet (bliss-pj0n), but it must not crash the process.
         ("(loop for t from 1 to 3 collect 1)", "(1 1 1)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// CLHS 6.1.2.1.1 lets an arithmetic FOR's start/limit/step subclauses be
@@ -2405,7 +2405,7 @@ fn an_arithmetic_loops_subclauses_may_be_written_in_any_order() {
             "(4611686018427387904 6917529027641081856 9223372036854775808)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ALLOCATE-INSTANCE and SLOT-MAKUNBOUND (CLHS 7.7.1), wired to the stdlib
@@ -13856,7 +13856,7 @@ fn concatenate_and_map_honour_every_result_type() {
         ),
         ("(concatenate '(vector * 2) '(1 2))", "#(1 2)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// REMOVE-DUPLICATES, DELETE-DUPLICATES and MAKE-SEQUENCE took `&rest keys` and
@@ -13951,7 +13951,7 @@ fn keyword_argument_lists_are_validated() {
             "(1 2 3)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// Calling a standard function with the wrong number of arguments is a
@@ -13996,7 +13996,7 @@ fn sequence_functions_signal_program_error_on_bad_arity() {
         (r#"(subseq "abcd" 1 3)"#, r#""bc""#),
         ("(concatenate 'list '(1))", "(1)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// MAKE-SEQUENCE never checked its result type: `(make-sequence 'symbol 10)`
@@ -14083,13 +14083,82 @@ fn make_sequence_validates_its_result_type() {
             "NIL",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
-/// Run `(expr, expected-printed-form)` pairs through BOTH backends: compiled as
-/// written, and tree-walked via EVAL. Nine of the fixes in the
-/// data-and-control-flow grind were single-backend divergences, so every case
-/// has to be checked twice.
+/// Run independent, single-line expression checks in one process per backend.
+/// Each case must leave global definitions, reader/printer settings and other
+/// process state unchanged, and print nothing except its result. Use
+/// `run_expression_cases` when a case needs a fresh environment or cold tier state.
+fn run_expression_cases_batched(cases: &[(&str, &str)]) {
+    if cases.is_empty() {
+        return;
+    }
+    for path in ["compiled", "tree-walked"] {
+        let mut command = egcl_bin();
+        for (expr, _) in cases {
+            let form = if path == "compiled" {
+                (*expr).to_string()
+            } else {
+                format!("(eval '{expr})")
+            };
+            // Separate --eval arguments preserve read-after-evaluation order.
+            // In particular, don't put the compiled cases through EVAL or hide
+            // them inside a Lisp loop: that would change the path under test.
+            command.args(["--eval", &format!("(cl:format t \"~S~%\" {form})")]);
+        }
+        let output = command.output().expect("failed to run egcl batch");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut lines = stdout.lines();
+        // Check every row even if the process exits successfully before the end,
+        // or if a later error follows some successfully printed results.
+        for (index, (expr, expected)) in cases.iter().enumerate() {
+            let actual = lines.next().unwrap_or_else(|| {
+                panic!("{path} case {index} produced no result: {expr}\nstatus: {}\nstdout: {stdout}\nstderr: {stderr}", output.status)
+            });
+            assert_eq!(
+                actual.trim(),
+                *expected,
+                "{path} case {index}: {expr}\nstderr: {stderr}"
+            );
+            // --eval echoes FORMAT's return value after the printed result.
+            assert_eq!(
+                lines.next(),
+                Some("NIL"),
+                "{path} case {index} has an unexpected FORMAT return: {expr}\nstdout: {stdout}\nstderr: {stderr}"
+            );
+        }
+        assert!(
+            lines.next().is_none(),
+            "{path} batch produced extra output:\n{stdout}\nstderr: {stderr}"
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{path} batch failed after its results\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn expression_batch_reads_each_case_after_the_previous_case_and_isolates_backends() {
+    run_expression_cases_batched(&[
+        (
+            "(progn (defpackage \"ACCEPTANCE-BATCH\" (:use \"CL\")) \
+             (defvar *acceptance-batch-counter* 0) (incf *acceptance-batch-counter*))",
+            "1",
+        ),
+        (
+            "(progn (defparameter acceptance-batch::value 42) \
+             (list acceptance-batch::value (incf *acceptance-batch-counter*)))",
+            "(42 2)",
+        ),
+    ]);
+}
+
+/// Keep a fresh process for each case and backend when global state or tier
+/// warmup matters. Both helpers test direct compiled forms and tree-walked EVAL.
 fn run_expression_cases(cases: &[(&str, &str)]) {
     for (expr, expected) in cases {
         for (path, form) in [
@@ -14117,6 +14186,18 @@ fn run_expression_cases(cases: &[(&str, &str)]) {
             );
         }
     }
+}
+
+#[test]
+#[should_panic(expected = "compiled case 1: (+ 2 2)")]
+fn expression_batch_checks_results_after_the_first_case() {
+    run_expression_cases_batched(&[("(+ 1 1)", "2"), ("(+ 2 2)", "wrong")]);
+}
+
+#[test]
+#[should_panic(expected = "compiled case 1 produced no result")]
+fn expression_batch_rejects_errors_before_all_results() {
+    run_expression_cases_batched(&[("42", "42"), ("(error \"batch failed\")", "NIL"), ("43", "43")]);
 }
 
 /// Deep self-recursion must raise a catchable STORAGE-CONDITION, not run off the
@@ -14310,7 +14391,7 @@ fn map_into_fills_to_capacity_and_sets_the_fill_pointer() {
             "#(11 22 0)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// COUNT, COUNT-IF and COUNT-IF-NOT accept :FROM-END. The count itself cannot
@@ -14357,7 +14438,7 @@ fn the_count_family_accepts_from_end() {
         ("(count 'a '(a b a) :test #'eq)", "2"),
         ("(count 'a '(a b a) :test-not #'eq)", "1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// NSUBSTITUTE, NSUBSTITUTE-IF and NSUBSTITUTE-IF-NOT are DESTRUCTIVE: they
@@ -14419,7 +14500,7 @@ fn the_nsubstitute_family_modifies_in_place() {
             "((B B B C) (A B A C))",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// SUBSEQ, COPY-SEQ and REVERSE of a bit vector answer a BIT VECTOR. The test
@@ -14474,7 +14555,7 @@ fn bit_vector_ness_survives_subseq_copy_and_reverse() {
             "#(A B)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// Two things SUBSTITUTE and everything built on it got wrong.
@@ -14517,7 +14598,7 @@ fn substitute_keeps_bit_vectors_and_clamps_a_negative_count() {
             "#*0101",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// :FROM-END changes the ORDER the test is applied in, not just which matches
@@ -14568,7 +14649,7 @@ fn from_end_reverses_the_order_the_test_is_applied_in() {
         ("(position 'a '(a b a))", "0"),
         ("(substitute 1 0 #*0101)", "#*1111"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// A string result type can be named through its ELEMENT TYPE as well as its
@@ -14599,7 +14680,7 @@ fn a_string_result_type_can_be_named_by_its_element_type() {
         ("(concatenate 'vector '(1 2))", "#(1 2)"),
         ("(concatenate 'list '(1 2))", "(1 2)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// REMOVE-IF and REMOVE-IF-NOT honour their full keyword set. They took
@@ -14649,7 +14730,7 @@ fn remove_if_honours_its_keywords() {
             "(A B)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// MERGE must reject a result type that cannot hold the merged elements. Most
@@ -14701,7 +14782,7 @@ fn merge_validates_its_result_type() {
         ),
         ("(make-sequence 'list 3 :initial-element 7)", "(7 7 7)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// REPLACE on OVERLAPPING ranges of the same object must behave as if the source
@@ -14768,7 +14849,7 @@ fn replace_handles_overlap_and_fill_checks_its_bounds() {
             "#(1 1 1)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// A sequence must be a PROPER list, and a FUNCTION is never a sequence however
@@ -14857,7 +14938,7 @@ fn a_function_is_not_a_sequence_and_a_dotted_list_is_not_either() {
         ),
         ("(length (make-array 4 :fill-pointer 2))", "2"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// `(setf (elt list n))` past the end must signal, not silently do nothing.
@@ -14900,7 +14981,7 @@ fn setf_elt_past_the_end_signals() {
             "\"az\"",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// NOT and NULL take exactly one argument. The operator-position handlers check
@@ -14952,7 +15033,7 @@ fn not_and_null_take_exactly_one_argument_on_every_path() {
         ("(mapcar #'not '(nil 1))", "(T NIL)"),
         ("(remove-if #'null '(1 nil 2))", "(1 2)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// FLOOR/CEILING/TRUNCATE/ROUND/MOD/REM on two fixnums take a native-integer
@@ -15004,7 +15085,7 @@ fn integer_division_rounding_modes_are_exact() {
             ":AE",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// MOD, REM and the four rounding operators reached through FUNCALL/APPLY (and
@@ -15063,7 +15144,7 @@ fn integer_division_through_funcall_matches_operator_position() {
             ":AE",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// CLHS 5.1.1.1: a place's subforms are evaluated left-to-right and the new
@@ -15115,7 +15196,7 @@ fn setf_subseq_evaluates_value_form_last() {
             "#(7 7 3 4 5)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// The fixnum division fast path (bliss-mwpb) computes in i128 and falls back
@@ -15140,7 +15221,7 @@ fn integer_division_is_exact_at_the_fixnum_boundary() {
            (list n bad))",
         "(288 0)",
     )];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// A ratio literal's components must become BIGNUMs when they leave the 61-bit
@@ -15179,7 +15260,7 @@ fn big_ratio_literals_read_without_wrapping() {
             "-1",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// CLHS 2.3.2.3: a radix prefix applies to a RATIO as well as an integer, so
@@ -15213,7 +15294,7 @@ fn radix_prefixed_ratio_literals_read_as_ratios() {
             ":ERR",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// CONCATENATE and MAP must return a FRESH sequence.
@@ -15262,7 +15343,7 @@ fn concatenate_and_map_return_fresh_sequences() {
         ("(map 'string #'char-upcase \"ab\")", "\"AB\""),
         ("(equal (concatenate 'string \"ab\" \"cd\") \"abcd\")", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// Compiled and interpreted call sites dispatch known builtins DIRECTLY,
@@ -15500,7 +15581,7 @@ fn vector_predicates_classify_without_the_string_registry() {
         ),
         ("(subseq (vector 1 2 3) 1)", "#(2 3)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// LENGTH dispatches on already-evaluated arguments (bliss-edzd). It used to
@@ -15562,7 +15643,7 @@ fn length_is_correct_on_every_sequence_representation() {
             ":PE",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// Type predicates dispatch on already-evaluated arguments (bliss-edzd). They
@@ -15626,7 +15707,7 @@ fn type_predicates_agree_between_operator_position_and_funcall() {
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    run_expression_cases(&refs);
+    run_expression_cases_batched(&refs);
 }
 
 /// EQL/EQUAL/EQUALP and MIN/MAX dispatch on already-evaluated arguments
@@ -15673,7 +15754,7 @@ fn equality_and_extrema_match_operator_position() {
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    run_expression_cases(&refs);
+    run_expression_cases_batched(&refs);
 }
 
 /// NTH dispatches on already-evaluated arguments (bliss-edzd). It was the worst
@@ -15716,7 +15797,7 @@ fn nth_matches_operator_position_including_index_validation() {
         // A dotted tail stops the walk rather than erroring.
         ("(nth 1 (cons 1 (cons 2 3)))", "2"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// CAR and CDR must reject a closure. The interpreter represents one as the
@@ -15777,7 +15858,7 @@ fn car_and_cdr_reject_a_closure() {
         ("(car (cons 1 2))", "1"),
         ("(cdr (cons 1 2))", "2"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// `#'<builtin>` is a reified wrapper closure whose body is literally
@@ -15903,7 +15984,7 @@ fn funcall_and_apply_dispatch_on_evaluated_arguments() {
         // only to catch a DIVERGENCE between the two paths, not as correct.
         ("(apply #'+ 1 2)", "1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-74rl: a closure is physically the cons `(EGCL::CLOSURE . id)`, so
@@ -16027,7 +16108,7 @@ fn closure_is_not_a_cons_for_predicates_or_destructive_stores() {
             "(:Y 2 3)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-74rl, the tiering half: the same predicates and guards must answer
@@ -16124,7 +16205,7 @@ fn nth_walks_the_spine_with_unchanged_edge_cases() {
             "0",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi CHARACTER.1: a symbol character designator is defined by its
@@ -16161,7 +16242,7 @@ fn character_designator_uses_symbol_name_exactly() {
             ":TE",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi STRING=.4: the string-comparison family takes string DESIGNATORS, and
@@ -16193,6 +16274,8 @@ fn string_comparison_takes_symbol_name_as_the_designator() {
         ("(string-equal 'abc \"ABC\")", "T"),
         ("(string 'abc)", "\"ABC\""),
     ];
+    // Reading ABC before |abc| currently aliases their names (bliss-341ou).
+    // Keep the existing fresh-process coverage until that reader bug is fixed.
     run_expression_cases(&cases);
 }
 
@@ -16311,7 +16394,7 @@ fn ordinal_accessors_share_the_nth_kernel() {
         ("(fourth (list 1 2 3 4))", "4"),
         ("(tenth (list 1 2 3 4 5 6 7 8 9 10))", "10"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-wukf: a signalled error did not STOP execution in native code. The c2i
@@ -16443,7 +16526,7 @@ fn typep_rejects_a_malformed_numeric_bound() {
         // The alexandria ARRAY-INDEX shape: exclusive bignum-ish upper bound.
         ("(typep 5 '(integer 0 (1152921504606846975)))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-7lqe: REMOVE-DUPLICATES was O(n) with no :test and O(n^2) pairwise
@@ -16517,7 +16600,7 @@ fn remove_duplicates_hashes_the_standard_tests() {
             "((1))",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-hb0q: `#'<builtin>` was not EQ-stable.
@@ -16647,7 +16730,7 @@ fn subtypep_decides_member_types_against_ordinary_supertypes() {
             "(NIL NIL)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// THE with a COMPOUND type specifier signalled a TYPE-ERROR naming the SPEC
@@ -16702,7 +16785,7 @@ fn the_accepts_compound_type_specifiers() {
             "(5 1)",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-c02n: STRINGP gave a different ANSWER once it promoted a tier.
@@ -17019,7 +17102,7 @@ fn coerce_builds_bit_vectors_and_rejects_a_nil_element_type() {
         // And the string half of the shared machinery is untouched.
         ("(coerce '(#\\a #\\b) '(vector character))", "\"ab\""),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-wzfm: COERCE reduced a type specifier to its HEAD symbol, so a
@@ -17080,7 +17163,7 @@ fn coerce_recognizes_a_string_named_by_its_element_type() {
             "\"xx\"",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-w0ae: MEMBER and ASSOC were the two worst builtins left on the
@@ -17152,7 +17235,7 @@ fn member_and_assoc_no_keyword_fast_path_matches_the_general_path() {
         // like the no-keyword case, which is how the general path reads it.
         ("(member 3 (list 1 2 3) :key nil)", "(3)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-ccgu: an FLET/LABELS binding shadows a BUILTIN, and the two tiers
@@ -17213,7 +17296,7 @@ fn flet_and_labels_shadow_builtins_identically_in_both_tiers() {
             ":INNER",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-7oa5: the character comparison family moved from boot.lisp `&rest`
@@ -17307,7 +17390,7 @@ fn character_comparisons_keep_their_arity_and_type_rules() {
         ),
         ("(apply #'char< (list #\\a #\\b))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-7efw: a class-allocated slot's `:initarg` was silently dropped unless
@@ -17419,7 +17502,7 @@ fn simple_vector_p_excludes_specialized_and_complex_vectors() {
         .iter()
         .map(|(e, w)| (e.as_str(), w.as_str()))
         .collect();
-    run_expression_cases(&refs);
+    run_expression_cases_batched(&refs);
 }
 
 /// bliss-swi5: LAST's loop exits immediately on a non-cons and returns its
@@ -17466,7 +17549,7 @@ fn last_requires_a_list_argument() {
             "-1",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-7kmw: STRING is a UNION type -- CLHS defines it as the union of
@@ -17555,7 +17638,7 @@ fn string_types_form_a_union_not_one_specialized_array() {
         ("(typep \"abc\" 'simple-string)", "T"),
         ("(typep 5 'string)", "NIL"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-ljmk: ABS had no evaluated-args kernel, so every call through
@@ -17618,7 +17701,7 @@ fn abs_preserves_exact_type_on_both_dispatch_paths() {
             "T",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-0dtf: a ratio literal whose numerator OR denominator exceeded i64 was
@@ -17688,7 +17771,7 @@ fn ratio_literals_with_bignum_components_read_as_rationals() {
             "1/61728394506172839450617283945",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-bd9c: the transcendental functions ran their argument through
@@ -17755,7 +17838,7 @@ fn transcendentals_accept_complex_arguments() {
         // `inverse_transcendentals_take_complex_and_out_of_domain_arguments`.
         ("(complexp (asin (complex 1.0 1.0)))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi EXP.ERROR.4-11 / EXPT.ERROR.4-11: CLHS 12.1.4.3 makes a float
@@ -17824,7 +17907,7 @@ fn exp_and_expt_signal_float_range_conditions() {
         ("(expt 2 0.5)", "1.4142135"),
         ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi CL-CONSTANT-SYMBOLS.1: every symbol in *CL-CONSTANT-SYMBOLS* must be
@@ -17858,7 +17941,7 @@ fn standard_limit_constants_are_constantp() {
             "NIL",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi LOGEQV.2-4: LOGEQV was defined as a flat `(lognot (logxor ...))`, which
@@ -17898,7 +17981,7 @@ fn logeqv_is_correct_at_every_arity() {
         ("(logior 5)", "5"),
         ("(logxor 5)", "5"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi EXPT.7 and EXPT.18: `(expt x 0)` is 1 for EVERY x. That has to be
@@ -17961,7 +18044,7 @@ fn expt_of_zero_exponent_is_one_for_every_base() {
         ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
         ("(expt (complex 0 1) 2)", "-1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi LOG.5-8 (and COSH.6/SINH.6/TANH.6): TYPEP's compound dispatch has arms
@@ -18001,7 +18084,7 @@ fn typep_handles_compound_complex_specifiers() {
             "T",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi PLUS.3 / MINUS.3: `#C(a b)` denotes `(complex a b)` (CLHS 2.4.8.11),
@@ -18050,7 +18133,7 @@ fn complex_literals_read_the_same_as_the_complex_function() {
             "T",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi GCD.2-3 / LCM.2-3 / COMPLEX.ERROR.1-2.
@@ -18101,7 +18184,7 @@ fn gcd_lcm_one_argument_and_complex_arity() {
         ("(complex 1.0 2)", "#C(1.0 2.0)"),
         ("(complex 1 0)", "1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi ASH.ERROR.4-5, ISQRT.ERROR.5, BOOLE.ERROR.5-7, RANDOM.ERROR.1-3: four
@@ -18212,7 +18295,7 @@ fn integer_builtins_signal_the_right_conditions() {
         ),
         ("(floatp (random 10.0))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi LOG.7-8: `(log <complex>)` type-errored -- `num_val` rejects a complex,
@@ -18245,7 +18328,7 @@ fn log_accepts_complex_arguments() {
         ("(log 100 10)", "2.0"),
         ("(complexp (log (complex 1.0 1.0)))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-i13d: the six INVERSE transcendentals accepted neither a complex
@@ -18300,7 +18383,7 @@ fn inverse_transcendentals_take_complex_and_out_of_domain_arguments() {
         ("(typep (asin 2.0) '(complex single-float))", "T"),
         ("(typep (atanh 2.0) '(complex single-float))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi ARITHMETIC-ERROR.3 and the four ARITHMETIC-ERROR-OPERATION/OPERANDS
@@ -18349,7 +18432,7 @@ fn arithmetic_error_readers() {
         ("(subtypep 'division-by-zero 'arithmetic-error)", "T"),
         ("(subtypep 'floating-point-overflow 'arithmetic-error)", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi TANH.3 / SINH.3: `(coerce x '(complex TYPE))` must give a complex whose
@@ -18391,7 +18474,7 @@ fn coerce_to_complex_honours_the_part_type() {
             ":TE",
         ),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi BIGNUM.FLOAT.COMPARE.7-8: FLOOR/CEILING/TRUNCATE/ROUND of a float at or
@@ -18463,7 +18546,7 @@ fn float_rounding_promotes_past_the_fixnum_range() {
         ("(mod -7 3)", "2"),
         ("(rem -7 3)", "-1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi RATIONAL.*.RANDOM.COMPARE and BIGNUM.*.RANDOM.COMPARE: an exponent
@@ -18500,7 +18583,7 @@ fn exponent_marker_after_a_bare_decimal_point() {
         ("(symbolp (read-from-string \"A.S0\"))", "T"),
         ("(symbolp (read-from-string \"1.2.3\"))", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi IMAGPART.4 and EXPT.29.
@@ -18573,7 +18656,7 @@ fn imagpart_zero_format_and_complex_exponent() {
         ("(expt -8 1/3)", "#C(1.0 1.7320508)"),
         ("(expt 5 0)", "1"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// ansi REAL.1-4: a numeric type's bounds were compared in f64. Beyond 2^53 an
@@ -18640,7 +18723,7 @@ fn numeric_type_bounds_compare_exactly() {
         ("(typep -5 '(real 0 *))", "NIL"),
         ("(typep 5 'real)", "T"),
     ];
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
 }
 
 /// EGCL must be able to SET an environment variable, not just read one
