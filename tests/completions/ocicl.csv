@@ -56,7 +56,7 @@ multilang-documentation-utils, ghcr.io/ocicl/documentation-utils@sha256:b2a1b3f3
 net.didierverna.asdf-flv, ghcr.io/ocicl/net.didierverna.asdf-flv@sha256:e5cd087d41cf24302a92d9bac426a925f8868b554be2414c0f012c961e3ddb8c, asdf-flv-20240503-3f1de41/net.didierverna.asdf-flv.asd
 parse-declarations-1.0, ghcr.io/ocicl/parse-declarations-1.0@sha256:9305fa9624205b16fd1fc51cb1cc4282a18e50eee9ac75b66a14f6f2c5df9518, parse-declarations-20240503-549aebb/parse-declarations-1.0.asd
 parse-number, ghcr.io/ocicl/parse-number@sha256:11f3f9f512871e1f96cea6b8260aa3610e34e8fd7272bbcdb210fd3c5dd8025c, parse-number-20240503-cb9e487/parse-number.asd
-precise-time, git+https://github.com/atgreen/precise-time@863446b80546db43dec2ca2c077103ecbc4969c0#ref=863446b80546db43dec2ca2c077103ecbc4969c0, precise-time-863446b/precise-time.asd
+precise-time, git+https://github.com/atgreen/precise-time@045df7c4cddc84d775610cbecf47b462aaea29d6#ref=045df7c4cddc84d775610cbecf47b462aaea29d6, precise-time-045df7c/precise-time.asd
 proc-parse, ghcr.io/ocicl/proc-parse@sha256:0880f9acb35eb9efbe1f77a981e36e84e8f29a22b14f680c7686eb381fa87bd6, proc-parse-20240503-3afe2b7/proc-parse.asd
 proc-parse-test, ghcr.io/ocicl/proc-parse@sha256:0880f9acb35eb9efbe1f77a981e36e84e8f29a22b14f680c7686eb381fa87bd6, proc-parse-20240503-3afe2b7/proc-parse-test.asd
 pure-tls, ghcr.io/ocicl/pure-tls@sha256:4517f49529230bdd69f7284d7903202469a215b307d59c0d674056ff41dad386, pure-tls-20260918-bf38899/pure-tls.asd
