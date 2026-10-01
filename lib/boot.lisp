@@ -2824,7 +2824,7 @@
           ((string-equal n "Null") (code-char 0))
           ((string-equal n "Nul") (code-char 0))
           ((string-equal n "Bell") (code-char 7))
-          ((string-equal n "Escape") (code-char 27))
+          ((or (string-equal n "Escape") (string-equal n "Esc")) (code-char 27))
           (t nil))))
 
 ;;; --- string builders and STRING-CAPITALIZE / N-string ops ------------------

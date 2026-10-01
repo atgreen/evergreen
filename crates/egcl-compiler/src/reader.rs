@@ -2755,6 +2755,7 @@ pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize),
     if end - start > 1 {
         let name: String = chars[start..end].iter().collect();
         match name.to_lowercase().as_str() {
+            "esc" | "escape" => return Ok((EgclVal::from_char('\u{1b}'), end)),
             "space" => return Ok((EgclVal::from_char(' '), end)),
             "newline" => return Ok((EgclVal::from_char('\n'), end)),
             "tab" => return Ok((EgclVal::from_char('\t'), end)),

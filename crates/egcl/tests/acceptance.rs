@@ -2233,7 +2233,10 @@ fn loop_downfrom_to_uses_a_descending_inclusive_bound() {
         ("(loop for n downfrom 6 to 0 by 2 collect n)", "(6 4 2 0)"),
         ("(loop for n downfrom 0 to 0 collect n)", "(0)"),
         ("(loop for n downfrom -1 to 0 collect n)", "NIL"),
-        ("(let ((sum 0)) (loop for n downfrom 3 to 0 do (incf sum n)) sum)", "6"),
+        (
+            "(let ((sum 0)) (loop for n downfrom 3 to 0 do (incf sum n)) sum)",
+            "6",
+        ),
         ("(loop for n from 0 to 3 collect n)", "(0 1 2 3)"),
     ]);
 }
@@ -4393,8 +4396,7 @@ fn large_simple_vector_is_usable_and_gc_safe() {
                 (error \"corrupt\")))) \
           (princ :ok))";
     let mut cmd = egcl_bin();
-    cmd.env("EGCL_GC_STRESS", "8000")
-        .env("EGCL_GC_POISON", "1");
+    cmd.env("EGCL_GC_STRESS", "8000").env("EGCL_GC_POISON", "1");
     cmd.args(["--eval", prog]);
     let out = cmd.output().expect("run egcl");
     assert_eq!(
@@ -4425,8 +4427,7 @@ fn format_of_inline_fresh_instance_is_gc_safe() {
               (error \"instance collected mid-format at ~D: ~A\" i s)))) \
         (princ :ok)";
     let mut cmd = egcl_bin();
-    cmd.env("EGCL_GC_STRESS", "100")
-        .env("EGCL_GC_POISON", "1");
+    cmd.env("EGCL_GC_STRESS", "100").env("EGCL_GC_POISON", "1");
     cmd.args(["--eval", prog]);
     let out = cmd.output().expect("run egcl");
     assert_eq!(
@@ -4461,8 +4462,7 @@ fn flet_body_survives_gc_across_calls() {
               (unless (and (m 5) (not (m 6))) (error \"flet\"))))) \
         (princ :ok)";
     let mut cmd = egcl_bin();
-    cmd.env("EGCL_GC_STRESS", "100")
-        .env("EGCL_GC_POISON", "1");
+    cmd.env("EGCL_GC_STRESS", "100").env("EGCL_GC_POISON", "1");
     cmd.args(["--eval", prog]);
     let out = cmd.output().expect("run egcl");
     assert_eq!(
@@ -4499,8 +4499,7 @@ fn multi_function_labels_bodies_survive_gc() {
               (unless (equal (walk (list 1 2 3 2)) (list 1 9 3 9)) (error \"labels\"))))) \
         (princ :ok)";
     let mut cmd = egcl_bin();
-    cmd.env("EGCL_GC_STRESS", "100")
-        .env("EGCL_GC_POISON", "1");
+    cmd.env("EGCL_GC_STRESS", "100").env("EGCL_GC_POISON", "1");
     cmd.args(["--eval", prog]);
     let out = cmd.output().expect("run egcl");
     assert_eq!(
@@ -6259,8 +6258,7 @@ fn large_string_literal_is_usable_and_gc_safe() {
             (unless (char= (char s n) #\\Z) (error \"tail\")) \
             (princ :ok)))";
     let mut cmd = egcl_bin();
-    cmd.env("EGCL_GC_STRESS", "8000")
-        .env("EGCL_GC_POISON", "1");
+    cmd.env("EGCL_GC_STRESS", "8000").env("EGCL_GC_POISON", "1");
     cmd.args(["--eval", prog]);
     let out = cmd.output().expect("run egcl");
     assert_eq!(
@@ -8534,11 +8532,9 @@ fn deep_recursion_raises_catchable_storage_condition_not_sigsegv() {
         .output()
         .expect("run egcl");
     assert_eq!(ok.status.code(), Some(0));
-    assert!(
-        String::from_utf8_lossy(&ok.stdout)
-            .to_uppercase()
-            .contains("DONE")
-    );
+    assert!(String::from_utf8_lossy(&ok.stdout)
+        .to_uppercase()
+        .contains("DONE"));
 }
 
 /// bliss-j5fo: a HANDLER-BIND handler must fire for a STORAGE-CONDITION (stack
@@ -9807,7 +9803,8 @@ fn random_returns_a_value_in_range() {
 fn pathname_directory_returns_a_list_not_a_namestring() {
     // bliss-lb6: PATHNAME-DIRECTORY must return (:absolute|:relative comp…) so
     // UIOP/ANSI directory-list arithmetic works, not a namestring string.
-    let prog = "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
+    let prog =
+        "(let ((d (pathname-directory (make-pathname :directory (list :absolute \"a\" \"b\"))))) \
        (format t \"~a ~a ~a\" (eq (car d) :absolute) (second d) (third d)))";
     let output = egcl_bin()
         .args(["--eval", prog])
@@ -14258,7 +14255,11 @@ fn expression_batch_checks_results_after_the_first_case() {
 #[test]
 #[should_panic(expected = "compiled case 1 produced no result")]
 fn expression_batch_rejects_errors_before_all_results() {
-    run_expression_cases_batched(&[("42", "42"), ("(error \"batch failed\")", "NIL"), ("43", "43")]);
+    run_expression_cases_batched(&[
+        ("42", "42"),
+        ("(error \"batch failed\")", "NIL"),
+        ("43", "43"),
+    ]);
 }
 
 /// Deep self-recursion must raise a catchable STORAGE-CONDITION, not run off the
@@ -19071,4 +19072,17 @@ fn the_instance_slot_fast_path_still_honours_class_allocated_slots() {
             "(1 NIL)",
         ),
     ]);
+}
+
+/// Rove emits #\Esc in terminal-color strings; both reader aliases and
+/// NAME-CHAR must denote the same character, including compiled callers.
+#[test]
+fn escape_character_aliases() {
+    let cases = [
+        ("(char-code #\\Esc)", "27"),
+        ("(char-code #\\Escape)", "27"),
+        ("(char-code (name-char \"eSc\"))", "27"),
+        ("(eql #\\Esc (name-char (char-name #\\Escape)))", "T"),
+    ];
+    run_expression_cases(&cases);
 }
