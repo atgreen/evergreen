@@ -19086,3 +19086,41 @@ fn escape_character_aliases() {
     ];
     run_expression_cases(&cases);
 }
+
+#[test]
+fn print_unreadable_object_macro() {
+    run_expression_cases(&[
+        (
+            r##"(with-output-to-string (s) (print-unreadable-object (nil s :type t)))"##,
+            "\"#<NULL >\"",
+        ),
+        (
+            r##"(with-output-to-string (s) (print-unreadable-object (nil s)))"##,
+            "\"#<>\"",
+        ),
+        (
+            r##"(with-output-to-string (s) (print-unreadable-object (nil s :type t) (write-string "body" s)))"##,
+            "\"#<NULL body>\"",
+        ),
+        (
+            r##"(let ((n 0)) (with-output-to-string (s) (print-unreadable-object ((progn (incf n) nil) (progn (incf n) s) :type (progn (incf n) nil) :identity (progn (incf n) nil)) (incf n))) n)"##,
+            "5",
+        ),
+        (
+            r##"(let ((s (make-string-output-stream))) (list (print-unreadable-object (nil s) :ignored) (get-output-stream-string s)))"##,
+            "(NIL \"#<>\")",
+        ),
+        (
+            r##"(let ((s (make-string-output-stream)) (ran nil)) (list (handler-case (let ((*print-readably* t)) (print-unreadable-object (42 s) (setf ran t))) (print-not-readable () :caught)) ran (get-output-stream-string s)))"##,
+            "(:CAUGHT NIL \"\")",
+        ),
+        (
+            r##"(let ((s (with-output-to-string (s) (print-unreadable-object (nil s :type t :identity t))))) (and (search "#<NULL " s) (not (search "  " s)) (char= (char s (1- (length s))) #\>)))"##,
+            "T",
+        ),
+        (
+            r##"(progn (defclass unreadable-probe () ()) (defmethod print-object ((obj unreadable-probe) s) (print-unreadable-object (obj s :type t) (write-string "value=7" s))) (princ-to-string (make-instance 'unreadable-probe)))"##,
+            "\"#<UNREADABLE-PROBE value=7>\"",
+        ),
+    ]);
+}

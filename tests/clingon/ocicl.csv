@@ -1,0 +1,15 @@
+alexandria, ghcr.io/ocicl/alexandria@sha256:407634b0781b2d8fc3e55a30432bcb5d0c042af2feb2d1d72de825940b0fb0df, alexandria-20260812-f283e25/alexandria.asd
+bobbin, ghcr.io/ocicl/bobbin@sha256:7368d88e9f1d8a94b9bddf5e1887e384ef738235570142dd1cfe98c90077cc13, bobbin-20240503-b454e82/bobbin.asd
+bordeaux-threads, git+https://github.com/atgreen/bordeaux-threads@2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f#ref=2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f, bordeaux-threads-2f736ed/bordeaux-threads.asd
+cl-ppcre, ghcr.io/ocicl/cl-ppcre@sha256:bf073924cf4fd5957a4fd961a95d446ed0e53fa32a5002cbd2d52182874f45e5, cl-ppcre-20250606-a2ea581/cl-ppcre.asd
+cl-reexport, ghcr.io/ocicl/cl-reexport@sha256:c795feb3e3727a19e61797187eb31bac1e855b1332335d26752200a28e9b9da8, cl-reexport-20240503-03ad7a0/cl-reexport.asd
+clingon, ghcr.io/ocicl/clingon@sha256:27d1426613e66fd28223c737bd7886dfdd4f20df742212bd0903c2fc6791871f, clingon-20260807-e7e936b/clingon.asd
+clingon.test, ghcr.io/ocicl/clingon@sha256:27d1426613e66fd28223c737bd7886dfdd4f20df742212bd0903c2fc6791871f, clingon-20260807-e7e936b/clingon.test.asd
+dissect, ghcr.io/ocicl/dissect@sha256:349ad54095f9094d7fd90785e53ac4fbc2ce530269e9d81da5a7f27fe0e8bbdb, dissect-20260410-7047690/dissect.asd
+global-vars, ghcr.io/ocicl/global-vars@sha256:d197e871c9c9abc4bf31b1186f5fd28f0ca848ebe2e9dddf2d82ecee01dbdc65, global-vars-20240503-c749f32/global-vars.asd
+rove, ghcr.io/ocicl/rove@sha256:417a70fa9f2481f76d4b55cb17b4a5f994a607c6e13c4a4a95e32c8c10330c62, rove-20260814-52b04ea/rove.asd
+split-sequence, ghcr.io/ocicl/split-sequence@sha256:3a37662eedd99c42995587b9d443c4631f25c4c523091bcca31a27b880585b8e, split-sequence-2.0.1/split-sequence.asd
+trivial-features, git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f#ref=651e8ea90db0b143d39b9a414ee382ec62efad2f, trivial-features-651e8ea/trivial-features.asd
+trivial-garbage, ghcr.io/ocicl/trivial-garbage@sha256:e76c38568f7ff0a2564ab47e27e0b2293f00f258e6510f2abec4d46920f2c4db, trivial-garbage-20260829-f0663f7/trivial-garbage.asd
+trivial-gray-streams, git+https://github.com/atgreen/trivial-gray-streams@0554d306864d252985c23923ef872a1b177894a6#ref=0554d306864d252985c23923ef872a1b177894a6, trivial-gray-streams-0554d30/trivial-gray-streams.asd
+with-user-abort, ghcr.io/ocicl/with-user-abort@sha256:c19560034f9909a7afb4110b5efd939a9f1e829d9ef9887797b98679f290c480, with-user-abort-20240503-a3db02e/with-user-abort.asd

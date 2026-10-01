@@ -1032,6 +1032,30 @@
      ,@body
      (get-output-stream-string ,var)))
 
+(defmacro print-unreadable-object ((object stream &key type identity) &body body)
+  (let ((obj (gensym "OBJECT"))
+        (out (gensym "STREAM"))
+        (show-type (gensym "TYPE"))
+        (show-identity (gensym "IDENTITY")))
+    `(let* ((,obj ,object)
+            (,out ,stream)
+            (,show-type ,type)
+            (,show-identity ,identity))
+       (when *print-readably*
+         (error 'print-not-readable :object ,obj))
+       (write-string "#<" ,out)
+       (when ,show-type
+         (princ (type-of ,obj) ,out)
+         (write-char #\Space ,out))
+       ,@body
+       (when ,show-identity
+         (when (or (not ,show-type) ,(not (null body)))
+           (write-char #\Space ,out))
+         (let ((*print-base* 16) (*print-radix* nil))
+           (princ (sxhash ,obj) ,out)))
+       (write-char #\> ,out)
+       nil)))
+
 ;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
 (defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
   (declare (ignore index))
