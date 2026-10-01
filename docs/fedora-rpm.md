@@ -87,11 +87,11 @@ when deliberately reusing that stage's CLI binaries.
 ## Install and use
 
 Install matching releases of the native package and whichever target packages
-you need. After building release 5, for example:
+you need. After building release 6, for example:
 
 ```sh
-sudo dnf install target/fedora-rpm/RPMS/x86_64/egcl-0.1.0-5.fc44.x86_64.rpm \
-    target/fedora-rpm/RPMS/x86_64/egcl-target-android-0.1.0-5.fc44.x86_64.rpm
+sudo dnf install target/fedora-rpm/RPMS/x86_64/egcl-0.0.1-6.fc44.x86_64.rpm \
+    target/fedora-rpm/RPMS/x86_64/egcl-target-android-0.0.1-6.fc44.x86_64.rpm
 ```
 
 For example, put this in `build.lisp` after your application's loading code:

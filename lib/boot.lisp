@@ -3825,7 +3825,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
         "EGCL-THREAD")
 
 (defun lisp-implementation-type () "EGCL")
-(defun lisp-implementation-version () "0.1.0")
+(defun lisp-implementation-version () "0.0.1")
 (defun machine-type () (egcl-ext::%machine-type))
 (defun machine-version () (egcl-ext::%machine-type))
 (defun machine-instance () "localhost")

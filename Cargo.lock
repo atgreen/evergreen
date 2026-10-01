@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "egcl"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "egcl-compiler",
  "egcl-delivery-macros",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "egcl-android"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "egcl",
  "egcl-rt",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "egcl-compiler"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "egcl-rt",
  "iced-x86",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "egcl-delivery-macros"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "quote",
  "syn",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "egcl-rt"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "cc",
  "elf_loader",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "egcl-stdlib"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "egcl-compiler",
  "egcl-rt",
@@ -196,7 +196,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "gc-root-lint"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "proc-macro2",
  "syn",

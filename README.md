@@ -73,6 +73,8 @@ ASDF systems, and provides selected SBCL-compatible extensions. The project is
 under active development; the manual describes current interfaces and
 limitations, while `spec/` records the design and self-hosting roadmap.
 
+See the [changelog](CHANGELOG.md) for version history.
+
 ## Manual
 
 The [EGCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,

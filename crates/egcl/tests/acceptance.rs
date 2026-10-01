@@ -120,10 +120,10 @@ fn version_flag_prints_version_and_exits_zero() {
         "version output should contain 'egcl', got: {}",
         stdout
     );
-    // Should contain a version number (at least major.minor.patch)
+    // Report the workspace version, not merely something containing a dot.
     assert!(
-        stdout.contains("0.1.0") || stdout.contains('.'),
-        "version output should contain a version number"
+        stdout.starts_with(&format!("egcl {} (", env!("CARGO_PKG_VERSION"))),
+        "version output should contain the workspace version: {stdout}"
     );
 }
 
