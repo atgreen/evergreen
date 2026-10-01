@@ -14679,6 +14679,32 @@ fn typep_matches(
     let (head, args) = cp(type_spec);
     let op = sym_bare_name_rc(head);
     match op.as_ref() {
+        "CONS" => {
+            let mut specs = list_to_vec(args);
+            egcl_rt::rooted_ref!(_specs_root = &mut specs);
+            if specs.len() > 2 {
+                return Err(EgclError::ProgramError(
+                    "CONS type accepts at most two component types".into(),
+                ));
+            }
+            if !object.is_cons() || is_function_value(object) {
+                return Ok(false);
+            }
+            // Re-read OBJECT after each recursive check: DEFTYPE expanders
+            // and SATISFIES predicates can allocate and move the cons.
+            for index in 0..2 {
+                let spec = specs.get(index).copied().unwrap_or(T);
+                if spec.is_symbol() && sym_bare_name_rc(spec).as_ref() == "*" {
+                    continue;
+                }
+                let (car, cdr) = cp(object);
+                let component = if index == 0 { car } else { cdr };
+                if !typep_matches(env, component, spec)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
         "OR" => {
             for spec in list_to_vec(args) {
                 if typep_matches(env, object, spec)? {
@@ -40196,5 +40222,40 @@ mod method_block_tests {
             read_eval_all_env("(method-block-compiled 42)", &mut env).unwrap(),
             EgclVal::from_fixnum(42)
         );
+    }
+}
+
+#[cfg(test)]
+mod cons_type_tests {
+    use super::*;
+
+    #[test]
+    fn cons_type_check_survives_relocation_in_car_predicate() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(defun collect-cons-component (x) (%force-minor-gc-for-test) t)",
+            &mut env,
+        )
+        .unwrap();
+        egcl_rt::rooted!(
+            spec = reader::read_from_string(
+                "(cons (satisfies collect-cons-component) (cons string null))"
+            )
+            .unwrap()
+            .0
+        );
+        egcl_rt::rooted!(text = arena_str("tail"));
+        egcl_rt::rooted!(tail = arena_cons(*text, NIL));
+        egcl_rt::rooted!(object = arena_cons(EgclVal::from_fixnum(1), *tail));
+        let before = object.to_raw();
+        assert!(typep_matches(&mut env, *object, *spec).unwrap());
+        assert_ne!(
+            object.to_raw(),
+            before,
+            "the predicate must actually move the cons"
+        );
+        assert_eq!(val_as_str(cp(cp(*object).1).0), "tail");
     }
 }

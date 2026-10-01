@@ -19124,3 +19124,18 @@ fn print_unreadable_object_macro() {
         ),
     ]);
 }
+
+#[test]
+fn typep_compound_cons_checks_both_parts() {
+    run_expression_cases(&[
+        (r#"(typep '(input "") '(cons symbol (cons vector null)))"#, "T"),
+        ("(typep '(1 . a) '(cons integer symbol))", "T"),
+        ("(typep '(1 . 2) '(cons integer symbol))", "NIL"),
+        ("(typep '(a . 2) '(cons integer integer))", "NIL"),
+        ("(typep nil '(cons))", "NIL"),
+        ("(typep (lambda () 1) '(cons * *))", "NIL"),
+        ("(list (typep '(1) '(cons)) (typep '(1) '(cons integer)) (typep '(a . 1) '(cons * integer)) (typep '(a) '(cons nil *)))", "(T T T NIL)"),
+        ("(progn (deftype cons-positive () '(integer 1 *)) (typep '(2 . 3) '(cons cons-positive cons-positive)))", "T"),
+        ("(typep '(1 . 2) '(cons (satisfies oddp) (satisfies evenp)))", "T"),
+    ]);
+}
