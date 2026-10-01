@@ -17,6 +17,11 @@
 (dolist (alternatives '((:little-endian :big-endian) (:32-bit :64-bit)))
   (assert (= 1 (count-if (lambda (feature) (member feature *features*))
                          alternatives))))
+;; Linux implies Unix in trivial-features' canonical set. Asserted here rather
+;; than in the fork: the fork carried a tests/egcl-smoke.lisp that duplicated
+;; the two checks above and added this one, referenced by nothing -- not its own
+;; .asd, not this repo. The durable test belongs in this scenario.
+#+linux (assert (member :unix *features*))
 
 (asdf:load-system :flexi-streams)
 #+(or egcl sbcl)
@@ -24,6 +29,15 @@
                 "STREAM-UNREAD-CHAR" "STREAM-FINISH-OUTPUT"))
   (assert (eq (find-symbol name :trivial-gray-streams)
               (find-symbol name #+egcl :egcl-gray-streams #+sbcl :sb-gray))))
+;; Not just the same symbols -- the same CLASSES. A parallel class hierarchy
+;; would satisfy the identity check above and still break stream dispatch for
+;; clients such as Flexi Streams. Came from the fork's own test/egcl-smoke.lisp,
+;; which nothing referenced; the identity check above was already duplicated
+;; there, this assertion was not.
+(assert (subtypep 'trivial-gray-streams:fundamental-character-input-stream
+                  #+egcl 'egcl-gray-streams:fundamental-character-input-stream
+                  #+sbcl 'sb-gray:fundamental-character-input-stream
+                  #-(or egcl sbcl) 'stream))
 (with-open-file (binary "sample-ascii.txt" :element-type '(unsigned-byte 8))
   (let ((stream (flexi-streams:make-flexi-stream
                  binary :external-format '(:utf-8 :eol-style :lf))))
