@@ -58,11 +58,14 @@ guard — Serapeum's `macro-tools` uses one — sees the truth. This is what let
 Trivia load.
 
 Install all twelve forks into an existing project with the
-[installer](../scripts/install-library-forks.sh):
+[installer](../scripts/install-egcl-forks):
 
 ```sh
-/path/to/evergreen/scripts/install-library-forks.sh /path/to/your/project
+install-egcl-forks /path/to/your/project
 ```
+
+The main `egcl` RPM installs this command in `/usr/bin`. From a source checkout,
+run `scripts/install-egcl-forks` instead.
 
 Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script

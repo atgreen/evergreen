@@ -5,6 +5,8 @@
 """The installed Java system must relocate with an extracted native RPM."""
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -19,6 +21,9 @@ class NativeContentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / 'source'
+            (source / 'scripts').mkdir(parents=True)
+            shutil.copy2(HERE.parents[1] / 'scripts/install-egcl-forks',
+                         source / 'scripts/install-egcl-forks')
             system = source / 'lib/egcl-jvm'
             (system / 'build').mkdir(parents=True)
             for name in ('egcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp'):
@@ -44,6 +49,11 @@ class NativeContentTests(unittest.TestCase):
             self.assertEqual((relocated / 'usr/share/common-lisp/source/egcl-jvm/libegcl_jvm.so').read_bytes(), b'native bridge')
             self.assertEqual((relocated / 'usr/share/doc/egcl/manual/java/index.html').read_text(), 'Java API')
             self.assertTrue((relocated / 'usr/share/doc/egcl/manual/assets/local.css').is_file())
+            installer = relocated / 'usr/bin/install-egcl-forks'
+            result = subprocess.run([str(installer), '--dry-run', str(root)],
+                                    text=True, capture_output=True, check=True)
+            self.assertIn('ocicl install git+https://github.com/atgreen/', result.stdout)
+            self.assertFalse((root / 'ocicl.csv').exists())
 
 
 if __name__ == '__main__':

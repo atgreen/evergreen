@@ -4,7 +4,7 @@ set -eu
 
 usage() {
     cat <<'EOF'
-Usage: install-library-forks.sh [--dry-run] [PROJECT-DIRECTORY]
+Usage: install-egcl-forks [--dry-run] [PROJECT-DIRECTORY]
 
 Install all documented EGCL library ports using ocicl git+https sources.
 Defaults to the current directory. Requires ocicl with Git-source support

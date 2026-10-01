@@ -231,6 +231,7 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %if %{egcl_native}
 %files
 %{_bindir}/egcl
+%{_bindir}/install-egcl-forks
 %{_libdir}/egcl
 %dir %{_datadir}/common-lisp
 %dir %{_datadir}/common-lisp/source

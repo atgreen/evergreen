@@ -22,6 +22,10 @@ def verify(stage):
         assert (manual / name).is_file(), f'Missing manual file: {name}'
     with tempfile.TemporaryDirectory(prefix='egcl-installed-java-') as temporary:
         work = Path(temporary)
+        installer = stage / 'usr/bin/install-egcl-forks'
+        preview = subprocess.check_output([str(installer), '--dry-run'], cwd=work, text=True)
+        assert 'ocicl install git+https://github.com/atgreen/' in preview
+        assert not (work / 'ocicl.csv').exists(), 'Installer dry run modified the project'
         blocked = work / 'bin'
         blocked.mkdir()
         for name in ('make', 'cc', 'gcc', 'javac'):

@@ -67,6 +67,12 @@ or changing the project's compiler version. The saved runtime includes these
 libraries statically; installed users need none of the build tools.
 
 The build uses ordinary `cargo`, native MinGW, Fedora cross-GCC and the NDK.
+The native RPM also installs `install-egcl-forks` in `/usr/bin`. Run
+`install-egcl-forks /path/to/project` to install the EGCL library ports, or add
+`--dry-run` before the project path to preview the commands. This requires `git`
+and an `ocicl` version with Git-source support on `PATH`; these tools are checked
+when the installer runs. Installation updates the project's `ocicl.csv`.
+
 The native RPM includes the `JAVA` and `EGCL-JVM` APIs as the ASDF system
 `egcl-jvm`, and `/usr/lib64/egcl/libegcl_jvm.so` with its Java helper classes
 embedded. `%build` compiles this bridge from source using a JDK (17+) and builds

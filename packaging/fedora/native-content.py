@@ -11,6 +11,10 @@ import subprocess
 
 
 def install(source, manual, stage, *, libdir, datadir, docdir):
+    installer = stage / 'usr/bin/install-egcl-forks'
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source / 'scripts/install-egcl-forks', installer)
+    installer.chmod(0o755)
     system = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-jvm'
     library = stage / libdir.lstrip('/') / 'egcl/libegcl_jvm.so'
     system.mkdir(parents=True, exist_ok=True)
