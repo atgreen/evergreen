@@ -2958,6 +2958,58 @@ fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
 }
 
 #[test]
+fn methods_expand_enclosing_local_macros_before_the_scope_exits() {
+    let dir = workdir("method-enclosing-macro");
+    let src = dir.join("method.lisp");
+    let out = dir.join("method.bfasl");
+    let source = r#"
+(macrolet ((define-modes (&rest names &environment env)
+             `(progn ,@(loop for name in names collect (macroexpand `(,name) env))))
+           (mode-lambda (&body body) `(lambda (start) ,@body)))
+  (macrolet ((mode-crypt ()
+               `(defmethod make-mode ((cipher t))
+                  (let ((key cipher))
+                    (values (mode-lambda (+ key start))
+                            (mode-lambda (- key start)))))))
+    (define-modes mode-crypt)))
+"#;
+    fs::write(&src, source).unwrap();
+    let call = "(multiple-value-bind (e d) (make-mode 10) (list (funcall e 3) (funcall d 3)))";
+    let interpreted = run(&format!("(progn {source} {call})"));
+    assert!(
+        interpreted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&interpreted.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&interpreted.stdout).trim(),
+        "(13 7)"
+    );
+    let compiled = run(&format!(
+        "(compile-file {:?} {:?})",
+        src.to_str().unwrap(),
+        out.to_str().unwrap()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        "(progn (load {:?}) {call})",
+        out.to_str().unwrap()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&loaded.stdout).trim(), "(13 7)");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn local_macros_compile_in_each_forms_package() {
     let dir = workdir("local-macro-package");
     let src = dir.join("local-macro.lisp");

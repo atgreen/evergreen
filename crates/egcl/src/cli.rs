@@ -11806,6 +11806,15 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
                 for index in 0..nested_forms.len() {
                     result.extend(compile_file_load_forms(nested_forms[index], env)?);
                 }
+                // Flattening removes this MACROLET from the load actions.
+                // Expand uses inside emitted definitions before restoring the
+                // outer environment, or their bodies retain orphaned calls to
+                // local macros (for example Ironclad's MODE-LAMBDA).
+                let mut menv = macroexpand_environment_from_cli(env);
+                egcl_rt::rooted_ref!(_menv_root = &mut menv);
+                for index in 0..result.len() {
+                    result[index] = compiler_macroexpand::macroexpand_all(result[index], &menv)?;
+                }
                 Ok::<(), EgclError>(())
             })();
             for index in (0..saved_names.len()).rev() {
@@ -33361,6 +33370,10 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(block_tail = arena_cons(block_name, body));
     egcl_rt::rooted!(block_form = arena_cons(block_op, *block_tail));
     body = arena_cons(*block_form, NIL);
+    // Expand while the definition's lexical macros are still visible, just as
+    // DEFUN does. Methods can outlive an enclosing MACROLET; saving only its
+    // unexpanded body loses those macros before the method is invoked.
+    body = mx_each(body, env, 0);
     let method_id = next_stdlib_class_id();
 
     // Parse the specialized lambda list. Required parameters (before any
