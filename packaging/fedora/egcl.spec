@@ -13,8 +13,8 @@ Name: egcl
 Version: %{egcl_version}
 Release: 6%{?dist}
 Summary: Evergreen Common Lisp — a tiered JIT and saved executable images
-License: MIT OR Apache-2.0
-URL: https://github.com/atgreen/egcl
+License: GPL-3.0-or-later WITH Classpath-exception-2.0
+URL: https://github.com/atgreen/evergreen
 Source0: egcl-payload.tar.gz
 Source1: egcl-source.tar.gz
 BuildRequires: python3
@@ -44,7 +44,7 @@ or Wine, without containers or a compiler on the user's machine.
 
 %package target-s390x-linux
 Summary: EGCL image-dumping tools for IBM Z Linux
-License: (MIT OR Apache-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-s390x
 
@@ -53,7 +53,7 @@ An s390x EGCL runtime, private Fedora runtime libraries, and a QEMU launcher.
 
 %package target-aarch64-linux
 Summary: EGCL image-dumping tools for AArch64 Linux
-License: (MIT OR Apache-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-aarch64
 
@@ -62,7 +62,7 @@ An AArch64 EGCL runtime, private Fedora runtime libraries, and a QEMU launcher.
 
 %package target-ppc64le-linux
 Summary: EGCL image-dumping tools for little-endian POWER Linux
-License: (MIT OR Apache-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-ppc64le
 
@@ -79,7 +79,7 @@ A Windows x86-64 EGCL runtime and a Wine launcher with a private Wine prefix.
 
 %package target-android
 Summary: EGCL Android application runtimes and project generator
-License: (MIT OR Apache-2.0) AND BSD-2-Clause AND BSD-3-Clause
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND BSD-2-Clause AND BSD-3-Clause
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-aarch64
 Requires: python3

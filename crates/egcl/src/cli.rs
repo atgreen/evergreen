@@ -38118,9 +38118,11 @@ pub fn print_help() {
 /// Who owns the code and on what terms, shown in the REPL banner.
 ///
 /// The license is the one declared in `Cargo.toml` and in the RPM spec; keep the
-/// three in step if it ever changes.
+/// three in step if it ever changes. (They drifted once: the relicensing updated
+/// Cargo.toml and left this banner claiming the old terms.)
 const COPYRIGHT: &str = "Copyright (C) 2026 Anthony Green.";
-const LICENSE: &str = "Licensed under the MIT or Apache-2.0 license, at your option. No warranty.";
+const LICENSE: &str =
+    "Licensed under the GNU GPL version 3 or later, with the Classpath Exception. No warranty.";
 
 /// The build's target triple, e.g. `x86_64-unknown-linux-musl`.
 ///

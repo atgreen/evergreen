@@ -36,9 +36,11 @@ fn version_and_banner_identify_the_build_and_its_licence() {
         assert!(text.contains(expected_target), "{text}");
         assert!(text.contains("Copyright (C)"), "{text}");
         assert!(text.contains("Anthony Green"), "{text}");
-        // The licence the crate metadata and the RPM spec both declare.
-        assert!(text.contains("MIT"), "{text}");
-        assert!(text.contains("Apache-2.0"), "{text}");
+        // The licence the crate metadata and the RPM spec both declare. This test
+        // is why the banner cannot drift silently -- it caught the relicensing
+        // having updated Cargo.toml and left the banner on the old terms.
+        assert!(text.contains("GPL version 3"), "{text}");
+        assert!(text.contains("Classpath Exception"), "{text}");
     }
 }
 
