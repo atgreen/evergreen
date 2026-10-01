@@ -3,11 +3,24 @@
 # QEMU_LD_PREFIX is forwarded into every container. cargo's target RUNNER emulates
 # the TEST binary with an explicit -L, but a test that SPAWNS a process — several
 # in egcl-rt re-execute themselves to drive thread registration and safepoints —
-# execs the child without it, and the child is then handed to the shell, which
-# reports `Syntax error: "(" unexpected` on an ELF header. qemu-user honours
-# QEMU_LD_PREFIX on every nested exec, which the runner's -L cannot reach. 15 of
-# 120 egcl-rt tests failed that way on all three targets (bliss-d3smh; the local
-# equivalent is the `cross-arch-cli-tests-under-qemu` memory).
+# execs the child without it. 15 of 120 egcl-rt tests failed that way on all three
+# targets (bliss-d3smh; the local equivalent is the `cross-arch-cli-tests-under-qemu`
+# memory).
+#
+# TWO things make that nested exec work, and QEMU_LD_PREFIX is only the second.
+# First the HOST kernel needs a binfmt_misc handler for the target, registered with
+# the F flag so the static qemu is opened at registration time and is therefore
+# reachable from a container that ships no qemu on its own PATH; without it execve
+# returns ENOEXEC, glibc's execvp falls back to `/bin/sh <file>`, and sh reports
+# `Syntax error: "(" unexpected` on an ELF header. Only then does QEMU_LD_PREFIX
+# matter, telling that qemu where the target dynamic loader lives — somewhere the
+# runner's -L cannot reach.
+#
+# This machine has those handlers from qemu-user-static + systemd-binfmt, which is
+# why the fix measured clean here while CI stayed at the pre-fix numbers for a day;
+# the workflow now registers them explicitly (bliss-3c385). Check yours with
+# `cat /proc/sys/fs/binfmt_misc/qemu-aarch64` before concluding anything from a
+# green local run.
 #
 # The workflow supplies the value per target; the paths are the images' own
 # multiarch sysroots, verified by inspecting each image rather than assumed:

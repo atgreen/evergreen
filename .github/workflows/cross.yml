@@ -84,12 +84,33 @@ jobs:
           shared-key: cross-${{ matrix.target }}
       - name: build the workspace for ${{ matrix.target }}
         run: cross build --workspace --release --target ${{ matrix.target }}
+      # Fifteen egcl-rt tests re-execute themselves for process isolation
+      # (Command::new(current_exe()) in gc.rs, safepoint.rs, thread.rs), so they
+      # exec a TARGET-architecture ELF directly. With no binfmt_misc handler the
+      # kernel returns ENOEXEC, glibc's execvp falls back to `/bin/sh <file>`, and
+      # sh parses the ELF header: `Syntax error: "(" unexpected`.
+      #
+      # This is the half of bliss-d3smh that was measured but never installed.
+      # That fix was verified on a laptop whose kernel already had the handlers
+      # registered WITH THE F FLAG (interpreter /usr/bin/qemu-aarch64-static,
+      # flags: F): F opens the static qemu at REGISTRATION time, so it works
+      # inside a container that ships no qemu on its own PATH. QEMU_LD_PREFIX then
+      # lets that qemu find ld-linux-aarch64.so.1. So the env var below is
+      # necessary but NOT sufficient — binfmt is what invokes qemu at all on a
+      # nested exec. ubuntu-latest registers nothing, so the job sat at exactly
+      # the pre-fix 105 passed / 15 failed (bliss-3c385).
+      #
+      # Registration is host-wide and affects only nested execs: cross's own
+      # in-container runner for the top-level test binary is untouched.
+      - name: register qemu binfmt handlers (nested exec of target binaries)
+        if: matrix.run_tests
+        uses: docker/setup-qemu-action@v3
       - name: run the runtime suite under qemu
         if: matrix.run_tests
-        # QEMU_LD_PREFIX is what lets a test SPAWN an emulated process: the target
-        # RUNNER's -L covers the test binary itself, but not anything it execs.
-        # Cross.toml passes this through into the container.
         env:
+          # How the emulated child above finds the target dynamic loader: the
+          # target RUNNER's -L covers the test binary itself, not what it execs.
+          # Cross.toml passes this through into the container.
           QEMU_LD_PREFIX: ${{ matrix.qemu_ld_prefix }}
           # ffi_elf_loader compiles a shared library at run time and loads it.
           # The container's plain `cc` targets the HOST, so it produced an x86-64
@@ -100,7 +121,9 @@ jobs:
         # cannot run them, and they cannot be filtered out by name because whole
         # binaries (test_fiber_sync, spec_threading_concurrency) crash with SIGSEGV
         # or SIGILL before any filter applies. bliss-tg6mf has the evidence and the
-        # options; the two env vars above are what fixed everything else.
+        # options. Note also that `cargo test` stops at the first failing binary,
+        # so clearing the exec failures reveals eight further test binaries that
+        # had never run in CI at all.
         run: cross test -p egcl-rt --release --target ${{ matrix.target }}
 
   # Android, built through packaging/android/build-runtime.py — the same script
