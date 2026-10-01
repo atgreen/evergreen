@@ -21,16 +21,16 @@ exercises these forks:
 
 | Library | Fork | Tested revision |
 |---|---|---|
-| trivial-features | https://github.com/atgreen/trivial-features | `26e8d168deb7d70d762d0d7e41b2919eba4321aa` |
-| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e55ad7e91aa5aa92408fe082b2e307f8986be080` |
-| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` |
-| trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691` |
-| trivial-garbage | https://github.com/atgreen/trivial-garbage | `0bb7ebd89ec5c8245516c5117f4bc598ebd56e84` |
-| bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `0251844d5e9482eb5fc91fa4686a05aacd24d9b4` |
-| precise-time | https://github.com/atgreen/precise-time | `deadbdeb95ee98cd743c538e649880181e8416f7` |
-| fset | https://github.com/atgreen/fset | `60a28fe91abfddfc8c2a3f6971933a0c2c5b20aa` |
-| cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `8fc4b2b439525e87795efdfb848a1761869adc2a` |
-| iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `81ac1fdc376fbcdb491fe758a3bf957ec0a9c175` |
+| trivial-features | https://github.com/atgreen/trivial-features | `eaec256ea8213e26bcf8ee917c8f11ffef940b9a` |
+| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `b66f6e98efccb43ee7a48f918bcf65377e7c85cd` |
+| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `9c88be9854200183d7e8e5d3f52fd314743c3ee4` |
+| trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
+| trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
+| bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f` |
+| precise-time | https://github.com/atgreen/precise-time | `863446b80546db43dec2ca2c077103ecbc4969c0` |
+| fset | https://github.com/atgreen/fset | `553d6a75f6520ef4435748f16b0f619e71988628` |
+| cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `ee7e4ea5238efce6ce4be7d6f0f29699884ad791` |
+| iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332e` — the EGCL backend, moved out of `lib/slynk/` |
 
@@ -60,15 +60,15 @@ Trivia load.
 For an existing ocicl project, run there:
 
 ```sh
-ocicl install git+https://github.com/atgreen/trivial-features@26e8d168deb7d70d762d0d7e41b2919eba4321aa
-ocicl install git+https://github.com/atgreen/trivial-gray-streams@e55ad7e91aa5aa92408fe082b2e307f8986be080
-ocicl install git+https://github.com/atgreen/trivial-cltl2@116e6d4ccbc5e4dbe67c9eda1441f73a0c5c7691
-ocicl install git+https://github.com/atgreen/trivial-garbage@0bb7ebd89ec5c8245516c5117f4bc598ebd56e84
-ocicl install git+https://github.com/atgreen/usocket@5f8ba3596b4be3b3962a26957ff5508d4d02cbcc
-ocicl install git+https://github.com/atgreen/bordeaux-threads@0251844d5e9482eb5fc91fa4686a05aacd24d9b4
-ocicl install git+https://github.com/atgreen/precise-time@deadbdeb95ee98cd743c538e649880181e8416f7
-ocicl install git+https://github.com/atgreen/cffi@8fc4b2b439525e87795efdfb848a1761869adc2a
-ocicl install git+https://github.com/atgreen/iolib@81ac1fdc376fbcdb491fe758a3bf957ec0a9c175
+ocicl install git+https://github.com/atgreen/trivial-features@eaec256ea8213e26bcf8ee917c8f11ffef940b9a
+ocicl install git+https://github.com/atgreen/trivial-gray-streams@b66f6e98efccb43ee7a48f918bcf65377e7c85cd
+ocicl install git+https://github.com/atgreen/trivial-cltl2@cf3253050711277e847a9dc445a45fa7170dc9cb
+ocicl install git+https://github.com/atgreen/trivial-garbage@3c4f9c86d4d3454dcd4f8d19113b4101c3add032
+ocicl install git+https://github.com/atgreen/usocket@9c88be9854200183d7e8e5d3f52fd314743c3ee4
+ocicl install git+https://github.com/atgreen/bordeaux-threads@2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f
+ocicl install git+https://github.com/atgreen/precise-time@863446b80546db43dec2ca2c077103ecbc4969c0
+ocicl install git+https://github.com/atgreen/cffi@ee7e4ea5238efce6ce4be7d6f0f29699884ad791
+ocicl install git+https://github.com/atgreen/iolib@57bc68250f498d48a6d0a3d07ccd2b36b8a561ea
 ocicl install git+https://github.com/atgreen/slime@a1d235181efa139eb0f51feffbe74f784842c1b3
 ```
 
