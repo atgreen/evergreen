@@ -22183,7 +22183,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return reinitialize_instance_values(instance, &initargs, env);
             }
             "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
-            | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE" => {
+            | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
+            | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
             "CHANGE-CLASS" => {
@@ -34715,6 +34717,8 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             // The image-control operators. 66b2396d stopped a BARE read of these
             // resolving to CL-USER's identity from inside another package, so that
             // a program could define its own SAVE-IMAGE — swank/backend does

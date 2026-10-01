@@ -1371,6 +1371,37 @@ fn eval_instance_not_confused_with_fixnum() {
 }
 
 #[test]
+fn reinitialize_instance_runs_shared_initialization_methods() {
+    run_expression_cases_batched(&[
+        (r#"(progn
+          (defvar *si-log* nil)
+          (defclass si-target () ((x :initarg :value :initform 1) (y :initform 7)))
+          (defmethod shared-initialize :around ((o si-target) names &rest args)
+            (push :around-in *si-log*) (call-next-method) (push :around-out *si-log*) o)
+          (defmethod shared-initialize :before ((o si-target) names &key value)
+            (push (list :before names value) *si-log*))
+          (defmethod shared-initialize :after ((o si-target) names &key value)
+            (push (list :after names value (slot-value o 'x)) *si-log*))
+          (defmethod reinitialize-instance :after ((o si-target) &rest args)
+            (push :reinitialized *si-log*))
+          (let ((o (make-instance 'si-target)))
+            (slot-makunbound o 'y)
+            (setf *si-log* nil)
+            (list (eq o (apply #'reinitialize-instance o '(:value 42)))
+                  (slot-value o 'x) (slot-boundp o 'y) (reverse *si-log*))))"#,
+         "(T 42 NIL (:AROUND-IN (:BEFORE NIL 42) (:AFTER NIL 42 42) :AROUND-OUT :REINITIALIZED))"),
+        (r#"(progn
+          (defclass si-slots () ((x :initarg :value :initform 1) (y :initform 7) (z :initform 9)))
+          (let ((o (make-instance 'si-slots)))
+            (slot-makunbound o 'y) (slot-makunbound o 'z)
+            (list (eq o (shared-initialize o '(y) :value 42))
+                  (slot-value o 'x) (slot-value o 'y) (slot-boundp o 'z)
+                  (progn (shared-initialize o t) (slot-value o 'z)))))"#,
+         "(T 42 7 NIL 9)"),
+    ]);
+}
+
+#[test]
 fn eval_defmethod_dispatches_correctly() {
     let expr = r#"(progn
   (defclass animal () ())

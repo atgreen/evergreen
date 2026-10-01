@@ -482,12 +482,14 @@
   (declare (ignore args))
   `(quote ,name))
 
-;; ANSI supplies a primary REINITIALIZE-INSTANCE method on STANDARD-OBJECT.
-;; Keep that method in the Lisp standard library so methods added by libraries
-;; participate in ordinary :around/:before/:after combination; only the slot
-;; update itself delegates to the stdlib-backed evaluator primitive.
+;; Keep initialization protocol dispatch in Lisp so library methods participate
+;; in ordinary :around/:before/:after combination. NIL selects no initforms
+;; during reinitialization; explicit initargs still update their slots.
+(defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
+  (egcl-internal::%standard-shared-initialize instance slot-names initargs))
+
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
-  (egcl-internal::%standard-reinitialize-instance instance initargs))
+  (apply #'shared-initialize instance nil initargs))
 
 (defmacro with-slots (slots instance &rest body)
   (let ((obj (gensym)))

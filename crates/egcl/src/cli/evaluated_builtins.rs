@@ -3086,6 +3086,45 @@ fn resolve(name: &str) -> Option<Handler> {
             )
         }),
 
+        "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
+        | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => Some(|_operator, args, env| {
+            egcl_rt::rooted!(args = args.to_vec());
+            if args.len() != 3 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE requires 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            let eligible = if args[1] == T {
+                None
+            } else {
+                let (names, tail) = list_to_vec_with_tail(args[1]);
+                if !tail.is_nil() || names.iter().any(|name| !name.is_symbol()) {
+                    return Err(EgclError::ProgramError(
+                        "SHARED-INITIALIZE slot names must be T or a list of symbols".into(),
+                    ));
+                }
+                Some(
+                    names.iter()
+                        .map(|name| sym_bare_name_rc(*name).to_string())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
+            egcl_rt::rooted!(initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?);
+            // Explicit initargs apply regardless of SLOT-NAMES. That argument
+            // only selects unbound slots whose initforms may run afterwards.
+            reinitialize_instance_values(args[0], &initargs, env)?;
+            let explicit_slots = initargs.chunks_exact(2)
+                .map(|pair| sym_bare_name_rc(pair[0]).to_string())
+                .collect::<Vec<_>>();
+            apply_class_initforms(
+                args[0], &class_name, env, eligible.as_deref(), &explicit_slots,
+            )?;
+            Ok(args[0])
+        }),
+
         "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
         | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
