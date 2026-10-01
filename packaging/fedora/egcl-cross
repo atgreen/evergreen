@@ -10,6 +10,9 @@ case "$target" in
     s390x-linux) runner=(qemu-s390x -L "$directory/sysroot") ;;
     ppc64le-linux) runner=(qemu-ppc64le -L "$directory/sysroot") ;;
     aarch64-linux) runner=(qemu-aarch64 -L "$directory/sysroot") ;;
+    s390x-linux-static) runner=(qemu-s390x) ;;
+    ppc64le-linux-static) runner=(qemu-ppc64le) ;;
+    aarch64-linux-static) runner=(qemu-aarch64) ;;
     android) runner=(qemu-aarch64) ;;
     windows)
         runner=(wine)

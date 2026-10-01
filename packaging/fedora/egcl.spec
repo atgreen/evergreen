@@ -11,7 +11,8 @@
 
 Name: egcl
 Version: %{egcl_version}
-Release: 6%{?dist}
+%{!?egcl_release:%global egcl_release 6}
+Release: %{egcl_release}%{?dist}
 Summary: Evergreen Common Lisp — a tiered JIT and saved executable images
 License: GPL-3.0-or-later WITH Classpath-exception-2.0
 URL: https://github.com/atgreen/evergreen
@@ -42,6 +43,15 @@ manual under %{_docdir}/egcl/manual/index.html.
 Optional target packages dump applications for other platforms through QEMU
 or Wine, without containers or a compiler on the user's machine.
 
+%package static
+Summary: Statically linked musl EGCL runtime
+
+%description static
+EGCL for Linux x86-64, statically linked against musl, with ASDF preloaded.
+The egcl-static command runs without a system dynamic loader and produces
+statically linked saved executables. Install egcl for the glibc-based runtime
+and JVM integration.
+
 %package target-s390x-linux
 Summary: EGCL image-dumping tools for IBM Z Linux
 License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)
@@ -68,6 +78,31 @@ Requires: /usr/bin/qemu-ppc64le
 
 %description target-ppc64le-linux
 A ppc64le EGCL runtime, private Fedora runtime libraries, and a QEMU launcher.
+
+%package target-s390x-linux-static
+Summary: Static musl EGCL image-dumping tools for IBM Z Linux
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND MIT AND (Apache-2.0 WITH LLVM-exception)
+Requires: /usr/bin/qemu-s390x
+
+%description target-s390x-linux-static
+A statically linked musl s390x EGCL runtime and QEMU launcher. Produces
+standalone executables without a target sysroot or shared-library dependencies.
+
+%package target-aarch64-linux-static
+Summary: Static musl EGCL image-dumping tools for AArch64 Linux
+Requires: /usr/bin/qemu-aarch64
+
+%description target-aarch64-linux-static
+A statically linked musl AArch64 EGCL runtime and QEMU launcher. Produces
+standalone executables without a target sysroot or shared-library dependencies.
+
+%package target-ppc64le-linux-static
+Summary: Static musl EGCL image-dumping tools for little-endian POWER Linux
+Requires: /usr/bin/qemu-ppc64le
+
+%description target-ppc64le-linux-static
+A statically linked musl ppc64le EGCL runtime and QEMU launcher. Produces
+standalone executables without a target sysroot or shared-library dependencies.
 
 %package target-windows
 Summary: EGCL image-dumping tools for Windows x86-64
@@ -109,7 +144,9 @@ python3 egcl-source/packaging/android/build-runtime.py \
 
 %check
 python3 egcl-source/packaging/fedora/test-native-content.py
+python3 egcl-source/packaging/fedora/test-static-package.py
 python3 egcl-source/packaging/fedora/test-cross-launcher.py
+python3 egcl-source/packaging/fedora/test-launcher.py
 python3 egcl-source/packaging/android/test_generator.py
 python3 egcl-source/packaging/android/test_build.py
 python3 egcl-source/packaging/android/test_install_tools.py
@@ -126,6 +163,9 @@ cp -a usr %{buildroot}/
 %{_datadir}/common-lisp/source/egcl-jvm
 %dir %{_libexecdir}/egcl
 %doc %{_docdir}/egcl
+
+%files static
+%{_bindir}/egcl-static
 
 %files target-s390x-linux
 %{_bindir}/egcl-s390x-linux
@@ -145,6 +185,22 @@ cp -a usr %{buildroot}/
 %files target-windows
 %{_bindir}/egcl-windows
 %{_libexecdir}/egcl/windows
+
+%files target-s390x-linux-static
+%{_bindir}/egcl-s390x-linux-static
+%dir %{_libexecdir}/egcl
+%{_libexecdir}/egcl/s390x-linux-static
+%license %{_datadir}/licenses/egcl-target-s390x-linux-static
+
+%files target-aarch64-linux-static
+%{_bindir}/egcl-aarch64-linux-static
+%dir %{_libexecdir}/egcl
+%{_libexecdir}/egcl/aarch64-linux-static
+
+%files target-ppc64le-linux-static
+%{_bindir}/egcl-ppc64le-linux-static
+%dir %{_libexecdir}/egcl
+%{_libexecdir}/egcl/ppc64le-linux-static
 
 %files target-android
 %{_bindir}/egcl-android

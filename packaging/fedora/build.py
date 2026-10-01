@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,6 +18,18 @@ import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
+TARGETS = {
+    'native': 'x86_64-unknown-linux-gnu',
+    'static': 'x86_64-unknown-linux-musl',
+    's390x-linux': 's390x-unknown-linux-gnu',
+    'aarch64-linux': 'aarch64-unknown-linux-gnu',
+    'ppc64le-linux': 'powerpc64le-unknown-linux-gnu',
+    's390x-linux-static': 's390x-unknown-linux-musl',
+    'aarch64-linux-static': 'aarch64-unknown-linux-musl',
+    'ppc64le-linux-static': 'powerpc64le-unknown-linux-musl',
+    'windows': 'x86_64-pc-windows-gnu',
+    'android': 'aarch64-linux-android',
+}
 
 
 def run(command, *, env=None, cwd=ROOT):
@@ -46,12 +59,7 @@ def build(args):
     env.pop('CARGO_ENCODED_RUSTFLAGS', None)
     env.pop('RUSTFLAGS', None)
     env['CARGO_TARGET_DIR'] = str(target_dir)
-    targets = [('native', 'x86_64-unknown-linux-gnu'),
-               ('s390x-linux', 's390x-unknown-linux-gnu'),
-               ('aarch64-linux', 'aarch64-unknown-linux-gnu'),
-               ('ppc64le-linux', 'powerpc64le-unknown-linux-gnu'),
-               ('windows', 'x86_64-pc-windows-gnu'),
-               ('android', 'aarch64-linux-android')]
+    targets = {name: TARGETS[name] for name in (args.target or TARGETS)}
     # `git rev-parse HEAD` alone names a commit the payload may not correspond
     # to: a build from a dirty tree would claim provenance it does not have, and
     # build.json is the only record of what went into the RPM. Mark it.
@@ -61,13 +69,38 @@ def build(args):
                   'rustc': subprocess.check_output(['rustc', '--version'], text=True, env=env).strip(),
                   'sysroot_release': args.sysroot_release,
                   'android_ndk': (ndk / 'source.properties').read_text(), 'artifacts': {}}
-    for name, triple in targets:
+    for name, triple in targets.items():
         target_env = env.copy()
         suffix = '.exe' if name == 'windows' else ''
         directory = stage / 'usr/libexec/egcl' / name
         runtime = target_dir / triple / 'release' / f'egcl{suffix}'
         runner = []
-        if name.endswith('-linux'):
+        if name.endswith('-linux-static'):
+            arch = name.split('-')[0]
+            compiler_arch = 'powerpc64le' if arch == 'ppc64le' else arch
+            target_env['RUSTFLAGS'] = '-C target-feature=+crt-static'
+            if arch == 's390x':
+                musl = tools / 's390x-musl'
+                linker = musl / 'bin/s390x-linux-musl-gcc'
+                target_env['RUSTFLAGS'] += f' -C link-self-contained=no -L native={musl}/lib'
+                # Tier 3: opt into build-std only for this pinned-toolchain build.
+                target_env['RUSTC_BOOTSTRAP'] = '1'
+                provenance['s390x_musl'] = json.loads((musl / 'build.json').read_text())
+                shutil.copytree(musl / 'licenses', stage / 'usr/share/licenses' /
+                                f'egcl-target-{name}', dirs_exist_ok=True)
+            else:
+                # These Rust targets ship self-contained musl CRTs and libraries.
+                linker = output / f'{arch}-static-link'
+                linker.write_text('#!/bin/sh\nexec ' + shlex.join([
+                    str(tools / 'usr/bin' / f'{compiler_arch}-linux-gnu-gcc'),
+                    '-fuse-ld=bfd', f'-B{tools}/usr/{compiler_arch}-linux-gnu/bin/']) + ' "$@"\n')
+                linker.chmod(0o755)
+            target_env[f'CARGO_TARGET_{triple.upper().replace("-", "_")}_LINKER'] = str(linker)
+            for spelling in (triple, triple.replace('-', '_')):
+                target_env[f'CC_{spelling}'] = str(linker)
+                target_env[f'AR_{spelling}'] = str(tools / 'usr/bin' / f'{compiler_arch}-linux-gnu-ar')
+            runner = [f'qemu-{arch}']
+        elif name.endswith('-linux'):
             arch = name.split('-')[0]
             compiler_arch = 'powerpc64le' if arch == 'ppc64le' else arch
             sysroot = tools / 'usr' / f'{arch}-redhat-linux/sys-root' / args.sysroot_release
@@ -126,7 +159,9 @@ def build(args):
             runner = ['qemu-aarch64']
             copy(ndk / 'NOTICE', stage / 'usr/share/licenses/egcl-target-android/NOTICE')
         command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'egcl']
-        if name != 'windows':
+        if triple == 's390x-unknown-linux-musl':
+            command += ['-Z', 'build-std=std,panic_unwind']
+        if name not in ('windows', 'static') and not name.endswith('-static'):
             command += ['--features', 'egcl-rt/c-ffi']
         run([limited, *command], env=target_env)
         # Strip BEFORE dumping; stripping an appended image destroys its trailer.
@@ -134,15 +169,19 @@ def build(args):
         copy(runtime, stripped)
         strip_tools = {
             'native': 'strip',
+            'static': 'strip',
             'windows': 'x86_64-w64-mingw32-strip',
             'android': ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip',
             'ppc64le-linux': tools / 'usr/bin/powerpc64le-linux-gnu-strip',
             's390x-linux': tools / 'usr/bin/s390x-linux-gnu-strip',
             'aarch64-linux': tools / 'usr/bin/aarch64-linux-gnu-strip',
         }
-        strip = strip_tools[name]
+        strip = strip_tools[name.removesuffix('-static')]
         run([strip, '--strip-debug', stripped])
-        destination = bin_dir / 'egcl' if name == 'native' else directory / f'egcl{suffix}'
+        if name in ('native', 'static'):
+            destination = bin_dir / ('egcl' if name == 'native' else 'egcl-static')
+        else:
+            destination = directory / f'egcl{suffix}'
         destination.parent.mkdir(parents=True, exist_ok=True)
         dump_env = target_env | {'EGCL_IMAGE_OUT': str(destination)}
         if name == 'windows':
@@ -152,7 +191,7 @@ def build(args):
         if name == 'windows':
             run(['wineserver', '-k'], env=target_env)
         destination.chmod(0o755)
-        if name != 'native':
+        if name not in ('native', 'static'):
             launcher = bin_dir / f'egcl-{name}'
             copy(Path(__file__).with_name('egcl-cross'), launcher)
             launcher.chmod(0o755)
@@ -162,7 +201,10 @@ def build(args):
     docs.mkdir(parents=True, exist_ok=True)
     (docs / 'build.json').write_text(json.dumps(provenance, indent=2) + '\n')
     copy(ROOT / 'docs/fedora-rpm.md', docs / 'fedora-rpm.md')
-    run(['python3', Path(__file__).with_name('verify.py'), stage], env=env)
+    verification = ['python3', Path(__file__).with_name('verify.py'), stage]
+    for name in targets:
+        verification += ['--target', name]
+    run(verification, env=env)
     return stage
 
 
@@ -192,7 +234,9 @@ def source_archive(output, sources):
         archive.add(snapshot, arcname='egcl-source')
 
 
-def package(output, stage, ndk):
+def package(output, stage, ndk, release=None):
+    if release is not None and not re.fullmatch(r'[0-9]+(?:\.[A-Za-z0-9]+)*', release):
+        raise ValueError('RPM release must contain only dot-separated alphanumeric components')
     version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
     sources = output / 'SOURCES'
     sources.mkdir(parents=True, exist_ok=True)
@@ -200,10 +244,13 @@ def package(output, stage, ndk):
     with tarfile.open(sources / 'egcl-payload.tar.gz', 'w:gz') as archive:
         archive.add(stage, arcname='payload')
     source_archive(output, sources)
-    run(['rpmbuild', '-bb', ROOT / 'packaging/fedora/egcl.spec',
+    command = ['rpmbuild', '-bb', ROOT / 'packaging/fedora/egcl.spec',
          '--define', f'_topdir {output}', '--define', f'egcl_version {version}',
          '--define', 'egcl_rustup 1',
-         '--define', f'android_ndk {ndk.resolve()}'])
+         '--define', f'android_ndk {ndk.resolve()}']
+    if release is not None:
+        command += ['--define', f'egcl_release {release}']
+    run(command)
     extract_and_verify(output, stage)
 
 
@@ -249,9 +296,18 @@ if __name__ == '__main__':
     parser.add_argument('--tools', type=Path, default=ROOT / 'target/fedora-rpm/tools')
     parser.add_argument('--android-ndk', type=Path, required=True)
     parser.add_argument('--sysroot-release', default='fc44')
+    parser.add_argument('--release', help='Override RPM release (e.g. 0.test.123.1 for a prerelease)')
     parser.add_argument('--package-only', action='store_true', help='Repackage an existing stage; still verify the extracted RPMs')
+    parser.add_argument('--stage-only', action='store_true', help='Build and verify payloads without assembling RPMs')
+    parser.add_argument('--target', action='append', choices=TARGETS,
+                        help='With --stage-only, build just this payload (repeatable)')
     args = parser.parse_args()
+    if args.target and not args.stage_only:
+        parser.error('--target requires --stage-only; RPM releases must contain every target')
+    if args.stage_only and args.package_only:
+        parser.error('--stage-only and --package-only are mutually exclusive')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     stage = output / 'stage' if args.package_only else build(args)
-    package(output, stage, args.android_ndk)
+    if not args.stage_only:
+        package(output, stage, args.android_ndk, args.release)

@@ -17,7 +17,10 @@ fn main() {
         && (matches!(arch.as_str(), "x86_64" | "aarch64")
             || matches!(
                 target.as_str(),
-                "powerpc64le-unknown-linux-gnu" | "s390x-unknown-linux-gnu"
+                "powerpc64le-unknown-linux-gnu"
+                    | "powerpc64le-unknown-linux-musl"
+                    | "s390x-unknown-linux-gnu"
+                    | "s390x-unknown-linux-musl"
             ));
     if unix_fibers {
         println!("cargo:rustc-cfg=egcl_unix_fibers");
@@ -25,7 +28,10 @@ fn main() {
     if unix_fibers || (arch == "x86_64" && target.contains("windows")) {
         println!("cargo:rustc-cfg=egcl_fibers");
     }
-    if target == "powerpc64le-unknown-linux-gnu" {
+    if matches!(
+        target.as_str(),
+        "powerpc64le-unknown-linux-gnu" | "powerpc64le-unknown-linux-musl"
+    ) {
         println!("cargo:rerun-if-changed=src/native_transfer/ppc64le.S");
         println!("cargo:rerun-if-changed=src/context/ppc64le.S");
         cc::Build::new()
@@ -34,7 +40,10 @@ fn main() {
             .flag("-mabi=elfv2")
             .compile("egcl_native_transfer_ppc64le");
     }
-    if target == "s390x-unknown-linux-gnu" {
+    if matches!(
+        target.as_str(),
+        "s390x-unknown-linux-gnu" | "s390x-unknown-linux-musl"
+    ) {
         println!("cargo:rerun-if-changed=src/native_transfer/s390x.S");
         println!("cargo:rerun-if-changed=src/context/s390x.S");
         cc::Build::new()

@@ -25,6 +25,7 @@ for arch in s390x aarch64 ppc64le; do
         rpm2cpio "$package" | (cd "$root/targets/$arch" && cpio -idmu --quiet)
     done
 done
+python3 packaging/fedora/prepare-musl.py --tools "$root"
 if [[ -z ${ANDROID_NDK_HOME:-} ]]; then
     archive=$root/android-ndk-r27d-linux.zip
     if [[ ! -f $archive ]]; then

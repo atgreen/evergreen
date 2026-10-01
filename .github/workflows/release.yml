@@ -1,0 +1,96 @@
+name: Fedora releases
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'test publishes a prerelease; build only uploads workflow artifacts'
+        type: choice
+        options: [test, build]
+        default: test
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check packaging contracts
+        run: |
+          python3 packaging/fedora/test-release.py
+          python3 packaging/fedora/test-static-package.py
+          python3 packaging/fedora/test-native-content.py
+          python3 packaging/fedora/test-cross-launcher.py
+          python3 packaging/fedora/test-launcher.py
+      - name: Plan release
+        id: plan
+        env:
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: python3 packaging/fedora/release.py plan
+      - name: Install container runner
+        run: |
+          # These SDKs are unused; the Fedora build installs its own pinned NDK.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Build and verify all ten Fedora 44 RPMs
+        run: |
+          set -o pipefail
+          sudo bash packaging/fedora/ci-container.sh 2>&1 | tee target/fedora-release.log
+      - name: Upload complete release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-rpms
+          path: target/release-assets/
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload build log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-build-log
+          path: target/fedora-release.log
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora44-rpms
+          path: assets
+      - name: Verify assets and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          cd assets
+          sha256sum --check SHA256SUMS
+          flags=(--verify-tag)
+          if [[ "$PRERELEASE" == true ]]; then
+            flags=(--target "$COMMIT" --prerelease --latest=false)
+          fi
+          # Keep incomplete uploads invisible; expose only the complete release.
+          gh release create "$RELEASE_TAG" --draft "${flags[@]}" \
+            --title "EGCL $RELEASE_TAG" --notes-file CHANGELOG.md ./*
+          gh release edit "$RELEASE_TAG" --draft=false

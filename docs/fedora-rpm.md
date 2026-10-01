@@ -1,18 +1,32 @@
 # Fedora RPMs and cross image-dumping tools
 
-This experimental packaging path builds native x86-64 Fedora EGCL and five
-optional target packages. Both building and using them are container-free.
+This experimental packaging path builds glibc and musl x86-64 EGCL and eight
+optional target packages. Local building and installed use are container-free;
+GitHub Actions uses a Fedora container on its Ubuntu runner.
 It produces local binary RPMs; it is not yet a Fedora-reviewed source RPM.
 The initial build baseline is Fedora 44 and Rust 1.94.1.
 
 | Package | Command | Application target | Host runner |
 | --- | --- | --- | --- |
 | `egcl` | `egcl` | Fedora x86-64, glibc | Native |
+| `egcl-static` | `egcl-static` | Linux x86-64, static musl | Native |
 | `egcl-target-s390x-linux` | `egcl-s390x-linux` | Fedora s390x | QEMU |
 | `egcl-target-aarch64-linux` | `egcl-aarch64-linux` | Fedora AArch64 | QEMU |
 | `egcl-target-ppc64le-linux` | `egcl-ppc64le-linux` | Fedora ppc64le (little-endian POWER) | QEMU |
+| `egcl-target-s390x-linux-static` | `egcl-s390x-linux-static` | Linux s390x, static musl | QEMU |
+| `egcl-target-aarch64-linux-static` | `egcl-aarch64-linux-static` | Linux AArch64, static musl | QEMU |
+| `egcl-target-ppc64le-linux-static` | `egcl-ppc64le-linux-static` | Linux ppc64le, static musl | QEMU |
 | `egcl-target-windows` | `egcl-windows` | Windows x86-64 | Wine |
 | `egcl-target-android` | `egcl-android`, `egcl-android-new` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
+
+The normal `egcl` command uses glibc and supports JVM integration. `egcl-static`
+is a separate subpackage with no dependency on the main package or its JVM;
+its runtime and saved executables have no dynamic loader or shared-library
+dependencies. Both binaries can be installed together.
+The three cross Linux `-static` packages likewise run without a target sysroot
+and can be installed independently of `egcl`. Their launchers use QEMU, but the
+executables they save run directly on the target architecture. Static runtimes
+do not provide the glibc runtime's dynamic shared-library FFI or JVM integration.
 
 Each command-line runtime has ASDF preloaded. Target tools accept the normal EGCL arguments;
 they execute the target runtime on the Fedora host, where it can load an
@@ -24,12 +38,14 @@ translate an existing x86-64 heap image into another platform's image.
 Install host prerequisites (Rust through rustup):
 
 ```sh
-sudo dnf install gcc binutils rpm-build rpm cpio python3 curl unzip \
+sudo dnf install gcc clang binutils rpm-build rpm cpio python3 curl unzip \
     qemu-user wine mingw64-gcc mingw64-binutils glibc make java-devel \
     mkdocs mkdocs-material
 rustup toolchain install 1.94.1 --profile minimal
-rustup target add --toolchain 1.94.1 x86_64-unknown-linux-gnu s390x-unknown-linux-gnu \
+rustup target add --toolchain 1.94.1 x86_64-unknown-linux-gnu x86_64-unknown-linux-musl s390x-unknown-linux-gnu \
     aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-linux-android x86_64-linux-android
+rustup target add --toolchain 1.94.1 aarch64-unknown-linux-musl powerpc64le-unknown-linux-musl
+rustup component add --toolchain 1.94.1 rust-src
 bash packaging/fedora/prepare-tools.sh
 python3 packaging/fedora/build.py \
     --android-ndk target/fedora-rpm/tools/android-ndk-r27d
@@ -41,6 +57,14 @@ downloads Google's NDK r27d and checks the published checksum. It does not insta
 foreign RPMs in the host RPM database, require root, or invoke containers.
 Use `ANDROID_NDK_HOME` to supply an existing NDK and avoid that download; pass the
 same directory to `build.py --android-ndk`.
+
+Rust supplies prebuilt musl standard libraries for x86-64, AArch64 and POWER.
+For s390x, the preparation script builds checksum-pinned musl 1.2.5 and LLVM
+libunwind 21.1.8 using Fedora's cross GCC and Clang. The builder then uses
+`-Z build-std=std,panic_unwind` with `RUSTC_BOOTSTRAP=1` scoped to the s390x musl
+build on the pinned Rust toolchain. This avoids requiring an s390x build host
+or changing the project's compiler version. The saved runtime includes these
+libraries statically; installed users need none of the build tools.
 
 The build uses ordinary `cargo`, native MinGW, Fedora cross-GCC and the NDK.
 The native RPM includes the `JAVA` and `EGCL-JVM` APIs as the ASDF system
@@ -83,6 +107,42 @@ in an isolated working directory without application sources.
 `--package-only` reuses the staged CLI images, rebuilds both Android app libraries
 from current source in `%build`, and verifies the extracted RPMs. Use it only
 when deliberately reusing that stage's CLI binaries.
+For a focused build, `--stage-only --target s390x-linux-static` builds and
+verifies that payload without producing an incomplete RPM release. Repeat
+`--target` to select additional payloads.
+
+## GitHub releases
+
+The **Fedora releases** workflow builds and verifies all ten RPMs on Fedora
+44, including the glibc `egcl` and musl `egcl-static` packages. It runs the same
+packaging checks described above, with systemd memory limits inside its Fedora
+container. Runs finish independently when newer commits are pushed.
+
+For a test release, select **Actions → Fedora releases → Run workflow**, choose
+the branch and leave `mode` set to `test`. The equivalent CLI command is:
+
+```sh
+gh workflow run release.yml --ref main -f mode=test
+```
+
+This publishes a prerelease tagged `test-v0.0.1-RUN_ID-ATTEMPT`. It does not
+become GitHub's latest stable release. Its RPM release is
+`0.test.RUN_ID.ATTEMPT.fc44`, which sorts below the stable release for the same
+version. Install matching versions of the main and target subpackages together.
+
+Choose `mode=build` to exercise the entire build and download the RPMs from the
+workflow's `fedora44-rpms` artifact without creating a tag or GitHub release.
+
+For a stable release, update the workspace version and changelog, commit them,
+then push a matching version tag, for example `v0.0.1`. The workflow rejects a
+tag that differs from the workspace version. Stable RPMs use the spec's release
+number (currently `6.fc44`). An existing release is never overwritten; a failed
+upload can leave a draft for inspection before retrying.
+
+Published assets include all ten RPMs, `CHANGELOG.md`, build provenance,
+release metadata, and `SHA256SUMS`. Publication runs only after package identity,
+payload, and runtime checks pass, with write permission confined to the publish
+job. RPMs are not GPG-signed by this workflow.
 
 ## Install and use
 
@@ -108,7 +168,8 @@ and forward slashes work conveniently under Wine.
 
 The output includes EGCL and the saved application. QEMU/Wine are needed only
 on the build host, not on the target. Linux applications still require compatible
-glibc and libgcc on the deployment system: a Fedora 44 build is not a promise of
+glibc and libgcc on the deployment system, except for the `-static` variants.
+A Fedora 44 glibc build is not a promise of
 compatibility with older RHEL, Ubuntu, or SUSE releases. Android uses static
 bionic and does not need the builder's sysroot; it is a CLI executable, not an
 APK, and cannot dynamically load Android shared libraries. Device execution

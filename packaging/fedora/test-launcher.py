@@ -26,7 +26,7 @@ class LauncherTests(unittest.TestCase):
                         XDG_DATA_HOME=str(self.root / 'data'),
                         RECORD=str(self.root / 'record'))
         self.env.pop('WINEPREFIX', None)
-        for tool in ['qemu-s390x', 'qemu-aarch64', 'wine']:
+        for tool in ['qemu-s390x', 'qemu-aarch64', 'qemu-ppc64le', 'wine']:
             path = self.bin / tool
             path.write_text('#!/usr/bin/python3\nimport json, os, sys\n'
                             'open(os.environ["RECORD"], "w").write(json.dumps('
@@ -62,6 +62,17 @@ class LauncherTests(unittest.TestCase):
         argv, _ = json.loads((self.root / 'record').read_text())
         self.assertNotIn('-L', argv)
         self.assertEqual(argv[-2:], ['--eval', '(+ 1 2)'])
+
+    def test_linux_static_variants_need_no_sysroot_and_preserve_arguments(self):
+        for arch in ('s390x', 'aarch64', 'ppc64le'):
+            target = f'{arch}-linux-static'
+            with self.subTest(target=target):
+                args = ['--load', 'a file.lisp', '--', 'literal $HOME; x']
+                result = self.run_target(target, args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv, _ = json.loads((self.root / 'record').read_text())
+                runtime = self.root / 'targets' / target / 'egcl'
+                self.assertEqual(argv, [str(self.bin / f'qemu-{arch}'), str(runtime), *args])
 
     def test_windows_uses_private_prefix(self):
         result = self.run_target('windows')

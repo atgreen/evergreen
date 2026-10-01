@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+import importlib.util
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location('rpm_release', Path(__file__).with_name('release.py'))
+release = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(release)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_tag_must_match_workspace_version(self):
+        plan = release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.1', '123', '1', '')
+        self.assertEqual(plan['tag'], 'v0.0.1')
+        self.assertFalse(plan['prerelease'])
+        with self.assertRaisesRegex(ValueError, 'version'):
+            release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.2', '123', '1', '')
+
+    def test_manual_test_has_unique_tag_and_lower_rpm_release(self):
+        plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '2', 'test')
+        self.assertEqual(plan['tag'], 'test-v0.0.1-123-2')
+        self.assertTrue(plan['prerelease'])
+        self.assertTrue(plan['publish'])
+        self.assertEqual(plan['rpm_release'], '0.test.123.2')
+
+    def test_build_only_does_not_publish(self):
+        plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
+        self.assertFalse(plan['publish'])
+
+    def test_rejects_unexpected_events_and_untrusted_identifiers(self):
+        for args in [
+            ('0.0.1', 'pull_request', 'refs/pull/1/merge', '123', '1', 'test'),
+            ('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'release'),
+            ('0.0.1', 'workflow_dispatch', 'refs/heads/main', 'bad\noutput=true', '1', 'test'),
+        ]:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                release.make_plan(*args)
+
+    def test_missing_duplicate_or_wrong_build_rpm_blocks_publication(self):
+        records = [(name, '0.0.1', '0.test.123.1.fc44', 'x86_64')
+                   for name in sorted(release.PACKAGES)]
+        release.validate_packages(records, '0.0.1', '0.test.123.1')
+        for bad in [records[:-1], records + [records[0]],
+                    records[:-1] + [('egcl-static', '0.0.2', '6.fc44', 'x86_64')]]:
+            with self.subTest(records=bad), self.assertRaises(ValueError):
+                release.validate_packages(bad, '0.0.1', '0.test.123.1')
+
+    def test_collect_checks_complete_set_and_hashes_every_asset(self):
+        plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rpms = root / 'rpms'
+            rpms.mkdir()
+            for name in release.PACKAGES:
+                (rpms / f'{name}.rpm').write_bytes(name.encode())
+            (root / 'CHANGELOG.md').write_text('Release notes\n')
+            provenance = root / 'target/fedora-rpm/stage/usr/share/doc/egcl/build.json'
+            provenance.parent.mkdir(parents=True)
+            provenance.write_text('{"git": "test-commit"}\n')
+
+            def identity(command, **kwargs):
+                return f'{Path(command[-1]).stem}\t0.0.1\t0.test.123.1.fc44\tx86_64'
+
+            with patch.object(release, 'ROOT', root), patch.object(
+                    release.subprocess, 'check_output', side_effect=identity):
+                destination = root / 'assets'
+                release.collect(rpms, destination, plan)
+                self.assertEqual(json.loads((destination / 'release.json').read_text()), plan)
+                entries = (destination / 'SHA256SUMS').read_text().splitlines()
+                self.assertEqual(len(entries), 13)
+                for entry in entries:
+                    digest, name = entry.split('  ')
+                    self.assertEqual(digest, hashlib.sha256((destination / name).read_bytes()).hexdigest())
+                with self.assertRaisesRegex(ValueError, 'empty'):
+                    release.collect(rpms, destination, plan)
+                (rpms / 'egcl-static.rpm').unlink()
+                with self.assertRaisesRegex(ValueError, '10 RPMs'):
+                    release.collect(rpms, root / 'incomplete', plan)
+                self.assertFalse((root / 'incomplete').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

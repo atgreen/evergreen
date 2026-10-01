@@ -11,15 +11,30 @@ import tempfile
 
 TARGETS = {
     'native': (':x86-64', ':linux'),
+    'static': (':x86-64', ':linux'),
     's390x-linux': (':s390x', ':big-endian'),
     'aarch64-linux': (':arm64', ':linux'),
     'ppc64le-linux': (':ppc64le', ':little-endian', ':linux'),
+    's390x-linux-static': (':s390x', ':big-endian', ':linux'),
+    'aarch64-linux-static': (':arm64', ':linux'),
+    'ppc64le-linux-static': (':ppc64le', ':little-endian', ':linux'),
     'windows': (':x86-64', ':windows'),
     'android': (':arm64', ':android'),
 }
 
 
-def verify(root, limited):
+def verify_linux_linkage(command, *, static):
+    env = dict(os.environ, LC_ALL='C')
+    headers = subprocess.check_output(['readelf', '-lW', str(command)], text=True, env=env)
+    dependencies = subprocess.check_output(['readelf', '-dW', str(command)], text=True, env=env)
+    if static:
+        if 'INTERP' in headers or '(NEEDED)' in dependencies:
+            raise RuntimeError(f'{command}: egcl-static must have no interpreter or shared dependencies')
+    elif 'INTERP' not in headers or 'libc.so.6' not in dependencies:
+        raise RuntimeError(f'{command}: egcl must be dynamically linked against glibc')
+
+
+def verify(root, limited, targets=None):
     root = root.resolve()
     env = dict(os.environ, EGCL_CROSS_ROOT=str(root / 'usr/libexec/egcl'),
                WINEDEBUG='-all')
@@ -28,10 +43,15 @@ def verify(root, limited):
         cwd = Path(temporary)
         env['WINEPREFIX'] = str(cwd / 'wine')
         try:
-            for target in TARGETS:
+            for target in (targets or TARGETS):
                 command = root / 'usr/bin' / ('egcl' if target == 'native' else f'egcl-{target}')
                 if not command.is_file():
                     raise RuntimeError(f'Missing packaged command: {command}')
+                is_static = target == 'static' or target.endswith('-static')
+                if is_static or target == 'native':
+                    payload = (command if target in ('native', 'static') else
+                               root / 'usr/libexec/egcl' / target / 'egcl')
+                    verify_linux_linkage(payload, static=is_static)
                 exe = cwd / ('application.exe' if target == 'windows' else 'application')
                 # Windows sees the same current directory through Wine. Relative
                 # paths avoid requiring a drive mapping in the Lisp source.
@@ -52,16 +72,34 @@ def verify(root, limited):
                     return result.stdout
                 checks = ''.join(f'(assert (member {feature} *features*))'
                                  for feature in TARGETS[target])
+                if is_static or target == 'native':
+                    arch = 'x86_64' if target in ('native', 'static') else target.split('-')[0]
+                    arch = 'powerpc64le' if arch == 'ppc64le' else arch
+                    triple = f'{arch}-unknown-linux-' + ('musl' if is_static else 'gnu')
+                    if f'target={triple}' not in run([command, '--runtime-info']).splitlines():
+                        raise RuntimeError(f'{command}: wrong runtime target, expected {triple}')
                 output = run([command, '--no-init', '--eval',
                               '(progn (assert (stringp (asdf:asdf-version)))' + checks +
                               '(format t "RPM-EVAL-OK~%"))'])
                 if 'RPM-EVAL-OK' not in output:
                     raise RuntimeError(f'{target}: unexpected evaluation output: {output}')
+                if is_static:
+                    output = run([command, '--no-init', '--eval',
+                                  "(progn (assert (equal '(42) (egcl-fiber:run-fibers "
+                                  '(list (egcl-fiber:make-fiber (lambda () '
+                                  '(egcl-fiber:fiber-yield) 42))) :carrier-count 1))) '
+                                  '(format t "RPM-FIBER-OK~%"))'])
+                    if 'RPM-FIBER-OK' not in output:
+                        raise RuntimeError(f'{target}: fiber yield/resume failed: {output}')
                 run([command, '--no-init', '--load', 'dump.lisp'])
                 if not exe.is_file():
                     raise RuntimeError(f'{target}: executable was not dumped')
-                if target == 'native':
+                if is_static or target == 'native':
+                    verify_linux_linkage(exe, static=is_static)
+                if target in ('native', 'static'):
                     runner = []
+                elif is_static:
+                    runner = [f'qemu-{target.split("-")[0]}']
                 elif target == 'windows':
                     runner = ['wine']
                 elif target == 'android':
@@ -92,5 +130,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
     parser.add_argument('--limited', type=Path, default=Path(__file__).resolve().parents[2] / 'scripts/egcl-limited.sh')
+    parser.add_argument('--target', action='append', choices=TARGETS,
+                        help='Verify only this package (repeatable; default: all)')
     args = parser.parse_args()
-    verify(args.root, args.limited.resolve())
+    verify(args.root, args.limited.resolve(), args.target)
