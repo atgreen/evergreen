@@ -693,6 +693,36 @@ fn allocate_with_call_operands(
 
     let adapter = Adapter::build(mf, call_clobbers, stack_call_operands);
 
+    // Ion 0.15.2 underflows ProgPoint::prev while diagnosing an impossible
+    // register demand at instruction zero. Report that demand ourselves so
+    // the framed allocator can retry its larger register pool normally.
+    // Uses and defs occupy separate phases; repeated uses of one vreg need
+    // only one register, and Any operands may spill.
+    let capacity: [usize; 3] = std::array::from_fn(|class| {
+        env.preferred_regs_by_class[class].into_iter().count()
+            + env.non_preferred_regs_by_class[class].into_iter().count()
+    });
+    let mut required: [Vec<Ra2VReg>; 6] = std::array::from_fn(|_| Vec::new());
+    for operands in &adapter.operands {
+        for regs in &mut required {
+            regs.clear();
+        }
+        for operand in operands {
+            if operand.constraint() != OperandConstraint::Reg {
+                continue;
+            }
+            let class = operand.class() as usize;
+            let phase = usize::from(operand.pos() == OperandPos::Late);
+            let regs = &mut required[class * 2 + phase];
+            if !regs.contains(&operand.vreg()) {
+                regs.push(operand.vreg());
+                if regs.len() > capacity[class] {
+                    return Err(RegAllocError::TooManyLiveRegs);
+                }
+            }
+        }
+    }
+
     let options = RegallocOptions {
         verbose_log: false,
         // Inputs are already SSA-shaped (lowering's contract): a single def per
@@ -843,6 +873,61 @@ mod tests {
             deopt_uses: Vec::new(),
             safepoint: false,
         }
+    }
+
+    fn entry_call(nargs: u32) -> MachFunc {
+        let args: Vec<_> = (0..nargs).map(|n| vreg(RegClass::Gpr, n)).collect();
+        let result = vreg(RegClass::Gpr, nargs);
+        MachFunc {
+            insts: vec![
+                inst(crate::t2::lower::op::CALL, vec![result], args.clone()),
+                inst(0, vec![], vec![result]),
+            ],
+            blocks: vec![MachBlock {
+                params: args,
+                start: 0,
+                end: 2,
+                succs: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn entry_call_pressure_retries_with_the_full_register_pool() {
+        let mut mf = entry_call(6);
+        assert!(matches!(
+            allocate_with_env(&mut mf, framed_machine_env(true), x86_call_clobbers()),
+            Err(RegAllocError::TooManyLiveRegs)
+        ));
+        allocate_framed(&mut mf).expect("six arguments fit the full register pool");
+    }
+
+    #[test]
+    fn impossible_entry_call_pressure_returns_an_error() {
+        assert!(matches!(
+            allocate_framed(&mut entry_call(9)),
+            Err(RegAllocError::TooManyLiveRegs)
+        ));
+    }
+
+    #[test]
+    fn repeated_call_arguments_share_one_register() {
+        let mut mf = entry_call(1);
+        mf.insts[0].uses = vec![vreg(RegClass::Gpr, 0); 9];
+        allocate_with_env(&mut mf, framed_machine_env(true), x86_call_clobbers())
+            .expect("repeated arguments do not increase register pressure");
+    }
+
+    #[test]
+    fn stack_call_arguments_are_not_counted_as_required_registers() {
+        allocate_with_call_operands(
+            &mut entry_call(12),
+            framed_machine_env(true),
+            x86_call_clobbers(),
+            true,
+        )
+        .expect("Any operands can spill even at the entry instruction");
     }
 
     /// A small SSA-shaped straight-line function over two GPR vregs and one XMM

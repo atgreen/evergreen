@@ -2192,3 +2192,25 @@ fn redefining_a_declined_function_allows_promotion_again() {
         "a redefined, now-compilable function stayed stuck at T0: {stdout}\n{stderr}"
     );
 }
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn six_argument_forwarder_reaches_t2_without_allocator_panic() {
+    let (out, ok) = run(
+        "(defun consume-six (a b c d e f) (list a b c d e f))
+         (defun forward-six (a b c d e f) (consume-six a b c d e f))
+         (dotimes (i 20)
+           (assert (equal (forward-six 1 2 3 4 5 6) '(1 2 3 4 5 6))))
+         (format t \"forward-tier=~A result=~S~%\"
+           (egcl-ext:function-tier 'forward-six)
+           (forward-six 6 5 4 3 2 1))",
+        &[
+            ("EGCL_T2", "1"),
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "{out}");
+    assert!(!out.contains("panicked"), "{out}");
+    assert!(out.contains("forward-tier=2 result=(6 5 4 3 2 1)"), "{out}");
+}
