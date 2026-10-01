@@ -17,8 +17,8 @@ Tiers are defined in [How Lisp runs](../explanation/execution.md).
 
 An older installed RPM may predate backend additions in this checkout.
 Unsupported native compilation shapes remain in a supported lower tier.
-The AArch64 port does not yet provide the x86-64 fiber context-switch and
-foreign-callback implementations. This is not full architecture parity.
+Stackful fibers support Unix x86-64 and AArch64 (including Android), Linux
+ppc64le and s390x, and Windows x86-64. This is not full architecture parity.
 
 ## Fedora package commands
 

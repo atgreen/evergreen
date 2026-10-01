@@ -1,9 +1,9 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
 
 static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -59,8 +59,7 @@ fn allocation_preemption_refreshes_carrier_state_and_preserves_fiber_state() {
     .unwrap();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 4 }).unwrap();
     for _ in 0..64 {
-        let entry =
-            unsafe { EgclVal::from_function_ptr(allocating_fiber as *const () as *mut u8) };
+        let entry = native_entry::entry(allocating_fiber);
         group
             .submit(egcl_rt::thread::make_fiber(entry).unwrap())
             .unwrap();
@@ -90,3 +89,6 @@ fn allocation_preemption_refreshes_carrier_state_and_preserves_fiber_state() {
         );
     }
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

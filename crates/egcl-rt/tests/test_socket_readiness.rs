@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Readiness is multiplexed independently of the number of waiting fibers.
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
+use egcl_rt::sync::{IoInterest, wait_socket};
+use egcl_rt::thread::{FiberState, fiber_state, make_fiber};
+use egcl_rt::value::EgclVal;
+use egcl_rt::{SchedulerConfig, SchedulerGroup};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use egcl_rt::sync::{IoInterest, wait_socket};
-use egcl_rt::thread::{FiberState, fiber_state, make_fiber};
-use egcl_rt::value::EgclVal;
-use egcl_rt::{SchedulerConfig, SchedulerGroup};
 
 static SOCKETS: OnceLock<Vec<TcpStream>> = OnceLock::new();
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -44,7 +44,7 @@ fn many_waiting_sockets_share_one_carrier_and_bounded_service_threads() {
     let baseline_threads = std::fs::read_dir("/proc/self/task").unwrap().count();
     let mut fibers = Vec::new();
     for _ in 0..COUNT {
-        let entry = unsafe { EgclVal::from_function_ptr(wait_for_peer as *const () as *mut u8) };
+        let entry = native_entry::entry(wait_for_peer);
         let fiber = make_fiber(entry).unwrap();
         fibers.push(fiber);
         group.submit(fiber).unwrap();
@@ -115,3 +115,6 @@ fn native_timeout_keeps_its_deadline_when_signals_interrupt_poll() {
         "signals restarted timeout: {elapsed:?}"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

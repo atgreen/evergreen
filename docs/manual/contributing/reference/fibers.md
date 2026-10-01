@@ -4,13 +4,34 @@ This page documents the implemented Rust interfaces in `egcl_rt`. The
 [public Lisp interface](../../fibers.md) is installed by the bootstrap and uses these runtime fibers.
 The runtime API is under development; treat IDs as process-local handles.
 
+## Native contexts
+
+`thread::FIBERS_SUPPORTED` reports whether the build has a stackful backend.
+Unix contexts are saved stack pointers; each backend keeps its register state
+on the suspended stack. Windows x86-64 uses OS fibers.
+
+| Unix backend | Saved state | Initial caller area |
+| --- | --- | --- |
+| x86-64 SysV | RBX, RBP, R12–R15, return PC | Entry RSP is 8 modulo 16 |
+| AArch64 | X19–X30, D8–D15, FPCR, FPSR | 16-byte aligned SP |
+| PPC64LE ELFv2 | R14–R31, F14–F31, V20–V31, CR, TOC, LR, FPSCR, VSCR, VRSAVE | 32-byte linkage area, 16-byte aligned SP |
+| s390x ELF64 | R6–R14, F8–F15, FPC | 160-byte caller save area |
+
+The new backends follow [AAPCS64](https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst),
+[ELFv2](https://openpowerfoundation.org/specifications/64bitelfabi/), and
+[s390x ELF64](https://ibm.github.io/s390x-abi/).
+Carrier thread-pointer registers are not restored from a fiber's saved context.
+Carrier-local accessors must also recompute TLS addresses after migration:
+the compiler can otherwise retain a former carrier's TLS address across a yield.
+`current_fiber`, `cached_tid`, fault-slot lookup, and root-list lookup keep those
+address computations in separate calls.
+
 ## Run two fibers { #example }
 
-This example uses native Rust entry functions on x86-64 Unix or Windows. The
-unsafe conversion is valid only for a function with the runtime entry ABI
-`fn() -> EgclVal`; it is not a general conversion of a Lisp closure or foreign
-function pointer. An embedding that runs Lisp callables installs its entry
-runner through `thread::set_thread_entry_runner`.
+This example registers a host entry runner on any supported fiber target.
+The runner is installed once per process; an embedding that runs Lisp callables
+uses that same hook for its evaluator. Arbitrary Rust function pointers cannot
+be tagged directly: their alignment can be smaller than the tag's eight bytes.
 
 ```rust
 use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
@@ -24,10 +45,14 @@ fn answer() -> EgclVal {
 fn main() -> Result<(), egcl_rt::EgclError> {
     current_thread_id();
     egcl_rt::gc::ensure_heap_initialized();
-    // SAFETY: answer has the runtime's native entry signature.
-    let entry = unsafe {
-        EgclVal::from_function_ptr(answer as *const () as *mut u8)
-    };
+    egcl_rt::thread::set_thread_entry_runner(|entry| {
+        if entry == EgclVal::from_fixnum(1) {
+            Ok(answer())
+        } else {
+            Err(egcl_rt::EgclError::TypeError { datum: entry, expected: "function".into() })
+        }
+    });
+    let entry = EgclVal::from_fixnum(1);
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 })?;
     group.submit(make_fiber(entry)?)?;
     group.submit(make_fiber(entry)?)?;

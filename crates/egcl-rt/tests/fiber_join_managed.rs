@@ -1,15 +1,15 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::OnceLock;
 use egcl_rt::thread::{current_fiber, join_fiber, make_fiber};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
+use std::sync::OnceLock;
 
 static GROUP: OnceLock<SchedulerGroup> = OnceLock::new();
 
 fn function(entry: fn() -> EgclVal) -> EgclVal {
-    unsafe { EgclVal::from_function_ptr(entry as *const () as *mut u8) }
+    native_entry::entry(entry)
 }
 
 fn collecting_child() -> EgclVal {
@@ -122,3 +122,6 @@ fn pinned_native_join_allows_collection_on_another_carrier() {
         2,
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

@@ -7,7 +7,9 @@ threads created by `egcl-thread:make-thread` remain dedicated OS threads.
 ## Availability { #availability }
 
 The `EGCL-FIBER` Lisp package is loaded by the standard bootstrap. Stackful
-fibers are supported on x86-64 Unix and Windows. Native Windows validation is
+fibers are supported on Unix x86-64 and AArch64 (including Android), Linux
+ppc64le and s390x, and Windows x86-64. Unix backends save native register and
+stack state directly, so they also work without libc `ucontext`. Native Windows validation is
 separate from testing under Wine. See [Platform support](user/reference/platforms.md).
 
 The lower-level Rust interface is documented in

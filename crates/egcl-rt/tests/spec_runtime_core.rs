@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::path::PathBuf;
-use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use egcl_rt::error::EgclError;
 use egcl_rt::ffi::{AlienType, Callback, ffi_call, marshal_to_c, unmarshal_from_c};
 use egcl_rt::gc::{register_finalizer, set_finalizer_dispatch};
@@ -18,10 +13,15 @@ use egcl_rt::thread::{
     FiberId, FiberState, current_fiber, current_stack, current_thread, fiber_yield, join_fiber,
     make_fiber, submit_fiber,
 };
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
 use egcl_rt::{
     LogLevel, Runtime, RuntimeConfig, enter_safepoint, install_signal_handlers, parse_cli,
 };
+use std::path::PathBuf;
+use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 fn serial_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -448,7 +448,7 @@ fn startup_requires_image_load_unless_the_cli_selects_bootstrap_mode() {
 fn fibers_run_user_functions_through_the_carrier_pool() {
     let _guard = lock_serial();
     // Per R2.04, fibers are multiplexed M:N onto exposed carrier threads.
-    let entry = unsafe { EgclVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let entry = native_entry::entry(fiber_returns_seven);
     let ids: Vec<_> = (0..8).map(|_| spawn_fiber(entry)).collect();
     let results: Vec<_> = ids
         .into_iter()
@@ -463,7 +463,7 @@ fn fiber_record_publishes_stack_roots() {
     let _guard = lock_serial();
     // A managed fiber publishes its stack roots (SP/FP) at a safepoint so the
     // collector can scan them while it is suspended (bliss-jtc.14.2).
-    let entry = unsafe { EgclVal::from_function_ptr(fiber_record_check as *const () as *mut u8) };
+    let entry = native_entry::entry(fiber_record_check);
     assert_eq!(join_fiber(spawn_fiber(entry)).unwrap().as_fixnum(), 7);
 }
 
@@ -495,7 +495,7 @@ fn many_fibers_complete_via_work_stealing() {
     let _guard = lock_serial();
     // Far more tasks than workers forces the per-worker deques to fill unevenly
     // and idle workers to steal (bliss-jtc.14.1); every task must still complete.
-    let entry = unsafe { EgclVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let entry = native_entry::entry(fiber_returns_seven);
     let ids: Vec<_> = (0..200).map(|_| spawn_fiber(entry)).collect();
     let results: Vec<_> = ids
         .into_iter()
@@ -512,8 +512,7 @@ fn many_fibers_complete_via_work_stealing() {
 fn fibers_have_distinct_cl_stacks_from_each_other_and_from_the_caller() {
     let _guard = lock_serial();
     // Per R2.05, each fiber maintains its own CL stack.
-    let entry =
-        unsafe { EgclVal::from_function_ptr(fiber_reports_stack_base as *const () as *mut u8) };
+    let entry = native_entry::entry(fiber_reports_stack_base);
     // Capture the caller's stack base *first*. current_thread() lazily creates
     // this thread's bootstrap CL stack, so it must be materialized before the
     // fibers are spawned and freed — otherwise the allocator can hand the
@@ -729,9 +728,7 @@ fn ffi_calls_transition_fibers_to_native_state() {
     let _guard = lock_serial();
     // Per R2.15, FFI calls transition the calling fiber into Native state.
     OBSERVED_THREAD_STATE.store(0xFF, Ordering::SeqCst);
-    let entry = unsafe {
-        EgclVal::from_function_ptr(fiber_calls_ffi_and_returns_nil as *const () as *mut u8)
-    };
+    let entry = native_entry::entry(fiber_calls_ffi_and_returns_nil);
     let id = spawn_fiber(entry);
     assert_eq!(join_fiber(id).unwrap(), NIL);
     assert_eq!(
@@ -755,7 +752,7 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
     let finalizer = UNBOUND;
     register_finalizer(object, finalizer).unwrap();
 
-    let slow_entry = unsafe { EgclVal::from_function_ptr(slow_fiber as *const () as *mut u8) };
+    let slow_entry = native_entry::entry(slow_fiber);
     let slow_fiber = spawn_fiber(slow_entry);
     let started = Instant::now();
     runtime.shutdown().unwrap();
@@ -785,7 +782,7 @@ fn shutdown_runs_registered_finalizers_and_waits_for_in_flight_workers() {
 fn runtime_accepts_large_fiber_populations_without_exhausting_the_api() {
     let _guard = lock_serial();
     // Per R2.19, the runtime supports large populations of simultaneous fibers.
-    let entry = unsafe { EgclVal::from_function_ptr(fiber_returns_seven as *const () as *mut u8) };
+    let entry = native_entry::entry(fiber_returns_seven);
     let ids: Vec<_> = (0..1024).map(|_| spawn_fiber(entry)).collect();
     for id in ids {
         assert_eq!(join_fiber(id).unwrap().as_fixnum(), 7);
@@ -1156,3 +1153,6 @@ fn spec_runtime_core_subprocess_helper() {
         _ => {}
     }
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

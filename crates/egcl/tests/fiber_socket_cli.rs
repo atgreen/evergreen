@@ -2,7 +2,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! A waiting TCP stream must release the sole carrier to other Lisp fibers.
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(all(
+    target_pointer_width = "64",
+    any(
+        all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(
+            target_vendor = "unknown",
+            target_os = "linux",
+            target_env = "gnu",
+            any(
+                all(target_arch = "powerpc64", target_endian = "little"),
+                target_arch = "s390x"
+            )
+        ),
+        all(windows, target_arch = "x86_64")
+    )
+))]
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

@@ -1,10 +1,10 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use egcl_rt::thread::{FiberId, fiber_state, make_fiber};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static FIRST: AtomicU64 = AtomicU64::new(0);
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
@@ -31,11 +31,11 @@ fn second() -> EgclVal {
 #[test]
 fn finish_roots_early_results_while_later_fibers_collect() {
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 2 }).unwrap();
-    let entry = unsafe { EgclVal::from_function_ptr(first as *const () as *mut u8) };
+    let entry = native_entry::entry(first);
     let id = make_fiber(entry).unwrap();
     FIRST.store(id.0, Ordering::Release);
     group.submit(id).unwrap();
-    let entry = unsafe { EgclVal::from_function_ptr(second as *const () as *mut u8) };
+    let entry = native_entry::entry(second);
     group.submit(make_fiber(entry).unwrap()).unwrap();
     let results = group.finish().unwrap();
     assert_eq!(
@@ -53,3 +53,6 @@ fn finish_roots_early_results_while_later_fibers_collect() {
         42.0
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

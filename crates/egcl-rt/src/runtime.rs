@@ -363,9 +363,7 @@ impl RuntimeConfig {
                 }
                 "--workers" => {
                     if i + 1 >= args.len() {
-                        return Err(EgclError::Internal(
-                            "--workers requires an argument".into(),
-                        ));
+                        return Err(EgclError::Internal("--workers requires an argument".into()));
                     }
                     self.num_workers = parse_usize(&args[i + 1], "--workers")?;
                     i += 2;
@@ -1532,6 +1530,8 @@ fn clear_sigsegv_recovery_slot(i: usize) {
     SIGSEGV_RECOVERY_TIDS[i].store(0, std::sync::atomic::Ordering::Release);
 }
 
+// Do not let a yielding caller retain this carrier's TLS cache address.
+#[inline(never)]
 fn sigsegv_recovery_slot_for_tid(tid: usize) -> Option<usize> {
     if tid == 0 {
         return None;
@@ -2902,10 +2902,7 @@ fn eval_builtin_call_with_vals(
                 crate::value::NIL
             })
         }
-        _ => Err(EgclError::Internal(format!(
-            "undefined function: {}",
-            name
-        ))),
+        _ => Err(EgclError::Internal(format!("undefined function: {}", name))),
     }
 }
 

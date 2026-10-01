@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Runtime operations for the public Lisp fiber library in lib/fibers.lisp.
+use egcl_rt::thread::{self, FiberId, FiberState};
+use egcl_rt::value::{NIL, T};
+use egcl_rt::{EgclError, EgclVal, SchedulerConfig, SchedulerGroup};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
-use egcl_rt::thread::{self, FiberId, FiberState};
-use egcl_rt::value::{NIL, T};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclError, EgclVal};
 
 // Registered fibers remain observable until explicitly joined. A join transfers
 // results to the Lisp object's slots, then removes both runtime registrations.
@@ -92,9 +92,7 @@ fn wait(fiber: FiberId, timeout: Option<Duration>) -> Result<bool, EgclError> {
         return Ok(false);
     }
     if thread::current_fiber_id() == Some(fiber) {
-        return Err(EgclError::ProgramError(
-            "a fiber cannot join itself".into(),
-        ));
+        return Err(EgclError::ProgramError("a fiber cannot join itself".into()));
     }
     let mode = egcl_rt::sync::blocking_mode("FIBER-JOIN")?;
     // SAFETY: the native loop uses only Rust-owned identities and timestamps.
@@ -145,9 +143,9 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             Ok(EgclVal::from_fixnum(*epoch as i64))
         }
         ("MAKE", [entry, size]) => {
-            if !cfg!(all(target_arch = "x86_64", any(unix, windows))) {
+            if !thread::FIBERS_SUPPORTED {
                 return Err(EgclError::ProgramError(
-                    "stackful Lisp fibers require x86-64 on Unix or Windows".into(),
+                    "stackful Lisp fibers are not supported on this target".into(),
                 ));
             }
             let context = crate::packages::PackageContext::capture()?;

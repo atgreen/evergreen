@@ -37,7 +37,8 @@ programs as they run.
   values. When an assumption fails, precise deoptimization resumes less
   specialized execution while preserving program semantics. Live function
   redefinition remains part of the programming model.
-- **Lightweight fibers with synchronous socket I/O.** On x86-64, many fibers
+- **Lightweight fibers with synchronous socket I/O.** On x86-64, AArch64,
+  ppc64le, and s390x, many fibers
   share native carrier threads. Reads, writes, and readiness waits on established
   TCP streams park an unpinned fiber so other work can run, while Lisp code stays
   sequential. Connect, accept, and DNS are not yet cooperative. See
@@ -138,8 +139,11 @@ the moving garbage collector; validation under QEMU includes GC stress and
 poisoning, compiled-file loading, and saved-image round trips, and on AArch64
 also a differential run on a physical device.
 
-What the non-x86-64 ports do not yet have. Foreign callbacks and fiber context
-switching are x86-64 only. s390x reaches foreign code through the bootstrap
+Stackful fibers run on Unix x86-64 and AArch64 (including Android), Linux
+ppc64le and s390x, and Windows x86-64. Unix ports use native context switches
+without libc `ucontext`; fibers can suspend and migrate between carriers.
+
+What the non-x86-64 ports do not yet have. s390x reaches foreign code through the bootstrap
 dispatcher's fixed set of call shapes, while AArch64 and ppc64le support scalar
 foreign calls through AAPCS64 and ELFv2 respectively; aggregate arguments are
 unported everywhere but x86-64. The AArch64 and ppc64le T2 emitters cover a

@@ -9,12 +9,11 @@ use crate::error::EgclError;
 use crate::gc::{TraceHostRoots, register_root_scanner};
 use crate::lock_order::{LockLevel, OrderedMutex};
 use crate::stack::EgclStack;
-use crate::value::{NIL, EgclVal};
+use crate::value::{EgclVal, NIL};
 
 use std::cell::RefCell;
-// Only the x86-64 fiber context uses an UnsafeCell; importing it
-// unconditionally warns on every other port (bliss-w2vp).
-#[cfg(all(target_arch = "x86_64", unix))]
+// Unix fibers own a saved stack pointer updated at each context switch.
+#[cfg(egcl_unix_fibers)]
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::ptr;
@@ -32,6 +31,9 @@ use windows::FiberExecutionContext;
 /// Unique identifier for a lightweight managed fiber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FiberId(pub u64);
+
+/// Whether this target has a real stackful fiber backend.
+pub const FIBERS_SUPPORTED: bool = cfg!(egcl_fibers);
 
 /// Managed fiber lifecycle states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +70,7 @@ pub struct FiberContinuation {
     resume_token: AtomicUsize,
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(egcl_unix_fibers)]
 struct FiberExecutionContext {
     // The fiber's saved stack pointer. Updated in place each time the fiber
     // suspends (crate::context::swap writes through this cell).
@@ -76,7 +78,7 @@ struct FiberExecutionContext {
     _native_stack: EgclStack,
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(egcl_unix_fibers)]
 impl FiberExecutionContext {
     fn new(stack_size: usize) -> Result<Self, EgclError> {
         let native_stack = EgclStack::new(stack_size);
@@ -103,7 +105,7 @@ impl FiberExecutionContext {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(egcl_unix_fibers)]
 impl Drop for FiberExecutionContext {
     fn drop(&mut self) {
         let low = self._native_stack.base() as usize - crate::syscall::page_size();
@@ -111,10 +113,10 @@ impl Drop for FiberExecutionContext {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+#[cfg(not(egcl_fibers))]
 struct FiberExecutionContext;
 
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+#[cfg(not(egcl_fibers))]
 impl FiberExecutionContext {
     fn new(_stack_size: usize) -> Result<Self, EgclError> {
         Ok(Self)
@@ -410,6 +412,10 @@ impl ThreadResult {
 
 #[cfg(test)]
 mod join_completion_tests {
+    mod native_entry {
+        use crate as egcl_rt;
+        include!("../tests/support/native_entry.rs");
+    }
     use super::*;
     use crate::value::T;
 
@@ -518,7 +524,7 @@ mod join_completion_tests {
         });
     }
 
-    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    #[cfg(egcl_fibers)]
     mod managed_races {
         use super::*;
         static RACE_POOL: OnceLock<CarrierPool> = OnceLock::new();
@@ -547,7 +553,7 @@ mod join_completion_tests {
                     }))
                 });
             }
-            let entry = unsafe { EgclVal::from_function_ptr(race_child as *const () as *mut u8) };
+            let entry = native_entry::entry(race_child);
             let child = make_fiber(entry).unwrap();
             RACE_POOL.get().unwrap().submit(child).unwrap();
             join_fiber(child).unwrap()
@@ -567,8 +573,7 @@ mod join_completion_tests {
                         .is_ok()
                 );
                 assert!(RACE_POOL.set(CarrierPool::new(2)).is_ok());
-                let entry =
-                    unsafe { EgclVal::from_function_ptr(race_parent as *const () as *mut u8) };
+                let entry = native_entry::entry(race_parent);
                 let parent = make_fiber(entry).unwrap();
                 let descriptor = fiber_registry()
                     .lock()
@@ -612,9 +617,7 @@ mod join_completion_tests {
         concurrent_join(false);
     }
 
-    // Match run_worker_task's real context-switch backends. Other targets
-    // have only an inline fallback, not concurrent stackful fibers.
-    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    #[cfg(egcl_fibers)]
     #[test]
     fn consumed_fiber_result_remains_completed() {
         concurrent_join(true);
@@ -1285,12 +1288,12 @@ impl Fiber {
         self.native_stack_size
     }
     pub fn native_stack_bounds(&self) -> Option<(usize, usize)> {
-        #[cfg(all(target_arch = "x86_64", unix))]
+        #[cfg(egcl_unix_fibers)]
         {
             let low = self.execution_context._native_stack.base() as usize;
             Some((low, low + self.native_stack_size))
         }
-        #[cfg(not(all(target_arch = "x86_64", unix)))]
+        #[cfg(not(egcl_unix_fibers))]
         {
             None
         }
@@ -2059,7 +2062,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
 
     match thread.native_faults.mount() {
         Ok(mounted_faults) => {
-            #[cfg(all(target_arch = "x86_64", unix))]
+            #[cfg(egcl_unix_fibers)]
             unsafe {
                 // Save the scheduler (carrier) context and switch to the fiber. The
                 // fiber resumes at its trampoline (first mount) or where it last
@@ -2082,7 +2085,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
                 thread.result.complete(Err(error));
             }
 
-            #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+            #[cfg(not(egcl_fibers))]
             {
                 let result = run_fiber_entry(&thread);
                 thread.stack.publish_top();
@@ -2146,7 +2149,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     }
 }
 
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(egcl_fibers)]
 extern "C" fn fiber_context_trampoline() {
     let Some(fiber) = current_fiber() else {
         crate::syscall::abort()
@@ -2169,7 +2172,7 @@ extern "C" fn fiber_context_trampoline() {
     crate::syscall::abort();
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
+#[cfg(egcl_unix_fibers)]
 unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), EgclError> {
     // Read the scheduler-return context from the fiber (migration-safe; see the
     // `scheduler_return` field). A thread-local would be unsound here.
@@ -2573,10 +2576,7 @@ pub fn make_fiber(entry: EgclVal) -> Result<FiberId, EgclError> {
 }
 
 /// Allocate a fiber with an explicit native stack reservation in bytes.
-pub fn make_fiber_with_stack_size(
-    entry: EgclVal,
-    stack_size: usize,
-) -> Result<FiberId, EgclError> {
+pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<FiberId, EgclError> {
     if !(64 * 1024..=1024 * 1024 * 1024).contains(&stack_size) {
         return Err(EgclError::ProgramError(
             "fiber stack size must be between 64 KiB and 1 GiB".into(),
@@ -2736,9 +2736,7 @@ fn submit_fiber_to_pool(id: FiberId, pool: &Arc<WorkerPool>) -> Result<(), EgclE
 
 pub fn join_fiber(id: FiberId) -> Result<EgclVal, EgclError> {
     if current_fiber_id() == Some(id) {
-        return Err(EgclError::ProgramError(
-            "a fiber cannot join itself".into(),
-        ));
+        return Err(EgclError::ProgramError("a fiber cannot join itself".into()));
     }
     let result = fiber_registry()
         .lock()
@@ -2770,6 +2768,9 @@ pub fn join_fiber(id: FiberId) -> Result<EgclVal, EgclError> {
     value
 }
 
+// A fiber can resume on another OS thread. Keep the TLS address computation
+// inside a fresh call so LLVM cannot hoist it across a yielding caller.
+#[inline(never)]
 pub fn current_fiber() -> Option<&'static Fiber> {
     ACTIVE_FIBER
         .try_with(|slot| {
@@ -2910,14 +2911,14 @@ pub fn fiber_yield() -> Result<(), EgclError> {
         fiber.stack.published_fp() as usize,
     );
 
-    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    #[cfg(egcl_fibers)]
     {
         fiber.suspend_reason.store(SUSPEND_YIELD, Ordering::Release);
         fiber.set_state(FiberState::Suspended);
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+    #[cfg(not(egcl_fibers))]
     std::thread::yield_now();
 
     Ok(())
@@ -2972,10 +2973,10 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), EgclError> {
     // unread there. The binding still earns its keep on every target: it is the
     // "called outside a fiber" check, and dropping it would turn a caller's bug
     // into a silent no-op (bliss-w2vp).
-    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+    #[cfg(not(egcl_fibers))]
     let _ = &fiber;
 
-    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    #[cfg(egcl_fibers)]
     {
         if !matches!(fiber.state(), FiberState::Blocked | FiberState::Waiting) {
             return Err(EgclError::Internal(
@@ -2985,7 +2986,7 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), EgclError> {
         unsafe { swap_fiber_to_scheduler(fiber)? };
     }
 
-    #[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+    #[cfg(not(egcl_fibers))]
     std::thread::yield_now();
 
     Ok(())

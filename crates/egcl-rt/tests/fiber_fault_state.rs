@@ -1,15 +1,15 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::runtime::{
     check_sigsegv_null_guard, check_sigsegv_stack_guard, current_sigsegv_null_guard_recovery_ip,
     current_sigsegv_stack_guard_recovery_ip, post_sigsegv_null_guard, post_sigsegv_stack_guard,
     set_sigsegv_recovery_ips,
 };
 use egcl_rt::thread::{current_thread_id, fiber_yield, make_fiber};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -57,10 +57,13 @@ fn recovery_targets_and_pending_faults_follow_the_fiber() {
         })
         .unwrap();
         for _ in 0..64 {
-            let entry = unsafe { EgclVal::from_function_ptr(probe as *const () as *mut u8) };
+            let entry = native_entry::entry(probe);
             group.submit(make_fiber(entry).unwrap()).unwrap();
         }
         assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(0); 64]);
     }
     assert!(MIGRATIONS.load(Ordering::Relaxed) > 0);
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
+use egcl_rt::sync::{
+    EgclCondVar, EgclMutex, EgclSemaphore, PinnedBlockingAction, fiber_sleep,
+    set_pinned_blocking_action,
+};
+#[cfg(unix)]
+use egcl_rt::sync::{IoInterest, wait_fd};
+use egcl_rt::thread::{FiberState, current_fiber, fiber_state, make_fiber};
+use egcl_rt::value::{EgclVal, T};
+use egcl_rt::{SchedulerConfig, SchedulerGroup};
 #[cfg(unix)]
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-#[cfg(unix)]
-use egcl_rt::sync::{IoInterest, wait_fd};
-use egcl_rt::sync::{
-    PinnedBlockingAction, EgclCondVar, EgclMutex, EgclSemaphore, fiber_sleep,
-    set_pinned_blocking_action,
-};
-use egcl_rt::thread::{FiberState, current_fiber, fiber_state, make_fiber};
-use egcl_rt::value::{T, EgclVal};
-use egcl_rt::{SchedulerConfig, SchedulerGroup};
 
 fn serial_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -22,7 +22,7 @@ fn serial_lock() -> &'static Mutex<()> {
 }
 
 fn function(entry: fn() -> EgclVal) -> EgclVal {
-    unsafe { EgclVal::from_function_ptr(entry as *const () as *mut u8) }
+    native_entry::entry(entry)
 }
 
 fn wait_until(predicate: impl Fn() -> bool) {
@@ -348,3 +348,6 @@ fn mutex_condition_and_semaphore_timeouts_return_without_stale_wakes() {
     TIMEOUT_SEM.get().unwrap().signal(1).unwrap();
     assert!(TIMEOUT_SEM.get().unwrap().try_wait(1).unwrap());
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

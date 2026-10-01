@@ -1,10 +1,10 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use egcl_rt::thread::{FiberId, fiber_state, make_fiber};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclError, EgclVal};
+use egcl_rt::{EgclError, EgclVal, SchedulerConfig, SchedulerGroup};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static FIRST: AtomicU64 = AtomicU64::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
@@ -28,7 +28,7 @@ fn finish_preserves_an_error_datum_while_shutting_down_carriers() {
     let id = make_fiber(invalid_entry).unwrap();
     FIRST.store(id.0, Ordering::Release);
     group.submit(id).unwrap();
-    let entry = unsafe { EgclVal::from_function_ptr(collecting as *const () as *mut u8) };
+    let entry = native_entry::entry(collecting);
     group.submit(make_fiber(entry).unwrap()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !READY.load(Ordering::Acquire) {
@@ -53,3 +53,6 @@ fn finish_preserves_an_error_datum_while_shutting_down_carriers() {
     assert_ne!(datum.to_raw(), original, "error datum must be relocated");
     assert_eq!(unsafe { datum.as_ptr().add(8).cast::<f64>().read() }, 42.0);
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

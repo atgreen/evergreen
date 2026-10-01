@@ -1,12 +1,12 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::scheduler::{SchedulerConfig, SchedulerGroup};
 use egcl_rt::thread::{current_thread_id, fiber_yield, make_fiber};
 use egcl_rt::value::EgclVal;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -34,7 +34,7 @@ fn root_guards_survive_fiber_suspension_and_carrier_migration() {
     let _serial = TEST_LOCK.lock().unwrap();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 4 }).unwrap();
     for _ in 0..64 {
-        let entry = unsafe { EgclVal::from_function_ptr(rooted_fiber as *const () as *mut u8) };
+        let entry = native_entry::entry(rooted_fiber);
         group.submit(make_fiber(entry).unwrap()).unwrap();
     }
     assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(42); 64]);
@@ -89,8 +89,7 @@ fn moving_gc_updates_owned_and_borrowed_roots_on_suspended_fiber_stacks() {
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 4 }).unwrap();
     let mut fibers = Vec::new();
     for _ in 0..16 {
-        let entry =
-            unsafe { EgclVal::from_function_ptr(parked_heap_roots as *const () as *mut u8) };
+        let entry = native_entry::entry(parked_heap_roots);
         let id = make_fiber(entry).unwrap();
         group.submit(id).unwrap();
         fibers.push(id);
@@ -110,3 +109,6 @@ fn moving_gc_updates_owned_and_borrowed_roots_on_suspended_fiber_stacks() {
     }
     assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(42); 16]);
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

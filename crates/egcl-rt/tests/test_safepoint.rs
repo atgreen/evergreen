@@ -4,11 +4,11 @@
 use egcl_rt::safepoint::*;
 
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-#[cfg(unix)]
 use egcl_rt::value::T;
 #[cfg(unix)]
 use egcl_rt::{EgclVal, install_signal_handlers, join_thread, make_thread};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Serializes these tests (bliss-z11t). The safepoint page is ONE mprotected
 /// page per process and `wait_for_all_threads`/`resume_all_threads` drive one
@@ -139,9 +139,7 @@ fn sigusr1_fallback_interrupts_a_blocked_syscall_and_reaches_safepoint() {
     let mut pipe_fds = [-1_i32; 2];
     assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
     BLOCKED_READ_FD.store(pipe_fds[0], Ordering::Release);
-    let thread =
-        make_thread(unsafe { EgclVal::from_function_ptr(blocked_reader as *const () as *mut u8) })
-            .unwrap();
+    let thread = make_thread(native_entry::entry(blocked_reader)).unwrap();
 
     let entered_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while !BLOCKED_READER_ENTERED.load(Ordering::Acquire)
@@ -174,3 +172,6 @@ fn sigusr1_fallback_interrupts_a_blocked_syscall_and_reaches_safepoint() {
         "SIGUSR1 fallback took {elapsed:?}"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

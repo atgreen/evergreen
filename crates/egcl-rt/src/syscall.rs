@@ -314,7 +314,8 @@ thread_local! {
 /// `gettid(2)`, cached per thread. Correct because a thread's TID never changes.
 /// NOTE: do not call from a signal handler — a raw [`gettid`] is used there to
 /// avoid reading a Cell that a normal-context access could be mid-initialising.
-#[inline]
+// Recompute the TLS address after fiber migration (not just the Cell's value).
+#[inline(never)]
 pub fn cached_tid() -> i32 {
     CACHED_TID.with(|c| {
         let t = c.get();

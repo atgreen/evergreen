@@ -117,13 +117,9 @@ jobs:
           # library for a target-architecture process and the loader refused it.
           # NOT named CC: cargo and cc-rs own that name for building the crate.
           EGCL_TEST_CC: ${{ matrix.cc }}
-        # STILL EXPECTED TO FAIL on the fiber and signal-recovery tests: qemu-user
-        # cannot run them, and they cannot be filtered out by name because whole
-        # binaries (test_fiber_sync, spec_threading_concurrency) crash with SIGSEGV
-        # or SIGILL before any filter applies. bliss-tg6mf has the evidence and the
-        # options. Note also that `cargo test` stops at the first failing binary,
-        # so clearing the exec failures reveals eight further test binaries that
-        # had never run in CI at all.
+        # Fiber tests exercise the native context backends on all three targets.
+        # Non-x86 signal-PC rewriting is separately unported; those deliberate
+        # guard-fault tests are not evidence that QEMU cannot run fibers.
         run: cross test -p egcl-rt --release --target ${{ matrix.target }}
 
   # Android, built through packaging/android/build-runtime.py — the same script

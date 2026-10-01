@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-use std::time::Instant;
 use egcl_rt::error::EgclError;
 use egcl_rt::object::type_id;
 use egcl_rt::runtime::{check_sigint, install_signal_handlers};
@@ -17,8 +12,13 @@ use egcl_rt::thread::{
     all_thread_ids, current_thread, current_thread_id, interrupt_thread, join_thread, make_fiber,
     make_thread, safepoint_participant_count_excluding, thread_is_carrier,
 };
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_rt::{Collector, GcConfig, HeapCollector, alloc_typed};
+use std::fs;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use std::time::Instant;
 
 static SLOW_THREAD_STARTED: AtomicBool = AtomicBool::new(false);
 static RELEASE_SLOW_THREAD: AtomicBool = AtomicBool::new(false);
@@ -159,7 +159,7 @@ fn native_ffi_entry() -> EgclVal {
 }
 
 unsafe fn fn_entry(function: fn() -> EgclVal) -> EgclVal {
-    unsafe { EgclVal::from_function_ptr(function as usize as *mut u8) }
+    native_entry::entry(function)
 }
 
 fn read_runtime_source(path: &str) -> String {
@@ -671,3 +671,6 @@ fn thread_sources_describe_thread_local_dynamic_bindings() {
         "special-binding frames must be walkable"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

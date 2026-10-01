@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::scheduler::*;
 use egcl_rt::thread::{
     FiberId, FiberState, all_thread_ids, fiber_state, fiber_yield, make_fiber, park_current_fiber,
     thread_is_carrier,
 };
-use egcl_rt::value::{T, EgclVal};
+use egcl_rt::value::{EgclVal, T};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Serializes the tests that stand up a real scheduler group (bliss-z11t).
 ///
@@ -164,14 +164,8 @@ fn yield_unmounts_and_later_resumes_after_the_call_site() {
     serialize_scheduler!();
     YIELD_TRACE.lock().unwrap().clear();
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
-    let a = make_fiber(unsafe {
-        EgclVal::from_function_ptr(yielding_fiber_a as *const () as *mut u8)
-    })
-    .unwrap();
-    let b = make_fiber(unsafe {
-        EgclVal::from_function_ptr(yielding_fiber_b as *const () as *mut u8)
-    })
-    .unwrap();
+    let a = make_fiber(native_entry::entry(yielding_fiber_a)).unwrap();
+    let b = make_fiber(native_entry::entry(yielding_fiber_b)).unwrap();
     group.submit(a).unwrap();
     group.submit(b).unwrap();
     assert_eq!(group.finish().unwrap(), vec![T, T]);
@@ -187,9 +181,7 @@ fn parked_fiber_unmounts_until_explicit_unpark() {
     serialize_scheduler!();
     PARK_PROGRESS.store(0, Ordering::Release);
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
-    let fiber =
-        make_fiber(unsafe { EgclVal::from_function_ptr(parking_fiber as *const () as *mut u8) })
-            .unwrap();
+    let fiber = make_fiber(native_entry::entry(parking_fiber)).unwrap();
     group.submit(fiber).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while fiber_state(fiber) != Some(FiberState::Blocked) && std::time::Instant::now() < deadline {
@@ -209,9 +201,7 @@ fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
     PREEMPT_HOG_DONE.store(0, Ordering::Release);
     PREEMPT_PEER_RAN_EARLY.store(0, Ordering::Release);
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
-    let hog =
-        make_fiber(unsafe { EgclVal::from_function_ptr(preemption_hog as *const () as *mut u8) })
-            .unwrap();
+    let hog = make_fiber(native_entry::entry(preemption_hog)).unwrap();
     group.submit(hog).unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -220,9 +210,7 @@ fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
     }
     assert_eq!(PREEMPT_HOG_STARTED.load(Ordering::Acquire), 1);
 
-    let peer =
-        make_fiber(unsafe { EgclVal::from_function_ptr(preemption_peer as *const () as *mut u8) })
-            .unwrap();
+    let peer = make_fiber(native_entry::entry(preemption_peer)).unwrap();
     group.submit(peer).unwrap();
     assert_eq!(group.finish().unwrap(), vec![T, T]);
     assert_eq!(
@@ -231,3 +219,6 @@ fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
         "the peer fiber should run before the CPU-bound fiber completes"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

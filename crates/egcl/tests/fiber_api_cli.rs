@@ -2,7 +2,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Public Lisp fibers run on actual runtime carriers (R9.42, R9.43, R13.18).
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(all(
+    target_pointer_width = "64",
+    any(
+        all(unix, any(target_arch = "x86_64", target_arch = "aarch64")),
+        all(
+            target_vendor = "unknown",
+            target_os = "linux",
+            target_env = "gnu",
+            any(
+                all(target_arch = "powerpc64", target_endian = "little"),
+                target_arch = "s390x"
+            )
+        ),
+        all(windows, target_arch = "x86_64")
+    )
+))]
 use std::process::Command;
 
 fn run(program: &str) {
@@ -27,15 +42,16 @@ fn lifecycle_yield_multiple_values_and_repeatable_finish() {
     run(r##"
       (assert (null (egcl-fiber:current-fiber)))
       (let* ((events nil)
+             (events-lock (egcl-thread:make-mutex))
              (a (egcl-fiber:make-fiber
                   (lambda (x)
-                    (push :a events)
+                    (egcl-thread:with-mutex (events-lock) (push :a events))
                     (egcl-fiber:fiber-yield)
                     (values (+ x 1) :second))
                   :name "first" :arguments '(40)))
              (b (egcl-fiber:make-fiber
                   (lambda ()
-                    (push :b events)
+                    (egcl-thread:with-mutex (events-lock) (push :b events))
                     (egcl-fiber:fiber-yield)
                     42))))
         (assert (egcl-fiber:fiber-p a))
@@ -225,11 +241,22 @@ fn backtrace_of_suspended_fiber_and_self_join() {
           (when (eq :dead (egcl-fiber:fiber-state fiber)) (egcl-fiber:fiber-join fiber)
             (error "Fiber exited before it could be inspected"))
           (sleep 0.001))
-        (let ((stream (make-string-output-stream)))
-          (egcl-fiber:print-fiber-backtrace fiber :stream stream)
-          (let ((text (get-output-stream-string stream)))
-            (assert (search "FIBER-TRACE-LEAF" text))
-            (assert (search "FIBER-TRACE-MIDDLE" text))))
+        ;; :SUSPENDED may describe a preemption before the mutex wait, and the
+        ;; carrier may still be unmounting. Retry the documented snapshot race.
+        (let ((deadline (+ (get-internal-real-time)
+                           (* 10 internal-time-units-per-second))))
+          (loop
+            (assert (< (get-internal-real-time) deadline))
+            (let* ((stream (make-string-output-stream))
+                   (text (handler-case
+                           (progn
+                             (egcl-fiber:print-fiber-backtrace fiber :stream stream)
+                             (get-output-stream-string stream))
+                           (egcl-fiber:fiber-still-running () nil))))
+              (when (and text (search "FIBER-TRACE-LEAF" text)
+                              (search "FIBER-TRACE-MIDDLE" text))
+                (return)))
+            (sleep 0.001)))
         (egcl-thread:release-mutex semaphore)
         (assert (equal '(:done) (egcl-fiber:finish-fibers group))))
       (format t "FIBER-API-OK~%")

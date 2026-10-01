@@ -1,11 +1,11 @@
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(egcl_fibers)]
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 use egcl_rt::lock_order::{LockLevel, OrderedMutex, OrderedRwLock};
 use egcl_rt::thread::{current_fiber, make_fiber};
 use egcl_rt::value::{NIL, T};
-use egcl_rt::{SchedulerConfig, SchedulerGroup, EgclVal};
+use egcl_rt::{EgclVal, SchedulerConfig, SchedulerGroup};
 
 fn native_guard_probe() -> EgclVal {
     let fiber = current_fiber().unwrap();
@@ -52,19 +52,18 @@ fn native_ordered_guards_prevent_carrier_migration_and_restore_eligibility() {
         return;
     }
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
-    let function =
-        unsafe { EgclVal::from_function_ptr(native_guard_probe as *const () as *mut u8) };
+    let function = native_entry::entry(native_guard_probe);
     group.submit(make_fiber(function).unwrap()).unwrap();
     assert_eq!(group.finish().unwrap(), vec![T]);
 }
 
 #[test]
 fn execution_lock_parks_contenders_without_blocking_its_owner() {
-    use std::sync::OnceLock;
-    use std::time::Duration;
     use egcl_rt::lock_order::OrderedExecutionMutex;
     use egcl_rt::sync::EgclSemaphore;
     use egcl_rt::thread::{FiberState, fiber_state};
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
     static LOCK: OnceLock<OrderedExecutionMutex<u32>> = OnceLock::new();
     static RELEASE: OnceLock<EgclSemaphore> = OnceLock::new();
@@ -88,7 +87,7 @@ fn execution_lock_parks_contenders_without_blocking_its_owner() {
         NIL
     }
     fn entry(f: fn() -> EgclVal) -> EgclVal {
-        unsafe { EgclVal::from_function_ptr(f as *const () as *mut u8) }
+        native_entry::entry(f)
     }
 
     const CHILD: &str = "EGCL_EXECUTION_LOCK_CHILD";
@@ -145,9 +144,9 @@ fn execution_lock_parks_contenders_without_blocking_its_owner() {
 
 #[test]
 fn execution_lock_ownership_survives_carrier_migration() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use egcl_rt::lock_order::OrderedExecutionMutex;
     use egcl_rt::thread::{current_thread_id, fiber_yield};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
     fn probe() -> EgclVal {
         let lock = OrderedExecutionMutex::new(LockLevel::Stream, 1, "migrating", 0);
@@ -192,7 +191,7 @@ fn execution_lock_ownership_survives_carrier_migration() {
         return;
     }
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 4 }).unwrap();
-    let entry = unsafe { EgclVal::from_function_ptr(probe as *const () as *mut u8) };
+    let entry = native_entry::entry(probe);
     for _ in 0..64 {
         group.submit(make_fiber(entry).unwrap()).unwrap();
     }
@@ -202,3 +201,6 @@ fn execution_lock_ownership_survives_carrier_migration() {
         "must exercise migration with a live execution guard"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

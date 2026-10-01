@@ -8,17 +8,17 @@
 //! SATB pre-write values. A minor GC consumes the remembered set to keep young
 //! referents alive and relocate the old slots after the nursery moves.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
 use egcl_rt::gc::{
     Allocator, Collector, GcConfig, HeapAllocator, HeapCollector, drain_satb_log, init_heap,
     remembered_set_len, set_gc_marking_in_progress, store_ref,
 };
-use egcl_rt::value::{T, TAG_HEAP_OBJECT, EgclVal};
+use egcl_rt::value::{EgclVal, T, TAG_HEAP_OBJECT};
 use egcl_rt::{
-    FiberState, SchedulerConfig, SchedulerGroup, EgclStack, current_stack, fiber_state,
-    make_fiber, park_current_fiber,
+    EgclStack, FiberState, SchedulerConfig, SchedulerGroup, current_stack, fiber_state, make_fiber,
+    park_current_fiber,
 };
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static PARKED_ROOT_INPUT: AtomicU64 = AtomicU64::new(0);
 static PARKED_ROOT_OUTPUT: AtomicU64 = AtomicU64::new(0);
@@ -214,10 +214,7 @@ fn nursery_root_relocates_across_fiber_park_and_resume() {
     PARKED_ROOT_READY.store(0, Ordering::Release);
 
     let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
-    let fiber = make_fiber(unsafe {
-        EgclVal::from_function_ptr(fiber_with_parked_stack_root as *const () as *mut u8)
-    })
-    .unwrap();
+    let fiber = make_fiber(native_entry::entry(fiber_with_parked_stack_root)).unwrap();
     group.submit(fiber).unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -247,3 +244,6 @@ fn nursery_root_relocates_across_fiber_park_and_resume() {
         "resumed fiber observed the relocated object with intact contents"
     );
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;

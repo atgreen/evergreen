@@ -14,8 +14,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 //!
 //! A [`Context`] is just a saved stack pointer; [`swap`] pushes the callee-saved
-//! registers onto the *current* stack, records the resulting `rsp` into `*from`,
-//! then loads `rsp` from `to`, pops that context's callee-saved registers, and
+//! registers onto the *current* stack, records the resulting SP into `*from`,
+//! then loads SP from `to`, restores that context's callee-saved registers, and
 //! `ret`s — resuming wherever `to` last swapped away (or, for a fresh context
 //! from [`make`], entering its entry function).
 
@@ -25,6 +25,32 @@ pub type Context = *mut u8;
 
 /// An empty/placeholder context (filled in by the first [`swap`] out of it).
 pub const NULL: Context = core::ptr::null_mut();
+
+#[cfg(all(egcl_unix_fibers, target_arch = "aarch64"))]
+#[path = "context/aarch64.rs"]
+mod backend;
+#[cfg(all(
+    egcl_unix_fibers,
+    any(target_arch = "powerpc64", target_arch = "s390x")
+))]
+#[path = "context/elf.rs"]
+mod backend;
+#[cfg(all(egcl_unix_fibers, not(target_arch = "x86_64")))]
+pub use backend::{make, swap};
+
+/// Reserve a zeroed, aligned initial frame and the ABI's caller linkage area.
+#[cfg(all(egcl_unix_fibers, not(target_arch = "x86_64")))]
+fn initial_frame(stack: &mut [u8], frame: usize, linkage: usize) -> *mut u8 {
+    let base = stack.as_mut_ptr() as usize;
+    let top = (base + stack.len()) & !15usize;
+    assert!(
+        top.saturating_sub(base) >= frame + linkage,
+        "fiber stack too small"
+    );
+    let sp = (top - frame - linkage) as *mut u8;
+    unsafe { core::ptr::write_bytes(sp, 0, frame + linkage) };
+    sp
+}
 
 /// Save the current context into `*from` and resume `to`. Returns when some
 /// later `swap` switches back into `*from`.
@@ -92,7 +118,7 @@ pub fn make(stack: &mut [u8], entry: extern "C" fn()) -> Context {
     sp as *mut u8
 }
 
-// ── Non-x86_64 / non-unix stub ───────────────────────────────────────────────
+// ── Targets without this stack-pointer backend ──────────────────────────────
 // Windows x86-64 uses owned OS fibers in thread/windows.rs instead of this
 // stack-pointer API. Other targets retain the inline fallback in thread.rs.
 // These stubs exist only so this module compiles on those targets.
@@ -101,10 +127,10 @@ pub fn make(stack: &mut [u8], entry: extern "C" fn()) -> Context {
 /// # Safety
 /// Callers must use the platform's supported fiber backend and must not rely
 /// on this stub to save or resume an execution context.
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(egcl_unix_fibers))]
 pub unsafe fn swap(_from: *mut Context, _to: Context) {}
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
+#[cfg(not(egcl_unix_fibers))]
 pub fn make(_stack: &mut [u8], _entry: extern "C" fn()) -> Context {
     NULL
 }

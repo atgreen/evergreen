@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use egcl_rt::gc::TraceHostRoots;
 use egcl_rt::thread::*;
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 static FIBER_FOREGROUND_READY: AtomicBool = AtomicBool::new(false);
 static FIBER_FOREGROUND_CAN_FINISH: AtomicBool = AtomicBool::new(false);
@@ -130,8 +130,7 @@ fn make_thread_creates_and_joins_a_native_os_thread() {
 #[test]
 fn named_thread_lifecycle_and_bounded_join_are_truthful() {
     NATIVE_LIFECYCLE_CAN_FINISH.store(false, Ordering::Release);
-    let entry =
-        unsafe { EgclVal::from_function_ptr(wait_for_lifecycle_release as *const () as *mut u8) };
+    let entry = native_entry::entry(wait_for_lifecycle_release);
     let id = make_thread_named(entry, Some("runtime lifecycle worker".into())).unwrap();
 
     let name = thread_name(id);
@@ -201,8 +200,7 @@ fn fiber_carrier_and_yield_state_read_through_the_execution_context() {
 #[test]
 fn mounted_fiber_tracks_carrier_continuation_and_pin_state() {
     serialize_thread_state!();
-    let entry =
-        unsafe { EgclVal::from_function_ptr(inspect_mounted_fiber as *const () as *mut u8) };
+    let entry = native_entry::entry(inspect_mounted_fiber);
     let id = make_fiber(entry).unwrap();
     submit_fiber(id).unwrap();
     assert_eq!(join_fiber(id).unwrap(), T);
@@ -240,9 +238,7 @@ fn interrupt_thread_uses_native_thread_identity() {
     assert!(interrupt_thread(NativeThreadId(0xFFFF), NIL).is_err());
     NATIVE_INTERRUPT_READY.store(false, Ordering::Release);
     NATIVE_INTERRUPT_CAN_FINISH.store(false, Ordering::Release);
-    let entry = unsafe {
-        EgclVal::from_function_ptr(wait_for_native_interrupt_entry as *const () as *mut u8)
-    };
+    let entry = native_entry::entry(wait_for_native_interrupt_entry);
     let id = make_thread(entry).unwrap();
     while !NATIVE_INTERRUPT_READY.load(Ordering::Acquire) {
         thread_yield();
@@ -280,16 +276,10 @@ fn condition_state_is_execution_local_empty_and_runtime_owned() {
     assert_eq!(snapshot.handler_depth, 1);
     assert_eq!(snapshot.restart_depth, 1);
 
-    let native = make_thread(unsafe {
-        EgclVal::from_function_ptr(condition_state_thread_entry as *const () as *mut u8)
-    })
-    .unwrap();
+    let native = make_thread(native_entry::entry(condition_state_thread_entry)).unwrap();
     assert_eq!(join_thread(native).unwrap(), T);
 
-    let fiber = make_fiber(unsafe {
-        EgclVal::from_function_ptr(condition_state_fiber_entry as *const () as *mut u8)
-    })
-    .unwrap();
+    let fiber = make_fiber(native_entry::entry(condition_state_fiber_entry)).unwrap();
     submit_fiber(fiber).unwrap();
     assert_eq!(join_fiber(fiber).unwrap(), T);
 
@@ -346,8 +336,7 @@ fn foreground_pending_signal_can_target_mounted_fiber() {
     FIBER_FOREGROUND_READY.store(false, Ordering::Release);
     FIBER_FOREGROUND_CAN_FINISH.store(false, Ordering::Release);
 
-    let entry =
-        unsafe { EgclVal::from_function_ptr(foreground_fiber_entry as *const () as *mut u8) };
+    let entry = native_entry::entry(foreground_fiber_entry);
     let id = make_fiber(entry).unwrap();
     submit_fiber(id).unwrap();
     while !FIBER_FOREGROUND_READY.load(Ordering::Acquire) {
@@ -375,3 +364,6 @@ fn native_thread_registry_includes_current_and_carriers() {
 fn max_tls_is_4096() {
     assert_eq!(MAX_TLS, 4096);
 }
+
+#[path = "support/native_entry.rs"]
+mod native_entry;
