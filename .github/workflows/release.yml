@@ -16,13 +16,14 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 10
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
       publish: ${{ steps.plan.outputs.publish }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
+      plan_json: ${{ steps.plan.outputs.plan_json }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,16 +40,138 @@ jobs:
         env:
           RELEASE_MODE: ${{ inputs.mode }}
         run: python3 packaging/fedora/release.py plan
+
+  source:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore release plan
+        env:
+          RELEASE_PLAN: ${{ needs.plan.outputs.plan_json }}
+        run: |
+          mkdir -p target
+          python3 - <<'PYPLAN'
+          import json, os
+          from pathlib import Path
+          Path('target/release-plan.json').write_text(json.dumps(json.loads(os.environ['RELEASE_PLAN'])) + '\n')
+          PYPLAN
       - name: Install container runner
         run: |
-          # These SDKs are unused; the Fedora build installs its own pinned NDK.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           sudo apt-get update
           sudo apt-get install -y podman
-      - name: Build and verify all ten Fedora 44 RPMs
+      - name: Build shared source RPM
         run: |
           set -o pipefail
-          sudo bash packaging/fedora/ci-container.sh 2>&1 | tee target/fedora-release.log
+          sudo bash packaging/fedora/ci-container.sh source 2>&1 | tee target/fedora-release.log
+      - name: Upload source RPM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-srpm
+          path: target/fedora-rpm/SRPMS/*.src.rpm
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Upload source build log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-log-source
+          path: target/fedora-release.log
+          if-no-files-found: ignore
+          overwrite: true
+
+  binaries:
+    needs: source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [native, s390x, aarch64, ppc64le, windows, android]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora44-srpm
+          path: target/srpm
+      - name: Install container runner
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: Rebuild and verify package group
+        env:
+          BUILD_GROUP: ${{ matrix.group }}
+        run: |
+          set -o pipefail
+          shopt -s nullglob
+          srpms=(target/srpm/*.src.rpm)
+          [[ ${#srpms[@]} == 1 ]]
+          sudo bash packaging/fedora/ci-container.sh binary "$BUILD_GROUP" "${srpms[0]}" \
+            2>&1 | tee target/fedora-release.log
+      - name: Upload verified RPMs and provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.group }}
+          path: |
+            target/fedora-rpm/RPMS/x86_64/*.rpm
+            target/build-provenance/${{ matrix.group }}.json
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+      - name: Upload build log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-log-${{ matrix.group }}
+          path: target/fedora-release.log
+          if-no-files-found: ignore
+          overwrite: true
+
+  collect:
+    needs: [plan, source, binaries]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora44-srpm
+          path: target/srpm
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          path: target/release-input
+          merge-multiple: true
+      - name: Restore release plan
+        env:
+          RELEASE_PLAN: ${{ needs.plan.outputs.plan_json }}
+        run: |
+          mkdir -p target
+          python3 - <<'PYPLAN'
+          import json, os
+          from pathlib import Path
+          Path('target/release-plan.json').write_text(json.dumps(json.loads(os.environ['RELEASE_PLAN'])) + '\n')
+          PYPLAN
+      - name: Validate and collect release assets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          shopt -s nullglob
+          srpms=(target/srpm/*.src.rpm)
+          [[ ${#srpms[@]} == 1 ]]
+          python3 packaging/fedora/release.py collect \
+            --rpm-dir target/release-input/fedora-rpm/RPMS/x86_64 \
+            --source-rpm "${srpms[0]}" --provenance-dir target/release-input/build-provenance
       - name: Upload complete release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -56,17 +179,11 @@ jobs:
           path: target/release-assets/
           if-no-files-found: error
           compression-level: 0
-      - name: Upload build log
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: fedora44-build-log
-          path: target/fedora-release.log
-          if-no-files-found: ignore
+          overwrite: true
 
   publish:
-    needs: build
-    if: needs.build.outputs.publish == 'true'
+    needs: [plan, collect]
+    if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -80,8 +197,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.build.outputs.tag }}
-          PRERELEASE: ${{ needs.build.outputs.prerelease }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
           COMMIT: ${{ github.sha }}
         run: |
           cd assets
@@ -90,7 +207,6 @@ jobs:
           if [[ "$PRERELEASE" == true ]]; then
             flags=(--target "$COMMIT" --prerelease --latest=false)
           fi
-          # Keep incomplete uploads invisible; expose only the complete release.
           gh release create "$RELEASE_TAG" --draft "${flags[@]}" \
             --title "EGCL $RELEASE_TAG" --notes-file CHANGELOG.md ./*
           gh release edit "$RELEASE_TAG" --draft=false

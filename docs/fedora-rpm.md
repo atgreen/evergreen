@@ -89,8 +89,8 @@ archive with locked, vendored Cargo dependencies (`--offline`). The local builde
 sets `egcl_rustup=1` because Rust is installed through rustup; direct rpmbuild
 otherwise requires Fedora's `cargo` package. Pass the absolute NDK directory as
 `--define 'android_ndk /path/to/android-ndk-r27d'`. Both Android Rust targets must
-already be installed. This does not yet convert the other prebuilt CLI payloads
-into a Fedora-reviewed source RPM.
+already be installed. The local `build.py` packaging path reuses prebuilt CLI
+payloads; the release workflow below rebuilds every runtime from its shared SRPM.
 It strips debug sections before dumping ASDF images. RPM stripping and debuginfo
 extraction are disabled because modifying an executable after dumping can
 remove its appended image. Cross ELF files are excluded from host dependency
@@ -117,6 +117,30 @@ The **Fedora releases** workflow builds and verifies all ten RPMs on Fedora
 44, including the glibc `egcl` and musl `egcl-static` packages. It runs the same
 packaging checks described above, with systemd memory limits inside its Fedora
 container. Runs finish independently when newer commits are pushed.
+A source job builds one SRPM containing EGCL source, vendored Rust dependencies,
+and the musl and LLVM unwinder sources, then uploads the `fedora44-srpm` artifact.
+Six parallel builder jobs download that exact SRPM and rebuild the native,
+s390x, AArch64, POWER, Windows and Android package groups. Each Linux group
+produces both glibc and musl RPMs. Each builder verifies its extracted RPMs and
+records the source RPM's SHA-256 checksum. A final collector requires matching
+source/toolchain provenance and a complete ten-package set before publication.
+A failed matrix job does not cancel the other builds.
+
+The same source build can be reproduced locally after installing the pinned Rust
+toolchain, its `rust-src` component and the selected target's standard libraries:
+
+```sh
+GITHUB_EVENT_NAME=workflow_dispatch GITHUB_REF=refs/heads/main \
+GITHUB_RUN_ID=1 GITHUB_RUN_ATTEMPT=1 RELEASE_MODE=build \
+    python3 packaging/fedora/release.py plan
+python3 packaging/fedora/source-rpm.py create --plan target/release-plan.json
+python3 packaging/fedora/source-rpm.py rebuild s390x target/fedora-rpm/SRPMS/egcl-*.src.rpm
+```
+
+The source job needs downloaded Cargo dependencies, including those of the Rust
+standard library, for vendoring. Rebuilding prepares cross toolchains before
+`rpmbuild`; compilation inside the spec uses vendored dependencies offline.
+Use a separate output directory for each group when rebuilding locally.
 
 For a test release, select **Actions → Fedora releases → Run workflow**, choose
 the branch and leave `mode` set to `test`. The equivalent CLI command is:
@@ -139,7 +163,7 @@ tag that differs from the workspace version. Stable RPMs use the spec's release
 number (currently `6.fc44`). An existing release is never overwritten; a failed
 upload can leave a draft for inspection before retrying.
 
-Published assets include all ten RPMs, `CHANGELOG.md`, build provenance,
+Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
 release metadata, and `SHA256SUMS`. Publication runs only after package identity,
 payload, and runtime checks pass, with write permission confined to the publish
 job. RPMs are not GPG-signed by this workflow.

@@ -18,4 +18,4 @@ until podman exec "$container" systemctl start user@0.service; do
     fi
     sleep 1
 done
-podman exec "$container" bash packaging/fedora/ci-build.sh
+podman exec "$container" bash packaging/fedora/ci-build.sh "$@"

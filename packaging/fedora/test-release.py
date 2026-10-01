@@ -52,6 +52,17 @@ class ReleaseTests(unittest.TestCase):
             with self.subTest(records=bad), self.assertRaises(ValueError):
                 release.validate_packages(bad, '0.0.1', '0.test.123.1')
 
+    def test_provenance_rejects_mixed_source_rpms_and_missing_or_duplicate_runtimes(self):
+        record = {'git': 'abc', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44',
+                  'srpm_sha256': 'source-hash', 'rpms': [],
+                  'artifacts': {name: name for name in release.RUNTIMES}}
+        release.merge_provenance([record], 'source-hash')
+        for records in ([record], [], [record, record],
+                        [record | {'artifacts': {'native': 'native'}}]):
+            digest = 'different-source' if records == [record] else 'source-hash'
+            with self.subTest(records=records), self.assertRaises(ValueError):
+                release.merge_provenance(records, digest)
+
     def test_collect_checks_complete_set_and_hashes_every_asset(self):
         plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
         with tempfile.TemporaryDirectory() as directory:
@@ -61,28 +72,36 @@ class ReleaseTests(unittest.TestCase):
             for name in release.PACKAGES:
                 (rpms / f'{name}.rpm').write_bytes(name.encode())
             (root / 'CHANGELOG.md').write_text('Release notes\n')
-            provenance = root / 'target/fedora-rpm/stage/usr/share/doc/egcl/build.json'
+            provenance = root / 'metadata/all.json'
             provenance.parent.mkdir(parents=True)
-            provenance.write_text('{"git": "test-commit"}\n')
+            source_rpm = root / 'egcl.src.rpm'
+            source_rpm.write_bytes(b'source archive')
+            provenance.write_text(json.dumps({
+                'git': 'test-commit', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44',
+                'artifacts': {name: name for name in release.RUNTIMES}, 'rpms': [],
+                'srpm_sha256': hashlib.sha256(source_rpm.read_bytes()).hexdigest(),
+            }))
 
             def identity(command, **kwargs):
+                if Path(command[-1]) == source_rpm:
+                    return 'egcl\t0.0.1\t0.test.123.1.fc44\t1'
                 return f'{Path(command[-1]).stem}\t0.0.1\t0.test.123.1.fc44\tx86_64'
 
             with patch.object(release, 'ROOT', root), patch.object(
                     release.subprocess, 'check_output', side_effect=identity):
                 destination = root / 'assets'
-                release.collect(rpms, destination, plan)
+                release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 self.assertEqual(json.loads((destination / 'release.json').read_text()), plan)
                 entries = (destination / 'SHA256SUMS').read_text().splitlines()
-                self.assertEqual(len(entries), 13)
+                self.assertEqual(len(entries), 14)
                 for entry in entries:
                     digest, name = entry.split('  ')
                     self.assertEqual(digest, hashlib.sha256((destination / name).read_bytes()).hexdigest())
                 with self.assertRaisesRegex(ValueError, 'empty'):
-                    release.collect(rpms, destination, plan)
+                    release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 (rpms / 'egcl-static.rpm').unlink()
                 with self.assertRaisesRegex(ValueError, '10 RPMs'):
-                    release.collect(rpms, root / 'incomplete', plan)
+                    release.collect(rpms, root / 'incomplete', plan, source_rpm, provenance.parent)
                 self.assertFalse((root / 'incomplete').exists())
 
 

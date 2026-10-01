@@ -5,18 +5,27 @@
 # Download and privately extract official build inputs; never run containers.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-root=$PWD/target/fedora-rpm/tools
+root=${EGCL_RPM_TOOLS:-$PWD/target/fedora-rpm/tools}
 mkdir -p "$root/rpms"
+group=${1:-all}
+case "$group" in
+    all) arches=(s390x aarch64 ppc64le) ;;
+    s390x|aarch64|ppc64le) arches=("$group") ;;
+    native|windows|android|package) arches=() ;;
+    *) echo "Unknown build group: $group" >&2; exit 2 ;;
+esac
 # Limit repository selection to Fedora; unrelated third-party repos are irrelevant.
-dnf --repo=fedora --repo=updates download --destdir="$root/rpms" \
-    gcc-s390x-linux-gnu gcc-aarch64-linux-gnu gcc-powerpc64le-linux-gnu \
-    binutils-s390x-linux-gnu binutils-aarch64-linux-gnu binutils-powerpc64le-linux-gnu \
-    sysroot-s390x-fc44-glibc sysroot-aarch64-fc44-glibc sysroot-ppc64le-fc44-glibc
-for package in "$root"/rpms/gcc-*.rpm "$root"/rpms/binutils-*.rpm "$root"/rpms/sysroot-*.rpm; do
-    rpmkeys --checksig "$package"
-    rpm2cpio "$package" | (cd "$root" && cpio -idmu --quiet)
-done
-for arch in s390x aarch64 ppc64le; do
+for arch in "${arches[@]}"; do
+    compiler_arch=$arch
+    [[ $arch != ppc64le ]] || compiler_arch=powerpc64le
+    dnf --repo=fedora --repo=updates download --destdir="$root/rpms" \
+        "gcc-$compiler_arch-linux-gnu" "binutils-$compiler_arch-linux-gnu" \
+        "sysroot-$arch-fc44-glibc"
+    for package in "$root"/rpms/gcc-"$compiler_arch"-*.rpm \
+                   "$root"/rpms/binutils-"$compiler_arch"-*.rpm "$root"/rpms/sysroot-"$arch"-*.rpm; do
+        rpmkeys --checksig "$package"
+        rpm2cpio "$package" | (cd "$root" && cpio -idmu --quiet)
+    done
     dnf --repo=fedora --repo=updates --forcearch="$arch" download \
         --destdir="$root/rpms" libgcc
     mkdir -p "$root/targets/$arch"
@@ -25,7 +34,12 @@ for arch in s390x aarch64 ppc64le; do
         rpm2cpio "$package" | (cd "$root/targets/$arch" && cpio -idmu --quiet)
     done
 done
-python3 packaging/fedora/prepare-musl.py --tools "$root"
+if [[ $group == all || $group == s390x ]]; then
+    python3 packaging/fedora/prepare-musl.py --tools "$root"
+fi
+if [[ $group != all && $group != android && $group != package ]]; then
+    exit 0
+fi
 if [[ -z ${ANDROID_NDK_HOME:-} ]]; then
     archive=$root/android-ndk-r27d-linux.zip
     if [[ ! -f $archive ]]; then

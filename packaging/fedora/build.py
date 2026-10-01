@@ -30,6 +30,14 @@ TARGETS = {
     'windows': 'x86_64-pc-windows-gnu',
     'android': 'aarch64-linux-android',
 }
+GROUPS = {
+    'native': ['native', 'static'],
+    's390x': ['s390x-linux', 's390x-linux-static'],
+    'aarch64': ['aarch64-linux', 'aarch64-linux-static'],
+    'ppc64le': ['ppc64le-linux', 'ppc64le-linux-static'],
+    'windows': ['windows'],
+    'android': ['android'],
+}
 
 
 def run(command, *, env=None, cwd=ROOT):
@@ -63,12 +71,18 @@ def build(args):
     # `git rev-parse HEAD` alone names a commit the payload may not correspond
     # to: a build from a dirty tree would claim provenance it does not have, and
     # build.json is the only record of what went into the RPM. Mark it.
-    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    dirty = subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT).returncode != 0
-    provenance = {'git': f'{head}-dirty' if dirty else head,
+    revision = ROOT / 'SOURCE-REVISION'
+    if revision.exists():
+        head = revision.read_text().strip()
+    else:
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        if subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT).returncode != 0:
+            head += '-dirty'
+    provenance = {'git': head,
                   'rustc': subprocess.check_output(['rustc', '--version'], text=True, env=env).strip(),
                   'sysroot_release': args.sysroot_release,
-                  'android_ndk': (ndk / 'source.properties').read_text(), 'artifacts': {}}
+                  'android_ndk': ((ndk / 'source.properties').read_text()
+                                  if 'android' in targets else None), 'artifacts': {}}
     for name, triple in targets.items():
         target_env = env.copy()
         suffix = '.exe' if name == 'windows' else ''
@@ -208,26 +222,35 @@ def build(args):
     return stage
 
 
-def source_archive(output, sources):
+def source_archive(output, sources, *, include_std=False):
     """Include current source plus locked, vendored crates for RPM %build."""
     snapshot = output / 'rpm-source' / 'egcl-source'
     snapshot.mkdir(parents=True, exist_ok=True)
-    for name in ('Cargo.toml', 'Cargo.lock', 'mkdocs.yml'):
+    for name in ('Cargo.toml', 'Cargo.lock', 'mkdocs.yml', 'rust-toolchain.toml'):
         copy(ROOT / name, snapshot / name)
-    for name in ('crates', 'lib', 'packaging/android', 'packaging/fedora', 'docs/manual'):
+    for name in ('crates', 'lib', 'scripts', 'packaging/android', 'packaging/fedora', 'docs/manual'):
         destination = snapshot / name
         if destination.exists():
             shutil.rmtree(destination)
         shutil.copytree(ROOT / name, destination,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'build', '*.fasl'))
     copy(ROOT / 'docs/hooks.py', snapshot / 'docs/hooks.py')
+    copy(ROOT / 'docs/fedora-rpm.md', snapshot / 'docs/fedora-rpm.md')
     # Workspace membership includes the linter even though only egcl-android
     # is built. Cargo still needs every member manifest when reading the lock.
     shutil.copytree(ROOT / 'tools/gc-root-lint', snapshot / 'tools/gc-root-lint',
                     dirs_exist_ok=True)
-    config = subprocess.check_output(
-        ['cargo', 'vendor', '--locked', '--offline', '--versioned-dirs', 'vendor'],
-        cwd=snapshot, text=True)
+    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    if subprocess.run(['git', 'diff', '--quiet', 'HEAD'], cwd=ROOT).returncode != 0:
+        revision += '-dirty'
+    (snapshot / 'SOURCE-REVISION').write_text(revision + '\n')
+    command = ['cargo', 'vendor', '--locked', '--offline', '--versioned-dirs', 'vendor']
+    env = dict(os.environ)
+    if include_std:
+        sysroot = subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip()
+        command += ['--sync', str(Path(sysroot) / 'lib/rustlib/src/rust/library/Cargo.toml')]
+        env['RUSTC_BOOTSTRAP'] = '1'
+    config = subprocess.check_output(command, cwd=snapshot, text=True, env=env)
     (snapshot / '.cargo').mkdir(exist_ok=True)
     (snapshot / '.cargo/config.toml').write_text(config)
     with tarfile.open(sources / 'egcl-source.tar.gz', 'w:gz') as archive:
@@ -246,6 +269,7 @@ def package(output, stage, ndk, release=None):
     source_archive(output, sources)
     command = ['rpmbuild', '-bb', ROOT / 'packaging/fedora/egcl.spec',
          '--define', f'_topdir {output}', '--define', f'egcl_version {version}',
+         '--define', 'egcl_prebuilt 1',
          '--define', 'egcl_rustup 1',
          '--define', f'android_ndk {ndk.resolve()}']
     if release is not None:
@@ -254,7 +278,7 @@ def package(output, stage, ndk, release=None):
     extract_and_verify(output, stage)
 
 
-def extract_and_verify(output, stage):
+def extract_and_verify(output, stage, targets=None):
     extracted = output / 'extracted'
     if extracted.exists():
         shutil.rmtree(extracted)
@@ -274,8 +298,15 @@ def extract_and_verify(output, stage):
             installed = extracted / path.relative_to(stage)
             if path.read_bytes() != installed.read_bytes():
                 raise RuntimeError(f'RPM changed payload file: {path}')
-    run(['python3', ROOT / 'packaging/fedora/verify.py', extracted])
-    run(['python3', ROOT / 'packaging/fedora/verify-native-content.py', extracted])
+    verification = ['python3', ROOT / 'packaging/fedora/verify.py', extracted]
+    for target in (targets or TARGETS):
+        verification += ['--target', target]
+    run(verification)
+    if targets is None or 'native' in targets:
+        run(['python3', ROOT / 'packaging/fedora/verify-native-content.py', extracted])
+    if targets is not None and 'android' not in targets:
+        print(f'RPMs built and verified: {output / "RPMS/x86_64"}')
+        return
     metadata = json.loads((extracted / 'usr/libexec/egcl/android/runtime.json').read_text())
     checker_spec = importlib.util.spec_from_file_location(
         'android_runtime', ROOT / 'packaging/android/build-runtime.py')
@@ -301,7 +332,13 @@ if __name__ == '__main__':
     parser.add_argument('--stage-only', action='store_true', help='Build and verify payloads without assembling RPMs')
     parser.add_argument('--target', action='append', choices=TARGETS,
                         help='With --stage-only, build just this payload (repeatable)')
+    parser.add_argument('--group', choices=['all', *GROUPS],
+                        help='With --stage-only, build an RPM package group')
     args = parser.parse_args()
+    if args.group:
+        if args.target:
+            parser.error('--group and --target are mutually exclusive')
+        args.target = list(TARGETS) if args.group == 'all' else GROUPS[args.group]
     if args.target and not args.stage_only:
         parser.error('--target requires --stage-only; RPM releases must contain every target')
     if args.stage_only and args.package_only:
