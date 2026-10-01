@@ -50,6 +50,8 @@ class NativeContentTests(unittest.TestCase):
             self.assertEqual((relocated / 'usr/share/doc/egcl/manual/java/index.html').read_text(), 'Java API')
             self.assertTrue((relocated / 'usr/share/doc/egcl/manual/assets/local.css').is_file())
             installer = relocated / 'usr/bin/install-egcl-forks'
+            # Fedora's brp-mangle-shebangs must leave the verified stage intact.
+            self.assertEqual(installer.read_bytes().splitlines()[0], b'#!/usr/bin/sh')
             result = subprocess.run([str(installer), '--dry-run', str(root)],
                                     text=True, capture_output=True, check=True)
             self.assertIn('ocicl install git+https://github.com/atgreen/', result.stdout)

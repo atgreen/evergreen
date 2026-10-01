@@ -14,6 +14,9 @@ def install(source, manual, stage, *, libdir, datadir, docdir):
     installer = stage / 'usr/bin/install-egcl-forks'
     installer.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source / 'scripts/install-egcl-forks', installer)
+    # Match Fedora's merged-/usr shebang before taking the payload snapshot;
+    # brp-mangle-shebangs would otherwise change the file during rpmbuild.
+    installer.write_bytes(installer.read_bytes().replace(b'#!/bin/sh\n', b'#!/usr/bin/sh\n', 1))
     installer.chmod(0o755)
     system = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-jvm'
     library = stage / libdir.lstrip('/') / 'egcl/libegcl_jvm.so'
