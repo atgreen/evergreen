@@ -2227,7 +2227,7 @@ then returning the non-empty string value of the variable"
     "The type of Lisp implementation used, as a short UIOP-standardized keyword"
     (first-feature
      '(:abcl (:acl :allegro) (:ccl :clozure) :clisp (:corman :cormanlisp)
-       (:cmu :cmucl :cmu) :clasp :ecl :gcl
+       (:cmu :cmucl :cmu) :clasp :ecl :egcl :gcl
        (:lwpe :lispworks-personal-edition) (:lw :lispworks)
        :mcl :mezzano :mkcl :sbcl :scl (:smbx :symbolics) :xcl)))
 
@@ -4741,6 +4741,7 @@ This is designed to abstract away the implementation specific quit forms."
     #+clozure (ccl:quit code)
     #+cormanlisp (win32:exitprocess code)
     #+(or cmucl scl) (unix:unix-exit code)
+    #+egcl (egcl::%exit code)
     #+gcl (system:quit code)
     #+genera (error "~S: You probably don't want to Halt Genera. (code: ~S)" 'quit code)
     #+lispworks (lispworks:quit :status code :confirm nil :return nil :ignore-errors-p t)
@@ -4751,7 +4752,7 @@ This is designed to abstract away the implementation specific quit forms."
                (cond
                  (exit `(,exit :code code :abort (not finish-output)))
                  (quit `(,quit :unix-status code :recklessly-p (not finish-output)))))
-    #-(or abcl allegro clasp clisp clozure cmucl ecl gcl genera lispworks mcl mkcl sbcl scl xcl)
+    #-(or abcl allegro clasp clisp clozure cmucl ecl egcl gcl genera lispworks mcl mkcl sbcl scl xcl)
     (not-implemented-error 'quit "(called with exit code ~S)" code))
 
   (defun die (code format &rest arguments)
@@ -4920,6 +4921,8 @@ Assume the calling conventions of a generated script that uses --
 if we are not called from a directly executable image."
     (block nil
       #+abcl (return arguments)
+      ;; EGCL keeps implementation options in raw argv, including the delimiter.
+      #+egcl (return (rest (member "--" arguments :test 'string=)))
       ;; SBCL and Allegro already separate user arguments from implementation arguments.
       #-(or sbcl allegro)
       (unless (eq *image-dumped-p* :executable)
@@ -4940,7 +4943,7 @@ Otherwise, return NIL."
     (cond
       ((eq *image-dumped-p* :executable) ; yes, this ARGV0 is our argv0 !
        ;; NB: not currently available on ABCL, Corman, Genera, MCL
-       (or #+(or allegro clisp clozure cmucl gcl lispworks sbcl scl xcl)
+       (or #+(or allegro clisp clozure cmucl egcl gcl lispworks sbcl scl xcl)
            (first (raw-command-line-arguments))
            #+(or clasp ecl) (si:argv 0) #+mkcl (mkcl:argv 0)))
       (t ;; argv[0] is the name of the interpreter.
@@ -4949,6 +4952,10 @@ Otherwise, return NIL."
 
   (defun setup-command-line-arguments ()
     (setf *command-line-arguments* (command-line-arguments)))
+
+  #+egcl
+  (defvar *egcl-restored-hook* nil
+    "Hook list already dispatched by EGCL startup in this process.")
 
   (defun restore-image (&key
                           (lisp-interaction *lisp-interaction*)
@@ -4990,7 +4997,13 @@ of the function will be returned rather than interpreted as a boolean designatin
       (setf *image-restore-hook* restore-hook)
       (setf *image-prelude* prelude)
       (setf *image-restored-p* :in-progress)
-      (call-image-restore-hook)
+      ;; Startup dispatches these before user code, including explicit --eval.
+      ;; A different caller-supplied hook list must still run.
+      #+egcl
+      (unless (eq restore-hook *egcl-restored-hook*)
+        (call-image-restore-hook))
+      #-egcl (call-image-restore-hook)
+      #+egcl (setf *egcl-restored-hook* nil)
       (standard-eval-thunk prelude)
       (setf *image-restored-p* t)
       (let ((results (multiple-value-list
@@ -5030,9 +5043,15 @@ or COMPRESSION on SBCL, and APPLICATION-TYPE on SBCL/Windows."
     (setf *image-dump-hook* dump-hook)
     (call-image-dump-hook)
     (setf *image-restored-p* nil)
-    #-(or clisp clozure (and cmucl executable) lispworks sbcl scl)
+    #-(or clisp clozure (and cmucl executable) egcl lispworks sbcl scl)
     (when executable
       (not-implemented-error 'dump-image "dumping an executable"))
+    #+egcl
+    (progn
+      (setf *egcl-restored-hook* nil)
+      (if executable
+          (egcl-ext:save-lisp-and-die filename :executable t :toplevel #'restore-image)
+          (egcl-ext:save-lisp-and-die filename)))
     #+allegro ;; revised with help from Franz
     (progn
       #+(and allegro-version>= (version>= 11))
@@ -5101,7 +5120,7 @@ or COMPRESSION on SBCL, and APPLICATION-TYPE on SBCL/Windows."
               #+(and sbcl os-windows) ;; passing :application-type :gui will disable the console window.
               ;; the default is :console - only works with SBCL 1.1.15 or later.
               (when application-type (list :application-type application-type)))))
-    #-(or allegro clisp clozure cmucl gcl lispworks sbcl scl)
+    #-(or allegro clisp clozure cmucl egcl gcl lispworks sbcl scl)
     (not-implemented-error 'dump-image))
 
   (defun create-image (destination lisp-object-files
@@ -5166,7 +5185,14 @@ or COMPRESSION on SBCL, and APPLICATION-TYPE on SBCL/Windows."
 ;;; its implementation hooks. Register a symbol so UIOP upgrades replace the
 ;;; dispatcher without leaving a stale function object or duplicate entry.
 #+egcl
-(pushnew 'call-image-restore-hook egcl-ext:*init-hooks*)
+(progn
+  (defun egcl-image-init-hook ()
+    (call-image-restore-hook)
+    (setf *egcl-restored-hook* *image-restore-hook*))
+  ;; Replace the older direct registration when upgrading an existing image.
+  (setf egcl-ext:*init-hooks*
+        (remove 'call-image-restore-hook egcl-ext:*init-hooks*))
+  (pushnew 'egcl-image-init-hook egcl-ext:*init-hooks*))
 
 ;;; Some universal image restore hooks
 (with-upgradability ()

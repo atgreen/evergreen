@@ -244,3 +244,93 @@ fn implementation_hooks_use_a_snapshot_and_propagate_errors() {
     assert!(String::from_utf8_lossy(&failed.stderr).contains("RESTORE-HOOK-FAILURE"));
     assert!(!String::from_utf8_lossy(&failed.stdout).contains("USER-CODE-RAN"));
 }
+
+#[test]
+fn uiop_dump_preserves_hooks_arguments_and_exit_status() {
+    let fixture =
+        Fixture(std::env::temp_dir().join(format!("egcl-uiop-dump-{}", std::process::id())));
+    fs::create_dir_all(&fixture.0).unwrap();
+    for executable in [true, false] {
+        let image = fixture.0.join(if executable { "app" } else { "core" });
+        let source = format!(
+            r#"
+(require :asdf)
+(defvar *events* nil)
+(defun restored () (push :restore *events*))
+(defun postlude () (push :postlude *events*))
+(defun dumped () (push :dump *events*))
+(defun prelude () (push :prelude *events*))
+(defun entry ()
+  (assert (equal *events* '(:prelude :restore :dump :postlude)))
+  (assert (equal uiop:*command-line-arguments* '("alpha" "beta")))
+  (assert (eq (uiop:implementation-type) :egcl))
+  (assert (equal asdf::*user-cache* (uiop:xdg-cache-home "common-lisp" :implementation)))
+  (format t "UIOP-DUMP-OK~%")
+  (not (uiop:getenv "TEST_FALSE_RESULT")))
+(uiop:register-image-restore-hook 'restored nil)
+(setf uiop:*image-prelude* #'prelude
+      uiop:*image-entry-point* 'entry
+      uiop:*lisp-interaction* nil)
+(uiop:dump-image {:?} :executable {} :postlude #'postlude :dump-hook '(dumped))
+"#,
+            image.to_str().unwrap(),
+            if executable { "t" } else { "nil" }
+        );
+        ok(Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--eval", &source])
+            .output()
+            .unwrap());
+        for failure in [false, true] {
+            let mut command = Command::new(if executable {
+                image.as_os_str()
+            } else {
+                std::ffi::OsStr::new(env!("CARGO_BIN_EXE_egcl"))
+            });
+            if !executable {
+                // Startup already dispatched the restore hooks. An explicit
+                // RESTORE-IMAGE must run the prelude/entry without repeating them.
+                command.arg("--image").arg(&image).args([
+                    "--no-init",
+                    "--eval",
+                    "(uiop:restore-image)",
+                ]);
+            }
+            command
+                .args(["--", "alpha", "beta"])
+                .env("HOME", fixture.0.join("new-home"))
+                .env_remove("XDG_CACHE_HOME")
+                .env_remove("TEST_FALSE_RESULT");
+            if failure {
+                command.env("TEST_FALSE_RESULT", "1");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(if failure { 1 } else { 0 }),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("UIOP-DUMP-OK"));
+        }
+    }
+}
+
+#[test]
+fn uiop_quit_preserves_explicit_status_and_flushes_output() {
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args([
+            "--no-init",
+            "--eval",
+            "(require :asdf) (write-string \"QUIT-FLUSH-OK\") (uiop:quit 23)",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("QUIT-FLUSH-OK"));
+}

@@ -61,10 +61,42 @@ init file, `--eval`, `--load`, scripts, or the saved `:toplevel` function.
 image does not run them. Startup uses a snapshot of the list, so changes made by
 a hook affect future saves/restores; an unhandled hook error aborts startup.
 
-Bundled UIOP registers its `call-image-restore-hook` dispatcher here. This
+Bundled UIOP registers a dispatcher for its image restore hooks here. This
 refreshes ASDF's user cache and UIOP's temporary directory, streams, and command
 line for the current user instead of retaining the image builder's values.
 Images built before this integration must be rebuilt to include the registration.
+
+## `uiop:dump-image`
+
+Bundled UIOP supports EGCL core files and standalone executables:
+
+```lisp
+(require :asdf)
+(defun main ()
+  (format t "Arguments: ~S~%" uiop:*command-line-arguments*)
+  t)
+(setf uiop:*image-entry-point* 'main
+      uiop:*lisp-interaction* nil)
+(uiop:dump-image "my-app" :executable t)
+```
+
+Run the result with `./my-app -- argument1 argument2`. EGCL retains its runtime
+command-line parser, so use `--` to separate application arguments.
+
+UIOP runs its postlude and dump hooks before saving. After restart, EGCL's
+init hooks dispatch UIOP's restore hooks once; `restore-image` then evaluates
+the prelude and calls the entry point. With `*lisp-interaction*` false, a true
+entry-point result exits with status 0 and a nil result exits with status 1.
+
+Without `:executable t`, restore the core with `egcl --image FILE`.
+To run its UIOP prelude and entry point explicitly, use
+`egcl --image FILE --eval '(uiop:restore-image)' -- arguments`.
+
+`(uiop:quit status)` flushes output and terminates the process with the supplied
+integer status, using EGCL's exit primitive.
+
+Installed EGCL executables containing an older bundled UIOP must be rebuilt
+to include this backend.
 
 ## Artifacts
 
