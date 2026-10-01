@@ -177,6 +177,19 @@ fn configure_runtime() {
 fn main() {
     configure_runtime();
     println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // The CLI bootstraps on the process's main thread. MSVC defaults to
+        // a 1 MiB stack, all of which the interpreter reserves as overflow
+        // headroom. Match the usual Linux main-stack reservation so startup
+        // and the native recursion guard have usable space on Windows too.
+        // This reserves address space; Windows commits pages as needed.
+        let flag = if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            "/STACK:8388608"
+        } else {
+            "-Wl,--stack,8388608"
+        };
+        println!("cargo:rustc-link-arg-bin=egcl={flag}");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux")
         && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
         && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("musl")
