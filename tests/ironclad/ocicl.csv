@@ -1,0 +1,6 @@
+alexandria, ghcr.io/ocicl/alexandria@sha256:407634b0781b2d8fc3e55a30432bcb5d0c042af2feb2d1d72de825940b0fb0df, alexandria-20260812-f283e25/alexandria.asd
+bordeaux-threads, git+https://github.com/atgreen/bordeaux-threads@2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f#ref=2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f, bordeaux-threads-2f736ed/bordeaux-threads.asd
+global-vars, ghcr.io/ocicl/global-vars@sha256:d197e871c9c9abc4bf31b1186f5fd28f0ca848ebe2e9dddf2d82ecee01dbdc65, global-vars-20240503-c749f32/global-vars.asd
+ironclad, ghcr.io/ocicl/ironclad@sha256:3117e5a26a3e94924074c3548c235a2b733609ed61a2731880ac9e31df55428b, ironclad-20240503-6da010f/ironclad.asd
+rt, ghcr.io/ocicl/rt@sha256:e3e71ac89d5dae840a65665b918a9ee40c3863b1efe2761469138bf9c7f4028a, rt-20240503-a6a7503/rt.asd
+trivial-features, git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f#ref=651e8ea90db0b143d39b9a414ee382ec62efad2f, trivial-features-651e8ea/trivial-features.asd
