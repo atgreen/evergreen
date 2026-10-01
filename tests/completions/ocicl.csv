@@ -86,8 +86,8 @@ trivia.trivial, ghcr.io/ocicl/trivia@sha256:51db74757bc31ceaf3a643914a8ffa878257
 trivial-backtrace, ghcr.io/ocicl/trivial-backtrace@sha256:89a3138695bb767c50001402fad60dacfc1e867e4e3d3579cc6f636d3e29a51c, trivial-backtrace-20240503-7f90b4a/trivial-backtrace.asd
 trivial-backtrace-test, ghcr.io/ocicl/trivial-backtrace@sha256:89a3138695bb767c50001402fad60dacfc1e867e4e3d3579cc6f636d3e29a51c, trivial-backtrace-20240503-7f90b4a/trivial-backtrace-test.asd
 trivial-cltl2, git+https://github.com/atgreen/trivial-cltl2@cf3253050711277e847a9dc445a45fa7170dc9cb#ref=cf3253050711277e847a9dc445a45fa7170dc9cb, trivial-cltl2-cf32530/trivial-cltl2.asd
-trivial-features, git+https://github.com/atgreen/trivial-features@eaec256ea8213e26bcf8ee917c8f11ffef940b9a#ref=eaec256ea8213e26bcf8ee917c8f11ffef940b9a, trivial-features-eaec256/trivial-features.asd
-trivial-features-tests, git+https://github.com/atgreen/trivial-features@eaec256ea8213e26bcf8ee917c8f11ffef940b9a#ref=eaec256ea8213e26bcf8ee917c8f11ffef940b9a, trivial-features-eaec256/trivial-features-tests.asd
+trivial-features, git+https://github.com/atgreen/trivial-features@cc45564e429761e5f7b5554261cf6d906ae1ae71#ref=cc45564e429761e5f7b5554261cf6d906ae1ae71, trivial-features-cc45564/trivial-features.asd
+trivial-features-tests, git+https://github.com/atgreen/trivial-features@cc45564e429761e5f7b5554261cf6d906ae1ae71#ref=cc45564e429761e5f7b5554261cf6d906ae1ae71, trivial-features-cc45564/trivial-features-tests.asd
 trivial-file-size, ghcr.io/ocicl/trivial-file-size@sha256:dfe138877e024d36e51fa14b1bcabf11e99e5745baa42ef4f627438485030f5c, trivial-file-size-20250427-60fd1bf/trivial-file-size.asd
 trivial-garbage, git+https://github.com/atgreen/trivial-garbage@3c4f9c86d4d3454dcd4f8d19113b4101c3add032#ref=3c4f9c86d4d3454dcd4f8d19113b4101c3add032, trivial-garbage-3c4f9c8/trivial-garbage.asd
 trivial-gray-streams, git+https://github.com/atgreen/trivial-gray-streams@b66f6e98efccb43ee7a48f918bcf65377e7c85cd#ref=b66f6e98efccb43ee7a48f918bcf65377e7c85cd, trivial-gray-streams-b66f6e9/trivial-gray-streams.asd

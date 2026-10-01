@@ -21,7 +21,7 @@ exercises these forks:
 
 | Library | Fork | Tested revision |
 |---|---|---|
-| trivial-features | https://github.com/atgreen/trivial-features | `eaec256ea8213e26bcf8ee917c8f11ffef940b9a` |
+| trivial-features | https://github.com/atgreen/trivial-features | `cc45564e429761e5f7b5554261cf6d906ae1ae71` |
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `b66f6e98efccb43ee7a48f918bcf65377e7c85cd` |
 | usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `9c88be9854200183d7e8e5d3f52fd314743c3ee4` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
@@ -60,7 +60,7 @@ Trivia load.
 For an existing ocicl project, run there:
 
 ```sh
-ocicl install git+https://github.com/atgreen/trivial-features@eaec256ea8213e26bcf8ee917c8f11ffef940b9a
+ocicl install git+https://github.com/atgreen/trivial-features@cc45564e429761e5f7b5554261cf6d906ae1ae71
 ocicl install git+https://github.com/atgreen/trivial-gray-streams@b66f6e98efccb43ee7a48f918bcf65377e7c85cd
 ocicl install git+https://github.com/atgreen/trivial-cltl2@cf3253050711277e847a9dc445a45fa7170dc9cb
 ocicl install git+https://github.com/atgreen/trivial-garbage@3c4f9c86d4d3454dcd4f8d19113b4101c3add032
