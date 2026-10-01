@@ -32649,6 +32649,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Register the struct name present INTERNAL in CL-USER (bliss-4n3h).
     home_defined_symbol(env, name_sym);
     let name_str = sym_bare_name_rc(name_sym);
+    let definition_package = resolve_package_name_cow(env, &env.current_package).into_owned();
 
     // Parse DEFSTRUCT options from the `(name option...)` head. Supported:
     // :conc-name (accessor prefix), :constructor (custom / BOA / suppressed),
@@ -32843,7 +32844,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let accessor = if conc_name.is_empty() {
             slot_sym
         } else {
-            resolve_sym(&format!("{conc_name}{slot_str}")).unwrap_or(NIL)
+            resolve_sym(&format!("{definition_package}::{conc_name}{slot_str}")).unwrap_or(NIL)
         };
         slots.push(StructSlot {
             slot_sym,
@@ -32937,7 +32938,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             let accessor = if conc_name.is_empty() {
                 slot_sym
             } else {
-                resolve_sym(&format!("{conc_name}{bare_sname}")).unwrap_or(NIL)
+                resolve_sym(&format!("{definition_package}::{conc_name}{bare_sname}")).unwrap_or(NIL)
             };
             // A `(slot … :read-only t)` override makes the inherited slot
             // read-only in the child.
