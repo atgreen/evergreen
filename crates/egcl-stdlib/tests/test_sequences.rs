@@ -301,6 +301,30 @@ fn concatenate_with_empty() {
 }
 
 #[test]
+fn concatenate_rank_one_array_types_returns_vectors_and_checks_length() {
+    for spec in [
+        "(simple-array (unsigned-byte 8) (4))",
+        "(array t (*))",
+        "(array t 1)",
+    ] {
+        let (ty, _) = egcl_compiler::reader::read_from_string(spec).unwrap();
+        let cat =
+            sequences::concatenate(ty, &[make_vector(&[0, 0]), make_vector(&[0, 1])]).unwrap();
+        assert!(egcl_rt::types::vectorp(cat), "{spec} must produce a vector");
+        assert_eq!(sequences::length(cat).unwrap(), 4);
+        sequences::set_elt(cat, 3, EgclVal::from_fixnum(2)).unwrap();
+        assert_eq!(sequences::elt(cat, 3).unwrap(), EgclVal::from_fixnum(2));
+    }
+    for spec in ["(simple-array t (3))", "(array t (2 2))", "(array t 2)"] {
+        let (ty, _) = egcl_compiler::reader::read_from_string(spec).unwrap();
+        assert!(
+            sequences::concatenate(ty, &[make_vector(&[0, 0, 0, 1])]).is_err(),
+            "{spec}"
+        );
+    }
+}
+
+#[test]
 fn concatenate_multiple() {
     let list_type = EgclVal::from_symbol_index(egcl_compiler::reader::intern_symbol("LIST"));
     let cat = sequences::concatenate(

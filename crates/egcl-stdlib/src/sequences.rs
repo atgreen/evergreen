@@ -1766,7 +1766,11 @@ fn result_type_is_vector(result_type: EgclVal) -> bool {
     if result_type.is_cons() {
         let car = unsafe { (*(result_type.as_ptr() as *const ConsCell)).car };
         if car.tag() == egcl_rt::value::TAG_SYMBOL {
-            return name_is_vector(car.as_symbol_index());
+            return name_is_vector(car.as_symbol_index())
+                || matches!(
+                    egcl_compiler::reader::symbol_name(car.as_symbol_index()).as_deref(),
+                    Some("ARRAY" | "SIMPLE-ARRAY")
+                );
         }
     }
     false
@@ -1927,6 +1931,16 @@ fn declared_sequence_length(result_type: EgclVal) -> Option<usize> {
         }
         _ => return None,
     };
+    // ARRAY dimensions are a rank or a dimension list, not a vector length.
+    // For rank one, only the sole list element constrains the result length.
+    let slot = if matches!(head.as_str(), "ARRAY" | "SIMPLE-ARRAY") {
+        if !slot.is_cons() {
+            return None;
+        }
+        unsafe { (*(slot.as_ptr() as *const ConsCell)).car }
+    } else {
+        slot
+    };
     if slot.is_fixnum() && slot.as_fixnum() >= 0 {
         Some(slot.as_fixnum() as usize)
     } else {
@@ -1952,6 +1966,26 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
     } else {
         return false;
     };
+    if matches!(
+        egcl_compiler::reader::symbol_name(head).as_deref(),
+        Some("ARRAY" | "SIMPLE-ARRAY")
+    ) && result_type.is_cons()
+    {
+        let rest = unsafe { (*(result_type.as_ptr() as *const ConsCell)).cdr };
+        if rest.is_cons() {
+            let dims_arg = unsafe { (*(rest.as_ptr() as *const ConsCell)).cdr };
+            if dims_arg.is_cons() {
+                let dims = unsafe { (*(dims_arg.as_ptr() as *const ConsCell)).car };
+                if dims.is_nil()
+                    || (dims.is_fixnum() && dims.as_fixnum() != 1)
+                    || (dims.is_cons()
+                        && !unsafe { (*(dims.as_ptr() as *const ConsCell)).cdr }.is_nil())
+                {
+                    return false;
+                }
+            }
+        }
+    }
     matches!(
         egcl_compiler::reader::symbol_name(head).as_deref(),
         Some(
