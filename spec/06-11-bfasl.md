@@ -210,6 +210,20 @@ This permits values produced by `#.` during `COMPILE-FILE` to remain in the
 authoritative BBU without replaying compile-time-only helper definitions when
 the artifact is loaded in a fresh process.
 
+#### Circular constants (bytecode version 1.14)
+
+Version 1.14 permits forward and cyclic references in `Cons`, `Vector`, and
+`MdArray` constants. The writer traverses aggregate graphs without recursive
+descent, reserving an index when an edge reaches an active ancestor. Acyclic
+entries retain structural interning; references to the same cyclic object keep
+the same index throughout the unit. Temporary address maps are discarded before
+any Lisp allocation, and persistent identity keys are GC roots.
+
+The loader allocates all aggregate shells before installing their edges through
+the GC write barrier. This preserves shared references and cycles even when
+allocation moves or promotes earlier shells. Every edge remains subject to
+constant-pool bounds validation. Older bytecode versions remain readable.
+
 ### 6.11.3.3 Function Table
 
 Each function record serializes one §4.4.3 `BytecodeFunction`.

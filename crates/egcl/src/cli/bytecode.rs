@@ -432,6 +432,7 @@ pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str
         .map(|(symbol, body)| {
             let reason = source_dependency(&body).or_else(|| {
                 let mut pool = BbuConstPool::default();
+                egcl_rt::rooted_ref!(_pool_root = &mut pool);
                 let mut functions = Vec::new();
                 serialize_bbu_function_tree(
                     &body,
@@ -654,6 +655,7 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
 /// post-STW-GC.
 pub(super) fn serialize_registry_unit() -> Vec<u8> {
     let mut pool = BbuConstPool::default();
+    egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string("<core-registry>");
     let mut functions: Vec<BbuFunction> = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
@@ -8357,7 +8359,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x010b: compiled LOAD-TIME-VALUE initializers (SetLoadTimeCell, action 11).
 // 0x010c: preserve load-time IN-PACKAGE (SetPackage, action 12).
 // 0x010d: source-independent multidimensional-array constants (tag 19).
-const BBU_BYTECODE_VERSION: u16 = 0x010d;
+// 0x010e: forward and cyclic references in aggregate constants.
+const BBU_BYTECODE_VERSION: u16 = 0x010e;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -8406,6 +8409,115 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 struct BbuConstPool {
     entries: Vec<Vec<u8>>,
     index: HashMap<Vec<u8>, u32>,
+    // Only cyclic graphs need identity memoization beyond structural interning.
+    // Keep movable keys in a rooted vector, never in a persistent pointer map.
+    graph_values: Vec<EgclVal>,
+    graph_refs: Vec<u32>,
+}
+
+impl egcl_rt::gc::TraceHostRoots for BbuConstPool {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.graph_values, visit);
+    }
+}
+
+enum BbuGraphNode {
+    Leaf,
+    Existing(u32),
+    Cons(Vec<usize>),
+    Vector(Vec<usize>),
+    MdArray(Vec<u64>, Vec<usize>),
+}
+
+impl BbuGraphNode {
+    fn children(&self) -> &[usize] {
+        match self {
+            Self::Cons(children) | Self::Vector(children) | Self::MdArray(_, children) => children,
+            Self::Leaf | Self::Existing(_) => &[],
+        }
+    }
+}
+
+// This snapshot phase must not allocate Lisp objects: its temporary address map
+// is valid only until the next GC. Copy only raw general-vector elements; numeric
+// boxing, pathname conversion, and all other allocating work happens afterwards.
+fn bbu_vector_elements(value: EgclVal) -> Option<Vec<EgclVal>> {
+    if !value.is_heap_object()
+        || unsafe { (*(value.as_ptr() as *const egcl_rt::ObjectHeader)).type_id() }
+            != egcl_rt::object::type_id::SIMPLE_VECTOR
+    {
+        return None;
+    }
+    unsafe {
+        let count = *(value.as_ptr().add(8) as *const u64) as usize;
+        Some(std::slice::from_raw_parts(value.as_ptr().add(16) as *const EgclVal, count).to_vec())
+    }
+}
+
+fn capture_bbu_graph(
+    value: EgclVal,
+    existing_values: &[EgclVal],
+    existing_refs: &[u32],
+) -> Option<(Vec<EgclVal>, Vec<BbuGraphNode>)> {
+    fn add(value: EgclVal, values: &mut Vec<EgclVal>, seen: &mut HashMap<EgclVal, usize>) -> usize {
+        if let Some(&index) = seen.get(&value) {
+            return index;
+        }
+        let index = values.len();
+        values.push(value);
+        seen.insert(value, index);
+        index
+    }
+    let existing: HashMap<_, _> = existing_values
+        .iter()
+        .copied()
+        .zip(existing_refs.iter().copied())
+        .collect();
+    let mut values = vec![value];
+    let mut seen = HashMap::from([(value, 0)]);
+    let mut nodes = Vec::new();
+    while nodes.len() < values.len() {
+        let value = values[nodes.len()];
+        let node = if let Some(&reference) = existing.get(&value) {
+            BbuGraphNode::Existing(reference)
+        } else if value.is_cons() {
+            let (car, cdr) = cp(value);
+            BbuGraphNode::Cons(vec![
+                add(car, &mut values, &mut seen),
+                add(cdr, &mut values, &mut seen),
+            ])
+        } else if let Some(elements) = bbu_vector_elements(value) {
+            BbuGraphNode::Vector(
+                elements
+                    .into_iter()
+                    .map(|element| add(element, &mut values, &mut seen))
+                    .collect(),
+            )
+        } else if let Some(storage) = egcl_rt::types::md_array_storage(value) {
+            let dimensions = bbu_vector_elements(egcl_rt::types::md_array_dims(value)?)?
+                .into_iter()
+                .map(|dimension| {
+                    if dimension.is_fixnum() {
+                        u64::try_from(dimension.as_fixnum()).ok()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let elements = bbu_vector_elements(storage)?;
+            BbuGraphNode::MdArray(
+                dimensions,
+                elements
+                    .into_iter()
+                    .map(|element| add(element, &mut values, &mut seen))
+                    .collect(),
+            )
+        } else {
+            BbuGraphNode::Leaf
+        };
+        nodes.push(node);
+    }
+    Some((values, nodes))
 }
 
 impl BbuConstPool {
@@ -8488,7 +8600,119 @@ impl BbuConstPool {
         Some(self.intern_encoded(bytes))
     }
 
-    fn value(&mut self, mut v: EgclVal) -> Option<u32> {
+    fn value(&mut self, v: EgclVal) -> Option<u32> {
+        let aggregate = v.is_cons()
+            || (v.is_heap_object()
+                && matches!(
+                    unsafe { (*(v.as_ptr() as *const egcl_rt::ObjectHeader)).type_id() },
+                    egcl_rt::object::type_id::SIMPLE_VECTOR | egcl_rt::object::type_id::MD_ARRAY
+                ));
+        if !aggregate {
+            return self.value_leaf(v);
+        }
+        let (mut values, nodes) = capture_bbu_graph(v, &self.graph_values, &self.graph_refs)?;
+        egcl_rt::rooted_ref!(_values_root = &mut values);
+        let entry_count = self.entries.len();
+        let graph_count = self.graph_values.len();
+        let result = self.encode_graph(&values, &nodes);
+        if result.is_none() {
+            // Unsupported leaves must not leave unresolved reserved entries in
+            // a pool that the caller may reuse for another function.
+            self.entries.truncate(entry_count);
+            self.index
+                .retain(|_, index| (*index as usize) < entry_count);
+            self.graph_values.truncate(graph_count);
+            self.graph_refs.truncate(graph_count);
+        }
+        result
+    }
+
+    fn encode_graph(&mut self, values: &[EgclVal], nodes: &[BbuGraphNode]) -> Option<u32> {
+        let mut states = vec![0_u8; nodes.len()];
+        let mut references = vec![None; nodes.len()];
+        let mut pending = vec![(0, false)];
+        let mut cyclic = false;
+        while let Some((index, finish)) = pending.pop() {
+            if finish {
+                let children = nodes[index]
+                    .children()
+                    .iter()
+                    .map(|&child| references[child])
+                    .collect::<Option<Vec<u32>>>()?;
+                let mut bytes = Vec::new();
+                match &nodes[index] {
+                    BbuGraphNode::Cons(_) => put_u8(&mut bytes, 13),
+                    BbuGraphNode::Vector(_) => {
+                        put_u8(&mut bytes, 14);
+                        put_u32(&mut bytes, u32::try_from(children.len()).ok()?);
+                    }
+                    BbuGraphNode::MdArray(dimensions, _) => {
+                        put_u8(&mut bytes, 19);
+                        put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
+                        for &dimension in dimensions {
+                            put_u64(&mut bytes, dimension);
+                        }
+                        put_u32(&mut bytes, u32::try_from(children.len()).ok()?);
+                    }
+                    _ => return None,
+                }
+                for child in children {
+                    put_u32(&mut bytes, child);
+                }
+                references[index] = Some(if let Some(reserved) = references[index] {
+                    self.entries[reserved as usize] = bytes;
+                    reserved
+                } else {
+                    self.intern_encoded(bytes)
+                });
+                states[index] = 2;
+            } else if states[index] == 1 {
+                // Back-edge to an active ancestor: reserve its stable index now
+                // and fill it when that ancestor's children have been encoded.
+                cyclic = true;
+                if references[index].is_none() {
+                    references[index] = Some(u32::try_from(self.entries.len()).ok()?);
+                    self.entries.push(Vec::new());
+                }
+            } else if states[index] == 0 {
+                match nodes[index] {
+                    BbuGraphNode::Leaf => {
+                        references[index] = Some(self.value_leaf(values[index])?);
+                        states[index] = 2;
+                    }
+                    BbuGraphNode::Existing(reference) => {
+                        references[index] = Some(reference);
+                        states[index] = 2;
+                    }
+                    _ => {
+                        states[index] = 1;
+                        pending.push((index, true));
+                        pending.extend(
+                            nodes[index]
+                                .children()
+                                .iter()
+                                .rev()
+                                .map(|&child| (child, false)),
+                        );
+                    }
+                }
+            }
+        }
+        if cyclic {
+            for (index, node) in nodes.iter().enumerate() {
+                if matches!(
+                    node,
+                    BbuGraphNode::Cons(_) | BbuGraphNode::Vector(_) | BbuGraphNode::MdArray(_, _)
+                ) {
+                    self.graph_values.push(values[index]);
+                    self.graph_refs.push(references[index]?);
+                }
+            }
+        }
+        references[0]
+    }
+
+    fn value_leaf(&mut self, mut v: EgclVal) -> Option<u32> {
         egcl_rt::rooted_ref!(_v_root = &mut v);
         if v.is_nil() {
             return Some(self.intern_encoded(vec![0]));
@@ -8558,35 +8782,6 @@ impl BbuConstPool {
             put_u32(&mut bytes, idx);
             return Some(self.intern_encoded(bytes));
         }
-        if v.is_cons() {
-            // Generated tables can contain proper lists tens of thousands of
-            // cells long.  Recursing through every CDR exhausts the native
-            // stack while writing their literal constants, so flatten the
-            // spine and rebuild its pool references from the tail upward.
-            // Root both the collected CARs and dotted tail: recursive value
-            // encoding may allocate EGCL objects for other literal kinds.
-            let mut cars: Vec<EgclVal> = Vec::new();
-            let mut tail = v;
-            egcl_rt::rooted_ref!(_cars_root = &mut cars);
-            egcl_rt::rooted_ref!(_tail_root = &mut tail);
-            while tail.is_cons() {
-                let (car, cdr) = cp(tail);
-                cars.push(car);
-                tail = cdr;
-            }
-
-            let mut cdr_ref = self.value(tail)?;
-            while let Some(mut car) = cars.pop() {
-                egcl_rt::rooted_ref!(_car_root = &mut car);
-                let car_ref = self.value(car)?;
-                let mut bytes = Vec::new();
-                put_u8(&mut bytes, 13);
-                put_u32(&mut bytes, car_ref);
-                put_u32(&mut bytes, cdr_ref);
-                cdr_ref = self.intern_encoded(bytes);
-            }
-            return Some(cdr_ref);
-        }
         // A ratio (e.g. `1/2`): pool its numerator and denominator (fixnums or
         // bignums, themselves poolable) and reconstruct the RATIO heap object on
         // load, preserving exact parts even when they exceed the fixnum range.
@@ -8614,55 +8809,6 @@ impl BbuConstPool {
             put_u8(&mut bytes, 18);
             put_u32(&mut bytes, name_ref);
             return Some(self.intern_encoded(bytes));
-        }
-        // A literal simple-vector (e.g. `#(…)` in source) → pool its elements and
-        // reconstruct on load. Needed for the load-source fallback of forms that
-        // embed vector literals (babel's encodings.lisp defclass initforms).
-        if v.is_heap_object() {
-            let tid = unsafe { (*(v.as_ptr() as *const egcl_rt::ObjectHeader)).type_id() };
-            if tid == egcl_rt::object::type_id::SIMPLE_VECTOR {
-                let count = unsafe { *(v.as_ptr().add(8) as *const u64) } as usize;
-                let mut refs = Vec::with_capacity(count);
-                for i in 0..count {
-                    let mut elem = unsafe { *(v.as_ptr().add(16 + i * 8) as *const EgclVal) };
-                    egcl_rt::rooted_ref!(_elem_root = &mut elem);
-                    refs.push(self.value(elem)?);
-                }
-                return Some(self.vector(&refs));
-            }
-            if tid == egcl_rt::object::type_id::MD_ARRAY {
-                let dims_value = egcl_rt::types::md_array_dims(v)?;
-                let storage = egcl_rt::types::md_array_storage(v)?;
-                let rank = egcl_stdlib::length(dims_value).ok()?;
-                let mut dimensions = Vec::with_capacity(rank);
-                for index in 0..rank {
-                    let dimension = egcl_stdlib::elt(dims_value, index).ok()?;
-                    if !dimension.is_fixnum() || dimension.as_fixnum() < 0 {
-                        return None;
-                    }
-                    dimensions.push(u64::try_from(dimension.as_fixnum()).ok()?);
-                }
-                let count = egcl_stdlib::length(storage).ok()?;
-                let mut elements = Vec::with_capacity(count);
-                egcl_rt::rooted_ref!(_elements_root = &mut elements);
-                for index in 0..count {
-                    elements.push(egcl_stdlib::elt(storage, index).ok()?);
-                }
-                let mut refs = Vec::with_capacity(count);
-                for &element in &elements {
-                    refs.push(self.value(element)?);
-                }
-                let mut bytes = vec![19];
-                put_u32(&mut bytes, u32::try_from(dimensions.len()).ok()?);
-                for dimension in dimensions {
-                    put_u64(&mut bytes, dimension);
-                }
-                put_u32(&mut bytes, u32::try_from(refs.len()).ok()?);
-                for reference in refs {
-                    put_u32(&mut bytes, reference);
-                }
-                return Some(self.intern_encoded(bytes));
-            }
         }
         None
     }
@@ -9491,6 +9637,7 @@ pub fn build_bbu_from_forms(
     let mut forms = forms.to_vec();
     egcl_rt::rooted_ref!(_forms_root = &mut forms);
     let mut pool = BbuConstPool::default();
+    egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string(src_path);
     let mut functions = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
@@ -9925,6 +10072,7 @@ fn image_combination_name(c: egcl_stdlib::MethodCombinationType) -> Option<&'sta
 #[allow(dead_code)] // alternate save-lisp-and-die image writer; not yet wired (image.rs save_image is the live path)
 pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, EgclError> {
     let mut pool = BbuConstPool::default();
+    egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string("<image>");
     let mut functions: Vec<BbuFunction> = Vec::new();
     let mut load_actions: Vec<(u8, u8, u32, u32, u32)> = Vec::new();
@@ -23009,6 +23157,40 @@ mod jtc4_stack_map_tests {
     }
 
     #[test]
+    fn bbu_graph_writer_remembers_identity_after_relocation() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pool = BbuConstPool::default();
+        egcl_rt::rooted_ref!(_pool_root = &mut pool);
+        egcl_rt::rooted!(circle = arena_cons(NIL, NIL));
+        super::super::store_cons_field(*circle, *circle, true).unwrap();
+        let reference = pool.value(*circle).unwrap();
+        let before = circle.to_raw();
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        assert_ne!(circle.to_raw(), before, "the memoized object must move");
+        assert_eq!(pool.value(*circle), Some(reference));
+        assert_eq!(pool.graph_values, vec![*circle]);
+    }
+
+    #[test]
+    fn bbu_graph_writer_rolls_back_reserved_entries_for_unsupported_leaves() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut pool = BbuConstPool::default();
+        egcl_rt::rooted_ref!(_pool_root = &mut pool);
+        let nil_ref = pool.value(NIL).unwrap();
+        egcl_rt::rooted!(bits = reader::read_from_string("#*101").unwrap().0);
+        egcl_rt::rooted!(circle = arena_cons(NIL, *bits));
+        super::super::store_cons_field(*circle, *circle, true).unwrap();
+        assert!(pool.value(*circle).is_none());
+        assert_eq!(pool.entries, vec![vec![0]]);
+        assert!(pool.graph_values.is_empty());
+        assert_eq!(pool.value(NIL), Some(nil_ref));
+    }
+
+    #[test]
     fn bbu_constant_graphs_preserve_cycles_and_shared_edges() {
         let _lock = super::super::heap_test_lock()
             .lock()
@@ -23077,6 +23259,7 @@ mod jtc4_stack_map_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut pool = BbuConstPool::default();
+        egcl_rt::rooted_ref!(_pool_root = &mut pool);
         let float_bits = [
             0,
             1,

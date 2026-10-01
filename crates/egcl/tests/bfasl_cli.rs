@@ -2591,6 +2591,59 @@ fn compile_file_round_trips_define_package_without_source() {
 }
 
 #[test]
+fn circular_literals_round_trip_without_source() {
+    let dir = workdir("circular-literals");
+    let src = dir.join("circles.lisp");
+    let out = dir.join("circles.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun cf-car-circle () '#1=(#1#))
+      (defun cf-cdr-circle () '#2=(42 . #2#))
+      (defun cf-vector-circle ()
+        '#.(let ((v (vector nil))) (setf (aref v 0) v) v))
+      (defun cf-mixed-circle () '#4=(#(#4# #4#)))
+      (defun cf-array-circle ()
+        '#.(let ((a (make-array '(1 2))))
+             (setf (aref a 0 0) a (aref a 0 1) a) a))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {out:?})"));
+    assert!(
+        compiled.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    bbu_counts(&bytes);
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "circular constants must not use source replay"
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        r#"(progn (load {out:?})
+      (let ((a (cf-car-circle)) (b (cf-cdr-circle))
+            (c (cf-vector-circle)) (d (cf-mixed-circle)) (e (cf-array-circle)))
+        (list (eq a (car a)) (eq b (cdr b)) (= 42 (car b))
+              (eq c (aref c 0)) (eq d (aref (car d) 0))
+              (eq d (aref (car d) 1)) (eq e (aref e 0 0))
+              (eq e (aref e 0 1)))))"#
+    ));
+    assert!(
+        loaded.status.success(),
+        "load failed: {}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(T T T T T T T T)"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn read_time_multidimensional_array_is_portable_without_compile_time_helper() {
     let dir = workdir("read-time-md-array");
     let src = dir.join("array.lisp");
