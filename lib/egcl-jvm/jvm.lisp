@@ -146,7 +146,7 @@ so a user can see which layouts were considered rather than guessing."
 (defun %java-home (home)
   (or home (egcl-ext:getenv "JAVA_HOME")
       (let* ((binary (string-trim '(#\Space #\Newline #\Return #\Tab)
-                      (uiop:run-program '("which" "java") :output :string)))
+                      (uiop:run-program '("sh" "-c" "command -v java") :output :string)))
              (resolved (string-trim '(#\Space #\Newline #\Return #\Tab)
                         (uiop:run-program (list "readlink" "-f" binary) :output :string))))
         (namestring (truename (merge-pathnames "../" (make-pathname :name nil :type nil :defaults resolved)))))))

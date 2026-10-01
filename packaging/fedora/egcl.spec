@@ -67,7 +67,6 @@ BuildRequires: java-devel >= 17
 BuildRequires: mkdocs
 BuildRequires: mkdocs-material
 Requires: java-headless >= 17
-Requires: which
 Requires: coreutils
 %if !0%{?egcl_rustup}
 BuildRequires: cargo
