@@ -1,0 +1,10 @@
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+(require :asdf)
+(defparameter *apk-source* (uiop:pathname-directory-pathname *load-truename*))
+(setf *default-pathname-defaults* *apk-source*)
+(asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
+(load (or (uiop:getenv "OCICL_RUNTIME")
+          (merge-pathnames ".local/share/ocicl/ocicl-runtime.lisp" (user-homedir-pathname))))
+(setf ocicl-runtime:*download* nil ocicl-runtime:*local-only* t)
+(asdf:load-asd (merge-pathnames "egcl-apk.asd" *apk-source*))
+(asdf:load-system :egcl-apk)

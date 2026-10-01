@@ -1,0 +1,18 @@
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+(defparameter *apk-test-root* (uiop:ensure-directory-pathname (or (uiop:getenv "EGCL_APK_TEST_DIR") "/tmp/")))
+(assert (equalp (egcl-apk::u32 #x12345678) #(120 86 52 18)))
+(assert (= (egcl-apk::crc32 (egcl-apk::utf8 "123456789")) #xcbf43926))
+(assert (equalp (egcl-apk::utf8 "é😀") #(195 169 240 159 152 128)))
+(assert (equalp (egcl-apk::der-integer 128) #(2 2 0 128)))
+(assert (handler-case (progn (egcl-apk:manifest :package "bad/package") nil) (error () t)))
+(dolist (name '("../bad" "/absolute" "a//b" "a/../b"))
+  (assert (handler-case (progn (egcl-apk::zip-sections (list (cons name #(1)))) nil) (error () t))))
+(assert (handler-case
+          (progn (egcl-apk::zip-sections (list (cons "a" #(1)) (cons "a" #(2)))) nil)
+          (error () t)))
+(egcl-apk::write-bytes (merge-pathnames "manifest.bin" *apk-test-root*)
+ (egcl-apk:manifest :package "org.egcl.example.egl" :label "EGCL EGL"))
+(egcl-apk:write-apk (merge-pathnames "unit.apk" *apk-test-root*)
+ (list (cons "AndroidManifest.xml" (egcl-apk:manifest :package "org.egcl.example.egl"))
+       (cons "assets/unicode.txt" (egcl-apk::utf8 "é😀"))))
+(format t "APK-UNIT-OK~%")

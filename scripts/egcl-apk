@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+set -eu
+umask 077
+if [ "$#" -ne 1 ]; then
+    echo 'Usage: egcl-apk PROJECT-DIRECTORY' >&2
+    echo 'Set SBCL_BIN, EGCL_APK_RUNTIME, EGCL_APK_OUTPUT or EGCL_APK_IDENTITY to override defaults.' >&2
+    exit 2
+fi
+repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+EGCL_APK_PROJECT=$(CDPATH='' cd -- "$1" && pwd)
+export EGCL_APK_PROJECT
+cd "$repo/lib/egcl-apk"
+exec "${SBCL_BIN:-sbcl}" --noinform --no-userinit --no-sysinit --non-interactive --load cli.lisp

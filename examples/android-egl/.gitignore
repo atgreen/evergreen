@@ -1,0 +1,5 @@
+/build/
+/local.mk
+/.debug.keystore
+
+/.egcl-apk-key
