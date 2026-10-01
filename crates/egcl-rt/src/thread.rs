@@ -612,6 +612,9 @@ mod join_completion_tests {
         concurrent_join(false);
     }
 
+    // Match run_worker_task's real context-switch backends. Other targets
+    // have only an inline fallback, not concurrent stackful fibers.
+    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
     #[test]
     fn consumed_fiber_result_remains_completed() {
         concurrent_join(true);
