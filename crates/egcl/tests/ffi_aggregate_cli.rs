@@ -31,19 +31,20 @@ fn lisp_native_buffers_support_aggregates_and_checked_lifetimes() {
         let dir = std::env::temp_dir().join(format!("egcl-aggregate-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let library = dir.join("aggregates.so");
-        assert!(
-            Command::new("cc")
-                .args(["-shared", "-fPIC", "-O2"])
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../egcl-rt/tests/fixtures/ffi_aggregates.c"
-                ))
-                .arg("-o")
-                .arg(&library)
-                .status()
-                .unwrap()
-                .success()
-        );
+        // Keep this fixture independent of the host libc: distro compiler
+        // defaults can introduce __stack_chk_fail, which the musl ELF loader
+        // cannot resolve. The runtime aggregate fixture uses the same flag.
+        assert!(Command::new("cc")
+            .args(["-shared", "-fPIC", "-O2", "-fno-stack-protector"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../egcl-rt/tests/fixtures/ffi_aggregates.c"
+            ))
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success());
         library
     };
     #[cfg(windows)]

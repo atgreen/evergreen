@@ -27,16 +27,16 @@ fn public_library_objects_support_lookup_call_close_and_destructors() {
     "#,
     )
     .unwrap();
-    assert!(
-        Command::new("cc")
-            .args(["-shared", "-fPIC"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&library)
-            .status()
-            .unwrap()
-            .success()
-    );
+    // Distro stack-protector defaults add a libc dependency (__stack_chk_fail)
+    // that the standalone musl ELF loader cannot resolve.
+    assert!(Command::new("cc")
+        .args(["-shared", "-fPIC", "-fno-stack-protector"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&library)
+        .status()
+        .unwrap()
+        .success());
     let program = format!(
         r#"
       (let* ((library (egcl-ffi:load-foreign-library {:?}))

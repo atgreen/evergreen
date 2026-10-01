@@ -31,8 +31,9 @@ fn build_test_so(dir: &Path, src: &str) -> Option<PathBuf> {
     let c = dir.join("s.c");
     std::fs::write(&c, src).ok()?;
     let so = dir.join("libs.so");
+    // Keep variadic fixtures loadable without the host libc's stack protector.
     let ok = Command::new("cc")
-        .args(["-shared", "-fPIC"])
+        .args(["-shared", "-fPIC", "-fno-stack-protector"])
         .arg(&c)
         .arg("-o")
         .arg(&so)
