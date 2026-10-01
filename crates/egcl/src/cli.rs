@@ -2954,6 +2954,10 @@ thread_local! {
     /// Serialized bytecode-registry BYTECODE_UNIT awaiting the post-Env drain
     /// (bliss-zz6w) — the BBU loader needs an Env the restore hook lacks.
     static PENDING_HOST_BYTECODE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SAVE_SETF_EXPANDERS: RefCell<Option<Rc<RefCell<HashMap<String, SetfExpander>>>>> =
+        const { RefCell::new(None) };
+    static PENDING_SETF_EXPANDERS: RefCell<HashMap<String, SetfExpander>> =
+        RefCell::new(HashMap::new());
 }
 
 fn hr_put_str(out: &mut Vec<u8>, s: &str) {
@@ -3071,6 +3075,9 @@ fn host_serialize_registries() -> Vec<u8> {
     // a single frame, not holding copies. Keying by `Arc::as_ptr` and walking
     // parents once is what preserves that, and it is the same walk the CLSR block
     // used before this was hoisted.
+    let setf_expanders = SAVE_SETF_EXPANDERS.with(|s| {
+        s.borrow().as_ref().map(|table| table.borrow().clone()).unwrap_or_default()
+    });
     let (frame_ids, clsr_frames) = {
         let reg = closure_registry();
         let reg = reg.borrow();
@@ -3091,6 +3098,11 @@ fn host_serialize_registries() -> Vec<u8> {
             .map(|c| Arc::clone(&c.captured_frame))
             .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
             .chain(method_frames)
+            .chain(setf_expanders.values().filter_map(|expander| match expander {
+                SetfExpander::Expander(def) => Some(Arc::clone(&def.captured_frame)),
+                SetfExpander::LongUpdate { captured_frame, .. } => Some(Arc::clone(captured_frame)),
+                SetfExpander::ShortUpdate(_) => None,
+            }))
             .collect();
         for root in roots {
             let mut cur = Some(root);
@@ -3365,6 +3377,28 @@ fn host_serialize_registries() -> Vec<u8> {
         for (&id, callable) in methods.iter() {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&callable.to_raw().to_le_bytes());
+        }
+    }
+    // SETF expanders are distinct from SETF writer functions. Preserve their
+    // source and shared lexical frames; compiled expanders ride the BCOD unit.
+    out.extend_from_slice(b"SEXP");
+    let source_expanders: Vec<_> = setf_expanders.iter().filter(|(_, expander)| {
+        !matches!(expander, SetfExpander::Expander(def) if def.bytecode.is_some())
+    }).collect();
+    out.extend_from_slice(&(source_expanders.len() as u32).to_le_bytes());
+    for (name, expander) in source_expanders {
+        hr_put_str(&mut out, name);
+        let (kind, values, frame) = match expander {
+            SetfExpander::Expander(def) =>
+                (0u8, vec![def.params_form, def.body], Some(&def.captured_frame)),
+            SetfExpander::ShortUpdate(function) => (1, vec![*function], None),
+            SetfExpander::LongUpdate { lambda_list, store_vars, body, captured_frame } =>
+                (2, vec![*lambda_list, *store_vars, *body], Some(captured_frame)),
+        };
+        out.push(kind);
+        out.extend_from_slice(&frame_id_of(frame).to_le_bytes());
+        for value in values {
+            out.extend_from_slice(&value.to_raw().to_le_bytes());
         }
     }
     out
@@ -3885,6 +3919,39 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         }
     }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
+    let mut expanders = HashMap::new();
+    if data.get(off..off + 4) == Some(b"SEXP") {
+        off += 4;
+        let bad = || EgclError::InvalidImage("host registry: invalid SETF expanders".into());
+        let count = u32::from_le_bytes(data.get(off..off + 4).ok_or_else(bad)?.try_into().unwrap());
+        off += 4;
+        for _ in 0..count {
+            let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
+            let kind = *data.get(off).ok_or_else(bad)?;
+            off += 1;
+            let frame_id = u32::from_le_bytes(data.get(off..off + 4).ok_or_else(bad)?.try_into().unwrap());
+            off += 4;
+            let frame = || PENDING_CLSR_FRAMES.with(|frames| {
+                frames.borrow().get(frame_id as usize).cloned().ok_or_else(bad)
+            });
+            let mut value = || hr_get_u64(data, &mut off)
+                .map(|raw| EgclVal::from_raw(remap(raw))).ok_or_else(bad);
+            let expander = match kind {
+                0 => SetfExpander::Expander(MacroDef {
+                    params_form: value()?, body: value()?, captured_frame: frame()?,
+                    bytecode: None, function: None,
+                }),
+                1 => SetfExpander::ShortUpdate(value()?),
+                2 => SetfExpander::LongUpdate {
+                    lambda_list: value()?, store_vars: value()?, body: value()?,
+                    captured_frame: frame()?,
+                },
+                _ => return Err(bad()),
+            };
+            expanders.insert(name, expander);
+        }
+    }
+    PENDING_SETF_EXPANDERS.with(|p| *p.borrow_mut() = expanders);
     Ok(())
 }
 
@@ -37420,6 +37487,14 @@ fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<
     SAVE_GENERICS.with(|g| *g.borrow_mut() = Some(env.generics));
     SAVE_METHODS.with(|m| *m.borrow_mut() = Some(env.methods));
     SAVE_CLASSES.with(|c| *c.borrow_mut() = Some(env.classes));
+    SAVE_SETF_EXPANDERS.with(|s| *s.borrow_mut() = Some(Rc::clone(&env.setf_expanders)));
+    struct ClearSavedSetfExpanders;
+    impl Drop for ClearSavedSetfExpanders {
+        fn drop(&mut self) {
+            SAVE_SETF_EXPANDERS.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    let _saved_setf_expanders = ClearSavedSetfExpanders;
     // Collect reclaimable garbage. Restored pinned objects require the delivery
     // serializer's separate reachability pass to omit dead objects from disk.
     egcl_rt::gc::full_gc()?;
@@ -37470,6 +37545,10 @@ fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<
 fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), EgclError> {
     egcl_rt::gc::ensure_heap_initialized();
     egcl_rt::image::load_image_from_bytes(bytes)?;
+    PENDING_SETF_EXPANDERS.with(|p| {
+        *env.setf_expanders.borrow_mut() = std::mem::take(&mut *p.borrow_mut());
+    });
+    egcl_rt::rooted_ref!(_env_root = &mut *env);
     // A core replaces the cold-start package registry wholesale. Older v1
     // cores carry the former sparse COMMON-LISP table, so repair it before any
     // restored/user code runs. This is idempotent for current complete cores.
@@ -38377,6 +38456,25 @@ mod class_slot_owner_tests {
 #[cfg(test)]
 mod host_registry_hook_tests {
     use super::*;
+
+    #[test]
+    fn host_registry_validates_setf_expanders_and_accepts_older_images() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = Env::new(false);
+        let bytes = host_serialize_registries();
+        let marker = bytes.windows(4).rposition(|w| w == b"SEXP").unwrap();
+        host_restore_registries(&bytes[..marker]).unwrap();
+        assert!(PENDING_SETF_EXPANDERS.with(|p| p.borrow().is_empty()));
+        assert!(host_restore_registries(&bytes[..marker + 4]).is_err());
+        let mut invalid = bytes[..marker + 4].to_vec();
+        invalid.extend_from_slice(&1u32.to_le_bytes());
+        hr_put_str(&mut invalid, "BAD-EXPANDER");
+        invalid.push(0); // Source expander with an invalid captured frame.
+        invalid.extend_from_slice(&u32::MAX.to_le_bytes());
+        invalid.extend_from_slice(&NIL.to_raw().to_le_bytes());
+        invalid.extend_from_slice(&NIL.to_raw().to_le_bytes());
+        assert!(matches!(host_restore_registries(&invalid), Err(EgclError::InvalidImage(_))));
+    }
 
     #[test]
     fn host_registry_validates_compiled_method_records_and_accepts_legacy_images() {

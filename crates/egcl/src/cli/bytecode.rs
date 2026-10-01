@@ -726,7 +726,20 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
     // Source-free bytecode MACRO expanders (kind-4 installs): the HREG macros
     // block only carries source params/body, which are NIL for bfasl-loaded
     // macros — re-emit their compiled expanders here.
-    for (name, bf_cell) in super::global_bytecode_macros() {
+    let mut expanders: Vec<_> = super::global_bytecode_macros().into_iter()
+        .map(|(name, body)| (4, name, body)).collect();
+    super::SAVE_SETF_EXPANDERS.with(|saved| {
+        if let Some(table) = saved.borrow().as_ref() {
+            for (name, expander) in table.borrow().iter() {
+                if let super::SetfExpander::Expander(def) = expander {
+                    if let Some(body) = &def.bytecode {
+                        expanders.push((8, name.clone(), Arc::clone(body)));
+                    }
+                }
+            }
+        }
+    });
+    for (action, name, bf_cell) in expanders {
         let Some(sym) = egcl_rt::symbols::find_index(&name) else {
             sk_pool += 1;
             continue;
@@ -739,7 +752,7 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
         match serialize_bbu_function_tree(&bf, name_ref, BBU_FUNC_MACRO, &mut pool, &mut functions)
         {
             Some(function_index) => {
-                load_actions.push((4, 0, function_index, name_ref, BBU_NO_INDEX));
+                load_actions.push((action, 0, function_index, name_ref, BBU_NO_INDEX));
             }
             None => {
                 sk_tree += 1;

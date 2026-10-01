@@ -137,6 +137,66 @@ fn restored_uiop_hooks_refresh_process_state_before_user_code() {
 }
 
 #[test]
+fn restored_images_preserve_setf_expanders() {
+    let fixture =
+        Fixture(std::env::temp_dir().join(format!("egcl-setf-image-{}", std::process::id())));
+    fs::create_dir_all(&fixture.0).unwrap();
+    let image = fixture.0.join("setf.core");
+    let compiled_source = fixture.0.join("compiled-expander.lisp");
+    fs::write(
+        &compiled_source,
+        "(define-setf-expander compiled-cell (x) (get-setf-expansion (list 'car x)))",
+    )
+    .unwrap();
+    let source = format!(
+        r#"
+(defun cell-value (x) (car x))
+(defun write-cell (x new) (rplaca x new) new)
+(defsetf cell-value write-cell)
+(let ((offset 8))
+  (defsetf offset-cell (x) (new) `(progn (rplaca ,x (+ ,new ,offset)) ,new))
+  (define-setf-expander field (x &environment env)
+    (get-setf-expansion `(ldb (byte 8 ,offset) ,x) env)))
+(load (compile-file {:?}))
+(save-lisp-and-die {:?})
+"#,
+        compiled_source.to_str().unwrap(),
+        image.to_str().unwrap()
+    );
+    ok(Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &source])
+        .output()
+        .unwrap());
+    let output = ok(Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .arg("--image")
+        .arg(&image)
+        .args([
+            "--no-init",
+            "--eval",
+            r##"
+(let ((x 0) (a (list 0)))
+  (assert (= 255 (setf (ldb (byte 8 0) x) 255)))
+  (assert (= 255 x))
+  (assert (= 3 (setf (field x) 3)))
+  (assert (= 1023 x))
+  (setf (mask-field (byte 8 0) x) 17)
+  (assert (= 785 x))
+  (setf (cell-value a) 5)
+  (assert (= 5 (car a)))
+  (assert (= 7 (setf (offset-cell a) 7)))
+  (assert (= 15 (car a)))
+  (setf (compiled-cell a) 19)
+  (assert (= 19 (car a))))
+(assert (= 42 (read-from-string "#.(let ((x 0)) (setf (ldb (byte 8 0) x) 42) x)")))
+(format t "RESTORED-SETF-OK~%")
+"##,
+        ])
+        .output()
+        .unwrap());
+    assert!(output.contains("RESTORED-SETF-OK"));
+}
+
+#[test]
 fn implementation_hooks_use_a_snapshot_and_propagate_errors() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
