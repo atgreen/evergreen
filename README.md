@@ -264,7 +264,7 @@ The CLI currently accepts:
 ```text
 Usage: egcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]
 
-EGCL Common Lisp
+Evergreen Common Lisp
 
 Options:
   --help               Print this help message and exit

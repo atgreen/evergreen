@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! `egcl-compiler` — EGCL Common Lisp compiler pipeline.
+//! `egcl-compiler` — Evergreen Common Lisp compiler pipeline.
 //!
 //! Reader → macro-expansion → sea-of-nodes IR → tiered compilation
 //! (T0 interpreter, T1 baseline, T2 optimising) → register allocation

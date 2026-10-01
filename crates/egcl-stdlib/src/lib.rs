@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! `egcl-stdlib` — EGCL Common Lisp standard library.
+//! `egcl-stdlib` — Evergreen Common Lisp standard library.
 //!
 //! Packages & bootstrap, CLOS, condition system, Gray streams,
 //! generic sequences, hash tables, FORMAT / pretty-printer,

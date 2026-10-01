@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! `egcl` — EGCL Common Lisp command-line interface.
+//! `egcl` — Evergreen Common Lisp command-line interface.
 //!
 //! Entry point, CLI argument parsing, image loading, and the
 //! interactive REPL driver.

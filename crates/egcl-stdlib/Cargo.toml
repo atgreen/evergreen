@@ -1,6 +1,6 @@
 [package]
 name = "egcl-stdlib"
-description = "EGCL Common Lisp standard library: packages, CLOS, conditions, streams, sequences"
+description = "Evergreen Common Lisp standard library: packages, CLOS, conditions, streams, sequences"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

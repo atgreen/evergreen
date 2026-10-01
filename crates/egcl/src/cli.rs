@@ -38080,7 +38080,7 @@ pub fn help_text() -> &'static str {
     concat!(
         "Usage: egcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]\n",
         "\n",
-        "EGCL Common Lisp\n",
+        "Evergreen Common Lisp\n",
         "\n",
         "Options:\n",
         "  --help               Print this help message and exit\n",
@@ -38167,7 +38167,7 @@ pub fn run_repl_with_reader<R: std::io::BufRead>(reader: &mut R) -> Result<i32, 
 /// `stdin().lock()`; tests inject an empty reader (immediate EOF).
 fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result<i32, EgclError> {
     let _config = ReplConfig::default();
-    println!("EGCL Common Lisp {} ({TARGET})", env!("CARGO_PKG_VERSION"));
+    println!("Evergreen Common Lisp {} ({TARGET})", env!("CARGO_PKG_VERSION"));
     println!("{COPYRIGHT}");
     println!("{LICENSE}");
     println!();

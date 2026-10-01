@@ -1,6 +1,6 @@
 [package]
 name = "egcl-rt"
-description = "EGCL Common Lisp runtime: object model, GC, threads, FFI"
+description = "Evergreen Common Lisp runtime: object model, GC, threads, FFI"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

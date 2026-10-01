@@ -1,6 +1,6 @@
 [package]
 name = "egcl-compiler"
-description = "EGCL Common Lisp compiler: reader, macroexpand, IR, tiered compilation, codegen"
+description = "Evergreen Common Lisp compiler: reader, macroexpand, IR, tiered compilation, codegen"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

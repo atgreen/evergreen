@@ -174,7 +174,7 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("EGCL Common Lisp"), "stdout: {stdout}");
+    assert!(stdout.contains("Evergreen Common Lisp"), "stdout: {stdout}");
     assert!(
         stdout.lines().any(|line| line.trim() == "3"),
         "stdout: {stdout} stderr: {stderr}"
