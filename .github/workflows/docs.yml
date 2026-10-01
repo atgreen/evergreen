@@ -28,9 +28,11 @@ permissions:
 
 # One Pages deployment at a time, and DON'T cancel in progress — cancelling a
 # half-finished deployment can leave the site serving a partial build.
+# Queue pending runs rather than replacing them when another push arrives.
 concurrency:
   group: pages
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
