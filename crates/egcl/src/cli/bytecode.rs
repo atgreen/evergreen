@@ -10840,6 +10840,16 @@ fn parse_bbu_handler_cases(
 }
 
 fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, EgclError> {
+    let mut values = allocate_bbu_constants(constants)?;
+    egcl_rt::rooted_ref!(_values_root = &mut values);
+    fill_bbu_constant_edges(constants, &values)?;
+    Ok(values)
+}
+
+// Allocate every aggregate before installing its edges. A constant graph can
+// refer forward, including back to itself; all shells remain rooted while later
+// constants allocate and potentially move the earlier ones.
+fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, EgclError> {
     let mut values = Vec::with_capacity(constants.len());
     egcl_rt::rooted_ref!(_values_root = &mut values);
     for (index, constant) in constants.iter().enumerate() {
@@ -10973,30 +10983,8 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
                 egcl_rt::rooted_ref!(_ns_root = &mut ns);
                 egcl_stdlib::pathnames::parse_namestring(ns, None, None)?.0
             }
-            BbuConstant::Cons(car_ref, cdr_ref) => {
-                // The writer emits structural children before their parent.
-                let mut car = *values.get(*car_ref as usize).ok_or_else(|| {
-                    bbu_error(format!("forward/cyclic cons reference at {index}"))
-                })?;
-                let mut cdr = *values.get(*cdr_ref as usize).ok_or_else(|| {
-                    bbu_error(format!("forward/cyclic cons reference at {index}"))
-                })?;
-                egcl_rt::rooted_ref!(_car_root = &mut car);
-                egcl_rt::rooted_ref!(_cdr_root = &mut cdr);
-                arena_cons(car, cdr)
-            }
-            BbuConstant::Vector(refs) => {
-                let mut elements = refs
-                    .iter()
-                    .map(|reference| {
-                        values.get(*reference as usize).copied().ok_or_else(|| {
-                            bbu_error(format!("forward/cyclic vector reference at {index}"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                egcl_rt::rooted_ref!(_elements_root = &mut elements);
-                egcl_stdlib::build_simple_vector(&elements)
-            }
+            BbuConstant::Cons(_, _) => arena_cons(NIL, NIL),
+            BbuConstant::Vector(refs) => egcl_stdlib::build_simple_vector(&vec![NIL; refs.len()]),
             BbuConstant::MdArray {
                 dimensions,
                 element_refs,
@@ -11008,15 +10996,7 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
                             .map_err(|_| bbu_error("array dimension exceeds host range"))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut elements = element_refs
-                    .iter()
-                    .map(|reference| {
-                        values.get(*reference as usize).copied().ok_or_else(|| {
-                            bbu_error(format!("forward/cyclic array reference at {index}"))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                egcl_rt::rooted_ref!(_elements_root = &mut elements);
+                let elements = vec![NIL; element_refs.len()];
                 egcl_stdlib::build_md_array_from_elements(&dimensions, &elements)
                     .map_err(|error| bbu_error(format!("invalid array constant: {error}")))?
             }
@@ -11024,6 +11004,37 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
         values.push(value);
     }
     Ok(values)
+}
+
+// No Lisp allocation occurs on this path: the shells contain only conses and
+// general vectors. Stores must still use the GC barrier, since an early shell
+// may have been promoted while a later referent was being allocated.
+fn fill_bbu_constant_edges(constants: &[BbuConstant], values: &[EgclVal]) -> Result<(), EgclError> {
+    let referent = |reference| {
+        bbu_index(reference, values.len(), "constant graph edge").map(|index| values[index])
+    };
+    for (index, constant) in constants.iter().enumerate() {
+        match constant {
+            BbuConstant::Cons(car_ref, cdr_ref) => {
+                super::store_cons_field(values[index], referent(*car_ref)?, true)?;
+                super::store_cons_field(values[index], referent(*cdr_ref)?, false)?;
+            }
+            BbuConstant::Vector(refs) => {
+                for (element, reference) in refs.iter().enumerate() {
+                    egcl_stdlib::set_elt(values[index], element, referent(*reference)?)?;
+                }
+            }
+            BbuConstant::MdArray { element_refs, .. } => {
+                let storage = egcl_rt::types::md_array_storage(values[index])
+                    .ok_or_else(|| bbu_error("missing array constant storage"))?;
+                for (element, reference) in element_refs.iter().enumerate() {
+                    egcl_stdlib::set_elt(storage, element, referent(*reference)?)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn bbu_symbol(constants: &[EgclVal], index: u32) -> Result<u32, EgclError> {
@@ -22995,6 +23006,69 @@ mod jtc4_stack_map_tests {
             BbuConstant::LegacySymbol(3)
         ));
         assert!(cursor.done());
+    }
+
+    #[test]
+    fn bbu_constant_graphs_preserve_cycles_and_shared_edges() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let constants = vec![
+            BbuConstant::Cons(0, 1),
+            BbuConstant::Cons(4, 1),
+            BbuConstant::Vector(vec![2, 0, 1, 3]),
+            BbuConstant::MdArray {
+                dimensions: vec![1, 2],
+                element_refs: vec![3, 2],
+            },
+            BbuConstant::String("shared tail".into()),
+        ];
+        egcl_rt::rooted!(values = materialize_bbu_constants(&constants).unwrap());
+        assert_eq!(cp(values[0]), (values[0], values[1]));
+        assert_eq!(cp(values[1]), (values[4], values[1]));
+        for (index, expected) in [2, 0, 1, 3].into_iter().enumerate() {
+            assert_eq!(
+                egcl_stdlib::elt(values[2], index).unwrap(),
+                values[expected]
+            );
+        }
+        let storage = egcl_rt::types::md_array_storage(values[3]).unwrap();
+        assert_eq!(egcl_stdlib::elt(storage, 0).unwrap(), values[3]);
+        assert_eq!(egcl_stdlib::elt(storage, 1).unwrap(), values[2]);
+    }
+
+    #[test]
+    fn bbu_constant_graph_shells_survive_relocation_before_fixup() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let constants = vec![BbuConstant::Cons(1, 0), BbuConstant::Vector(vec![0, 1])];
+        egcl_rt::rooted!(values = allocate_bbu_constants(&constants).unwrap());
+        let before = values[0].to_raw();
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        assert_ne!(values[0].to_raw(), before, "the shell must actually move");
+        fill_bbu_constant_edges(&constants, &values).unwrap();
+        assert_eq!(cp(values[0]), (values[1], values[0]));
+        assert_eq!(egcl_stdlib::elt(values[1], 0).unwrap(), values[0]);
+        assert_eq!(egcl_stdlib::elt(values[1], 1).unwrap(), values[1]);
+    }
+
+    #[test]
+    fn bbu_constant_graphs_reject_out_of_bounds_edges() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for constant in [
+            BbuConstant::Cons(1, 0),
+            BbuConstant::Cons(0, 1),
+            BbuConstant::Vector(vec![1]),
+            BbuConstant::MdArray {
+                dimensions: vec![1, 1],
+                element_refs: vec![1],
+            },
+        ] {
+            assert!(materialize_bbu_constants(&[constant]).is_err());
+        }
     }
 
     #[test]
