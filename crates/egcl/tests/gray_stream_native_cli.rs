@@ -4,6 +4,44 @@
 use std::process::Command;
 
 #[test]
+fn format_writes_to_gray_output_streams() {
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args([
+            "--no-init",
+            "--eval",
+            r#"
+          (defclass format-sink (egcl-gray-streams:fundamental-character-output-stream)
+            ((output :initform (make-string-output-stream) :reader sink-output)))
+          (defmethod egcl-gray-streams:stream-write-char ((s format-sink) c)
+            (write-char c (sink-output s)))
+          (let ((s (make-instance 'format-sink)))
+            (assert (null (format s "~A:~D~%" "hello" 42)))
+            (assert (null (funcall #'format s "~A" "call")))
+            (assert (null (eval (list 'format s "~A" "eval"))))
+            (let ((*standard-output* s)) (format t "~A" "bound"))
+            (assert (string= (get-output-stream-string (sink-output s))
+                             (format nil "hello:42~%callevalbound")))
+            (princ "princ" s)
+            (prin1 "prin1" s)
+            (print "print" s)
+            (write "write" :stream s)
+            (assert (string= (get-output-stream-string (sink-output s))
+                             (format nil "princ~S~%~S ~S" "prin1" "print" "write"))))
+          (format t "GRAY-FORMAT-OK~%")
+        "#,
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("GRAY-FORMAT-OK"), "{stdout}");
+}
+
+#[test]
 fn stream_element_type_preserves_native_and_gray_methods() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args([

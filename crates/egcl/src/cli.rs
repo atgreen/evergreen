@@ -842,12 +842,21 @@ fn resolve_input_stream(designator: EgclVal, env: &Env) -> EgclVal {
 }
 
 /// Write a string to a resolved output stream via the stdlib stream API.
-fn write_str_to(stream: EgclVal, s: &str) -> Result<(), EgclError> {
+fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError> {
     let mut stream = stream;
     egcl_rt::rooted_ref!(_stream_root = &mut stream);
     check_pending_sigpipe_for_output()?;
-    let sv = egcl_stdlib::make_lisp_string(s);
-    egcl_stdlib::stream_write_string(stream, sv, 0, None)
+    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string(s));
+    if is_gray_stream(stream) {
+        invoke_generic_function(
+            "STREAM-WRITE-STRING",
+            &[stream, *sv, EgclVal::from_fixnum(0), NIL],
+            env,
+        )?;
+        Ok(())
+    } else {
+        egcl_stdlib::stream_write_string(stream, *sv, 0, None)
+    }
 }
 
 /// Write a diagnostic report to `*TRACE-OUTPUT*` (falling back to
@@ -878,7 +887,7 @@ fn write_trace_output(env: &mut Env, s: &str) -> Result<(), EgclError> {
         )?;
         Ok(())
     } else {
-        write_str_to(out, s)
+        write_str_to(out, s, env)
     }
 }
 
@@ -905,7 +914,7 @@ fn write_standard_output(env: &mut Env, s: &str) -> Result<(), EgclError> {
         )?;
         Ok(())
     } else {
-        write_str_to(out, s)
+        write_str_to(out, s, env)
     }
 }
 
@@ -12929,7 +12938,7 @@ fn print_condition_defined_report(
             continue;
         };
         if is_string_value(designator) {
-            write_str_to(*stream, &val_as_str(designator))?;
+            write_str_to(*stream, &val_as_str(designator), env)?;
             return Ok(true);
         }
         egcl_rt::rooted!(desform = designator);
@@ -37248,9 +37257,23 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Park the env so the formatter's `~A`/`~S` can dispatch user print-object
     // methods (via stdlib_print_object_hook → dispatch_print_object).
     let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
-    let result = egcl_stdlib::format(*dest, &fs, &av);
+    // The stdlib owns formatting, while the evaluator supplies dispatch to
+    // user-defined Gray methods, just as for WRITE-STRING. Keep DEST rooted
+    // across rendering: user PRINT-OBJECT methods can allocate and collect.
+    let gray = is_gray_stream(*dest);
+    let result = egcl_stdlib::format(if gray { NIL } else { *dest }, &fs, &av);
     PRINT_ENV.with(|c| c.set(prev_env));
-    result
+    if gray {
+        egcl_rt::rooted!(rendered = result?);
+        invoke_generic_function(
+            "STREAM-WRITE-STRING",
+            &[*dest, *rendered, EgclVal::from_fixnum(0), NIL],
+            env,
+        )?;
+        Ok(NIL)
+    } else {
+        result
+    }
 }
 
 fn val_as_str(val: EgclVal) -> String {

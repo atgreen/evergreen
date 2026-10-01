@@ -57,10 +57,10 @@ fn resolve(name: &str) -> Option<Handler> {
             // the object or the stream (bliss-6b2 #2).
             let rendered = format_val_env(args[0], env, true);
             let stream = if args.len() > 1 { args[1] } else { NIL };
-            let out = resolve_output_stream(stream, env);
-            write_str_to(out, "\n")?;
-            write_str_to(out, &rendered)?;
-            write_str_to(out, " ")?;
+            egcl_rt::rooted!(out = resolve_output_stream(stream, env));
+            write_str_to(*out, "\n", env)?;
+            write_str_to(*out, &rendered, env)?;
+            write_str_to(*out, " ", env)?;
             Ok(args[0])
         }),
 
@@ -76,7 +76,7 @@ fn resolve(name: &str) -> Option<Handler> {
             princ_val_env(args[0], env, &mut s);
             let stream = if args.len() > 1 { args[1] } else { NIL };
             let out = resolve_output_stream(stream, env);
-            write_str_to(out, &s)?;
+            write_str_to(out, &s, env)?;
             Ok(args[0])
         }),
 
@@ -92,7 +92,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let rendered = format_val_env(args[0], env, true);
             let stream = if args.len() > 1 { args[1] } else { NIL };
             let out = resolve_output_stream(stream, env);
-            write_str_to(out, &rendered)?;
+            write_str_to(out, &rendered, env)?;
             Ok(args[0])
         }),
 
@@ -133,7 +133,7 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let stream = stream_idx.map(|k| args[k]).unwrap_or(NIL);
             let out = resolve_output_stream(stream, env);
-            write_str_to(out, &rendered)?;
+            write_str_to(out, &rendered, env)?;
             Ok(args[0])
         }),
 
@@ -2931,7 +2931,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     let text = condition_report_string(env, *cond).unwrap_or(message);
                     let stream = env.lookup_var("*ERROR-OUTPUT*").unwrap_or(NIL);
                     if !stream.is_nil() {
-                        let _ = write_str_to(stream, &format!("WARNING: {}\n", text));
+                        let _ = write_str_to(stream, &format!("WARNING: {}\n", text), env);
                     } else {
                         eprintln!("WARNING: {}", text);
                     }
@@ -3718,7 +3718,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 )?;
                 return Ok(args[0]);
             }
-            write_str_to(out, &s)?;
+            write_str_to(out, &s, env)?;
             Ok(args[0])
         }),
 
@@ -3755,7 +3755,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 invoke_generic_function("STREAM-TERPRI", &[out], env)?;
                 return Ok(args[0]);
             }
-            write_str_to(out, &s)?;
+            write_str_to(out, &s, env)?;
             egcl_stdlib::stream_terpri(out)?;
             Ok(args[0])
         }),
