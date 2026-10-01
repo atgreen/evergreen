@@ -28564,7 +28564,18 @@ fn eval_expander_body(
     body: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    let specials = lambda_list_special_params(params_form);
+    // The expander body is a body, so its own leading `(declare (special v))`
+    // counts too (CLHS 3.3.4) — exactly as it does for an ordinary lambda body.
+    // This is what makes `MACROLET.44` dynamic: it declares its PARAMETER `*x*`
+    // special in the expander body, and before bliss-dbpeu that test passed only
+    // by accident, because the earmuff spelling bound every such parameter
+    // dynamically whether declared or not.
+    let mut specials = let_body_special_decls(body_through_implicit_block(body));
+    for idx in lambda_list_special_params(params_form) {
+        if !specials.contains(&idx) {
+            specials.push(idx);
+        }
+    }
     if specials.is_empty() {
         return eval_progn(body, env);
     }
@@ -28577,16 +28588,27 @@ fn eval_expander_body(
     result
 }
 
-/// The parameter names in `params_form` that are SPECIAL variables — earmuffed
-/// or proclaimed. Binding such a name establishes a DYNAMIC binding, so a
-/// function the body calls sees the argument value through the value cell (CLHS
-/// 3.1.2.1.1; bliss-pw4d). Trivia's `(defmacro match0 (*what* &body clauses
-/// &environment *env*) …)` is exactly this: its expander body calls helpers that
-/// read `*what*`.
+/// The parameter names in `params_form` that are SPECIAL variables — meaning
+/// PROCLAIMED special (`defvar`/`defparameter`/`declaim`), not merely earmuffed.
+/// Binding such a name establishes a DYNAMIC binding, so a function the body
+/// calls sees the argument value through the value cell (CLHS 3.1.2.1.1;
+/// bliss-pw4d). Trivia's `(defmacro match0 (*what* &body clauses &environment
+/// *env*) …)` is exactly this: its expander body calls helpers that read
+/// `*what*` — and it works because trivia's `level0/impl.lisp` really does
+/// `(defvar *what*)` and `(defvar *env*)` immediately above that macro, so
+/// proclamation carries it and the earmuff spelling never needed to.
 ///
-/// Feeding the result to [`enter_body_special_decls`] alongside the body's own
-/// `(declare (special v))` names is what converts the just-made lexical binding
-/// into a dynamic one carrying the same value.
+/// Deliberately NOT [`is_special_var`], which also answers true for any name
+/// spelled `*…*`: for a lambda-list parameter that is not ANSI. CLHS 3.1.2.1.1
+/// makes a parameter binding lexical unless the name is proclaimed special or
+/// the body declares it so; earmuffs are a naming convention carrying no
+/// meaning. Binding on the spelling made `MACROLET.43` return T where ANSI
+/// wants NIL — the macro parameter `*x*` got a dynamic binding, which a closure
+/// over the genuinely-special outer `*x*` then observed (bliss-dbpeu).
+///
+/// The analogous earmuff heuristic on LET and on variable *reference* is a
+/// bigger change with a load-bearing reason behind it, and stays for now:
+/// bliss-c3gyu. This function is only about what a lambda list BINDS.
 ///
 /// Walks the lambda list only, over live conses — no allocation, so it cannot GC.
 fn lambda_list_special_params(params_form: EgclVal) -> Vec<u32> {
@@ -28605,7 +28627,8 @@ fn lambda_list_special_params(params_form: EgclVal) -> Vec<u32> {
         let mut names = Vec::new();
         collect_lambda_list_names(elem, &mut names);
         for name in names {
-            if is_special_var(name) {
+            // By FULL name: proclaiming is per-symbol, not per-spelling (bliss-eq72).
+            if name.is_symbol() && is_proclaimed_special(&sym_name_rc(name)) {
                 specials.push(name.as_symbol_index());
             }
         }
