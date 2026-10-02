@@ -19496,45 +19496,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 egcl_stdlib::set_fill_pointer(vec, val.as_fixnum() as usize)?;
                             }
                             other => {
-                                // Match the accessor by symbol identity, not the
-                                // context-dependent printed name: at a SETF site in
-                                // a package that only imports (or references
-                                // qualified) the accessor symbol, `other` arrives
-                                // package-qualified (ASDF/COMPONENT:%FOO) while the
-                                // slot stored the bare accessor name (%FOO). Compare
-                                // bare names too so the accessor resolves regardless
-                                // of the caller's *PACKAGE* (bliss-d0b family; this
-                                // is the same fix already used for reader dispatch at
-                                // the FUNCTION handler below). Without it, e.g.
-                                // ASDF's `(push … (%additional-input-files c))`
-                                // raised "SETF: unsupported place", blocking
-                                // (asdf:load-system :split-sequence).
-                                let reader_slot = accessor_slot_name(env, other);
-                                if let Some(slot_name) = reader_slot {
-                                    egcl_rt::rooted!(tgt = eval_form(tgt_form, env)?);
-                                    // The gate above is name-only on purpose, so
-                                    // which BRANCH is taken is unchanged. Only the
-                                    // slot is re-resolved, now that the instance is
-                                    // in hand: two classes may give one accessor
-                                    // name to differently-named slots, and the
-                                    // name-only answer is an arbitrary one of them
-                                    // (bliss-i6ga1). Falls back to that answer when
-                                    // the target is not an instance of a class that
-                                    // declares the accessor.
-                                    // Memoized per (class, accessor); falls back to
-                                    // the uncached resolution when the class has no
-                                    // naming symbol (bliss-1qjmm).
-                                    let slot = accessor_slot_symbol_cached_by_name(
-                                        env, *tgt, other,
-                                    )
-                                    .unwrap_or_else(|| {
-                                        let name =
-                                            accessor_slot_name_for_instance(env, *tgt, other)
-                                                .unwrap_or(slot_name);
-                                        resolve_sym(&name).unwrap_or(NIL)
-                                    });
-                                    write_slot_value(*tgt, slot, *val, env)?;
-                                } else if let Some((params_form, body)) =
+                                // Explicit writers and setter generics take priority
+                                // over the native accessor fallback. In particular,
+                                // direct slot stores must not bypass around methods.
+                                if let Some((params_form, body)) =
                                     local_setf_writer(env, other)
                                 {
                                     // A writer bound by an enclosing FLET/LABELS
@@ -19638,6 +19603,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                         args.push(*v);
                                     }
                                     invoke_generic_function(&key, &args, env)?;
+                                } else if let Some(slot_name) = accessor_slot_name(env, other) {
+                                    egcl_rt::rooted!(tgt = eval_form(tgt_form, env)?);
+                                    // Resolve on this instance: unrelated classes can
+                                    // use one accessor name for different slots.
+                                    let slot = accessor_slot_symbol_cached_by_name(
+                                        env, *tgt, other,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        let name =
+                                            accessor_slot_name_for_instance(env, *tgt, other)
+                                                .unwrap_or(slot_name);
+                                        resolve_sym(&name).unwrap_or(NIL)
+                                    });
+                                    write_slot_value(*tgt, slot, *val, env)?;
                                 } else if let Some(mid) = other
                                     .strip_prefix('C')
                                     .and_then(|s| s.strip_suffix('R'))

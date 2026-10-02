@@ -3,7 +3,7 @@
 Run the pinned Babel encoding suite in fresh and cached EGCL processes:
 
 ```sh
-EGCL_BIN="$PWD/target/x86_64-unknown-linux-musl/debug/egcl" \
+EGCL_TIMEOUT=1800 EGCL_BIN="$PWD/target/x86_64-unknown-linux-musl/release/egcl" \
 SBCL_BIN="$(command -v sbcl)" bash scripts/test-babel.sh
 ```
 
@@ -19,9 +19,9 @@ The pinned upstream suite currently has two errors on SBCL in `RW-EQUIV.1` and
 NIL into a character. These baseline errors must be distinguished from EGCL
 failures when comparing results.
 
-EGCL is not yet passing: the initial full run timed out at the default 600
-seconds, and cached loading registered no child tests (bliss-0jx70). The
-incorrect multiple-value result from decoding (bliss-p3lxe) is fixed; rebuild
-existing FASL caches to pick up the compiler change.
+EGCL is not yet passing: the full optimized run currently reaches an internal
+symbol-allocation failure (bliss-t4z7n). Cached suite registration (bliss-0jx70),
+incorrect decoding multiple values (bliss-p3lxe), and quadratic string traversal
+(bliss-tivfl) are fixed. Rebuild existing FASL caches to pick up compiler changes.
 Use `EGCL_TIMEOUT` to allow a longer full run; the runner rejects an empty suite
 even if its framework reports success.

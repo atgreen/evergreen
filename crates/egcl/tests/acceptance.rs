@@ -19218,6 +19218,37 @@ fn macro_expanded_bodies_clear_stale_multiple_values() {
 }
 
 #[test]
+fn interpreted_initializer_honors_accessor_around_methods() {
+    let program = r#"(progn
+      (defclass registration-node () ((parent :initform nil :accessor node-parent)))
+      (defvar *registrations* 0)
+      (defmethod shared-initialize :after ((node registration-node) slots &key)
+        (declare (ignore slots))
+        (setf (node-parent node) 42))
+      (defmethod (setf node-parent) :around (value (node registration-node))
+        (prog1 (call-next-method) (incf *registrations*)))
+      (let ((node (make-instance 'registration-node)))
+        (format t "RESULT ~S~%" (list (node-parent node) *registrations*))))"#;
+    for interpreted in [false, true] {
+        let mut command = egcl_bin();
+        if interpreted {
+            command.env("EGCL_NO_METHOD_COMPILE", "1");
+        }
+        let output = command.args(["--eval", program]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.lines().any(|line| line == "RESULT (42 1)"),
+            "interpreted={interpreted}: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn print_unreadable_object_macro() {
     run_expression_cases(&[
         (
