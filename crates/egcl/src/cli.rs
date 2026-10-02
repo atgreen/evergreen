@@ -4143,6 +4143,8 @@ fn install_loaded_compiler_macro(
     compiler_macroexpand::define_compiler_macro(
         name,
         Arc::new(move |form, macro_env| {
+            // &ENVIRONMENT handles have dynamic extent, including on errors.
+            let _macroexpand_env_scope = MacroexpandEnvScope::new();
             // The callback's FORM copy and argument vector must survive Env
             // construction, which can allocate and relocate nursery objects.
             egcl_rt::rooted!(form = form);
@@ -31163,6 +31165,8 @@ fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Eg
     compiler_macroexpand::define_compiler_macro(
         name_form,
         Arc::new(move |form, _macro_env| {
+            // &ENVIRONMENT handles have dynamic extent, including on errors.
+            let _macroexpand_env_scope = MacroexpandEnvScope::new();
             // FORM is a by-value copy owned by this callback. Root it across
             // creation of the throwaway Env, then read the globally rooted
             // capture so its local copies start with post-GC addresses.
@@ -40287,5 +40291,72 @@ mod loop_initialization_tests {
         );
         assert_eq!(*result, *source);
         assert_eq!(cp(*result).0, EgclVal::from_fixnum(42));
+    }
+}
+
+#[cfg(test)]
+mod compiler_macro_environment_tests {
+    use super::*;
+
+    fn check_environment_cleanup(compiled: bool, fail: bool) {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let source = if fail {
+            "(define-compiler-macro environment-cleanup-probe (x &environment e) (if e (error \"expected expansion error\") x))"
+        } else {
+            "(define-compiler-macro environment-cleanup-probe (x &environment e) (if e x 0))"
+        };
+        if compiled {
+            let bytes =
+                build_bfasl_from_source(source, "environment-cleanup.lisp", &mut env).unwrap();
+            load_bfasl_into_env(&bytes, &mut env).unwrap();
+        } else {
+            read_eval_all_env(source, &mut env).unwrap();
+        }
+        // An inner expander must preserve handles belonging to its caller.
+        let _outer_scope = MacroexpandEnvScope::new();
+        egcl_rt::rooted!(outer = store_macroexpand_environment(MacroexpandEnv::null()));
+        egcl_rt::rooted!(
+            form = read_from_string_in_env("(environment-cleanup-probe 42)", &mut env)
+                .unwrap()
+                .0
+        );
+        let before = MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len());
+        for _ in 0..10 {
+            let result =
+                compiler_macroexpand::compiler_macroexpand_1(*form, &MacroexpandEnv::null());
+            if fail {
+                assert!(result.is_err(), "expander must signal its error");
+            } else {
+                assert_eq!(result.unwrap(), (EgclVal::from_fixnum(42), true));
+            }
+            assert!(load_macroexpand_environment(*outer).is_some());
+            assert_eq!(
+                MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len()),
+                before,
+                "compiler macro retained its dynamic environment"
+            );
+        }
+        compiler_macroexpand::undefine_compiler_macro(
+            resolve_sym("ENVIRONMENT-CLEANUP-PROBE").unwrap(),
+        );
+    }
+
+    #[test]
+    fn source_environment_cleanup() {
+        check_environment_cleanup(false, false);
+    }
+    #[test]
+    fn source_environment_cleanup_on_error() {
+        check_environment_cleanup(false, true);
+    }
+    #[test]
+    fn fasl_environment_cleanup() {
+        check_environment_cleanup(true, false);
+    }
+    #[test]
+    fn fasl_environment_cleanup_on_error() {
+        check_environment_cleanup(true, true);
     }
 }
