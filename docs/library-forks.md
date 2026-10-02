@@ -27,6 +27,7 @@ exercises these forks:
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f` |
+| cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
 | fset | https://github.com/atgreen/fset | `553d6a75f6520ef4435748f16b0f619e71988628` |
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `ee7e4ea5238efce6ce4be7d6f0f29699884ad791` |
@@ -57,7 +58,7 @@ deliberately left unbound rather than stubbed, so a caller's own `FBOUNDP`
 guard — Serapeum's `macro-tools` uses one — sees the truth. This is what lets
 Trivia load.
 
-Install all twelve forks into an existing project with the
+Install all thirteen forks into an existing project with the
 [installer](../scripts/install-egcl-forks):
 
 ```sh
@@ -134,3 +135,7 @@ The older patch files are retained as historical references. The Bordeaux
 Threads port still requires an audit (`bliss-59qu`): its documented no-op
 synchronization is not a general-purpose threading implementation. Do not copy
 that workaround into a published compatibility fork as though it were one.
+
+The [CL-FAD scenario](../tests/cl-fad/README.md) verifies native EGCL environment
+lookup and an optional UIOP fallback on otherwise unsupported implementations.
+Directory listing and recursive deletion still require an EGCL port.

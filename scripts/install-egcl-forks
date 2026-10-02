@@ -56,6 +56,7 @@ trivial-gray-streams
 trivial-cltl2
 trivial-garbage
 bordeaux-threads
+cl-fad
 usocket
 precise-time
 fset
