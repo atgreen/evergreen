@@ -7,14 +7,18 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+// Stress + verification scans the heap at every bootstrap allocation. Startup
+// alone takes about 155s on the development host; allow it to finish before
+// testing the socket exchange, whose peer I/O deadlines remain 10s.
+const STRESS_TIMEOUT_SECONDS: u64 = 240;
+
 fn run(form: &str, extra: &[&str], stress: bool) -> Output {
     let mut command = Command::new("timeout");
-    command.args([
-        "--kill-after=5",
-        if stress { "150" } else { "30" },
-        env!("CARGO_BIN_EXE_egcl"),
-        "--no-init",
-    ]);
+    let timeout = if stress { STRESS_TIMEOUT_SECONDS } else { 30 };
+    command
+        .arg("--kill-after=5")
+        .arg(timeout.to_string())
+        .args([env!("CARGO_BIN_EXE_egcl"), "--no-init"]);
     command.args(extra).args(["--eval", form]);
     if stress {
         command
@@ -42,7 +46,8 @@ fn native_client_reads_incrementally_and_writes_before_eof() {
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(if stress { 150 } else { 20 });
+            let deadline = Instant::now()
+                + Duration::from_secs(if stress { STRESS_TIMEOUT_SECONDS } else { 20 });
             let (mut peer, _) = loop {
                 match listener.accept() {
                     Ok(pair) => break pair,
