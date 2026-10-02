@@ -31903,6 +31903,7 @@ fn augment_env_with_macros(
                     compiler_macroexpand::register_macro_function(
                         handle,
                         Arc::new(move |form, call_macro_env| {
+                            let _macroexpand_env_scope = MacroexpandEnvScope::new();
                             egcl_rt::rooted!(form = form);
                             egcl_rt::rooted!(args = list_to_vec(cp(*form).1));
                             let mut macro_env = Env::new_for_macro_expansion(false);
@@ -31975,6 +31976,7 @@ fn augment_env_with_macros(
                 compiler_macroexpand::register_macro_function(
                     handle,
                     Arc::new(move |form, call_macro_env| {
+                        let _macroexpand_env_scope = MacroexpandEnvScope::new();
                         let (mut params_form, mut body, captured_frame) = {
                             let capture = capture
                                 .lock()
@@ -40298,7 +40300,7 @@ mod loop_initialization_tests {
 mod compiler_macro_environment_tests {
     use super::*;
 
-    fn check_environment_cleanup(compiled: bool, fail: bool) {
+    fn check_environment_cleanup(compiled: bool, fail: bool, ordinary: bool) {
         let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
@@ -40307,12 +40309,17 @@ mod compiler_macro_environment_tests {
         } else {
             "(define-compiler-macro environment-cleanup-probe (x &environment e) (if e x 0))"
         };
+        let source = if ordinary {
+            source.replace("define-compiler-macro", "defmacro")
+        } else {
+            source.to_owned()
+        };
         if compiled {
             let bytes =
-                build_bfasl_from_source(source, "environment-cleanup.lisp", &mut env).unwrap();
+                build_bfasl_from_source(&source, "environment-cleanup.lisp", &mut env).unwrap();
             load_bfasl_into_env(&bytes, &mut env).unwrap();
         } else {
-            read_eval_all_env(source, &mut env).unwrap();
+            read_eval_all_env(&source, &mut env).unwrap();
         }
         // An inner expander must preserve handles belonging to its caller.
         let _outer_scope = MacroexpandEnvScope::new();
@@ -40322,10 +40329,14 @@ mod compiler_macro_environment_tests {
                 .unwrap()
                 .0
         );
+        egcl_rt::rooted!(expansion_env = macroexpand_environment_from_cli(&env));
         let before = MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len());
         for _ in 0..10 {
-            let result =
-                compiler_macroexpand::compiler_macroexpand_1(*form, &MacroexpandEnv::null());
+            let result = if ordinary {
+                compiler_macroexpand::macroexpand_1(*form, &expansion_env)
+            } else {
+                compiler_macroexpand::compiler_macroexpand_1(*form, &expansion_env)
+            };
             if fail {
                 assert!(result.is_err(), "expander must signal its error");
             } else {
@@ -40335,7 +40346,7 @@ mod compiler_macro_environment_tests {
             assert_eq!(
                 MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len()),
                 before,
-                "compiler macro retained its dynamic environment"
+                "macro expander retained its dynamic environment"
             );
         }
         compiler_macroexpand::undefine_compiler_macro(
@@ -40345,18 +40356,35 @@ mod compiler_macro_environment_tests {
 
     #[test]
     fn source_environment_cleanup() {
-        check_environment_cleanup(false, false);
+        check_environment_cleanup(false, false, false);
     }
     #[test]
     fn source_environment_cleanup_on_error() {
-        check_environment_cleanup(false, true);
+        check_environment_cleanup(false, true, false);
     }
     #[test]
     fn fasl_environment_cleanup() {
-        check_environment_cleanup(true, false);
+        check_environment_cleanup(true, false, false);
     }
     #[test]
     fn fasl_environment_cleanup_on_error() {
-        check_environment_cleanup(true, true);
+        check_environment_cleanup(true, true, false);
+    }
+
+    #[test]
+    fn source_ordinary_environment_cleanup() {
+        check_environment_cleanup(false, false, true);
+    }
+    #[test]
+    fn source_ordinary_environment_cleanup_on_error() {
+        check_environment_cleanup(false, true, true);
+    }
+    #[test]
+    fn fasl_ordinary_environment_cleanup() {
+        check_environment_cleanup(true, false, true);
+    }
+    #[test]
+    fn fasl_ordinary_environment_cleanup_on_error() {
+        check_environment_cleanup(true, true, true);
     }
 }

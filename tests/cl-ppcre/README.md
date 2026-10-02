@@ -20,6 +20,7 @@ The pinned upstream suite passes on SBCL. EGCL's lost lexical captures after
 lazy compilation are fixed in `dffb211b`; binary stream element-type aliases
 and parameterized type expansion are fixed in `cb007f0c`; Gray-stream prefix
 reparsing and repeated read-time evaluation are fixed in `3932dd29`.
-The subsequent run exposes retained macro-expansion environments during
-Flexi-streams character callbacks (`bliss-x3eov`). A complete passing EGCL run
-is still pending.
+Compiler-macro and compiler-registered ordinary macro callbacks now reclaim
+their dynamic environment handles (`bliss-x3eov`, `bliss-p409f`). The latter
+leak still retained 345,640 environments after fixing compiler macros alone.
+A complete passing EGCL run is still pending.
