@@ -8,6 +8,54 @@
 //! undiagnosable (bliss-e5eh6, bliss-l9tt; lib/egcl-jvm was the motivating case).
 use std::process::Command;
 
+#[test]
+fn handled_errors_do_not_render_reports() {
+    let setup = "(defvar *report-calls* 0)
+        (define-condition quiet-error (error) ()
+          (:report (lambda (c s) (declare (ignore c))
+                     (incf *report-calls*) (write-string \"unexpected report\" s))))";
+    for form in [
+        "(list (handler-case (error 'quiet-error) (error () :caught)) *report-calls*)",
+        "(list (handler-case (error 'type-error :datum '#1=(1 . #1#) :expected-type 'integer)
+                 (type-error () :caught)) *report-calls*)",
+        "(list (handler-case (error \"~S\" '#1=(1 . #1#)) (error () :caught)) *report-calls*)",
+    ] {
+        for interpreted in [false, true] {
+            let expression = if interpreted {
+                format!("(eval '{form})")
+            } else {
+                form.into()
+            };
+            let output = Command::new("timeout")
+                .args([
+                    "--kill-after=5",
+                    "20",
+                    env!("CARGO_BIN_EXE_egcl"),
+                    "--no-init",
+                    "--eval",
+                    setup,
+                    "--eval",
+                    &expression,
+                ])
+                .output()
+                .expect("run handled-error probe");
+            assert!(
+                output.status.success(),
+                "handled error failed or hung: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .lines()
+                    .last(),
+                Some("(:CAUGHT 0)"),
+                "a handler transfer must precede reporting (interpreted={interpreted})"
+            );
+        }
+    }
+}
+
 /// Evaluate `program` and assert `marker` appears in stdout+stderr combined.
 ///
 /// Both streams, because the uncaught-error path reports on stderr and exits
@@ -135,10 +183,9 @@ fn conditions_without_a_report_are_unchanged() {
     );
 }
 
-/// Rendering a report ALLOCATES (a string output stream) and may FUNCALL a lambda,
-/// either of which can fire a moving GC before the condition is signalled. Unrooted,
-/// the signal saw a stale copy and a re-synthesized condition reached the handler --
-/// a wrong answer with no crash, so only an output diff catches it.
+/// Rendering a report allocates a string stream and may call arbitrary Lisp.
+/// Render the caught condition inside its handler under GC stress, checking that
+/// the condition and its slot values survive those allocations.
 #[test]
 fn rendering_a_report_does_not_orphan_the_condition() {
     let program: &[&str] = &[
