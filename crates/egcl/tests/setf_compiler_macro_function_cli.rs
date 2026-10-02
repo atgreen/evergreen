@@ -54,9 +54,8 @@ fn compiler_macro_function_reads_back_what_was_installed() {
 #[test]
 fn a_function_installed_compiler_macro_can_be_copied_to_another_name_and_removed() {
     // The DEFALIAS shape: read one name's expander and install it under another.
-    // This works for an expander that IS a function object; one defined by
-    // DEFINE-COMPILER-MACRO still reads back as T and so cannot be copied
-    // (bliss-0g5lg) — the next test pins that.
+    // Both directly installed functions and DEFINE-COMPILER-MACRO expanders
+    // support this; the next test covers the latter.
     assert_eq!(
         eval(
             r#"(progn (defun a (x) (list :a x))
@@ -76,11 +75,9 @@ fn a_function_installed_compiler_macro_can_be_copied_to_another_name_and_removed
 }
 
 #[test]
-fn copying_a_define_compiler_macro_expander_leaves_the_alias_without_one() {
-    // DEFINE-COMPILER-MACRO's expander is a host closure, so the reader answers T
-    // and there is no function to copy (bliss-0g5lg). Installing that T must leave
-    // the alias with no compiler macro — legal, since a compiler macro is always
-    // optional — rather than installing something uncallable.
+fn copying_a_define_compiler_macro_expander_preserves_the_expander() {
+    // DEFINE-COMPILER-MACRO exposes a callable function that can be shared by
+    // aliases, just like a directly installed compiler macro (bliss-0g5lg).
     assert_eq!(
         eval(
             r#"(progn (defun a (x) (list :a x))
@@ -89,10 +86,11 @@ fn copying_a_define_compiler_macro_expander_leaves_the_alias_without_one() {
                       (setf (compiler-macro-function 'b) (compiler-macro-function 'a))
                       (defun call-a () (a 7))
                       (defun call-b () (b 7))
-                      (format t "RESULT:~s" (list (compiler-macro-function 'a)
+                      (format t "RESULT:~s" (list (functionp (compiler-macro-function 'a))
                                                   (call-a) (call-b)
-                                                  (compiler-macro-function 'b))))"#
+                                                  (eq (compiler-macro-function 'a)
+                                                      (compiler-macro-function 'b)))))"#
         ),
-        "(T (:EXPANDED 7) (:B 7) NIL)"
+        "(T (:EXPANDED 7) (:EXPANDED 7) T)"
     );
 }
