@@ -14656,7 +14656,10 @@ fn typep_matches(
                         || (other == "STANDARD-OBJECT"
                             && !hierarchy.iter().any(|name| name == "CONDITION"))
                 } else {
-                    other == symbol_bare_name(&val_as_str(object))
+                    // A class/type name describes representation, not printed
+                    // contents. In particular, "component" is a string, not
+                    // an ASDF COMPONENT (bliss-rfxjd).
+                    false
                 }
             }
         };
