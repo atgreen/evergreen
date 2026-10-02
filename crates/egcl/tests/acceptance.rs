@@ -1099,6 +1099,55 @@ fn plist_places_and_nconc_conform() {
 }
 
 #[test]
+fn list_modify_macros_use_custom_setf_writers() {
+    let setup = "(defun custom-list-read (cell) (copy-list (car cell)))
+      (define-setf-expander custom-list-place (cell)
+        (let ((c (gensym)) (v (gensym)))
+          (values (list c) (list cell) (list v)
+                  `(progn (rplaca ,c ,v) :writer-result)
+                  `(custom-list-read ,c))))";
+    let cases = [
+        (
+            "(let ((c (list nil))) (list (push 7 (custom-list-place c)) c))",
+            "((7) ((7)))",
+        ),
+        (
+            "(let ((c (list (list 7 8)))) (list (pop (custom-list-place c)) c))",
+            "(7 ((8)))",
+        ),
+        (
+            "(let ((c (list nil))) (list (pushnew 7 (custom-list-place c)) c))",
+            "((7) ((7)))",
+        ),
+        (
+            "(let ((c (list (list 7)))) (list (pushnew 7 (custom-list-place c)) c))",
+            "((7) ((7)))",
+        ),
+        (
+            "(let ((c (list nil)) (order nil)) (push (progn (push :item order) 7) (custom-list-place (progn (push :place order) c))) (list c (reverse order)))",
+            "(((7)) (:ITEM :PLACE))",
+        ),
+        (
+            "(let ((c (list nil)) (order nil)) (pushnew (progn (push :item order) 7) (custom-list-place (progn (push :place order) c)) :test (progn (push :test order) #'eql)) (list c (reverse order)))",
+            "(((7)) (:ITEM :PLACE :TEST))",
+        ),
+        (
+            "(let ((c (list (list 7 8))) (n 0)) (list (pop (custom-list-place (progn (incf n) c))) c n))",
+            "(7 ((8)) 1)",
+        ),
+    ];
+    let programs: Vec<_> = cases
+        .iter()
+        .map(|(form, expected)| (format!("(progn {setup} {form})"), *expected))
+        .collect();
+    let cases: Vec<_> = programs
+        .iter()
+        .map(|(form, expected)| (form.as_str(), *expected))
+        .collect();
+    run_expression_cases(&cases);
+}
+
+#[test]
 fn get_setf_expansion_store_form_handles_standard_places() {
     // GET-SETF-EXPANSION's fourth value must be an executable storing form,
     // including for standard places whose writers are implemented directly by

@@ -176,9 +176,9 @@
 
 ;; PUSH: evaluate ITEM first, then the PLACE subforms once each (left to right),
 ;; read/store the place exactly once (CLHS 5.1.2 / push.order.*). Uses the
-;; place's setf-expansion so the subforms are lifted into temporaries; the store
-;; goes through operator SETF on the getter, which handles every built-in place
-;; (variables, CAR, AREF, GETF, …). A naive (setf place (cons item place))
+;; place's setf-expansion so the subforms are lifted into temporaries and the
+;; returned writer handles the store, including custom places whose reader is
+;; not itself assignable. A naive (setf place (cons item place))
 ;; double-evaluates the place subforms and gets the order wrong.
 (defmacro push (item place &environment env)
   ;; Macroexpand the PLACE in ENV first so a MACROLET/symbol-macro place is
@@ -187,11 +187,13 @@
   (let ((place (macroexpand place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
-      (declare (ignore newval setter))
-      (let ((g (gensym)))
+      (let ((g (gensym)) (result (gensym)))
         `(let* ((,g ,item)
-                ,@(mapcar (function list) dummies vals))
-           (setf ,getter (cons ,g ,getter)))))))
+                ,@(mapcar (function list) dummies vals)
+                (,result (cons ,g ,getter)))
+           (multiple-value-bind ,newval ,result
+             ,setter)
+           ,result)))))
 
 ;; POP: read the PLACE's list once (its subforms evaluated once, left to right),
 ;; return its CAR, and store its CDR back into the place (CLHS 5.1.2 /
@@ -203,12 +205,12 @@
   (let ((place (macroexpand place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
-      (declare (ignore newval setter))
       (let ((g (gensym)))
         `(let* (,@(mapcar (function list) dummies vals)
                 (,g ,getter))
            (prog1 (car ,g)
-             (setf ,getter (cdr ,g))))))))
+             (multiple-value-bind ,newval (cdr ,g)
+               ,setter)))))))
 
 ;; pushnew: add ITEM to the list in PLACE only if not already a MEMBER.
 ;; Keyword args (:test/:key) are accepted but only the default EQL test is
@@ -2392,11 +2394,13 @@
   (let ((place (macroexpand place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
-      (declare (ignore newval setter))
-      (let ((g (gensym)))
+      (let ((g (gensym)) (result (gensym)))
         `(let* ((,g ,item)
-                ,@(mapcar (function list) dummies vals))
-           (setf ,getter (adjoin ,g ,getter ,@keys)))))))
+                ,@(mapcar (function list) dummies vals)
+                (,result (adjoin ,g ,getter ,@keys)))
+           (multiple-value-bind ,newval ,result
+             ,setter)
+           ,result)))))
 
 ;;; --- reverse-association and tree equality ---------------------------------
 
