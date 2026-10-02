@@ -18,7 +18,8 @@ remain in the printed artifact directory.
 
 The pinned upstream suite passes on SBCL. EGCL's lost lexical captures after
 lazy compilation are fixed in `dffb211b`; binary stream element-type aliases
-and parameterized type expansion are fixed in `cb007f0c`. The subsequent run
-exposes repeated prefix parsing in Gray-stream `READ` (`bliss-vrbna`), both slow
-on large corpus forms and incorrect for read-time side effects. A complete
-passing EGCL run is still pending.
+and parameterized type expansion are fixed in `cb007f0c`; Gray-stream prefix
+reparsing and repeated read-time evaluation are fixed in `3932dd29`.
+The subsequent run exposes retained macro-expansion environments during
+Flexi-streams character callbacks (`bliss-x3eov`). A complete passing EGCL run
+is still pending.
