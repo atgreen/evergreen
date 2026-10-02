@@ -473,9 +473,22 @@ struct ActiveBytecodeRoot {
 
 impl ActiveBytecodeRoot {
     fn new(function: &Arc<BytecodeFunction>) -> Self {
-        register_bytecode_roots(function);
+        install_bytecode_root_scanner();
         Self {
             _function: Arc::clone(function),
+        }
+    }
+}
+
+impl egcl_rt::gc::TraceHostRoots for ActiveBytecodeRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        // SAFETY: host roots are visited while all mutators are stopped. Trace
+        // the original pool so the executing/compiling body sees relocations.
+        unsafe {
+            trace_bytecode_function(
+                Arc::as_ptr(&self._function) as *mut BytecodeFunction,
+                visit,
+            );
         }
     }
 }
@@ -9282,7 +9295,7 @@ fn serialize_bbu_loadable_function(
     }
 
     let bf = Arc::new(bf);
-    let _function_root = ActiveBytecodeRoot::new(&bf);
+    egcl_rt::rooted!(_function_root = ActiveBytecodeRoot::new(&bf));
     egcl_rt::rooted!(pending = Vec::<EgclVal>::new());
     collect(&bf, &mut pending);
     let original_functions = functions.len();
@@ -11618,7 +11631,7 @@ fn make_bytecode_closure(
     // Building the installed lambda list can move literals in this cloned
     // body before the registry owns it. Root the clone, not just its parent.
     let nested = Arc::new(nested.clone());
-    let _nested_roots = ActiveBytecodeRoot::new(&nested);
+    egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(&nested));
     let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
     let sym_idx = sym.as_symbol_index();
     let lambda_list = if nested.variadic {
@@ -12001,7 +12014,7 @@ pub(super) fn lazy_compile_defun(
                 // BytecodeFunction across an allocation does this (see lines ~8855,
                 // ~11150, ~11573); this one did not (bliss-e3op).
                 let fast = Arc::new(fast);
-                let _fast_root = ActiveBytecodeRoot::new(&fast);
+                egcl_rt::rooted!(_fast_root = ActiveBytecodeRoot::new(&fast));
                 reset_last_bail_reason();
                 match compile(true) {
                     Some(portable) => Some(Arc::new(portable)),
@@ -12095,7 +12108,7 @@ pub(super) fn compile_and_reify_lambda(
         return None;
     }
     let bf = Arc::new(bf);
-    let _bytecode_root = ActiveBytecodeRoot::new(&bf);
+    egcl_rt::rooted!(_bytecode_root = ActiveBytecodeRoot::new(&bf));
     let sym = egcl_rt::symbols::make_uninterned(label);
     let sym_idx = sym.as_symbol_index();
     // Reified method functions are shared definitions, just like escaping
@@ -13358,10 +13371,10 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
     // later thunk/function has been registered or made active. Keep every
     // decoded function's constants rooted for the whole load plan so structural
     // literals embedded in future thunks are rewritten by a moving GC.
-    let _function_roots = functions
+    egcl_rt::rooted!(_function_roots = functions
         .iter()
         .map(ActiveBytecodeRoot::new)
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>());
 
     let mut last = NIL;
     egcl_rt::rooted_ref!(_last_root = &mut last);
@@ -14074,7 +14087,7 @@ fn run_with_binding(
     mut macro_whole: Option<EgclVal>,
     call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<EgclVal, EgclError> {
-    let _active_bytecode_root = ActiveBytecodeRoot::new(&entry);
+    egcl_rt::rooted!(_active_bytecode_root = ActiveBytecodeRoot::new(&entry));
     egcl_rt::rooted!(args = args.to_vec());
     egcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
     validate_declared_args(&entry, &args)?;
@@ -22329,7 +22342,7 @@ mod direct_call_invalidation_tests {
             compile_function("TRANSFER-SOURCE-BODY", NIL, *form, &env, false, false)
                 .expect("lower transfer source"),
         );
-        let _body_roots = ActiveBytecodeRoot::new(&body);
+        egcl_rt::rooted!(_body_roots = ActiveBytecodeRoot::new(&body));
         let scopes = ScopeMap::analyze_function(&body).unwrap();
         let ir = build_from_bytecode_for_transfers(&body).expect("build actual exceptional calls");
         assert!(egcl_compiler::t2::verify::verify(&ir).is_ok());
@@ -23361,4 +23374,52 @@ mod jtc4_stack_map_tests {
 #[cfg(egcl_no_disassembly)]
 fn format_native_listing(_: &NativeCode) -> String {
     "; Native disassembly was omitted at delivery.\n".into()
+}
+
+#[cfg(test)]
+mod active_bytecode_root_tests {
+    use super::*;
+
+    #[test]
+    fn constant_pool_root_ends_with_active_scope() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let mut function = compile_function("ACTIVE-POOL", NIL, *form, &env, false, false)
+            .expect("compile constant body");
+        // Add a fresh nursery constant after compilation, so even stress-mode
+        // compilation cannot promote the object before the relocation probe.
+        egcl_rt::rooted!(constant = super::super::arena_cons(NIL, NIL));
+        function.constants.push(*constant);
+        let function = Arc::new(function);
+        egcl_rt::rooted!(active = ActiveBytecodeRoot::new(&function));
+        let mut weak = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(*constant).unwrap(),
+        ));
+        egcl_rt::gc::register_weak_pointer(&mut weak);
+        drop(form);
+        drop(constant);
+        env.mv.clear();
+        let before_collection = weak.value().0;
+        egcl_rt::gc::full_gc().unwrap();
+        let live = !weak.is_broken();
+        let moved = weak.value().0 != before_collection;
+        let pool_updated = function.constants.iter().any(|value| {
+            egcl_rt::gc::finalizer_key(*value).ok() == Some(weak.value().0)
+        });
+        drop(active);
+        // An Arc keeps the host allocation valid, but is not a Lisp GC root.
+        // The guard must stop retaining constants even while this Arc exists.
+        egcl_rt::gc::full_gc().unwrap();
+        let collected = weak.is_broken();
+        egcl_rt::gc::unregister_weak_pointer(&weak);
+        drop(function);
+        assert!(live, "active compilation must retain its constants");
+        assert!(moved, "the probe must exercise actual relocation");
+        assert!(pool_updated, "relocation must update the original constant pool");
+        assert!(collected, "leaving the active scope must release its constants");
+    }
 }
