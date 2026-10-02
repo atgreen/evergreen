@@ -195,3 +195,20 @@ fn gray_read_consumes_whitespace_defined_by_the_readtable() {
       (format t "DISPATCH-OK~%")
     "##);
 }
+
+#[test]
+fn empty_features_does_not_enable_bootstrap_defaults() {
+    run(r##"
+      (let ((*features* nil))
+        (assert (= (read-from-string "#+egcl 1 #-egcl 2") 2))
+        (assert (= (read-from-string "#+(not egcl) 3 4") 3))
+        (with-input-from-string (s "#+egcl 1 #-egcl 2")
+          (assert (= (read s) 2))))
+      (let ((*features* '(:custom)))
+        (assert (= (read-from-string "#+custom 5 #-custom 6") 5))
+        (assert (= (read-from-string "#+egcl 1 #-egcl 2") 2)))
+      (assert (member :egcl *features*))
+      (assert (= (read-from-string "#+egcl 7 #-egcl 8") 7))
+      (format t "DISPATCH-OK~%")
+    "##);
+}

@@ -14,9 +14,8 @@ on the optional UIOP fallback. A separate process hides UIOP before reading the
 GETENV definition and checks that unsupported implementations report an error.
 Setting `SBCL_BIN` repeats the environment checks on SBCL.
 
-The fallback tests use a nonempty feature list with no implementation name:
-EGCL currently treats an empty `*FEATURES*` list as its default feature set
-(tracked as bliss-qhpp1). No downloaded dependency sources are edited.
+The fallback tests clear `*FEATURES*` to select the unsupported-implementation
+branch. No downloaded dependency sources are edited.
 
 This scenario covers environment lookup and loading, not CL-FAD's full
 filesystem API. Directory listing and recursive deletion still need an EGCL

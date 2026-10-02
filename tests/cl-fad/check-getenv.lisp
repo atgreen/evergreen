@@ -9,7 +9,7 @@
 (defparameter *uiop-package* (find-package "UIOP"))
 (defparameter *uiop-name* (package-name *uiop-package*))
 (defparameter *uiop-nicknames* (package-nicknames *uiop-package*))
-(unless (equal *mode* "native") (setf *features* '(:cl-fad-port-test)))
+(unless (equal *mode* "native") (setf *features* nil))
 (when (equal *mode* "absent")
   (rename-package *uiop-package* "CL-FAD-TEST-HIDDEN-UIOP" nil)
   (assert (null (find-package "UIOP"))))

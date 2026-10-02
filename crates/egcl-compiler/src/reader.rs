@@ -3316,7 +3316,7 @@ fn runtime_feature_present(name: &str) -> bool {
     let features =
         egcl_rt::symbols::find_index("*FEATURES*").and_then(egcl_rt::symbols::symbol_value);
     let mut list = match features {
-        Some(l) if l.is_cons() => l,
+        Some(l) if l == NIL || l.is_cons() => l,
         _ => return name.eq_ignore_ascii_case("EGCL"),
     };
     while list.is_cons() {
