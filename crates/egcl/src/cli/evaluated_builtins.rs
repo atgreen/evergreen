@@ -636,6 +636,10 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%MEMORY-FENCE" => Some(|_operator, args, env| {
+            env.clear_mv();
+            egcl_stdlib::synchronization::memory_barrier(args)
+        }),
         "EGCL::%TEXT-CODEC" => Some(|_operator, args, env| {
             env.clear_mv();
             egcl_stdlib::text_codec::call(args)

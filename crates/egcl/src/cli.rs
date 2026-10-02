@@ -17210,7 +17210,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.clear_mv();
                 return egcl_stdlib::fibers::call(&args);
             }
-            "EGCL::%POSIX" | "EGCL::%TEXT-CODEC" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%POSIX" | "EGCL::%TEXT-CODEC" | "EGCL::%MEMORY-FENCE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FOREIGN-MEMORY" => {
                 if env.sandbox {
                     return Err(EgclError::SandboxViolation("FFI access denied".into()));
@@ -35109,6 +35109,7 @@ fn is_builtin_function(name: &str) -> bool {
         "EGCL::%NATIVE-MUTEX"
             | "EGCL::%POSIX"
             | "EGCL::%TEXT-CODEC"
+            | "EGCL::%MEMORY-FENCE"
             | "EGCL::%NATIVE-FIBER"
             | "EGCL::%FOREIGN-MEMORY"
             | "EGCL::%FOREIGN-LIBRARY"

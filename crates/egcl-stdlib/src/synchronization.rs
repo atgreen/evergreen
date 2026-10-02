@@ -9,6 +9,24 @@ use egcl_rt::object::{ObjectHeader, type_id};
 use egcl_rt::sync::{EgclCondVar, EgclMutex};
 use egcl_rt::value::{NIL, T, EgclVal};
 
+/// Order memory accesses on the current native thread. This must stay an
+/// effectful runtime call in the Lisp compiler, never a pure/constant builtin.
+pub fn memory_barrier(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    use std::sync::atomic::{Ordering, fence};
+    let [kind] = args else {
+        return Err(EgclError::ProgramError("memory barrier requires one kind".into()));
+    };
+    let name = egcl_rt::symbols::symbol_name_of(*kind).unwrap_or_default();
+    let order = match name.rsplit(':').next().unwrap_or_default() {
+        "READ" | "DATA-DEPENDENCY" => Ordering::Acquire,
+        "WRITE" => Ordering::Release,
+        "FULL" => Ordering::SeqCst,
+        _ => return Err(EgclError::ProgramError(format!("invalid memory barrier kind: {name}"))),
+    };
+    fence(order);
+    Ok(NIL)
+}
+
 pub fn mutex_p(value: EgclVal) -> bool {
     value.is_heap_object()
         && unsafe { (*(value.as_ptr() as *const ObjectHeader)).type_id() == type_id::MUTEX }

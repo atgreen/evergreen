@@ -4322,3 +4322,10 @@ a hook error aborts startup.")
   (check-type vector (vector (unsigned-byte 8)))
   (egcl::%text-codec :decode (subseq vector start end) external-format nil))
 (export '(egcl-ext::string-to-octets egcl-ext::octets-to-string) :egcl-ext)
+
+;;; Native ordering fences, distinct from a thread rendezvous barrier.
+(defun egcl-ext::memory-barrier (&optional (kind :full))
+  (egcl::%memory-fence kind))
+(defun egcl-ext::load-barrier () (egcl::%memory-fence :read))
+(defun egcl-ext::store-barrier () (egcl::%memory-fence :write))
+(export '(egcl-ext::memory-barrier egcl-ext::load-barrier egcl-ext::store-barrier) :egcl-ext)

@@ -104,3 +104,22 @@ Supported format names are `:utf-8`, `:utf8`, `:ascii`, and `:us-ascii`;
 `:default` means UTF-8. ASCII encoding rejects non-ASCII characters. Both
 decoders replace malformed input with U+FFFD, rather than signalling as SBCL's
 default decoder does. Other external formats are not supported.
+
+## Memory ordering
+
+**Function** `(egcl-ext:memory-barrier &optional (kind :full))` → `nil`
+
+**Function** `(egcl-ext:load-barrier)` → `nil`
+
+**Function** `(egcl-ext:store-barrier)` → `nil`
+
+These operations order memory accesses on the calling native thread. `:read`
+and `load-barrier` use an acquire fence; `:write` and `store-barrier` use a release
+fence; `:full` uses a sequentially consistent fence. `:data-dependency` uses the
+stronger acquire fence. Unknown kinds signal `program-error`.
+
+For a shared-memory publication protocol, acquire after reading the publication
+word and before consuming its payload; release after producing the payload and
+before publishing its word. The publication word also needs an appropriate
+atomic access protocol. A fence does not make an arbitrary memory access atomic
+or wait for another thread to arrive.
