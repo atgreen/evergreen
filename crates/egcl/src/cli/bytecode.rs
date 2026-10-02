@@ -6328,6 +6328,19 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted_ref!(_rest_root = &mut rest);
         let (mut target, _) = cp(rest);
         egcl_rt::rooted_ref!(_target_root = &mut target);
+        // Compound function names use the same synthetic symbol as generic
+        // writer calls. LoadFunction resolves it at invocation time, preserving
+        // lexical lookup and subsequent global writer redefinitions.
+        if target.is_cons() {
+            let (head, tail) = cp(target);
+            if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "SETF" {
+                if !tail.is_cons() || !cp(tail).0.is_symbol() || !cp(tail).1.is_nil() {
+                    return Err(Bail);
+                }
+                let key = super::function_name_key(target);
+                target = EgclVal::from_symbol_index(reader::intern_symbol(&key));
+            }
+        }
         // `#'localfn` for a capturing flet/labels function is the closure value
         // itself, held in a heap binding of its name in the FUNCTION namespace.
         if target.is_symbol() && self.closure_fns.contains(&sym_name(target)) {
@@ -23060,6 +23073,47 @@ mod direct_call_invalidation_tests {
 #[cfg(test)]
 mod method_compilation_tests {
     use super::*;
+
+    #[test]
+    fn setf_function_designators_keep_methods_compiled() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env(
+            "(defun (setf ordinary-writer-probe) (value cell)
+               (setf (car cell) value))
+             (defmethod (setf generic-writer-probe) ((value t) (cell t))
+               (setf (car cell) value))
+             (defmethod ordinary-writer-caller ((cell t))
+               (funcall #'(setf ordinary-writer-probe) 41 cell))
+             (defmethod generic-writer-caller ((cell t))
+               (funcall #'(setf generic-writer-probe) 42 cell))",
+            &mut env,
+        )
+        .unwrap();
+        for name in ["ORDINARY-WRITER-CALLER", "GENERIC-WRITER-CALLER"] {
+            let id = env.methods.borrow()[name][0].method_id.0;
+            let callable = super::super::METHOD_COMPILED.borrow().get(&id).copied();
+            assert!(
+                callable.is_some(),
+                "{name} must compile, not interpret FUNCTION SETF"
+            );
+            let function = egcl_rt::function::name(callable.unwrap()).as_symbol_index();
+            assert!(!contains_host_eval(&registry_get(function).unwrap()));
+        }
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(let ((cell (list 0)))
+                   (and (= (ordinary-writer-caller cell) 41) (= (car cell) 41)
+                        (= (generic-writer-caller cell) 42) (= (car cell) 42)))",
+                &mut env,
+            )
+            .unwrap(),
+            T
+        );
+    }
 
     #[test]
     fn method_callback_retry_preserves_live_load_time_value_fallback() {

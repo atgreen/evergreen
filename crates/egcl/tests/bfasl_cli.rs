@@ -629,6 +629,57 @@ fn setf_function_and_cadr_places_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn setf_function_designators_bfasl_round_trip() {
+    let dir = workdir("setf-designators");
+    let src = dir.join("writers.lisp");
+    let out = dir.join("writers.bfasl");
+    fs::write(
+        &src,
+        "(defpackage :writer-package (:use :cl))
+         (in-package :writer-package)
+         (defun (setf ordinary) (value cell) (setf (car cell) value))
+         (defmethod (setf generic) ((value t) (cell t)) (setf (car cell) value))
+         (defun fetch-ordinary-writer () #'(setf ordinary))
+         (defun fetch-generic-writer () #'(setf generic))",
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "(compile-file {:?} {:?})",
+        src.to_str().unwrap(),
+        out.to_str().unwrap()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(
+        bfasl_section(&fs::read(&out).unwrap(), 11).is_none(),
+        "SETF function designators must compile without source fallback"
+    );
+    let loaded = run(&format!(
+        r#"(progn (load {:?})
+           (let ((cell (list 0))
+                 (ordinary (funcall (find-symbol "FETCH-ORDINARY-WRITER" "WRITER-PACKAGE")))
+                 (generic (funcall (find-symbol "FETCH-GENERIC-WRITER" "WRITER-PACKAGE"))))
+             (list (functionp ordinary) (functionp generic)
+                   (funcall ordinary 41 cell) (car cell)
+                   (funcall generic 42 cell) (car cell))))"#,
+        out.to_str().unwrap()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "(T T 41 41 42 42)"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// The extended LOOP grammar (`with`, `for … {in|on} … by`, conditional
 /// `collect … and collect`, `finally (return …)`, numeric `from … below`) and
 /// `setf` of a `cdr` place must all lower to source-free bytecode. This is the

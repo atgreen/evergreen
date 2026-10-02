@@ -16096,6 +16096,16 @@ fn symbol_function_object_ex(
     if !skip_lexical && let Some(c) = local_fn_closure(env, &fn_name) {
         return Some(c);
     }
+    // Bytecode represents FUNCTION (SETF name) with the same synthetic name
+    // used by generic writer calls. Ordinary writers keep their function cell
+    // under a separate internal symbol; return that actual function object.
+    if let Some(place) = fn_name
+        .strip_prefix("(SETF ")
+        .and_then(|name| name.strip_suffix(')'))
+        && let Some(function) = global_fn(&setf_writer_symbol_name(place))
+    {
+        return Some(function);
+    }
     // An UNINTERNED symbol's function cell is keyed only by its registry index
     // (its name is not in the name→index map, so `global_fn` by name misses it):
     // read it directly, so `(symbol-function (gensym-with-installed-fn))` returns
