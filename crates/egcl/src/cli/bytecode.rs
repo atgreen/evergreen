@@ -6021,6 +6021,7 @@ impl<'e> Lowerer<'e> {
                 &enclosing_blocks,
                 &enclosing_tags,
                 &enclosing_slots,
+                &std::collections::HashSet::new(),
             )
             .ok_or(Bail)?
         } else {
@@ -7794,6 +7795,7 @@ fn compile_function(
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
     )
 }
 
@@ -7845,6 +7847,7 @@ fn compile_function_in(
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
+    captures: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     // A failed allocating attempt can relocate both inputs before a retry.
     // Source-free delivery restores bytecode; native tiering compiles that
@@ -7867,6 +7870,7 @@ fn compile_function_in(
             enclosing_blocks,
             enclosing_tags,
             enclosing_slots,
+            captures,
             &forced,
         );
         if attempt.is_some() {
@@ -7892,6 +7896,7 @@ fn compile_function_forcing_boxed(
     enclosing_blocks: &std::collections::HashSet<String>,
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
+    captures: &std::collections::HashSet<String>,
     forced_boxed: &std::collections::HashSet<String>,
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
@@ -7980,6 +7985,13 @@ fn compile_function_forcing_boxed(
     let mut lo = Lowerer::new(env);
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
+    // A hot DEFUN nested in LET still addresses the definition's shared
+    // lexical cells after compilation. Parameters and inner bindings shadow
+    // these enclosing bindings through the ordinary scope machinery.
+    for name in captures {
+        lo.scopes[0].insert(name.clone(), VarLoc::Boxed);
+    }
+    lo.has_env = !captures.is_empty();
     lo.captured_names = compute_captured_names(*body);
     // Names a previous attempt discovered were captured by a macro-revealed
     // closure but had been given frame slots (bliss-ptv4).
@@ -11529,17 +11541,16 @@ fn closure_captured_control(fn_val: EgclVal) -> Option<super::LexicalExitNames> 
 
 /// The heap environment an env-capturing closure was created in, if any.
 pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<SharedCell<EnvFrame>>> {
-    if !fn_val.is_heap_object() || !egcl_rt::function::is_interpreted_function(fn_val) {
+    // Native call adapters and whole-function deoptimization can enter with
+    // a symbol designator; ordinary dispatch passes the function object.
+    let symbol = if let Some(symbol) = fn_val.symbol_index() {
+        symbol
+    } else if fn_val.is_heap_object() && egcl_rt::function::is_interpreted_function(fn_val) {
+        egcl_rt::function::name(fn_val).symbol_index()?
+    } else {
         return None;
-    }
-    let name = egcl_rt::function::name(fn_val);
-    if !name.is_symbol() {
-        return None;
-    }
-    closure_envs()
-        .borrow()
-        .get(&name.as_symbol_index())
-        .cloned()
+    };
+    closure_envs().borrow().get(&symbol).cloned()
 }
 
 /// Record the captured heap frame for a closure whose interpreted-function object
@@ -11911,6 +11922,42 @@ pub(super) fn lazy_compile_defun(
     // is_registered refreshed this execution's generation. Macro expansion can
     // run Lisp (including LOAD/DEFUN), so compilation is not a read-only phase.
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+    egcl_rt::rooted!(params = params);
+    egcl_rt::rooted!(body = body);
+    let mut compile_env = env.clone();
+    let mut captures = std::collections::HashSet::new();
+    if let Some(frame) = closure_envs().borrow().get(&sym).cloned() {
+        compile_env.frame = Arc::clone(&frame);
+        let mut current = Some(frame);
+        while let Some(frame) = current {
+            let frame = frame.borrow();
+            captures.extend(
+                frame.vars.keys().filter(|name| !is_special_name(name)).cloned(),
+            );
+            captures.extend(
+                frame.symbol_vars.keys()
+                    .map(|&index| sym_name(EgclVal::from_symbol_index(index)))
+                    .filter(|name| !is_special_name(name)),
+            );
+            current = frame.parent.clone();
+        }
+    }
+    egcl_rt::rooted_ref!(_compile_env_root = &mut compile_env);
+    let empty = std::collections::HashSet::new();
+    let compile = |portable| {
+        compile_function_in(
+            name,
+            *params,
+            *body,
+            &compile_env,
+            portable,
+            false,
+            &empty,
+            &empty,
+            &empty,
+            &captures,
+        )
+    };
     reset_last_bail_reason();
     // First try the fast opportunistic (non-portable) lowering: enclosing
     // lexicals stay in activation slots and local calls use the gensym
@@ -11932,7 +11979,7 @@ pub(super) fn lazy_compile_defun(
     // path was previously unrooted — `compile_function` hands back a bare value,
     // and the Arc was only created at the `publish_bytecode` call at the end.
     let compiled: Option<Arc<BytecodeFunction>> =
-        match compile_function(name, params, body, env, false, false) {
+        match compile(false) {
             Some(fast) if contains_host_eval(&fast) => {
                 // The opportunistic compiler can call a result "compiled" while
                 // leaving a capturing lambda behind as MakeClosureEnv. Executing
@@ -11956,7 +12003,7 @@ pub(super) fn lazy_compile_defun(
                 let fast = Arc::new(fast);
                 let _fast_root = ActiveBytecodeRoot::new(&fast);
                 reset_last_bail_reason();
-                match compile_function(name, params, body, env, true, false) {
+                match compile(true) {
                     Some(portable) => Some(Arc::new(portable)),
                     None => {
                         trace_named(name, "portable retry bailed", last_bail_reason().as_deref());
@@ -11967,7 +12014,7 @@ pub(super) fn lazy_compile_defun(
             Some(fast) => Some(Arc::new(fast)),
             None => {
                 reset_last_bail_reason();
-                compile_function(name, params, body, env, true, false).map(Arc::new)
+                compile(true).map(Arc::new)
             }
         };
     match compiled.filter(|function| !contains_load_time_values(function)) {
@@ -14733,7 +14780,13 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                                 continue;
                             }
                         };
-                        let env_frame = make_env_frame(&callee, Arc::clone(&env.frame));
+                        // A named DEFUN can close over a surrounding LET just
+                        // like an anonymous closure. Match run_with_binding and
+                        // run_native instead of borrowing the caller's scope.
+                        let captured = closure_envs().borrow().get(&sym).cloned();
+                        let parent = captured.clone()
+                            .unwrap_or_else(|| Arc::clone(&env.frame));
+                        let env_frame = make_env_frame(&callee, parent).or(captured);
                         if callee.variadic {
                             if let Err(e) =
                                 bind_variadic(&callee, frame, args, env_frame.as_ref(), env)

@@ -3705,3 +3705,54 @@ fn a_compiled_macros_environment_sees_the_call_sites_symbol_macrolet() {
     }
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn hot_nested_defun_preserves_lexical_captures() {
+    let dir = workdir("hot-nested-defun");
+    let src = dir.join("capture.lisp");
+    let out = dir.join("capture.bfasl");
+    fs::write(
+        &src,
+        "(let ((captured 42) (other 7) (counter 0))
+           (defun hot-capture (&optional use-other)
+             (flet ((inner () other))
+               (incf counter)
+               (list (if use-other (inner) captured) counter))))",
+    )
+    .unwrap();
+    let exercise = "(let ((captured 999) (other 888) (counter -1))
+                      (declare (ignorable captured other counter))
+                      (dotimes (i 500) (hot-capture))
+                      (list (hot-capture) (hot-capture t)))";
+    for input in [&src, &out] {
+        if input == &out {
+            let compiled = run(&format!(
+                "(compile-file {:?} {:?})",
+                src.to_str().unwrap(),
+                out.to_str().unwrap()
+            ));
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+            fs::remove_file(&src).unwrap();
+        }
+        let result = run(&format!(
+            "(progn (load {:?}) {exercise})",
+            input.to_str().unwrap()
+        ));
+        assert!(
+            result.status.success(),
+            "{}: {}",
+            input.display(),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).trim(),
+            "((42 501) (7 502))"
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}
