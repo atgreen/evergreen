@@ -30739,6 +30739,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
         if let Some(expander) = expander {
             match expander {
                 SetfExpander::Expander(mdef) => {
+                    let _macroexpand_env_scope = MacroexpandEnvScope::new();
                     // Apply it to the place's subforms and read back the five
                     // values it returns via (values …). The expander body runs in
                     // a CHILD env, so the multiple values land on that child's mv —
@@ -40386,5 +40387,68 @@ mod compiler_macro_environment_tests {
     #[test]
     fn fasl_ordinary_environment_cleanup_on_error() {
         check_environment_cleanup(true, true, true);
+    }
+}
+
+#[cfg(test)]
+mod setf_environment_tests {
+    use super::*;
+
+    fn check_cleanup(compiled: bool, fail: bool) {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let source = if fail {
+            "(define-setf-expander setf-environment-probe (&environment e) (if e (error \"expected setf expansion error\") nil))"
+        } else {
+            "(define-setf-expander setf-environment-probe (&environment e) (if e (values nil nil '(store) '(setq slot store) 'slot) nil))"
+        };
+        if compiled {
+            let bytes = build_bfasl_from_source(source, "setf-environment.lisp", &mut env).unwrap();
+            load_bfasl_into_env(&bytes, &mut env).unwrap();
+        } else {
+            read_eval_all_env(source, &mut env).unwrap();
+        }
+        let _outer_scope = MacroexpandEnvScope::new();
+        egcl_rt::rooted!(outer = store_macroexpand_environment(MacroexpandEnv::null()));
+        egcl_rt::rooted!(
+            place = read_from_string_in_env("(setf-environment-probe)", &mut env)
+                .unwrap()
+                .0
+        );
+        let before = MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len());
+        for _ in 0..10 {
+            let result = get_setf_expansion(*place, &mut env);
+            if fail {
+                assert!(result.is_err());
+            } else {
+                let expansion = result.unwrap();
+                assert_eq!(expansion.stores.len(), 1);
+                assert_eq!(sym_name(expansion.access_form), "SLOT");
+            }
+            assert!(load_macroexpand_environment(*outer).is_some());
+            assert_eq!(
+                MACROEXPAND_ENVIRONMENTS.with(|envs| envs.borrow().len()),
+                before,
+                "SETF expander retained its dynamic environment"
+            );
+        }
+    }
+
+    #[test]
+    fn source_cleanup() {
+        check_cleanup(false, false);
+    }
+    #[test]
+    fn source_cleanup_on_error() {
+        check_cleanup(false, true);
+    }
+    #[test]
+    fn fasl_cleanup() {
+        check_cleanup(true, false);
+    }
+    #[test]
+    fn fasl_cleanup_on_error() {
+        check_cleanup(true, true);
     }
 }
