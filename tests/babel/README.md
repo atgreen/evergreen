@@ -20,7 +20,8 @@ NIL into a character. These baseline errors must be distinguished from EGCL
 failures when comparing results.
 
 EGCL is not yet passing: the initial full run timed out at the default 600
-seconds, and cached loading registered no child tests (bliss-0jx70). Individual
-decoding tests also expose an incorrect multiple-value result (bliss-p3lxe).
+seconds, and cached loading registered no child tests (bliss-0jx70). The
+incorrect multiple-value result from decoding (bliss-p3lxe) is fixed; rebuild
+existing FASL caches to pick up the compiler change.
 Use `EGCL_TIMEOUT` to allow a longer full run; the runner rejects an empty suite
 even if its framework reports success.
