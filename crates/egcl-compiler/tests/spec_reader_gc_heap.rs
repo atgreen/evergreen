@@ -88,3 +88,62 @@ fn reader_shared_structure_retains_identity_across_gc() {
 
     stack.pop_frame();
 }
+
+/// Reading a character from a user-defined stream may collect. In particular,
+/// a dotted tail and a complex imaginary part remain live while the parser
+/// requests the whitespace/closing delimiter that follows them.
+#[test]
+fn streaming_reader_roots_values_across_character_callbacks() {
+    use egcl_compiler::reader::{ReaderMacroKind, ReaderStream, read_from_stream};
+    use egcl_rt::{error::EgclError, object::ComplexData};
+
+    struct CollectingInput {
+        chars: Vec<char>,
+        position: usize,
+        collections: usize,
+    }
+    impl ReaderStream for CollectingInput {
+        fn read_char(&mut self) -> Result<Option<char>, EgclError> {
+            HeapCollector::new()
+                .minor_gc()
+                .expect("callback collection");
+            self.collections += 1;
+            let ch = self.chars.get(self.position).copied();
+            if ch.is_some() {
+                self.position += 1;
+            }
+            Ok(ch)
+        }
+        fn unread_char(&mut self, ch: char) -> Result<(), EgclError> {
+            self.position -= 1;
+            assert_eq!(self.chars[self.position], ch);
+            Ok(())
+        }
+        fn invoke_macro(
+            &mut self,
+            _: EgclVal,
+            _: char,
+            _: ReaderMacroKind,
+        ) -> Result<Vec<EgclVal>, EgclError> {
+            panic!("no custom macros in this test")
+        }
+    }
+    let _g = gc_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _thread = current_thread();
+    let mut input = CollectingInput {
+        chars: "((1 . (2 3) ) #c(1.25d0 2.5d0 ))".chars().collect(),
+        position: 0,
+        collections: 0,
+    };
+    egcl_rt::rooted!(form = read_from_stream(&mut input, 10, false, false).unwrap());
+    assert_eq!(input.collections, input.chars.len());
+    let list = car(*form);
+    assert_eq!(car(list).as_fixnum(), 1);
+    assert_eq!(car(cdr(list)).as_fixnum(), 2);
+    assert_eq!(car(cdr(cdr(list))).as_fixnum(), 3);
+    assert!(cdr(cdr(cdr(list))).is_nil());
+    let complex = car(cdr(*form));
+    let parts = unsafe { &*(complex.as_ptr() as *const ComplexData) };
+    assert_eq!(parts.realpart.as_double_float(), 1.25);
+    assert_eq!(parts.imagpart.as_double_float(), 2.5);
+}

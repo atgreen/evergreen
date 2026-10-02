@@ -191,7 +191,7 @@ fn any_custom_macros() -> bool {
 /// handler — the NEXT token read from where the handler stopped.
 #[allow(clippy::too_many_arguments)]
 fn try_custom_sharp_dispatch(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos_after_sub: usize,
     sub: char,
     infix: Option<i64>,
@@ -209,26 +209,31 @@ fn try_custom_sharp_dispatch(
         return None;
     }
     let handler = lookup_custom_dispatch(readtable, '#', sub.to_ascii_uppercase())?;
-    let invoker = (*MACRO_INVOKER.lock().unwrap())?;
-    let text: String = chars[pos_after_sub..].iter().collect();
-    Some(match invoker(handler, &text, sub, infix) {
-        Ok((vals, consumed)) => {
-            let newpos = pos_after_sub + consumed;
-            match vals.into_iter().next() {
-                Some(v) => Ok((v, newpos)),
-                None => read_token_with_base(
-                    chars,
-                    newpos,
-                    labels,
-                    read_base,
-                    read_eval,
-                    read_circular,
-                    depth,
-                ),
+    Some(
+        match chars.invoke_macro(
+            handler,
+            pos_after_sub,
+            sub,
+            ReaderMacroKind::Dispatch(infix),
+        ) {
+            Ok((vals, consumed)) => {
+                let newpos = pos_after_sub + consumed;
+                match vals.into_iter().next() {
+                    Some(v) => Ok((v, newpos)),
+                    None => read_token_with_base(
+                        chars,
+                        newpos,
+                        labels,
+                        read_base,
+                        read_eval,
+                        read_circular,
+                        depth,
+                    ),
+                }
             }
-        }
-        Err(e) => Err(e),
-    })
+            Err(e) => Err(e),
+        },
+    )
 }
 
 /// True if a custom `#<sub>` handler is registered in the current readtable —
@@ -604,7 +609,7 @@ fn alloc_md_array(dims: &[usize], flat: &[EgclVal]) -> EgclVal {
 /// flattens row-major, and builds a SIMPLE_VECTOR (rank ≤ 1) or MD_ARRAY.
 #[allow(clippy::too_many_arguments)]
 fn read_nd_array_literal(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -613,7 +618,7 @@ fn read_nd_array_literal(
     depth: usize,
     rank: u32,
 ) -> Result<(EgclVal, usize), EgclError> {
-    pos = skip_whitespace_and_comments(chars, pos);
+    pos = skip_whitespace_and_comments(chars, pos)?;
     let (mut contents, p) = read_token_with_base(
         chars,
         pos,
@@ -947,6 +952,165 @@ pub enum SyntaxType {
     Invalid,
 }
 
+/// Operations the reader needs from a live character stream. Implementations
+/// may allocate Lisp objects, including while reading or unreading a character.
+pub trait ReaderStream {
+    fn read_char(&mut self) -> Result<Option<char>, EgclError>;
+    fn unread_char(&mut self, ch: char) -> Result<(), EgclError>;
+    fn invoke_macro(
+        &mut self,
+        handler: EgclVal,
+        ch: char,
+        kind: ReaderMacroKind,
+    ) -> Result<Vec<EgclVal>, EgclError>;
+}
+
+#[derive(Clone, Copy)]
+pub enum ReaderMacroKind {
+    Plain,
+    Dispatch(Option<i64>),
+}
+
+enum InputChars<'a> {
+    Slice(&'a [char]),
+    Buffered(Vec<char>),
+}
+
+/// A single parser serves both existing source buffers and live streams. Live
+/// input is fetched only on demand; parsed prefixes are never evaluated again.
+struct ReaderInput<'a> {
+    chars: InputChars<'a>,
+    stream: Option<&'a mut dyn ReaderStream>,
+    eof: bool,
+}
+
+impl<'a> ReaderInput<'a> {
+    fn slice(chars: &'a [char]) -> Self {
+        Self {
+            chars: InputChars::Slice(chars),
+            stream: None,
+            eof: true,
+        }
+    }
+
+    fn data(&self) -> &[char] {
+        match &self.chars {
+            InputChars::Slice(chars) => chars,
+            InputChars::Buffered(chars) => chars,
+        }
+    }
+
+    fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn has(&mut self, pos: usize) -> Result<bool, EgclError> {
+        while pos >= self.data().len() && !self.eof {
+            match self.stream.as_mut().unwrap().read_char()? {
+                Some(ch) => match &mut self.chars {
+                    InputChars::Buffered(chars) => chars.push(ch),
+                    InputChars::Slice(_) => unreachable!(),
+                },
+                None => self.eof = true,
+            }
+        }
+        Ok(pos < self.data().len())
+    }
+
+    fn at(&mut self, pos: usize) -> Result<char, EgclError> {
+        if self.has(pos)? {
+            Ok(self.data()[pos])
+        } else {
+            Err(EgclError::StreamError("unexpected end of input".into()))
+        }
+    }
+
+    fn unread_lookahead(&mut self, pos: usize) -> Result<(), EgclError> {
+        let extra = self.data().len().saturating_sub(pos);
+        if extra > 1 {
+            return Err(EgclError::StreamError(
+                "reader consumed too much lookahead".into(),
+            ));
+        }
+        if extra == 1 {
+            let ch = self.data()[pos];
+            self.stream.as_mut().unwrap().unread_char(ch)?;
+            if let InputChars::Buffered(chars) = &mut self.chars {
+                chars.truncate(pos);
+            }
+        }
+        Ok(())
+    }
+
+    fn invoke_macro(
+        &mut self,
+        handler: EgclVal,
+        pos: usize,
+        ch: char,
+        kind: ReaderMacroKind,
+    ) -> Result<(Vec<EgclVal>, usize), EgclError> {
+        egcl_rt::rooted!(handler = handler);
+        if self.is_stream() {
+            self.unread_lookahead(pos)?;
+            // The handler consumes the original stream, including recursive READ.
+            // Its characters need not be replayed into our private prefix buffer.
+            let values = self
+                .stream
+                .as_mut()
+                .unwrap()
+                .invoke_macro(*handler, ch, kind)?;
+            self.eof = false;
+            return Ok((values, 0));
+        }
+        let text: String = self.data()[pos..].iter().collect();
+        match kind {
+            ReaderMacroKind::Plain => {
+                let invoker = *PLAIN_MACRO_INVOKER.lock().unwrap();
+                invoker.ok_or_else(|| EgclError::StreamError("no reader macro invoker".into()))?(
+                    *handler, &text, ch,
+                )
+            }
+            ReaderMacroKind::Dispatch(infix) => {
+                let invoker = *MACRO_INVOKER.lock().unwrap();
+                invoker.ok_or_else(|| EgclError::StreamError("no dispatch macro invoker".into()))?(
+                    *handler, &text, ch, infix,
+                )
+            }
+        }
+    }
+}
+
+/// Read exactly one object from a live stream, preserving any lookahead in its
+/// one-character unread buffer. No prefix retries or speculative reader calls.
+pub fn read_from_stream(
+    stream: &mut dyn ReaderStream,
+    read_base: u32,
+    read_eval: bool,
+    preserve_whitespace: bool,
+) -> Result<EgclVal, EgclError> {
+    let mut input = ReaderInput {
+        chars: InputChars::Buffered(Vec::new()),
+        stream: Some(stream),
+        eof: false,
+    };
+    let (value, mut consumed) = read_form_input(&mut input, 0, read_base, read_eval)?;
+    egcl_rt::rooted!(value = value);
+    // Only consume whitespace that was already read as the token terminator.
+    // A self-delimiting form needs no extra read from an interactive stream.
+    if !preserve_whitespace
+        && input.data().get(consumed).is_some_and(|&ch| {
+            if any_char_syntax_override() {
+                effective_char_syntax(current_readtable_value(), ch).0 == 1
+            } else {
+                ch.is_ascii_whitespace()
+            }
+        })
+    {
+        consumed += 1;
+    }
+    input.unread_lookahead(consumed)?;
+    Ok(*value)
+}
 // ── Core reader ───────────────────────────────────────────────────
 
 pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
@@ -980,7 +1144,8 @@ pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
                     );
 
                     // Honor custom readtable entries before falling back to built-ins.
-                    let first_pos = skip_whitespace_and_comments(&chars, 0);
+                    let first_pos =
+                        skip_whitespace_and_comments(&mut ReaderInput::slice(&chars), 0)?;
                     if let Some(custom) =
                         apply_custom_macro_handler(&chars, first_pos, state.readtable)
                     {
@@ -988,7 +1153,7 @@ pub fn read(state: &mut ReaderState) -> Result<EgclVal, EgclError> {
                     }
 
                     let (val, _pos) = read_token_with_base(
-                        &chars,
+                        &mut ReaderInput::slice(&chars),
                         0,
                         &mut labels,
                         state.read_base,
@@ -1044,12 +1209,25 @@ pub fn read_form_at(
     read_base: u32,
     read_eval: bool,
 ) -> Result<(EgclVal, usize), EgclError> {
+    read_form_input(&mut ReaderInput::slice(chars), start, read_base, read_eval)
+}
+
+pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
+    read_char_literal_input(&mut ReaderInput::slice(chars), pos)
+}
+
+fn read_form_input(
+    chars: &mut ReaderInput<'_>,
+    start: usize,
+    read_base: u32,
+    read_eval: bool,
+) -> Result<(EgclVal, usize), EgclError> {
     // `*READ-SUPPRESS*`: parse the form's syntax, discard it, return NIL while
     // still consuming the characters. `skip_form` implements exactly this
     // parse-and-discard traversal (it also drives suppressed #+/#- branches).
     if read_suppress_active() {
-        let mut p = skip_whitespace_and_comments(chars, start);
-        if p >= chars.len() {
+        let mut p = skip_whitespace_and_comments(chars, start)?;
+        if !chars.has(p)? {
             return Ok((EOF, p));
         }
         p = skip_form(chars, p, 0)?;
@@ -1074,8 +1252,8 @@ pub fn read_form_at(
         if val != MISSING {
             return Ok((val, next));
         }
-        pos = skip_whitespace_and_comments(chars, next);
-        if pos >= chars.len() {
+        pos = skip_whitespace_and_comments(chars, next)?;
+        if !chars.has(pos)? {
             return Ok((EOF, pos));
         }
     }
@@ -1112,7 +1290,7 @@ fn default_string_reader_circular_mode() -> bool {
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_token(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -1125,9 +1303,9 @@ fn read_token(
 /// reader-error (make-dispatch-macro-character.3).
 #[allow(clippy::too_many_arguments)]
 fn read_custom_dispatch_char(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
-    rt: EgclVal,
+    mut rt: EgclVal,
     disp: char,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -1135,26 +1313,26 @@ fn read_custom_dispatch_char(
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
+    egcl_rt::rooted_ref!(_readtable_root = &mut rt);
     let mut p = pos + 1; // past the dispatch char
     let mut infix: Option<i64> = None;
-    while p < chars.len() && chars[p].is_ascii_digit() {
-        let d = chars[p] as i64 - '0' as i64;
+    while chars.has(p)? && chars.at(p)?.is_ascii_digit() {
+        let d = chars.at(p)? as i64 - '0' as i64;
         infix = Some(infix.unwrap_or(0) * 10 + d);
         p += 1;
     }
-    if p >= chars.len() {
+    if !chars.has(p)? {
         return Err(EgclError::StreamError(
             "unexpected end after dispatch character".into(),
         ));
     }
-    let sub = chars[p];
+    let sub = chars.at(p)?;
     p += 1;
     match lookup_custom_dispatch(rt, disp, sub.to_ascii_uppercase()) {
         Some(handler) if handler != T => {
             let disp_invoker = *MACRO_INVOKER.lock().unwrap();
-            if let Some(invoker) = disp_invoker {
-                let text: String = chars[p..].iter().collect();
-                match invoker(handler, &text, sub, infix) {
+            if disp_invoker.is_some() || chars.is_stream() {
+                match chars.invoke_macro(handler, p, sub, ReaderMacroKind::Dispatch(infix)) {
                     Ok((vals, consumed)) => {
                         let newpos = p + consumed;
                         match vals.into_iter().next() {
@@ -1186,7 +1364,7 @@ fn read_custom_dispatch_char(
 }
 
 fn read_token_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -1200,11 +1378,11 @@ fn read_token_with_base(
         ));
     }
     // Skip whitespace and line comments
-    pos = skip_whitespace_and_comments(chars, pos);
-    if pos >= chars.len() {
+    pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? {
         return Ok((EOF, pos));
     }
-    let ch = chars[pos];
+    let ch = chars.at(pos)?;
     // Honour per-character syntax customised via SET-SYNTAX-FROM-CHAR before the
     // standard hardcoded dispatch. `dispatch_ch` is the character whose built-in
     // reader behaviour applies (the copied "delegate"), so e.g. a char given
@@ -1234,9 +1412,13 @@ fn read_token_with_base(
                 if let Some((handler, _)) = lookup_custom_macro(rt, ch) {
                     if handler != T {
                         let plain_invoker = *PLAIN_MACRO_INVOKER.lock().unwrap();
-                        if let Some(invoker) = plain_invoker {
-                            let text: String = chars[pos + 1..].iter().collect();
-                            return match invoker(handler, &text, ch) {
+                        if plain_invoker.is_some() || chars.is_stream() {
+                            return match chars.invoke_macro(
+                                handler,
+                                pos + 1,
+                                ch,
+                                ReaderMacroKind::Plain,
+                            ) {
                                 Ok((vals, consumed)) => {
                                     let newpos = pos + 1 + consumed;
                                     match vals.into_iter().next() {
@@ -1276,7 +1458,7 @@ fn read_token_with_base(
                 if delegate == ';' {
                     // line comment: consume to end of line and continue
                     let mut p = pos + 1;
-                    while p < chars.len() && chars[p] != '\n' {
+                    while chars.has(p)? && chars.at(p)? != '\n' {
                         p += 1;
                     }
                     return read_token_with_base(
@@ -1343,7 +1525,7 @@ fn read_token_with_base(
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
-            if pos + 1 < chars.len() && (chars[pos + 1] == '@' || chars[pos + 1] == '.') {
+            if chars.has(pos + 1)? && (chars.at(pos + 1)? == '@' || chars.at(pos + 1)? == '.') {
                 // `,@` splices; `,.` is the destructive-splice variant (CLHS
                 // 2.4.6) — append semantics are a conforming implementation and
                 // what iterate's `(progn ,.body)` skeleton needs (bliss-tzc2).
@@ -1387,47 +1569,51 @@ fn read_token_with_base(
     }
 }
 
-fn skip_whitespace_and_comments(chars: &[char], mut pos: usize) -> usize {
+fn skip_whitespace_and_comments(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+) -> Result<usize, EgclError> {
     // When SET-SYNTAX-FROM-CHAR is in play, whitespace-skipping and comment
     // recognition must follow the readtable, not the hardcoded set: a char given
     // constituent syntax is no longer whitespace (so it starts a token, exposing
     // its invalid trait), and a char given `;`-syntax starts a line comment.
     if any_char_syntax_override() {
-        let rt = current_readtable_value();
+        let mut rt = current_readtable_value();
+        egcl_rt::rooted_ref!(_readtable_root = &mut rt);
         loop {
-            if pos >= chars.len() {
-                return pos;
+            if !chars.has(pos)? {
+                return Ok(pos);
             }
-            let (code, delegate) = effective_char_syntax(rt, chars[pos]);
+            let (code, delegate) = effective_char_syntax(rt, chars.at(pos)?);
             if code == 1 {
                 pos += 1;
             } else if code == 2 && delegate == ';' {
-                while pos < chars.len() && chars[pos] != '\n' {
+                while chars.has(pos)? && chars.at(pos)? != '\n' {
                     pos += 1;
                 }
-                if pos < chars.len() {
+                if chars.has(pos)? {
                     pos += 1;
                 }
             } else {
-                return pos;
+                return Ok(pos);
             }
         }
     }
     loop {
-        if pos >= chars.len() {
-            return pos;
+        if !chars.has(pos)? {
+            return Ok(pos);
         }
-        if chars[pos].is_ascii_whitespace() {
+        if chars.at(pos)?.is_ascii_whitespace() {
             pos += 1;
-        } else if chars[pos] == ';' {
-            while pos < chars.len() && chars[pos] != '\n' {
+        } else if chars.at(pos)? == ';' {
+            while chars.has(pos)? && chars.at(pos)? != '\n' {
                 pos += 1;
             }
-            if pos < chars.len() {
+            if chars.has(pos)? {
                 pos += 1;
             }
         } else {
-            return pos;
+            return Ok(pos);
         }
     }
 }
@@ -1505,7 +1691,7 @@ fn ensure_nesting_within_limit(chars: &[char]) -> Result<(), EgclError> {
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_list(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -1513,7 +1699,7 @@ fn read_list(
 }
 
 fn read_list_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -1528,22 +1714,22 @@ fn read_list_with_base(
     // (bliss-6b2 #2). HostRoot keeps the Vec's slots scanned and rewritten.
     egcl_rt::rooted!(elements = Vec::<EgclVal>::new());
     loop {
-        pos = skip_whitespace_and_comments(chars, pos);
-        if pos >= chars.len() {
+        pos = skip_whitespace_and_comments(chars, pos)?;
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated list".into()));
         }
-        if chars[pos] == ')' {
+        if chars.at(pos)? == ')' {
             return Ok((make_list(&elements), pos + 1));
         }
-        if chars[pos] == '.' {
+        if chars.at(pos)? == '.' {
             // Check if it's a dot token (followed by whitespace or delimiter)
-            if pos + 1 >= chars.len() || is_delimiter(chars[pos + 1]) {
+            if !chars.has(pos + 1)? || is_delimiter(chars.at(pos + 1)?) {
                 if elements.is_empty() {
                     return Err(EgclError::StreamError("dot at start of list".into()));
                 }
                 pos += 1;
-                pos = skip_whitespace_and_comments(chars, pos);
-                let (cdr_val, p) = read_token_with_base(
+                pos = skip_whitespace_and_comments(chars, pos)?;
+                let (mut cdr_val, p) = read_token_with_base(
                     chars,
                     pos,
                     labels,
@@ -1552,8 +1738,9 @@ fn read_list_with_base(
                     read_circular,
                     depth + 1,
                 )?;
-                pos = skip_whitespace_and_comments(chars, p);
-                if pos >= chars.len() || chars[pos] != ')' {
+                egcl_rt::rooted_ref!(_cdr_root = &mut cdr_val);
+                pos = skip_whitespace_and_comments(chars, p)?;
+                if !chars.has(pos)? || chars.at(pos)? != ')' {
                     // Check for illegal (a . b . c)
                     return Err(EgclError::StreamError("multiple objects after dot".into()));
                 }
@@ -1597,20 +1784,20 @@ fn is_delimiter(c: char) -> bool {
         || c == ','
 }
 
-fn read_string(chars: &[char], mut pos: usize) -> Result<(EgclVal, usize), EgclError> {
+fn read_string(chars: &mut ReaderInput<'_>, mut pos: usize) -> Result<(EgclVal, usize), EgclError> {
     let mut s = String::new();
     loop {
-        if pos >= chars.len() {
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated string".into()));
         }
-        match chars[pos] {
+        match chars.at(pos)? {
             '"' => return Ok((alloc_string(&s), pos + 1)),
             '\\' => {
                 pos += 1;
-                if pos >= chars.len() {
+                if !chars.has(pos)? {
                     return Err(EgclError::StreamError("unterminated string escape".into()));
                 }
-                s.push(chars[pos]);
+                s.push(chars.at(pos)?);
                 pos += 1;
             }
             c => {
@@ -1625,12 +1812,12 @@ fn read_string(chars: &[char], mut pos: usize) -> Result<(EgclVal, usize), EgclE
     dead_code,
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
-fn read_atom(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
+fn read_atom(chars: &mut ReaderInput<'_>, pos: usize) -> Result<(EgclVal, usize), EgclError> {
     read_atom_with_base(chars, pos, 10)
 }
 
 fn read_atom_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     read_base: u32,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -1645,7 +1832,7 @@ fn read_atom_with_base(
 /// wanted this string, and tokenizing dominates the load-time allocation profile
 /// (bliss-gq5.9).
 fn collect_token(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
 ) -> Result<(String, usize, bool, Option<usize>), EgclError> {
     let case_mode = current_readtable_case_mode();
@@ -1653,11 +1840,12 @@ fn collect_token(
     // consult per-character syntax (escape/constituent/delimiter) instead of the
     // hardcoded `\`, `|`, `is_delimiter` fast path.
     let overrides = any_char_syntax_override();
-    let rt = if overrides {
+    let mut rt = if overrides {
         current_readtable_value()
     } else {
         NIL
     };
+    egcl_rt::rooted_ref!(_readtable_root = &mut rt);
     let mut name = String::new();
     // For `:invert` (mode 3): track which chars of `name` are unescaped (and so
     // eligible for whole-token case inversion). Left empty for other modes.
@@ -1672,8 +1860,8 @@ fn collect_token(
     // collapsing into one symbol named "PY::has space" (bliss-i83w).
     let mut first_unescaped_colon: Option<usize> = None;
 
-    while pos < chars.len() {
-        let c = chars[pos];
+    while chars.has(pos)? {
+        let c = chars.at(pos)?;
         if in_multiple_escape {
             let closes = if overrides {
                 effective_char_syntax(rt, c).0 == 5
@@ -1699,10 +1887,10 @@ fn collect_token(
                     // single escape
                     had_escape = true;
                     pos += 1;
-                    if pos >= chars.len() {
+                    if !chars.has(pos)? {
                         return Err(EgclError::StreamError("trailing single escape".into()));
                     }
-                    name.push(chars[pos]);
+                    name.push(chars.at(pos)?);
                     if case_mode == 3 {
                         invert_eligible.push(false);
                     }
@@ -1740,10 +1928,10 @@ fn collect_token(
             '\\' => {
                 had_escape = true;
                 pos += 1;
-                if pos >= chars.len() {
+                if !chars.has(pos)? {
                     return Err(EgclError::StreamError("trailing single escape".into()));
                 }
-                name.push(chars[pos]); // escaped: preserve case
+                name.push(chars.at(pos)?); // escaped: preserve case
                 if case_mode == 3 {
                     invert_eligible.push(false);
                 }
@@ -2416,7 +2604,7 @@ fn alloc_bignum(sign: i32, limbs: &[u64]) -> EgclVal {
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_sharpsign(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -2424,7 +2612,7 @@ fn read_sharpsign(
 }
 
 fn read_sharpsign_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -2432,21 +2620,21 @@ fn read_sharpsign_with_base(
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    if pos >= chars.len() {
+    if !chars.has(pos)? {
         return Err(EgclError::StreamError("unexpected end after #".into()));
     }
     // Check for #nR, #n=, #n#
-    if chars[pos].is_ascii_digit() {
+    if chars.at(pos)?.is_ascii_digit() {
         let start = pos;
-        while pos < chars.len() && chars[pos].is_ascii_digit() {
+        while chars.has(pos)? && chars.at(pos)?.is_ascii_digit() {
             pos += 1;
         }
-        if pos >= chars.len() {
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unexpected end after #n".into()));
         }
         // A `#n…` infix argument that overflows u32 (e.g. a huge radix or label)
         // is a reader error, not a process-crashing panic (ansi-test reader-aux).
-        let num: u32 = match chars[start..pos].iter().collect::<String>().parse() {
+        let num: u32 = match chars.data()[start..pos].iter().collect::<String>().parse() {
             Ok(n) => n,
             Err(_) => {
                 return Err(EgclError::StreamError(
@@ -2454,10 +2642,11 @@ fn read_sharpsign_with_base(
                 ));
             }
         };
+        let sub = chars.at(pos)?;
         if let Some(result) = try_custom_sharp_dispatch(
             chars,
             pos + 1,
-            chars[pos],
+            sub,
             Some(num as i64),
             labels,
             read_base,
@@ -2467,7 +2656,7 @@ fn read_sharpsign_with_base(
         ) {
             return result;
         }
-        match chars[pos].to_ascii_uppercase() {
+        match chars.at(pos)?.to_ascii_uppercase() {
             'R' => {
                 pos += 1;
                 return read_radix_integer(chars, pos, num);
@@ -2559,12 +2748,12 @@ fn read_sharpsign_with_base(
                 }
                 return Err(EgclError::StreamError(format!(
                     "unknown # dispatch #{}",
-                    chars[pos]
+                    chars.at(pos)?
                 )));
             }
         }
     }
-    let dispatch = chars[pos];
+    let dispatch = chars.at(pos)?;
     pos += 1;
     if let Some(result) = try_custom_sharp_dispatch(
         chars,
@@ -2596,7 +2785,7 @@ fn read_sharpsign_with_base(
             let func_sym = EgclVal::from_symbol_index(intern_symbol("FUNCTION"));
             Ok((make_list(&[func_sym, val]), p))
         }
-        '\\' => read_char_literal(chars, pos),
+        '\\' => read_char_literal_input(chars, pos),
         '(' => read_vector_literal_with_base(
             chars,
             pos,
@@ -2627,8 +2816,8 @@ fn read_sharpsign_with_base(
             // so the enclosing list reader closes the list instead of trying to
             // read `)` as a token ("unexpected )").
             let p = skip_block_comment(chars, pos)?;
-            let p2 = skip_whitespace_and_comments(chars, p);
-            if p2 >= chars.len() || chars[p2] == ')' {
+            let p2 = skip_whitespace_and_comments(chars, p)?;
+            if !chars.has(p2)? || chars.at(p2)? == ')' {
                 return Ok((MISSING, p2));
             }
             read_token_with_base(
@@ -2734,8 +2923,11 @@ pub fn character_literal_delimiter(ch: char) -> bool {
 
 /// Parse the token following standard sharp-backslash syntax, without consulting
 /// user dispatch handlers. Also used by the callable standard stream handler.
-pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
-    if pos >= chars.len() {
+fn read_char_literal_input(
+    chars: &mut ReaderInput<'_>,
+    pos: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    if !chars.has(pos)? {
         return Err(EgclError::StreamError("unexpected end after #\\".into()));
     }
     // Collect a named character token.  Implementation-defined names are not
@@ -2747,13 +2939,13 @@ pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize),
     let mut end = pos + 1;
     // A non-alphabetic first character is the character itself (`#\)`,
     // `#\\`, etc.); only an alphabetic start introduces a named character.
-    if chars[pos].is_ascii_alphabetic() {
-        while end < chars.len() && !character_literal_delimiter(chars[end]) {
+    if chars.at(pos)?.is_ascii_alphabetic() {
+        while chars.has(end)? && !character_literal_delimiter(chars.at(end)?) {
             end += 1;
         }
     }
     if end - start > 1 {
-        let name: String = chars[start..end].iter().collect();
+        let name: String = chars.data()[start..end].iter().collect();
         match name.to_lowercase().as_str() {
             "sub" => return Ok((EgclVal::from_char('\u{1a}'), end)),
             "esc" | "escape" => return Ok((EgclVal::from_char('\u{1b}'), end)),
@@ -2781,7 +2973,7 @@ pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize),
             }
         }
     }
-    Ok((EgclVal::from_char(chars[pos]), end))
+    Ok((EgclVal::from_char(chars.at(pos)?), end))
 }
 
 #[expect(
@@ -2789,7 +2981,7 @@ pub fn read_char_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize),
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_vector_literal(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -2797,7 +2989,7 @@ fn read_vector_literal(
 }
 
 fn read_vector_literal_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -2809,11 +3001,11 @@ fn read_vector_literal_with_base(
     // (bliss-6b2 #2), as in read_list_with_base.
     egcl_rt::rooted!(elements = Vec::<EgclVal>::new());
     loop {
-        pos = skip_whitespace_and_comments(chars, pos);
-        if pos >= chars.len() {
+        pos = skip_whitespace_and_comments(chars, pos)?;
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated vector".into()));
         }
-        if chars[pos] == ')' {
+        if chars.at(pos)? == ')' {
             return Ok((alloc_vector(&elements), pos + 1));
         }
         let (val, p) = read_token_with_base(
@@ -2837,7 +3029,7 @@ fn read_vector_literal_with_base(
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_complex_literal(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -2845,7 +3037,7 @@ fn read_complex_literal(
 }
 
 fn read_complex_literal_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -2853,12 +3045,12 @@ fn read_complex_literal_with_base(
     read_circular: bool,
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    pos = skip_whitespace_and_comments(chars, pos);
-    if pos >= chars.len() || chars[pos] != '(' {
+    pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? || chars.at(pos)? != '(' {
         return Err(EgclError::StreamError("expected ( after #C".into()));
     }
     pos += 1;
-    pos = skip_whitespace_and_comments(chars, pos);
+    pos = skip_whitespace_and_comments(chars, pos)?;
     let (mut real, p) = read_token_with_base(
         chars,
         pos,
@@ -2871,8 +3063,8 @@ fn read_complex_literal_with_base(
     // Root `real` across the second component's read, which allocates and can
     // fire a relocating minor GC (bliss-wlf).
     egcl_rt::rooted_ref!(_real_root = &mut real);
-    pos = skip_whitespace_and_comments(chars, p);
-    let (imag, p) = read_token_with_base(
+    pos = skip_whitespace_and_comments(chars, p)?;
+    let (mut imag, p) = read_token_with_base(
         chars,
         pos,
         labels,
@@ -2881,8 +3073,9 @@ fn read_complex_literal_with_base(
         read_circular,
         depth + 1,
     )?;
-    pos = skip_whitespace_and_comments(chars, p);
-    if pos >= chars.len() || chars[pos] != ')' {
+    egcl_rt::rooted_ref!(_imag_root = &mut imag);
+    pos = skip_whitespace_and_comments(chars, p)?;
+    if !chars.has(pos)? || chars.at(pos)? != ')' {
         return Err(EgclError::StreamError(
             "expected ) after #C(real imag".into(),
         ));
@@ -2890,17 +3083,20 @@ fn read_complex_literal_with_base(
     Ok((alloc_complex(real, imag), pos + 1))
 }
 
-fn read_bit_vector(chars: &[char], mut pos: usize) -> Result<(EgclVal, usize), EgclError> {
+fn read_bit_vector(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+) -> Result<(EgclVal, usize), EgclError> {
     let mut bits = Vec::new();
-    while pos < chars.len() && (chars[pos] == '0' || chars[pos] == '1') {
-        bits.push(if chars[pos] == '1' { 1u8 } else { 0u8 });
+    while chars.has(pos)? && (chars.at(pos)? == '0' || chars.at(pos)? == '1') {
+        bits.push(if chars.at(pos)? == '1' { 1u8 } else { 0u8 });
         pos += 1;
     }
     Ok((alloc_bit_vector(&bits), pos))
 }
 
 fn read_radix_integer(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     radix: u32,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -2914,8 +3110,8 @@ fn read_radix_integer(
         )));
     }
     let start = pos;
-    let negative = if pos < chars.len() && (chars[pos] == '+' || chars[pos] == '-') {
-        let neg = chars[pos] == '-';
+    let negative = if chars.has(pos)? && (chars.at(pos)? == '+' || chars.at(pos)? == '-') {
+        let neg = chars.at(pos)? == '-';
         pos += 1;
         neg
     } else {
@@ -2925,13 +3121,13 @@ fn read_radix_integer(
     // prefix, so `#x1F/2` is the rational 31/2. Stopping at the `/` read the
     // numerator alone and left `/2` in the stream, so `#x1F/2` silently read as
     // 31 and `#b101/11` as 5 (bliss-mwpb).
-    while pos < chars.len()
-        && (chars[pos].is_ascii_alphanumeric() || chars[pos] == '/')
-        && !is_delimiter(chars[pos])
+    while chars.has(pos)?
+        && (chars.at(pos)?.is_ascii_alphanumeric() || chars.at(pos)? == '/')
+        && !is_delimiter(chars.at(pos)?)
     {
         pos += 1;
     }
-    let token: String = chars[start..pos].iter().collect();
+    let token: String = chars.data()[start..pos].iter().collect();
     if token.contains('/') {
         // Reuse the shared ratio parser so reduction, sign normalization and
         // the fixnum/bignum choice are identical to the unprefixed path.
@@ -2942,7 +3138,7 @@ fn read_radix_integer(
             ))),
         };
     }
-    let digits: String = chars[start..pos].iter().collect();
+    let digits: String = chars.data()[start..pos].iter().collect();
     let digits = digits.trim_start_matches('+').trim_start_matches('-');
     // Fixnum-range values stay immediate; anything larger — including i64
     // overflow like fast-http's #xFFFFFFFFFFFFFFFF content-length bound —
@@ -2968,13 +3164,13 @@ fn read_radix_integer(
     }
 }
 
-fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, EgclError> {
+fn skip_block_comment(chars: &mut ReaderInput<'_>, mut pos: usize) -> Result<usize, EgclError> {
     let mut depth = 1u32;
-    while pos + 1 < chars.len() {
-        if chars[pos] == '#' && chars[pos + 1] == '|' {
+    while chars.has(pos + 1)? {
+        if chars.at(pos)? == '#' && chars.at(pos + 1)? == '|' {
             depth += 1;
             pos += 2;
-        } else if chars[pos] == '|' && chars[pos + 1] == '#' {
+        } else if chars.at(pos)? == '|' && chars.at(pos + 1)? == '#' {
             depth -= 1;
             pos += 2;
             if depth == 0 {
@@ -2992,7 +3188,7 @@ fn skip_block_comment(chars: &[char], mut pos: usize) -> Result<usize, EgclError
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_feature_expr(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
     include_if_present: bool,
@@ -3020,7 +3216,7 @@ struct ReaderOptions {
 }
 
 fn read_feature_expr_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     include_if_present: bool,
@@ -3055,7 +3251,7 @@ fn read_feature_expr_with_base(
         // Skip the next form syntactically without resolving packages or
         // evaluating reader macros inside the suppressed branch.
         pos = skip_form(chars, pos, 0)?;
-        pos = skip_whitespace_and_comments(chars, pos);
+        pos = skip_whitespace_and_comments(chars, pos)?;
         Ok((MISSING, pos))
     }
 }
@@ -3174,7 +3370,11 @@ fn cons_parts(val: EgclVal) -> (EgclVal, EgclVal) {
 /// exactly how libraries use the idiom to comment out a block (string-case's
 /// trailing "demo output" section; bliss-prts). Skipping only the guarded form
 /// left `=>` to be read and evaluated as a variable.
-fn skip_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, EgclError> {
+fn skip_form(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+    depth: usize,
+) -> Result<usize, EgclError> {
     let mut first = true;
     loop {
         // Only the FIRST unit must be a form: a bare `)` there is malformed even
@@ -3183,15 +3383,15 @@ fn skip_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, Egcl
         // enclosing list — `(a #+bad b)` must close, not error. Leave it for
         // `skip_list`.
         if !first {
-            let next = skip_whitespace_and_comments(chars, pos);
-            if next >= chars.len() || chars[next] == ')' {
+            let next = skip_whitespace_and_comments(chars, pos)?;
+            if !chars.has(next)? || chars.at(next)? == ')' {
                 return Ok(next);
             }
             pos = next;
         }
         let (next, produced) = skip_form_once(chars, pos, depth)?;
         pos = next;
-        if produced || pos >= chars.len() {
+        if produced || !chars.has(pos)? {
             return Ok(pos);
         }
         first = false;
@@ -3200,19 +3400,23 @@ fn skip_form(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, Egcl
 
 /// Skip one syntactic unit, reporting whether it PRODUCES a datum. Only a
 /// false-testing `#+`/`#-` produces none.
-fn skip_form_once(chars: &[char], pos: usize, depth: usize) -> Result<(usize, bool), EgclError> {
+fn skip_form_once(
+    chars: &mut ReaderInput<'_>,
+    pos: usize,
+    depth: usize,
+) -> Result<(usize, bool), EgclError> {
     if depth > MAX_READER_NESTING {
         return Err(EgclError::StreamError(
             "reader nesting limit exceeded".into(),
         ));
     }
-    let pos = skip_whitespace_and_comments(chars, pos);
-    if pos >= chars.len() {
+    let pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? {
         return Ok((pos, true));
     }
 
     let produced = |end: Result<usize, EgclError>| end.map(|end| (end, true));
-    match chars[pos] {
+    match chars.at(pos)? {
         '(' => produced(skip_list(chars, pos + 1, depth + 1)),
         // A bare `)` where a form is expected is malformed, even while skipping
         // for *read-suppress* or a #+/#- branch (read-suppress.error.1: `')`).
@@ -3220,7 +3424,7 @@ fn skip_form_once(chars: &[char], pos: usize, depth: usize) -> Result<(usize, bo
         '"' => produced(skip_string(chars, pos + 1)),
         '\'' | '`' => produced(skip_form(chars, pos + 1, depth + 1)),
         ',' => produced(
-            if pos + 1 < chars.len() && (chars[pos + 1] == '@' || chars[pos + 1] == '.') {
+            if chars.has(pos + 1)? && (chars.at(pos + 1)? == '@' || chars.at(pos + 1)? == '.') {
                 skip_form(chars, pos + 2, depth + 1)
             } else {
                 skip_form(chars, pos + 1, depth + 1)
@@ -3231,22 +3435,26 @@ fn skip_form_once(chars: &[char], pos: usize, depth: usize) -> Result<(usize, bo
     }
 }
 
-fn skip_list(chars: &[char], mut pos: usize, depth: usize) -> Result<usize, EgclError> {
+fn skip_list(
+    chars: &mut ReaderInput<'_>,
+    mut pos: usize,
+    depth: usize,
+) -> Result<usize, EgclError> {
     loop {
-        pos = skip_whitespace_and_comments(chars, pos);
-        if pos >= chars.len() {
+        pos = skip_whitespace_and_comments(chars, pos)?;
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated list".into()));
         }
-        if chars[pos] == ')' {
+        if chars.at(pos)? == ')' {
             return Ok(pos + 1);
         }
         pos = skip_form(chars, pos, depth + 1)?;
     }
 }
 
-fn skip_string(chars: &[char], mut pos: usize) -> Result<usize, EgclError> {
-    while pos < chars.len() {
-        match chars[pos] {
+fn skip_string(chars: &mut ReaderInput<'_>, mut pos: usize) -> Result<usize, EgclError> {
+    while chars.has(pos)? {
+        match chars.at(pos)? {
             '\\' => pos += 2,
             '"' => return Ok(pos + 1),
             _ => pos += 1,
@@ -3255,31 +3463,31 @@ fn skip_string(chars: &[char], mut pos: usize) -> Result<usize, EgclError> {
     Err(EgclError::StreamError("unterminated string".into()))
 }
 
-fn skip_atom(chars: &[char], pos: usize) -> Result<usize, EgclError> {
+fn skip_atom(chars: &mut ReaderInput<'_>, pos: usize) -> Result<usize, EgclError> {
     let (_token, end, _escaped, _) = collect_token(chars, pos)?;
     Ok(end)
 }
 
 fn skip_sharpsign_once(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     depth: usize,
 ) -> Result<(usize, bool), EgclError> {
-    if pos >= chars.len() {
+    if !chars.has(pos)? {
         return Err(EgclError::StreamError("unexpected end after #".into()));
     }
 
     // Optional infix numeric argument (`#3r…`, `#0(…)`, `#100000000\Space`).
     // Its magnitude is irrelevant when skipping, so we never parse it — the
     // dispatch that follows determines the syntax.
-    while pos < chars.len() && chars[pos].is_ascii_digit() {
+    while chars.has(pos)? && chars.at(pos)?.is_ascii_digit() {
         pos += 1;
     }
-    if pos >= chars.len() {
+    if !chars.has(pos)? {
         return Err(EgclError::StreamError("unexpected end after #".into()));
     }
 
-    let dispatch = chars[pos];
+    let dispatch = chars.at(pos)?;
     let produced = |end: Result<usize, EgclError>| end.map(|end| (end, true));
     match dispatch {
         '=' => produced(skip_form(chars, pos + 1, depth + 1)),
@@ -3292,7 +3500,7 @@ fn skip_sharpsign_once(
             Ok((after_form, false))
         }
         '\'' | '.' => produced(skip_form(chars, pos + 1, depth + 1)),
-        '\\' => Ok((skip_char_literal(chars, pos + 1), true)),
+        '\\' => Ok((skip_char_literal(chars, pos + 1)?, true)),
         ':' | 'b' | 'B' | 'o' | 'O' | 'x' | 'X' | 'r' | 'R' | '*' => {
             produced(skip_atom(chars, pos + 1))
         }
@@ -3323,18 +3531,18 @@ fn skip_sharpsign_once(
 /// trailing constituents. Routing this through skip_atom treated `#\'` as an
 /// empty token and `#\\` as an escape that swallowed the next character —
 /// either way a skipped form with character keys derailed (bliss-d0b).
-fn skip_char_literal(chars: &[char], pos: usize) -> usize {
+fn skip_char_literal(chars: &mut ReaderInput<'_>, pos: usize) -> Result<usize, EgclError> {
     let mut p = pos;
-    if p < chars.len() {
+    if chars.has(p)? {
         p += 1; // the character itself, whatever it is
-        while p < chars.len()
-            && !chars[p].is_whitespace()
-            && !matches!(chars[p], '(' | ')' | '"' | '\'' | '`' | ',' | ';')
+        while chars.has(p)?
+            && !chars.at(p)?.is_whitespace()
+            && !matches!(chars.at(p)?, '(' | ')' | '"' | '\'' | '`' | ',' | ';')
         {
             p += 1;
         }
     }
-    p
+    Ok(p)
 }
 
 /// Coerce a numeric EgclVal to f64 for mixed-type arithmetic.
@@ -3573,9 +3781,12 @@ fn eval_read_time_arithmetic(op: &str, args: EgclVal) -> Result<EgclVal, EgclErr
     Ok(EgclVal::from_single_float(total as f32))
 }
 
-fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize), EgclError> {
+fn read_pathname_literal(
+    chars: &mut ReaderInput<'_>,
+    pos: usize,
+) -> Result<(EgclVal, usize), EgclError> {
     // #P"string" — parse the string that follows
-    if pos >= chars.len() || chars[pos] != '"' {
+    if !chars.has(pos)? || chars.at(pos)? != '"' {
         return Err(EgclError::StreamError("expected string after #P".into()));
     }
     let (string_val, end) = read_string(chars, pos + 1)?;
@@ -3587,7 +3798,7 @@ fn read_pathname_literal(chars: &[char], pos: usize) -> Result<(EgclVal, usize),
     reason = "kept for bootstrap reader entrypoints not yet wired through public APIs"
 )]
 fn read_struct_literal(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     pos: usize,
     labels: &mut CircularLabels,
 ) -> Result<(EgclVal, usize), EgclError> {
@@ -3595,7 +3806,7 @@ fn read_struct_literal(
 }
 
 fn read_struct_literal_with_base(
-    chars: &[char],
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
@@ -3604,19 +3815,17 @@ fn read_struct_literal_with_base(
     depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
     // #S(name slot-key slot-value ...) — parse struct literal
-    pos = skip_whitespace_and_comments(chars, pos);
-    if pos >= chars.len() || chars[pos] != '(' {
+    pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? || chars.at(pos)? != '(' {
         return Err(EgclError::StreamError("expected ( after #S".into()));
     }
     pos += 1;
-    pos = skip_whitespace_and_comments(chars, pos);
-    if pos >= chars.len() {
+    pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? {
         return Err(EgclError::StreamError("unterminated #S literal".into()));
     }
-    if chars[pos] == ')' {
-        return Err(EgclError::StreamError(
-            "#S() requires a struct name".into(),
-        ));
+    if chars.at(pos)? == ')' {
+        return Err(EgclError::StreamError("#S() requires a struct name".into()));
     }
     // Read struct name
     let (mut name_val, p) = read_token_with_base(
@@ -3636,11 +3845,11 @@ fn read_struct_literal_with_base(
     // Read remaining slot key-value pairs as a flat list
     egcl_rt::rooted!(slots = Vec::new());
     loop {
-        pos = skip_whitespace_and_comments(chars, pos);
-        if pos >= chars.len() {
+        pos = skip_whitespace_and_comments(chars, pos)?;
+        if !chars.has(pos)? {
             return Err(EgclError::StreamError("unterminated #S literal".into()));
         }
-        if chars[pos] == ')' {
+        if chars.at(pos)? == ')' {
             pos += 1;
             break;
         }

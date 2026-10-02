@@ -1062,13 +1062,9 @@ fn stream_push_char(stream: EgclVal, ch: char, env: &mut Env) -> Result<(), Egcl
     }
 }
 
-/// Read a single Lisp form from an input stream (shared by READ and
-/// READ-PRESERVING-WHITESPACE). The stream only buffers one un-read character, so
-/// we grow a buffer one char at a time and re-parse; the first time a parse
-/// consumes fewer chars than the buffer we have read exactly one terminator past
-/// a complete form, which we push back. Returns `None` at end of input (only
-/// whitespace/comments remained). Neither consumes trailing whitespace beyond the
-/// single terminator. bliss-lb6.14: ASDF's slurp-stream-forms reads source files.
+/// Read one Lisp form using the compiler's shared parser. Native text snapshots
+/// use the buffered path; other streams supply characters on demand through
+/// `LispReaderStream`, so reader macros execute only once.
 #[allow(dead_code)] // ASDF slurp-stream-forms helper (bliss-lb6.14); awaiting caller
 fn read_one_form_from_stream(
     stream: EgclVal,
@@ -1102,47 +1098,67 @@ fn read_one_form_from_stream_ws(
         }
         return Ok(if *form == EOF { None } else { Some(*form) });
     }
-    let mut buffer = String::new();
-    loop {
-        match stream_next_char(stream, env)? {
-            None => {
-                if buffer.trim().is_empty() {
-                    return Ok(None);
-                }
-                let (form, _) = read_from_string_in_env(&buffer, env)?;
-                // The buffered text can produce NO datum: a `#+feature` whose
-                // test fails consumes its guarded form and yields nothing (CLHS
-                // 2.4.8.17). For READ that is end of file, so the
-                // eof-error-p/eof-value contract governs — returning the
-                // reader's internal EOF sentinel as if it were a datum made
-                // `(read s nil :eof)` answer #<EOF>, and a
-                // `(loop … until (eq f :eof))` never terminated (bliss-fi51).
-                if form == EOF {
-                    return Ok(None);
-                }
-                return Ok(Some(form));
-            }
-            Some(c) => {
-                buffer.push(c);
-                if let Ok((mut form, consumed)) = read_from_string_in_env(&buffer, env) {
-                    egcl_rt::rooted_ref!(_form_root = &mut form);
-                    let total = buffer.chars().count();
-                    if consumed < total {
-                        let mut excess: Vec<char> = buffer.chars().skip(consumed).collect();
-                        // Plain READ discards a single terminating whitespace
-                        // char rather than unreading it.
-                        if !preserve_whitespace && excess.first().is_some_and(|c| c.is_whitespace())
-                        {
-                            excess.remove(0);
-                        }
-                        for lc in excess.into_iter().rev() {
-                            stream_push_char(stream, lc, env)?;
-                        }
-                        return Ok(Some(form));
-                    }
-                }
-            }
+    let read_eval = env.lookup_var("*READ-EVAL*").is_none_or(|v| !v.is_nil());
+    let read_base = env
+        .lookup_var("*READ-BASE*")
+        .filter(|v| v.is_fixnum())
+        .map(|v| v.as_fixnum() as u32)
+        .filter(|b| (2..=36).contains(b))
+        .unwrap_or(10);
+    sync_reader_float_format(env);
+    let previous_suppress = reader::read_suppress_active();
+    reader::set_read_suppress_flag(
+        env.lookup_var("*READ-SUPPRESS*")
+            .is_some_and(|v| !v.is_nil()),
+    );
+    let previous_env = READ_EVAL_ENV.with(|c| c.replace(env as *mut Env));
+    let result = reader::read_from_stream(
+        &mut LispReaderStream {
+            stream: &mut stream,
+            env,
+        },
+        read_base,
+        read_eval,
+        preserve_whitespace,
+    );
+    READ_EVAL_ENV.with(|c| c.set(previous_env));
+    reader::set_read_suppress_flag(previous_suppress);
+    result.map(|form| if form == EOF { None } else { Some(form) })
+}
+
+struct LispReaderStream<'a> {
+    // The enclosing read roots STREAM; use that same slot across every callback.
+    stream: &'a mut EgclVal,
+    env: &'a mut Env,
+}
+
+impl reader::ReaderStream for LispReaderStream<'_> {
+    fn read_char(&mut self) -> Result<Option<char>, EgclError> {
+        stream_next_char(*self.stream, self.env)
+    }
+
+    fn unread_char(&mut self, ch: char) -> Result<(), EgclError> {
+        stream_push_char(*self.stream, ch, self.env)
+    }
+
+    fn invoke_macro(
+        &mut self,
+        handler: EgclVal,
+        ch: char,
+        kind: reader::ReaderMacroKind,
+    ) -> Result<Vec<EgclVal>, EgclError> {
+        let mut args = vec![*self.stream, EgclVal::from_char(ch)];
+        if let reader::ReaderMacroKind::Dispatch(infix) = kind {
+            args.push(infix.map(EgclVal::from_fixnum).unwrap_or(NIL));
         }
+        let result = apply_function(handler, &args, self.env)?;
+        let zero_values = self.env.mv_active && self.env.mv.is_empty();
+        self.env.clear_mv();
+        Ok(if zero_values {
+            Vec::new()
+        } else {
+            vec![result]
+        })
     }
 }
 
