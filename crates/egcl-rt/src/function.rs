@@ -68,6 +68,15 @@ pub fn alloc_interpreted(
     crate::rooted!(env = env);
     crate::rooted!(name = name);
     let body_ptr = crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
+        .or_else(|| {
+            if std::env::var_os("EGCL_GC_DISABLE").is_some() {
+                return None;
+            }
+            // All fields are rooted above. Collect outside the allocator's
+            // heap lock, then retry slots reclaimed from dead functions.
+            crate::gc::full_gc().expect("GC failed while allocating interpreted function");
+            crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
+        })
         .expect("OOM allocating interpreted function object");
     // SAFETY: fresh FUNCTION_INTERPRETED body; header precedes it and its start
     // coincides with FunctionData's first field.

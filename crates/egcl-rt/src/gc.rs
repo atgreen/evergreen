@@ -5080,6 +5080,21 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     }
 
     if target_idx.is_none() {
+        // Function allocation can collect and retry. Leave enough free space
+        // for the minor phase of that collection to evacuate the nursery.
+        // Other pinned allocation callers retain their non-collecting contract.
+        let evacuation_reserve = state
+            .regions
+            .iter()
+            .filter(|region| region.header.kind == RegionKind::Nursery)
+            .count()
+            + 1;
+        if type_id == crate::object::type_id::FUNCTION_INTERPRETED
+            && std::env::var_os("EGCL_GC_DISABLE").is_none()
+            && state.stats.regions_free as usize <= evacuation_reserve
+        {
+            return None;
+        }
         for (idx, region) in state.regions.iter_mut().enumerate() {
             if region.header.kind != RegionKind::Free {
                 continue;
