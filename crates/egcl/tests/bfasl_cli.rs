@@ -2948,6 +2948,53 @@ fn malformed_set_package_action_is_rejected_before_any_load_effects() {
 }
 
 #[test]
+fn macro_expanded_single_value_tail_survives_fasl() {
+    let dir = workdir("macro-multiple-values");
+    let src = dir.join("values.lisp");
+    let out = dir.join("values.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defmacro hidden-tail () '(let ((s "abc")) (values 2 3) s))
+      (defun single-tail () (hidden-tail))
+      (defun multiple-tail () (let ((s "abc")) (values s 3)))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "(compile-file \"{}\" \"{}\")",
+        src.display(),
+        out.display()
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must compile without retained source"
+    );
+    bbu_counts(&bytes);
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!(
+        "(progn (load \"{}\") (list (multiple-value-list (single-tail)) (multiple-value-list (multiple-tail))))",
+        out.display()
+    ));
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).trim(),
+        "((\"abc\") (\"abc\" 3))"
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn macro_and_compiler_macro_expanders_round_trip_as_bytecode() {
     let dir = workdir("macro-bytecode");
     let src = dir.join("macros.lisp");

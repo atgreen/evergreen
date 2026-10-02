@@ -2385,28 +2385,10 @@ impl<'e> Lowerer<'e> {
     }
 
     fn lower_progn(&mut self, rest: EgclVal) -> LowerResult<()> {
-        // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
-        egcl_rt::rooted!(forms = list_to_vec(rest));
-        if forms.is_empty() {
-            // No forms: exactly NIL, one value. Without the clear, whatever the
-            // enclosing form left in mv escapes as this body's values
-            // (bliss-p3gu).
-            self.emit(Instr::ClearMv);
-            let c = self.add_const(NIL);
-            self.emit(Instr::Const(c));
-            self.push_n(1);
-            return Ok(());
-        }
-        let n = forms.len();
-        for i in 0..n {
-            self.lower_expr(forms[i])?;
-            if i + 1 < n {
-                // Discard non-final values.
-                self.emit(Instr::Pop);
-                self.pop_n(1);
-            }
-        }
-        Ok(())
+        // Expanded macro bodies need the same single-value tail cleanup as
+        // function bodies. The original macro call is opaque to the caller's
+        // multiple-value analysis, so cleanup must happen after expansion.
+        lower_body(self, rest)
     }
 
     /// `(when test body...)` / `(unless test body...)`.
@@ -2843,22 +2825,9 @@ impl<'e> Lowerer<'e> {
         // were lowered above.
         let declarations = self.enter_body_declarations(body);
 
-        // Body as an implicit progn.
-        egcl_rt::rooted!(body_forms = list_to_vec(body));
-        if body_forms.is_empty() {
-            let c = self.add_const(NIL);
-            self.emit(Instr::Const(c));
-            self.push_n(1);
-        } else {
-            let n = body_forms.len();
-            for i in 0..n {
-                self.lower_expr(body_forms[i])?;
-                if i + 1 < n {
-                    self.emit(Instr::Pop);
-                    self.pop_n(1);
-                }
-            }
-        }
+        // Use the same value cleanup as every other implicit body, including
+        // when a macro expansion hides this LET from the enclosing analysis.
+        lower_body(self, body)?;
         self.pop_declared_special(&decl_special);
         self.leave_body_declarations(declarations);
         self.unshadow_declared_special(shadowed);
@@ -8277,6 +8246,7 @@ fn compute_captured_names(body: EgclVal) -> std::collections::HashSet<String> {
 fn lower_body(lo: &mut Lowerer, body: EgclVal) -> LowerResult<()> {
     egcl_rt::rooted!(forms = list_to_vec(body));
     if forms.is_empty() {
+        lo.emit(Instr::ClearMv);
         let c = lo.add_const(NIL);
         lo.emit(Instr::Const(c));
         lo.push_n(1);

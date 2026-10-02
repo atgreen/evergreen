@@ -19179,6 +19179,45 @@ fn substitute_character_name_roundtrips() {
 }
 
 #[test]
+fn macro_expanded_bodies_clear_stale_multiple_values() {
+    for (body, expected) in [
+        ("(let ((s \"abc\")) (values 2 3) s)", "(\"abc\")"),
+        ("(progn (values 2 3) :last)", "(:LAST)"),
+        ("(let ((s :last)) (values s 3))", "(:LAST 3)"),
+        ("(progn (values 2 3) (progn))", "(NIL)"),
+    ] {
+        for expression in [
+            "(multiple-value-list (mv-hidden-tail))",
+            "(eval '(multiple-value-list (mv-hidden-tail)))",
+        ] {
+            // Install the macro before compiling its caller: an enclosing
+            // PROGN defining both would fall back to the evaluator.
+            let output = egcl_bin()
+                .args([
+                    "--eval",
+                    &format!("(defmacro mv-hidden-tail () '{body})"),
+                    "--eval",
+                    &format!("(format t \"RESULT ~S~%\" {expression})"),
+                ])
+                .output()
+                .expect("run macro-expanded multiple-value probe");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                stdout
+                    .lines()
+                    .any(|line| line == format!("RESULT {expected}")),
+                "{expression} with {body}: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn print_unreadable_object_macro() {
     run_expression_cases(&[
         (
