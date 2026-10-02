@@ -636,6 +636,10 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%TEXT-CODEC" => Some(|_operator, args, env| {
+            env.clear_mv();
+            egcl_stdlib::text_codec::call(args)
+        }),
         "EGCL::%POSIX" => Some(|_operator, args, env| {
             if env.sandbox {
                 return Err(EgclError::SandboxViolation("POSIX access denied".into()));

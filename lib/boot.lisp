@@ -4313,3 +4313,12 @@ and process-state initialization, before init files or user code. Hooks are not
 called on a cold start. A snapshot of the list is used for each restoration;
 a hook error aborts startup.")
 (export '(egcl-ext::*init-hooks*) :egcl-ext)
+
+;;; Text conversion for syscall buffers, ELF strings, and portable applications.
+(defun egcl-ext::string-to-octets (string &key (external-format :utf-8) (start 0) end null-terminate)
+  (check-type string string)
+  (egcl::%text-codec :encode (subseq string start end) external-format null-terminate))
+(defun egcl-ext::octets-to-string (vector &key (external-format :utf-8) (start 0) end)
+  (check-type vector (vector (unsigned-byte 8)))
+  (egcl::%text-codec :decode (subseq vector start end) external-format nil))
+(export '(egcl-ext::string-to-octets egcl-ext::octets-to-string) :egcl-ext)

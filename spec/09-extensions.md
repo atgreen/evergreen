@@ -730,3 +730,16 @@ Debug builds MUST assert correct ordering (§8).
 
 **R9.35** Bordeaux-Threads test suite MUST pass as integration gate for §9.2.
 **R9.36** Closer-MOP test suite MUST pass as integration gate for §9.7.
+
+## 9.15  String and Octet Conversion
+
+`EGCL-EXT:STRING-TO-OCTETS` and `EGCL-EXT:OCTETS-TO-STRING` support UTF-8
+and ASCII, `:start`/`:end` subsequences, and encoding with `:null-terminate`.
+Whistler uses these operations to exchange text with syscall buffers and parse
+ELF/DWARF string tables. They operate outside the ANSI namespace.
+
+The keyword interface follows SBCL for this subset. EGCL deliberately decodes
+malformed input with U+FFFD replacement; SBCL's default decoder signals instead.
+`:default` always denotes UTF-8 in EGCL. See the user manual's operating-system
+interface for aliases and bounds semantics. `text_codec_cli.rs` tests Unicode,
+byte boundaries, NUL termination, invalid input, and displaced input vectors.

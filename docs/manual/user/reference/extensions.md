@@ -87,3 +87,20 @@ from the parsed application arguments above.
 See [Starting and stopping](../../starting.md) for invocation order and
 init-file behavior, and [Compilation](../../compiler.md) for the compiler
 observation functions previously grouped with these operating-system calls.
+
+## String and octet conversion
+
+**Function** `(egcl-ext:string-to-octets string &key (external-format :utf-8) (start 0) end null-terminate)` → byte vector
+
+**Function** `(egcl-ext:octets-to-string vector &key (external-format :utf-8) (start 0) end)` → string
+
+These functions convert UTF-8 or ASCII text for binary files and foreign buffers.
+Encoding bounds count characters; decoding bounds count bytes. `end` defaults to
+sequence length. `:null-terminate t` appends one zero byte when encoding; decoding
+does not treat zero as a terminator, so pass the position of the first zero as
+`:end` when reading a C string. Inputs are not modified and results are fresh.
+
+Supported format names are `:utf-8`, `:utf8`, `:ascii`, and `:us-ascii`;
+`:default` means UTF-8. ASCII encoding rejects non-ASCII characters. Both
+decoders replace malformed input with U+FFFD, rather than signalling as SBCL's
+default decoder does. Other external formats are not supported.
