@@ -17544,6 +17544,8 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
 // Direct-call contract fields remain part of installed metadata on all targets.
 // Only the x86-64 emitter currently consumes them for direct native calls.
 struct NativeCode {
+    /// Retain executable pages while activations and embedded callers own this code.
+    _buffer: egcl_rt::jit::JitBuffer,
     /// The exact metadata and constant slots this machine code was built from.
     /// Only synthetic signal-recovery test adapters have no bytecode body.
     body: Option<Arc<BytecodeFunction>>,
@@ -18905,7 +18907,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     };
     #[cfg(not(all(target_arch = "x86_64", windows)))]
     let buf = egcl_rt::jit::JitBuffer::new(&artifact.code)?;
-    let entry = buf.leak();
+    let entry = buf.as_ptr();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
     maybe_write_jitdump_code_load("T2", entry as usize, &artifact.code, done.sym);
     // EGCL_T2_DISASM=<substring>: print the installed code of matching
@@ -18943,6 +18945,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         }
     }
     let nc = Rc::new(NativeCode {
+        _buffer: buf,
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -21088,12 +21091,13 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // the activation's safepoint must exist, or the code is not installed.
     let code_info = install_stack_map(num_slots)?;
     let buf = install_t1_code(&code, &osr_entries)?;
-    let entry = buf.leak();
+    let entry = buf.as_ptr();
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
     // (bliss-jtc.10) — the same mechanism HotSpot uses for its JIT code.
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
+        _buffer: buf,
         body: Some(bf),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -21471,6 +21475,8 @@ fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> boo
 /// entry stub that jumps into that header. Shares the frame/GC layout with the
 /// normal native tier (same `num_slots`/stack map).
 struct OsrCode {
+    /// OSR activations retain their code owner across registry invalidation.
+    _buffer: egcl_rt::jit::JitBuffer,
     _direct_calls: Vec<Rc<NativeCode>>,
     entry: *const u8,
     num_slots: u16,
@@ -21668,10 +21674,11 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     let num_slots = bf.num_slots();
     let code_info = install_stack_map(num_slots)?;
     let buf = install_t1_code(&code, &osr)?;
-    let entry = buf.leak();
+    let entry = buf.as_ptr();
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
     Some(Rc::new(OsrCode {
+        _buffer: buf,
         _direct_calls: direct_calls,
         entry,
         num_slots,
@@ -22966,6 +22973,21 @@ mod direct_call_invalidation_tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn has_executable_mapping(address: usize) -> bool {
+        std::fs::read_to_string("/proc/self/maps")
+            .expect("read process mappings")
+            .lines()
+            .any(|line| {
+                let mut fields = line.split_whitespace();
+                let (start, end) = fields.next().unwrap().split_once('-').unwrap();
+                let permissions = fields.next().unwrap();
+                let start = usize::from_str_radix(start, 16).unwrap();
+                let end = usize::from_str_radix(end, 16).unwrap();
+                permissions.contains('x') && (start..end).contains(&address)
+            })
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn direct_native_caller_retains_its_embedded_callee() {
@@ -23002,6 +23024,8 @@ mod direct_call_invalidation_tests {
                 .any(|window| window == (callee.entry as u64).to_le_bytes()),
             "test must cover an embedded direct call, not the c2i fallback"
         );
+        #[cfg(target_os = "linux")]
+        let mapping_addresses = [callee.entry as usize, caller.entry as usize];
         drop(callee);
         registry_remove(callee_symbol);
         registry_remove(caller_symbol);
@@ -23009,11 +23033,22 @@ mod direct_call_invalidation_tests {
             weak_callee.upgrade().is_some(),
             "a direct caller must retain the exact callee embedded in its machine code"
         );
+        #[cfg(target_os = "linux")]
+        for address in mapping_addresses {
+            assert!(has_executable_mapping(address), "owned code must stay mapped");
+        }
         drop(caller);
         assert!(
             weak_callee.upgrade().is_none(),
             "dependency dies with its caller"
         );
+        #[cfg(target_os = "linux")]
+        for address in mapping_addresses {
+            assert!(
+                !has_executable_mapping(address),
+                "retired native code remains mapped at {address:#x}"
+            );
+        }
     }
 
     #[test]
@@ -23415,7 +23450,7 @@ mod jtc4_stack_map_tests {
             0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
         ];
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
-        let entry = buf.leak();
+        let entry = buf.as_ptr();
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(entry) };
 
         let ret = f();
@@ -23442,9 +23477,10 @@ mod jtc4_stack_map_tests {
             0x48, 0x89, 0x00, // mov [rax], rax => null-guard SIGSEGV
         ];
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
-        let entry = buf.leak();
+        let entry = buf.as_ptr();
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
+            _buffer: buf,
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -23503,9 +23539,10 @@ mod jtc4_stack_map_tests {
         code.extend_from_slice(&guard.to_le_bytes());
         code.extend_from_slice(&[0x48, 0x89, 0x00]); // mov [rax], rax
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
-        let entry = buf.leak();
+        let entry = buf.as_ptr();
         let code_info = install_stack_map(1).unwrap();
         let nc = NativeCode {
+            _buffer: buf,
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,

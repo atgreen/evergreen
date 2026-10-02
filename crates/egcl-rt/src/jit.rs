@@ -6,8 +6,8 @@
 //! A `JitBuffer` owns a page-aligned mapping that holds machine code emitted by
 //! the compiler. It is mapped W→X (writable while filling, then made
 //! read+execute) so the process never holds a simultaneously writable+executable
-//! mapping. The buffer is leaked for the lifetime of the code cache; installed
-//! native code lives forever.
+//! mapping. Installed native code owns its buffer until its last activation or
+//! compiled caller releases it. Process-lifetime trampolines may leak a buffer.
 
 /// A block of executable machine code.
 pub struct JitBuffer {
@@ -190,7 +190,7 @@ impl JitBuffer {
     }
 
     /// Leak this buffer, returning its code pointer. The mapping lives forever
-    /// (the code cache owns installed native code).
+    /// (reserved for process-lifetime code such as recovery trampolines).
     pub fn leak(self) -> *const u8 {
         let ptr = self.ptr;
         std::mem::forget(self);
