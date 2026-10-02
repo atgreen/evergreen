@@ -31,7 +31,7 @@ exercises these forks:
 | fset | https://github.com/atgreen/fset | `553d6a75f6520ef4435748f16b0f619e71988628` |
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `ee7e4ea5238efce6ce4be7d6f0f29699884ad791` |
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
-| swank (in the slime tree, branch `torcl`) | https://github.com/atgreen/slime | `a1d235181efa139eb0f51feffbe74f784842c1b3` |
+| swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `69afcb088f6463850c532a2f573d9ec5d875fdb9` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
@@ -71,7 +71,7 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-SLIME (`torcl` branch) and SLY (`egcl` branch), where their ports live. No commit revisions
+SLIME and SLY (`egcl` branches), where their ports live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
 commit it in your project for reproducibility. The script downloads and

@@ -61,6 +61,6 @@ precise-time
 fset
 cffi
 iolib
-slime@torcl
+slime@egcl
 sly@egcl
 EOF

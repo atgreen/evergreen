@@ -1,0 +1,48 @@
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+(require :asdf)
+(asdf:initialize-source-registry '(:source-registry :ignore-inherited-configuration))
+(asdf:initialize-output-translations
+ (list :output-translations (list t (uiop:getenv "EGCL_PORT_CACHE")) :ignore-inherited-configuration))
+(load (uiop:getenv "EGCL_PORT_RUNTIME"))
+(setf ocicl-runtime:*local-only* t ocicl-runtime:*download* nil)
+(asdf:load-system :swank)
+(format t "SWANK-LOAD-PASS~%")
+(assert (string= (swank/backend:gray-package-name)
+                #+egcl "EGCL-GRAY-STREAMS" #+sbcl "SB-GRAY"))
+#+egcl
+(progn
+  (assert (member :egcl swank-loader::*implementation-features*))
+  (assert (member '(swank-loader::swank swank-loader::egcl)
+                  swank-loader::*sysdep-files* :test #'equal))
+  (assert (string= (swank-loader::lisp-version-string) (lisp-implementation-version))))
+#+egcl (assert (null (swank/backend:preferred-communication-style)))
+(let ((socket (swank/backend:create-socket "127.0.0.1" 0)))
+  (unwind-protect
+       (assert (plusp (swank/backend:local-port socket)))
+    (swank/backend:close-socket socket)))
+(let ((received ""))
+  (let ((stream (swank/backend:make-output-stream
+                 (lambda (text) (setf received (concatenate 'string received text))))))
+    (write-string "swank-gray-ok" stream)
+    (finish-output stream)
+    (assert (string= received "swank-gray-ok"))))
+(defvar *swank-compile-probe*)
+(let* ((input (merge-pathnames "swank-compile-probe.lisp" (uiop:getcwd)))
+       (output (merge-pathnames "swank-compile-probe.fasl" (uiop:getcwd))))
+  (unwind-protect
+       (progn
+         (with-open-file (stream input :direction :output :if-exists :supersede)
+           (write-line "(setq cl-user::*swank-compile-probe* 73)" stream))
+         (multiple-value-bind (artifact warnings failure)
+             (swank/backend:swank-compile-file input output nil :default)
+           (declare (ignore warnings))
+           (assert (pathnamep artifact))
+           (assert (not failure))
+           (assert (probe-file artifact))
+           (assert (not (boundp 'cl-user::*swank-compile-probe*))))
+         (swank/backend:swank-compile-file input output t :default)
+         (assert (= (symbol-value 'cl-user::*swank-compile-probe*) 73)))
+    (when (probe-file input) (delete-file input))
+    (when (probe-file output) (delete-file output))))
+(format t "SWANK-SUITE-PASS~%")
+(uiop:quit 0)
