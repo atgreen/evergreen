@@ -172,3 +172,46 @@ fn posix_process_operations_and_errno_conditions() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("POSIX-PROCESS-OK"));
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn raw_syscall_returns_errno_and_writes_foreign_storage() {
+    let source = r#"
+      (require :egcl-posix)
+      (multiple-value-bind (pid errno) (egcl-posix:raw-syscall 39)
+        (assert (= pid (egcl-posix:getpid)))
+        (assert (null errno)))
+      (multiple-value-bind (result errno) (egcl-posix:raw-syscall 3 -1)
+        (assert (= result -1))
+        (assert (= errno 9)))
+      (multiple-value-bind (result errno) (egcl-posix:raw-syscall -1)
+        (assert (= result -1))
+        (assert (= errno 38)))
+      (let ((fd (egcl-posix:open "/dev/zero" egcl-posix:o-rdonly))
+            (ptr (egcl-ffi:foreign-alloc 3)))
+        (unwind-protect
+            (progn
+              (egcl-ffi:mem-set 123 ptr :uint8)
+              (multiple-value-bind (count errno) (egcl-posix:raw-syscall 0 fd ptr 3)
+                (assert (= count 3))
+                (assert (null errno)))
+              (assert (= 0 (egcl-ffi:mem-ref ptr :uint8))))
+          (egcl-posix:close fd)
+          (egcl-ffi:foreign-free ptr)))
+      (assert (handler-case
+                  (progn (egcl-posix:raw-syscall 39 0 0 0 0 0 0 0) nil)
+                (program-error () t)))
+      (format t "RAW-SYSCALL-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("RAW-SYSCALL-OK"));
+}

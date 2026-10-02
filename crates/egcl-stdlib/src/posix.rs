@@ -35,6 +35,51 @@ pub fn call(args: &[EgclVal]) -> Result<[EgclVal; 3], EgclError> {
     let mut secondary = NIL;
     let mut errno = NIL;
     let result = match (name, args) {
+        #[cfg(target_os = "linux")]
+        ("RAW-SYSCALL", [number, arguments @ ..]) if arguments.len() <= 6 => {
+            use egcl_rt::ffi::{AlienType, marshal_to_c, memory::ForeignPointer};
+            let word = |value: EgclVal| -> Result<libc::c_long, EgclError> {
+                let bits = (std::mem::size_of::<libc::c_long>() * 8) as u8;
+                marshal_to_c(value, &AlienType::Int { signed: true, bits })
+                    .or_else(|_| {
+                        marshal_to_c(
+                            value,
+                            &AlienType::Int {
+                                signed: false,
+                                bits,
+                            },
+                        )
+                    })
+                    .map(|bits| bits as libc::c_long)
+            };
+            let number = word(*number)?;
+            let mut words = [0 as libc::c_long; 6];
+            for (slot, value) in words.iter_mut().zip(arguments) {
+                *slot = if ForeignPointer::is_pointer(*value) {
+                    ForeignPointer::from_lisp(*value)?.call_address()? as libc::c_long
+                } else {
+                    word(*value)?
+                };
+            }
+            let (result, error) = crate::process::process_operation("RAW-SYSCALL", move || {
+                // SAFETY: callers select the Linux syscall ABI and own all foreign
+                // buffers until return. Only native words enter the blocking worker.
+                let result = unsafe {
+                    libc::syscall(
+                        number, words[0], words[1], words[2], words[3], words[4], words[5],
+                    )
+                };
+                // Capture on the same native thread, before any other operation.
+                let error = if result == -1 {
+                    std::io::Error::last_os_error().raw_os_error()
+                } else {
+                    None
+                };
+                Ok((result, error))
+            })?;
+            errno = error.map(fix).unwrap_or(NIL);
+            egcl_rt::bignum::BigInt::from_i64(result as i64).to_val()
+        }
         // These libc calls have no pointer arguments and cannot fail.
         ("GETPID", []) => fix(unsafe { libc::getpid() }),
         ("GETPPID", []) => fix(unsafe { libc::getppid() }),

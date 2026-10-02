@@ -5,7 +5,7 @@
 (defpackage #:egcl-posix
   (:use #:cl)
   (:shadow #:open #:close)
-  (:export #:syscall-error #:syscall-errno #:syscall-name
+  (:export #:syscall-error #:syscall-errno #:syscall-name #:raw-syscall
            #:getpid #:getppid #:kill #:waitpid #:open #:close #:o-rdonly
            #:getpagesize #:mmap #:munmap #:prot-read #:prot-write #:prot-none
            #:map-shared #:map-private #:map-anon
@@ -30,6 +30,14 @@
     (values result secondary)))
 
 (defun getpid () (nth-value 0 (%checked-call :getpid)))
+(defun raw-syscall (number &rest arguments)
+  "Call a Linux syscall with up to six native words or foreign pointers.
+Return the result and errno (NIL on success). The caller owns foreign storage
+through completion and must obey the syscall's ABI and lifetime requirements."
+  (multiple-value-bind (result secondary errno)
+      (apply #'egcl::%posix :raw-syscall number arguments)
+    (declare (ignore secondary))
+    (values result errno)))
 (defun getppid () (nth-value 0 (%checked-call :getppid)))
 (defun kill (pid signal) (nth-value 0 (%checked-call :kill pid signal)))
 (defun waitpid (pid options) (%checked-call :waitpid pid options))
