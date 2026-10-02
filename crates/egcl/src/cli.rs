@@ -8566,6 +8566,7 @@ impl Env {
         // interpreted and compiled access agree and the registry persists across
         // envs/threads (same fix class as bliss-1i3q).
         ensure_global("*TYPE-DEFINITIONS*", NIL);
+        ensure_global("*TYPE-EXPANDERS*", NIL);
         ensure_global("*CONDITION-TYPES*", NIL);
         ensure_global("*CONDITION-DEFINITIONS*", NIL);
         env.define_local("*BREAK-ON-SIGNALS*", NIL);
@@ -12652,71 +12653,79 @@ fn plist_entry(list: EgclVal, key: &str) -> Option<EgclVal> {
 /// unrecognised name, so `(typep p 'an-alias)` answered NIL and
 /// `(coerce "ab" 'babel:unicode-string)` answered a general vector that was not
 /// a STRING (bliss-hfn71).
-fn resolve_type_spec(env: &Env, type_spec: EgclVal) -> EgclVal {
-    let mut spec = type_spec;
-    // A DEFTYPE chain is short; the bound only stops a circular definition from
-    // expanding forever.
+fn resolve_type_spec(env: &Env, type_spec: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(spec = type_spec);
+    // Keep circular aliases bounded, as before.
     for _ in 0..64 {
-        let expanded = resolve_type_spec_once(env, spec);
-        if expanded == spec {
-            return expand_type_spec_arguments(env, spec);
+        let expanded = resolve_type_spec_once(env, *spec)?;
+        if expanded == *spec {
+            return expand_type_spec_arguments(env, *spec);
         }
-        spec = expanded;
+        *spec = expanded;
     }
-    spec
+    Ok(*spec)
 }
 
 /// Expand the type arguments of a compound specifier whose head takes one, so an
 /// element type named by a DEFTYPE is recognised. Only these heads are walked:
 /// the argument of `SATISFIES` is a function name, of `EQL`/`MEMBER` a value, and
 /// of `INTEGER` a bound — none of them a type to expand.
-fn expand_type_spec_arguments(env: &Env, spec: EgclVal) -> EgclVal {
+fn expand_type_spec_arguments(env: &Env, spec: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(spec = spec);
     if !spec.is_cons() {
-        return spec;
+        return Ok(*spec);
     }
-    let (head, rest) = cp(spec);
+    let (head, rest) = cp(*spec);
     if !head.is_symbol() || !rest.is_cons() {
-        return spec;
+        return Ok(*spec);
     }
     if !matches!(
         sym_bare_name_rc(head).as_ref(),
         "VECTOR" | "ARRAY" | "SIMPLE-ARRAY" | "SIMPLE-VECTOR"
     ) {
-        return spec;
+        return Ok(*spec);
     }
     let (element, tail) = cp(rest);
-    if !element.is_symbol() {
-        return spec;
+    egcl_rt::rooted!(tail = tail);
+    egcl_rt::rooted!(element = element);
+    let expanded = resolve_type_spec(env, *element)?;
+    if expanded == *element {
+        return Ok(*spec);
     }
-    let expanded = resolve_type_spec(env, element);
-    if expanded == element {
-        return spec;
-    }
-    // Rebuild `(head expanded . tail)`; each cons is rooted before the next.
-    egcl_rt::rooted!(new_rest = arena_cons(expanded, tail));
-    arena_cons(head, *new_rest)
+    egcl_rt::rooted!(new_rest = arena_cons(expanded, *tail));
+    Ok(arena_cons(head, *new_rest))
 }
 
-fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> EgclVal {
-    if type_spec.is_symbol() {
-        // A symbol that names a CLOS class is a class type and must NOT be
-        // expanded through the DEFTYPE registry: the registry is keyed by bare
-        // name, so a DEFTYPE of the same bare name in a *different* package would
-        // otherwise shadow this package's class (bliss-66ny: bordeaux-threads
-        // v1's `(deftype thread () 'integer)` shadowed v2's THREAD class, so
-        // `(typep 5 'bt2::thread)` wrongly returned T). find_class resolves the
-        // fully-qualified symbol, so it does not itself collide.
-        if egcl_stdlib::find_class(type_spec).is_some() {
-            return type_spec;
-        }
-        let name = sym_bare_name_rc(type_spec);
-        if let Some(expanded) =
-            plist_get(env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL), &name)
-        {
-            return expanded;
+fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> Result<EgclVal, EgclError> {
+    let (name, args) = if type_spec.is_cons() {
+        cp(type_spec)
+    } else {
+        (type_spec, NIL)
+    };
+    if !name.is_symbol() || egcl_stdlib::find_class(name).is_some() {
+        return Ok(type_spec);
+    }
+    let bare_name = sym_bare_name_rc(name);
+    if let Some(expander) = plist_get(
+        env.lookup_var("*TYPE-EXPANDERS*").unwrap_or(NIL),
+        &bare_name,
+    ) {
+        if !expander.is_nil() {
+            let mut expansion_env = env.clone();
+            egcl_rt::rooted_ref!(_env_root = &mut expansion_env);
+            return apply_function(expander, &list_to_vec(args), &mut expansion_env);
         }
     }
-    type_spec
+    // Zero-argument aliases (including older boot images) carry concrete expansions.
+    if args.is_nil() {
+        if let Some(expanded) = plist_get(
+            env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL),
+            &bare_name,
+        ) {
+            return Ok(expanded);
+        }
+    }
+    Ok(type_spec)
 }
 
 fn condition_definition_entry(env: &Env, type_name: &str) -> Option<EgclVal> {
@@ -14470,7 +14479,7 @@ fn typep_matches(
             }
         }
     }
-    let type_spec = resolve_type_spec(env, type_spec);
+    type_spec = resolve_type_spec(env, type_spec)?;
     if type_spec.is_symbol() {
         let type_name = sym_bare_name_rc(type_spec);
         // Interpreter closures are physically tagged cons cells, but their
@@ -20745,7 +20754,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // the interpreter is what AGENTS.md's architecture rule forbids,
                 // and this is precisely how the two drifted apart.
                 // Expand a DEFTYPE alias first — see the CONCATENATE arm.
-                let expanded = resolve_type_spec(env, result_type);
+                let expanded = resolve_type_spec(env, result_type)?;
                 egcl_rt::rooted!(expanded = expanded);
                 return egcl_stdlib::build_result_sequence(*expanded, &results);
             }
@@ -20915,7 +20924,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // character (*)))` is the case that surfaced this — was rejected
                 // outright as "not a sequence type specifier". CLHS allows any
                 // type specifier denoting a sequence subtype, DEFTYPE included.
-                let expanded = resolve_type_spec(env, *result_type);
+                let expanded = resolve_type_spec(env, *result_type)?;
                 egcl_rt::rooted!(expanded = expanded);
                 return egcl_stdlib::concatenate(*expanded, &sequences);
             }
@@ -22117,8 +22126,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(t2_form = t2_form);
                 egcl_rt::rooted!(t1_r = eval_form(t1_form, env)?);
                 egcl_rt::rooted!(t2_r = eval_form(*t2_form, env)?);
-                egcl_rt::rooted!(t1_res = resolve_type_spec(env, *t1_r));
-                let t2 = resolve_type_spec(env, *t2_r);
+                egcl_rt::rooted!(t1_res = resolve_type_spec(env, *t1_r)?);
+                let t2 = resolve_type_spec(env, *t2_r)?;
                 let t1 = *t1_res;
                 let (subtype_p, certain_p) = subtypep_relation(t1, t2);
                 let subp = if subtype_p { T } else { NIL };
@@ -28027,7 +28036,7 @@ fn coerce_evaluated(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(value = value);
-    egcl_rt::rooted!(type_val = resolve_type_spec(env, raw_type));
+    egcl_rt::rooted!(type_val = resolve_type_spec(env, raw_type)?);
     if type_val.is_symbol() && sym_bare_name_rc(*type_val).as_ref() == "FUNCTION" {
         if is_function_value(*value) {
             return Ok(*value);
@@ -36856,10 +36865,9 @@ struct OpenOptions {
 /// function whose arguments are evaluated anyway. Callers evaluate first and
 /// hand the results here.
 ///
-/// Allocation-free — it only inspects and copies `EgclVal`s — so it cannot
-/// trigger a GC and needs no roots of its own; the caller owns rooting the
-/// slice it passes and the options it gets back.
-fn decode_open_options(pairs: &[EgclVal]) -> OpenOptions {
+/// Expanding an element-type alias can allocate. Keep copied option values
+/// rooted during expansion; callers must root their pathname across this call.
+fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, EgclError> {
     let mut direction = egcl_stdlib::StreamDirection::Input;
     let mut element_type = T;
     let mut if_exists = T;
@@ -36876,13 +36884,7 @@ fn decode_open_options(pairs: &[EgclVal]) -> OpenOptions {
                 "INPUT" => direction = egcl_stdlib::StreamDirection::Input,
                 _ => {}
             },
-            "ELEMENT-TYPE" => {
-                // (unsigned-byte 8) or the fixnum 8 selects a byte stream.
-                let is_byte = value == EgclVal::from_fixnum(8)
-                    || (value.is_cons()
-                        && sym_bare_name_rc(cp(value).0).as_ref() == "UNSIGNED-BYTE");
-                element_type = if is_byte { EgclVal::from_fixnum(8) } else { T };
-            }
+            "ELEMENT-TYPE" => element_type = value,
             "IF-EXISTS" => if_exists = value,
             "IF-DOES-NOT-EXIST" => {
                 if_does_not_exist = value;
@@ -36905,12 +36907,22 @@ fn decode_open_options(pairs: &[EgclVal]) -> OpenOptions {
         if_does_not_exist = T;
     }
 
-    OpenOptions {
+    // Flexi-streams names its octet type through DEFTYPE. Resolve aliases
+    // before translating the Lisp specifier to the stdlib's byte-stream marker.
+    egcl_rt::rooted_ref!(_if_exists_root = &mut if_exists);
+    egcl_rt::rooted_ref!(_if_dne_root = &mut if_does_not_exist);
+    let expanded = resolve_type_spec(env, element_type)?;
+    let is_byte = expanded == EgclVal::from_fixnum(8)
+        || (expanded.is_cons()
+            && sym_bare_name_rc(cp(expanded).0).as_ref() == "UNSIGNED-BYTE");
+    element_type = if is_byte { EgclVal::from_fixnum(8) } else { T };
+
+    Ok(OpenOptions {
         direction,
         element_type,
         if_exists,
         if_does_not_exist,
-    }
+    })
 }
 
 fn eval_with_open_file(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
@@ -36951,7 +36963,7 @@ fn eval_with_open_file(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError
         opt_values.push(value);
         i += 2;
     }
-    let mut options = decode_open_options(&opt_values);
+    let mut options = decode_open_options(&opt_values, env)?;
     egcl_rt::rooted_ref!(_element_type_root = &mut options.element_type);
     egcl_rt::rooted_ref!(_if_exists_root = &mut options.if_exists);
     egcl_rt::rooted_ref!(_if_dne_root = &mut options.if_does_not_exist);

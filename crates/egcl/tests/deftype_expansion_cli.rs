@@ -99,3 +99,38 @@ fn an_alias_is_expanded_wherever_a_type_specifier_is_read() {
         "(T T T T \"zz\")"
     );
 }
+
+#[test]
+fn parameterized_types_expand_with_supplied_arguments() {
+    assert_eq!(
+        eval(
+            r#"(progn
+                (deftype bounded-byte (&optional (width 8)) (list 'unsigned-byte width))
+                (deftype below (limit) (list 'integer 0 (list limit)))
+                (format t "RESULT:~s"
+                  (list (typep 255 'bounded-byte)
+                        (typep 256 'bounded-byte)
+                        (typep 256 '(bounded-byte 16))
+                        (typep 10 '(below 10))
+                        (typep 9 '(below 10)))))"#
+        ),
+        "(T NIL T NIL T)"
+    );
+}
+
+#[test]
+fn redefining_parameterized_and_constant_aliases_replaces_the_expansion() {
+    assert_eq!(
+        eval(
+            r#"(progn
+            (deftype changing-type (&optional (width 8)) (list 'unsigned-byte width))
+            (assert (typep 255 'changing-type))
+            (deftype changing-type () 'character)
+            (assert (not (typep 255 'changing-type)))
+            (assert (typep #\a '(changing-type)))
+            (deftype changing-type (width) (list 'unsigned-byte width))
+            (format t "RESULT:~s" (typep 256 '(changing-type 16))))"#
+        ),
+        "T"
+    );
+}

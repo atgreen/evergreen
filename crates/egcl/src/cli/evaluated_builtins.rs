@@ -1593,7 +1593,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let args = RootedVals::new(args.to_vec());
 
             let spec = args.first().copied().unwrap_or(NIL);
-            Ok(resolve_type_spec(env, spec))
+            resolve_type_spec(env, spec)
         }),
 
         "EGCL-INTERNAL::%MAKE-SIMPLE-VECTOR"
@@ -2249,12 +2249,10 @@ fn resolve(name: &str) -> Option<Handler> {
                     val_as_str(path_val)
                 )));
             }
-            let options = decode_open_options(opts);
-            // `options` copies out of the rooted `args`, and `egcl_stdlib::open`
-            // is the next thing that can allocate, so nothing needs re-rooting
-            // between here and the call.
+            egcl_rt::rooted!(path_val = path_val);
+            let options = decode_open_options(opts, env)?;
             egcl_stdlib::open(
-                path_val,
+                *path_val,
                 options.direction,
                 options.element_type,
                 options.if_exists,

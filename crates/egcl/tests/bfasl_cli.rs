@@ -3756,3 +3756,35 @@ fn hot_nested_defun_preserves_lexical_captures() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn parameterized_deftype_survives_compiled_file_loading() {
+    let dir = workdir("parameterized-deftype");
+    let src = dir.join("types.lisp");
+    let out = dir.join("types.bfasl");
+    fs::write(
+        &src,
+        "(deftype stored-byte (&optional (width 8)) (list 'unsigned-byte width))
+         (deftype stored-alias () '(stored-byte 16))",
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {out:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
+    fs::remove_file(src).unwrap();
+    let result = run(&format!(
+        "(progn (load {out:?}) (list (typep 256 'stored-byte)
+           (typep 256 '(stored-byte 16)) (typep 256 'stored-alias)))"
+    ));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "(NIL T T)");
+    fs::remove_dir_all(dir).unwrap();
+}

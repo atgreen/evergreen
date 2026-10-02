@@ -361,34 +361,24 @@
 ;; Track bootstrap type aliases so TYPEP/CHECK-TYPE can consult them.
 (defvar *type-definitions* nil)
 
+(defvar *type-expanders* nil)
+
 (defmacro deftype (name lambda-list &rest body)
-  ;; A deftype body is like a defmacro body: it is CODE that returns a type
-  ;; specifier (alexandria writes `(integer 1 ,most-positive-fixnum), with a
-  ;; docstring before it). For the common zero-parameter case we evaluate the
-  ;; body now so the concrete spec (backquote expanded, docstring dropped) is
-  ;; what TYPEP/CHECK-TYPE consult. Parameterised deftypes fall back to storing
-  ;; the last body form literally.
-  (if lambda-list
-      ;; Parameterised deftype (e.g. alexandria's
-      ;;   (deftype array-index (&optional (length ...)) `(integer 0 (,length)))).
-      ;; Used as a bare type name it expands with every parameter defaulted, so
-      ;; evaluate the expander with no arguments to get the concrete spec. If
-      ;; the expander needs required arguments (or otherwise errors) we can't
-      ;; expand it bare, so fall back to T (match anything) rather than reject.
-      `(progn
-         (setq *type-definitions*
-               (cons (list ',name
-                           (or (ignore-errors (funcall (lambda ,lambda-list ,@body)))
-                               t))
-                     *type-definitions*))
-         (egcl-internal::%home-symbol ',name)
-         ',name)
-      `(progn
-         (setq *type-definitions*
-               (cons (list ',name ,(if body (cons 'progn body) t))
-                     *type-definitions*))
-         (egcl-internal::%home-symbol ',name)
-         ',name)))
+  ;; Parameterized types need an expander at use time. Keep the existing
+  ;; concrete expansion for zero-argument aliases, which are common in hot
+  ;; element-type checks. A NIL expander also hides an older parameterized
+  ;; definition when the type is redefined without parameters.
+  `(progn
+     (setq *type-expanders*
+           (cons (list ',name ,(when lambda-list
+                                `(function (lambda ,lambda-list ,@body))))
+                 *type-expanders*))
+     ,@(unless lambda-list
+         `((setq *type-definitions*
+                 (cons (list ',name ,(if body (cons 'progn body) t))
+                       *type-definitions*))))
+     (egcl-internal::%home-symbol ',name)
+     ',name))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
 ;; real condition instances through the evaluator.

@@ -19319,3 +19319,27 @@ fn loop_driver_bindings_exist_before_initially_and_after_empty_iteration() {
         ("(let ((xs '(1 2))) (loop for xs on xs initially (return xs)))", "(1 2)"),
     ]);
 }
+
+#[test]
+fn open_expands_byte_element_type_aliases() {
+    let path = std::env::temp_dir().join(format!("egcl-octet-alias-{}.bin", std::process::id()));
+    std::fs::write(&path, [0u8, 129, 255]).unwrap();
+    let setup = "(deftype test-octet (&optional (width 8)) (list 'unsigned-byte width))
+                 (deftype test-byte () '(test-octet 8))";
+    let read = "(list (stream-element-type s) (read-byte s) (read-byte s)
+                     (read-byte s) (read-byte s nil :eof))";
+    let open = format!(
+        "(progn {setup} (let ((s (open {:?} :element-type 'test-byte)))
+           (unwind-protect {read} (close s))))",
+        path.to_str().unwrap()
+    );
+    let with_open = format!(
+        "(progn {setup} (with-open-file (s {:?} :element-type '(test-octet 8)) {read}))",
+        path.to_str().unwrap()
+    );
+    run_expression_cases(&[
+        (&open, "((UNSIGNED-BYTE 8) 0 129 255 :EOF)"),
+        (&with_open, "((UNSIGNED-BYTE 8) 0 129 255 :EOF)"),
+    ]);
+    std::fs::remove_file(path).unwrap();
+}
