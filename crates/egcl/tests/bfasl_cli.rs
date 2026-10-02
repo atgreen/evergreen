@@ -1281,7 +1281,9 @@ fn loop_conditional_selectable_clauses_bfasl_round_trip() {
         &src,
         "(defun first-big (n) (loop for i from 0 below n when (> i 3) do (return-from first-big i) finally (return -1)))\n\
          (defun tag-parity (n) (loop for i from 0 below n when (evenp i) collect (list :e i) else collect (list :o i)))\n\
-         (defun only-when (n) (loop for i from 0 below n when (oddp i) collect i))\n",
+         (defun only-when (n) (loop for i from 0 below n when (oddp i) collect i))\n\
+         (defun nested-it () (loop for x in '(nil 1 2 3) if x if (> x 1) collect it else collect :small end else collect :missing))\n\
+         (defun nested-and () (loop for x in '(nil 1 2) if x unless (= x 1) collect x end and collect x))\n",
     )
     .unwrap();
 
@@ -1298,7 +1300,7 @@ fn loop_conditional_selectable_clauses_bfasl_round_trip() {
     assert!(bfasl_section(&fs::read(&out).unwrap(), 11).is_none());
 
     let l = run(&format!(
-        "(progn (load \"{}\") (list (first-big 10) (tag-parity 4) (only-when 6)))",
+        "(progn (load \"{}\") (list (first-big 10) (tag-parity 4) (only-when 6) (nested-it) (nested-and)))",
         out.display()
     ));
     assert!(
@@ -1308,7 +1310,7 @@ fn loop_conditional_selectable_clauses_bfasl_round_trip() {
     );
     assert_eq!(
         String::from_utf8_lossy(&l.stdout).trim(),
-        "(4 ((:E 0) (:O 1) (:E 2) (:O 3)) (1 3 5))",
+        "(4 ((:E 0) (:O 1) (:E 2) (:O 3)) (1 3 5) (:MISSING :SMALL T T) (1 2 2))",
     );
 
     let _ = fs::remove_dir_all(&dir);

@@ -4669,79 +4669,11 @@ impl<'e> Lowerer<'e> {
                     i += 2;
                 }
                 Some("WHEN") | Some("IF") | Some("UNLESS") => {
-                    let negate = key.as_deref() == Some("UNLESS");
-                    let mut test = *forms.get(i + 1).ok_or(Bail)?;
-                    egcl_rt::rooted_ref!(_test_root = &mut test);
-                    i += 2;
-                    // then-branch: one or more selectable clauses (do/return/
-                    // accumulations, joined by `and`).
-                    egcl_rt::rooted!(then_forms = Vec::<EgclVal>::new());
                     parse_loop_selectable(
-                        &forms,
-                        &mut i,
-                        &kw,
-                        &mut bindings,
-                        &mut list_acc,
-                        &mut sum_acc,
-                        &mut count_acc,
-                        &mut nsym,
-                        id,
-                        &mut then_forms,
-                        &mut explicit_result,
+                        &forms, &mut i, &kw, &mut bindings, &mut list_acc,
+                        &mut sum_acc, &mut count_acc, &mut nsym, id,
+                        &mut body, &mut explicit_result,
                     )?;
-                    if then_forms.is_empty() {
-                        return Err(Bail);
-                    }
-                    // optional `else` branch.
-                    egcl_rt::rooted!(else_forms = Vec::<EgclVal>::new());
-                    if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("ELSE") {
-                        i += 1;
-                        parse_loop_selectable(
-                            &forms,
-                            &mut i,
-                            &kw,
-                            &mut bindings,
-                            &mut list_acc,
-                            &mut sum_acc,
-                            &mut count_acc,
-                            &mut nsym,
-                            id,
-                            &mut else_forms,
-                            &mut explicit_result,
-                        )?;
-                    }
-                    // optional terminating `end`.
-                    if kw(*forms.get(i).unwrap_or(&NIL)).as_deref() == Some("END") {
-                        i += 1;
-                    }
-                    // Bind the `it` anaphor (CLHS 6.1.5) to the test value in a
-                    // fresh temp, then rewrite every `it`/`:it` in the branch
-                    // forms to reference it. LOOP matches the anaphor by *name*,
-                    // so the keyword `:it` works too; a keyword cannot be a
-                    // variable, hence substitution rather than a lexical `it`
-                    // binding. TEST is evaluated exactly once (into the temp) and
-                    // the temp doubles as the branch guard. then_forms/else_forms
-                    // stay rooted across the allocating form_list calls.
-                    let it_temp = fresh("IT", &mut nsym)?;
-                    egcl_rt::rooted!(then_progn = vec![s("PROGN")?]);
-                    then_progn.extend(then_forms.iter().map(|f| subst_loop_it(*f, it_temp)));
-                    let mut cond_form = if else_forms.is_empty() {
-                        let guard = if negate { "UNLESS" } else { "WHEN" };
-                        form_list(&[s(guard)?, it_temp, form_list(&then_progn)])
-                    } else {
-                        egcl_rt::rooted!(else_progn = vec![s("PROGN")?]);
-                        else_progn.extend(else_forms.iter().map(|f| subst_loop_it(*f, it_temp)));
-                        // `(if it then else)`, flipping arms for `unless`.
-                        let (a, b) = if negate {
-                            (form_list(&else_progn), form_list(&then_progn))
-                        } else {
-                            (form_list(&then_progn), form_list(&else_progn))
-                        };
-                        form_list(&[s("IF")?, it_temp, a, b])
-                    };
-                    egcl_rt::rooted_ref!(_cond_form_root = &mut cond_form);
-                    let binding = form_list(&[it_temp, test]);
-                    body.push(form_list(&[s("LET")?, form_list(&[binding]), cond_form]));
                 }
                 Some("COLLECT") | Some("COLLECTING") | Some("APPEND") | Some("APPENDING")
                 | Some("NCONC") | Some("NCONCING") | Some("SUM") | Some("SUMMING")
@@ -7106,7 +7038,7 @@ fn apply_loop_accumulation(
 
 /// Parse the selectable clause body of a LOOP conditional (`when`/`if`/`unless`)
 /// — the forms after the test (and after `else`). Handles `do`/`doing`,
-/// `return`, the accumulation clauses, and chaining with `and`; stops at `else`,
+/// `return`, nested conditionals, accumulation clauses, and chaining with `and`; stops at `else`,
 /// `end`, or any other clause keyword (or end of input) without consuming it.
 /// Sets `explicit_result` when a `return` clause is seen. Bails on an
 /// unrecognised leading operator so the whole LOOP falls back.
@@ -7128,6 +7060,74 @@ fn parse_loop_selectable(
     loop {
         let op = kw(*forms.get(*i).ok_or(Bail)?).ok_or(Bail)?;
         match op.as_str() {
+            "WHEN" | "IF" | "UNLESS" => {
+                let negate = op == "UNLESS";
+                egcl_rt::rooted!(test = *forms.get(*i + 1).ok_or(Bail)?);
+                *i += 2;
+                egcl_rt::rooted!(then_forms = Vec::<EgclVal>::new());
+                parse_loop_selectable(
+                    forms,
+                    i,
+                    kw,
+                    bindings,
+                    list_acc,
+                    sum_acc,
+                    count_acc,
+                    nsym,
+                    id,
+                    &mut then_forms,
+                    explicit_result,
+                )?;
+                if then_forms.is_empty() {
+                    return Err(Bail);
+                }
+                egcl_rt::rooted!(else_forms = Vec::<EgclVal>::new());
+                if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("ELSE") {
+                    *i += 1;
+                    parse_loop_selectable(
+                        forms,
+                        i,
+                        kw,
+                        bindings,
+                        list_acc,
+                        sum_acc,
+                        count_acc,
+                        nsym,
+                        id,
+                        &mut else_forms,
+                        explicit_result,
+                    )?;
+                }
+                if kw(*forms.get(*i).unwrap_or(&NIL)).as_deref() == Some("END") {
+                    *i += 1;
+                }
+                // Each conditional evaluates its test once and owns its IT
+                // binding. Recursive parsing rewrites nested IT references
+                // first, so an outer condition cannot capture them.
+                *nsym += 1;
+                let it_temp = s(&format!("%LG-IT{id}_{}", *nsym))?;
+                egcl_rt::rooted!(then_progn = vec![s("PROGN")?]);
+                for index in 0..then_forms.len() {
+                    then_progn.push(subst_loop_it(then_forms[index], it_temp));
+                }
+                egcl_rt::rooted!(else_progn = vec![s("PROGN")?]);
+                for index in 0..else_forms.len() {
+                    else_progn.push(subst_loop_it(else_forms[index], it_temp));
+                }
+                egcl_rt::rooted!(then_body = form_list(&then_progn));
+                egcl_rt::rooted!(else_body = form_list(&else_progn));
+                let conditional_op = s("IF")?;
+                let (yes, no) = if negate {
+                    (*else_body, *then_body)
+                } else {
+                    (*then_body, *else_body)
+                };
+                egcl_rt::rooted!(condition = form_list(&[conditional_op, it_temp, yes, no]));
+                egcl_rt::rooted!(binding = form_list(&[it_temp, *test]));
+                egcl_rt::rooted!(binding_list = form_list(&[*binding]));
+                out.push(form_list(&[s("LET")?, *binding_list, *condition]));
+            }
+
             "DO" | "DOING" => {
                 *i += 1;
                 while *i < forms.len() && kw(forms[*i]).is_none() {
@@ -23074,6 +23074,42 @@ mod direct_call_invalidation_tests {
 mod method_compilation_tests {
     use super::*;
 
+    #[test]
+    fn nested_loop_conditionals_keep_methods_compiled() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env(
+            "(defmethod nested-loop-condition-probe ((omit t))
+               (let ((result nil))
+                 (loop for start in '(1 nil 3) for end in '(2 nil 4)
+                   if start do (setq result (cons start result))
+                               (setq result (cons end result))
+                   else unless omit do (setq result (cons nil result))
+                                       (setq result (cons nil result)))
+                 result))",
+            &mut env,
+        )
+        .unwrap();
+        let id = env.methods.borrow()["NESTED-LOOP-CONDITION-PROBE"][0]
+            .method_id
+            .0;
+        let callable = super::super::METHOD_COMPILED.borrow().get(&id).copied();
+        assert!(callable.is_some(), "nested LOOP clauses must compile");
+        let function = egcl_rt::function::name(callable.unwrap()).as_symbol_index();
+        assert!(!contains_host_eval(&registry_get(function).unwrap()));
+        assert_eq!(
+            super::super::read_eval_all_env(
+                "(and (equal (nested-loop-condition-probe nil) '(4 3 nil nil 2 1))
+                      (equal (nested-loop-condition-probe t) '(4 3 2 1)))",
+                &mut env,
+            )
+            .unwrap(),
+            T
+        );
+    }
     #[test]
     fn setf_function_designators_keep_methods_compiled() {
         let _lock = super::super::heap_test_lock()
