@@ -19167,6 +19167,17 @@ fn escape_character_aliases() {
     run_expression_cases(&cases);
 }
 
+/// Babel's encoding tests use the ASCII substitute character by name.
+#[test]
+fn substitute_character_name_roundtrips() {
+    run_expression_cases(&[
+        ("(char-code #\\Sub)", "26"),
+        ("(char-code (name-char \"sUb\"))", "26"),
+        ("(char-name (code-char 26))", "\"Sub\""),
+        ("(eql #\\Sub (name-char (char-name #\\Sub)))", "T"),
+    ]);
+}
+
 #[test]
 fn print_unreadable_object_macro() {
     run_expression_cases(&[

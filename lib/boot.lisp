@@ -2831,6 +2831,7 @@
           ((= code 12288) "IDEOGRAPHIC_SPACE")
           ((= code 0) "Null")
           ((= code 7) "Bell")
+          ((= code 26) "Sub")
           ((= code 27) "Escape")
           (t nil))))
 
@@ -2852,6 +2853,7 @@
           ((string-equal n "Null") (code-char 0))
           ((string-equal n "Nul") (code-char 0))
           ((string-equal n "Bell") (code-char 7))
+          ((string-equal n "Sub") (code-char 26))
           ((or (string-equal n "Escape") (string-equal n "Esc")) (code-char 27))
           (t nil))))
 
