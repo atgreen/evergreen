@@ -354,7 +354,7 @@ impl NativeBlockingScope {
             return inactive;
         }
         crate::thread::current_stack().publish_top();
-        crate::gc::retire_current_t0_tlab_for_safepoint();
+        crate::gc::publish_current_t0_tlab_for_safepoint();
         let coord = coordinator();
         let guard = coord.park_mutex.lock().unwrap();
         let counted = coord.parked.load(Ordering::SeqCst);

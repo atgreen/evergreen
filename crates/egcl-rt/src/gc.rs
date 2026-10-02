@@ -463,7 +463,7 @@ impl HeapAllocator {
     /// end of allocated space. Without a filler, an under-filled TLAB leaves a
     /// zero gap before the next TLAB carved from the same region, hiding every
     /// later object from marking and relocation.
-    fn retire_tlab(&mut self) {
+    fn publish_tlab_tail(&mut self) {
         let cursor = self.tlab.cursor as usize;
         let limit = self.tlab.limit as usize;
         let remaining = limit.saturating_sub(cursor);
@@ -482,6 +482,10 @@ impl HeapAllocator {
                 write_object_header(self.tlab.cursor, 0, body_size as u32);
             }
         }
+    }
+
+    fn retire_tlab(&mut self) {
+        self.publish_tlab_tail();
         self.tlab.cursor = self.tlab.limit as *mut u8;
     }
 
@@ -5071,8 +5075,28 @@ pub(crate) fn retire_current_t0_tlab_for_safepoint() {
             // triggering GC, so there is nothing more to publish here.
             return;
         };
-        if let Some((_, allocator)) = guard.as_mut() {
-            allocator.retire_tlab();
+        if let Some((epoch, allocator)) = guard.as_mut() {
+            if *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire) {
+                allocator.retire_tlab();
+            }
+        }
+    });
+}
+
+/// Make the reserved TLAB tail walkable while native code is blocked, without
+/// discarding it. If no collection occurs, the next allocation overwrites the
+/// filler. If one does occur, `alloc_typed` sees the changed GC_MOVE_EPOCH and
+/// replaces the allocator before touching the old nursery reservation.
+pub(crate) fn publish_current_t0_tlab_for_safepoint() {
+    let _ = T0_ALLOCATOR.try_with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            if let Some((epoch, allocator)) = guard.as_mut() {
+                // A previous blocked interval may have collected, with no
+                // intervening Lisp allocation to refresh this allocator yet.
+                if *epoch == GC_MOVE_EPOCH.load(Ordering::Acquire) {
+                    allocator.publish_tlab_tail();
+                }
+            }
         }
     });
 }

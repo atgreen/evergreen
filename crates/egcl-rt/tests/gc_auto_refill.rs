@@ -38,6 +38,53 @@ fn allocate(allocator: &mut HeapAllocator) -> *mut u8 {
 }
 
 #[test]
+fn native_blocking_without_collection_reuses_tlab_space() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&config()).expect("init_heap");
+    let before = heap_stats().minor_gc_count;
+    // 100 objects occupy 3.2 KiB in an 8 KiB nursery. Publishing roots for
+    // native synchronization must not consume a whole 256-byte TLAB per call.
+    for _ in 0..100 {
+        alloc_typed(16, egcl_rt::object::type_id::BIGNUM).expect("allocation");
+        // SAFETY: no Lisp accesses occur while the native scope is active.
+        let blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
+        drop(blocked);
+    }
+    assert_eq!(
+        heap_stats().minor_gc_count,
+        before,
+        "native synchronization exhausted the nursery without allocating its capacity"
+    );
+}
+
+#[test]
+fn native_blocking_publishes_roots_and_invalidates_collected_tlab() {
+    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&config()).expect("init_heap");
+    let body = alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
+    unsafe { *(body as *mut f64) = 42.0 };
+    egcl_rt::rooted!(value = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
+    let original = value.to_raw();
+    {
+        // SAFETY: only native thread operations occur until the scope ends.
+        let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
+        std::thread::spawn(|| egcl_rt::collect_t0_minor().unwrap())
+            .join()
+            .unwrap();
+    }
+    assert_ne!(value.to_raw(), original, "the collection must move the root");
+    // Reenter before an allocation refreshes the stale allocator. Neither
+    // publishing nor retiring roots may write through its old nursery cursor.
+    {
+        let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
+    }
+    for _ in 0..1_000 {
+        alloc_typed(48, egcl_rt::object::type_id::BIGNUM).unwrap();
+    }
+    assert_eq!(unsafe { *(value.as_ptr().add(8) as *const f64) }, 42.0);
+}
+
+#[test]
 fn slow_path_collects_and_reuses_the_configured_nursery() {
     let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     init_heap(&config()).expect("init_heap");
