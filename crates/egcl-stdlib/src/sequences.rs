@@ -241,12 +241,10 @@ fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         return Ok(elems);
     }
     if is_vector(sequence) {
-        let ptr = unsafe { sequence.as_ptr() };
-        let len = unsafe { *(ptr.add(8) as *const u64) } as usize;
+        let len = vector_length(sequence);
         let mut elems = Vec::with_capacity(len);
         for i in 0..len {
-            let val = unsafe { *(ptr.add(16 + i * 8) as *const EgclVal) };
-            elems.push(val);
+            elems.push(vector_elt(sequence, i));
         }
         return Ok(elems);
     }
@@ -1096,8 +1094,9 @@ fn sort_vector_in_place(
     stable: bool,
 ) -> EgclVal {
     let ptr = unsafe { sequence.as_ptr() };
-    let len = unsafe { *(ptr.add(8) as *const u64) as usize };
-    let elems = unsafe { std::slice::from_raw_parts_mut(ptr.add(16) as *mut EgclVal, len) };
+    let len = vector_length(sequence);
+    let offset = vector_payload_offset(ptr) + 8;
+    let elems = unsafe { std::slice::from_raw_parts_mut(ptr.add(offset) as *mut EgclVal, len) };
     if stable {
         elems.sort_by(|a, b| compare_with_predicate(predicate, key, *a, *b));
     } else {
