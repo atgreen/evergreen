@@ -28278,16 +28278,23 @@ fn coerce_value(value: EgclVal, type_val: EgclVal) -> Result<EgclVal, EgclError>
 // runs in the evaluator, where functions can be called. Both SORT and
 // STABLE-SORT use this stable merge sort.
 fn sort_less(
-    predicate: EgclVal,
-    key: Option<EgclVal>,
-    a: EgclVal,
-    b: EgclVal,
+    mut predicate: EgclVal,
+    mut key: Option<EgclVal>,
+    mut a: EgclVal,
+    mut b: EgclVal,
     env: &mut Env,
 ) -> Result<bool, EgclError> {
-    let ka = match key {
+    // A callback can move both callable objects and the next comparison value.
+    // Roots in our caller do not update these by-value copies (bliss-99150).
+    egcl_rt::rooted_ref!(_predicate_root = &mut predicate);
+    egcl_rt::rooted_ref!(_key_root = &mut key);
+    egcl_rt::rooted_ref!(_a_root = &mut a);
+    egcl_rt::rooted_ref!(_b_root = &mut b);
+    let mut ka = match key {
         Some(k) if !k.is_nil() => apply_function(k, &[a], env)?,
         _ => a,
     };
+    egcl_rt::rooted_ref!(_ka_root = &mut ka);
     let kb = match key {
         Some(k) if !k.is_nil() => apply_function(k, &[b], env)?,
         _ => b,
@@ -28297,10 +28304,12 @@ fn sort_less(
 
 fn merge_sort_pred(
     elems: &mut [EgclVal],
-    predicate: EgclVal,
-    key: Option<EgclVal>,
+    mut predicate: EgclVal,
+    mut key: Option<EgclVal>,
     env: &mut Env,
 ) -> Result<(), EgclError> {
+    egcl_rt::rooted_ref!(_predicate_root = &mut predicate);
+    egcl_rt::rooted_ref!(_key_root = &mut key);
     let n = elems.len();
     if n <= 1 {
         return Ok(());
@@ -28340,11 +28349,14 @@ fn merge_sort_pred(
 }
 
 fn sort_sequence(
-    seq: EgclVal,
-    predicate: EgclVal,
-    key: Option<EgclVal>,
+    mut seq: EgclVal,
+    mut predicate: EgclVal,
+    mut key: Option<EgclVal>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_seq_root = &mut seq);
+    egcl_rt::rooted_ref!(_predicate_root = &mut predicate);
+    egcl_rt::rooted_ref!(_key_root = &mut key);
     if seq.is_nil() {
         return Ok(NIL);
     }
@@ -28375,6 +28387,7 @@ fn sort_sequence(
     } else {
         let n = egcl_stdlib::length(seq)?;
         let mut v = Vec::with_capacity(n);
+        egcl_rt::rooted_ref!(_vector_elements_root = &mut v);
         for i in 0..n {
             v.push(egcl_stdlib::elt(seq, i)?);
         }
@@ -41002,5 +41015,38 @@ mod compiler_macro_function_tests {
     #[test]
     fn fasl_compiler_macro_has_a_callable_snapshot() {
         check_first_class_expander(true);
+    }
+}
+
+#[cfg(test)]
+mod sort_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn allocating_keys_preserve_both_elements_and_the_first_key() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(defun sort-collect-key (x)
+               (%force-minor-gc-for-test)
+               (cons (car x) nil))
+             (defun sort-key-less (a b) (< (car a) (car b)))",
+            &mut env,
+        )
+        .unwrap();
+        let key = resolve_sym("SORT-COLLECT-KEY").unwrap();
+        let predicate = resolve_sym("SORT-KEY-LESS").unwrap();
+        egcl_rt::rooted!(a = arena_cons(EgclVal::from_fixnum(1), NIL));
+        egcl_rt::rooted!(b = arena_cons(EgclVal::from_fixnum(2), NIL));
+        let before_b = b.to_raw();
+        assert!(sort_less(predicate, Some(key), *a, *b, &mut env).unwrap());
+        assert_ne!(
+            b.to_raw(),
+            before_b,
+            "the second element must actually move"
+        );
+        assert_eq!(cp(*a).0.as_fixnum(), 1);
+        assert_eq!(cp(*b).0.as_fixnum(), 2);
     }
 }
