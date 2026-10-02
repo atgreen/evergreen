@@ -7623,7 +7623,6 @@ fn is_bail_special(name: &str) -> bool {
             | "IN-PACKAGE"
             | "DEFINE-SYMBOL-MACRO"
             | "DEFINE-COMPILER-MACRO"
-            | "EVAL"
             | "EGCL::QUASIQUOTE"
             | "EGCL::UNQUOTE"
             | "EGCL::UNQUOTE-SPLICING"

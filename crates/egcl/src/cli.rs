@@ -16236,7 +16236,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         // nothing at all (ansi ELT.ERROR.1/2/3, LENGTH.ERROR.1/2,
         // REVERSE.ERROR.1/2, SUBSEQ.ERROR.2/3, CONCATENATE.ERROR.3).
         "ELT" => Some((2, 2)),
-        "LENGTH" | "REVERSE" | "NREVERSE" | "VALUES-LIST" => Some((1, 1)),
+        "LENGTH" | "REVERSE" | "NREVERSE" | "VALUES-LIST" | "EVAL" => Some((1, 1)),
         "SUBSEQ" => Some((2, 3)),
         "CONCATENATE" => Some((1, usize::MAX)),
         "CONSP" | "ATOM" | "LISTP" | "ENDP" => Some((1, 1)),
@@ -34985,7 +34985,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%NATIVE-CONDITION"
             // Control / function application
             | "FUNCALL" | "APPLY" | "VALUES" | "VALUES-LIST" | "IDENTITY" | "COMPLEMENT"
-            | "COMPILE"
+            | "COMPILE" | "EVAL"
             | "CONSTANTLY" | "NOT" | "EQ" | "EQL" | "EQUAL" | "EQUALP"
             // Both are real builtins that FBOUNDP reported as unbound; ansi
             // DCF-FUNS walks the whole section-5 function list and named exactly
