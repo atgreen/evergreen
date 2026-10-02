@@ -20637,10 +20637,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // WITH-HASH-TABLE-ITERATOR (bliss-jtc.8).
                 let (tf, _) = cp(cdr);
                 let tbl = eval_form(tf, env)?;
-                let pairs: Vec<EgclVal> = egcl_stdlib::hash_table_entries(tbl)?
-                    .into_iter()
-                    .map(|(k, v)| arena_cons(k, v))
-                    .collect();
+                egcl_rt::rooted!(entries = egcl_stdlib::hash_table_entries(tbl)?);
+                egcl_rt::rooted!(pairs = Vec::<EgclVal>::with_capacity(entries.len()));
+                // Each cons can move the remaining snapshot values and the
+                // pairs already built. Read entries by index after each GC.
+                for index in 0..entries.len() {
+                    let (key, value) = entries[index];
+                    pairs.push(arena_cons(key, value));
+                }
                 return Ok(vec_to_list(&pairs));
             }
             "MAPCAR" => {
@@ -41058,5 +41062,87 @@ mod sort_rooting_tests {
         );
         assert_eq!(cp(*a).0.as_fixnum(), 1);
         assert_eq!(cp(*b).0.as_fixnum(), 2);
+    }
+}
+
+#[cfg(test)]
+mod hash_entry_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn entries_remain_distinct_across_allocating_the_snapshot_list() {
+        const CHILD: &str = "EGCL_HASH_ENTRY_ROOTING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::hash_entry_rooting_tests::entries_remain_distinct_across_allocating_the_snapshot_list",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("EGCL_GC_STRESS", "1")
+                .env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_STRESS_SKIP")
+                .env_remove("EGCL_GC_STRESS_AT")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("HASH-ENTRIES-RELOCATED"));
+            return;
+        }
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env("(setq table (make-hash-table))", &mut env).unwrap();
+        for key in 0..32 {
+            read_eval_all_env(
+                &format!("(setf (gethash {key} table) {})", key + 100),
+                &mut env,
+            )
+            .unwrap();
+        }
+        egcl_rt::rooted!(
+            form = read_from_string_in_env("(hash-table-entries table)", &mut env)
+                .unwrap()
+                .0
+        );
+        egcl_rt::rooted!(entries = eval_form(*form, &mut env).unwrap());
+        let mut actual: Vec<_> = list_to_vec(*entries)
+            .into_iter()
+            .map(|entry| {
+                let (key, value) = cp(entry);
+                assert!(key.is_fixnum() && value.is_fixnum());
+                (key.as_fixnum(), value.as_fixnum())
+            })
+            .collect();
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            (0..32).map(|key| (key, key + 100)).collect::<Vec<_>>()
+        );
+
+        // Put a nursery value into the table after preparing the call form.
+        // The entry-list allocation must really relocate it, rather than merely
+        // exercise a stress configuration over already-promoted objects.
+        egcl_rt::rooted!(table = env.lookup_var("TABLE").unwrap());
+        egcl_rt::rooted!(fresh = arena_cons(EgclVal::from_fixnum(171), NIL));
+        let before = fresh.to_raw();
+        egcl_stdlib::set_gethash(EgclVal::from_fixnum(0), *table, *fresh).unwrap();
+        *entries = eval_form(*form, &mut env).unwrap();
+        let (after, present) = egcl_stdlib::gethash(EgclVal::from_fixnum(0), *table, NIL).unwrap();
+        assert!(present);
+        assert_ne!(before, after.to_raw(), "the snapshotted value must actually move");
+        egcl_rt::rooted!(entry = list_to_vec(*entries)
+            .into_iter()
+            .find(|entry| cp(*entry).0 == EgclVal::from_fixnum(0))
+            .unwrap());
+        assert_eq!(cp(*entry).1, after);
+        assert_eq!(cp(after).0, EgclVal::from_fixnum(171));
+        println!("HASH-ENTRIES-RELOCATED");
     }
 }
