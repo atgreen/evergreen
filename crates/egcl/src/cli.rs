@@ -4206,6 +4206,77 @@ fn macroexpand_environment_handle_symbol() -> EgclVal {
     resolve_sym("EGCL::MACROEXPAND-ENV").unwrap_or(NIL)
 }
 
+// Compiler macro callbacks receive a lexical environment only. Explicit
+// MACROEXPAND calls also run within the caller's dynamic condition context.
+// The pointer is scoped to a rooted snapshot in with_macroexpand_dynamic_context.
+static MACROEXPAND_DYNAMIC_ENV: egcl_rt::execution_local::ExecutionLocal<
+    std::cell::Cell<*const Env>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(std::ptr::null()))
+};
+
+fn with_macroexpand_dynamic_context<T>(env: &Env, f: impl FnOnce() -> T) -> T {
+    egcl_rt::rooted!(snapshot = env.clone());
+    struct Restore(*const Env);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.replace(&*snapshot)));
+    f()
+}
+
+#[cfg(test)]
+mod macroexpand_dynamic_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_snapshot_survives_relocation_and_restores_its_scope() {
+        const CHILD: &str = "EGCL_MACROEXPAND_DYNAMIC_ROOTING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::macroexpand_dynamic_rooting_tests::dynamic_snapshot_survives_relocation_and_restores_its_scope",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("EGCL_GC_STRESS", "1")
+                .env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_STRESS_SKIP")
+                .env_remove("EGCL_GC_STRESS_AT")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("MACRO-DYNAMIC-RELOCATED"));
+            return;
+        }
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(env = Env::new(false));
+        egcl_rt::rooted!(tag = arena_cons(EgclVal::from_fixnum(731), NIL));
+        let before = tag.to_raw();
+        env.catch_stack.push((*tag, "dynamic-rooting-probe".into()));
+        assert!(MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get().is_null()));
+        with_macroexpand_dynamic_context(&env, || {
+            let _collection_trigger = arena_cons(NIL, NIL);
+            egcl_rt::rooted!(child = Env::new_for_macro_expansion(false));
+            let after = child.catch_stack[0].0;
+            assert_ne!(before, after.to_raw(), "the dynamic catch tag must actually move");
+            assert_eq!(cp(after).0, EgclVal::from_fixnum(731));
+            let outer = MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get());
+            with_macroexpand_dynamic_context(&child, || {
+                assert_ne!(MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get()), outer);
+            });
+            assert_eq!(MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get()), outer);
+        });
+        assert!(MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get().is_null()));
+        println!("MACRO-DYNAMIC-RELOCATED");
+    }
+}
+
 /// Reclaim the macroexpand environments created inside one macro expansion.
 ///
 /// `MACROEXPAND_ENVIRONMENTS` used to only ever GROW: every `&environment`
@@ -8236,7 +8307,19 @@ impl Env {
     /// FORMAT-DOCUMENTATION — otherwise dispatched against this env's EMPTY
     /// tables and died "undefined function" mid-expansion (bliss-nc3b).
     fn new_for_macro_expansion(sandbox: bool) -> Self {
-        Self::new_impl(sandbox, false, true)
+        let mut env = Self::new_impl(sandbox, false, true);
+        let dynamic = MACROEXPAND_DYNAMIC_ENV.with(|slot| slot.get());
+        if !dynamic.is_null() {
+            // SAFETY: the scope owns and roots this snapshot until its callback
+            // returns. Cloning these fields performs no Lisp allocation; no
+            // borrow of the snapshot survives an allocation or callback.
+            let dynamic = unsafe { &*dynamic };
+            env.handlers = dynamic.handlers.clone();
+            env.restarts = dynamic.restarts.clone();
+            env.condition_restarts = dynamic.condition_restarts.clone();
+            env.catch_stack = dynamic.catch_stack.clone();
+        }
+        env
     }
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
@@ -32161,11 +32244,13 @@ fn eval_macroexpand(
         macroexpand_environment_from_cli(env)
     };
     egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
-    let (expanded, expanded_p) = if single_step {
-        compiler_macroexpand::macroexpand_1(form, &macro_env)?
-    } else {
-        compiler_macroexpand::macroexpand(form, &macro_env)?
-    };
+    let (expanded, expanded_p) = with_macroexpand_dynamic_context(env, || {
+        if single_step {
+            compiler_macroexpand::macroexpand_1(form, &macro_env)
+        } else {
+            compiler_macroexpand::macroexpand(form, &macro_env)
+        }
+    })?;
     env.set_mv(vec![expanded, if expanded_p { T } else { NIL }]);
     Ok(expanded)
 }
