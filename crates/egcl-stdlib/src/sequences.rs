@@ -161,7 +161,12 @@ pub fn string_content_bytes(v: EgclVal) -> Option<Vec<u8>> {
 /// off the end (bliss-lb6). STRINGP already excludes pathnames the same way.
 #[inline]
 fn is_char_seq(v: EgclVal) -> bool {
-    string_content(v).is_some()
+    // Classification must not decode/copy the contents: ELT calls this for
+    // every character, making a traversal quadratic if it materializes text.
+    !crate::pathnames::is_pathname(v)
+        && (crate::pathnames::is_registered_string(v)
+            || v.is_string()
+            || (is_complex_vector(v) && cvec_is_string(v)))
 }
 
 /// Collect all elements of a sequence into a Vec.
