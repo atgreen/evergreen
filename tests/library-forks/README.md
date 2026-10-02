@@ -67,3 +67,12 @@ shapes listed above.
 Refresh pins deliberately with `ocicl install git+URL@SHA` in an isolated
 project, rerun this scenario, and update the committed CSV and port documentation.
 Do not submit upstream patches or PRs without new authorization.
+
+## Closer-MOP
+
+`check-closer-mop.lisp` loads the pinned fork through ocicl, checks inherited
+slot names, and calls a funcallable instance. Run it from this directory with
+`EGCL_PORT_RUNTIME` and `EGCL_PORT_CACHE` set as above; a development EGCL
+binary additionally needs `--bootstrap`. The same test runs on SBCL. This
+adapter exposes EGCL's existing slot and callable-instance APIs; it does not
+claim complete MOP support.

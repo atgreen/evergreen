@@ -60,6 +60,7 @@ cl-fad
 usocket
 precise-time
 fset
+closer-mop@egcl
 cffi
 iolib
 slime@egcl

@@ -10,6 +10,7 @@ cffi-libffi, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec28
 cffi-tests, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-tests.asd
 cffi-toolchain, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-toolchain.asd
 cffi-uffi-compat, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/cffi-uffi-compat.asd
+closer-mop, git+https://github.com/atgreen/closer-mop@e9f6d94ff7bb91768841339c87a89bf70b52b95f#ref=e9f6d94ff7bb91768841339c87a89bf70b52b95f, closer-mop-e9f6d94/closer-mop.asd
 dref, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/dref.asd
 dref-test, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/dref-test.asd
 dref-test-package-inferred, ghcr.io/ocicl/mgl-pax-bootstrap@sha256:1c15644701ad5b8e441b2724c265c995437052beb52322c447816c3cc17c564a, mgl-pax-20260313-f7f9414/dref/test/data/dref-test-package-inferred.asd
