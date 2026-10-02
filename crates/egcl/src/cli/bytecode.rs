@@ -4285,6 +4285,21 @@ impl<'e> Lowerer<'e> {
         let kw = |f: EgclVal| -> Option<String> {
             f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
         };
+        // Normalize optional declarations in the private rooted clause copy so
+        // all iteration drivers retain their existing operand offsets.
+        let take_type = |forms: &mut Vec<EgclVal>, at: usize| -> LowerResult<Option<String>> {
+            let Some(token) = forms.get(at).copied() else {
+                return Ok(None);
+            };
+            let (type_form, count) = match kw(token).as_deref() {
+                Some("OF-TYPE") => (*forms.get(at + 1).ok_or(Bail)?, 2),
+                Some("FIXNUM" | "FLOAT" | "T" | "NIL") => (token, 1),
+                _ => return Ok(None),
+            };
+            let name = kw(type_form);
+            forms.drain(at..at + count);
+            Ok(name)
+        };
         let top = resolve_sym(&format!("%LG-TOP{id}")).ok_or(Bail)?;
         let end = resolve_sym(&format!("%LG-END{id}")).ok_or(Bail)?;
         // First-iteration flag: `for VAR = INIT then STEP` evaluates INIT only on
@@ -4316,17 +4331,18 @@ impl<'e> Lowerer<'e> {
             let key = kw(forms[i]);
             match key.as_deref() {
                 Some("WITH") => {
-                    // with VAR [= EXPR] {and VAR [= EXPR]}*
+                    // with VAR [TYPE] [= EXPR] {and VAR [TYPE] [= EXPR]}*
                     loop {
                         let var = *forms.get(i + 1).ok_or(Bail)?;
                         if !var.is_symbol() {
                             return Err(Bail);
                         }
+                        let type_name = take_type(&mut forms, i + 2)?;
                         let (init, adv) =
-                            if kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() == Some("=") {
+                            if forms.get(i + 2).copied().and_then(kw).as_deref() == Some("=") {
                                 (*forms.get(i + 3).ok_or(Bail)?, 4)
                             } else {
-                                (NIL, 2)
+                                (super::loop_type_default(type_name.as_deref()), 2)
                             };
                         bindings.push(form_list(&[var, init]));
                         i += adv;
@@ -4343,14 +4359,7 @@ impl<'e> Lowerer<'e> {
                     // recursion (moving GC; bliss-wlf).
                     let mut var = *forms.get(i + 1).ok_or(Bail)?;
                     egcl_rt::rooted_ref!(_var_root = &mut var);
-                    // OF-TYPE is a declaration, not an iteration driver. Like
-                    // THE, T0 currently accepts it without specializing code.
-                    // Remove it from this private rooted clause copy so all
-                    // drivers share the same operand offsets below.
-                    if kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() == Some("OF-TYPE") {
-                        forms.get(i + 4).ok_or(Bail)?;
-                        forms.drain(i + 2..i + 4);
-                    }
+                    take_type(&mut forms, i + 2)?;
                     match kw(*forms.get(i + 2).ok_or(Bail)?).as_deref() {
                         Some("ACROSS") => {
                             // Evaluate the vector and its active length once;
