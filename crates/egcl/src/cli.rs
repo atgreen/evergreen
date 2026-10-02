@@ -38171,6 +38171,16 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     }
 
     if core_loaded || embedded.is_some() || ca.image.is_some() {
+        // A saved pathname default belongs to the builder's process. Refresh
+        // it before library/user hooks resolve relative paths (bliss-swoz5).
+        // Call the stdlib directly: Lisp TRUENAME would merge against the very
+        // stale default we are replacing.
+        egcl_rt::rooted_ref!(_startup_env_root = &mut env);
+        egcl_rt::rooted!(dot = arena_str("."));
+        egcl_rt::rooted!(cwd = egcl_stdlib::pathnames::truename(*dot)?);
+        if let Some(symbol) = resolve_sym("*DEFAULT-PATHNAME-DEFAULTS*") {
+            egcl_rt::symbols::set_symbol_value(symbol.as_symbol_index(), *cwd);
+        }
         run_image_init_hooks(&mut env)?;
     }
 
