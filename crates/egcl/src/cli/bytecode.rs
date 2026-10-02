@@ -12178,6 +12178,17 @@ pub(super) fn lazy_compile_defun(
     body: EgclVal,
     env: &super::Env,
 ) -> bool {
+    compile_defun(sym, name, params, body, env, true)
+}
+
+fn compile_defun(
+    sym: u32,
+    name: &str,
+    params: EgclVal,
+    body: EgclVal,
+    env: &super::Env,
+    prefer_compiled_closures: bool,
+) -> bool {
     if is_registered(sym) {
         return true;
     }
@@ -12245,7 +12256,7 @@ pub(super) fn lazy_compile_defun(
     // and the Arc was only created at the `publish_bytecode` call at the end.
     let compiled: Option<Arc<BytecodeFunction>> =
         match compile(false) {
-            Some(fast) if contains_host_eval(&fast) => {
+            Some(fast) if prefer_compiled_closures && contains_host_eval(&fast) => {
                 // The opportunistic compiler can call a result "compiled" while
                 // leaving a capturing lambda behind as MakeClosureEnv. Executing
                 // that instruction re-enters eval_form to build a tree-walked
@@ -22061,27 +22072,20 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
             // (the stage-5 gate). Straight-line/leaf functions defer, removing the
             // asdf load penalty. Clear stale state for the (re)definition either
             // way.
+            clear_lazy_state(sym);
             if lazy_compile_enabled() && !body_contains_loop(*body) {
-                clear_lazy_state(sym);
                 return Ok(result);
             }
-            if lazy_compile_enabled() {
-                clear_lazy_state(sym);
-            }
-            reset_last_bail_reason();
-            match compile_function(&name, *params, *body, env, false, false) {
-                Some(bf) => {
-                    trace("compiled");
-                    trace_named(&name, "compiled", None);
-                    registry_put(sym, Arc::new(bf));
-                }
-                // Redefinition that no longer compiles must not leave stale
-                // bytecode behind — drop it so calls fall back to the tree-walker.
-                None => {
-                    trace("bailed");
-                    trace_named(&name, "bailed", last_bail_reason().as_deref());
-                    registry_remove(sym);
-                }
+            // Retry a fast-path decline with capture-aware portable lowering:
+            // a loop may run only once and never reach the invocation threshold.
+            // Keep a successful fast result, including host closure construction,
+            // since its T1 support is broader than portable MakeClosure support.
+            if compile_defun(sym, &name, *params, *body, env, false) {
+                trace("compiled");
+                trace_named(&name, "compiled", None);
+            } else {
+                trace("bailed");
+                trace_named(&name, "bailed", last_bail_reason().as_deref());
             }
         }
         return Ok(result);
