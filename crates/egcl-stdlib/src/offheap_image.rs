@@ -63,6 +63,8 @@ pub fn allocate_all(data: &[u8]) -> Vec<(usize, usize)> {
 /// dedup against the restored table entries.
 pub fn populate_all(remap: &dyn Fn(u64) -> u64) {
     crate::streams::populate_interned_strings();
-    crate::hashtable::populate_live_tables(remap);
     crate::pathnames::populate_pathnames(remap);
+    // EQUAL/EQUALP keys can contain pathnames, including inside conses and
+    // vectors. Their content hashes require the restored pathname records.
+    crate::hashtable::populate_live_tables(remap);
 }
