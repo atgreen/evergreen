@@ -7760,23 +7760,9 @@ fn visit_bytecode_function_roots(
     function: &mut egcl_rt::bytecode::BytecodeFunction,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
-    for constant in &mut function.constants {
-        visit(constant);
-    }
-    visit(&mut function.params_form);
-    for handler_bind in &mut function.handler_binds {
-        for (_, form) in &mut handler_bind.bindings {
-            visit(form);
-        }
-    }
-    for restart_case in &mut function.restart_cases {
-        for restart in &mut restart_case.restarts {
-            visit_bytecode_function_roots(&mut restart.function, visit);
-        }
-    }
-    for nested in &mut function.nested_functions {
-        visit_bytecode_function_roots(nested, visit);
-    }
+    // SAFETY: evaluator host roots are scanned with mutators stopped. Macro
+    // and restart bodies own private callees just as ordinary bytecode does.
+    unsafe { bytecode::trace_bytecode_function(function, visit) };
 }
 
 fn visit_handler_roots(
@@ -40450,5 +40436,209 @@ mod setf_environment_tests {
     #[test]
     fn fasl_cleanup_on_error() {
         check_cleanup(true, true);
+    }
+}
+
+#[cfg(test)]
+mod compiled_closure_lifetime_tests {
+    use super::*;
+
+    fn check_capture_lifetime(cyclic: bool, shared: bool) {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let bytes = build_bfasl_from_source(
+            if cyclic {
+                "(defun lifetime-maker (held) (let ((self nil)) (setq self (lambda (&optional flag) (if flag self held))) self))"
+            } else {
+                "(defun lifetime-maker (held) (lambda () held))"
+            },
+            "closure-lifetime.lisp",
+            &mut env,
+        )
+        .unwrap();
+        load_bfasl_into_env(&bytes, &mut env).unwrap();
+        egcl_rt::rooted!(held = arena_cons(EgclVal::from_fixnum(71), NIL));
+        let maker = resolve_sym("LIFETIME-MAKER").unwrap();
+        egcl_rt::rooted!(closure = apply_function(maker, &[*held], &mut env).unwrap());
+        let closure_name = egcl_rt::function::name(*closure);
+        egcl_rt::rooted!(
+            sibling = if shared {
+                egcl_rt::function::alloc_interpreted(
+                    egcl_rt::function::lambda_list(*closure),
+                    NIL,
+                    NIL,
+                    closure_name,
+                )
+            } else {
+                NIL
+            }
+        );
+        let mut weak_capture = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(*held).unwrap(),
+        ));
+        let mut weak_closure = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(*closure).unwrap(),
+        ));
+        egcl_rt::gc::register_weak_pointer(&mut weak_capture);
+        egcl_rt::gc::register_weak_pointer(&mut weak_closure);
+        drop(held);
+        egcl_rt::gc::full_gc().unwrap();
+        let live_capture = weak_capture.value();
+        let mut live_answer = true;
+        for _ in 0..1000 {
+            let result = apply_function(*closure, &[], &mut env).unwrap();
+            live_answer &= egcl_rt::gc::finalizer_key(result).unwrap() == weak_capture.value().0;
+        }
+        drop(closure);
+        env.mv.clear();
+        env.mv_active = false;
+        egcl_rt::gc::full_gc().unwrap();
+        let shared_survived = !shared
+            || (!weak_capture.is_broken()
+                && bytecode::closure_captured_env(closure_name).is_some()
+                && bytecode::is_registered(closure_name.as_symbol_index())
+                && egcl_rt::gc::finalizer_key(apply_function(*sibling, &[], &mut env).unwrap())
+                    .unwrap()
+                    == weak_capture.value().0);
+        drop(sibling);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        let closure_dead = weak_closure.is_broken();
+        let capture_dead = weak_capture.is_broken();
+        // Unregister before assertions so a failing test cannot leave dangling
+        // pointers in the collector's weak-reference registry.
+        egcl_rt::gc::unregister_weak_pointer(&weak_capture);
+        egcl_rt::gc::unregister_weak_pointer(&weak_closure);
+        assert!(
+            shared_survived,
+            "live sibling must retain shared code and captures"
+        );
+        assert!(!live_capture.1, "live closure must retain its capture");
+        assert!(live_answer, "live closure must return its capture");
+        assert!(closure_dead, "discarded callable must be collected");
+        assert!(capture_dead, "dead closure's capture must be collected");
+        assert!(
+            bytecode::closure_captured_env(closure_name).is_none(),
+            "dead closure's host frame must be removed"
+        );
+        assert!(
+            !bytecode::is_registered(closure_name.as_symbol_index()),
+            "dead closure's code must be removed"
+        );
+    }
+
+    #[test]
+    fn discarded_compiled_closure_releases_its_capture() {
+        check_capture_lifetime(false, false);
+    }
+    #[test]
+    fn discarded_compiled_closure_cycle_releases_its_capture() {
+        check_capture_lifetime(true, false);
+    }
+
+    #[test]
+    fn shared_function_identity_keeps_captures_until_last_owner_dies() {
+        check_capture_lifetime(false, true);
+    }
+
+    #[test]
+    fn unbound_named_function_releases_its_host_capture() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        read_eval_all_env(
+            "(let ((held (list 71))) (defun lifetime-named () held))",
+            &mut env,
+        )
+        .unwrap();
+        let name = resolve_sym("LIFETIME-NAMED").unwrap();
+        let capture = apply_function(name, &[], &mut env).unwrap();
+        let mut weak = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(capture).unwrap(),
+        ));
+        egcl_rt::gc::register_weak_pointer(&mut weak);
+        read_eval_all_env("(fmakunbound 'lifetime-named)", &mut env).unwrap();
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        let collected = weak.is_broken();
+        egcl_rt::gc::unregister_weak_pointer(&weak);
+        assert!(collected, "unbound function's capture must be collected");
+        assert!(
+            bytecode::closure_captured_env(name).is_none(),
+            "unbound function's host frame must be removed"
+        );
+    }
+
+    #[test]
+    fn live_compiled_caller_keeps_private_callee_without_heap_owner() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(callee_body = vec_to_list(&[EgclVal::from_fixnum(71)]));
+        egcl_rt::rooted!(
+            callee = bytecode::compile_and_reify_lambda("PRIVATE-CALLEE", NIL, *callee_body, &env,)
+                .unwrap()
+        );
+        let callee_name = egcl_rt::function::name(*callee);
+        egcl_rt::rooted!(call = vec_to_list(&[callee_name]));
+        egcl_rt::rooted!(caller_body = vec_to_list(&[*call]));
+        egcl_rt::rooted!(
+            caller = bytecode::compile_and_reify_lambda("PRIVATE-CALLER", NIL, *caller_body, &env,)
+                .unwrap()
+        );
+        let caller_name = egcl_rt::function::name(*caller);
+        assert_eq!(
+            apply_function(*caller, &[], &mut env).unwrap(),
+            EgclVal::from_fixnum(71)
+        );
+        drop(callee);
+        drop(callee_body);
+        drop(caller_body);
+        drop(call);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        egcl_rt::rooted!(result = apply_function(*caller, &[], &mut env));
+        drop(caller);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        assert_eq!(*result.as_ref().unwrap(), EgclVal::from_fixnum(71));
+        assert!(!bytecode::is_registered(caller_name.as_symbol_index()));
+        assert!(!bytecode::is_registered(callee_name.as_symbol_index()));
+    }
+
+    #[test]
+    fn discarded_compiled_constant_cycle_is_collected() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(constant = arena_cons(NIL, NIL));
+        let quote = resolve_sym("QUOTE").unwrap();
+        egcl_rt::rooted!(quoted = vec_to_list(&[quote, *constant]));
+        egcl_rt::rooted!(body = vec_to_list(&[*quoted]));
+        egcl_rt::rooted!(
+            function =
+                bytecode::compile_and_reify_lambda("CONSTANT-CYCLE", NIL, *body, &env).unwrap()
+        );
+        let name = egcl_rt::function::name(*function);
+        assert!(bytecode::is_registered(name.as_symbol_index()));
+        store_cons_field(*constant, *function, true).unwrap();
+        let mut weak = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(*constant).unwrap(),
+        ));
+        egcl_rt::gc::register_weak_pointer(&mut weak);
+        drop(function);
+        drop(body);
+        drop(quoted);
+        drop(constant);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        let collected = weak.is_broken();
+        egcl_rt::gc::unregister_weak_pointer(&weak);
+        assert!(
+            collected,
+            "dead function's constant cycle must be collected"
+        );
+        assert!(!bytecode::is_registered(name.as_symbol_index()));
     }
 }

@@ -282,10 +282,43 @@ static REGISTRY_GENERATION: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, u64, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 
-unsafe fn trace_bytecode_function(
+// Host code forms a graph too: private bodies are owned by live callables or
+// active/calling code, not by the dispatch caches that happen to store Arcs.
+fn traced_bytecode_bodies() -> &'static SharedCell<(u64, std::collections::HashSet<usize>)> {
+    static TRACED: std::sync::OnceLock<SharedCell<(u64, std::collections::HashSet<usize>)>> =
+        std::sync::OnceLock::new();
+    TRACED.get_or_init(|| SharedCell::new((0, std::collections::HashSet::new())))
+}
+
+fn with_traced_bytecode_bodies<R>(f: impl FnOnce(&mut std::collections::HashSet<usize>) -> R) -> R {
+    let mut traced = traced_bytecode_bodies().borrow_mut();
+    let pass = egcl_rt::gc::root_scan_pass();
+    if traced.0 != pass {
+        traced.0 = pass;
+        traced.1.clear();
+    }
+    f(&mut traced.1)
+}
+
+pub(super) unsafe fn trace_bytecode_function(
     function: *mut BytecodeFunction,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
+    unsafe { trace_bytecode_graph(function, visit, &mut std::collections::HashSet::new()) };
+}
+
+unsafe fn trace_bytecode_graph(
+    function: *mut BytecodeFunction,
+    visit: &mut dyn FnMut(*mut EgclVal),
+    seen: &mut std::collections::HashSet<usize>,
+) {
+    let identity = function as usize;
+    if !seen.insert(identity) {
+        return;
+    }
+    with_traced_bytecode_bodies(|traced| {
+        traced.insert(identity);
+    });
     // SAFETY: the scanner runs during a stop-the-world GC. BytecodeFunction is
     // held behind Arc during execution/registration, but its EgclVal slots must
     // still be rewritten when the moving collector forwards their referents.
@@ -305,13 +338,35 @@ unsafe fn trace_bytecode_function(
     for restart_case in &mut function.restart_cases {
         for restart in &mut restart_case.restarts {
             unsafe {
-                trace_bytecode_function(&mut *restart.function, visit);
+                trace_bytecode_graph(&mut *restart.function, visit, seen);
             }
         }
     }
     for nested in &mut function.nested_functions {
         unsafe {
-            trace_bytecode_function(&mut **nested, visit);
+            trace_bytecode_graph(&mut **nested, visit, seen);
+        }
+    }
+    for instruction in &function.code {
+        let symbol = match instruction {
+            Instr::CallNamed { sym, .. } | Instr::LoadFunction(sym) => *sym,
+            _ => continue,
+        };
+        // Named definitions have ordinary global owners. Private calls can
+        // outlive the heap function object from which they were compiled.
+        let body = closure_bodies().borrow().get(&symbol).cloned();
+        if let Some(body) = body {
+            let frame = closure_envs().borrow().get(&symbol).cloned();
+            if let Some(frame) = frame {
+                super::visit_env_frame_roots(
+                    &frame,
+                    &mut super::EnvRootVisitState::default(),
+                    visit,
+                );
+            }
+            unsafe {
+                trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, seen)
+            };
         }
     }
 }
@@ -332,24 +387,184 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         });
     }
 
+    let private_pools: std::collections::HashSet<_> = closure_bodies()
+        .borrow()
+        .values()
+        .map(|body| Arc::as_ptr(body) as usize)
+        .collect();
+    let named_pools: std::collections::HashSet<_> = named_definitions()
+        .borrow()
+        .values()
+        .filter_map(|definition| definition.body.as_ref())
+        .map(|body| Arc::as_ptr(body) as usize)
+        .collect();
     live_bytecode_bodies().borrow_mut().retain(|_, weak| {
         let Some(function) = weak.upgrade() else {
             return false;
         };
+        let identity = Arc::as_ptr(&function) as usize;
+        if private_pools.contains(&identity) && !named_pools.contains(&identity) {
+            return true;
+        }
         // All mutators are stopped. Trace the same Arc allocation used by its
         // owning thread, including dormant named functions in that thread's
         // registry; a copied constant pool would leave the original stale.
         unsafe { trace_bytecode_function(Arc::as_ptr(&function) as *mut BytecodeFunction, visit) };
         true
     });
-    // Escaped compiled closures can be dormant when collection happens. Their
-    // Rust-owned frames are not reachable through the function object's heap
-    // fields, so activation roots alone do not preserve or relocate captures.
-    super::with_env_visit_state(|state| {
-        for frame in closure_envs().borrow().values() {
-            super::visit_env_frame_roots(frame, state, visit);
-        }
-    });
+}
+
+fn sweep_function_captures(names: &[EgclVal]) {
+    let mut dead: std::collections::HashSet<u32> = names
+        .iter()
+        .filter_map(|name| name.symbol_index())
+        .collect();
+    let traced = with_traced_bytecode_bodies(|bodies| bodies.clone());
+    {
+        let bodies = closure_bodies().borrow();
+        dead.retain(|symbol| {
+            bodies
+                .get(symbol)
+                .is_none_or(|body| !traced.contains(&(Arc::as_ptr(body) as usize)))
+        });
+        // A body can lose its heap owner in an earlier collection but remain
+        // callable through other code. Reconsider these bodies every major GC.
+        dead.extend(bodies.iter().filter_map(|(&symbol, body)| {
+            (!traced.contains(&(Arc::as_ptr(body) as usize))).then_some(symbol)
+        }));
+    }
+    if dead.is_empty() {
+        return;
+    }
+    closure_envs()
+        .borrow_mut()
+        .retain(|symbol, _| !dead.contains(symbol));
+    closure_controls()
+        .borrow_mut()
+        .retain(|symbol, _| !dead.contains(symbol));
+    // Named definitions are invalidated by FMAKUNBOUND/redefinition. Only
+    // private closure code is owned solely by the collected function objects.
+    dead.retain(|&symbol| egcl_rt::symbols::is_uninterned(symbol));
+    if dead.is_empty() {
+        return;
+    }
+    closure_bodies()
+        .borrow_mut()
+        .retain(|symbol, _| !dead.contains(symbol));
+    let mut bodies = std::collections::HashSet::new();
+    // The major collector has stopped every execution before this callback.
+    unsafe {
+        REGISTRY.scan(|registry| {
+            registry.borrow_mut().retain(|symbol, body| {
+                if dead.contains(symbol) {
+                    bodies.insert(Arc::as_ptr(body) as usize);
+                    false
+                } else {
+                    true
+                }
+            })
+        });
+        REGISTRY_GENERATION.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        NATIVE_REGISTRY.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        OSR_REGISTRY.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        INVOKE_COUNTS.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        DEOPT_COUNTS.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        T2_QUEUED.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        OSR_ENTRY_COUNTS.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol, _| !dead.contains(symbol))
+        });
+        LAZY_DECLINED.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol| !dead.contains(symbol))
+        });
+        DEOPT_BLACKLIST.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol| !dead.contains(symbol))
+        });
+        PROFILE_PIN.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol| !dead.contains(symbol))
+        });
+        T2_DECLINED.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol| !dead.contains(symbol))
+        });
+        T1_DECLINED.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|symbol| !dead.contains(symbol))
+        });
+        TYPE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| !bodies.contains(body))
+        });
+        CALL_SITE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| !bodies.contains(body))
+        });
+        FUNCTION_SAMPLE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|body, _| !bodies.contains(body))
+        });
+        ANON_OSR_REGISTRY.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|body, _| !bodies.contains(body))
+        });
+        ANON_BACK_EDGES.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| !bodies.contains(body))
+        });
+    }
+    bump_direct_call_gen();
+}
+
+fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
+    let Some(symbol) = name.symbol_index() else {
+        return;
+    };
+    let body = closure_bodies().borrow().get(&symbol).cloned();
+    if let Some(body) = body {
+        unsafe { trace_bytecode_function(Arc::as_ptr(&body) as *mut BytecodeFunction, visit) };
+    }
+    let frame = closure_envs().borrow().get(&symbol).cloned();
+    if let Some(frame) = frame {
+        super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
+    }
 }
 
 /// Code and captures are edges from a callable's identity, not roots merely
@@ -464,7 +679,11 @@ pub(super) fn delivery_root_scanner() -> egcl_rt::gc::RootScanner {
 
 fn install_bytecode_root_scanner() {
     static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| egcl_rt::gc::register_root_scanner(scan_bytecode_roots));
+    INSTALL.call_once(|| {
+        egcl_rt::gc::register_root_scanner(scan_bytecode_roots);
+        egcl_rt::gc::set_function_capture_trace_fn(trace_function_captures);
+        egcl_rt::gc::set_function_capture_sweep_fn(sweep_function_captures);
+    });
 }
 
 struct ActiveBytecodeRoot {
@@ -23381,6 +23600,48 @@ mod active_bytecode_root_tests {
     use super::*;
 
     #[test]
+    fn macro_body_keeps_its_private_compiled_callee() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(body = super::super::vec_to_list(&[EgclVal::from_fixnum(71)]));
+        egcl_rt::rooted!(
+            callee = compile_and_reify_lambda("MACRO-PRIVATE-CALLEE", NIL, *body, &env).unwrap()
+        );
+        let callee_name = egcl_rt::function::name(*callee);
+        egcl_rt::rooted!(call = super::super::vec_to_list(&[callee_name]));
+        egcl_rt::rooted!(macro_body = super::super::vec_to_list(&[*call]));
+        let code = Arc::new(
+            compile_function("PRIVATE-CALL-MACRO", NIL, *macro_body, &env, true, false).unwrap(),
+        );
+        assert!(code.code.iter().any(|instruction| matches!(instruction,
+            Instr::CallNamed { sym, .. } if *sym == callee_name.as_symbol_index())));
+        super::super::install_loaded_macro(
+            super::super::resolve_sym("PRIVATE-CALL-MACRO").unwrap(),
+            code,
+            &env,
+        );
+        drop(callee);
+        drop(body);
+        drop(call);
+        drop(macro_body);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        egcl_rt::rooted!(invocation = super::super::vec_to_list(&[
+            super::super::resolve_sym("PRIVATE-CALL-MACRO").unwrap(),
+        ]));
+        egcl_rt::rooted!(result = super::super::eval_form(*invocation, &mut env));
+        drop(invocation);
+        super::super::global_macro_remove("PRIVATE-CALL-MACRO");
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        assert_eq!(*result.as_ref().unwrap(), EgclVal::from_fixnum(71));
+        assert!(!is_registered(callee_name.as_symbol_index()));
+    }
+
+    #[test]
     fn constant_pool_root_ends_with_active_scope() {
         let _lock = super::super::heap_test_lock()
             .lock()
@@ -23407,9 +23668,10 @@ mod active_bytecode_root_tests {
         egcl_rt::gc::full_gc().unwrap();
         let live = !weak.is_broken();
         let moved = weak.value().0 != before_collection;
-        let pool_updated = function.constants.iter().any(|value| {
-            egcl_rt::gc::finalizer_key(*value).ok() == Some(weak.value().0)
-        });
+        let pool_updated = function
+            .constants
+            .iter()
+            .any(|value| egcl_rt::gc::finalizer_key(*value).ok() == Some(weak.value().0));
         drop(active);
         // An Arc keeps the host allocation valid, but is not a Lisp GC root.
         // The guard must stop retaining constants even while this Arc exists.
@@ -23419,7 +23681,13 @@ mod active_bytecode_root_tests {
         drop(function);
         assert!(live, "active compilation must retain its constants");
         assert!(moved, "the probe must exercise actual relocation");
-        assert!(pool_updated, "relocation must update the original constant pool");
-        assert!(collected, "leaving the active scope must release its constants");
+        assert!(
+            pool_updated,
+            "relocation must update the original constant pool"
+        );
+        assert!(
+            collected,
+            "leaving the active scope must release its constants"
+        );
     }
 }

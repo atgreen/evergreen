@@ -1230,6 +1230,11 @@ unsafe fn trace_object(
             for i in 0..4 {
                 visit_word(i);
             }
+            if words >= 4 {
+                if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
+                    trace(word(3), &mut visit);
+                }
+            }
         }
         // ── Compiled function (§1.11.2): entry_point and code_size are raw;
         //    name/lambda_list/constants are references. ──
@@ -2457,6 +2462,8 @@ impl HeapCollector {
         // Compute live_bytes per region from mark results.
         // Also run finalizers for dead objects and break their weak pointers.
         let mut dead_object_vals: Vec<EgclVal> = Vec::new();
+        let mut dead_functions = std::collections::HashSet::new();
+        let mut live_functions = std::collections::HashSet::new();
         for (idx, region) in state.regions.iter_mut().enumerate() {
             match region.header.kind {
                 RegionKind::OldGen | RegionKind::Survivor | RegionKind::LargeObject => {
@@ -2492,6 +2499,15 @@ impl HeapCollector {
                             // per-region (a continuation carries no header at
                             // its base, so per-region liveness is meaningless
                             // there).
+                            if type_id == crate::object::type_id::FUNCTION_INTERPRETED && body_size >= 32 {
+                                let payload = unsafe { header_ptr.add(body_offset(header_ptr)) };
+                                let name = unsafe { *(payload as *const EgclVal).add(3) };
+                                if object_map.is_marked(body_addr) {
+                                    live_functions.insert(name);
+                                } else {
+                                    dead_functions.insert(name);
+                                }
+                            }
                             if object_map.is_marked(body_addr) {
                                 live += total_size as u32;
                             } else {
@@ -2507,6 +2523,11 @@ impl HeapCollector {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(sweep) = FUNCTION_CAPTURE_SWEEP_FN.get() {
+            dead_functions.retain(|name| !live_functions.contains(name));
+            sweep(&dead_functions.into_iter().collect::<Vec<_>>());
         }
 
         // Run finalizers for dead objects (R3.12).
@@ -5367,6 +5388,26 @@ static FINALIZER_DISPATCH: OnceLock<fn(EgclVal, EgclVal)> = OnceLock::new();
 /// initialization to register how finalizer EgclVal functions are invoked.
 pub fn set_finalizer_dispatch(dispatch: fn(EgclVal, EgclVal)) {
     let _ = FINALIZER_DISPATCH.set(dispatch);
+}
+
+/// Trace off-heap captured lexical bindings owned by a live function object.
+type FunctionCaptureTraceFn = fn(EgclVal, &mut dyn FnMut(*mut EgclVal));
+static FUNCTION_CAPTURE_TRACE_FN: OnceLock<FunctionCaptureTraceFn> = OnceLock::new();
+
+/// Install the evaluator's function-owned reference tracer. Called for marking,
+/// relocation, and heap snapshots; it must not allocate Lisp objects.
+pub fn set_function_capture_trace_fn(trace: FunctionCaptureTraceFn) {
+    let _ = FUNCTION_CAPTURE_TRACE_FN.set(trace);
+}
+
+type FunctionCaptureSweepFn = fn(&[EgclVal]);
+static FUNCTION_CAPTURE_SWEEP_FN: OnceLock<FunctionCaptureSweepFn> = OnceLock::new();
+
+/// Install cleanup for function identities with no remaining live heap owner.
+/// Runs during major GC with all executions stopped, before dead storage is freed.
+/// Function objects are pinned, so nursery collection cannot end their lifetime.
+pub fn set_function_capture_sweep_fn(sweep: FunctionCaptureSweepFn) {
+    let _ = FUNCTION_CAPTURE_SWEEP_FN.set(sweep);
 }
 
 /// Callback that traces the heap references reachable from a STREAM handle.
