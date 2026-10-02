@@ -15481,6 +15481,24 @@ fn module_designator_name(module: EgclVal) -> String {
     }
 }
 
+fn load_posix_module(env: &mut Env) -> Result<(), EgclError> {
+    // Loading the embedded module has the same package boundary as LOAD.
+    // Keep both the reader context and the dynamic value cell intact.
+    let saved_package = env.current_package.clone();
+    egcl_rt::rooted!(saved_package_value = env.lookup_var("*PACKAGE*").unwrap_or(NIL));
+    let package_symbol = resolve_sym("*PACKAGE*")
+        .ok_or_else(|| EgclError::Internal("REQUIRE: *PACKAGE* is unavailable".into()))?;
+    let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
+        .unwrap_or(egcl_rt::value::UNBOUND);
+    egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
+    let mut result = read_eval_all_env(include_str!("../../../lib/posix.lisp"), env);
+    egcl_rt::rooted_ref!(_result_root = &mut result);
+    env.current_package = saved_package;
+    env.define_local("*PACKAGE*", *saved_package_value);
+    result?;
+    Ok(())
+}
+
 fn require_module(module: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let normalized = module_designator_name(module);
     // ANSI: REQUIRE does nothing if the module is already present (whether loaded
@@ -15502,6 +15520,11 @@ fn require_module(module: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
     if normalized == "ASDF" {
         load_path_into_env(&bundled_asdf_path(), env)?;
         // asdf.lisp PROVIDEs itself; belt-and-suspenders in case it did not.
+        record_module(env, &normalized);
+        return Ok(T);
+    }
+    if normalized == "EGCL-POSIX" {
+        load_posix_module(env)?;
         record_module(env, &normalized);
         return Ok(T);
     }
@@ -15827,6 +15850,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
             | "EGCL-EXT:RUN-PROGRAM"
+            | "EGCL::%POSIX"
             | "EGCL-EXT:GET-PRECISE-TIME"
             // COMPILE sets (values result warnings-p failure-p) but was absent
             // here, so the allowlist truncated it to one value (bliss-p14j).
@@ -17186,6 +17210,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.clear_mv();
                 return egcl_stdlib::fibers::call(&args);
             }
+            "EGCL::%POSIX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FOREIGN-MEMORY" => {
                 if env.sandbox {
                     return Err(EgclError::SandboxViolation("FFI access denied".into()));
@@ -35082,6 +35107,7 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         // Introspection / devtools
         "EGCL::%NATIVE-MUTEX"
+            | "EGCL::%POSIX"
             | "EGCL::%NATIVE-FIBER"
             | "EGCL::%FOREIGN-MEMORY"
             | "EGCL::%FOREIGN-LIBRARY"

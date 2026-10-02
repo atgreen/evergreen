@@ -636,6 +636,14 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%POSIX" => Some(|_operator, args, env| {
+            if env.sandbox {
+                return Err(EgclError::SandboxViolation("POSIX access denied".into()));
+            }
+            let values = egcl_stdlib::posix::call(args)?;
+            env.set_mv(values.to_vec());
+            Ok(values[0])
+        }),
         "EGCL::%NATIVE-MUTEX" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 

@@ -38,6 +38,7 @@ pub mod conditions;
 pub mod ffi;
 pub mod fibers;
 pub mod process;
+pub mod posix;
 pub mod streams;
 pub mod synchronization;
 

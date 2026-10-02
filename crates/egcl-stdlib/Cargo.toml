@@ -17,5 +17,8 @@ egcl-rt.workspace = true
 egcl-compiler.workspace = true
 rustyline = "18.0.1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_Pipes", "Win32_Foundation"] }

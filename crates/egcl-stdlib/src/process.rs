@@ -173,7 +173,7 @@ fn spawn_process(mut command: Command) -> io::Result<Process> {
     })
 }
 
-fn process_operation<T: Send + 'static>(
+pub(crate) fn process_operation<T: Send + 'static>(
     operation: &'static str,
     action: impl FnOnce() -> io::Result<T> + Send + 'static,
 ) -> Result<T, EgclError> {
