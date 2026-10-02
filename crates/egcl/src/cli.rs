@@ -14831,27 +14831,13 @@ fn typep_matches(
             Ok(eql_values(object, value))
         }
         "INTEGER" => {
-            if !object.is_fixnum() {
+            if !egcl_rt::types::integerp(object) {
                 return Ok(false);
             }
             let bounds = list_to_vec(args);
-            let value = object.as_fixnum();
-            // A bound is `*`/omitted (unbounded), an integer (inclusive), or a
-            // one-element list `(n)` (exclusive). `is_lower` picks the
-            // comparison direction. alexandria's ARRAY-INDEX is
-            // `(integer 0 (array-dimension-limit))` — an exclusive upper bound,
-            // so calling as_fixnum on the `(n)` cons used to panic.
-            // A bound that is neither `*` nor an integer is a MALFORMED type
-            // specifier, e.g. `(integer 0 a)`. Answering `true` -- treating the
-            // unusable bound as no constraint -- reported a value as being of a
-            // type that cannot be constructed, where SBCL signals. ansi's
-            // SIGNALS-ERROR depends on TYPEP rejecting such a spec when it
-            // validates a condition's DATUM against its EXPECTED-TYPE, which is
-            // what ARRAY-FILL-10 and its FIXNUM / UNSIGNED-BYTE8 siblings check.
-            //
-            // A BIGNUM bound is NOT malformed -- it is simply outside fixnum
-            // range, so a fixnum `value` can never exceed a positive one. Keep
-            // answering for those rather than signalling.
+            // Bounds are inclusive integers, exclusive one-element lists, or
+            // omitted/* for infinity. Use the shared exact numeric comparison:
+            // both the object and either bound may be arbitrarily large bignums.
             let bound_ok = |bound: EgclVal, is_lower: bool| -> Result<bool, EgclError> {
                 if bound.is_symbol() && sym_bare_name_rc(bound).as_ref() == "*" {
                     return Ok(true);
@@ -14861,25 +14847,18 @@ fn typep_matches(
                 } else {
                     (bound, false)
                 };
-                if !b.is_fixnum() {
-                    if egcl_rt::types::integerp(b) {
-                        // Bignum bound: decide by sign, no comparison needed.
-                        let negative = numeric_cmp(b, EgclVal::from_fixnum(0))
-                            .map(|o| o == Ordering::Less)
-                            .unwrap_or(false);
-                        return Ok(if is_lower { negative } else { !negative });
-                    }
+                if !egcl_rt::types::integerp(b) {
                     return Err(EgclError::TypeError {
                         datum: b,
                         expected: "an integer or *".into(),
                     });
                 }
-                let n = b.as_fixnum();
+                let ordering = numeric_cmp(object, b)?;
                 Ok(match (is_lower, exclusive) {
-                    (true, true) => value > n,
-                    (true, false) => value >= n,
-                    (false, true) => value < n,
-                    (false, false) => value <= n,
+                    (true, true) => ordering == Ordering::Greater,
+                    (true, false) => ordering != Ordering::Less,
+                    (false, true) => ordering == Ordering::Less,
+                    (false, false) => ordering != Ordering::Greater,
                 })
             };
             let lower_ok = match bounds.first().copied() {

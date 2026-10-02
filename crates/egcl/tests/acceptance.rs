@@ -3226,6 +3226,37 @@ fn rational_numeric_ops_and_ratio_literal_reduction() {
     }
 }
 
+/// Alexandria's integer predicates must cover bignums as well as fixnums.
+#[test]
+fn typep_integer_intervals_include_bignums_exactly() {
+    run_expression_cases(&[
+        ("(typep (1- most-negative-fixnum) '(integer * -1))", "T"),
+        ("(typep (1+ most-positive-fixnum) '(integer 1 *))", "T"),
+        ("(typep (expt 2 100) '(integer))", "T"),
+        (
+            "(let ((n (expt 2 100))) (list (typep n `(integer ,n ,n)) (typep (1- n) `(integer ,n *)) (typep (1+ n) `(integer * ,n))))",
+            "(T NIL NIL)",
+        ),
+        (
+            "(let ((n (expt 2 100))) (list (typep n `(integer (,n) *)) (typep (1+ n) `(integer (,n) *)) (typep n `(integer * (,n))) (typep (1- n) `(integer * (,n)))))",
+            "(NIL T NIL T)",
+        ),
+        (
+            "(let ((n (- (expt 2 100)))) (list (typep n `(integer ,n ,n)) (typep (1- n) `(integer ,n *)) (typep (1+ n) `(integer * ,n)) (typep (1+ n) `(integer (,n) *))))",
+            "(T NIL NIL T)",
+        ),
+        ("(typep 42 `(integer ,(- (expt 2 100)) ,(expt 2 100)))", "T"),
+        (
+            "(list (typep 1/2 '(integer * *)) (typep 1.0 '(integer * *)))",
+            "(NIL NIL)",
+        ),
+        (
+            "(handler-case (typep (expt 2 100) '(integer 0 bad-bound)) (type-error () :caught))",
+            ":CAUGHT",
+        ),
+    ]);
+}
+
 /// Regression (egcl-c0m): TYPEP recognises the real heap numeric types (bignum,
 /// ratio, double-float, complex) — previously its NUMBER/REAL/RATIONAL/INTEGER/
 /// FLOAT checks only saw fixnum/single-float, so e.g. (typep (expt 2 100)
