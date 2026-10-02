@@ -679,6 +679,12 @@ pub fn undefine_compiler_macro(name: EgclVal) {
     table.remove(&name.0);
 }
 
+/// Discard process-local compiler macro callbacks before registering a restored
+/// image's definitions. The cheap presence flag may safely remain conservative.
+pub fn clear_compiler_macros() {
+    COMPILER_MACRO_TABLE.write().unwrap().clear();
+}
+
 /// Look up a compiler macro by name.
 fn lookup_compiler_macro(name: EgclVal) -> Option<CompilerMacroFn> {
     let table = COMPILER_MACRO_TABLE.read().unwrap();

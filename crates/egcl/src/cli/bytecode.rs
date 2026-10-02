@@ -11843,7 +11843,7 @@ pub(super) fn install_closure_control(
 /// `funcall`/`apply`/`mapcar`/`reduce` exactly like any global. When
 /// `captured_env` is `Some`, the closure records that heap frame so its body can
 /// read and write the enclosing lexical bindings (portable `flet`/`labels`).
-fn make_bytecode_closure(
+pub(super) fn make_bytecode_closure(
     nested: &BytecodeFunction,
     captured_env: Option<Arc<SharedCell<EnvFrame>>>,
 ) -> EgclVal {
@@ -13678,7 +13678,8 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
                     symbol,
                     Arc::clone(&functions[action.arg0 as usize]),
                     definition_package,
-                );
+                    env,
+                )?;
                 last = symbol;
             }
             8 => {
@@ -14176,7 +14177,9 @@ fn bind_macro_variadic(
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
     call_menv: Option<&super::MacroexpandEnv>,
+    mut explicit_environment: Option<EgclVal>,
 ) -> Result<(), EgclError> {
+    egcl_rt::rooted_ref!(_explicit_environment_root = &mut explicit_environment);
     let parent = Arc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
         // If the macro lambda list begins with `&whole`, that variable must bind
@@ -14218,14 +14221,24 @@ fn bind_macro_variadic(
         // differently depending on whether it had been loaded from source (which
         // takes the tree-walker's path and does get the call-site environment) or
         // from a .bfasl. SBCL answers as the source case does (bliss-1pve).
-        let menv = if !super::params_form_uses_environment(func.params_form) {
+        let menv = if explicit_environment.is_some()
+            || !super::params_form_uses_environment(func.params_form)
+        {
             None
         } else if let Some(caller) = call_menv {
             Some(caller.clone())
         } else {
             Some(super::macroexpand_environment_from_cli(env))
         };
-        super::bind_macro_lambda_list(func.params_form, args, env, menv.as_ref(), whole, None)?;
+        super::bind_macro_lambda_list_with_environment(
+            func.params_form,
+            args,
+            env,
+            menv.as_ref(),
+            whole,
+            None,
+            explicit_environment,
+        )?;
         env.clear_mv();
         let current = Arc::clone(&env.frame);
         // See bind_variadic: re-derive lookup keys from the live params_form so
@@ -14277,7 +14290,7 @@ pub(super) fn run_with_sym(
     sym: u32,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, entry_fn_val, sym, env, false, None, None)
+    run_with_binding(entry, args, entry_fn_val, sym, env, false, None, None, None)
 }
 
 /// Run a compiled macro expander.
@@ -14293,7 +14306,30 @@ pub(super) fn run_macro(
     env: &mut Env,
     call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole, call_menv)
+    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole, call_menv, None)
+}
+
+pub(super) fn run_compiler_macro_function(
+    function: EgclVal,
+    args: &[EgclVal],
+    whole: EgclVal,
+    environment: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    let name = egcl_rt::function::name(function);
+    let entry = registry_get(name.as_symbol_index())
+        .ok_or_else(|| EgclError::ProgramError("missing compiled compiler macro".into()))?;
+    run_with_binding(
+        entry,
+        args,
+        function,
+        name.as_symbol_index(),
+        env,
+        true,
+        Some(whole),
+        None,
+        Some(environment),
+    )
 }
 
 fn run_with_binding(
@@ -14305,10 +14341,12 @@ fn run_with_binding(
     macro_lambda_list: bool,
     mut macro_whole: Option<EgclVal>,
     call_menv: Option<&super::MacroexpandEnv>,
+    mut explicit_environment: Option<EgclVal>,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(_active_bytecode_root = ActiveBytecodeRoot::new(&entry));
     egcl_rt::rooted!(args = args.to_vec());
     egcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
+    egcl_rt::rooted_ref!(_explicit_environment_root = &mut explicit_environment);
     validate_declared_args(&entry, &args)?;
     record_profiled_invocation(Arc::as_ptr(&entry) as usize);
     // A callee's return values are determined by its own body — discard any
@@ -14355,6 +14393,7 @@ fn run_with_binding(
                 env_frame.as_ref(),
                 env,
                 call_menv,
+                explicit_environment,
             )
         {
             stack.pop_frame();

@@ -342,6 +342,19 @@ pub fn interned_names() -> Vec<(u32, String)> {
     })
 }
 
+/// Snapshot the identities of all live registry symbols, including uninterned
+/// names. Indices are immediate values and remain stable across allocation.
+pub fn all_symbol_indices() -> Vec<u32> {
+    with_registry(|reg| {
+        reg.map(|reg| {
+            (0..reg.interned.len() as u32)
+                .chain(reg.uninterned.keys().copied())
+                .collect()
+        })
+        .unwrap_or_default()
+    })
+}
+
 /// True if `idx` names an uninterned symbol (one made by `make-symbol`/`gensym`,
 /// with no home package). Uninterned indices live at or above [`UNINTERNED_BASE`]
 /// (the high bit is set), so this is a pure index test — no registry lock needed.

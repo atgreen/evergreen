@@ -4133,54 +4133,13 @@ fn install_loaded_compiler_macro(
     name: EgclVal,
     function: Arc<egcl_rt::bytecode::BytecodeFunction>,
     definition_package: String,
-) {
-    install_evaluator_global_root_scanner();
-    let function = Arc::new(Mutex::new((*function).clone()));
-    LOADED_COMPILER_MACRO_FUNCTIONS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(Arc::downgrade(&function));
-    compiler_macroexpand::define_compiler_macro(
-        name,
-        Arc::new(move |form, macro_env| {
-            // &ENVIRONMENT handles have dynamic extent, including on errors.
-            let _macroexpand_env_scope = MacroexpandEnvScope::new();
-            // The callback's FORM copy and argument vector must survive Env
-            // construction, which can allocate and relocate nursery objects.
-            egcl_rt::rooted!(form = form);
-            egcl_rt::rooted!(args = list_to_vec(cp(*form).1));
-            let package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
-                EgclError::Internal("compiler macro: *PACKAGE* is unavailable".into())
-            })?;
-            egcl_rt::rooted!(definition_package_value = package_object(&definition_package));
-            // Save the caller's dynamic package before Env construction resets
-            // the global cell; the rooted guard restores it on Ok or Err.
-            egcl_rt::rooted!(
-                _package_binding = DynBind::establish(package_symbol, *definition_package_value,)
-            );
-            let mut env = Env::new_for_macro_expansion(false);
-            egcl_rt::rooted_ref!(_env_root = &mut env);
-            env.current_package = definition_package.clone();
-            env.define_local("*PACKAGE*", *definition_package_value);
-            egcl_rt::symbols::set_symbol_value(
-                package_symbol.as_symbol_index(),
-                *definition_package_value,
-            );
-            // Clone the globally rooted bytecode only after Env construction;
-            // run_macro registers the clone before its first allocation.
-            let function = function
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            bytecode::run_macro(
-                Arc::new(function),
-                &args,
-                Some(*form),
-                &mut env,
-                Some(macro_env),
-            )
-        }),
+    env: &mut Env,
+) -> Result<(), EgclError> {
+    egcl_rt::rooted!(descriptor = bytecode::make_bytecode_closure(&function, None));
+    egcl_rt::rooted!(
+        expander = make_compiler_macro_function(*descriptor, NIL, &definition_package)
     );
+    install_compiler_macro_function(env, name, *expander)
 }
 
 /// Remove a global macro (FMAKUNBOUND / redefinition as a function).
@@ -17064,7 +17023,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             // Debug introspection (bliss-zz6w): raw body/lambda-list of an
             // interpreted-function object, for inspecting restored cores.
-            "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
             // ── Custom reader macros (bliss-r4mk) ──────────────────────
             // Registrations key by the (pinned) readtable OBJECT in
             // *READTABLE*; handlers are coerced to pinned interpreted-function
@@ -30016,6 +29975,25 @@ fn bind_macro_param(
 }
 
 fn bind_macro_lambda_list(
+    params_form: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+    macroexpand_env: Option<&MacroexpandEnv>,
+    whole: Option<EgclVal>,
+    arg_list: Option<EgclVal>,
+) -> Result<(), EgclError> {
+    bind_macro_lambda_list_with_environment(
+        params_form,
+        args,
+        env,
+        macroexpand_env,
+        whole,
+        arg_list,
+        None,
+    )
+}
+
+fn bind_macro_lambda_list_with_environment(
     mut params_form: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
@@ -30030,7 +30008,9 @@ fn bind_macro_lambda_list(
     // for a macro call `whole` is `(operator . args)` while this is just `args`.
     // `None` reconstructs it from `args`, correct whenever it is a proper list.
     arg_list: Option<EgclVal>,
+    mut explicit_environment: Option<EgclVal>,
 ) -> Result<(), EgclError> {
+    egcl_rt::rooted_ref!(_explicit_environment_root = &mut explicit_environment);
     #[derive(PartialEq)]
     enum Mode {
         Req,
@@ -30085,10 +30065,12 @@ fn bind_macro_lambda_list(
             {
                 let (mut var, _) = cp(scan);
                 egcl_rt::rooted_ref!(_var_root = &mut var);
-                let mut env_value = macroexpand_env
-                    .cloned()
-                    .map(store_macroexpand_environment)
-                    .unwrap_or(NIL);
+                let mut env_value = explicit_environment.unwrap_or_else(|| {
+                    macroexpand_env
+                        .cloned()
+                        .map(store_macroexpand_environment)
+                        .unwrap_or(NIL)
+                });
                 egcl_rt::rooted_ref!(_env_value_root = &mut env_value);
                 bind_pattern_value(var, env_value, env)?;
                 break;
@@ -30122,10 +30104,12 @@ fn bind_macro_lambda_list(
                     // that operation allocates, so retaining REST_AFTER_VAR as
                     // an unrooted copy would leave the next cursor stale.
                     c = rest_after_var;
-                    let mut env_value = macroexpand_env
-                        .cloned()
-                        .map(store_macroexpand_environment)
-                        .unwrap_or(NIL);
+                    let mut env_value = explicit_environment.unwrap_or_else(|| {
+                        macroexpand_env
+                            .cloned()
+                            .map(store_macroexpand_environment)
+                            .unwrap_or(NIL)
+                    });
                     egcl_rt::rooted_ref!(_env_value_root = &mut env_value);
                     bind_pattern_value(var, env_value, env)?;
                     continue;
@@ -31123,97 +31107,152 @@ fn eval_define_symbol_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
 }
 
 fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    let (name_form, rest) = cp(cdr);
+    let (name, rest) = cp(cdr);
     let (params_form, body) = cp(rest);
-    if !name_form.is_symbol() {
-        // A compiler macro is always optional (CLHS 3.2.2.1.3: the compiler is
-        // not required to use one), and our registry keys expanders by symbol.
-        // For a `(setf f)` function name — e.g. ASDF's WITH-DEPRECATION
-        // instrumenting a `(defmethod (setf foo) …)` — just skip defining the
-        // compiler macro; the underlying function/method still works.
-        return Ok(name_form);
+    if !name.is_symbol() {
+        return Ok(name);
     }
-
-    // The expander is stored in egcl-compiler's global registry as an
-    // Arc<dyn Fn + Send + Sync>, so it must own a Send snapshot of the defining
-    // lexical frame rather than share the live Rc chain. See FrozenEnvFrame.
-    let capture = register_frozen_macro_capture(FrozenMacroCapture {
-        registration: None,
-        params_form,
-        body,
-        captured_frame: freeze_env_frame(&env.frame),
-        funs: env.funs.borrow().clone(),
-        symbol_macros: env.symbol_macros.borrow().clone(),
-    });
-    let current_package = env.current_package.clone();
-    let sandbox = env.sandbox;
-    let eval_context = env.eval_context;
-
-    compiler_macroexpand::define_compiler_macro(
-        name_form,
-        Arc::new(move |form, _macro_env| {
-            // &ENVIRONMENT handles have dynamic extent, including on errors.
-            let _macroexpand_env_scope = MacroexpandEnvScope::new();
-            // FORM is a by-value copy owned by this callback. Root it across
-            // creation of the throwaway Env, then read the globally rooted
-            // capture so its local copies start with post-GC addresses.
-            egcl_rt::rooted!(form = form);
-            let package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
-                EgclError::Internal("compiler macro: *PACKAGE* is unavailable".into())
-            })?;
-            egcl_rt::rooted!(definition_package_value = package_object(&current_package));
-            // Env construction resets the global cell to CL-USER. Establish a
-            // rooted dynamic binding first so the caller's value is restored on
-            // every exit, then reinstall the definition package after creation.
-            egcl_rt::rooted!(
-                _package_binding = DynBind::establish(package_symbol, *definition_package_value,)
-            );
-            let mut macro_env = Env::new_for_macro_expansion(sandbox);
-            egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
-            macro_env.current_package = current_package.clone();
-            macro_env.define_local("*PACKAGE*", *definition_package_value);
-            egcl_rt::symbols::set_symbol_value(
-                package_symbol.as_symbol_index(),
-                *definition_package_value,
-            );
-            let (params_form, body, captured_frame, funs, symbol_macros) = {
-                let capture = capture
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                (
-                    capture.params_form,
-                    capture.body,
-                    Arc::clone(&capture.captured_frame),
-                    capture.funs.clone(),
-                    capture.symbol_macros.clone(),
-                )
-            };
-            egcl_rt::rooted!(params_form = params_form);
-            egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(args = list_to_vec(cp(*form).1));
-            // Move every heap-capable registry snapshot into the rooted Env
-            // before thawing its frame, which allocates and may relocate their
-            // values. The frozen capture remains globally scanned, but these
-            // by-value HashMap copies would not be rewritten there.
-            macro_env.funs = Arc::new(SharedCell::new(funs));
-            macro_env.macros = Rc::new(RefCell::new(HashMap::new()));
-            macro_env.symbol_macros = Rc::new(RefCell::new(symbol_macros));
-            macro_env.frame = thaw_env_frame(&captured_frame);
-            macro_env.eval_context = eval_context;
-            bind_macro_lambda_list(
-                *params_form,
-                &args,
-                &mut macro_env,
-                Some(_macro_env),
-                // A compiler macro's `&whole` binds the whole call form.
-                Some(*form),
-                None,
-            )?;
-            eval_expander_body(*params_form, *body, &mut macro_env)
-        }),
+    egcl_rt::rooted!(
+        descriptor = register_tree_closure(Closure {
+            params_form,
+            body,
+            captured_frame: Arc::clone(&env.frame),
+            captured_blocks: env.block_stack.clone(),
+            captured_tags: env.tag_stack.clone(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+        })
     );
+    // Keep lexical symbol macros in Lisp data, so the expander's snapshot is
+    // traced and serialized along with the ordinary function that owns it.
+    egcl_rt::rooted!(symbol_macros = NIL);
+    egcl_rt::rooted!(
+        definitions = env
+            .symbol_macros
+            .borrow()
+            .values()
+            .copied()
+            .collect::<Vec<_>>()
+    );
+    let names = env
+        .symbol_macros
+        .borrow()
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for (i, name) in names.iter().enumerate() {
+        egcl_rt::rooted!(key = EgclVal::from_symbol_index(*name));
+        egcl_rt::rooted!(pair = arena_cons(*key, definitions[i]));
+        *symbol_macros = arena_cons(*pair, *symbol_macros);
+    }
+    let package = env.current_package.clone();
+    egcl_rt::rooted!(
+        expander = make_compiler_macro_function(*descriptor, *symbol_macros, &package)
+    );
+    install_compiler_macro_function(env, name, *expander)?;
+    Ok(name)
+}
 
-    Ok(name_form)
+/// A normal two-argument function whose constants own the expander definition.
+/// Retaining this function therefore retains the old definition after a later
+/// DEFINE-COMPILER-MACRO replaces the symbol's current expander.
+fn make_compiler_macro_function(
+    descriptor: EgclVal,
+    symbol_macros: EgclVal,
+    package: &str,
+) -> EgclVal {
+    egcl_rt::rooted!(descriptor = descriptor);
+    egcl_rt::rooted!(symbol_macros = symbol_macros);
+    let whole = egcl_rt::symbols::make_uninterned("WHOLE");
+    let environment = egcl_rt::symbols::make_uninterned("ENVIRONMENT");
+    let invoke = resolve_sym("EGCL::%INVOKE-COMPILER-MACRO").unwrap();
+    let quote = quote_sym();
+    egcl_rt::rooted!(params = vec_to_list(&[whole, environment]));
+    egcl_rt::rooted!(package = arena_str(package));
+    egcl_rt::rooted!(quoted_descriptor = vec_to_list(&[quote, *descriptor]));
+    egcl_rt::rooted!(quoted_macros = vec_to_list(&[quote, *symbol_macros]));
+    egcl_rt::rooted!(
+        call = vec_to_list(&[
+            invoke,
+            *quoted_descriptor,
+            whole,
+            environment,
+            *package,
+            *quoted_macros
+        ])
+    );
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    let name = egcl_rt::symbols::make_uninterned("COMPILER-MACRO");
+    egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
+}
+
+fn invoke_compiler_macro_function(
+    args: &[EgclVal],
+    caller: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if args.len() != 5 {
+        return Err(EgclError::ProgramError(
+            "compiler macro invocation requires five arguments".into(),
+        ));
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    let _environment_scope = MacroexpandEnvScope::new();
+    if !args[2].is_nil() && load_macroexpand_environment(args[2]).is_none() {
+        return Err(EgclError::ProgramError(
+            "invalid compiler macro environment".into(),
+        ));
+    }
+    let package = string_designator(args[3]);
+    let package_symbol = resolve_sym("*PACKAGE*").unwrap();
+    egcl_rt::rooted!(package_value = package_object(&package));
+    egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, *package_value));
+    let mut env = Env::new_for_macro_expansion(caller.sandbox);
+    egcl_rt::rooted_ref!(_env_root = &mut env);
+    env.eval_context = caller.eval_context;
+    env.current_package = package;
+    env.define_local("*PACKAGE*", *package_value);
+    egcl_rt::symbols::set_symbol_value(package_symbol.as_symbol_index(), *package_value);
+    egcl_rt::rooted!(operands = list_to_vec(cp(args[1]).1));
+    if egcl_rt::function::is_interpreted_function(args[0]) {
+        return bytecode::run_compiler_macro_function(
+            args[0], &operands, args[1], args[2], &mut env,
+        );
+    }
+    let mut closure = closure_registry()
+        .borrow()
+        .get(&(cp(args[0]).1.as_fixnum() as u64))
+        .cloned()
+        .ok_or_else(|| EgclError::ProgramError("missing compiler macro definition".into()))?;
+    egcl_rt::rooted_ref!(_closure_root = &mut closure);
+    env.frame = Arc::clone(&closure.captured_frame);
+    env.block_stack = closure.captured_blocks.clone();
+    env.tag_stack = closure.captured_tags.clone();
+    if let Some(funs) = &closure.captured_funs {
+        env.funs = Arc::clone(funs);
+    }
+    env.macros = Rc::new(RefCell::new(HashMap::new()));
+    env.symbol_macros = Rc::new(RefCell::new(HashMap::new()));
+    let mut macros = args[4];
+    while macros.is_cons() {
+        let (pair, rest) = cp(macros);
+        let (key, expansion) = cp(pair);
+        env.symbol_macros
+            .borrow_mut()
+            .insert(key.as_symbol_index(), expansion);
+        macros = rest;
+    }
+    let parent = Arc::clone(&env.frame);
+    with_child_frame(&mut env, parent, |env| {
+        bind_macro_lambda_list_with_environment(
+            closure.params_form,
+            &operands,
+            env,
+            None,
+            Some(args[1]),
+            Some(cp(args[1]).1),
+            Some(args[2]),
+        )?;
+        eval_expander_body(closure.params_form, closure.body, env)
+    })
 }
 
 /// Indicator under which a compiler macro installed as a FUNCTION is kept on its
@@ -31240,6 +31279,7 @@ fn install_compiler_macro_function(
     name: EgclVal,
     function: EgclVal,
 ) -> Result<(), EgclError> {
+    egcl_rt::rooted!(function = function);
     let Some(indicator) = resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY) else {
         return Err(EgclError::Internal(
             "SETF COMPILER-MACRO-FUNCTION: indicator symbol is unavailable".into(),
@@ -31250,22 +31290,16 @@ fn install_compiler_macro_function(
         compiler_macroexpand::undefine_compiler_macro(name);
         return Ok(());
     }
-    // COMPILER-MACRO-FUNCTION answers T for a DEFINE-COMPILER-MACRO expander,
-    // which has no Lisp function object to install here (bliss-0g5lg). Copying
-    // that answer to another name therefore gives the other name no compiler
-    // macro — legal, since a compiler macro is always optional (CLHS 3.2.2.1),
-    // and better than installing something uncallable.
-    if function == T {
-        return Ok(());
-    }
-    let installed = coerce_installed_function(env, function);
+    let installed = coerce_installed_function(env, *function);
     symbol_plist_put(name, indicator, installed);
     let sandbox = env.sandbox;
     let eval_context = env.eval_context;
     compiler_macroexpand::define_compiler_macro(
         name,
-        Arc::new(move |form, _macro_env| {
+        Arc::new(move |form, call_env| {
+            let _environment_scope = MacroexpandEnvScope::new();
             egcl_rt::rooted!(form = form);
+            egcl_rt::rooted!(environment = store_macroexpand_environment(call_env.clone()));
             let expander = resolve_sym(COMPILER_MACRO_FUNCTION_PROPERTY)
                 .and_then(|indicator| plist_lookup(symbol_plist_of(name), indicator))
                 .filter(|expander| !expander.is_nil());
@@ -31275,10 +31309,14 @@ fn install_compiler_macro_function(
                 return Ok(*form);
             };
             egcl_rt::rooted!(expander = expander);
+            let package_symbol = resolve_sym("*PACKAGE*").unwrap();
+            let package_value =
+                egcl_rt::symbols::symbol_value(package_symbol.as_symbol_index()).unwrap_or(NIL);
+            egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, package_value));
             let mut macro_env = Env::new_for_macro_expansion(sandbox);
             egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
             macro_env.eval_context = eval_context;
-            apply_function(*expander, &[*form, NIL], &mut macro_env)
+            apply_function(*expander, &[*form, *environment], &mut macro_env)
         }),
     );
     Ok(())
@@ -35035,7 +35073,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ALLOCATE-INSTANCE" | "SLOT-MAKUNBOUND"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
-            | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
+            | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
     )
 }
 
@@ -37767,6 +37805,15 @@ fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), EgclError> {
     let unit = PENDING_HOST_BYTECODE.with(|p| std::mem::take(&mut *p.borrow_mut()));
     if !unit.is_empty() {
         bytecode::load_bbu(&unit, env)?;
+    }
+    // Function objects and symbol properties are image data; Rust callbacks
+    // are not. Rebuild the compiler's dispatch table from the restored world.
+    compiler_macroexpand::clear_compiler_macros();
+    for index in egcl_rt::symbols::all_symbol_indices() {
+        let name = EgclVal::from_symbol_index(index);
+        if let Some(function) = installed_compiler_macro_function(name) {
+            install_compiler_macro_function(env, name, function)?;
+        }
     }
     // Streams are process-specific resources with OFF-HEAP bodies (file handles,
     // buffers) that the heap snapshot cannot carry: the restored *STANDARD-OUTPUT*
@@ -40640,5 +40687,117 @@ mod compiled_closure_lifetime_tests {
             "dead function's constant cycle must be collected"
         );
         assert!(!bytecode::is_registered(name.as_symbol_index()));
+    }
+}
+
+#[cfg(test)]
+mod compiler_macro_function_tests {
+    use super::*;
+
+    fn check_first_class_expander(compiled: bool) {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let definition = r#"
+          (define-compiler-macro first-class-expander-probe (&whole whole x &environment e)
+            (if (eq x :environment) e
+                (if (eq x :decline) whole (list 'quote x))))
+        "#;
+        if compiled {
+            let bytes =
+                build_bfasl_from_source(definition, "first-class-compiler-macro.lisp", &mut env)
+                    .unwrap();
+            load_bfasl_into_env(&bytes, &mut env).unwrap();
+        } else {
+            read_eval_all_env(definition, &mut env).unwrap();
+        }
+        assert_eq!(
+            read_eval_all_env(
+                "(typep (compiler-macro-function 'first-class-expander-probe) 'function)",
+                &mut env
+            )
+            .unwrap(),
+            T,
+            "COMPILER-MACRO-FUNCTION must return a function, not an existence flag",
+        );
+        {
+            let _scope = MacroexpandEnvScope::new();
+            egcl_rt::rooted!(handle = store_macroexpand_environment(MacroexpandEnv::null()));
+            egcl_rt::rooted!(
+                form = read_from_string_in_env("(another-name :environment)", &mut env)
+                    .unwrap()
+                    .0
+            );
+            egcl_rt::rooted!(
+                function = installed_compiler_macro_function(
+                    resolve_sym("FIRST-CLASS-EXPANDER-PROBE").unwrap()
+                )
+                .unwrap()
+            );
+            egcl_rt::rooted!(
+                actual = apply_function(*function, &[*form, *handle], &mut env).unwrap()
+            );
+            assert_eq!(
+                *actual, *handle,
+                "the expander must receive the caller's exact environment object"
+            );
+        }
+        read_eval_all_env(r#"
+          (defun %compiler-expander-check (value)
+            (if value t (error "Compiler expander assertion failed")))
+          (setq *saved-compiler-expander* (compiler-macro-function 'first-class-expander-probe))
+          (%compiler-expander-check (typep *saved-compiler-expander* 'function))
+          (%compiler-expander-check (null (funcall *saved-compiler-expander* '(another-name :environment) nil)))
+          (%compiler-expander-check (equal '(quote 71) (funcall *saved-compiler-expander* '(another-name 71) nil)))
+          (let ((form (list 'first-class-expander-probe :decline)))
+            (%compiler-expander-check (eq form (funcall *saved-compiler-expander* form nil))))
+          (setf (compiler-macro-function 'copied-expander-probe) *saved-compiler-expander*)
+          (%compiler-expander-check (eq *saved-compiler-expander* (compiler-macro-function 'copied-expander-probe)))
+          (define-compiler-macro first-class-expander-probe (x) (list 'quote (list x)))
+          (%compiler-expander-check (equal '(quote 71) (funcall *saved-compiler-expander* '(first-class-expander-probe 71) nil)))
+          (%compiler-expander-check (equal '(quote (71)) (funcall (compiler-macro-function 'first-class-expander-probe) '(first-class-expander-probe 71) nil)))
+        "#, &mut env).unwrap_or_else(|error| panic!("{}", describe_err(&error)));
+    }
+
+    #[test]
+    fn source_compiler_macro_preserves_lexical_context_and_relocated_capture() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        env.define_local("HELD", NIL);
+        read_eval_all_env(
+            "(flet ((lexical-expander-helper (x) (cons :lexical x)))
+               (symbol-macrolet ((context :symbol-macro))
+                 (define-compiler-macro captured-expander ()
+                   (list context (lexical-expander-helper held)))))",
+            &mut env,
+        )
+        .unwrap();
+        egcl_rt::rooted!(
+            function = installed_compiler_macro_function(resolve_sym("CAPTURED-EXPANDER").unwrap())
+                .unwrap()
+        );
+        egcl_rt::rooted!(
+            form = read_from_string_in_env("(captured-expander)", &mut env)
+                .unwrap()
+                .0
+        );
+        egcl_rt::rooted!(held = arena_cons(EgclVal::from_fixnum(71), NIL));
+        env.define_local("HELD", *held);
+        let before = *held;
+        egcl_rt::collect_t0_minor().unwrap();
+        assert_ne!(*held, before, "the captured value must actually relocate");
+        egcl_rt::rooted!(actual = apply_function(*function, &[*form, NIL], &mut env).unwrap());
+        assert_eq!(format_val(*actual), "(:SYMBOL-MACRO (:LEXICAL 71))");
+    }
+
+    #[test]
+    fn source_compiler_macro_has_a_callable_snapshot() {
+        check_first_class_expander(false);
+    }
+
+    #[test]
+    fn fasl_compiler_macro_has_a_callable_snapshot() {
+        check_first_class_expander(true);
     }
 }
