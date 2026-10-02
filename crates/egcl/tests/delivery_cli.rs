@@ -560,14 +560,9 @@ fn delivery_follows_only_reachable_compiled_closure_bodies_and_captures() {
         "{report}"
     );
     assert!(report.contains("capabilities=tree-walker\n"), "{report}");
-    let removed: usize = report
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("private-code-removed = ")
-                .map(|n| n.parse().unwrap())
-        })
-        .unwrap();
-    assert!(removed >= 2, "{report}");
+    // Saving runs GC, which may already reclaim both discarded closures.
+    // Check dead targets above and restored behavior below rather than requiring
+    // delivery itself to reclaim a particular number of private code objects.
     // Exercise publication/restore without making an ordinary regression test
     // rebuild a separate native release runtime.
     fs::write(&spec, "version = 1\nentry = CLOSURE-SHAKE::MAIN\nprune-package = CLOSURE-SHAKE\ndynamic = explicit\n").unwrap();

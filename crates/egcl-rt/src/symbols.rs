@@ -75,12 +75,12 @@ static REGISTRY: OrderedRwLock<Option<SymbolRegistry>> =
     OrderedRwLock::new(LockLevel::GcWorld, 3, "GC-rooted symbol registry", None);
 static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
 
-/// Allocate a pinned `SIMPLE_BASE_STRING` on the GC heap holding `s`.
+/// Allocate a string on the GC heap holding `s`.
 ///
 /// Layout `[header | len: u64 | bytes]` (matches the reader's string encoding).
-/// Pinned + immortal because a symbol's name must never move out from under the
-/// object reference cached in the registry.
-fn alloc_pinned_name(s: &str) -> EgclVal {
+/// Interned names remain pinned; uninterned names move and are traced through
+/// their symbol's name cell or any other reference to the string.
+fn alloc_name(s: &str, pinned: bool) -> EgclVal {
     // A SIMPLE_BASE_STRING's payload is one BYTE PER CHARACTER (code points
     // below 256), so copying a Rust string's UTF-8 BYTES into one is correct
     // only for ASCII. For anything else the name decoded back as Latin-1
@@ -93,8 +93,12 @@ fn alloc_pinned_name(s: &str) -> EgclVal {
     // always right -- and write code points, not UTF-8 bytes.
     let (tid, padded) = crate::object::narrowest_string_alloc(s);
     let char_len = s.chars().count();
-    let body = crate::gc::alloc_pinned_typed(padded - header_size(), tid)
-        .expect("OOM allocating symbol name string");
+    let body = if pinned {
+        crate::gc::alloc_pinned_typed(padded - header_size(), tid)
+    } else {
+        crate::gc::alloc_typed(padded - header_size(), tid)
+    }
+    .expect("OOM allocating symbol name string");
     // SAFETY: `body` points past a freshly written header at `body - header`,
     // and `padded` was sized for exactly `char_len` characters at this width.
     unsafe {
@@ -179,7 +183,7 @@ pub fn intern(name: &str) -> u32 {
     // lock (`for_each_root_slot`); holding the write lock across the allocation
     // would deadlock. Both objects are pinned before any further allocation, so
     // a mid-intern collection cannot reclaim them.
-    let name_str = alloc_pinned_name(name);
+    let name_str = alloc_name(name, true);
     let sym = alloc_pinned_symbol(name_str, NIL);
     // Decide the result under the write lock, but do NOT touch the GC heap while
     // holding it. The re-check's `gc::unpin` acquires `heap_state` (lock order 2),
@@ -251,7 +255,7 @@ pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, 
     // (same discipline as `intern`).
     let new_names: Vec<EgclVal> = affected
         .iter()
-        .map(|(_, _, new_key)| alloc_pinned_name(new_key))
+        .map(|(_, _, new_key)| alloc_name(new_key, true))
         .collect();
     // Phase 3 (write lock): swap the map keys and heap name cells. No GC-heap
     // calls under the lock (bliss-52k).
@@ -388,7 +392,7 @@ pub fn symbol_name(idx: u32) -> Option<String> {
 /// name is not added to the intern map, so `intern`/`find_index` never return it.
 pub fn make_uninterned(name: &str) -> EgclVal {
     let idx = UNINTERNED_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name_str = alloc_pinned_name(name);
+    let name_str = alloc_name(name, false);
     let sym = alloc_pinned_symbol(name_str, NIL);
     with_registry_mut(|reg| {
         reg.uninterned.insert(idx, sym);
@@ -432,6 +436,52 @@ pub(crate) fn for_each_root_slot(mut f: impl FnMut(*mut EgclVal)) {
     for &obj in reg.uninterned.values() {
         visit(obj);
     }
+}
+
+/// Report an immediate symbol identity stored in host metadata.
+/// GC never changes the index; the temporary slot exposes its backing object.
+pub fn trace_symbol_index(index: u32, visit: &mut dyn FnMut(*mut EgclVal)) {
+    let mut symbol = EgclVal::from_symbol_index(index);
+    visit(&mut symbol);
+}
+
+pub(crate) fn uninterned_objects() -> HashMap<u32, EgclVal, FxBuildHasher> {
+    with_registry(|reg| reg.map(|reg| reg.uninterned.clone()).unwrap_or_default())
+}
+
+/// Major marking starts from interned cells only. Release the registry lock
+/// before visiting: a symbol-valued cell can resolve another registry entry.
+pub(crate) fn visit_interned_roots(mut visit: impl FnMut(EgclVal)) {
+    let objects = with_registry(|reg| reg.map(|reg| reg.interned.clone()).unwrap_or_default());
+    for object in objects {
+        unsafe {
+            let symbol = &*symbol_data(object);
+            for value in [
+                symbol.name,
+                symbol.value,
+                symbol.function,
+                symbol.plist,
+                symbol.package,
+            ] {
+                visit(value);
+            }
+        }
+    }
+}
+
+pub(crate) fn sweep_uninterned(mut live: impl FnMut(EgclVal) -> bool) -> Vec<(u32, EgclVal)> {
+    let mut dead = Vec::new();
+    with_registry_mut(|reg| {
+        reg.uninterned.retain(|&index, object| {
+            if live(*object) {
+                true
+            } else {
+                dead.push((index, *object));
+                false
+            }
+        });
+    });
+    dead
 }
 
 // ── Image serialization (bliss-jtc.6 Stage F) ───────────────────────────────
@@ -702,7 +752,8 @@ pub fn bind_symbol_value(idx: u32, value: EgclVal) -> Option<EgclVal> {
             // SAFETY: root scanners execute under the stop-the-world handshake.
             unsafe {
                 DYNAMIC_VALUES.scan(|values| {
-                    for value in values.borrow_mut().values_mut() {
+                    for (&index, value) in values.borrow_mut().iter_mut() {
+                        trace_symbol_index(index, visit);
                         visit(value);
                     }
                 })

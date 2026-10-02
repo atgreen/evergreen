@@ -1283,6 +1283,7 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
             let id = t.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
+                egcl_rt::rooted!(closure = closure);
                 // Give the object a fresh private name and record the closure's
                 // captured frame under it, mirroring the bytecode MakeClosure
                 // path: the tree-walker call sites reparent the body's frame to
@@ -1294,9 +1295,8 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
                     fresh.as_symbol_index(),
                     Arc::clone(&closure.captured_frame),
                 );
-                // params_form/body are bare EgclVals; alloc_interpreted roots
-                // them before it can allocate, and nothing allocates between the
-                // clone above and this call, so they cannot go stale.
+                // Symbol-name allocation may move the copied lambda list/body.
+                // The construction root above keeps this clone updated too.
                 return egcl_rt::function::alloc_interpreted(
                     closure.params_form,
                     closure.body,
@@ -7434,6 +7434,9 @@ fn visit_env_frame_roots(
         for value in frame.vars.values_mut() {
             visit(value as *mut EgclVal);
         }
+        for &index in frame.symbol_vars.keys() {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
+        }
         for value in frame.symbol_vars.values_mut() {
             visit(value as *mut EgclVal);
         }
@@ -7788,6 +7791,9 @@ fn visit_frozen_env_frame_roots(
             .symbol_vars
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for &index in vars.keys() {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
+        }
         for value in vars.values_mut() {
             visit(value);
         }
@@ -7860,6 +7866,12 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
 // Delivery follows closure and generic ownership from reachable handles. Ordinary
 // GC must continue scanning every registry entry until delivery removes it.
 fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool) {
+    for &index in PROCLAIMED_DECLARATIONS.borrow().iter() {
+        egcl_rt::symbols::trace_symbol_index(index, visit);
+    }
+    for &(index, _) in PROCLAIMED_OPTIMIZE.borrow().iter() {
+        egcl_rt::symbols::trace_symbol_index(index, visit);
+    }
     // SAFETY: registered root scanners run with all mutators stopped.
     unsafe {
         CONTROL_VALUES.scan(|values| {
@@ -7954,7 +7966,8 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
             for definition in capture.funs.values_mut() {
                 visit_fun_def_roots(definition, visit);
             }
-            for expansion in capture.symbol_macros.values_mut() {
+            for (&index, expansion) in capture.symbol_macros.iter_mut() {
+                egcl_rt::symbols::trace_symbol_index(index, visit);
                 visit(expansion);
             }
         }
@@ -8130,6 +8143,10 @@ impl Env {
     ) {
         visit_env_frame_roots(&self.frame, state, visit);
 
+        for &index in &self.locally_specials {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
+        }
+
         visit_fun_map_roots(&self.funs, state, visit);
         if root_closures {
             for def in self.macros.borrow_mut().values_mut() {
@@ -8139,10 +8156,12 @@ impl Env {
         for expander in self.setf_expanders.borrow_mut().values_mut() {
             visit_setf_expander_roots(expander, state, visit);
         }
-        for expansion in self.symbol_macros.borrow_mut().values_mut() {
+        for (&index, expansion) in self.symbol_macros.borrow_mut().iter_mut() {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
             visit(expansion);
         }
-        for expansion in self.global_symbol_macros.borrow_mut().values_mut() {
+        for (&index, expansion) in self.global_symbol_macros.borrow_mut().iter_mut() {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
             visit(expansion);
         }
         for restart in &mut self.restarts {
@@ -28413,7 +28432,7 @@ static PROCLAIMED_DECLARATIONS: LazyLock<SharedCell<std::collections::HashSet<u3
 
 /// Globally proclaimed OPTIMIZE qualities: (quality symbol index, value).
 /// Latest proclamation of a quality wins, as CLHS 3.3.4 requires of a global
-/// proclamation. Values are small integers, so no GC roots are involved.
+/// proclamation. Quality names retain symbol identities even when uninterned.
 static PROCLAIMED_OPTIMIZE: LazyLock<SharedCell<Vec<(u32, i64)>>> =
     LazyLock::new(|| SharedCell::new(Vec::new()));
 
@@ -31172,11 +31191,11 @@ fn make_compiler_macro_function(
 ) -> EgclVal {
     egcl_rt::rooted!(descriptor = descriptor);
     egcl_rt::rooted!(symbol_macros = symbol_macros);
-    let whole = egcl_rt::symbols::make_uninterned("WHOLE");
-    let environment = egcl_rt::symbols::make_uninterned("ENVIRONMENT");
+    egcl_rt::rooted!(whole = egcl_rt::symbols::make_uninterned("WHOLE"));
+    egcl_rt::rooted!(environment = egcl_rt::symbols::make_uninterned("ENVIRONMENT"));
     let invoke = resolve_sym("EGCL::%INVOKE-COMPILER-MACRO").unwrap();
     let quote = quote_sym();
-    egcl_rt::rooted!(params = vec_to_list(&[whole, environment]));
+    egcl_rt::rooted!(params = vec_to_list(&[*whole, *environment]));
     egcl_rt::rooted!(package = arena_str(package));
     egcl_rt::rooted!(quoted_descriptor = vec_to_list(&[quote, *descriptor]));
     egcl_rt::rooted!(quoted_macros = vec_to_list(&[quote, *symbol_macros]));
@@ -31184,8 +31203,8 @@ fn make_compiler_macro_function(
         call = vec_to_list(&[
             invoke,
             *quoted_descriptor,
-            whole,
-            environment,
+            *whole,
+            *environment,
             *package,
             *quoted_macros
         ])
@@ -33745,12 +33764,14 @@ fn install_slot_accessor_method(
     slot_sym: EgclVal,
     is_writer: bool,
 ) -> Result<(), EgclError> {
-    let obj = reader::make_uninterned_symbol("O");
-    // Root each fresh cons across the subsequent allocating list builds
-    // (moving GC; bliss-8qf): `method_name` may itself be a `(SETF acc)` cons.
+    // Creating the uninterned argument allocates its movable name string.
+    // Root incoming values first: method_name can itself be a (SETF acc) cons.
     egcl_rt::rooted!(method_name_r = method_name);
-    egcl_rt::rooted!(obj_spec = vec_to_list(&[obj, class_form])); // (o CLASS)
-    egcl_rt::rooted!(quoted_slot = vec_to_list(&[quote_sym(), slot_sym])); // 'SLOT
+    egcl_rt::rooted!(class_form = class_form);
+    egcl_rt::rooted!(slot_sym = slot_sym);
+    let obj = reader::make_uninterned_symbol("O");
+    egcl_rt::rooted!(obj_spec = vec_to_list(&[obj, *class_form])); // (o CLASS)
+    egcl_rt::rooted!(quoted_slot = vec_to_list(&[quote_sym(), *slot_sym])); // 'SLOT
     egcl_rt::rooted!(
         slot_place = vec_to_list(&[resolve_sym("SLOT-VALUE").unwrap_or(NIL), obj, *quoted_slot,])
     ); // (slot-value o 'SLOT)
@@ -38876,6 +38897,175 @@ mod host_registry_hook_tests {
 #[cfg(test)]
 mod env_gc_root_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_macro_temporaries_survive_allocation_pressure() {
+        const CHILD: &str = "EGCL_TEST_COMPILER_MACRO_SYMBOL_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new("timeout")
+                .args(["--kill-after=5", "45"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "cli::env_gc_root_tests::compiler_macro_temporaries_survive_allocation_pressure", "--nocapture"])
+                .env(CHILD, "1")
+                .env("EGCL_GC_STRESS", "1")
+                .env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_DISABLE")
+                .env_remove("EGCL_GC_STRESS_SKIP")
+                .env_remove("EGCL_GC_STRESS_AT")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        egcl_rt::init_heap(&egcl_rt::GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 4 * 1024 * 1024,
+            nursery_size: 8 * 1024,
+            tlab_size: 256,
+            region_size: 4096,
+            promotion_threshold: 1,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.0,
+        })
+        .unwrap();
+        ensure_package_registry();
+        {
+            egcl_rt::rooted!(function = make_compiler_macro_function(NIL, NIL, "CL-USER"));
+            let params = list_to_vec(egcl_rt::function::lambda_list(*function));
+            assert_eq!(
+                egcl_rt::symbols::symbol_name_of(params[0]).as_deref(),
+                Some("WHOLE")
+            );
+            assert_eq!(
+                egcl_rt::symbols::symbol_name_of(params[1]).as_deref(),
+                Some("ENVIRONMENT")
+            );
+        }
+        use egcl_rt::bytecode::{BytecodeFunction, Instr, VarLoc};
+        let nested = BytecodeFunction {
+            code: vec![Instr::LoadLocal(0), Instr::Return],
+            constants: vec![],
+            load_time_values: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            names: vec![],
+            restart_cases: vec![],
+            nested_functions: vec![],
+            param_layout: vec![("ARG".into(), VarLoc::Slot(0))],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 1,
+            max_stack: 1,
+            arity: 1,
+            name: "TEMPORARY-CLOSURE".into(),
+            params_form: NIL,
+            min_args: 1,
+            max_args: Some(1),
+            variadic: false,
+        };
+        {
+            egcl_rt::rooted!(function = bytecode::make_bytecode_closure(&nested, None));
+            assert_eq!(
+                egcl_rt::symbols::symbol_name_of(egcl_rt::function::name(*function)).as_deref(),
+                Some("CLOSURE")
+            );
+        }
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(
+            reference = register_tree_closure(Closure {
+                params_form: NIL,
+                body: NIL,
+                captured_frame: Arc::clone(&env.frame),
+                captured_blocks: vec![],
+                captured_tags: vec![],
+                captured_funs: None,
+            })
+        );
+        let id = cp(*reference).1.as_fixnum() as u64;
+        egcl_rt::rooted!(fresh_body = arena_cons(EgclVal::from_fixnum(42), NIL));
+        env.closures.borrow_mut().get_mut(&id).unwrap().body = *fresh_body;
+        let before = *fresh_body;
+        egcl_rt::rooted!(function = coerce_installed_function(&env, *reference));
+        assert_ne!(*fresh_body, before, "the captured body must actually move");
+        assert_eq!(egcl_rt::function::body(*function), *fresh_body);
+        let accessor = resolve_sym("TEMPORARY-ACCESSOR").unwrap();
+        let slot = resolve_sym("TEMPORARY-SLOT").unwrap();
+        let setf = resolve_sym("SETF").unwrap();
+        egcl_rt::rooted!(method_name = vec_to_list(&[setf, accessor]));
+        let method_key = function_name_key(*method_name);
+        let before_method = *method_name;
+        install_slot_accessor_method(&mut env, *method_name, T, slot, true).unwrap();
+        assert_ne!(
+            *method_name, before_method,
+            "the accessor name must actually move"
+        );
+        assert!(
+            env.methods.borrow().contains_key(&method_key),
+            "accessor registered under the wrong name"
+        );
+        assert!(egcl_rt::heap_stats().major_gc_count > 0);
+    }
+
+    #[test]
+    fn global_declarations_keep_symbol_identities_alive() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let declaration = 0x8000_0201;
+        let quality = 0x8000_0202;
+        PROCLAIMED_DECLARATIONS.borrow_mut().insert(declaration);
+        PROCLAIMED_OPTIMIZE.borrow_mut().push((quality, 1));
+        egcl_rt::gc::advance_root_scan_pass();
+        let mut seen = HashSet::new();
+        scan_evaluator_global_roots(&mut |slot| {
+            if let Some(index) = unsafe { *slot }.symbol_index() {
+                seen.insert(index);
+            }
+        });
+        PROCLAIMED_DECLARATIONS.borrow_mut().remove(&declaration);
+        PROCLAIMED_OPTIMIZE
+            .borrow_mut()
+            .retain(|&(index, _)| index != quality);
+        assert!(
+            seen.contains(&declaration),
+            "declaration symbol was not traced"
+        );
+        assert!(
+            seen.contains(&quality),
+            "optimization quality was not traced"
+        );
+    }
+
+    #[test]
+    fn env_root_visitor_keeps_symbol_map_keys_alive() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        env.frame.borrow_mut().symbol_vars.insert(0x8000_0101, NIL);
+        env.symbol_macros.borrow_mut().insert(0x8000_0102, NIL);
+        env.global_symbol_macros
+            .borrow_mut()
+            .insert(0x8000_0103, NIL);
+        env.locally_specials.push(0x8000_0104);
+        egcl_rt::gc::advance_root_scan_pass();
+        let mut seen = HashSet::new();
+        env.visit_gc_roots(&mut |slot| {
+            if let Some(index) = unsafe { *slot }.symbol_index() {
+                seen.insert(index);
+            }
+        });
+        for index in [0x8000_0101, 0x8000_0102, 0x8000_0103, 0x8000_0104] {
+            assert!(
+                seen.contains(&index),
+                "symbol map key {index:#x} was not traced"
+            );
+        }
+    }
 
     const BASE: i64 = 900_000_000;
     const ROOT_COUNT: i64 = 41;

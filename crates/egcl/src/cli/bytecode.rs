@@ -347,27 +347,42 @@ unsafe fn trace_bytecode_graph(
             trace_bytecode_graph(&mut **nested, visit, seen);
         }
     }
-    for instruction in &function.code {
+    trace_instruction_roots(&function.code, visit, seen);
+}
+
+fn trace_instruction_roots(
+    code: &[Instr],
+    visit: &mut dyn FnMut(*mut EgclVal),
+    seen: &mut std::collections::HashSet<usize>,
+) {
+    for instruction in code {
         let symbol = match instruction {
-            Instr::CallNamed { sym, .. } | Instr::LoadFunction(sym) => *sym,
+            Instr::CallNamed { sym, .. }
+            | Instr::LoadFunction(sym)
+            | Instr::LoadGlobal(sym)
+            | Instr::StoreGlobal(sym)
+            | Instr::BindSpecial(sym) => *sym,
             _ => continue,
         };
-        // Named definitions have ordinary global owners. Private calls can
-        // outlive the heap function object from which they were compiled.
-        let body = closure_bodies().borrow().get(&symbol).cloned();
-        if let Some(body) = body {
-            let frame = closure_envs().borrow().get(&symbol).cloned();
-            if let Some(frame) = frame {
-                super::visit_env_frame_roots(
-                    &frame,
-                    &mut super::EnvRootVisitState::default(),
-                    visit,
-                );
-            }
-            unsafe {
-                trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, seen)
-            };
+        trace_private_function_roots(symbol, visit, seen);
+    }
+}
+
+fn trace_private_function_roots(
+    symbol: u32,
+    visit: &mut dyn FnMut(*mut EgclVal),
+    seen: &mut std::collections::HashSet<usize>,
+) {
+    egcl_rt::symbols::trace_symbol_index(symbol, visit);
+    // Named definitions have ordinary global owners. Private calls can
+    // outlive the heap function object from which they were compiled.
+    let body = closure_bodies().borrow().get(&symbol).cloned();
+    if let Some(body) = body {
+        let frame = closure_envs().borrow().get(&symbol).cloned();
+        if let Some(frame) = frame {
+            super::visit_env_frame_roots(&frame, &mut super::EnvRootVisitState::default(), visit);
         }
+        unsafe { trace_bytecode_graph(Arc::as_ptr(&body) as *mut BytecodeFunction, visit, seen) };
     }
 }
 
@@ -2102,6 +2117,11 @@ struct TagScope {
 /// already-compiled `restart_cases` / `nested_functions` (bliss-wlf).
 impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        let mut seen = std::collections::HashSet::new();
+        trace_instruction_roots(&self.code, visit, &mut seen);
+        for &symbol in self.local_fns.values() {
+            trace_private_function_roots(symbol, visit, &mut seen);
+        }
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.macro_env, visit);
         for specifier in &mut self.declared_specifiers {
             visit(specifier as *mut EgclVal);
@@ -11864,7 +11884,7 @@ pub(super) fn make_bytecode_closure(
     // body before the registry owns it. Root the clone, not just its parent.
     let nested = Arc::new(nested.clone());
     egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(&nested));
-    let sym = egcl_rt::symbols::make_uninterned("CLOSURE");
+    egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("CLOSURE"));
     let sym_idx = sym.as_symbol_index();
     let lambda_list = if nested.variadic {
         nested.params_form
@@ -11878,7 +11898,7 @@ pub(super) fn make_bytecode_closure(
     if let Some(frame) = captured_env {
         closure_envs().borrow_mut().insert(sym_idx, frame);
     }
-    egcl_rt::function::alloc_interpreted(lambda_list, NIL, NIL, sym)
+    egcl_rt::function::alloc_interpreted(lambda_list, NIL, NIL, *sym)
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
@@ -23727,6 +23747,48 @@ fn format_native_listing(_: &NativeCode) -> String {
 #[cfg(test)]
 mod active_bytecode_root_tests {
     use super::*;
+
+    #[test]
+    fn lowerer_keeps_symbol_operands_and_local_function_names_alive() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let mut indices = Vec::new();
+        {
+            let mut lowerer = Lowerer::new(&env);
+            egcl_rt::rooted_ref!(_lowerer_root = &mut lowerer);
+            for name in ["LOAD", "STORE", "FUNCTION", "BIND", "CALL", "LOCAL"] {
+                let index = egcl_rt::symbols::make_uninterned(name).as_symbol_index();
+                indices.push(index);
+                match name {
+                    "LOAD" => lowerer.code.push(Instr::LoadGlobal(index)),
+                    "STORE" => lowerer.code.push(Instr::StoreGlobal(index)),
+                    "FUNCTION" => lowerer.code.push(Instr::LoadFunction(index)),
+                    "BIND" => lowerer.code.push(Instr::BindSpecial(index)),
+                    "CALL" => lowerer.code.push(Instr::CallNamed {
+                        sym: index,
+                        nargs: 0,
+                    }),
+                    _ => {
+                        lowerer.local_fns.insert(name.into(), index);
+                    }
+                }
+            }
+            egcl_rt::gc::full_gc().unwrap();
+            for &index in &indices {
+                assert!(
+                    egcl_rt::symbols::symbol_name(index).is_some(),
+                    "in-progress compiler lost symbol {index:#x}"
+                );
+            }
+        }
+        egcl_rt::gc::full_gc().unwrap();
+        for index in indices {
+            assert!(egcl_rt::symbols::symbol_name(index).is_none());
+        }
+    }
 
     #[test]
     fn macro_body_keeps_its_private_compiled_callee() {

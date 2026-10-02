@@ -99,12 +99,12 @@ pub struct Environment {
     functions: HashMap<u64, FunctionInfo>,
     /// Active declarations.
     declarations: Vec<DeclInfo>,
-    /// True when this level and everything above it hold no MOVABLE GC
-    /// pointers, so `visit_gc_roots` may stop here.
+    /// True when this level and everything above it need neither relocation
+    /// nor symbol liveness marking, so `visit_gc_roots` may stop here.
     ///
     /// Set only for the cached global-macro base, whose function map holds
-    /// immediate macro handles (`from_macro_handle`) — visiting an immediate is
-    /// a no-op, so skipping it is equivalent. It matters because descending
+    /// immediate macro handles (`from_macro_handle`) and immortal symbol keys.
+    /// It matters because descending
     /// into a parent uses `Arc::make_mut`, which CLONES a shared Arc: without
     /// this, sharing the base would make every GC trace copy it, which is worse
     /// than the per-expansion clone it replaces (bliss-htff).
@@ -171,10 +171,10 @@ impl Environment {
         }
     }
 
-    /// Yield every movable value slot retained by this compiler environment.
+    /// Yield every value retained by this compiler environment.
     ///
-    /// Environment map keys are symbol identity bits and therefore immediate;
-    /// only the binding/declaration payloads can point into the moving heap.
+    /// Symbol keys are immediate, but still keep their backing objects alive.
+    /// Binding/declaration payloads can also point into the moving heap.
     /// `Arc::make_mut` safely gives this stored environment its own parent chain
     /// when another environment shares a frame.
     pub fn visit_gc_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
@@ -203,6 +203,15 @@ impl Environment {
 
     /// Visit this frame's own reference slots, without descending.
     fn visit_own_gc_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for &key in self
+            .variables
+            .keys()
+            .chain(self.functions.keys())
+            .chain(self.blocks.iter())
+            .chain(self.tags.iter())
+        {
+            visit(&mut EgclVal(key));
+        }
         for info in self.variables.values_mut() {
             match info {
                 VariableInfo::Constant(value) | VariableInfo::SymbolMacro(value) => visit(value),
@@ -215,6 +224,17 @@ impl Environment {
             }
         }
         for declaration in &mut self.declarations {
+            match declaration {
+                DeclInfo::Declaration(key)
+                | DeclInfo::Type(key, _)
+                | DeclInfo::Ignore(key)
+                | DeclInfo::Ignorable(key)
+                | DeclInfo::Dynamic(key)
+                | DeclInfo::Custom(key, _) => {
+                    visit(&mut EgclVal(*key));
+                }
+                DeclInfo::Optimize(_) => {}
+            }
             match declaration {
                 DeclInfo::Type(_, value) | DeclInfo::Custom(_, value) => visit(value),
                 DeclInfo::Optimize(_)
@@ -440,11 +460,20 @@ impl Environment {
 
     /// General-purpose augment-environment (CLtL2 compatible).
     /// Creates a new environment augmented with given bindings and declarations.
-    /// Mark this environment as holding no movable GC pointers, so a child may
-    /// share it by `Arc` without the collector cloning it. Only correct when
-    /// every value it (and its parents) hold is an immediate.
+    /// Skip scanning this environment through shared children only when its
+    /// values need neither relocation nor liveness marking. Uninterned symbols
+    /// are immediate values, but their backing objects are collectible.
     pub fn mark_no_gc_roots(mut self) -> Environment {
-        self.no_gc_roots = true;
+        let mut needs_roots = false;
+        self.visit_gc_roots(&mut |slot| {
+            let value = unsafe { *slot };
+            needs_roots |= value.is_cons()
+                || value.is_heap_object()
+                || value
+                    .symbol_index()
+                    .is_some_and(egcl_rt::symbols::is_uninterned);
+        });
+        self.no_gc_roots = !needs_roots;
         self
     }
 
@@ -583,7 +612,8 @@ fn scan_global_macro_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     let mut table = GLOBAL_MACRO_TABLE
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for expander in table.values_mut() {
+    for (&key, expander) in table.iter_mut() {
+        visit(&mut EgclVal(key));
         visit(expander);
     }
 }
@@ -3088,6 +3118,51 @@ fn expand_local_quasiquote(
 mod registry_key_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn cached_parent_keeps_uninterned_symbol_keys_visible() {
+        let symbol = EgclVal::from_symbol_index(0x8000_1234);
+        let mut parent = Environment::null();
+        parent.functions.insert(symbol.0, FunctionInfo::Lexical);
+        let parent = Arc::new(parent.mark_no_gc_roots());
+        let mut child = Environment::child_of(parent, vec![], vec![], vec![]);
+        let mut seen = false;
+        child.visit_gc_roots(&mut |slot| {
+            seen |= unsafe { *slot } == symbol;
+        });
+        assert!(seen, "cached parent skipped a collectible symbol");
+    }
+
+    #[test]
+    fn environment_traces_symbol_identities_in_keys_and_declarations() {
+        use egcl_rt::value::NIL;
+        let keys: Vec<_> = (0..10)
+            .map(|n| EgclVal::from_symbol_index(0x8000_1000 + n).0)
+            .collect();
+        let mut env = Environment::null();
+        env.variables.insert(keys[0], VariableInfo::Lexical);
+        env.functions.insert(keys[1], FunctionInfo::Lexical);
+        env.blocks.insert(keys[2]);
+        env.tags.insert(keys[3]);
+        env.declarations = vec![
+            DeclInfo::Declaration(keys[4]),
+            DeclInfo::Type(keys[5], NIL),
+            DeclInfo::Ignore(keys[6]),
+            DeclInfo::Ignorable(keys[7]),
+            DeclInfo::Dynamic(keys[8]),
+            DeclInfo::Custom(keys[9], NIL),
+        ];
+        let mut seen = HashSet::new();
+        env.visit_gc_roots(&mut |slot| {
+            seen.insert(unsafe { *slot }.0);
+        });
+        for key in keys {
+            assert!(
+                seen.contains(&key),
+                "compiler environment did not trace {key:#x}"
+            );
+        }
+    }
 
     /// bliss-6b2 regression: `MACRO_FUNCTION_REGISTRY` is a single table keyed by
     /// `key.0`, and BOTH macrolet-local expanders (via `enclose`) and the

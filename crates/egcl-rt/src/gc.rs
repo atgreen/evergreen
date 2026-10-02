@@ -2401,7 +2401,14 @@ impl HeapCollector {
         // was not already marked, which is exactly the old
         // `contains_key(..) && marked.insert(..)` pair — in two bit operations
         // instead of two hash lookups.
+        // Root scanners hold locks ordered after the symbol registry. Resolve
+        // immediate identities through a stopped-world snapshot, not a nested lock.
+        let symbol_objects = crate::symbols::uninterned_objects();
         let mark_ref = |v: EgclVal, map: &mut NurseryObjectMap, worklist: &mut Vec<usize>| {
+            let v = v
+                .symbol_index()
+                .and_then(|index| symbol_objects.get(&index).copied())
+                .unwrap_or(v);
             if is_heap_ref(v) {
                 // Resolve persistent (CHANGE-CLASS) forwarding first, as in
                 // the minor collector's mark_ref (bliss-334).
@@ -2427,12 +2434,10 @@ impl HeapCollector {
         // this one walk covers mixed-tier stacks.
         Self::scan_cl_stack_roots(|v| mark_ref(v, &mut object_map, &mut scan_worklist));
 
-        // Symbol-table roots (bliss-jtc.6 Stage C): every interned/uninterned
-        // symbol's cells are roots, so a heap object reachable only through a
-        // global symbol (its value/function/plist) survives collection.
-        crate::symbols::for_each_root_slot(|slot| {
-            let v = unsafe { *slot };
-            mark_ref(v, &mut object_map, &mut scan_worklist);
+        // Interned symbols own their cells permanently. Uninterned symbols
+        // enter the marking graph only through reachable symbol identities.
+        crate::symbols::visit_interned_roots(|value| {
+            mark_ref(value, &mut object_map, &mut scan_worklist);
         });
         // External roots (bliss-jtc.8): EgclVals owned outside the GC heap, e.g.
         // hash-table entries in a Rust Vec.
@@ -2462,6 +2467,13 @@ impl HeapCollector {
                 });
             }
         }
+
+        let dead_symbols =
+            crate::symbols::sweep_uninterned(|object| object_map.is_marked(ref_body_addr(object)));
+        let dead_symbol_objects: std::collections::HashSet<_> = dead_symbols
+            .iter()
+            .map(|(_, object)| (object.to_raw() & !crate::value::TAG_MASK) as usize)
+            .collect();
 
         // Compute live_bytes per region from mark results.
         // Also run finalizers for dead objects and break their weak pointers.
@@ -2512,9 +2524,15 @@ impl HeapCollector {
                                 } else {
                                     dead_functions.insert(name);
                                     if unsafe { header_is_pinned(header_ptr) } {
-                                        dead_function_slots.push((cursor, body_size as usize));
+                                        dead_function_slots.push((cursor, unsafe {
+                                            header_exact_body_len(header_ptr)
+                                        }));
                                     }
                                 }
+                            }
+                            if dead_symbol_objects.contains(&cursor) {
+                                dead_function_slots
+                                    .push((cursor, unsafe { header_exact_body_len(header_ptr) }));
                             }
                             if object_map.is_marked(body_addr) {
                                 live += total_size as u32;
@@ -2545,8 +2563,13 @@ impl HeapCollector {
 
         // Break weak pointers to dead objects (R3.13).
         {
-            let dead_set: std::collections::HashSet<u64> =
+            let mut dead_set: std::collections::HashSet<u64> =
                 dead_object_vals.iter().map(|v| v.to_raw()).collect();
+            dead_set.extend(
+                dead_symbols
+                    .iter()
+                    .map(|(index, _)| EgclVal::from_symbol_index(*index).to_raw()),
+            );
             break_dead_weak_pointers(&|val: EgclVal| dead_set.contains(&val.to_raw()));
             // Weak containers drop entries for the same dead objects. Nothing has
             // moved yet at this point in a major cycle, so this pass only decides
@@ -2558,7 +2581,7 @@ impl HeapCollector {
         }
 
         // Captures, finalizers and weak references have now observed the old
-        // identity. Erase dead function fields before reusing their storage;
+        // identity. Erase dead pinned object fields before reusing their storage;
         // type-zero fillers preserve heap walking without retaining references.
         for &(address, size) in &dead_function_slots {
             unsafe {
@@ -2566,7 +2589,7 @@ impl HeapCollector {
                 write_object_header(address as *mut u8, 0, size as u32);
             }
         }
-        state.free_function_slots.extend(dead_function_slots);
+        state.free_pinned_slots.extend(dead_function_slots);
 
         // Phase 2: Region selection — find old-gen regions with high garbage ratio.
         // A region is a candidate if live_bytes < 50% of used bytes (i.e. mostly garbage).
@@ -2845,7 +2868,7 @@ impl HeapCollector {
                     region_has_pinned(region.base as usize, region.header.alloc_top as usize)
                 }
         });
-        state.free_function_slots.retain(|&(address, _)| {
+        state.free_pinned_slots.retain(|&(address, _)| {
             let index = (address - heap_base_addr) / region_size;
             state.pinned_hosts.contains(&index)
                 && address < state.regions[index].header.alloc_top as usize
@@ -4987,7 +5010,7 @@ pub fn alloc_character_string(s: &str) -> EgclVal {
 ///
 /// This is for process-lifetime objects whose raw addresses are cached outside
 /// the moving heap, such as interned symbols and their names. Interpreted
-/// functions also use this path for stable addresses, but major GC can reclaim
+/// functions and uninterned symbols also use stable addresses, but major GC can reclaim
 /// their slots once unreachable. Unlike
 /// [`alloc_typed`], this path intentionally does not run `EGCL_GC_STRESS`
 /// before allocation: stress collections are meant to shake out ordinary
@@ -5040,13 +5063,16 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         return None;
     }
 
-    if type_id == crate::object::type_id::FUNCTION_INTERPRETED {
+    if matches!(
+        type_id,
+        crate::object::type_id::FUNCTION_INTERPRETED | crate::object::type_id::SYMBOL
+    ) {
         if let Some(index) = state
-            .free_function_slots
+            .free_pinned_slots
             .iter()
             .rposition(|&(_, size)| size == body_size)
         {
-            let (address, _) = state.free_function_slots.swap_remove(index);
+            let (address, _) = state.free_pinned_slots.swap_remove(index);
             let ptr = address as *mut u8;
             let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
             unsafe { (*(ptr as *mut ObjectHeader)).set_pinned() };
@@ -5543,8 +5569,14 @@ pub fn register_finalizer(object: EgclVal, finalizer: EgclVal) -> Result<(), Egc
 /// Convert a Lisp heap value into the opaque, untagged body key used by the
 /// finalizer side table.  Keeping this representation out of ordinary root
 /// scanning is what makes the association weak.  The helper also handles the
-/// extended header used by large heap objects.
+/// extended header used by large heap objects and symbols' indirect identities.
 pub fn finalizer_key(object: EgclVal) -> Result<EgclVal, EgclError> {
+    let object = object
+        .symbol_index()
+        .and_then(crate::symbols::symbol_object_ptr)
+        // Registry entries point at pinned SymbolData headers.
+        .map(|address| unsafe { EgclVal::from_heap_ptr(address as *mut u8) })
+        .unwrap_or(object);
     if object.is_cons() {
         // A cons-tagged value points directly at its two-word body.
         return Ok(EgclVal::from_raw(unsafe { object.as_ptr() } as u64));
@@ -5769,9 +5801,9 @@ struct HeapState {
     /// pins was turning every OldGen region unreclaimable one gensym at a time
     /// until the heap ran out of regions.
     pinned_hosts: std::collections::HashSet<usize>,
-    /// Dead pinned function slots, recorded only after major-GC reachability.
-    /// Each slot remains a walkable filler until reused; live functions never move.
-    free_function_slots: Vec<(usize, usize)>,
+    /// Dead pinned function/symbol slots, recorded after major-GC reachability.
+    /// Each slot remains a walkable filler until reused; live objects never move.
+    free_pinned_slots: Vec<(usize, usize)>,
 }
 
 // Safety: HeapState is only accessed under the global mutex.
@@ -5911,7 +5943,7 @@ pub fn init_heap(config: &GcConfig) -> Result<(), EgclError> {
     // changes across processes, which is exactly what the image format needs.
     let state = HeapState {
         pinned_hosts: std::collections::HashSet::new(),
-        free_function_slots: Vec::new(),
+        free_pinned_slots: Vec::new(),
         config: config.clone(),
         stats,
         regions,
@@ -6073,7 +6105,7 @@ fn byte_store(name: &'static str) -> &'static OrderedMutex<Vec<u8>> {
 }
 
 fn clear_heap_objects(state: &mut HeapState) {
-    state.free_function_slots.clear();
+    state.free_pinned_slots.clear();
     state.pinned_hosts.clear();
     for region in &mut state.regions {
         let used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
