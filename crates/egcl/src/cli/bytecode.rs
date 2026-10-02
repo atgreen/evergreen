@@ -2064,6 +2064,9 @@ struct Lowerer<'e> {
     /// through the shared tag-token stack (`env.tag_stack`) — the tagbody
     /// analogue of `enclosing_blocks` (bliss-x8t).
     enclosing_tags: std::collections::HashSet<String>,
+    /// Exit tag of the lexically innermost extended LOOP. Unlike the loop
+    /// driver's runtime token, this must be inherited by nested functions.
+    loop_finish_tag: Option<String>,
     /// Names bound to an *unboxed frame slot* in an enclosing function that this
     /// body (a nested closure) closes over. Such a name cannot be reached from
     /// the child — the parent slot lives on the bytecode operand frame, not in
@@ -2170,6 +2173,7 @@ impl<'e> Lowerer<'e> {
             block_scope: Vec::new(),
             enclosing_blocks: std::collections::HashSet::new(),
             enclosing_tags: std::collections::HashSet::new(),
+            loop_finish_tag: None,
             enclosing_slots: std::collections::HashSet::new(),
             tag_scope: Vec::new(),
             pending_gos: Vec::new(),
@@ -2523,6 +2527,13 @@ impl<'e> Lowerer<'e> {
                 "DOTIMES" => self.lower_dotimes(rest),
                 "DOLIST" => self.lower_dolist(rest),
                 "LOOP" => self.lower_loop(rest),
+                "LOOP-FINISH" => {
+                    if !rest.is_nil() {
+                        return Err(Bail);
+                    }
+                    let tag = self.loop_finish_symbol()?;
+                    self.lower_go(form_list(&[tag]))
+                }
                 "UNWIND-PROTECT" => self.lower_unwind_protect(rest),
                 "HANDLER-CASE" => self.lower_handler_case(rest),
                 "HANDLER-BIND" => self.lower_handler_bind(rest),
@@ -3965,11 +3976,13 @@ impl<'e> Lowerer<'e> {
         // tag on the shared control-token stack via NamedTag so a non-local
         // `GO` from that closure (GoNamed) can unwind here (bliss-x8t). Emitted
         // right after PushTag (runs once at tagbody entry); tag_bcp is patched
-        // below once tag PCs are known, like pending_gos. Gated so ordinary
-        // loops emit none and their bytecode is unchanged.
+        // below once tag PCs are known, like pending_gos. A LOOP-FINISH target
+        // must also be registered when a macro hides the closure from this
+        // source scan. Registration is once at entry, not on each back-edge.
         let mut named_tag_idxs: Vec<(usize, String)> = Vec::new();
-        if body_may_capture_closure(&items) {
-            for name in &tag_order {
+        let may_capture = body_may_capture_closure(&items);
+        for name in &tag_order {
+            if may_capture || self.loop_finish_tag.as_ref() == Some(name) {
                 let name_idx = self.intern_name(name);
                 self.emit(Instr::NamedTag {
                     name_idx,
@@ -4213,11 +4226,9 @@ impl<'e> Lowerer<'e> {
         self.lower_expr(block_form)
     }
 
-    /// `(loop form*)` — only the *simple* loop form (bliss-jtc.28 follow-up):
-    /// every form is a compound form and the loop repeats them until an explicit
-    /// RETURN/RETURN-FROM. Lowered to `(block nil (tagbody top form* (go top)))`
-    /// so it promotes like any other loop. The *extended* LOOP (with atomic
-    /// keywords such as FOR/WHILE/COLLECT) is left to the tree-walker.
+    /// Compile simple and extended LOOP forms through core control forms.
+    /// Only an extended LOOP establishes a new lexical LOOP-FINISH target;
+    /// a simple loop nested inside it inherits the enclosing target.
     fn lower_loop(&mut self, rest: EgclVal) -> LowerResult<()> {
         // Root the clause list so the &[EgclVal] slices handed to the
         // lower_loop_* helpers stay precise across their allocating lowering
@@ -4230,35 +4241,45 @@ impl<'e> Lowerer<'e> {
         // means the extended grammar — dispatch the common single-`for` shapes by
         // their iteration keyword, else bail to the tree-walker's full LOOP.
         if !forms.iter().all(|f| f.is_cons()) {
-            let kw = |f: EgclVal| -> Option<String> {
-                f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
-            };
-            // Try the proven specialized handlers first for the shapes they
-            // recognize; each bails during parsing (before emitting) on an
-            // unsupported clause, so falling through to the general compiler is
-            // safe. A partial emit (code grew before a bail) can't be recovered,
-            // so give up in that case.
-            let snapshot = self.code.len();
-            let specialized = match kw(forms[0]).as_deref() {
-                Some("WHILE") | Some("UNTIL") => Some(self.lower_loop_while(&forms)),
-                Some("REPEAT") => Some(self.lower_loop_repeat(&forms)),
-                Some("FOR") if forms.len() >= 3 => match kw(forms[2]).as_deref() {
-                    Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
-                        Some(self.lower_loop_numeric_for(&forms))
-                    }
-                    Some("IN") => Some(self.lower_loop_for_in(&forms)),
-                    Some("ON") => Some(self.lower_loop_for_on(&forms)),
-                    Some("BEING") => Some(self.lower_loop_for_being_hash(&forms)),
+            // A globally unique tag is also safe in a nested function, whose
+            // local fresh_id counter starts over. Restore the outer lexical
+            // target even if a specialized lowering declines compilation.
+            let tag_name = next_control_token("__LOOP_FINISH__").replace(':', "_");
+            let tag = sym_name(resolve_sym(&tag_name).ok_or(Bail)?);
+            let outer = self.loop_finish_tag.replace(tag);
+            let lowered = (|| {
+                let kw = |f: EgclVal| -> Option<String> {
+                    f.is_symbol().then(|| sym_bare_name_rc(f).to_string())
+                };
+                // Try the proven specialized handlers first for the shapes they
+                // recognize; each bails during parsing (before emitting) on an
+                // unsupported clause, so falling through to the general compiler is
+                // safe. A partial emit (code grew before a bail) can't be recovered,
+                // so give up in that case.
+                let snapshot = self.code.len();
+                let specialized = match kw(forms[0]).as_deref() {
+                    Some("WHILE") | Some("UNTIL") => Some(self.lower_loop_while(&forms)),
+                    Some("REPEAT") => Some(self.lower_loop_repeat(&forms)),
+                    Some("FOR") if forms.len() >= 3 => match kw(forms[2]).as_deref() {
+                        Some("FROM") | Some("UPFROM") | Some("DOWNFROM") => {
+                            Some(self.lower_loop_numeric_for(&forms))
+                        }
+                        Some("IN") => Some(self.lower_loop_for_in(&forms)),
+                        Some("ON") => Some(self.lower_loop_for_on(&forms)),
+                        Some("BEING") => Some(self.lower_loop_for_being_hash(&forms)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            };
-            match specialized {
-                Some(Ok(())) => return Ok(()),
-                Some(Err(_)) if self.code.len() != snapshot => return Err(Bail),
-                _ => {}
-            }
-            return self.lower_loop_general(&forms);
+                };
+                match specialized {
+                    Some(Ok(())) => return Ok(()),
+                    Some(Err(_)) if self.code.len() != snapshot => return Err(Bail),
+                    _ => {}
+                }
+                self.lower_loop_general(&forms)
+            })();
+            self.loop_finish_tag = outer;
+            return lowered;
         }
         let id = self.fresh_id();
         let top = resolve_sym(&format!("%LOOP-TOP{id}")).ok_or(Bail)?;
@@ -4269,6 +4290,10 @@ impl<'e> Lowerer<'e> {
         tb.push(form_list(&[s("GO")?, top]));
         let block = form_list(&[s("BLOCK")?, NIL, form_list(&tb)]);
         self.lower_expr(block)
+    }
+
+    fn loop_finish_symbol(&self) -> LowerResult<EgclVal> {
+        resolve_sym(self.loop_finish_tag.as_deref().ok_or(Bail)?).ok_or(Bail)
     }
 
     /// General extended-LOOP compiler: expand the clause grammar to core forms
@@ -4301,7 +4326,7 @@ impl<'e> Lowerer<'e> {
             Ok(name)
         };
         let top = resolve_sym(&format!("%LG-TOP{id}")).ok_or(Bail)?;
-        let end = resolve_sym(&format!("%LG-END{id}")).ok_or(Bail)?;
+        let end = self.loop_finish_symbol()?;
         // First-iteration flag: `for VAR = INIT then STEP` evaluates INIT only on
         // iteration 1 (guarded by this flag in `pre`, in source order) and STEP on
         // later iterations. Only bound when a `= … then …` clause is present.
@@ -4812,7 +4837,8 @@ impl<'e> Lowerer<'e> {
             form_list(&[s("1-")?, count]),
         ]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let mut tagbody = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let finish = self.loop_finish_symbol()?;
+        let mut tagbody = form_list(&[s("TAGBODY")?, top, form_list(&when_items), finish]);
         egcl_rt::rooted_ref!(_tagbody_root = &mut tagbody);
         egcl_rt::rooted!(bindings = vec![form_list(&[count, forms[1]])]);
         if uses_acc {
@@ -4899,7 +4925,8 @@ impl<'e> Lowerer<'e> {
             form_list(&[s(step_op)?, var, step_v]),
         ]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let finish = self.loop_finish_symbol()?;
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items), finish]);
         egcl_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
         // Root the vector FIRST, then build into it one element at a time
@@ -5130,7 +5157,8 @@ impl<'e> Lowerer<'e> {
         when_items.extend(per_iter.iter().copied());
         when_items.append(&mut steps);
         when_items.push(form_list(&[s("GO")?, top]));
-        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let finish = self.loop_finish_symbol()?;
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items), finish]);
         egcl_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
         if uses_acc {
@@ -5238,7 +5266,8 @@ impl<'e> Lowerer<'e> {
         when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[s("SETQ")?, var, form_list(&[s("CDR")?, var])]));
         when_items.push(form_list(&[s("GO")?, top]));
-        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let finish = self.loop_finish_symbol()?;
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items), finish]);
         egcl_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
         egcl_rt::rooted!(binding_items = vec![form_list(&[var, list])]);
@@ -5288,7 +5317,8 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted!(when_items = vec![s("WHEN")?, test]);
         when_items.extend(per_iter.iter().copied());
         when_items.push(form_list(&[s("GO")?, top]));
-        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items)]);
+        let finish = self.loop_finish_symbol()?;
+        let mut tagbody_form = form_list(&[s("TAGBODY")?, top, form_list(&when_items), finish]);
         egcl_rt::rooted_ref!(_tagbody_form_root = &mut tagbody_form);
 
         let bindings = if uses_acc {
@@ -6215,6 +6245,7 @@ impl<'e> Lowerer<'e> {
                 &enclosing_tags,
                 &enclosing_slots,
                 &std::collections::HashSet::new(),
+                self.loop_finish_tag.as_deref(),
             )
             .ok_or(Bail)?
         } else {
@@ -6255,6 +6286,7 @@ impl<'e> Lowerer<'e> {
                 &enclosing_tags,
                 &enclosing_slots,
                 self.portable,
+                self.loop_finish_tag.as_deref(),
             )
             .ok_or(Bail)?
         };
@@ -6275,7 +6307,7 @@ impl<'e> Lowerer<'e> {
     fn lower_lambda(&mut self, op: EgclVal, rest: EgclVal) -> LowerResult<()> {
         let (params_form, body) = cp(rest);
         let captured = self.lambda_captured_locals(params_form, body);
-        if self.portable {
+        if self.portable || self.loop_finish_tag.is_some() {
             return self.emit_portable_closure(params_form, body, &captured);
         }
         egcl_rt::rooted!(form = arena_cons(op, rest));
@@ -6326,7 +6358,7 @@ impl<'e> Lowerer<'e> {
             if t_op.is_symbol() && sym_name(t_op) == "LAMBDA" {
                 let (params_form, body) = cp(t_rest);
                 let captured = self.lambda_captured_locals(params_form, body);
-                if self.portable {
+                if self.portable || self.loop_finish_tag.is_some() {
                     return self
                         .emit_portable_closure(params_form, body, &captured)
                         .inspect_err(|_e| {
@@ -6419,7 +6451,7 @@ impl<'e> Lowerer<'e> {
         // bodies only in the compiling process's registry, so it never survives a
         // .bfasl round-trip.) A capturing closure additionally reaches the
         // enclosing lexicals through the frame.
-        if self.portable {
+        if self.portable || self.loop_finish_tag.is_some() {
             return self.lower_flet_capturing(&parsed, &defs[..], body, is_labels);
         }
 
@@ -6631,6 +6663,7 @@ impl<'e> Lowerer<'e> {
                 &enclosing_tags,
                 &child_enclosing_slots,
                 self.portable,
+                self.loop_finish_tag.as_deref(),
             )
             .ok_or(Bail)?;
             let idx = self.nested_functions.len();
@@ -6737,6 +6770,7 @@ fn compile_capturing_local(
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
     portable: bool,
+    loop_finish_tag: Option<&str>,
 ) -> Option<BytecodeFunction> {
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
@@ -6750,6 +6784,7 @@ fn compile_capturing_local(
     lo.closure_fns = callable.clone();
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
+    lo.loop_finish_tag = loop_finish_tag.map(str::to_owned);
     // A capture/param of the same name shadows an enclosing slot (it resolves
     // locally first), so keep only genuinely-free enclosing slots (bliss-9u6d).
     lo.enclosing_slots = enclosing_slots
@@ -8069,6 +8104,7 @@ fn compile_function(
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
+        None,
     )
 }
 
@@ -8121,6 +8157,7 @@ fn compile_function_in(
     enclosing_tags: &std::collections::HashSet<String>,
     enclosing_slots: &std::collections::HashSet<String>,
     captures: &std::collections::HashSet<String>,
+    loop_finish_tag: Option<&str>,
 ) -> Option<BytecodeFunction> {
     // A failed allocating attempt can relocate both inputs before a retry.
     // Source-free delivery restores bytecode; native tiering compiles that
@@ -8145,6 +8182,7 @@ fn compile_function_in(
             enclosing_slots,
             captures,
             &forced,
+            loop_finish_tag,
         );
         if attempt.is_some() {
             return attempt;
@@ -8171,6 +8209,7 @@ fn compile_function_forcing_boxed(
     enclosing_slots: &std::collections::HashSet<String>,
     captures: &std::collections::HashSet<String>,
     forced_boxed: &std::collections::HashSet<String>,
+    loop_finish_tag: Option<&str>,
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
@@ -8273,6 +8312,7 @@ fn compile_function_forcing_boxed(
     }
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
+    lo.loop_finish_tag = loop_finish_tag.map(str::to_owned);
     // Drop names shadowed by this function's own params: only genuinely-free
     // references to an unreachable enclosing slot should bail (bliss-9u6d).
     lo.enclosing_slots = enclosing_slots
@@ -12240,6 +12280,7 @@ fn compile_defun(
             &empty,
             &empty,
             &captures,
+            None,
         )
     };
     reset_last_bail_reason();
