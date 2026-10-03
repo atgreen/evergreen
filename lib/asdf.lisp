@@ -7369,6 +7369,7 @@ or an indication of failure via the EXIT-CODE of the process"
                  ;; (egcl lacks SLURP-INPUT-STREAM's stream methods).
                  (cond
                    ((null spec) nil)
+                   ((streamp spec) (write-string str spec) nil)
                    ((or (eq spec t) (eq spec :interactive)) (write-string str) nil)
                    ((eq spec :string) str)
                    ((and (consp spec) (eq (first spec) :string))
