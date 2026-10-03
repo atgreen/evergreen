@@ -560,6 +560,8 @@ mod tests {
         assert_eq!(count_guards(&f), 1, "an unproven guard must survive");
     }
 
+    // spec-covers: R4.63
+    // "Per-operation re-guarding of an already-narrowed value is a defect."
     #[test]
     fn dominating_duplicate_guard_is_removed() {
         // entry: Guard(p : FIXNUM) ; jump B.   B: Guard(p : FIXNUM) ; ret.
@@ -687,6 +689,10 @@ mod tests {
         );
     }
 
+    // spec-covers: R4.63
+    // "exactly one guard at the earliest point that dominates all speculative
+    // uses (typically a loop preheader)" — the guard moves to the preheader and
+    // count_guards stays 1, so hoisting neither duplicates nor drops it.
     #[test]
     fn loop_invariant_guard_is_hoisted() {
         // entry(v:TOP) -> header ; header: Guard(v:FIXNUM) ; brif -> body, exit ;

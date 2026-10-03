@@ -204,6 +204,11 @@ mod tests {
         (f, header)
     }
 
+    // spec-covers: R4.66
+    // A dedicated OSR entry region (a distinct block, not the header or the
+    // normal entry) whose live-ins import one param per interpreter slot with
+    // MATCHING type and repr — "the state A4.03 transfers in is exactly the
+    // state the loop body consumes".
     #[test]
     fn osr_entry_imports_header_slots() {
         let (mut f, header) = counted_loop();

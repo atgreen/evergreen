@@ -752,6 +752,11 @@ mod gc_pause_tests {
         assert!(result.is_ok(), "thread exit lost an arrival: {result:?}");
     }
 
+    // spec-covers: R3.14
+    // GC pauses run through the cooperative safepoint handshake: the mutator
+    // acknowledges and participates rather than being suspended asynchronously.
+    // Coverage, NOT a correctness claim — bliss-ddqhv is an open handshake bug
+    // under EGCL_GC_STRESS, and gc.yml still skips one safepoint test by name.
     #[test]
     fn parked_mutator_participates_in_consecutive_pauses() {
         const CHILD: &str = "EGCL_TEST_CONSECUTIVE_PAUSES_CHILD";
@@ -809,6 +814,8 @@ mod gc_pause_tests {
         assert!(failure.is_none(), "consecutive pause failed: {failure:?}");
     }
 
+    // spec-covers: R3.14
+    // "All GC activity MUST respect safepoints" — including major GC root scan.
     #[test]
     fn major_gc_keeps_world_stopped_while_scanning_roots() {
         const CHILD: &str = "EGCL_TEST_MAJOR_PAUSE_CHILD";

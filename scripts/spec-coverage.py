@@ -7,8 +7,11 @@
 Enumerates the normative requirements declared in ``spec/`` (both markdown
 table rows of the form ``| R6.45 | ... | MUST |`` and prose entries of the
 form ``**R10.01** ... MUST ...``) and checks which are cited by at least one
-test under ``crates/*/tests/`` — tests reference a requirement by its R-id,
-e.g. ``// Per R6.45, (require ...) delegates to ASDF``.
+test. A test under ``crates/*/tests/`` (or in a ``test*``-named file) cites a
+requirement by bare R-id, e.g. ``// Per R6.45, (require ...) delegates to
+ASDF``. A unit test inside a ``#[cfg(test)]`` module in an implementation file
+claims coverage with an explicit ``spec-covers: R6.45`` marker, because in
+those files a bare R-id is usually implementation prose, not a test.
 
 Why this exists: a spec-mandated capability that no phase ever turned into a
 task is never tested *and* never implemented, so it sails straight past a
@@ -51,6 +54,13 @@ from collections import defaultdict
 from pathlib import Path
 
 _RID_EXACT = re.compile(r"R\d+\.\d+")
+# An explicit, intentional coverage claim: `spec-covers: R4.64, R4.65`.
+# Recognised in ANY .rs file, so a `#[cfg(test)] mod tests` living beside
+# the code it tests can claim coverage without being renamed. Deliberately
+# a distinct marker rather than a bare R-id: bare ids appear throughout
+# implementation prose (gc.rs alone cites R1.09/R7.01 in module docs), and
+# counting those would let a comment satisfy a *test*-coverage gate.
+_RID_COVERS = re.compile(r"spec-covers:\s*([R\d.,\s]+)")
 _RID_PROSE = re.compile(r"^\*\*(R\d+\.\d+)\*\*")
 _LEVEL = re.compile(r"\b(MUST(?:\s*/\s*SHOULD)?|SHOULD|MAY|REQUIRED|SHALL)\b",
                     re.IGNORECASE)
@@ -151,10 +161,22 @@ def parse_citations(repo: Path) -> set[str]:
     """Return the set of requirement ids cited by any test source file."""
     cited: set[str] = set()
     for rs in (repo / "crates").rglob("*.rs"):
+        text = rs.read_text(errors="replace")
         parts = set(rs.parts)
-        if "tests" not in parts and not rs.name.startswith("test"):
+        if "tests" in parts or rs.name.startswith("test"):
+            # A dedicated test file: every R-id in it is a test-side citation.
+            cited.update(_RID_EXACT.findall(text))
             continue
-        cited.update(_RID_EXACT.findall(rs.read_text(errors="replace")))
+        # Otherwise only explicit `spec-covers:` claims count. Rust puts unit
+        # tests in `#[cfg(test)]` modules inside the implementation file, and
+        # those were invisible here: 163 such tests under egcl-compiler/src/t2
+        # and 33 in egcl-rt/src/gc.rs alone, including the only tests that
+        # exercise the §4.10 verifier and FrameState lowering. Position-based
+        # rules do not work -- gc.rs has 14 separate `#[cfg(test)]` blocks
+        # interleaved with code, so "after the first one" means "the whole
+        # file".
+        for group in _RID_COVERS.findall(text):
+            cited.update(_RID_EXACT.findall(group))
     return cited
 
 

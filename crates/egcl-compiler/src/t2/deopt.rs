@@ -476,6 +476,8 @@ mod tests {
         (fs, v_n, v_i)
     }
 
+    // spec-covers: R4.65
+    // FrameState lowers to the descriptor set that A4.04 (deopt) consumes.
     #[test]
     fn each_slot_lowers_to_expected_descriptor() {
         let (fs, v_n, v_i) = fixture();
@@ -624,6 +626,9 @@ mod tests {
         assert_eq!(frame.locals, vec![EgclVal::from_fixnum(7)]);
     }
 
+    // spec-covers: R4.65
+    // "a FrameState that cannot be fully lowered MUST fail compilation ... never
+    // install partial metadata" — the unbound Value is a hard LowerError.
     #[test]
     fn unallocated_value_fails_lowering() {
         let v = Value(9);
@@ -702,6 +707,9 @@ mod tests {
         assert_eq!(frame.stack, vec![EgclVal::from_fixnum(22)]);
     }
 
+    // spec-covers: R4.67
+    // A FrameState is a non-empty stack of scopes, outermost first; inlining
+    // prefixes caller scopes and A4.04 reconstructs every one in that order.
     #[test]
     fn lowers_and_reconstructs_every_inlined_scope_in_order() {
         let outer_value = Value(0);

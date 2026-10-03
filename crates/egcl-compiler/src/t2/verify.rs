@@ -1486,6 +1486,11 @@ mod tests {
 
     // ── V4: type/repr disagreement on a block argument ──────────────────
 
+    // spec-covers: R4.61, R4.64
+    // R4.61: representation MUST never change implicitly along an edge — an
+    // UnboxedFixnum argument reaching a Tagged block param is rejected rather
+    // than silently coerced. R4.64: the "representation a slot's lowering
+    // cannot produce" clause of the verifier's FrameState rejection set.
     #[test]
     fn v4_repr_mismatch() {
         let mut f = Function::new("repr");
@@ -1707,6 +1712,8 @@ mod tests {
 
     // ── V8: a frame_state naming a non-dominating value ─────────────────
 
+    // spec-covers: R4.64
+    // The "references a non-dominating SSA value" clause.
     #[test]
     fn v8_framestate_non_dominating_value() {
         let mut f = Function::new("guard_bad_fs");
@@ -1776,6 +1783,11 @@ mod tests {
 
     // ── V8: cyclic rematerialisation recipe ─────────────────────────────
 
+    // spec-covers: R4.64
+    // The "rematerialisation recipe is cyclic" clause. NOTE: R4.64's remaining
+    // clause — slot counts disagreeing with the source bytecode's abstract frame
+    // — is NOT covered here and cannot be: this verifier runs without the source
+    // BytecodeFunction (see the module header). Tracked, not silently claimed.
     #[test]
     fn v8_cyclic_remat() {
         use crate::t2::frame_state::{RematOp, RematRecipe, RematRecipeId};
