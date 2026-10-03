@@ -55,6 +55,17 @@ def create(plan, output=OUTPUT):
                     '--define', 'egcl_rustup 1'], check=True)
 
 
+def expected_packages(group):
+    """The RPM names a group's build must produce.
+
+    The runtime names build.py uses and the package names rpm reports differ
+    for exactly two entries, so the mapping is spelled out rather than derived
+    from a prefix rule that would quietly mis-name them.
+    """
+    return [('egcl' if name == 'native' else 'egcl-static' if name == 'static' else
+             f'egcl-target-{name}') for name in BUILDER['GROUPS'][group]]
+
+
 def rebuild(group, srpm, output=OUTPUT, tools=None):
     srpm = srpm.resolve()
     sources = output / 'SOURCES'
@@ -77,8 +88,7 @@ def rebuild(group, srpm, output=OUTPUT, tools=None):
                     '--define', f'egcl_build_group {group}', '--define', f'egcl_tools {tools}'], check=True)
     names = [subprocess.check_output(['rpm', '-qp', '--queryformat', '%{NAME}', str(path)], text=True)
              for path in (output / 'RPMS/x86_64').glob('*.rpm')]
-    expected = [('egcl' if name == 'native' else 'egcl-static' if name == 'static' else
-                 f'egcl-target-{name}') for name in BUILDER['GROUPS'][group]]
+    expected = expected_packages(group)
     if sorted(names) != sorted(expected):
         raise RuntimeError(f'Wrong RPM set for {group}: {names}')
     stages = list((output / 'BUILD').glob('**/egcl-source/target/fedora-rpm/stage'))

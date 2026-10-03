@@ -41,6 +41,7 @@ jobs:
         run: |
           python3 packaging/fedora/test-release.py
           python3 packaging/fedora/test-sbom.py
+          python3 packaging/fedora/test-source-rpm.py
           python3 packaging/fedora/test-static-package.py
           python3 packaging/fedora/test-native-content.py
           python3 packaging/fedora/test-cross-launcher.py
