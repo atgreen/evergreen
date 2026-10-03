@@ -1,4 +1,14 @@
-FROM registry.fedoraproject.org/fedora:44
+# Digest-pinned, not :44 -- this container builds the RPMs we publish, so its
+# contents must be a recorded input rather than whatever the tag points at on
+# the day of the build. A floating tag means an old release cannot be rebuilt
+# and a changed base image silently changes shipped binaries. Every other build
+# input is already pinned this way: prepare-tools.sh runs `rpmkeys --checksig`
+# on the Fedora cross RPMs and sha1-pins the NDK, prepare-musl.py sha256-pins
+# musl and libunwind, ci-build.sh checksum-pins rustup-init (bliss-9qu9p).
+#
+# To move to a newer Fedora 44 compose:
+#   skopeo inspect --format '{{.Digest}}' docker://registry.fedoraproject.org/fedora:44
+FROM registry.fedoraproject.org/fedora:44@sha256:7011f51bd8089d345be42d41f0aa3190d258823528852a5e7ec976fe2fd20f53
 
 # systemd supplies the same per-command memory limits as local packaging.
 RUN dnf -y install systemd dbus-daemon dnf5-plugins \
