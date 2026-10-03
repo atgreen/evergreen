@@ -100,7 +100,7 @@ jobs:
       # in-container runner for the top-level test binary is untouched.
       - name: register qemu binfmt handlers (nested exec of target binaries)
         if: matrix.run_tests
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: run the runtime suite under qemu
         if: matrix.run_tests
         env:
@@ -169,7 +169,7 @@ jobs:
           python3 packaging/android/test_build.py
           python3 packaging/android/test_install_tools.py
       - name: keep the staged runtimes
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: egcl-android-runtimes
           path: ${{ runner.temp }}/android-stage/usr/
