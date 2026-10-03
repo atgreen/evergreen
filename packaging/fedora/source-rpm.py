@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILDER = runpy.run_path(str(Path(__file__).with_name('build.py')))
 MUSL = runpy.run_path(str(Path(__file__).with_name('prepare-musl.py')))
 OUTPUT = ROOT / 'target/fedora-rpm'
+# rpmbuild writes RPMS/<arch>/, and the release downloads every builder's
+# provenance into one directory -- so a builder on a second architecture has to
+# look in its own RPMS directory and name its record distinctly. The POWER
+# builder's group is `native`, the same name the x86_64 builder uses.
+HOST_MACHINE = BUILDER['HOST_MACHINE']
 
 
 def substitute(spec, pattern, replacement):
@@ -66,6 +71,17 @@ def expected_packages(group):
              f'egcl-target-{name}') for name in BUILDER['GROUPS'][group]]
 
 
+def provenance_name(group):
+    """The record filename for a group built on this host.
+
+    Every builder's provenance is downloaded into one directory, so two
+    builders must never pick the same name. `native` is built on x86_64 AND on
+    POWER, so off x86_64 the arch goes in front -- matching how build.py keys
+    its artifact digests and what release.py's RUNTIMES expects.
+    """
+    return group if HOST_MACHINE == 'x86_64' else f'{HOST_MACHINE}-{group}'
+
+
 def rebuild(group, srpm, output=OUTPUT, tools=None):
     srpm = srpm.resolve()
     sources = output / 'SOURCES'
@@ -87,7 +103,7 @@ def rebuild(group, srpm, output=OUTPUT, tools=None):
                     '--define', f'_topdir {output}', '--define', 'egcl_rustup 1',
                     '--define', f'egcl_build_group {group}', '--define', f'egcl_tools {tools}'], check=True)
     names = [subprocess.check_output(['rpm', '-qp', '--queryformat', '%{NAME}', str(path)], text=True)
-             for path in (output / 'RPMS/x86_64').glob('*.rpm')]
+             for path in (output / 'RPMS' / HOST_MACHINE).glob('*.rpm')]
     expected = expected_packages(group)
     if sorted(names) != sorted(expected):
         raise RuntimeError(f'Wrong RPM set for {group}: {names}')
@@ -101,7 +117,7 @@ def rebuild(group, srpm, output=OUTPUT, tools=None):
         metadata['srpm_sha256'] = hashlib.file_digest(stream, 'sha256').hexdigest()
     destination = ROOT / 'target/build-provenance'
     destination.mkdir(exist_ok=True)
-    (destination / f'{group}.json').write_text(json.dumps(metadata, indent=2) + '\n')
+    (destination / f'{provenance_name(group)}.json').write_text(json.dumps(metadata, indent=2) + '\n')
 
 
 if __name__ == '__main__':

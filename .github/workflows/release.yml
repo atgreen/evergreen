@@ -108,11 +108,31 @@ jobs:
   binaries:
     needs: source
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
-        group: [native, s390x, aarch64, ppc64le, windows, android]
+        # `name` is the job and artifact label, `group` what build.py builds,
+        # `arch` the RPMS/<arch>/ directory rpmbuild writes into. The two
+        # `native` entries differ only by the architecture they build FOR,
+        # which is why the label cannot just be the group.
+        include:
+          - { name: native,  group: native,  arch: x86_64, platform: '', timeout: 120 }
+          - { name: s390x,   group: s390x,   arch: x86_64, platform: '', timeout: 120 }
+          - { name: aarch64, group: aarch64, arch: x86_64, platform: '', timeout: 120 }
+          - { name: ppc64le, group: ppc64le, arch: x86_64, platform: '', timeout: 120 }
+          - { name: windows, group: windows, arch: x86_64, platform: '', timeout: 120 }
+          - { name: android, group: android, arch: x86_64, platform: '', timeout: 120 }
+          # POWER-native packages. GitHub has no POWER runner, so the Fedora
+          # container itself runs under qemu-user and the whole build -- rustc
+          # included -- is emulated. Measured 9.1x on this workspace's Rust
+          # compilation (183s native vs 1661s emulated, 4 cores, same container
+          # contents and command). The x86_64 `native` job takes 8 min, so
+          # budget generously rather than tightly: 300, well under GitHub's 6h
+          # hard cap, and the emulated runtime cost was already being paid by
+          # the `ppc64le` cross job, which dumps and verifies under qemu today.
+          - { name: ppc64le-native, group: native, arch: ppc64le,
+              platform: linux/ppc64le, timeout: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,23 +146,45 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
           sudo apt-get update
           sudo apt-get install -y podman
+      - name: Register foreign-architecture emulation
+        if: ${{ matrix.platform != '' }}
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          # Ubuntu's own qemu-user-static, not a third-party binfmt installer
+          # image: every other input to these packages is pinned, and this one
+          # comes from the runner's apt snapshot. It registers handlers with
+          # binfmt's F flag, so the static qemu is opened at registration time
+          # and stays reachable from a container that ships no qemu itself --
+          # without F, execve in the container returns ENOEXEC.
+          sudo apt-get install -y qemu-user-static
+          # Prove the handler exists before starting an hours-long build that
+          # would otherwise fail on the container's first RUN.
+          test -f "/proc/sys/fs/binfmt_misc/qemu-$BUILD_ARCH"
       - name: Rebuild and verify package group
         env:
           BUILD_GROUP: ${{ matrix.group }}
+          BUILD_PLATFORM: ${{ matrix.platform }}
         run: |
           set -o pipefail
           shopt -s nullglob
           srpms=(target/srpm/*.src.rpm)
           [[ ${#srpms[@]} == 1 ]]
-          sudo bash packaging/fedora/ci-container.sh binary "$BUILD_GROUP" "${srpms[0]}" \
+          # `sudo env`, not a plain `sudo`: sudo drops the environment, so the
+          # platform would silently be lost and the job would build x86_64
+          # packages under the POWER job's name.
+          sudo env "EGCL_CONTAINER_PLATFORM=$BUILD_PLATFORM" \
+            bash packaging/fedora/ci-container.sh binary "$BUILD_GROUP" "${srpms[0]}" \
             2>&1 | tee target/fedora-release.log
       - name: Upload verified RPMs and provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binary-${{ matrix.group }}
+          name: binary-${{ matrix.name }}
+          # One provenance record per builder, named by source-rpm.py's
+          # provenance_name() -- a glob rather than a spelling to keep in step.
           path: |
-            target/fedora-rpm/RPMS/x86_64/*.rpm
-            target/build-provenance/${{ matrix.group }}.json
+            target/fedora-rpm/RPMS/${{ matrix.arch }}/*.rpm
+            target/build-provenance/*.json
           if-no-files-found: error
           compression-level: 0
           overwrite: true
@@ -150,7 +192,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fedora44-log-${{ matrix.group }}
+          name: fedora44-log-${{ matrix.name }}
           path: target/fedora-release.log
           if-no-files-found: ignore
           overwrite: true
@@ -193,8 +235,12 @@ jobs:
           shopt -s nullglob
           srpms=(target/srpm/*.src.rpm)
           [[ ${#srpms[@]} == 1 ]]
+          # One --rpm-dir per architecture: rpmbuild writes RPMS/<arch>/, and
+          # the collector requires every architecture's complete package set
+          # before anything is published.
           python3 packaging/fedora/release.py collect \
             --rpm-dir target/release-input/fedora-rpm/RPMS/x86_64 \
+            --rpm-dir target/release-input/fedora-rpm/RPMS/ppc64le \
             --source-rpm "${srpms[0]}" --provenance-dir target/release-input/build-provenance \
             --sbom target/sbom/egcl-sbom.cdx.json
       - name: Upload complete release assets
