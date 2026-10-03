@@ -1,10 +1,18 @@
 # Fedora RPMs and cross image-dumping tools
 
 This experimental packaging path builds glibc and musl x86-64 EGCL and eight
-optional target packages. Local building and installed use are container-free;
+optional target packages, plus POWER-native glibc and musl EGCL for ppc64le.
+Local building and installed use are container-free;
 GitHub Actions uses a Fedora container on its Ubuntu runner.
 It produces local binary RPMs; it is not yet a Fedora-reviewed source RPM.
 The initial build baseline is Fedora 44 and Rust 1.94.1.
+
+Note the difference between the two kinds of POWER package. The x86-64
+`egcl-target-ppc64le-linux` packages install on an **Intel** Fedora machine and
+dump POWER executables through QEMU. The ppc64le `egcl` and `egcl-static`
+packages install on a **POWER** Fedora machine and run natively there.
+
+The x86-64 packages:
 
 | Package | Command | Application target | Host runner |
 | --- | --- | --- | --- |
@@ -18,6 +26,19 @@ The initial build baseline is Fedora 44 and Rust 1.94.1.
 | `egcl-target-ppc64le-linux-static` | `egcl-ppc64le-linux-static` | Linux ppc64le, static musl | QEMU |
 | `egcl-target-windows` | `egcl-windows` | Windows x86-64 | Wine |
 | `egcl-target-android` | `egcl-android`, `egcl-android-new` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
+
+And the POWER-native packages, for installation on a ppc64le Fedora machine:
+
+| Package | Command | Application target | Host runner |
+| --- | --- | --- | --- |
+| `egcl` | `egcl` | Fedora ppc64le, glibc | Native |
+| `egcl-static` | `egcl-static` | Linux ppc64le, static musl | Native |
+
+The POWER packages carry no cross-target subpackages: the cross toolchains,
+MinGW and the Android NDK are all x86-64-hosted, so image-dumping for other
+platforms stays an x86-64 feature. `egcl.spec` enforces this with an
+`%ifarch x86_64` guard, so even a full `--group all` build on POWER produces
+just these two.
 
 The normal `egcl` command uses glibc and supports JVM integration. `egcl-static`
 is a separate subpackage with no dependency on the main package or its JVM;
@@ -106,7 +127,8 @@ Builds and image probes run through `scripts/egcl-limited.sh`; a working user
 systemd session is required. `CARGO_BUILD_JOBS`, `EGCL_MEM_MAX`, and
 `EGCL_TIMEOUT` control resource limits. The builder does not use PGO.
 
-RPMs appear in `target/fedora-rpm/RPMS/x86_64/`. The builder checks each staged
+RPMs appear in `target/fedora-rpm/RPMS/<arch>/` — `x86_64` on an Intel build
+host, `ppc64le` on a POWER one. The builder checks each staged
 runtime, packages it, extracts the RPMs, compares payload bytes, then repeats
 architecture/ASDF/evaluation/application-dump/restart and GC stress checks
 in an isolated working directory without application sources.
@@ -119,18 +141,45 @@ verifies that payload without producing an incomplete RPM release. Repeat
 
 ## GitHub releases
 
-The **Fedora releases** workflow builds and verifies all ten RPMs on Fedora
-44, including the glibc `egcl` and musl `egcl-static` packages. It runs the same
+The **Fedora releases** workflow builds and verifies all twelve RPMs on Fedora
+44 — the ten x86-64 packages and the two POWER-native ones. It runs the same
 packaging checks described above, with systemd memory limits inside its Fedora
 container. Runs finish independently when newer commits are pushed.
 A source job builds one SRPM containing EGCL source, vendored Rust dependencies,
 and the musl and LLVM unwinder sources, then uploads the `fedora44-srpm` artifact.
-Six parallel builder jobs download that exact SRPM and rebuild the native,
-s390x, AArch64, POWER, Windows and Android package groups. Each Linux group
+Seven parallel builder jobs download that exact SRPM and rebuild the native,
+s390x, AArch64, POWER, Windows and Android package groups, plus the
+POWER-native group described below. Each cross Linux group
 produces both glibc and musl RPMs. Each builder verifies its extracted RPMs and
 records the source RPM's SHA-256 checksum. A final collector requires matching
-source/toolchain provenance and a complete ten-package set before publication.
+source/toolchain provenance and every architecture's complete package set
+before publication: a build group that fails blocks the release rather than
+publishing a partial one.
 A failed matrix job does not cancel the other builds.
+
+### The POWER-native builder
+
+GitHub offers no POWER runner, so the `ppc64le-native` job runs the *same*
+pinned Fedora 44 container for `linux/ppc64le` under `qemu-user`, registered
+through `binfmt_misc` from Ubuntu's `qemu-user-static`. The whole build is
+emulated, `rustc` included. The container pin needs no change for this: the
+digest in `packaging/fedora/Containerfile` is an OCI image index that already
+covers amd64, arm64, ppc64le and s390x, so one pin serves every architecture
+and reproducibility is unaffected.
+
+Emulation costs about **9x** on this workspace's Rust compilation — measured at
+183s native against 1661s emulated, on four cores with identical container
+contents and the same cargo command. Since the x86-64 `native` job takes about
+eight minutes, the POWER job is given a 300-minute timeout against GitHub's
+six-hour hard cap. Note that the emulated *runtime* cost was already being paid
+before this job existed: the `ppc64le` cross job has always dumped its image and
+run the whole of `verify.py`, GC-stress probe included, under `qemu-ppc64le`.
+
+Because two builder jobs now build the `native` group and differ only in the
+architecture they build *for*, each matrix entry carries an explicit `name`
+alongside its `group`, and a builder off x86-64 prefixes its architecture onto
+its provenance record — otherwise both would write `native.json` and one would
+overwrite the other in the collector's merged download.
 
 `rpmlint` runs in the source job against a ratcheted baseline
 (`packaging/fedora/rpmlint-baseline.txt`). A new finding fails the release, and
@@ -205,7 +254,7 @@ collector validates package identity without a hardcoded Fedora version. An
 existing release is never overwritten; a failed upload can leave a draft for
 inspection before retrying.
 
-Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
+Published assets include all twelve binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
 release metadata, the `RPM-GPG-KEY-egcl` public key, a CycloneDX SBOM, and
 `SHA256SUMS` with its detached signature `SHA256SUMS.asc`.
 Publication runs only after package identity, payload, and runtime checks pass.
@@ -294,6 +343,14 @@ you need. After building release 6, for example:
 ```sh
 sudo dnf install target/fedora-rpm/RPMS/x86_64/egcl-0.0.1-6.fc44.x86_64.rpm \
     target/fedora-rpm/RPMS/x86_64/egcl-target-android-0.0.1-6.fc44.x86_64.rpm
+```
+
+On a POWER machine, install the ppc64le packages instead. These have no target
+subpackages, and `egcl` there is a native POWER binary rather than a QEMU
+launcher:
+
+```sh
+sudo dnf install egcl-0.0.1-6.fc44.ppc64le.rpm egcl-static-0.0.1-6.fc44.ppc64le.rpm
 ```
 
 For example, put this in `build.lisp` after your application's loading code:
