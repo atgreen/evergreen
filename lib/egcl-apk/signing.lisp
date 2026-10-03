@@ -44,15 +44,33 @@
     (der-sequence tbs (signature-algorithm) (der-bits (ecdsa-sign private tbs)))))
 
 (defstruct signing-identity private public certificate)
+(defun restrict-to-owner (path)
+  "Make PATH readable and writable by its owner only.
+
+This is why creating an identity needs no particular umask from its caller: the
+file holds an unencrypted P-256 private key, and leaving its mode to whatever
+the caller happened to set is how such a key ends up world-readable. EGCL
+reaches chmod through EGCL-POSIX and SBCL through SB-POSIX."
+  #+egcl (progn (require :egcl-posix)
+                (funcall (read-from-string "egcl-posix:chmod") (namestring path) #o600))
+  #+sbcl (progn (require :sb-posix)
+                (funcall (read-from-string "sb-posix:chmod") (namestring path) #o600))
+  #-(or egcl sbcl)
+  (warn "Cannot restrict ~A to its owner on this implementation; ~
+         check its permissions by hand." path))
+
 (defun create-identity (path)
   "Create a new persistent development signing identity; never overwrite one.
-The CLI uses umask 077. Library callers must likewise protect PATH."
+
+The key is chmod 0600 as soon as it exists, so no caller has to arrange a
+umask first."
   (when (probe-file path) (error "Signing identity already exists: ~A" path))
   (multiple-value-bind (private public-key) (ironclad:generate-key-pair :secp256r1)
     (let* ((public (getf (ironclad:destructure-public-key public-key) :y))
            (secret (getf (ironclad:destructure-private-key private) :x))
            (cert (certificate private public)))
       (write-bytes path (bytes (utf8 "EGCLKEY1") secret public (length-prefix cert)) :if-exists :error)
+      (restrict-to-owner path)
       (make-signing-identity :private private :public public :certificate cert))))
 (defun load-identity (path)
   (let ((data (read-bytes path)))

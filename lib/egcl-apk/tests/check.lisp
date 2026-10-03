@@ -1,5 +1,14 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 (defparameter *apk-test-root* (uiop:ensure-directory-pathname (or (uiop:getenv "EGCL_APK_TEST_DIR") "/tmp/")))
+
+(defun file-mode (path)
+  "PATH's permission bits. Both hosts reach stat through their POSIX module."
+  #+egcl (progn (require :egcl-posix)
+                (funcall (read-from-string "egcl-posix:stat-mode")
+                         (funcall (read-from-string "egcl-posix:stat") (namestring path))))
+  #+sbcl (progn (require :sb-posix)
+                (funcall (read-from-string "sb-posix:stat-mode")
+                         (funcall (read-from-string "sb-posix:stat") (namestring path)))))
 (assert (equalp (egcl-apk::u32 #x12345678) #(120 86 52 18)))
 (assert (= (egcl-apk::crc32 (egcl-apk::utf8 "123456789")) #xcbf43926))
 (assert (equalp (egcl-apk::utf8 "é😀") #(195 169 240 159 152 128)))

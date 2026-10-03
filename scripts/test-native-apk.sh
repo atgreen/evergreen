@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 set -euo pipefail
-umask 077
+# Deliberately NOT 077. create-identity chmods the signing key 0600 itself --
+# that is what removed the need for a wrapper script around every build -- and
+# tests/asdf.lisp asserts the mode. A restrictive umask here would make that
+# assertion pass whether or not the chmod still happens.
+umask 022
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 : "${SBCL_BIN:=sbcl}"
 : "${ANDROID_BUILD_TOOLS:?Set ANDROID_BUILD_TOOLS for independent APK validation}"

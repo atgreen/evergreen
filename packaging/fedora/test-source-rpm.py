@@ -60,9 +60,11 @@ VENDORED = build.ROOT / 'lib/egcl-apk/ocicl'
 class ApkBuilderStagingTests(unittest.TestCase):
     """egcl-target-android must ship the APK builder, not just the runtimes.
 
-    `egcl-apk' builds an application's APK from the description in its .asd, so
-    it is useless unless the Android package installs the builder's sources, the
-    dependencies ocicl.csv pins, and ASDF -- none of which the host egcl has.
+    egcl-apk-asdf lets an application describe its APK in its own .asd, so it is
+    useless unless the Android package installs the builder and the dependencies
+    ocicl.csv pins. They go in /usr/share/common-lisp/source, which ASDF's
+    default system source registry already searches as a (:TREE ...), so
+    `asdf:make' finds all of them by name with no launcher and no configuration.
     """
 
     def test_a_source_tree_without_vendored_dependencies_is_refused(self):
@@ -74,54 +76,64 @@ class ApkBuilderStagingTests(unittest.TestCase):
                 build.stage_apk_builder(root / 'stage')
 
     @unittest.skipUnless(VENDORED.is_dir(), 'run `ocicl install` in lib/egcl-apk')
-    def test_staging_installs_the_launcher_and_everything_it_loads(self):
+    def test_staging_puts_the_builder_and_its_dependencies_in_asdfs_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)
             build.stage_apk_builder(stage)
-            launcher = stage / 'usr/bin/egcl-apk'
-            self.assertTrue(launcher.is_file())
-            self.assertTrue(launcher.stat().st_mode & stat.S_IXUSR, 'launcher not executable')
-            builder = stage / 'usr/libexec/egcl/android/apk-builder'
-            # run.lisp drives the saved image, save.lisp writes it, cli.lisp is
-            # the from-source fallback: the launcher loads all three by name.
-            for name in ('run.lisp', 'save.lisp', 'cli.lisp', 'load.lisp',
-                         'egcl-apk.asd', 'egcl-apk-asdf.asd', 'ocicl.csv', 'asdf.lisp'):
+            builder = stage / 'usr/share/common-lisp/source/egcl-apk'
+            for name in ('egcl-apk.asd', 'egcl-apk-asdf.asd', 'asdf-integration.lisp',
+                         'signing.lisp', 'apk.lisp', 'manifest.lisp', 'binary.lisp'):
                 with self.subTest(name=name):
                     self.assertTrue((builder / name).is_file(), f'{name} was not staged')
             pinned = [line.split(',')[2].strip().split('/')[0] for line
                       in (builder / 'ocicl.csv').read_text().splitlines() if line.strip()]
+            self.assertIn('ironclad-20240503-6da010f', pinned, 'ocicl.csv lost ironclad')
             for system in pinned:
                 with self.subTest(system=system):
                     self.assertTrue((builder / 'ocicl' / system).is_dir())
-            # The tests drive a fixture project and are not part of the install.
-            self.assertFalse((builder / 'tests').exists())
-            self.assertTrue((stage / 'usr/share/licenses/egcl-target-android'
-                             / 'ASDF-LICENSE.txt').is_file(), 'ASDF ships without its notice')
 
-    def test_the_android_package_installs_the_launcher(self):
-        """Staging a file the spec does not list would ship a builder nobody
-        can run (and %files only errors the other way round)."""
-        self.assertIn('%{_bindir}/egcl-apk\n', SPEC.read_text())
+    @unittest.skipUnless(VENDORED.is_dir(), 'run `ocicl install` in lib/egcl-apk')
+    def test_nothing_is_staged_that_only_the_source_tree_needs(self):
+        """No launcher, no ASDF, and no bootstrap that registers a vendored tree.
 
-    def test_there_is_one_launcher_implementation(self):
-        """scripts/egcl-apk only redirects the packaged launcher at the tree.
-
-        Two copies drifted apart the moment one grew the image cache; keep the
-        source-tree entry point a wrapper.
+        asdf.lisp is already in the installed egcl's appended image, and
+        load.lisp exists only to register an ocicl/ directory ASDF does not
+        search -- which is the problem this layout removes. Staging either one
+        would mean the installed builder had a second, divergent way to load.
         """
-        wrapper = (build.ROOT / 'scripts/egcl-apk').read_text()
-        self.assertIn('packaging/android/egcl-apk', wrapper)
-        for variable in ('EGCL_APK_BUILDER', 'EGCL_APK_ASDF'):
-            with self.subTest(variable=variable):
-                self.assertIn(variable, wrapper)
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            build.stage_apk_builder(stage)
+            self.assertFalse((stage / 'usr/bin').exists(), 'a launcher was staged')
+            builder = stage / 'usr/share/common-lisp/source/egcl-apk'
+            for name in ('asdf.lisp', 'load.lisp', 'tests'):
+                with self.subTest(name=name):
+                    self.assertFalse((builder / name).exists(), f'{name} should not ship')
 
-    def test_the_builder_needs_no_ocicl_in_the_user_home(self):
-        """It used to load ocicl-runtime from ~/.local/share/ocicl, which an
-        RPM user does not have; the pinned tree is registered directly now."""
-        loader = (build.ROOT / 'lib/egcl-apk/load.lisp').read_text()
-        for absent in ('OCICL_RUNTIME', 'user-homedir-pathname'):
-            with self.subTest(absent=absent):
-                self.assertNotIn(absent, loader)
+    def test_the_android_package_owns_the_builder_directory(self):
+        """Staging files the spec does not list fails the build, but the %dir
+        entries are the easy thing to lose: egcl owns those two directories and
+        is built in a different rpmbuild."""
+        spec = SPEC.read_text()
+        for line in ('%dir %{_datadir}/common-lisp\n',
+                     '%dir %{_datadir}/common-lisp/source\n',
+                     '%{_datadir}/common-lisp/source/egcl-apk\n'):
+            with self.subTest(line=line.strip()):
+                self.assertIn(line, spec)
+        self.assertNotIn('%{_bindir}/egcl-apk', spec, 'the launcher is gone; so is its %files entry')
+
+    def test_creating_a_signing_key_does_not_depend_on_the_callers_umask(self):
+        """What made a shell wrapper necessary at all.
+
+        create-identity writes an unencrypted P-256 private key. It used to be
+        refused unless a caller had set umask 077 first, because EGCL had no
+        chmod; it now sets the mode itself, so a plain `asdf:make' is safe.
+        """
+        signing = (build.ROOT / 'lib/egcl-apk/signing.lisp').read_text()
+        self.assertIn('restrict-to-owner', signing)
+        self.assertIn('#o600', signing)
+        integration = (build.ROOT / 'lib/egcl-apk/asdf-integration.lisp').read_text()
+        self.assertNotIn('*allow-identity-creation*', integration)
 
 
 class SubstituteTests(unittest.TestCase):

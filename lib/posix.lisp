@@ -6,7 +6,7 @@
   (:use #:cl)
   (:shadow #:open #:close)
   (:export #:syscall-error #:syscall-errno #:syscall-name #:raw-syscall
-           #:strerror #:getpid #:getppid #:kill #:waitpid #:open #:close #:o-rdonly
+           #:strerror #:getpid #:getppid #:kill #:waitpid #:open #:close #:chmod #:o-rdonly
            #:getpagesize #:mmap #:munmap #:prot-read #:prot-write #:prot-none
            #:map-shared #:map-private #:map-anon
            #:stat #:stat-dev #:stat-ino #:stat-mode #:stat-nlink #:stat-uid #:stat-gid
@@ -47,6 +47,13 @@ through completion and must obey the syscall's ABI and lifetime requirements."
 (defun open (path flags &optional (mode 0))
   (nth-value 0 (%checked-call :open (namestring path) flags mode)))
 (defun close (fd) (nth-value 0 (%checked-call :close fd)))
+(defun chmod (path mode)
+  "Set PATH's permission bits to MODE, whatever the process umask is.
+
+OPEN's mode argument can only be narrowed by the umask, so it cannot make a
+file more restrictive than the caller already asked for; this can. A private
+key written by a library must not depend on its caller having set umask 077."
+  (nth-value 0 (%checked-call :chmod path mode)))
 (defun getpagesize () (nth-value 0 (%checked-call :getpagesize)))
 (defun mmap (address length protection flags fd offset)
   "Return an EGCL-FFI foreign pointer. Release the mapping with MUNMAP."

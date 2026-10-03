@@ -244,3 +244,48 @@ fn posix_strerror_returns_owned_messages() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("POSIX-STRERROR-OK"));
 }
+
+#[test]
+fn posix_chmod_sets_the_mode_whatever_the_umask_is() {
+    // The reason this primitive exists: an APK signing key must land 0600 no
+    // matter what umask the caller carries. OPEN's mode argument can only be
+    // narrowed by the umask, so before CHMOD the only safe key writer was a
+    // shell wrapper that set umask 077 first (see lib/egcl-apk/signing.lisp).
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::env::temp_dir().join(format!("egcl-posix-chmod-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("key");
+    std::fs::write(&path, b"secret").unwrap();
+    // Start world-readable, so a CHMOD that silently did nothing would fail
+    // this test rather than inherit an already-correct mode.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let missing = directory.join("absent");
+    let source = format!(
+        r#"
+      (require :egcl-posix)
+      (assert (= 0 (egcl-posix:chmod {path:?} #o600)))
+      (assert (= #o600 (logand #o777 (egcl-posix:stat-mode (egcl-posix:stat {path:?})))))
+      (assert (handler-case (progn (egcl-posix:chmod {missing:?} #o600) nil)
+                (egcl-posix:syscall-error (condition)
+                  (and (eq :chmod (egcl-posix:syscall-name condition))
+                       (plusp (egcl-posix:syscall-errno condition))))))
+      (format t "POSIX-CHMOD-OK~%")
+    "#
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &source])
+        .output()
+        .unwrap();
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    std::fs::remove_dir_all(&directory).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("POSIX-CHMOD-OK"));
+    // Checked from Rust too: the mode really changed on disk, not just in
+    // whatever EGCL's own stat reported.
+    assert_eq!(mode, 0o600, "chmod did not take effect on disk");
+}

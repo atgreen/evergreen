@@ -288,48 +288,36 @@ def vendor_lisp_dependencies(project):
 
 
 def stage_apk_builder(stage):
-    """Install the Lisp APK builder, the dependencies it pins, and ASDF.
+    """Install the Lisp APK builder where ASDF already looks for systems.
 
-    `egcl-apk' builds an application's APK from the description in its own .asd,
-    so it has to ship with the Android package rather than live only in the
-    source tree. Three things it needs are not in the host `egcl': the builder's
-    sources, the dependency tree `ocicl.csv' pins (vendored into the snapshot by
-    vendor_lisp_dependencies when the SRPM is made), and ASDF itself.
+    `egcl-apk-asdf' lets an application describe its APK in its own .asd, so it
+    has to ship with the Android package rather than live only in the source
+    tree. It needs nothing staged beside it: ASDF's default system source
+    registry contains (:TREE "/usr/share/common-lisp/source/"), the same tree
+    that already carries egcl-jvm, so dropping the builder and the dependencies
+    `ocicl.csv' pins under it makes every one of them findable by name --
 
-    No saved image is staged, even though loading that world from source costs
-    about nine seconds. The Android package is built in its own rpmbuild, which
-    has no host egcl to write an image with, and an image is refused by any egcl
-    but the one that wrote it ("runtime source mismatch") -- so a shipped one
-    would be dead weight the moment egcl is rebuilt. /usr/bin/egcl-apk writes
-    one into the user's cache on first use instead.
+        egcl --eval '(asdf:load-asd "my-app.asd")' --eval '(asdf:make "my-app/apk")'
+
+    with no launcher, no paths and no registry configuration. ASDF itself is
+    already in the installed egcl's appended image, so it is not staged either.
+
+    The source-tree bootstrap (load.lisp, cli.lisp, save.lisp) is deliberately
+    left out: it exists to register a vendored ocicl/ tree that ASDF does not
+    search, which is exactly the problem this layout removes.
     """
     source = ROOT / 'lib/egcl-apk'
-    builder = stage / 'usr/libexec/egcl/android/apk-builder'
+    builder = stage / 'usr/share/common-lisp/source/egcl-apk'
     if not (source / 'ocicl').is_dir():
         raise SystemExit(f'{source}: no vendored ocicl/ tree; run `ocicl install` there')
     if builder.exists():
         shutil.rmtree(builder)
-    # tests/ drives the builder against a fixture project and is not part of
-    # what is installed; a fasl belongs to whichever Lisp compiled it.
+    # tests/ drives the builder against a fixture project and is not installed;
+    # a fasl belongs to whichever Lisp compiled it.
     shutil.copytree(source, builder,
                     ignore=shutil.ignore_patterns('tests', '*.fasl', '__pycache__',
-                                                  '.gitignore', BUNDLED_LICENSES))
-    copy(ROOT / 'lib/asdf.lisp', builder / 'asdf.lisp')
-    copy(ROOT / 'packaging/android/egcl-apk', stage / 'usr/bin/egcl-apk')
-    (stage / 'usr/bin/egcl-apk').chmod(0o755)
-    # ASDF's notice lives in a comment block inside asdf.lisp, which %license
-    # cannot point into, so lift it out into a file of its own.
-    lines = (ROOT / 'lib/asdf.lisp').read_text().splitlines()
-    try:
-        start = lines.index(';;; -- LICENSE START')
-        end = lines.index(';;; -- LICENSE END')
-    except ValueError:
-        raise SystemExit('lib/asdf.lisp: no LICENSE START/END block to extract')
-    notice = '\n'.join(line.removeprefix(';;;').strip() for line in lines[start + 1:end])
-    licenses = stage / 'usr/share/licenses/egcl-target-android'
-    licenses.mkdir(parents=True, exist_ok=True)
-    (licenses / 'ASDF-LICENSE.txt').write_text(
-        'ASDF is bundled with the EGCL APK builder as asdf.lisp.\n\n' + notice + '\n')
+                                                  '.gitignore', BUNDLED_LICENSES,
+                                                  'load.lisp', 'cli.lisp', 'save.lisp'))
 
 
 def source_archive(output, sources, *, include_std=False):

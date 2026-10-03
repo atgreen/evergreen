@@ -7,7 +7,9 @@ The Android app is named **EGCL EGL** (`org.egcl.example.egl`).
 ## Build and run
 
 Install SBCL and the `egcl-target-android` RPM, then install the builder's
-pinned Lisp dependencies once, from the repository root:
+pinned Lisp dependencies once, from the repository root. (A checkout needs that
+step; an installed `egcl-target-android` ships them where ASDF already looks,
+and `make` there is just `asdf:make`.)
 
 ```sh
 (cd lib/egcl-apk && ocicl install)
@@ -28,7 +30,7 @@ architectures, or which asset files are included.
 Set machine-specific paths in the ignored `local.mk`:
 
 ```make
-SBCL_BIN := /path/to/sbcl
+LISP := /path/to/sbcl          # or an egcl, to build self-hosted
 EGCL_APK_RUNTIME := /usr/libexec/egcl/android/
 # Only for make verify:
 BUILD_TOOLS := /path/to/android-sdk/build-tools/34.0.0
@@ -36,7 +38,8 @@ BUILD_TOOLS := /path/to/android-sdk/build-tools/34.0.0
 
 Use `SERIAL=DEVICE_SERIAL` with install/run/logcat when multiple devices are
 connected. The first build creates an unencrypted development signing identity
-in `.egcl-apk-key`, with private permissions. Keep it to update installed apps;
+in `.egcl-apk-key`, mode 0600 whatever your umask is. Keep it to update
+installed apps;
 `make clean` preserves it. See the
 [builder documentation](../../lib/egcl-apk/README.md) for scope and limitations.
 

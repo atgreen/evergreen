@@ -250,6 +250,36 @@ pub fn call(args: &[EgclVal]) -> Result<[EgclVal; 3], EgclError> {
             errno = error.map(fix).unwrap_or(NIL);
             fix(result)
         }
+        ("CHMOD", [path, mode]) => {
+            // The reason this exists: an APK signing key must land 0600 no
+            // matter what umask the caller carries, and OPEN's mode argument
+            // can only be narrowed by the umask, never widened. Without a way
+            // to set the mode outright, the only safe key writer was a shell
+            // wrapper that set umask 077 first.
+            if !path.is_string() {
+                return Err(EgclError::TypeError {
+                    datum: *path,
+                    expected: "STRING".into(),
+                });
+            }
+            let path = std::ffi::CString::new(path.as_string()).map_err(|_| {
+                EgclError::ProgramError("POSIX path contains a null character".into())
+            })?;
+            let mode = integer(*mode)? as libc::mode_t;
+            let (result, error) = crate::process::process_operation("CHMOD", move || {
+                // SAFETY: the owned path is null-terminated and mode is a
+                // plain scalar; chmod takes no other pointer.
+                let result = unsafe { libc::chmod(path.as_ptr(), mode) };
+                let error = if result == -1 {
+                    std::io::Error::last_os_error().raw_os_error()
+                } else {
+                    None
+                };
+                Ok((result, error))
+            })?;
+            errno = error.map(fix).unwrap_or(NIL);
+            fix(result)
+        }
         ("CLOSE", [fd]) => {
             let fd = integer(*fd)?;
             let (result, error) = crate::process::process_operation("CLOSE", move || {

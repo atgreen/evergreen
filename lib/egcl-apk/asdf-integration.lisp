@@ -33,7 +33,7 @@
 (defpackage :egcl-apk-asdf
   (:use :cl)
   (:export #:android-apk #:apk-op #:*runtime-directory*
-           #:*allow-identity-creation* #:build-project))
+           #:build-project))
 (in-package :egcl-apk-asdf)
 
 (defclass android-apk (asdf:system)
@@ -96,12 +96,6 @@ its own default instead of being handed an explicit nothing."
       (setf config (append config (list :runtime-version (apk-runtime-version system)))))
     config))
 
-(defvar *allow-identity-creation* nil
-  "When true, a build may create a missing signing identity. Set only by a
-caller that has already established a restrictive umask -- see the
-`egcl-apk' launcher. An unencrypted private key must not be written with
-whatever umask an interactive session happens to carry.")
-
 (defvar *runtime-directory* nil
   "Overrides EGCL_APK_RUNTIME when non-NIL, for a caller that would rather bind
 a variable than set an environment variable.")
@@ -148,18 +142,12 @@ against the runtime's own runtime.json."
     (unless (member (concatenate 'string "assets/" entry) assets :key #'car :test #'equal)
       (error "~A: the :apk-entry ~S is not one of this system's components: ~{~A~^ ~}"
              (asdf:component-name s) entry (mapcar #'file-namestring files)))
-    ;; Do NOT mint a signing key from an ordinary build. create-identity writes
-    ;; an unencrypted P-256 private key and relies on the caller's umask, and
-    ;; EGCL exposes no chmod to repair the mode afterwards. The `egcl-apk'
-    ;; launcher sets umask 077 and then binds *allow-identity-creation*, so the
-    ;; permission travels with the only caller that has established the umask;
-    ;; a plain `asdf:make' from a REPL inherits whatever the user happens to
-    ;; have and is refused.
-    (unless (or (probe-file identity-path) *allow-identity-creation*)
-      (error "~A: no signing identity at ~A.~%~
-              Create one with `egcl-apk', which sets umask 077 first:~%~
-              an APK signing key must not be written under an inherited umask."
-             (asdf:component-name s) identity-path))
+    ;; A missing identity is minted here, by any caller. That used to be
+    ;; refused unless a shell wrapper had set umask 077 first, because
+    ;; create-identity writes an unencrypted P-256 private key and EGCL had no
+    ;; chmod to repair the mode afterwards. It now chmods the key 0600 itself
+    ;; (egcl-apk::restrict-to-owner), so the umask no longer decides whether a
+    ;; private key is world-readable and a plain `asdf:make' is safe.
     (egcl-apk::build-apk-from (apk-config s) (apk-runtime-directory)
                               assets output identity-path)))
 

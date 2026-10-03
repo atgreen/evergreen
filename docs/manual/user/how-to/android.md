@@ -6,8 +6,8 @@ RPM. It supplies native libraries for ARM64 phones and x86-64 emulators, plus
 Android SDK. They do not need Rust, the NDK, a EGCL checkout, or containers.
 
 If you would rather not install the SDK and a JDK at all, skip to
-[build without the Android SDK](#build-without-the-android-sdk): `egcl-apk`
-assembles and signs an APK entirely in Lisp.
+[build without the Android SDK](#build-without-the-android-sdk), where
+`asdf:make` assembles and signs an APK entirely in Lisp.
 
 ## Generate the project
 
@@ -98,10 +98,10 @@ existing installation without addressing the signing mismatch.
 
 ## Build without the Android SDK
 
-`egcl-apk`, also from `egcl-target-android`, builds and signs an APK with no
-SDK, JDK, Make or Python — just the `egcl` the package already requires. The
+`egcl-apk-asdf`, also from `egcl-target-android`, builds and signs an APK with
+no SDK, JDK, Make or Python — just the `egcl` the package already requires. The
 project describes its APK in its own `.asd` rather than in a manifest and
-Makefile:
+Makefile, and `asdf:make` is the whole build:
 
 ```lisp
 ;; The primary system exists so ASDF accepts the secondary name below. It has
@@ -123,17 +123,28 @@ Makefile:
 ```
 
 ```sh
-egcl-apk hello/
+cd hello
+egcl --eval '(require :asdf)' \
+     --eval '(asdf:load-asd (truename "hello.asd"))' \
+     --eval '(asdf:make "hello/apk")'
 ```
 
 That writes `hello/build/hello.apk`, signed with a P-256 key it creates once as
-`hello/.egcl-apk-key` (umask 077). Install it with `adb install`. The system's
-file components *are* the APK's assets, in declaration order, so the two cannot
-drift; `:apk-entry` (default `app.lisp`) names the one that is loaded first.
+`hello/.egcl-apk-key`, mode 0600 whatever your umask is. Install it with
+`adb install`. The system's file components *are* the APK's assets, in
+declaration order, so the two cannot drift; `:apk-entry` (default `app.lisp`)
+names the one that is loaded first.
 
-The first build spends about nine seconds saving an image of the loaded builder
-under `${XDG_CACHE_HOME:-$HOME/.cache}/egcl`; later builds restore it. `egcl-apk`
-rebuilds that image by itself after an `egcl` upgrade.
+Nothing has to be launched or configured: the builder and its dependencies
+install into `/usr/share/common-lisp/source/egcl-apk`, which ASDF already
+searches, and `:defsystem-depends-on ("egcl-apk-asdf")` in the `.asd` pulls them
+in. `(require :asdf)` is a no-op on an installed `egcl` — its appended image
+already holds ASDF — and `asdf:load-asd` wants an absolute pathname, hence
+`truename`.
+
+A build takes about 18 seconds, around 7 of which is loading Ironclad. If you
+build many in a row, `save.lisp` in the builder's source tree writes an image
+that cuts it to about 11; see the builder's README.
 
 See the [builder's README](https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md)
 for every `:apk-*` slot, and the

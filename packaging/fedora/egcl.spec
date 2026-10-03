@@ -199,10 +199,11 @@ Requires: /usr/bin/adb
 %description target-android
 Reusable Android NativeActivity libraries for ARM64 phones and x86-64 emulators,
 plus egcl-android-new and Makefile templates for building signed APKs on Linux.
-Also includes egcl-apk, which builds and signs an APK entirely in Lisp from the
-description in an application's own .asd, needing neither the Android SDK nor a
-JDK. The Android SDK and a JDK are needed only for the Makefile route; Rust and
-the NDK are needed only when building these RPMs. Installing and launching on a device or
+Also includes egcl-apk-asdf, an ASDF extension that builds and signs an APK
+entirely in Lisp from the description in an application's own .asd, needing
+neither the Android SDK nor a JDK: asdf:make on the project is the whole build.
+The Android SDK and a JDK are needed only for the Makefile route; Rust and the
+NDK are needed only when building these RPMs. Installing and launching on a device or
 emulator uses adb, which this package pulls in. Also includes the static
 AArch64 command-line runtime and QEMU launcher.
 %endif
@@ -325,8 +326,14 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %files target-android
 %{_bindir}/egcl-android
 %{_bindir}/egcl-android-new
-%{_bindir}/egcl-apk
 %{_libexecdir}/egcl/android
+# The APK builder, in the tree ASDF's default source registry already searches.
+# egcl owns these two directories as well; sharing directory ownership is how
+# the other subpackages treat %{_libexecdir}/egcl, and this subpackage Requires
+# egcl anyway.
+%dir %{_datadir}/common-lisp
+%dir %{_datadir}/common-lisp/source
+%{_datadir}/common-lisp/source/egcl-apk
 %license %{_datadir}/licenses/egcl-target-android
 %endif
 

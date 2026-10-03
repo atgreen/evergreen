@@ -56,10 +56,14 @@
     ;; Components become the assets, in declaration order.
     (assert (equal (mapcar #'file-namestring (egcl-apk-asdf::system-asset-files system))
                    '("app.lisp" "helper.lisp")))
-    ;; A build must not mint a signing key under an inherited umask.
-    (assert (handler-case (progn (asdf:make "fixture/apk") nil)
-              (error (e) (search "no signing identity" (princ-to-string e)))))
-    (egcl-apk:create-identity key)
+    ;; A build mints a missing signing identity, and the key comes out 0600
+    ;; whatever umask this process carries -- create-identity chmods it rather
+    ;; than trusting the umask, which is what removed the need for a shell
+    ;; wrapper around every build.
+    (assert (not (probe-file key)))
+    (asdf:make "fixture/apk")
+    (assert (probe-file key))
+    (assert (= #o600 (logand #o777 (file-mode key))))
     ;; An :apk-entry that is not a component is rejected rather than producing
     ;; an APK the runtime cannot start.
     (setf (slot-value system 'egcl-apk-asdf::entry) "absent.lisp")

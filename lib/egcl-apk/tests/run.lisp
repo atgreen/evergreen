@@ -25,6 +25,5 @@
 
 ;; The real demo project, when a real runtime is available.
 (when (uiop:getenv "EGCL_APK_RUNTIME")
-  (let ((egcl-apk-asdf:*allow-identity-creation* t))
-    (egcl-apk-asdf:build-project (uiop:getenv "EGCL_APK_TEST_PROJECT")))
+  (egcl-apk-asdf:build-project (uiop:getenv "EGCL_APK_TEST_PROJECT"))
   (format t "APK-DEMO-OK~%"))
