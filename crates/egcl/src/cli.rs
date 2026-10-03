@@ -38341,13 +38341,13 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // stranded).
     let image_magic = egcl_rt::image::IMAGE_MAGIC.to_ne_bytes();
     let mut core_loaded = false;
-    let embedded_core = if ca.deliver.is_some() || ca.image.is_some() {
+    let embedded = if ca.deliver.is_some() || ca.image.is_some() {
         None
     } else {
-        embedded_image().filter(|b| b.starts_with(&image_magic))
+        embedded_image()
     };
-    if let Some(bytes) = embedded_core {
-        load_core_image_bytes(&bytes, &mut env)?;
+    if let Some(bytes) = embedded.as_ref().filter(|b| b.starts_with(&image_magic)) {
+        load_core_image_bytes(bytes, &mut env)?;
         core_loaded = true;
     } else if let Some(ref image_path) = ca.image {
         let bytes = std::fs::read(image_path)
@@ -38405,14 +38405,8 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
     }
 
-    // A saved `:executable` binary carries its image appended to itself. Detect
-    // and load it like `--image`, but treat the process as that saved program:
-    // skip the user init file and run its recorded top-level entry point.
-    let embedded = if ca.image.is_some() {
-        None
-    } else {
-        embedded_image()
-    };
+    // Reuse the payload read before bootstrap for legacy BFASL executables.
+    // Core images have already been restored; do not read them a second time.
     if let Some(ref bytes) = embedded {
         if bytes.starts_with(&egcl_rt::bfasl::BFASL_MAGIC) {
             load_bfasl_into_env(bytes, &mut env)?;
