@@ -6223,6 +6223,139 @@ pub fn full_gc() -> Result<(), EgclError> {
     collector.full_gc()
 }
 
+/// Snapshot occupied heap spans without changing the live heap.
+///
+/// # Safety
+/// The caller must hold a stopped-world heap snapshot for the entire call.
+pub unsafe fn snapshot_heap_regions(
+    reachable_only: bool,
+) -> Result<crate::image_heap::HeapSnapshot, EgclError> {
+    use crate::image_heap::{HeapSnapshot, IMAGE_PAGE_SIZE, SnapshotRegion};
+    let retained = if reachable_only {
+        Some(unsafe { reachable_heap_objects()? })
+    } else {
+        None
+    };
+    let (region_size, heap_base, kinds) = {
+        let guard = heap_state().lock().unwrap();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| EgclError::Internal("heap not initialized".into()))?;
+        (
+            state.config.region_size,
+            state.heap_base as usize,
+            state
+                .regions
+                .iter()
+                .map(|region| region.header.kind)
+                .collect::<Vec<_>>(),
+        )
+    };
+    if region_size % IMAGE_PAGE_SIZE != 0 {
+        return Err(EgclError::InvalidImage(
+            "heap region size is not page aligned".into(),
+        ));
+    }
+    let mut objects = std::collections::BTreeMap::<usize, Vec<_>>::new();
+    walk_heap_records(|body, kind, len, identity| {
+        if kind != 0
+            && retained
+                .as_ref()
+                .is_none_or(|set| set.contains(&(body as usize)))
+        {
+            let header = identity - OBJECT_HEADER_SIZE;
+            let region = (header - heap_base) / region_size;
+            let footprint = unsafe { header_total_bytes(header as *const u8) };
+            objects
+                .entry(region)
+                .or_default()
+                .push((header, body, kind, len, footprint));
+        }
+        true
+    })?;
+    let mut regions = Vec::with_capacity(objects.len());
+    for (index, objects) in objects {
+        let saved_start = heap_base + index * region_size;
+        let &(header, _, _, _, footprint) = objects.last().unwrap();
+        let used = header + footprint - saved_start;
+        let mut region = SnapshotRegion {
+            saved_start,
+            kind: kinds[index],
+            used,
+            bytes: vec![0; align_up(used, IMAGE_PAGE_SIZE)],
+            fixups: Vec::new(),
+        };
+        let mut previous_end = 0;
+        for (header, body, kind, len, footprint) in objects {
+            let offset = header - saved_start;
+            let gap = offset - previous_end;
+            if gap != 0 {
+                // Use a type-zero filler instead of a zero header: all GC walkers
+                // must be able to reach later live objects across filtered gaps.
+                let (_, extended) = object_footprint(gap - OBJECT_HEADER_SIZE);
+                let header_len = if extended {
+                    LARGE_OBJECT_PAYLOAD_OFFSET
+                } else {
+                    OBJECT_HEADER_SIZE
+                };
+                let mut filler = [0u64; 2];
+                unsafe {
+                    write_object_header(filler.as_mut_ptr().cast(), 0, (gap - header_len) as u32);
+                }
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(filler.as_ptr().cast::<u8>(), header_len) };
+                region.bytes[previous_end..previous_end + header_len].copy_from_slice(bytes);
+            }
+            let initialized = body as usize - header + len;
+            let original = unsafe { std::slice::from_raw_parts(header as *const u8, initialized) };
+            region.bytes[offset..offset + initialized].copy_from_slice(original);
+            let mut copied_header = ObjectHeader(u64::from_ne_bytes(
+                region.bytes[offset..offset + 8].try_into().unwrap(),
+            ));
+            copied_header.set_pinned();
+            region.bytes[offset..offset + 8].copy_from_slice(&copied_header.0.to_ne_bytes());
+            let body_offset = body as usize - saved_start;
+            use crate::object::type_id as tid;
+            if matches!(
+                kind,
+                tid::FOREIGN_POINTER
+                    | tid::FOREIGN_LIBRARY
+                    | tid::FOREIGN_CALLBACK
+                    | tid::PYTHON_OBJECT
+            ) {
+                region.bytes[body_offset..body_offset + len].fill(0);
+            } else if matches!(kind, tid::STREAM | tid::MUTEX | tid::CONDITION_VARIABLE) {
+                region.bytes[body_offset..body_offset + len.min(8)].fill(0);
+            }
+            unsafe {
+                trace_object(body as *mut u8, kind, len, |slot| {
+                    let address = slot as usize;
+                    // Some trace hooks also expose references in off-heap host
+                    // state, which belongs to its own serializer, not this span.
+                    if address < body as usize || address + 8 > body as usize + len {
+                        return;
+                    }
+                    let value = *slot;
+                    if is_heap_ref(value) {
+                        let value = resolve_forwarded(value);
+                        let field = address - saved_start;
+                        region.bytes[field..field + 8].copy_from_slice(&value.0.to_ne_bytes());
+                        region.fixups.push(field);
+                    }
+                });
+            }
+            previous_end = offset + footprint;
+        }
+        region.fixups.sort_unstable();
+        region.fixups.dedup();
+        regions.push(region);
+    }
+    Ok(HeapSnapshot {
+        region_size,
+        regions,
+    })
+}
+
 /// Per-object record: `[old_body u64][type_id u8][size u32][body bytes]`. The old
 /// body address lets the loader build an old→new map so pointers relocate
 /// per-object (not by a single uniform delta, which only worked when the restored
@@ -6238,6 +6371,13 @@ pub fn serialize_heap_objects() -> Vec<u8> {
 /// # Safety
 /// Call inside `with_heap_snapshot`, with no concurrent Lisp allocation.
 pub(crate) unsafe fn serialize_reachable_heap_objects() -> Result<Vec<u8>, EgclError> {
+    let retained = unsafe { reachable_heap_objects()? };
+    Ok(serialize_heap_objects_matching(|ptr| retained.contains(&(ptr as usize))))
+}
+
+// Call only while the heap snapshot is stopped; the returned addresses are
+// host-side metadata, not roots that could survive a moving collection.
+unsafe fn reachable_heap_objects() -> Result<std::collections::HashSet<usize>, EgclError> {
     let mut objects = HashMap::new();
     let mut pending = Vec::new();
     walk_heap_records(|ptr, kind, size, identity| {
@@ -6291,9 +6431,7 @@ pub(crate) unsafe fn serialize_reachable_heap_objects() -> Result<Vec<u8>, EgclE
             });
         }
     }
-    Ok(serialize_heap_objects_matching(|ptr| {
-        retained.contains(&(ptr as usize))
-    }))
+    Ok(retained)
 }
 
 fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) -> Vec<u8> {
@@ -7506,5 +7644,157 @@ mod restore_target_tests {
                 body
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod region_snapshot_tests {
+    use super::*;
+    use crate::object::type_id as tid;
+    use crate::value::{NIL, TAG_CONS};
+
+    #[test]
+    fn snapshot_preserves_layout_and_marks_only_pointer_slots() {
+        const CHILD: &str = "EGCL_TEST_REGION_SNAPSHOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::region_snapshot_tests::snapshot_preserves_layout_and_marks_only_pointer_slots", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let config = GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 8 * 1024 * 1024,
+            nursery_size: 4 * 1024 * 1024,
+            tlab_size: 4096,
+            region_size: 8192,
+            promotion_threshold: 2,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.5,
+        };
+        init_heap(&config).unwrap();
+        let mut cons_bytes = Vec::new();
+        cons_bytes.extend_from_slice(&EgclVal::from_fixnum(7).0.to_ne_bytes());
+        cons_bytes.extend_from_slice(&NIL.0.to_ne_bytes());
+        record_object(tid::CONS, cons_bytes.clone());
+        record_object(tid::CONS, cons_bytes.clone()); // unreachable hole
+        record_object(tid::CONS, cons_bytes);
+        let mut bodies = Vec::new();
+        walk_heap(|ptr, _, _| {
+            bodies.push(ptr as usize);
+            true
+        })
+        .unwrap();
+        let first = bodies[0];
+        let last = bodies[2];
+        unsafe {
+            *(first as *mut u64) = first as u64; // legitimate fixnum with pointer-shaped bits
+            *((first as *mut u64).add(1)) = last as u64 | TAG_CONS;
+            *((last as *mut u64).add(1)) = first as u64 | TAG_CONS;
+        }
+        // The same pointer-shaped bits are data in a string and a fixnum slot.
+        let mut string = 8u64.to_ne_bytes().to_vec();
+        string.extend_from_slice(&(first as u64 | TAG_CONS).to_ne_bytes());
+        record_object(tid::SIMPLE_BASE_STRING, string.clone());
+        record_object(tid::FOREIGN_POINTER, vec![0x55; 16]);
+        let snapshot = unsafe { snapshot_heap_regions(false) }.unwrap();
+        assert_eq!(snapshot.region_size, config.region_size);
+        assert_eq!(snapshot.regions.len(), 1);
+        let region = &snapshot.regions[0];
+        let base = region.saved_start;
+        assert_eq!(region.bytes.len() % crate::image_heap::IMAGE_PAGE_SIZE, 0);
+        assert_eq!(region.fixups, vec![first + 8 - base, last + 8 - base]);
+        assert_eq!(
+            u64::from_ne_bytes(
+                region.bytes[first - base..first + 8 - base]
+                    .try_into()
+                    .unwrap()
+            ),
+            first as u64
+        );
+        assert_eq!(
+            u64::from_ne_bytes(
+                region.bytes[first + 8 - base..first + 16 - base]
+                    .try_into()
+                    .unwrap()
+            ),
+            last as u64 | TAG_CONS
+        );
+        let mut native_unchanged = false;
+        walk_heap(|ptr, kind, size| {
+            let offset = ptr as usize - base;
+            if kind == tid::SIMPLE_BASE_STRING {
+                assert_eq!(&region.bytes[offset..offset + size], string.as_slice());
+            }
+            if kind == tid::FOREIGN_POINTER {
+                assert!(region.bytes[offset..offset + size].iter().all(|&b| b == 0));
+                native_unchanged = unsafe { std::slice::from_raw_parts(ptr, size) }
+                    .iter()
+                    .all(|&b| b == 0x55);
+            }
+            true
+        })
+        .unwrap();
+        assert!(native_unchanged);
+        crate::rooted!(root = EgclVal(first as u64 | TAG_CONS));
+        let reachable = unsafe { snapshot_heap_regions(true) }.unwrap();
+        assert_eq!(reachable.regions.len(), 1);
+        let region = &reachable.regions[0];
+        assert_eq!(
+            region.used,
+            last - OBJECT_HEADER_SIZE + object_footprint(16).0 - base
+        );
+        let hole = bodies[1] - OBJECT_HEADER_SIZE - base;
+        let header = ObjectHeader(u64::from_ne_bytes(
+            region.bytes[hole..hole + 8].try_into().unwrap(),
+        ));
+        assert_eq!(
+            header.type_id(),
+            0,
+            "filtered objects become walkable fillers"
+        );
+        assert_eq!(region.fixups.len(), 2);
+        assert_eq!(root.0, first as u64 | TAG_CONS);
+        // Large objects retain their extended header and span multiple regions.
+        let mut allocator = HeapAllocator::new().unwrap();
+        let large_len = 600_000;
+        let large_body = allocator.alloc_large(large_len).unwrap();
+        unsafe {
+            write_object_header(
+                large_body.sub(LARGE_OBJECT_PAYLOAD_OFFSET),
+                tid::SIMPLE_ARRAY,
+                large_len as u32,
+            );
+            std::ptr::write_bytes(large_body, 0x5a, large_len);
+            std::ptr::write_unaligned(large_body.cast::<u64>(), first as u64 | TAG_CONS);
+        }
+        let snapshot = unsafe { snapshot_heap_regions(false) }.unwrap();
+        let large = snapshot
+            .regions
+            .iter()
+            .find(|region| region.kind == RegionKind::LargeObject)
+            .unwrap();
+        assert_eq!(large.used, object_footprint(large_len).0);
+        assert!(large.used > 2 * config.region_size);
+        assert_eq!(
+            u64::from_ne_bytes(large.bytes[8..16].try_into().unwrap()),
+            object_footprint(large_len).0 as u64
+        );
+        assert!(
+            large.fixups.is_empty(),
+            "packed array data must never be relocated"
+        );
+        assert_eq!(
+            &large.bytes[LARGE_OBJECT_PAYLOAD_OFFSET..LARGE_OBJECT_PAYLOAD_OFFSET + large_len],
+            unsafe { std::slice::from_raw_parts(large_body, large_len) }
+        );
     }
 }
