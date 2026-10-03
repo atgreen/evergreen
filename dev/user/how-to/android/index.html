@@ -2066,9 +2066,10 @@ searches, and <code>:defsystem-depends-on ("egcl-apk-asdf")</code> in the <code>
 in. <code>(require :asdf)</code> is a no-op on an installed <code>egcl</code> — its appended image
 already holds ASDF — and <code>asdf:load-asd</code> wants an absolute pathname, hence
 <code>truename</code>.</p>
-<p>A build takes about 18 seconds, around 7 of which is loading Ironclad. If you
-build many in a row, <code>save.lisp</code> in the builder's source tree writes an image
-that cuts it to about 11; see the builder's README.</p>
+<p>A build takes about 6 seconds, around 3 of which is ASDF loading the builder
+and its dependencies. SBCL does the same build in about 1 second. If you build
+many in a row, <code>save.lisp</code> in the builder's source tree writes an image of that
+loaded world and takes a build to about 4.5 seconds; see the builder's README.</p>
 <p>See the <a href="https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md">builder's README</a>
 for every <code>:apk-*</code> slot, and the
 <a href="../../reference/android/">Android project reference</a> for build paths,
