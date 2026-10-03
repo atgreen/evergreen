@@ -52,6 +52,7 @@ pub mod python;
 
 // ── Image persistence ─────────────────────────────────────────────
 pub mod image;
+pub mod image_relocation;
 
 // ── Security sandbox ──────────────────────────────────────────────
 pub mod sandbox;

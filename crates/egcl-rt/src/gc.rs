@@ -6,6 +6,7 @@
 //! Inspired by HotSpot G1 and ZGC. See §3 of the spec.
 
 use crate::error::EgclError;
+use crate::image_relocation::ImageRelocations;
 use crate::value::EgclVal;
 
 use std::alloc::Layout;
@@ -6353,15 +6354,9 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
     out
 }
 
-/// The old→new object-body relocation map built by [`restore_heap`]. Keyed by
-/// raw object addresses and grown to the whole snapshot's object count, so it is
-/// FxHash (a usize address needs no SipHash) and pre-sized to avoid the
-/// rehash storm — image/bfasl restore builds this per-object (bliss-pohq).
-type RelocMap = std::collections::HashMap<usize, usize, crate::fxhash::FxBuildHasher>;
-
 /// The old→new object-body map from the most recent [`restore_heap`], consulted
 /// by registry restores (symbols/packages) to remap their saved object addresses.
-static RELOC_MAP: std::sync::Mutex<Option<RelocMap>> = std::sync::Mutex::new(None);
+static RELOC_MAP: std::sync::Mutex<Option<ImageRelocations>> = std::sync::Mutex::new(None);
 
 /// Remap one saved pointer value through the last restore's old→new map,
 /// tag-aware: a cons ref (|001) points at the body; a heap-object/function ref
@@ -6370,7 +6365,7 @@ static RELOC_MAP: std::sync::Mutex<Option<RelocMap>> = std::sync::Mutex::new(Non
 pub fn remap_saved_pointer(raw: u64) -> u64 {
     let guard = RELOC_MAP.lock().unwrap();
     match guard.as_ref() {
-        Some(map) => remap_pointer_with(map, raw),
+        Some(map) => map.remap(raw),
         None => raw,
     }
 }
@@ -6432,29 +6427,6 @@ pub fn set_pending_offheap(data: Option<Vec<u8>>) {
     *PENDING_OFFHEAP.lock().unwrap() = data;
 }
 
-fn remap_pointer_with(map: &RelocMap, raw: u64) -> u64 {
-    use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
-    let tag = raw & TAG_MASK;
-    match tag {
-        TAG_CONS => match map.get(&((raw & !TAG_MASK) as usize)) {
-            Some(&new_body) => (new_body as u64) | TAG_CONS,
-            None => raw,
-        },
-        TAG_HEAP_OBJECT | TAG_FUNCTION => {
-            let old_body = (raw & !TAG_MASK) as usize + OBJECT_HEADER_SIZE;
-            match map.get(&old_body) {
-                Some(&new_body) => ((new_body - OBJECT_HEADER_SIZE) as u64) | tag,
-                None => raw,
-            }
-        }
-        0 => match map.get(&(raw as usize)) {
-            Some(&new_body) => new_body as u64,
-            None => raw,
-        },
-        _ => raw,
-    }
-}
-
 pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     let mut guard = heap_state().lock().unwrap();
     let state = guard
@@ -6474,8 +6446,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     // to a generous estimate of the object count (each record is a >=13-byte
     // header plus payload) so the per-object inserts never trigger a rehash
     // (bliss-pohq: the rehash storm dominated large restores).
-    let mut map: RelocMap =
-        RelocMap::with_capacity_and_hasher(data.len() / 24 + 16, Default::default());
+    let mut map = ImageRelocations::with_object_capacity(data.len() / 24 + 16);
     let mut offset = 0usize;
     let mut targets = [None; 2];
     while offset < data.len() {
@@ -6497,7 +6468,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
         }
         let new_body =
             append_serialized_object(state, type_id, &data[offset..offset + size], &mut targets)?;
-        map.insert(old_body, new_body);
+        map.insert_object(old_body, new_body);
         offset += size;
     }
 
@@ -6523,9 +6494,9 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
             for (old_body, new_body) in pairs {
                 // Off-heap objects follow the header-based convention: a
                 // reference's masked address is the header, body = header +
-                // OBJECT_HEADER_SIZE — the key remap_pointer_with looks up for a
+                // OBJECT_HEADER_SIZE — the key ImageRelocations::remap looks up for a
                 // TAG_HEAP_OBJECT reference.
-                full_map.insert(old_body + OBJECT_HEADER_SIZE, new_body + OBJECT_HEADER_SIZE);
+                full_map.insert_object(old_body + OBJECT_HEADER_SIZE, new_body + OBJECT_HEADER_SIZE);
             }
         }
     }
@@ -6537,7 +6508,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     // allocation) must never relocate it out from under them. Pinning marks each
     // restored object's header so `region_has_pinned` retains its nursery region
     // in place; fresh mutator garbage still collects normally in other regions.
-    for &new_body in map.values() {
+    for &new_body in map.object_targets() {
         let header = (new_body - OBJECT_HEADER_SIZE) as *const u8;
         unsafe {
             let hdr = (new_body - OBJECT_HEADER_SIZE) as *mut ObjectHeader;
@@ -6548,7 +6519,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
         while fo + 8 <= body_size as usize {
             let field = unsafe { (new_body as *mut u8).add(fo) as *mut u64 };
             let raw = unsafe { std::ptr::read_unaligned(field) };
-            let new_raw = remap_pointer_with(&full_map, raw);
+            let new_raw = full_map.remap(raw);
             if new_raw != raw {
                 unsafe { std::ptr::write_unaligned(field, new_raw) };
             }
