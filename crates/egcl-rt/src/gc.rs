@@ -6133,6 +6133,7 @@ fn append_serialized_object(
     state: &mut HeapState,
     type_id: u8,
     body: &[u8],
+    targets: &mut [Option<usize>; 2],
 ) -> Result<usize, EgclError> {
     let (total_size, _) = object_footprint(body.len());
     let region_limit = state.config.region_size / 2;
@@ -6142,16 +6143,18 @@ fn append_serialized_object(
         RegionKind::Nursery
     };
 
-    let mut target_idx = None;
-    for (idx, region) in state.regions.iter_mut().enumerate() {
-        if region.header.kind != desired_kind {
-            continue;
-        }
+    // The cache belongs to this restore, while the heap lock is held: no GC
+    // can recycle its regions. Keep large objects separate from nursery objects.
+    let target_slot = usize::from(desired_kind == RegionKind::LargeObject);
+    let fits = |region: &HeapRegion| {
         let used = (region.header.alloc_top as usize).saturating_sub(region.base as usize);
-        if used + total_size <= region.size {
-            target_idx = Some(idx);
-            break;
-        }
+        region.header.kind == desired_kind && used + total_size <= region.size
+    };
+    let mut target_idx = targets[target_slot].filter(|&idx| fits(&state.regions[idx]));
+    if target_idx.is_none() {
+        #[cfg(test)]
+        restore_target_tests::TARGET_SEARCHES.with(|count| count.set(count.get() + 1));
+        target_idx = state.regions.iter().position(fits);
     }
 
     if target_idx.is_none() {
@@ -6167,6 +6170,7 @@ fn append_serialized_object(
     }
 
     let idx = target_idx.ok_or(EgclError::Oom)?;
+    targets[target_slot] = Some(idx);
     let region = &mut state.regions[idx];
     let header_ptr = region.header.alloc_top;
     let body_addr = unsafe {
@@ -6196,7 +6200,7 @@ fn append_serialized_object(
 pub fn record_object(type_id: u8, data: Vec<u8>) {
     let mut guard = heap_state().lock().unwrap();
     if let Some(state) = guard.as_mut() {
-        let _ = append_serialized_object(state, type_id, &data);
+        let _ = append_serialized_object(state, type_id, &data, &mut [None; 2]);
     }
 }
 
@@ -6473,6 +6477,7 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     let mut map: RelocMap =
         RelocMap::with_capacity_and_hasher(data.len() / 24 + 16, Default::default());
     let mut offset = 0usize;
+    let mut targets = [None; 2];
     while offset < data.len() {
         if data.len() - offset < 13 {
             return Err(EgclError::InvalidImage(
@@ -6490,7 +6495,8 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
                 "truncated heap object payload".into(),
             ));
         }
-        let new_body = append_serialized_object(state, type_id, &data[offset..offset + size])?;
+        let new_body =
+            append_serialized_object(state, type_id, &data[offset..offset + size], &mut targets)?;
         map.insert(old_body, new_body);
         offset += size;
     }
@@ -7415,5 +7421,119 @@ mod relocation_tests {
         let mut fix = EgclVal::from_fixnum(42);
         unsafe { relocate_slot(&mut fix as *mut EgclVal, lo, hi) };
         assert_eq!(fix, EgclVal::from_fixnum(42));
+    }
+}
+
+#[cfg(test)]
+mod restore_target_tests {
+    use super::*;
+    use crate::value::NIL;
+
+    thread_local! {
+        pub(super) static TARGET_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn restored_objects_search_per_region_and_preserve_links() {
+        const CHILD: &str = "EGCL_TEST_RESTORE_TARGET_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gc::restore_target_tests::restored_objects_search_per_region_and_preserve_links", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let config = GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 8 * 1024 * 1024,
+            nursery_size: 4 * 1024 * 1024,
+            tlab_size: 4096,
+            region_size: 8192,
+            promotion_threshold: 2,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.5,
+        };
+        init_heap(&config).unwrap();
+        // Synthetic old addresses exercise relocation independently of the new heap base.
+        let mut bytes = Vec::new();
+        let mut tail = NIL.0;
+        for i in 0..2000 {
+            let old_body = 0x10000000u64 + i * 32;
+            bytes.extend_from_slice(&old_body.to_le_bytes());
+            bytes.push(crate::object::type_id::CONS);
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&EgclVal::from_fixnum(i as i64).0.to_le_bytes());
+            bytes.extend_from_slice(&tail.to_le_bytes());
+            tail = old_body | crate::value::TAG_CONS;
+        }
+        // A second restore must not retain a cursor into the previous heap.
+        for _ in 0..2 {
+            TARGET_SEARCHES.with(|count| count.set(0));
+            restore_heap(&bytes).unwrap();
+            let searches = TARGET_SEARCHES.with(|count| count.get());
+            let mut cursor = remap_saved_pointer(tail);
+            for i in (0..2000).rev() {
+                let body = (cursor & !crate::value::TAG_MASK) as *const EgclVal;
+                unsafe {
+                    assert_eq!(*body, EgclVal::from_fixnum(i));
+                    cursor = (*body.add(1)).0;
+                }
+            }
+            assert_eq!(cursor, NIL.0);
+            let regions = (2000 * object_footprint(16).0).div_ceil(config.region_size);
+            assert!(
+                searches <= regions + 1,
+                "restoring {regions} regions required {searches} region searches"
+            );
+        }
+        // Interleave large and small objects, then force a search back into an
+        // older nursery region's gap. Verify every payload remains disjoint.
+        let mut guard = heap_state().lock().unwrap();
+        let state = guard.as_mut().unwrap();
+        clear_heap_objects(state);
+        let mut targets = [None; 2];
+        let mut objects = Vec::new();
+        for size in [4000, 5000, 4000, 1000, 6000, 4000, 3032, 128] {
+            let mut body = vec![b'x'; size];
+            body[..8].copy_from_slice(&((size - 8) as u64).to_le_bytes());
+            let addr = append_serialized_object(
+                state,
+                crate::object::type_id::SIMPLE_BASE_STRING,
+                &body,
+                &mut targets,
+            )
+            .unwrap();
+            let slot = usize::from(object_footprint(size).0 > config.region_size / 2);
+            assert_eq!(
+                state.regions[targets[slot].unwrap()].header.kind,
+                if slot == 0 {
+                    RegionKind::Nursery
+                } else {
+                    RegionKind::LargeObject
+                }
+            );
+            objects.push((addr, body));
+        }
+        let first_region = (objects[0].0 - state.heap_base as usize) / config.region_size;
+        let last_region =
+            (objects.last().unwrap().0 - state.heap_base as usize) / config.region_size;
+        assert_eq!(
+            first_region, last_region,
+            "small object should reuse the earlier gap"
+        );
+        for (addr, body) in objects {
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(addr as *const u8, body.len()) },
+                body
+            );
+        }
     }
 }
