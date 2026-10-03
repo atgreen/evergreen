@@ -1473,6 +1473,78 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
 }
 
 /// Set element at index (CL `(SETF ELT)`).
+/// Store OCTETS as fixnums into SEQUENCE's elements, starting at START.
+///
+/// Returns the number stored, or `None` when SEQUENCE is not a simple vector so
+/// the caller can fall back to the generic per-element path.
+///
+/// Why this exists: READ-SEQUENCE on a byte stream used to call `set_elt` per
+/// octet, and each call re-ran the vector/complex-vector/string/bit-vector
+/// dispatch, re-checked bounds, and recomputed the vector's payload offset.
+/// Over a 6.76 MB file that was the larger half of a 1.1 s read. Here the type
+/// check, the bounds check and the offset all happen once.
+///
+/// GC safety: nothing in the loop allocates, so no collection can occur inside
+/// it; and every stored value is a fixnum, which is an immediate rather than a
+/// heap reference, so no write barrier is owed however old SEQUENCE is. (This
+/// is the same reasoning `build_filled_simple_vector` documents, minus its
+/// nursery assumption, which a destination handed in from Lisp cannot make.)
+pub fn fill_vector_with_octets(sequence: EgclVal, start: usize, octets: &[u8]) -> Option<usize> {
+    if !is_vector(sequence) {
+        return None;
+    }
+    let len = vector_length(sequence);
+    if start > len || octets.len() > len - start {
+        return None;
+    }
+    let ptr = unsafe { sequence.as_ptr() };
+    let base = vector_payload_offset(ptr) + 8 + start * 8;
+    for (i, &byte) in octets.iter().enumerate() {
+        unsafe {
+            *(ptr.add(base + i * 8) as *mut EgclVal) = EgclVal::from_fixnum(i64::from(byte));
+        }
+    }
+    Some(octets.len())
+}
+
+/// Collect SEQUENCE's elements in `start..end` as octets.
+///
+/// Returns `None` when SEQUENCE is not a simple vector, the range is out of
+/// bounds, or any element is not an integer in 0..255 -- in every one of those
+/// cases the caller must fall back to the generic per-element path, which is
+/// what produces the right TYPE-ERROR. Nothing is written before the check
+/// completes, so falling back reproduces the generic path's behaviour exactly,
+/// including its partial write up to the offending element.
+///
+/// The counterpart to [`fill_vector_with_octets`], for WRITE-SEQUENCE: building
+/// a `Vec<EgclVal>` through `elt` cost a full sequence dispatch per element and,
+/// at 8 bytes an element, eight times the memory of the data itself.
+pub fn vector_octets(sequence: EgclVal, start: usize, end: usize) -> Option<Vec<u8>> {
+    if !is_vector(sequence) {
+        return None;
+    }
+    if start > end || end > vector_length(sequence) {
+        return None;
+    }
+    let ptr = unsafe { sequence.as_ptr() };
+    let base = vector_payload_offset(ptr) + 8;
+    let mut out = Vec::with_capacity(end - start);
+    for index in start..end {
+        // Reads only; no allocation, so no collection can move the vector
+        // out from under this loop.
+        let value = unsafe { *(ptr.add(base + index * 8) as *const EgclVal) };
+        if !value.is_fixnum() {
+            return None;
+        }
+        let byte = value.as_fixnum();
+        if !(0..=255).contains(&byte) {
+            return None;
+        }
+        out.push(byte as u8);
+    }
+    Some(out)
+}
+
 pub fn set_elt(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
     if is_vector(sequence) {
         let len = vector_length(sequence);

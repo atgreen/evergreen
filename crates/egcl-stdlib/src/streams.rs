@@ -239,6 +239,120 @@ enum StreamInner {
 }
 
 impl StreamMutableState {
+    /// Read up to `count` octets, in bulk where the stream is a buffered byte
+    /// stream and one at a time otherwise.
+    ///
+    /// Callers that want octets rather than elements should use this: it takes
+    /// the stream lock once and avoids materializing one `EgclVal` per byte.
+    fn read_octets(&mut self, count: usize) -> Result<Vec<u8>, EgclError> {
+        self.check_input()?;
+        let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
+        match &mut self.inner {
+            StreamInner::FileInput {
+                element_type,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if *element_type == StreamElementType::UnsignedByte8 => {
+                bulk_read_octets(file, read_buf, buf_pos, buf_fill, count)
+            }
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if byte_stream => bulk_read_octets(file, read_buf, buf_pos, buf_fill, count),
+            // Anything else (string streams, concatenated, character streams
+            // read as codepoints) keeps the per-element semantics of
+            // `stream_read_byte`, including its EOF and decoding behaviour.
+            _ => {
+                let mut out = Vec::with_capacity(count.min(1 << 22));
+                for _ in 0..count {
+                    let byte = self.stream_read_byte()?;
+                    if byte == EOF {
+                        break;
+                    }
+                    if !byte.is_fixnum() {
+                        return Err(EgclError::TypeError {
+                            datum: byte,
+                            expected: "an octet from a byte stream".into(),
+                        });
+                    }
+                    let value = byte.as_fixnum();
+                    if !(0..=255).contains(&value) {
+                        return Err(EgclError::TypeError {
+                            datum: byte,
+                            expected: "an (unsigned-byte 8) element".into(),
+                        });
+                    }
+                    out.push(value as u8);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Write OCTETS, in bulk where the stream is a buffered byte stream and one
+    /// at a time otherwise.
+    ///
+    /// `stream_write_byte` is the wrong shape for a sequence: besides taking the
+    /// stream lock per call, it does `self.components().to_vec()` every time --
+    /// a heap allocation per octet. Writing the 6.8 MB of an APK through it cost
+    /// 3.97 s, ~590 ns a byte, which was the single slowest phase of a build.
+    fn write_octets(&mut self, octets: &[u8]) -> Result<(), EgclError> {
+        self.check_output()?;
+        if octets.is_empty() {
+            return Ok(());
+        }
+        match &mut self.inner {
+            StreamInner::StringOutput { buffer, line, col } => {
+                buffer.extend_from_slice(octets);
+                advance_line_col(octets, line, col);
+                Ok(())
+            }
+            StreamInner::FileOutput {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            }
+            | StreamInner::FileIo {
+                file,
+                write_buf,
+                line,
+                col,
+                ..
+            } => {
+                // A transfer larger than the buffer goes straight to the fd, but
+                // only after the buffer drains -- otherwise it would overtake
+                // bytes written earlier and the file would be out of order.
+                if octets.len() >= FILE_BUF_SIZE {
+                    file_flush_write_buf(file, write_buf)?;
+                    write_all_octets(file, octets)?;
+                } else {
+                    write_buf.extend_from_slice(octets);
+                    if write_buf.len() >= FILE_BUF_SIZE {
+                        file_flush_write_buf(file, write_buf)?;
+                    }
+                }
+                advance_line_col(octets, line, col);
+                Ok(())
+            }
+            // Broadcast and the rest fan out or re-encode per element; keep
+            // their existing behaviour rather than duplicate it here.
+            _ => {
+                for &byte in octets {
+                    self.stream_write_byte(EgclVal::from_fixnum(i64::from(byte)))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn direction(&self) -> StreamDirection {
         match &self.inner {
             StreamInner::StringInput { .. } => StreamDirection::Input,
@@ -451,6 +565,81 @@ fn file_read_byte_raw(
     let byte = read_buf[*buf_pos];
     *buf_pos += 1;
     Ok(EgclVal::from_fixnum(byte as i64))
+}
+
+/// Read up to `count` octets from a buffered byte stream in one go.
+///
+/// `file_read_byte_raw` above is the right shape for READ-BYTE and the wrong
+/// shape for READ-SEQUENCE: per octet it costs a buffer-bookkeeping branch, and
+/// the stream's buffer is only 8 KiB, so a 6.76 MB read also made ~826 refill
+/// syscalls. This drains whatever the per-byte path left buffered and then reads
+/// straight into the destination in 64 KiB chunks, which is what makes a bulk
+/// transfer run at memory speed rather than per-element speed.
+fn bulk_read_octets(
+    file: &mut StreamHandle,
+    read_buf: &mut [u8],
+    buf_pos: &mut usize,
+    buf_fill: &mut usize,
+    count: usize,
+) -> Result<Vec<u8>, EgclError> {
+    // `count` comes from a sequence's length, but cap the eager allocation
+    // anyway: a bogus one must not be a request to reserve that much memory.
+    let mut out: Vec<u8> = Vec::with_capacity(count.min(1 << 22));
+    let buffered = (*buf_fill - *buf_pos).min(count);
+    out.extend_from_slice(&read_buf[*buf_pos..*buf_pos + buffered]);
+    *buf_pos += buffered;
+    while out.len() < count {
+        let base = out.len();
+        let chunk = (count - base).min(1 << 16);
+        out.resize(base + chunk, 0);
+        match file.read(&mut out[base..]) {
+            // Short of `count` is not an error: READ-SEQUENCE reports how much
+            // it transferred, and the caller compares against what it wanted.
+            Ok(0) => {
+                out.truncate(base);
+                break;
+            }
+            Ok(n) => out.truncate(base + n),
+            Err(e) => {
+                return Err(EgclError::StreamError(format!("file read error: {}", e)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Write a whole slice to a file, retrying short writes and EINTR.
+///
+/// The counterpart to `file_flush_write_buf` for a bulk transfer: a 6.8 MB
+/// WRITE-SEQUENCE has no reason to be copied through an 8 KiB buffer.
+fn write_all_octets(file: &mut impl Write, octets: &[u8]) -> Result<(), EgclError> {
+    let mut written = 0;
+    loop {
+        if written == octets.len() {
+            return Ok(());
+        }
+        match file.write(&octets[written..]) {
+            Ok(0) => {
+                return Err(EgclError::StreamError(
+                    "file write error: wrote zero bytes".into(),
+                ));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(EgclError::StreamError(format!("file write error: {error}"))),
+        }
+    }
+}
+
+/// Advance a stream's line/column counters past OCTETS.
+fn advance_line_col(octets: &[u8], line: &mut u64, col: &mut u64) {
+    match octets.iter().rposition(|&b| b == b'\n') {
+        Some(last) => {
+            *line += octets.iter().filter(|&&b| b == b'\n').count() as u64;
+            *col = (octets.len() - last - 1) as u64;
+        }
+        None => *col += octets.len() as u64,
+    }
 }
 
 /// Flush a write buffer to file.
@@ -2339,6 +2528,29 @@ pub fn stream_read_byte_sequence(
         }
         Ok(out)
     })
+}
+
+/// Read up to `count` octets from STREAM as bytes.
+///
+/// Preferred over `stream_read_byte_sequence` for byte streams: that one builds
+/// a `Vec<EgclVal>`, which for a 6.76 MB file is a 54 MB intermediate on top of
+/// a dispatch per byte.
+pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, EgclError> {
+    // Not `with_stream`: that roots the result, and plain octets hold no Lisp
+    // value for the collector to trace or relocate. Root only the stream, which
+    // is what an allocation during the read could move.
+    egcl_rt::rooted!(stream = stream);
+    let mut guard = lock_stream(*stream)?;
+    guard.read_octets(count)
+}
+
+/// Write OCTETS to STREAM as bytes, taking the stream lock once.
+pub fn stream_write_octets(stream: EgclVal, octets: &[u8]) -> Result<(), EgclError> {
+    // As in `stream_read_octets`: octets hold no Lisp value, so only the stream
+    // needs rooting.
+    egcl_rt::rooted!(stream = stream);
+    let mut guard = lock_stream(*stream)?;
+    guard.write_octets(octets)
 }
 
 pub fn stream_write_sequence(stream: EgclVal, elements: &[EgclVal]) -> Result<(), EgclError> {

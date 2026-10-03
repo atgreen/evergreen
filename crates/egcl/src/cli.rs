@@ -23171,13 +23171,25 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         pos += 1;
                     }
                 } else if egcl_stdlib::is_byte_stream(inp) {
-                    // Byte (unsigned-byte 8) stream: transfer octets, not chars.
-                    // In bulk -- a per-octet stream_read_byte takes the stream
-                    // lock each time, which was ~750 ns a byte and 5.1 s to read
-                    // a 6.76 MB file.
-                    for b in egcl_stdlib::streams::stream_read_byte_sequence(inp, count)? {
-                        seq_set_elt(seq, pos, b)?;
-                        pos += 1;
+                    // Byte (unsigned-byte 8) stream: transfer octets, not chars,
+                    // and do it in bulk at both ends. Taking the stream lock per
+                    // octet was ~750 ns a byte (5.1 s for a 6.76 MB file); then
+                    // locking once but still dispatching per byte -- and
+                    // building a Vec<EgclVal> 8x the size of the data -- left
+                    // 1.1 s of it, which was the slowest phase of an APK build
+                    // by a wide margin and 225x SBCL. Reading octets and storing
+                    // them with one type and bounds check is ~10 ms.
+                    let octets = egcl_stdlib::streams::stream_read_octets(inp, count)?;
+                    match egcl_stdlib::sequences::fill_vector_with_octets(seq, pos, &octets) {
+                        Some(stored) => pos += stored,
+                        // Not a simple vector (a list, a fill-pointer vector, a
+                        // string): the generic store is the only correct one.
+                        None => {
+                            for &byte in &octets {
+                                seq_set_elt(seq, pos, EgclVal::from_fixnum(i64::from(byte)))?;
+                                pos += 1;
+                            }
+                        }
                     }
                 } else {
                     for el in egcl_stdlib::stream_read_sequence(inp, count)? {
@@ -23204,6 +23216,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 check_pending_sigpipe_for_output()?;
                 let seq_len = egcl_stdlib::length(seq)?;
                 let (start, end) = read_start_end_keys(&vals[2..], seq_len);
+                // Bulk path first, so a byte stream never materializes the
+                // Vec<EgclVal> below: that cost a sequence dispatch per element
+                // to build, and then stream_write_byte took the stream lock and
+                // allocated a components Vec for every single octet. Writing an
+                // APK's 6.8 MB took 3.97 s; in bulk it is ~70 ms.
+                if !is_gray_stream(out) && egcl_stdlib::is_byte_stream(out) {
+                    if let Some(octets) = egcl_stdlib::sequences::vector_octets(seq, start, end) {
+                        egcl_stdlib::streams::stream_write_octets(out, &octets)?;
+                        return Ok(seq);
+                    }
+                    // Not a simple vector of octets: fall through to the
+                    // generic path, which signals the TYPE-ERROR this cannot.
+                }
                 let mut elems = Vec::with_capacity(end - start);
                 egcl_rt::rooted_ref!(_elements_root = &mut elems);
                 for i in start..end {
