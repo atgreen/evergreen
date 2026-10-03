@@ -101,9 +101,16 @@ pub(super) fn try_run(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
-    if std::env::var_os("EGCL_NATIVE_TRANSFER") != Some(std::ffi::OsString::from("1"))
-        || !native_transfer::is_supported()
-    {
+    // Cached: this runs on EVERY ordinary native invocation, and an uncached
+    // read here cost a getenv plus an OsString allocation per call -- 2.7% of a
+    // SHA-256 profile, for a process-wide switch that cannot change. The same
+    // OnceLock idiom as nn_direct_enabled and profiling_disabled.
+    fn opted_in() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
+    }
+    if !opted_in() || !native_transfer::is_supported() {
         return None;
     }
 

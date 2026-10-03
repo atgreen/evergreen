@@ -213,27 +213,27 @@ pub(super) fn bump_direct_call_gen() {
 }
 
 // Captured lexical locations are process-wide, just like function identities.
-fn closure_envs() -> &'static SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>>> {
-    static ENVS: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>>>> =
+fn closure_envs() -> &'static SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>> {
+    static ENVS: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>>> =
         std::sync::OnceLock::new();
-    ENVS.get_or_init(|| SharedCell::new(HashMap::new()))
+    ENVS.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
 type ClosureControl = (Vec<(String, String)>, Vec<(String, String)>);
 
-fn closure_controls() -> &'static SharedCell<HashMap<u32, ClosureControl>> {
-    static CONTROLS: std::sync::OnceLock<SharedCell<HashMap<u32, ClosureControl>>> =
+fn closure_controls() -> &'static SharedCell<HashMap<u32, ClosureControl, egcl_rt::fxhash::FxBuildHasher>> {
+    static CONTROLS: std::sync::OnceLock<SharedCell<HashMap<u32, ClosureControl, egcl_rt::fxhash::FxBuildHasher>>> =
         std::sync::OnceLock::new();
-    CONTROLS.get_or_init(|| SharedCell::new(HashMap::new()))
+    CONTROLS.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
 /// Private closure symbols have immutable executable bodies. Keep the same
 /// body allocation alive and GC-visible when another thread calls the closure;
 /// its heap function object intentionally has no source body to fall back to.
-fn closure_bodies() -> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>>> {
-    static BODIES: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<BytecodeFunction>>>> =
+fn closure_bodies() -> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher>> {
+    static BODIES: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher>>> =
         std::sync::OnceLock::new();
-    BODIES.get_or_init(|| SharedCell::new(HashMap::new()))
+    BODIES.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
 /// Canonical named definitions outlive the execution that loaded them. A
@@ -245,10 +245,10 @@ struct NamedBytecodeDefinition {
     body: Option<Arc<BytecodeFunction>>,
 }
 
-fn named_definitions() -> &'static SharedCell<HashMap<u32, NamedBytecodeDefinition>> {
-    static DEFINITIONS: std::sync::OnceLock<SharedCell<HashMap<u32, NamedBytecodeDefinition>>> =
+fn named_definitions() -> &'static SharedCell<HashMap<u32, NamedBytecodeDefinition, egcl_rt::fxhash::FxBuildHasher>> {
+    static DEFINITIONS: std::sync::OnceLock<SharedCell<HashMap<u32, NamedBytecodeDefinition, egcl_rt::fxhash::FxBuildHasher>>> =
         std::sync::OnceLock::new();
-    DEFINITIONS.get_or_init(|| SharedCell::new(HashMap::new()))
+    DEFINITIONS.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
 /// Root the original constant pools of bodies owned by any execution. Weak
@@ -259,7 +259,7 @@ fn live_bytecode_bodies() -> &'static SharedCell<HashMap<usize, std::sync::Weak<
     static BODIES: std::sync::OnceLock<
         SharedCell<HashMap<usize, std::sync::Weak<BytecodeFunction>>>,
     > = std::sync::OnceLock::new();
-    BODIES.get_or_init(|| SharedCell::new(HashMap::new()))
+    BODIES.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
 fn register_bytecode_roots(function: &Arc<BytecodeFunction>) {
@@ -586,7 +586,7 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
 /// because a registry owns them. Heap function objects trace their name symbol,
 /// and direct bytecode calls explicitly trace their symbol operands.
 /// Only called in a heap snapshot, without Lisp allocation.
-fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>> {
+fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher> {
     let mut bodies = closure_bodies().borrow().clone();
     REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
     for (&symbol, definition) in named_definitions().borrow().iter() {

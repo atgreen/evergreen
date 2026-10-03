@@ -36,7 +36,15 @@ pub(super) fn try_run(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
-    if std::env::var_os("EGCL_NATIVE_TRANSFER") != Some(std::ffi::OsString::from("1"))
+    // Cached: this runs on EVERY ordinary native invocation, and an uncached
+    // read here cost a getenv plus an OsString allocation per call. Same
+    // OnceLock idiom as nn_direct_enabled and profiling_disabled.
+    fn opted_in() -> bool {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
+    }
+    if !opted_in()
         || !native_transfer::is_supported()
         || !native_transfer::current_segment().is_null()
     {
