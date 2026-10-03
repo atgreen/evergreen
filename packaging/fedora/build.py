@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
 import shutil
@@ -18,9 +19,18 @@ import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
+# `native` and `static` are built FOR the machine running the build, not for a
+# fixed architecture: x86_64 for the cross-targeting release, ppc64le for the
+# POWER-native one. Keyed by `uname -m`, which agrees with rpm's %{_arch} for
+# every architecture egcl.spec's ExclusiveArch allows. An unknown host falls
+# through unmapped so cargo names the missing target rather than silently
+# building for the wrong one.
+HOST_RUST_ARCH = {'x86_64': 'x86_64', 'ppc64le': 'powerpc64le'}
+HOST_MACHINE = platform.machine()
+HOST_ARCH = HOST_RUST_ARCH.get(HOST_MACHINE, HOST_MACHINE)
 TARGETS = {
-    'native': 'x86_64-unknown-linux-gnu',
-    'static': 'x86_64-unknown-linux-musl',
+    'native': f'{HOST_ARCH}-unknown-linux-gnu',
+    'static': f'{HOST_ARCH}-unknown-linux-musl',
     's390x-linux': 's390x-unknown-linux-gnu',
     'aarch64-linux': 'aarch64-unknown-linux-gnu',
     'ppc64le-linux': 'powerpc64le-unknown-linux-gnu',
@@ -30,14 +40,20 @@ TARGETS = {
     'windows': 'x86_64-pc-windows-gnu',
     'android': 'aarch64-linux-android',
 }
-GROUPS = {
-    'native': ['native', 'static'],
-    's390x': ['s390x-linux', 's390x-linux-static'],
-    'aarch64': ['aarch64-linux', 'aarch64-linux-static'],
-    'ppc64le': ['ppc64le-linux', 'ppc64le-linux-static'],
-    'windows': ['windows'],
-    'android': ['android'],
-}
+GROUPS = {'native': ['native', 'static']}
+# The cross groups need x86_64-hosted toolchains -- Fedora's cross GCC and
+# sysroot RPMs from prepare-tools.sh, MinGW, and the Android NDK -- so they
+# exist only on x86_64. This mirrors egcl.spec's `%ifarch x86_64` guard around
+# the matching subpackages; the two must stay in step, or `--group all` would
+# build payloads the spec then refuses to package.
+if HOST_MACHINE == 'x86_64':
+    GROUPS.update({
+        's390x': ['s390x-linux', 's390x-linux-static'],
+        'aarch64': ['aarch64-linux', 'aarch64-linux-static'],
+        'ppc64le': ['ppc64le-linux', 'ppc64le-linux-static'],
+        'windows': ['windows'],
+        'android': ['android'],
+    })
 
 
 def run(command, *, env=None, cwd=ROOT):

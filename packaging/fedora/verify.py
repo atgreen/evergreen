@@ -6,12 +6,24 @@
 import argparse
 import os
 from pathlib import Path
+import platform
 import subprocess
 import tempfile
 
+# The *FEATURES an egcl built for this host must report. `native` and `static`
+# follow the build machine (build.py's HOST_ARCH); every other entry is a fixed
+# cross target. Keyed by `uname -m`, matching egcl.spec's ExclusiveArch.
+HOST_FEATURES = {
+    'x86_64': (':x86-64', ':linux'),
+    'ppc64le': (':ppc64le', ':little-endian', ':linux'),
+}
+# Linux/rpm architecture names to Rust's spelling, for the --runtime-info
+# triple check below. Only ppc64le actually differs; the rest pass through.
+RUST_ARCH = {'ppc64le': 'powerpc64le'}
+HOST_MACHINE = platform.machine()
 TARGETS = {
-    'native': (':x86-64', ':linux'),
-    'static': (':x86-64', ':linux'),
+    'native': HOST_FEATURES.get(HOST_MACHINE, (':linux',)),
+    'static': HOST_FEATURES.get(HOST_MACHINE, (':linux',)),
     's390x-linux': (':s390x', ':big-endian'),
     'aarch64-linux': (':arm64', ':linux'),
     'ppc64le-linux': (':ppc64le', ':little-endian', ':linux'),
@@ -73,8 +85,9 @@ def verify(root, limited, targets=None):
                 checks = ''.join(f'(assert (member {feature} *features*))'
                                  for feature in TARGETS[target])
                 if is_static or target == 'native':
-                    arch = 'x86_64' if target in ('native', 'static') else target.split('-')[0]
-                    arch = 'powerpc64le' if arch == 'ppc64le' else arch
+                    arch = (HOST_MACHINE if target in ('native', 'static')
+                            else target.split('-')[0])
+                    arch = RUST_ARCH.get(arch, arch)
                     triple = f'{arch}-unknown-linux-' + ('musl' if is_static else 'gnu')
                     if f'target={triple}' not in run([command, '--runtime-info']).splitlines():
                         raise RuntimeError(f'{command}: wrong runtime target, expected {triple}')
