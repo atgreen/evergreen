@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-"""Plan Fedora releases and validate the complete RPM set before publishing."""
+"""Plan Fedora releases, sign the packages, and validate the complete RPM set."""
 import argparse
 import hashlib
 import json
@@ -11,9 +11,12 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
+PUBLIC_KEY = Path(__file__).resolve().with_name('RPM-GPG-KEY-egcl')
+GPG_KEY_NAME = 'EGCL RPM Signing Key'
 PACKAGES = {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
             'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
             'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
@@ -101,24 +104,80 @@ def collect(rpm_dir, destination, plan, source_rpm, provenance_dir):
         shutil.copy2(rpm, destination / rpm.name)
     shutil.copy2(source_rpm, destination / source_rpm.name)
     shutil.copy2(ROOT / 'CHANGELOG.md', destination / 'CHANGELOG.md')
+    shutil.copy2(PUBLIC_KEY, destination / PUBLIC_KEY.name)
     (destination / 'build.json').write_text(json.dumps(provenance, indent=2) + '\n')
     (destination / 'release.json').write_text(json.dumps(plan, indent=2) + '\n')
+    write_checksums(destination)
+
+
+def write_checksums(destination):
+    """Rewrite SHA256SUMS over every other asset, replacing any earlier manifest."""
+    manifest = destination / 'SHA256SUMS'
+    manifest.unlink(missing_ok=True)
     checksums = []
     for path in sorted(destination.iterdir()):
         with path.open('rb') as source:
             digest = hashlib.file_digest(source, 'sha256').hexdigest()
         checksums.append(f'{digest}  {path.name}\n')
-    (destination / 'SHA256SUMS').write_text(''.join(checksums))
+    manifest.write_text(''.join(checksums))
+
+
+def sign(assets, passphrase_file, public_key=None, gpg='/usr/bin/gpg'):
+    """Sign every package in place, prove it, then refresh the checksum manifest.
+
+    Signing rewrites the RPM header, so this has to run before SHA256SUMS is
+    final -- and the caller should verify the pre-signing manifest first, so the
+    hand-off from the build jobs is still checked.
+    """
+    public_key = public_key or PUBLIC_KEY
+    rpms = sorted(assets.glob('*.rpm'))
+    if len(rpms) != len(PACKAGES) + 1:
+        raise ValueError(f'Expected {len(PACKAGES) + 1} packages to sign, got {len(rpms)}')
+    subprocess.run(
+        ['rpmsign',
+         # Debian/Ubuntu's rpm defaults %__gpg to /usr/bin/gpg2, which Ubuntu
+         # does not ship, and rpmsign then fails with "Could not exec gpg".
+         '--define', f'__gpg {gpg}',
+         '--define', f'_gpg_name {GPG_KEY_NAME}',
+         # Unattended signing: no tty and no agent prompt on a CI runner.
+         '--define', f'_gpg_sign_cmd_extra_args '
+                     f'--pinentry-mode loopback --passphrase-file {passphrase_file}',
+         '--addsign', *map(str, rpms)], check=True)
+    verify_signatures(rpms, public_key)
+    write_checksums(assets)
+    return rpms
+
+
+def verify_signatures(rpms, public_key=None):
+    """Fail unless every package carries a signature made by our key.
+
+    A keyring holding only our public key answers "signed by us"; the output has
+    to be read as well, because `rpmkeys --checksig` EXITS 0 FOR AN UNSIGNED
+    PACKAGE -- it reports "digests OK" and says nothing about signatures, so
+    trusting the exit status alone would wave unsigned RPMs through.
+    """
+    public_key = public_key or PUBLIC_KEY
+    with tempfile.TemporaryDirectory() as keyring:
+        subprocess.run(['rpmkeys', '--dbpath', keyring, '--import', str(public_key)], check=True)
+        report = subprocess.run(
+            ['rpmkeys', '--dbpath', keyring, '--checksig', *map(str, rpms)],
+            check=True, text=True, capture_output=True).stdout
+    verified = {line.split(':')[0] for line in report.splitlines() if 'signatures OK' in line}
+    unverified = [rpm.name for rpm in rpms if not any(name.endswith(rpm.name) for name in verified)]
+    if unverified:
+        raise ValueError(f'Packages are not signed by {GPG_KEY_NAME}: {unverified}\n{report}')
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('plan', 'collect'))
+    parser.add_argument('command', choices=('plan', 'collect', 'sign'))
     parser.add_argument('--plan', type=Path, default=Path('target/release-plan.json'))
     parser.add_argument('--rpm-dir', type=Path, default=Path('target/fedora-rpm/RPMS/x86_64'))
     parser.add_argument('--destination', type=Path, default=Path('target/release-assets'))
     parser.add_argument('--source-rpm', type=Path)
     parser.add_argument('--provenance-dir', type=Path)
+    parser.add_argument('--assets', type=Path, default=Path('target/release-assets'))
+    parser.add_argument('--passphrase-file', type=Path)
     args = parser.parse_args()
     if args.command == 'plan':
         version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
@@ -133,6 +192,11 @@ def main():
                 for key, value in plan.items():
                     stream.write(f'{key}={str(value).lower() if isinstance(value, bool) else value}\n')
         print(json.dumps(plan, indent=2))
+    elif args.command == 'sign':
+        if not args.passphrase_file:
+            parser.error('sign requires --passphrase-file')
+        for rpm in sign(args.assets, args.passphrase_file):
+            print(f'signed {rpm.name}')
     else:
         if not args.source_rpm or not args.provenance_dir:
             parser.error('collect requires --source-rpm and --provenance-dir')

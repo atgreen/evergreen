@@ -170,9 +170,46 @@ number (currently `6.fc44`). An existing release is never overwritten; a failed
 upload can leave a draft for inspection before retrying.
 
 Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
-release metadata, and `SHA256SUMS`. Publication runs only after package identity,
-payload, and runtime checks pass, with write permission confined to the publish
-job. RPMs are not GPG-signed by this workflow.
+release metadata, the `RPM-GPG-KEY-egcl` public key, and `SHA256SUMS`.
+Publication runs only after package identity, payload, and runtime checks pass.
+Write permission and the signing key are confined to the publish job, which runs
+in a protected `release` environment that only `main` and `v*` tags may deploy
+to, and which waits for maintainer approval.
+
+Two runs for the same ref never publish concurrently. Test prereleases beyond
+the three most recent are pruned automatically.
+
+### Package signing
+
+Every published RPM, the SRPM included, is GPG-signed in the publish job:
+
+```
+EGCL RPM Signing Key <green@moxielogic.com>
+RSA 4096, key ID F2EAEAEE344F7576
+fingerprint 6101 7475 407E 35EB 2608 BF2B F2EA EAEE 344F 7576
+```
+
+Signing rewrites each RPM header, so it happens in a defined order: the
+`SHA256SUMS` produced by the collector is checked first, which verifies the
+hand-off from the build jobs; the packages are then signed; each signature is
+verified against `packaging/fedora/RPM-GPG-KEY-egcl` in a keyring holding no
+other key; and only then is `SHA256SUMS` rewritten over the signed bytes. The
+published manifest therefore describes exactly the files you download.
+
+To verify what you downloaded:
+
+```sh
+sha256sum --check SHA256SUMS
+sudo rpmkeys --import RPM-GPG-KEY-egcl
+rpmkeys --checksig egcl-*.rpm
+```
+
+Each package must report `digests signatures OK`. Note that `digests OK`
+*without* the word `signatures` means the package is **unsigned** — and
+`rpmkeys --checksig` still exits 0 in that case, so read the output rather than
+relying on the exit status. Verify the fingerprint above out of band before
+importing; a key shipped beside the packages it signs only proves they came from
+the same place.
 
 ## Install and use
 
