@@ -93,7 +93,13 @@ class DocumentTests(unittest.TestCase):
             sbom.ndk_release(path)
 
     def test_document_is_deterministic_and_declares_cyclonedx(self):
-        with patch.object(sbom.subprocess, 'check_output', return_value=json.dumps(METADATA)):
+        # SOURCE_DATE_EPOCH has to be cleared, not merely assumed absent. rpmbuild
+        # sets it for reproducible builds, so inheriting the ambient value made
+        # this case assert the opposite of the next one and fail only inside the
+        # spec's %check -- green on a bare runner, red in every binaries job.
+        with patch.object(sbom.subprocess, 'check_output', return_value=json.dumps(METADATA)), \
+                patch.dict(sbom.os.environ):
+            sbom.os.environ.pop('SOURCE_DATE_EPOCH', None)
             first = sbom.build('0.0.1')
             second = sbom.build('0.0.1')
         self.assertEqual(json.dumps(first), json.dumps(second))
