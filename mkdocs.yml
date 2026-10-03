@@ -54,6 +54,13 @@ markdown_extensions:
       anchor_linenums: true
   - pymdownx.superfences
   - pymdownx.inlinehilite
+extra:
+  version:
+    # Reads versions.json, which mike maintains at the root of the published
+    # branch. `alias: true` shows `latest` beside the version it points at.
+    provider: mike
+    alias: true
+
 extra_css:
   - stylesheets/extra.css
 validation:

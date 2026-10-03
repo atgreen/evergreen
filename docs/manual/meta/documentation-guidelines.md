@@ -80,13 +80,39 @@ local preview. The site uses system fonts and local search assets.
 
 ## Publication and versions
 
-The intended address is `https://atgreen.github.io/egcl/`. Publication is not
-enabled yet. The documentation workflow only builds and uploads a preview
-artifact; it does not deploy Pages or push a branch. Keep deployment disabled
-until the owner authorizes publication and the destination repository is ready.
+The manual is published at `https://atgreen.github.io/evergreen/`, versioned
+with [mike](https://github.com/jimporter/mike). Each version is a directory on
+the `gh-pages` branch, `versions.json` at the branch root drives the version
+selector, and the root redirects to the default alias:
 
-This first edition documents the development checkout. Do not label it as a
-stable release manual. When supported release versions need separate manuals,
-add versioned publication tied to EGCL releases and retain old references.
-Unlike Gloopy, EGCL does not currently have a separately versioned control
-protocol that should drive manual versioning.
+```
+/              redirect to latest/
+/versions.json
+/latest/       alias for the newest release
+/0.0.1/
+/dev/          built from main
+```
+
+A push to `main` refreshes `dev` and nothing else; released versions and the
+default alias are untouched. A release publishes its own version and moves
+`latest` onto it:
+
+```sh
+gh workflow run docs.yml -f version=0.0.1 -f alias=latest
+```
+
+Material injects the version selector in the browser by fetching
+`versions.json`, so it does not appear in the built HTML. An absent selector in
+`site/` is expected and not a build problem.
+
+The deploy job pushes the `gh-pages` branch and then publishes that whole
+branch to Pages. The signed dnf repository metadata lives under `repo/` on the
+same branch, so it is published by the same deployment. Each publisher commits
+only its own subtree and cannot overwrite the other's.
+
+Do not run `mike delete --all`. It rewrites the branch and would remove the
+repository metadata along with the docs.
+
+Links that predate versioning point at the unversioned paths, which now live
+under the default alias — `/evergreen/compiler/` is `/evergreen/latest/compiler/`.
+Only the site root is redirected.
