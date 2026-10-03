@@ -13,20 +13,32 @@ toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.
 # A pinned, checksum-verified rustup-init rather than piping https://sh.rustup.rs:
 # that URL is unversioned and unsigned, so it is the one input to the published
 # RPMs that could change under us -- silently changing shipped binaries, and
-# leaving an old release un-rebuildable. The container is ExclusiveArch x86_64
-# (see egcl.spec), so one host triple suffices (bliss-9qu9p).
+# leaving an old release un-rebuildable. One digest PER HOST TRIPLE: the
+# container runs on x86_64 for the cross-targeting release and on ppc64le,
+# under qemu-user, for the POWER-native one (egcl.spec's ExclusiveArch).
+# Originally bliss-9qu9p, when x86_64 was the only host.
 #
 # To update: read the version from
 #   https://static.rust-lang.org/rustup/release-stable.toml
 # then the digest from the matching
 #   https://static.rust-lang.org/rustup/archive/<version>/<triple>/rustup-init.sha256
 rustup_version=1.29.1
-rustup_sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+case "$(uname -m)" in
+    x86_64)
+        rustup_triple=x86_64-unknown-linux-gnu
+        rustup_sha256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71 ;;
+    ppc64le)
+        rustup_triple=powerpc64le-unknown-linux-gnu
+        rustup_sha256=86ebc5b46b20013fca57dff4f83aa0c325ee90914626ce1c80ae76e126e48afb ;;
+    *)
+        echo "No pinned rustup-init for $(uname -m); egcl.spec allows x86_64 and ppc64le" >&2
+        exit 2 ;;
+esac
 # The basename must stay rustup-init: the binary is multi-call and dispatches on
 # argv[0], so under any other name it exits with "unknown proxy name".
 mkdir -p /tmp/egcl-rustup
 curl --fail --location --retry 3 \
-    "https://static.rust-lang.org/rustup/archive/$rustup_version/x86_64-unknown-linux-gnu/rustup-init" \
+    "https://static.rust-lang.org/rustup/archive/$rustup_version/$rustup_triple/rustup-init" \
     -o /tmp/egcl-rustup/rustup-init
 printf '%s  %s\n' "$rustup_sha256" /tmp/egcl-rustup/rustup-init | sha256sum --check -
 chmod +x /tmp/egcl-rustup/rustup-init
