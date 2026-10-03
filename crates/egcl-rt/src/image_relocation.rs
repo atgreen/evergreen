@@ -109,6 +109,15 @@ impl ImageRelocations {
             _ => raw,
         }
     }
+
+    /// Relocate a tagged Lisp value, never an untagged integer or native handle.
+    pub fn remap_value(&self, raw: u64) -> u64 {
+        use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, TAG_MASK};
+        match raw & TAG_MASK {
+            TAG_CONS | TAG_FUNCTION | TAG_HEAP_OBJECT => self.remap(raw),
+            _ => raw,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +170,8 @@ mod tests {
         for tag in [TAG_CONS, TAG_HEAP_OBJECT, TAG_FUNCTION, 0] {
             assert_eq!(map.remap(0x1010 | tag), 0x5010 | tag);
         }
+        assert_eq!(map.remap_value(0x1010), 0x1010, "fixnums are not addresses");
+        assert_eq!(map.remap_value(0x1010 | TAG_CONS), 0x5010 | TAG_CONS);
         map.insert_object(0x8008, 0xc008);
         assert_eq!(
             map.remap(0x8000 | TAG_HEAP_OBJECT),

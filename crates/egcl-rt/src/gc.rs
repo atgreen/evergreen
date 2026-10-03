@@ -5837,6 +5837,12 @@ fn heap_state() -> &'static OrderedMutex<Option<HeapState>> {
 /// Initialize the GC heap. Called once during runtime startup.
 /// Validates configuration and sets up the region-based heap structure.
 pub fn init_heap(config: &GcConfig) -> Result<(), EgclError> {
+    let state = allocate_heap_state(config)?;
+    install_heap_state(state);
+    Ok(())
+}
+
+fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
     if config.heap_size == 0 {
         return Err(EgclError::Internal("heap_size must be non-zero".into()));
     }
@@ -5953,16 +5959,21 @@ pub fn init_heap(config: &GcConfig) -> Result<(), EgclError> {
         remembered: std::collections::HashSet::new(),
         satb_log: Vec::new(),
     };
-    HEAP_RANGE_BASE.store(heap_base as usize, std::sync::atomic::Ordering::Relaxed);
+    Ok(state)
+}
+
+fn install_heap_state(state: HeapState) {
+    HEAP_RANGE_BASE.store(
+        state.heap_base as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     HEAP_RANGE_END.store(
-        heap_base as usize + config.heap_size,
+        state.heap_base as usize + state.config.heap_size,
         std::sync::atomic::Ordering::Relaxed,
     );
     *heap_state().lock().unwrap() = Some(state);
     HEAP_IDENTITY_EPOCH.fetch_add(1, Ordering::Release);
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
-
-    Ok(())
 }
 
 /// Query the current heap stats. Returns default (zeroed) stats if the
@@ -6496,16 +6507,26 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
 /// by registry restores (symbols/packages) to remap their saved object addresses.
 static RELOC_MAP: std::sync::Mutex<Option<ImageRelocations>> = std::sync::Mutex::new(None);
 
-/// Remap one saved pointer value through the last restore's old→new map,
-/// tag-aware: a cons ref (|001) points at the body; a heap-object/function ref
-/// (|010/|110) at the header; a bare value at the body. Unmapped or non-pointer
-/// values pass through. Registry restores use this for their saved `EgclVal`s.
+/// Remap a saved tagged Lisp value through the last restore's map.
+/// Fixnums and other immediate values pass through, even if their bits match
+/// an address in a saved region. Registry restores carry `EgclVal`s.
 pub fn remap_saved_pointer(raw: u64) -> u64 {
     let guard = RELOC_MAP.lock().unwrap();
     match guard.as_ref() {
-        Some(map) => map.remap(raw),
+        Some(map) => map.remap_value(raw),
         None => raw,
     }
+}
+
+/// Translate an explicitly untagged native address. Use `remap_saved_pointer`
+/// for Lisp values so pointer-shaped fixnums remain unchanged.
+pub fn remap_saved_address(address: usize) -> usize {
+    RELOC_MAP
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|map| map.translate_address(address))
+        .unwrap_or(address)
 }
 
 // ── Off-heap-body object serialization (bliss-x0f2 M3) ─────────────────
@@ -6563,6 +6584,177 @@ pub fn serialize_offheap_objects() -> Vec<u8> {
 /// Stash (or clear) the off-heap section bytes for the next `restore_heap`.
 pub fn set_pending_offheap(data: Option<Vec<u8>>) {
     *PENDING_OFFHEAP.lock().unwrap() = data;
+}
+
+/// Restore a region snapshot into a separately owned heap allocation.
+///
+/// # Safety
+/// The caller must stop all mutators and supply a trusted native heap snapshot
+/// for this runtime. If backing is supplied, its bytes at the given section
+/// offset must match data and remain unchanged while the restored heap lives.
+pub unsafe fn restore_heap_regions(
+    data: &[u8],
+    backing: Option<(&std::fs::File, u64)>,
+) -> Result<(), EgclError> {
+    use crate::image_relocation::RegionRelocation;
+    let image = crate::image_heap::HeapImageView::parse(data)?;
+    let invalid = || EgclError::InvalidImage("invalid restored heap extent".into());
+    let mut config = heap_state()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or_else(|| EgclError::Internal("heap not initialized".into()))?
+        .config
+        .clone();
+    config.region_size = image.region_size;
+    if config.tlab_size > config.region_size {
+        return Err(EgclError::InvalidImage(
+            "image regions are smaller than the configured TLAB".into(),
+        ));
+    }
+    let mut occupied = 0usize;
+    for region in &image.regions {
+        let span = region
+            .used
+            .checked_add(config.region_size - 1)
+            .ok_or_else(invalid)?
+            / config.region_size
+            * config.region_size;
+        occupied = occupied.checked_add(span).ok_or_else(invalid)?;
+    }
+    let required = occupied
+        .checked_add(config.nursery_size)
+        .ok_or_else(invalid)?;
+    config.heap_size = config.heap_size.max(required);
+    if config.heap_size > config.heap_max {
+        return Err(EgclError::Oom);
+    }
+    if let Some((file, offset)) = backing {
+        let end = offset.checked_add(data.len() as u64).ok_or_else(invalid)?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| EgclError::InvalidImage(e.to_string()))?
+            .len();
+        if end > file_len || end > i64::MAX as u64 {
+            return Err(invalid());
+        }
+    }
+    // Own the entire destination before using MAP_FIXED on any of its pages.
+    // Errors drop only this new allocation; the current heap remains alive.
+    let mut state = allocate_heap_state(&config)?;
+    let mut ranges = Vec::with_capacity(image.regions.len());
+    let mut index = 0usize;
+    for region in &image.regions {
+        let count = region.used.div_ceil(config.region_size);
+        let destination = state.regions[index].base;
+        let mut mapped = false;
+        #[cfg(target_os = "linux")]
+        if let Some((file, section_offset)) = backing {
+            use std::os::fd::AsRawFd;
+            let offset = section_offset
+                .checked_add(region.data_offset as u64)
+                .ok_or_else(invalid)?;
+            let page = crate::syscall::page_size();
+            if offset % page as u64 == 0
+                && destination as usize % page == 0
+                && region.bytes.len() % page == 0
+            {
+                // SAFETY: this complete extent belongs to the unpublished state;
+                // replacing it cannot clobber the old heap or another mapping.
+                let result = unsafe {
+                    crate::syscall::mmap(
+                        destination,
+                        region.bytes.len(),
+                        crate::syscall::PROT_READ | crate::syscall::PROT_WRITE,
+                        crate::syscall::MAP_PRIVATE | crate::syscall::MAP_FIXED,
+                        file.as_raw_fd(),
+                        offset as i64,
+                    )
+                };
+                result.map_err(|errno| {
+                    EgclError::InvalidImage(format!("heap region mmap failed: errno {errno}"))
+                })?;
+                mapped = true;
+            }
+        }
+        if !mapped {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    region.bytes.as_ptr(),
+                    destination,
+                    region.bytes.len(),
+                );
+            }
+        }
+        let kind = if region.kind == RegionKind::LargeObject {
+            RegionKind::LargeObject
+        } else {
+            RegionKind::OldGen
+        };
+        for part in 0..count {
+            let target = &mut state.regions[index + part];
+            target.header.kind = kind;
+            target.header.gen_age = config.promotion_threshold;
+            // Large-object continuations have no independent objects to walk.
+            target.header.alloc_top = if part == 0 {
+                unsafe { destination.add(region.used) }
+            } else {
+                target.base
+            };
+            target.header.live_bytes = region
+                .used
+                .saturating_sub(part * config.region_size)
+                .min(config.region_size) as u32;
+            state.pinned_hosts.insert(index + part);
+        }
+        state.stats.bytes_allocated += region.used as u64;
+        if kind == RegionKind::LargeObject {
+            state.stats.large_object_bytes += region.used as u64;
+        } else {
+            state.stats.old_gen_used += region.used as u64;
+        }
+        ranges.push(RegionRelocation {
+            saved_start: region.saved_start,
+            restored_start: destination as usize,
+            len: region.used,
+        });
+        index += count;
+    }
+    state.stats.regions_free -= index as u32;
+    let mut map = ImageRelocations::new(ranges)?;
+    if let Some(allocate) = *OFFHEAP_ALLOCATE.lock().unwrap() {
+        let pending = PENDING_OFFHEAP.lock().unwrap();
+        if let Some(bytes) = pending.as_ref().filter(|bytes| !bytes.is_empty()) {
+            for (old_header, new_header) in allocate(bytes) {
+                map.insert_object(
+                    old_header
+                        .checked_add(OBJECT_HEADER_SIZE)
+                        .ok_or_else(invalid)?,
+                    new_header
+                        .checked_add(OBJECT_HEADER_SIZE)
+                        .ok_or_else(invalid)?,
+                );
+            }
+        }
+    }
+    for region in &image.regions {
+        let base = map
+            .translate_address(region.saved_start)
+            .ok_or_else(invalid)?;
+        for offset in region.fixups() {
+            let slot = (base + offset) as *mut u64;
+            let old = unsafe { std::ptr::read_unaligned(slot) };
+            let new = map.remap_value(old);
+            if new != old {
+                unsafe {
+                    std::ptr::write_unaligned(slot, new);
+                }
+            }
+        }
+    }
+    install_heap_state(state);
+    *RELOC_MAP.lock().unwrap() = Some(map);
+    Ok(())
 }
 
 pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
@@ -7805,5 +7997,92 @@ mod region_snapshot_tests {
             &large.bytes[LARGE_OBJECT_PAYLOAD_OFFSET..LARGE_OBJECT_PAYLOAD_OFFSET + large_len],
             unsafe { std::slice::from_raw_parts(large_body, large_len) }
         );
+        // Exercise both the buffer path and a real file-backed restore, then
+        // mutate, collect, and save the restored heap again.
+        let path = std::env::temp_dir().join(format!("egcl-region-{}.image", std::process::id()));
+        let mut next_image = encoded;
+        for file_backed in [false, true] {
+            let old_root = root.0;
+            let before_epoch = gc_move_epoch();
+            let mut file_bytes = vec![0; crate::image_heap::IMAGE_PAGE_SIZE];
+            file_bytes.extend_from_slice(&next_image);
+            std::fs::write(&path, &file_bytes).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            #[cfg(target_os = "linux")]
+            if file_backed && crate::syscall::page_size() == 4096 {
+                let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                let old_base = heap_base_address();
+                assert!(
+                    unsafe { restore_heap_regions(&next_image, Some((&write_only, 4096))) }
+                        .is_err()
+                );
+                assert_eq!(
+                    heap_base_address(),
+                    old_base,
+                    "failed mapping replaced live heap"
+                );
+                assert_eq!(gc_move_epoch(), before_epoch);
+            }
+            unsafe {
+                restore_heap_regions(&next_image, file_backed.then_some((&file, 4096))).unwrap();
+            }
+            *root = EgclVal(remap_saved_pointer(old_root));
+            assert_ne!(root.0, old_root, "fresh reservation must force relocation");
+            assert!(gc_move_epoch() > before_epoch);
+            let restored = (root.0 & !crate::value::TAG_MASK) as *mut u64;
+            #[cfg(target_os = "linux")]
+            if file_backed && crate::syscall::page_size() == 4096 {
+                let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+                assert!(
+                    maps.lines().any(|line| {
+                        let range = line.split_whitespace().next().unwrap();
+                        let (start, end) = range.split_once('-').unwrap();
+                        let start = usize::from_str_radix(start, 16).unwrap();
+                        let end = usize::from_str_radix(end, 16).unwrap();
+                        start <= restored as usize
+                            && (restored as usize) < end
+                            && line.contains(path.to_str().unwrap())
+                            && line.contains("rw-p")
+                    }),
+                    "restored object is not in a private file mapping"
+                );
+            }
+            unsafe {
+                assert_eq!(*restored, first as u64, "pointer-shaped fixnum changed");
+                let tail = (*restored.add(1) & !crate::value::TAG_MASK) as *const u64;
+                assert_eq!(*tail.add(1), root.0, "cycle lost");
+                *restored = EgclVal::from_fixnum(91).0;
+                *restored = first as u64;
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                file_bytes,
+                "private writes changed file"
+            );
+            let mut young_allocator = HeapAllocator::new().unwrap();
+            let young = young_allocator.alloc_fast(16).unwrap();
+            unsafe {
+                write_object_header(young.sub(OBJECT_HEADER_SIZE), tid::CONS, 16);
+                *(young as *mut u64) = EgclVal::from_fixnum(123).0;
+                *(young as *mut u64).add(1) = NIL.0;
+                store_ref(restored.cast::<EgclVal>(), EgclVal(young as u64 | TAG_CONS));
+            }
+            let mut fresh = HeapCollector::new();
+            fresh.minor_gc().unwrap();
+            unsafe {
+                let moved = (*restored & !crate::value::TAG_MASK) as *const u64;
+                assert_ne!(
+                    moved,
+                    young.cast(),
+                    "probe must actually move the young object"
+                );
+                assert_eq!(*moved, EgclVal::from_fixnum(123).0);
+                store_ref(restored.cast::<EgclVal>(), EgclVal(first as u64));
+            }
+            let saved_again = unsafe { snapshot_heap_regions(false) }.unwrap();
+            assert!(saved_again.regions.iter().any(|r| r.used == large.used));
+            next_image = saved_again.encode().unwrap();
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -177,8 +177,7 @@ static HOST_RESTORED_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 static HOST_RESTORE_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn host_serialize_hook() -> Vec<u8> {
-    // Emit a marker plus a saved heap pointer (a bare old-body address, the
-    // shape a registry EgclVal would carry).
+    // Emit a marker plus an explicitly untagged saved heap body address.
     let ptr = HOST_SAVED_PTR.load(std::sync::atomic::Ordering::SeqCst) as u64;
     let mut out = b"HOSTREG1".to_vec();
     out.extend_from_slice(&ptr.to_le_bytes());
@@ -194,8 +193,8 @@ fn host_restore_hook(data: &[u8]) -> Result<(), egcl_rt::error::EgclError> {
     let raw = u64::from_le_bytes(data[8..16].try_into().unwrap());
     // The hook runs after heap restore, so remap resolves the saved pointer
     // into the newly materialized heap.
-    let remapped = egcl_rt::gc::remap_saved_pointer(raw);
-    HOST_RESTORED_PTR.store(remapped as usize, std::sync::atomic::Ordering::SeqCst);
+    let remapped = egcl_rt::gc::remap_saved_address(raw as usize);
+    HOST_RESTORED_PTR.store(remapped, std::sync::atomic::Ordering::SeqCst);
     HOST_RESTORE_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
     Ok(())
 }
