@@ -140,3 +140,31 @@ fn internal_store_is_a_special_operator_and_not_a_callable_function() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("STORE-OPERATOR-OK"));
 }
+
+#[test]
+fn explicit_setf_writer_takes_precedence_over_reader_macro() {
+    let program = r#"
+      (defmacro asymmetric-reader (cell) `(car ,cell))
+      (defun asymmetric-writer (cell value) (setf (cdr cell) value))
+      (defsetf asymmetric-reader asymmetric-writer)
+      (let ((cell (cons 3 4)))
+        (setf (asymmetric-reader cell) 7)
+        (assert (equal cell '(3 . 7)))
+        (incf (asymmetric-reader cell) 2)
+        (assert (equal cell '(3 . 5)))
+        (macrolet ((alias (x) `(asymmetric-reader ,x)))
+          (setf (alias cell) 9))
+        (assert (equal cell '(3 . 9)))
+        (symbol-macrolet ((alias (asymmetric-reader cell)))
+          (setf alias 11))
+        (assert (equal cell '(3 . 11))))
+      (format t "SETF-WRITER-PRECEDENCE-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .output().unwrap();
+    assert!(output.status.success(), "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("SETF-WRITER-PRECEDENCE-OK"));
+}

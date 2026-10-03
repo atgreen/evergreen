@@ -1119,7 +1119,18 @@ pub fn macroexpand_1(
 /// Detects circular expansion by tracking seen forms (R4.16).
 /// Enforces *macroexpand-limit* iteration cap (spec §4.2.13, default 65536).
 pub fn macroexpand(form: EgclVal, env: &Environment) -> Result<(EgclVal, bool), EgclError> {
+    macroexpand_until(form, env, |_| false)
+}
+
+/// Expand with the usual hook, cycle detection, and iteration limit, stopping
+/// before a caller-owned syntactic protocol takes precedence over a macro.
+pub fn macroexpand_until(
+    form: EgclVal,
+    env: &Environment,
+    stop: impl Fn(EgclVal) -> bool,
+) -> Result<(EgclVal, bool), EgclError> {
     let mut current = form;
+    egcl_rt::rooted_ref!(_current_root = &mut current);
     let mut ever_expanded = false;
     let mut seen = HashSet::new();
     let mut iteration_count: usize = 0;
@@ -1129,6 +1140,9 @@ pub fn macroexpand(form: EgclVal, env: &Environment) -> Result<(EgclVal, bool), 
     seen.insert(structural_fingerprint(current, 8));
 
     loop {
+        if stop(current) {
+            return Ok((current, ever_expanded));
+        }
         let (expanded, did_expand) = macroexpand_1(current, env)?;
         if !did_expand {
             return Ok((current, ever_expanded));

@@ -15934,6 +15934,7 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "ARRAY-DISPLACEMENT"
             | "MACROEXPAND"
             | "MACROEXPAND-1"
+            | "EGCL::%MACROEXPAND-PLACE"
             | "GET-MACRO-CHARACTER"
             | "GET-PROPERTIES"
             | "GET-SETF-EXPANSION"
@@ -16487,7 +16488,7 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "COMPILED-FUNCTION-P" | "FUNCTION-LAMBDA-EXPRESSION" => Some((1, 1)),
         // (get-setf-expansion place &optional environment) — ansi
         // GET-SETF-EXPANSION.ERROR.1/2 (bliss-g5pa).
-        "GET-SETF-EXPANSION" => Some((1, 2)),
+        "GET-SETF-EXPANSION" | "EGCL::%MACROEXPAND-PLACE" => Some((1, 2)),
         // `apply function &rest args+` (CLHS): at least one argument must follow
         // the function, so (apply) and (apply #'list) are both PROGRAM-ERRORs —
         // confirmed against SBCL. Without this (apply) took the missing first
@@ -19940,8 +19941,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "DEFINE-COMPILER-MACRO" => return eval_define_compiler_macro(cdr, env),
             "MACROLET" => return eval_macrolet(cdr, env),
             "SYMBOL-MACROLET" => return eval_symbol_macrolet(cdr, env),
-            "MACROEXPAND-1" => return eval_macroexpand(cdr, env, true),
-            "MACROEXPAND" => return eval_macroexpand(cdr, env, false),
+            "MACROEXPAND-1" => return eval_macroexpand(cdr, env, true, false),
+            "MACROEXPAND" => return eval_macroexpand(cdr, env, false, false),
+            "EGCL::%MACROEXPAND-PLACE" => return eval_macroexpand(cdr, env, false, true),
             "DEFCLASS" => return eval_defclass(cdr, env),
             "DEFSTRUCT" => return eval_defstruct(cdr, env),
             "DEFGENERIC" => return eval_defgeneric(cdr, env),
@@ -31196,7 +31198,11 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
         let common_lisp_builtin_setf_place = accessor
             .symbol_index()
             .is_some_and(|index| !reader::is_uninterned(index) && !symbol_is_homeless(index))
-            && symbol_home_package_name(*accessor) == "COMMON-LISP"
+            // Imported symbols remain CL accessors. Scanning package present
+            // tables for an apparent home can pick an importing package first.
+            && egcl_stdlib::find_package("COMMON-LISP").is_some_and(|cl| {
+                egcl_stdlib::find_present_symbol(cl, &bare_acc) == Some(*accessor)
+            })
             && (matches!(
                 bare_acc.as_str(),
                 "CAR"
@@ -32368,6 +32374,7 @@ fn eval_macroexpand(
     cdr: EgclVal,
     env: &mut Env,
     single_step: bool,
+    setf_place: bool,
 ) -> Result<EgclVal, EgclError> {
     let (form_expr, mut rest) = cp(cdr);
     // Root across the allocating form/env evaluations (moving GC; bliss-8qf).
@@ -32396,7 +32403,11 @@ fn eval_macroexpand(
     };
     egcl_rt::rooted_ref!(_macro_env_root = &mut macro_env);
     let (expanded, expanded_p) = with_macroexpand_dynamic_context(env, || {
-        if single_step {
+        if setf_place {
+            compiler_macroexpand::macroexpand_until(form, &macro_env, |place| {
+                place_has_user_setf_expander(place, env)
+            })
+        } else if single_step {
             compiler_macroexpand::macroexpand_1(form, &macro_env)
         } else {
             compiler_macroexpand::macroexpand(form, &macro_env)

@@ -181,10 +181,10 @@
 ;; not itself assignable. A naive (setf place (cons item place))
 ;; double-evaluates the place subforms and gets the order wrong.
 (defmacro push (item place &environment env)
-  ;; Macroexpand the PLACE in ENV first so a MACROLET/symbol-macro place is
-  ;; analysed as the place it denotes (push.4/5); GET-SETF-EXPANSION uses the
-  ;; expansion-time env, which does not carry the lexical macro bindings.
-  (let ((place (macroexpand place env)))
+  ;; Expand lexical macro/symbol-macro places in ENV, stopping at an explicit
+  ;; SETF writer even when its accessor is also a reader macro. Ordinary
+  ;; MACROEXPAND would discard that writer (bliss-frd2v).
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (let ((g (gensym)) (result (gensym)))
@@ -202,7 +202,7 @@
 ;; must increment I exactly once. Use the setf-expansion so the subforms are
 ;; lifted into temporaries and the getter is read/stored once.
 (defmacro pop (place &environment env)
-  (let ((place (macroexpand place env)))
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (let ((g (gensym)))
@@ -231,7 +231,7 @@
 ;; subforms are lifted into temporaries and the getter is read once.
 ;; DELTA is bound after the place temporaries to preserve left-to-right order.
 (defmacro incf (place &rest delta &environment env)
-  (let ((place (macroexpand place env)))
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (let ((d (gensym)))
@@ -241,7 +241,7 @@
              ,setter))))))
 
 (defmacro decf (place &rest delta &environment env)
-  (let ((place (macroexpand place env)))
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (let ((d (gensym)))
@@ -2394,7 +2394,7 @@
 ;; identity (pushnew.2/3). The setf-expansion lifts place subforms so they are
 ;; evaluated once.
 (defmacro pushnew (item place &rest keys &environment env)
-  (let ((place (macroexpand place env)))
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (let ((g (gensym)) (result (gensym)))
@@ -2460,7 +2460,7 @@
 ;; remf.order.*). Using the setf-expansion getter guarantees the place is read
 ;; after the indicator subform runs — remf.order.3 relies on that.
 (defmacro remf (place indicator &environment env)
-  (let ((place (macroexpand place env)))
+  (let ((place (egcl::%macroexpand-place place env)))
     (multiple-value-bind (dummies vals newval setter getter)
         (get-setf-expansion place env)
       (declare (ignore newval setter))
@@ -3340,7 +3340,7 @@
 (defun %setf-expansions (places env)
   (let ((binds nil) (getters nil))
     (dolist (raw places)
-      (let ((place (macroexpand raw env)))
+      (let ((place (egcl::%macroexpand-place raw env)))
         (if (and (consp place) (eq (car place) 'values))
             ;; A nested (VALUES …) place: its arguments are PLACES, not value
             ;; subforms, so they must NOT be lifted into temporaries.
@@ -4386,7 +4386,7 @@ a hook error aborts startup.")
   (let ((tail pairs) (forms nil))
     (do () ((null tail))
       (unless (cdr tail) (error 'program-error))
-      (let ((place (macroexpand (car tail) env))
+      (let ((place (egcl::%macroexpand-place (car tail) env))
             (value (cadr tail)))
         (if (%values-place-p place)
             (setq forms (cons `(egcl::%setf-values ,(cdr place) ,value) forms))
