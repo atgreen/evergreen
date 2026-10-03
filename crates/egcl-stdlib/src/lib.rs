@@ -24,6 +24,7 @@ pub(crate) fn test_heap_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 // ── Package system & bootstrap ────────────────────────────────────
+pub mod digest;
 pub mod packages;
 
 // ── CLOS ──────────────────────────────────────────────────────────

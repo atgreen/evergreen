@@ -54,4 +54,13 @@
     (loop for b across data do
       (setf crc (logxor (ash crc -8) (aref *crc-table* (logand (logxor crc b) 255)))))
     (logxor crc #xffffffff)))
-(defun sha256 (data) (ironclad:digest-sequence :sha256 data))
+;; SHA-256 is the whole cost of APK v2 signing, which hashes the entire
+;; archive in 1 MiB chunks. Ironclad's portable implementation measures about
+;; 0.012 MiB/s under EGCL -- roughly 22 minutes for a 6.8 MB APK against SBCL's
+;; 1.2 seconds -- so use the runtime's primitive there. Ironclad itself drops to
+;; implementation-specific routines on every host that has them; this is the
+;; same arrangement. Both produce the same digest, checked against the NIST
+;; vectors on each side.
+(defun sha256 (data)
+  #+egcl (egcl-ext:sha256 data)
+  #-egcl (ironclad:digest-sequence :sha256 data))

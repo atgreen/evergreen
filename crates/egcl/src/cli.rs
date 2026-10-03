@@ -23040,6 +23040,21 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (_, distinct) = bytecode::generic_receiver_profile_counts(&name);
                 return Ok(EgclVal::from_fixnum(distinct as i64));
             }
+            // SHA-256 of a byte vector, in the runtime rather than in Lisp.
+            // Ironclad's portable implementation measures ~0.012 MiB/s here,
+            // which made signing a 6.8 MB APK take ~22 minutes against SBCL's
+            // 1.2 s (bliss-omaps); Ironclad itself uses implementation-specific
+            // routines wherever a host has them, and this is EGCL's.
+            "EGCL-EXT:SHA256" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(EgclError::ProgramError(format!(
+                        "EGCL-EXT:SHA256 takes one sequence, got {}",
+                        args.len()
+                    )));
+                }
+                return egcl_stdlib::digest::sha256_of_sequence(args[0]);
+            }
             // Process-wide count of T1 speculative deoptimizations (bliss-jtc.27):
             // observability for the S5 gate's second half — a failed speculation
             // deoptimizes to the interpreter and still returns the correct value.

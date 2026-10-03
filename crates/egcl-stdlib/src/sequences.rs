@@ -346,7 +346,7 @@ pub fn build_simple_vector(vals: &[EgclVal]) -> EgclVal {
 /// forever (bliss-18s). Body layout after the header: `[length:u64 |
 /// elements…]`, matching the historical `[header | len | bytes]` scheme the
 /// readers and the GC's SIMPLE_VECTOR tracer expect (the length is stored raw).
-fn build_vector(vals: &[EgclVal]) -> EgclVal {
+pub(crate) fn build_vector(vals: &[EgclVal]) -> EgclVal {
     egcl_rt::rooted!(vals = vals.to_vec());
     // Body = one length word + the elements.
     let body_size = 8 + vals.len() * 8;
