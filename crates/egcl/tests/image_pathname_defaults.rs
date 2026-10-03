@@ -73,7 +73,26 @@ fn restored_pathname_defaults_use_the_process_directory_before_hooks() {
             .current_dir(&user)
             // Saving bootstraps ASDF normally; stress the restored process,
             // including the fresh directory pathname and its startup hooks.
-            .env("EGCL_GC_STRESS", "1")
+            //
+            // A STRIDE, not 1. EGCL_GC_STRESS=N collects every N allocations,
+            // and this body is a full ASDF bootstrap plus a load-system -- at
+            // N=1 that is a collection per allocation over millions of them.
+            // Measured: `(require :asdf)` ALONE is ~30s in the debug binary
+            // and had not finished at 180s under N=1, and this test does it
+            // twice. It could not complete in any CI budget, which is why the
+            // `test` job's 90-minute timeout was the next thing it would have
+            // hit (bliss-hn1cc). gc.yml records the same lesson about
+            // tier_observability: not one test finished in 21 minutes at N=1.
+            //
+            // The point of the knob here is that collections HAPPEN during a
+            // restored image's startup, its hooks and its pathname defaults --
+            // and a stride still fires thousands of them across an ASDF load,
+            // with poison on so a stale deref still faults immediately.
+            // Override with EGCL_IMAGE_STRESS_STRIDE to go back to 1 by hand.
+            .env(
+                "EGCL_GC_STRESS",
+                std::env::var("EGCL_IMAGE_STRESS_STRIDE").unwrap_or_else(|_| "1000".into()),
+            )
             .env("EGCL_GC_POISON", "1")
             .args([
                 "--no-init", "--eval",

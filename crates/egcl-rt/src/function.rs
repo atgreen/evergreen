@@ -37,15 +37,18 @@ fn header_size() -> usize {
 }
 
 /// True if `v` is an interpreted function heap object created here.
+///
+/// A heap TAG is not proof of a readable header. Native entry points and pinned
+/// objects outside the managed heap carry pointer tags too, and the collector's
+/// own field walk range-checks before reading a header for exactly that reason
+/// (`gc::visit_object_references`). Host registry slots surviving a heap that
+/// image restore replaced are another source: `--deliver` on a restored image
+/// walks those roots and segfaulted here on a pointer into the unmapped old
+/// heap. `gc::heap_object_type_id` applies the same lock-free bounds check, so
+/// it is safe to call with the world stopped.
 pub fn is_interpreted_function(v: EgclVal) -> bool {
-    if !v.is_heap_object() {
-        return false;
-    }
-    // SAFETY: heap-tagged values point at an ObjectHeader we can read.
-    unsafe {
-        let header = &*(v.as_ptr() as *const ObjectHeader);
-        header.type_id() == type_id::FUNCTION_INTERPRETED
-    }
+    v.is_heap_object()
+        && crate::gc::heap_object_type_id(v) == Some(type_id::FUNCTION_INTERPRETED)
 }
 
 /// # Safety

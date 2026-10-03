@@ -24647,6 +24647,18 @@ fn eval_tagbody(body: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let target = val_as_str(take_control_value(&token));
                 match tag_index.get(&target) {
                     Some(idx) => {
+                        // A backward GO is the tree-walker's only unbounded
+                        // loop, so it is where SIGINT/SIGTERM and the sandbox
+                        // CPU deadline have to be observed — the bytecode
+                        // interpreter's run_loop polls on every instruction,
+                        // but nothing polled here, so a tree-walked (LOOP) ran
+                        // forever under EGCL_SANDBOX_CPU_MS. A forward GO
+                        // cannot loop on its own, so it stays unpolled.
+                        if *idx <= pc {
+                            if let Some(error) = pending_signal_error_for_current_execution() {
+                                break Err(error);
+                            }
+                        }
                         pc = *idx;
                     }
                     None => break Err(EgclError::Internal(msg)),
@@ -29091,6 +29103,15 @@ fn shadow_locally_special(env: &mut Env, sym: EgclVal) {
 
 fn eval_let(cdr: EgclVal, env: &mut Env, sequential: bool) -> Result<EgclVal, EgclError> {
     let (bindings_form, body) = cp(cdr);
+    // Validate the binding names before any initializer runs. NIL and T are
+    // Lisp symbols but have no symbol-table index for the binding machinery.
+    let mut bindings = bindings_form;
+    while bindings.is_cons() {
+        let (binding, rest) = cp(bindings);
+        let name = if binding.is_cons() { cp(binding).0 } else { binding };
+        reject_assignment_to_constant(name)?;
+        bindings = rest;
+    }
     let parent = Arc::clone(&env.frame);
 
     // Names made dynamic by a `(declare (special v))` at the head of the body,
@@ -31140,6 +31161,47 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                 }
             }
         }
+        // APPLY places retain their literal function name: the writer is
+        // (SETF f), not (SETF APPLY), and only the actual arguments are bound.
+        if symbol_bare_name(&acc) == "APPLY"
+            && egcl_stdlib::find_package("COMMON-LISP").is_some_and(|cl| {
+                egcl_stdlib::find_present_symbol(cl, "APPLY") == Some(accessor)
+            })
+        {
+            egcl_rt::rooted!(forms = list_to_vec(args));
+            let fname = forms.first().copied().filter(|form| form.is_cons())
+                .and_then(|form| {
+                    let (quote, rest) = cp(form);
+                    if quote.is_symbol()
+                        && matches!(sym_bare_name_rc(quote).as_ref(), "FUNCTION" | "QUOTE")
+                        && rest.is_cons() && cp(rest).1.is_nil()
+                    {
+                        Some(cp(rest).0).filter(|name| name.symbol_index().is_some())
+                    } else { None }
+                })
+                .filter(|_| forms.len() >= 2)
+                .ok_or_else(|| EgclError::ProgramError(
+                    "APPLY place requires a literal function name and argument list".into()))?;
+            egcl_rt::rooted!(fname = fname);
+            egcl_rt::rooted!(temps = Vec::new());
+            for _ in 1..forms.len() { temps.push(gensym_symbol("A")); }
+            egcl_rt::rooted!(store = gensym_symbol("NEW"));
+            egcl_rt::rooted!(writer_name = vec_to_list(&[
+                resolve_sym("SETF").unwrap_or(NIL), *fname]));
+            egcl_rt::rooted!(writer = vec_to_list(&[
+                resolve_sym("FUNCTION").unwrap_or(NIL), *writer_name]));
+            egcl_rt::rooted!(items = vec![resolve_sym("APPLY").unwrap_or(NIL), *writer, *store]);
+            items.extend_from_slice(&temps);
+            egcl_rt::rooted!(store_form = vec_to_list(&items));
+            items.clear();
+            items.extend_from_slice(&[resolve_sym("APPLY").unwrap_or(NIL), forms[0]]);
+            items.extend_from_slice(&temps);
+            let access_form = vec_to_list(&items);
+            return Ok(SetfExpansion {
+                temps: temps.clone(), vals: forms[1..].to_vec(), stores: vec![*store],
+                store_form: *store_form, access_form,
+            });
+        }
         // Default expansion for a function place: bind each argument to a
         // temporary and access via `(f t1 t2 …)`. Known built-in places store
         // through the internal store operator because many have no callable `(setf f)`
@@ -31255,7 +31317,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
             access_form: *access_form,
         });
     }
-    Err(EgclError::Internal(format!(
+    Err(EgclError::ProgramError(format!(
         "GET-SETF-EXPANSION: not a place: {}",
         format_val(place)
     )))

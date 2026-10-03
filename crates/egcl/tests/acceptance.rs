@@ -2434,9 +2434,9 @@ fn an_arithmetic_loop_variable_is_the_iteration_counter() {
             "(let ((i 0)) (loop for nil from 0 to 10 by 2 collect (incf i)))",
             "(1 2 3 4 5 6)",
         ),
-        // `for t` is a program error SBCL rejects at compile time; EGCL does not
-        // signal it yet (bliss-pj0n), but it must not crash the process.
-        ("(loop for t from 1 to 3 collect 1)", "(1 1 1)"),
+        // A constant cannot be a loop variable. Signal a Lisp condition,
+        // never panic while interpreting or lowering the binding.
+        ("(handler-case (loop for t from 1 to 3 collect 1) (program-error () :pe))", ":PE"),
     ];
     run_expression_cases_batched(&cases);
 }
@@ -17051,6 +17051,18 @@ fn stringp_keeps_its_answer_across_tier_promotion() {
 /// returned the value as though something had been assigned. CLHS 3.1.2.1.1.3
 /// makes all of these constant variables; SBCL signals PROGRAM-ERROR for every
 /// row below, which is what these were checked against.
+#[test]
+fn constant_let_bindings_signal_before_initializers_run() {
+    run_expression_cases_batched(&[
+        ("(handler-case (let ((t 1)) t) (program-error () :pe))", ":PE"),
+        ("(handler-case (let* ((nil 1)) nil) (program-error () :pe))", ":PE"),
+        ("(handler-case (let ((:key 1)) :key) (program-error () :pe))", ":PE"),
+        ("(handler-case (let ((pi 1)) pi) (program-error () :pe))", ":PE"),
+        ("(let ((hit nil)) (handler-case (let ((t (setq hit t))) t) (program-error () nil)) hit)", "NIL"),
+        ("(let ((x 1)) (let* ((y x) (x 2)) (list x y)))", "(2 1)"),
+    ]);
+}
+
 #[test]
 fn assigning_to_a_constant_variable_signals_rather_than_panicking() {
     let cases = [

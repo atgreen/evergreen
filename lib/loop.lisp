@@ -220,12 +220,22 @@
                                      (unless ,present (go ,end))
                                      ,@stores))))))
                      ((member mode '("IN" "ON" "ACROSS") :test #'equal)
-                      (let ((sequence (bind (gensym "LOOP-SEQUENCE") (take)))
-                            (index (gensym "LOOP-INDEX")) (step ''cdr))
+                      (let* ((sequence (bind (gensym "LOOP-SEQUENCE") (take)))
+                             (index (gensym "LOOP-INDEX")) (step ''cdr)
+                             ;; ON over a plain variable tracks the cursor
+                             ;; itself: the variable starts at the whole list,
+                             ;; so INITIALLY sees it, and it holds the
+                             ;; terminating atom once the list is exhausted, so
+                             ;; FINALLY sees that. A destructuring pattern
+                             ;; instead keeps the parts of the last real cons —
+                             ;; the terminating atom is never destructured.
+                             (cursor-var (and (equal mode "ON") var (symbolp var) var)))
                         (when (at "BY")
                           (take)
                           (setq step (bind (gensym "LOOP-LIST-STEP") (take))))
-                        (bind-pattern var type)
+                        (if cursor-var
+                            (bind cursor-var sequence)
+                            (bind-pattern var type))
                         (if (equal mode "ACROSS")
                             (progn
                               (bind index 0)
@@ -235,6 +245,7 @@
                             (progn
                               (emit `(unless ,first (setq ,sequence (funcall ,step ,sequence))))
                               (emit `(when (,(if (equal mode "ON") 'atom 'endp) ,sequence)
+                                       ,@(when cursor-var `((setq ,cursor-var ,sequence)))
                                        (go ,end)))
                               (assign-pattern var (if (equal mode "IN") `(car ,sequence) sequence))))))
                      ((equal mode "=")

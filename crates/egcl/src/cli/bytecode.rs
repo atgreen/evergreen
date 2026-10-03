@@ -7636,6 +7636,8 @@ fn is_special_name(name: &str) -> bool {
 }
 
 fn binding_name_init(b: EgclVal) -> LowerResult<(String, EgclVal)> {
+    let name = if b.is_cons() { cp(b).0 } else { b };
+    super::reject_assignment_to_constant(name).map_err(|_| Bail)?;
     if b.is_symbol() {
         return Ok((sym_name(b), NIL));
     }
@@ -15560,7 +15562,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             None => return Ok(v),
                         }
                     }
-                    Some(Ok(OsrOutcome::Deopt { bcp, sp_top })) => {
+                    Some(Ok(OsrOutcome::Deopt { bcp, sp_top, env_frame })) => {
+                        acts[top_idx].env_frame = env_frame;
                         // A speculating OSR loop hit a fixnum guard mid-run
                         // (bliss-izt.2). The live frame already holds the updated
                         // locals and the peek-preserved operands, and this
@@ -16706,6 +16709,32 @@ extern "C" fn c2i_eval_host(form: u64) -> u64 {
 
 extern "C" fn c2i_make_closure(form: u64) -> u64 {
     c2i_eval_form_with_frame(EgclVal(form), true)
+}
+
+extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture: u64) -> u64 {
+    match guard_c2i(|| {
+        let env = NATIVE_ENV.with(|slot| slot.get());
+        if nested.is_null() || env.is_null() {
+            return Err(EgclError::Internal("native closure has no body or environment".into()));
+        }
+        let captured = if capture != 0 {
+            NATIVE_ENV_FRAME.with(|slot| slot.borrow().clone())
+        } else {
+            None
+        };
+
+        // The executing NativeCode retains its original bytecode body, including
+        // this nested function, even if its global name is redefined meanwhile.
+        egcl_rt::rooted!(closure = make_bytecode_closure(unsafe { &*nested }, captured));
+        register_closure_control(*closure, unsafe { &*env });
+        Ok(*closure)
+    }) {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
 }
 
 extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
@@ -19352,6 +19381,7 @@ fn run_native(
         .as_ref()
         .and_then(|body| make_env_frame(body, parent))
         .or(closure_env);
+    egcl_rt::rooted!(_env_frame_root = env_frame.clone().map(super::SuspendedFrameRoot));
     // Bind both stack and captured parameters before entering native code. The
     // same heap frame is published through NATIVE_ENV_FRAME for environment
     // bytecodes and closure construction.
@@ -19373,8 +19403,10 @@ fn run_native(
     let slots = unsafe { frame.add(1) as *mut u64 };
 
     let saved = NATIVE_ENV.with(|e| e.replace(env as *mut Env));
-    let saved_env_frame =
-        NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame.clone()));
+    egcl_rt::rooted!(saved_env_frame = NATIVE_ENV_FRAME.with(|slot| {
+        std::mem::replace(&mut *slot.borrow_mut(), env_frame.clone())
+            .map(super::SuspendedFrameRoot)
+    }));
     // NATIVE_ERROR is per-invocation. Native calls now nest directly
     // (native → c2i → run_native → native, bliss-x5y.8), so save any pending
     // error from an outer native frame, run with a fresh slot, then restore the
@@ -19397,7 +19429,14 @@ fn run_native(
     };
     egcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
-    NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
+    // Native code can enter a lexical child before deoptimizing. Preserve
+    // that exact frame for T0, and root it while restoring the caller state.
+    egcl_rt::rooted!(resume_env_frame = NATIVE_ENV_FRAME.with(|slot| {
+        std::mem::replace(
+            &mut *slot.borrow_mut(),
+            saved_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)),
+        ).map(super::SuspendedFrameRoot)
+    }));
 
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
@@ -19524,7 +19563,7 @@ fn run_native(
                     }
                     // State-transfer: resume T0 on this frame; `resume_in_t0`
                     // owns the frame's lifecycle from here (do NOT pop it first).
-                    resume_in_t0(entry, frame, bcp, sp_top, sym, env_frame, env)
+                    resume_in_t0(entry, frame, bcp, sp_top, sym, resume_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)), env)
                 }
                 NativeDeoptResume::Inlined { scopes, metadata } => {
                     if std::env::var_os("EGCL_DEOPT_PATH_DBG").is_some() {
@@ -19916,22 +19955,15 @@ fn emit_native(
             return None;
         }};
     }
-    // The native entry ABI is `fn(*mut u64) -> u64`: its only register argument
-    // (rdi) is the frame-slots pointer, and run_native/bind_params pre-load ALL
-    // Lisp arguments into those frame slots before entry — regardless of count.
-    // Native→native calls route through c2i_call_args → run_native, the same
-    // frame-based path, so there is no register-argument ABI that would cap the
-    // arity at the 6 SysV integer registers. The old `arity > 6` decline was a
-    // stale leftover that pinned every wide-arity function at T0 — notably UIOP's
-    // ensure-inherited / ensure-symbol (8 params each), the dominant ASDF/package
-    // load hotspot (bliss-gq5). LoadLocal reads [r14 + 8*i] for any i, so a wide
-    // arity needs no codegen change. Bound only by the activation slot count.
-    if bf.arity > bf.num_slots() {
-        decline_t1!(
-            "required arity {} exceeds activation slots {}",
-            bf.arity,
-            bf.num_slots()
-        );
+    // run_native binds arguments according to param_layout before entry.
+    // Captured parameters live in the heap environment and need no stack slot;
+    // validate each destination instead of comparing total arity with slots.
+    for (_, location) in &bf.param_layout {
+        match location {
+            VarLoc::Slot(slot) if *slot < bf.n_locals => {}
+            VarLoc::Boxed if bf.has_env => {}
+            _ => decline_t1!("parameter location is outside its activation"),
+        }
     }
     // The activation lives in the EgclStack frame passed in rdi. r14 = frame
     // slots pointer; local i at [r14 + 8*i]; r15 = operand-stack pointer
@@ -19956,6 +19988,8 @@ fn emit_native(
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
+    let make_bytecode_closure_addr = c2i_make_bytecode_closure
+        as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let take_values_addr =
         c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
@@ -20607,6 +20641,18 @@ fn emit_native(
                 pop_into(&mut c, 7, false); // car -> rdi
                 c.extend_from_slice(&[0x48, 0xB8]);
                 c.extend_from_slice(&alloc_cons_addr.to_le_bytes());
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::MakeClosure { func, capture_env } => {
+                let nested = bf.nested_functions.get(*func as usize)?.as_ref()
+                    as *const BytecodeFunction;
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained nested body
+                c.extend_from_slice(&(nested as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, capture flag
+                c.extend_from_slice(&u64::from(*capture_env).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(&make_bytecode_closure_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
@@ -21826,7 +21872,11 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
 /// and (peek-preserved) operands, so no value transfer is needed (`Deopt`).
 enum OsrOutcome {
     Finished(EgclVal),
-    Deopt { bcp: u32, sp_top: u16 },
+    Deopt {
+        bcp: u32,
+        sp_top: u16,
+        env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    },
 }
 
 /// Enter OSR native code at `stub_off` to finish the current activation, reading
@@ -21855,8 +21905,10 @@ fn run_native_osr(
     // touches a captured/env variable hits "native environment name vanished"
     // (bliss-zqit — surfaced once uncommon-trap OSR unlocked env-var-using
     // functions that previously declined).
-    let saved_env_frame =
-        NATIVE_ENV_FRAME.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), env_frame));
+    egcl_rt::rooted!(saved_env_frame = NATIVE_ENV_FRAME.with(|slot| {
+        std::mem::replace(&mut *slot.borrow_mut(), env_frame)
+            .map(super::SuspendedFrameRoot)
+    }));
     let saved_err = NATIVE_ERROR.with(|c| c.take());
     NATIVE_DEOPT.with(|d| d.set(false));
     // OSR executes inside the interpreter activation, so its fault-recovery
@@ -21880,7 +21932,14 @@ fn run_native_osr(
     );
     egcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
-    NATIVE_ENV_FRAME.with(|slot| *slot.borrow_mut() = saved_env_frame);
+    // Native code can enter a lexical child before deoptimizing. Preserve
+    // that exact frame for T0, and root it while restoring the caller state.
+    egcl_rt::rooted!(resume_env_frame = NATIVE_ENV_FRAME.with(|slot| {
+        std::mem::replace(
+            &mut *slot.borrow_mut(),
+            saved_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)),
+        ).map(super::SuspendedFrameRoot)
+    }));
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.take());
@@ -21895,7 +21954,10 @@ fn run_native_osr(
     }
     if deopt {
         if let Some(NativeDeoptResume::Single { bcp, sp_top }) = resume {
-            return Ok(OsrOutcome::Deopt { bcp, sp_top });
+            return Ok(OsrOutcome::Deopt {
+                bcp, sp_top,
+                env_frame: resume_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)),
+            });
         }
         // No resume point recorded — should not happen for OSR (speculation
         // always records one), but treat it as a benign no-progress signal by
