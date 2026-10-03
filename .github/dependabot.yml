@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+# Every action in .github/workflows is pinned to a full commit SHA, which is
+# the right call -- a tag like @v7 can be moved, a SHA cannot. The cost is that
+# nothing then notices a security fix in actions/checkout or upload-artifact,
+# so the pins quietly age. SHA pinning and Dependabot are meant to be a pair:
+# this keeps the pins current while they stay immutable.
+#
+# Not the cargo ecosystem: this workspace is pinned to one compiler
+# (rust-toolchain.toml, 1.94.1) and its Cargo.lock is a release input recorded
+# in build provenance, so dependency bumps want to land deliberately rather
+# than as a weekly PR stream. Add an ecosystem entry here if that changes.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for all of them: these move together and each needs the same
+    # look at the release notes.
+    groups:
+      actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: 'Bump'
+    labels:
+      - dependencies

@@ -57,7 +57,7 @@ jobs:
         run: |
           rustup toolchain install nightly --component rust-src --profile minimal
           rustup target add x86_64-unknown-linux-gnu --toolchain nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: san-${{ matrix.san }}
       - name: ${{ matrix.san }}sanitizer over the runtime
@@ -81,7 +81,7 @@ jobs:
         run: |
           rustup toolchain install nightly --component miri --profile minimal
           cargo +nightly miri setup
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: miri
       - name: miri over the compiler crate

@@ -72,10 +72,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cross
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: cross-${{ matrix.target }}
       - name: build the workspace for ${{ matrix.target }}
@@ -100,7 +100,7 @@ jobs:
       # in-container runner for the top-level test binary is untouched.
       - name: register qemu binfmt handlers (nested exec of target binaries)
         if: matrix.run_tests
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
       - name: run the runtime suite under qemu
         if: matrix.run_tests
         env:
@@ -151,7 +151,7 @@ jobs:
         run: rustup show active-toolchain
       - name: add both Android ABIs
         run: rustup target add aarch64-linux-android x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: android
       - name: report which NDK this runner ships
@@ -169,7 +169,7 @@ jobs:
           python3 packaging/android/test_build.py
           python3 packaging/android/test_install_tools.py
       - name: keep the staged runtimes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: egcl-android-runtimes
           path: ${{ runner.temp }}/android-stage/usr/
