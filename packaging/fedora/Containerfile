@@ -13,8 +13,18 @@ FROM registry.fedoraproject.org/fedora:44@sha256:7011f51bd8089d345be42d41f0aa319
 # systemd supplies the same per-command memory limits as local packaging.
 RUN dnf -y install systemd dbus-daemon dnf5-plugins \
         gcc gcc-c++ clang binutils rpm-build rpm cpio python3 curl unzip git \
-        qemu-user wine mingw64-gcc mingw64-binutils glibc make java-devel \
+        qemu-user mingw64-gcc mingw64-binutils glibc make java-devel \
         mkdocs mkdocs-material procps-ng findutils rpmlint \
     && dnf clean all
+
+# Wine runs the Windows payload's dump step, and Fedora builds it for x86 only
+# -- on ppc64le `dnf install wine` fails with "No match for argument", which
+# took the whole image build down. This Containerfile serves every architecture
+# (EGCL_CONTAINER_PLATFORM), and the ppc64le image builds the POWER-native
+# group, which has no Windows target and so no use for Wine. Keep anything
+# x86-only behind this guard rather than in the list above.
+RUN if [ "$(rpm --eval '%{_arch}')" = x86_64 ]; then \
+        dnf -y install wine && dnf clean all; \
+    fi
 WORKDIR /workspace
 CMD ["/sbin/init"]
