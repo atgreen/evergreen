@@ -295,8 +295,11 @@ fn uiop_dump_preserves_hooks_arguments_and_exit_status() {
                     "(uiop:restore-image)",
                 ]);
             }
+            if !executable {
+                command.arg("--");
+            }
             command
-                .args(["--", "alpha", "beta"])
+                .args(["alpha", "beta"])
                 .env("HOME", fixture.0.join("new-home"))
                 .env_remove("XDG_CACHE_HOME")
                 .env_remove("TEST_FALSE_RESULT");

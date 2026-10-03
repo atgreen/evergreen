@@ -4922,7 +4922,9 @@ if we are not called from a directly executable image."
     (block nil
       #+abcl (return arguments)
       ;; EGCL keeps implementation options in raw argv, including the delimiter.
-      #+egcl (return (rest (member "--" arguments :test 'string=)))
+      #+egcl (return (if (eq *image-dumped-p* :executable)
+                        (rest arguments)
+                        (rest (member "--" arguments :test 'string=))))
       ;; SBCL and Allegro already separate user arguments from implementation arguments.
       #-(or sbcl allegro)
       (unless (eq *image-dumped-p* :executable)
@@ -5050,7 +5052,7 @@ or COMPRESSION on SBCL, and APPLICATION-TYPE on SBCL/Windows."
     (progn
       (setf *egcl-restored-hook* nil)
       (if executable
-          (egcl-ext:save-lisp-and-die filename :executable t :toplevel #'restore-image)
+          (egcl-ext:save-lisp-and-die filename :executable t :application t :toplevel #'restore-image)
           (egcl-ext:save-lisp-and-die filename)))
     #+allegro ;; revised with help from Franz
     (progn

@@ -23222,6 +23222,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let path = path_designator_to_string(path_val)?;
                 let mut executable = false;
                 let mut toplevel_set = false;
+                let mut application = false;
                 let mut key = rest;
                 while key.is_cons() {
                     let (k, kr) = cp(key);
@@ -23248,6 +23249,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             } else {
                                 let (vform, kr2) = cp(kr);
                                 executable = eval_form(vform, env)? != NIL;
+                                key = kr2;
+                            }
+                        }
+                        "APPLICATION" => {
+                            if value_is_missing {
+                                application = true;
+                                key = kr;
+                            } else {
+                                let (vform, kr2) = cp(kr);
+                                application = eval_form(vform, env)? != NIL;
                                 key = kr2;
                             }
                         }
@@ -23280,7 +23291,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if executable && !toplevel_set {
                     eprintln!(";; save-lisp-and-die: no :toplevel — the executable starts a REPL");
                 }
-                save_core_and_die(&path, executable, env)?;
+                save_core_and_die(&path, executable, application, env)?;
                 unreachable!("save_core_and_die exits the process");
             }
             "%SAVE-CORE" | "EGCL-EXT:%SAVE-CORE" => {
@@ -23329,7 +23340,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         }
                     }
                 }
-                save_core_and_die(&path, executable, env)?;
+                save_core_and_die(&path, executable, false, env)?;
                 unreachable!("save_core_and_die exits the process");
             }
             "DEFPACKAGE" => return eval_defpackage(cdr, env),
@@ -37819,6 +37830,8 @@ const IMAGE_TOPLEVEL_VAR: &str = "EGCL-INTERNAL::*IMAGE-TOPLEVEL*";
 // the pad restores the width. A deliberate trailer-magic change: an executable
 // image produced by a `torcl` build is no longer recognised, which is right.
 const EXE_IMAGE_MAGIC: &[u8; 8] = b"EGCLEXE\0";
+// Application arguments bypass the runtime CLI before the heap is restored.
+const APP_IMAGE_MAGIC: &[u8; 8] = b"EGCLAPP\0";
 
 /// The bytes of the currently running runtime binary. On Linux, read the magic
 /// `/proc/self/exe` symlink directly rather than resolving it to a path: the
@@ -37841,11 +37854,11 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
 /// bytes after the executable, so the concatenation still runs as the original
 /// program, while [`embedded_image`] recovers the image at startup (the same
 /// runtime-plus-core scheme SBCL uses for `:executable t`).
-fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
+fn wrap_executable(image: &[u8], application: bool) -> std::io::Result<Vec<u8>> {
     let mut bytes = current_runtime_bytes()?;
     delivery::remove_embedded_images(&mut bytes)?;
     bytes.extend_from_slice(image);
-    bytes.extend_from_slice(EXE_IMAGE_MAGIC);
+    bytes.extend_from_slice(if application { APP_IMAGE_MAGIC } else { EXE_IMAGE_MAGIC });
     bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
     Ok(bytes)
 }
@@ -37859,8 +37872,8 @@ fn wrap_executable(image: &[u8]) -> std::io::Result<Vec<u8>> {
 /// appended to a copy of the runtime binary (reusing the `EGCLEXE` trailer
 /// scheme, recovered by `embedded_image` at startup). GC-safe: no EGCL
 /// allocation between the GC and the serialize walk.
-fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), EgclError> {
-    save_core(path, executable, false, env)?;
+fn save_core_and_die(path: &str, executable: bool, application: bool, env: &Env) -> Result<(), EgclError> {
+    save_core(path, executable, false, application, env)?;
     use std::io::Write;
     let _ = std::io::stdout().flush();
     eprintln!(
@@ -37870,7 +37883,7 @@ fn save_core_and_die(path: &str, executable: bool, env: &Env) -> Result<(), Egcl
     std::process::exit(0);
 }
 
-fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<(), EgclError> {
+fn save_core(path: &str, executable: bool, delivery: bool, application: bool, env: &Env) -> Result<(), EgclError> {
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (egcl-x0f2.7a).
@@ -37919,7 +37932,7 @@ fn save_core(path: &str, executable: bool, delivery: bool, env: &Env) -> Result<
         .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
         let core_bytes = std::fs::read(&tmp.path)
             .map_err(|e| EgclError::FileError(format!("%save-core: reread core: {e}")))?;
-        let exe_bytes = wrap_executable(&core_bytes)
+        let exe_bytes = wrap_executable(&core_bytes, application)
             .map_err(|e| EgclError::FileError(format!("%save-core :executable: {e}")))?;
         delivery::write_atomic(std::path::Path::new(path), &exe_bytes, true)
             .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
@@ -38057,10 +38070,9 @@ fn reopen_standard_streams() {
 /// If the running binary has an image appended by an `:executable` save, return
 /// it. Only the 16-byte trailer is read unless the magic matches, so a normal
 /// launch pays almost nothing.
-fn embedded_image() -> Option<Vec<u8>> {
+fn embedded_image_header() -> Option<(std::fs::File, u64, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    let exe_path = std::env::current_exe().ok()?;
-    let mut f = std::fs::File::open(&exe_path).ok()?;
+    let mut f = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
     let len = f.metadata().ok()?.len();
     if len < 16 {
         return None;
@@ -38068,16 +38080,22 @@ fn embedded_image() -> Option<Vec<u8>> {
     f.seek(SeekFrom::End(-16)).ok()?;
     let mut trailer = [0u8; 16];
     f.read_exact(&mut trailer).ok()?;
-    if &trailer[..8] != EXE_IMAGE_MAGIC {
+    let application = &trailer[..8] == APP_IMAGE_MAGIC;
+    if !application && &trailer[..8] != EXE_IMAGE_MAGIC {
         return None;
     }
     let image_len = u64::from_le_bytes(trailer[8..16].try_into().ok()?);
-    if image_len == 0 || image_len + 16 > len {
+    if image_len == 0 || image_len >= len - 16 {
         return None;
     }
-    let start = len - 16 - image_len;
-    f.seek(SeekFrom::Start(start)).ok()?;
-    let mut image = vec![0u8; image_len as usize];
+    f.seek(SeekFrom::Start(len - 16 - image_len)).ok()?;
+    Some((f, image_len, application))
+}
+
+fn embedded_image() -> Option<Vec<u8>> {
+    use std::io::Read;
+    let (mut f, image_len, _) = embedded_image_header()?;
+    let mut image = vec![0u8; usize::try_from(image_len).ok()?];
     f.read_exact(&mut image).ok()?;
     Some(image)
 }
@@ -38146,7 +38164,13 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // A restored entry point can run without reading any source. Its formatter
     // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
-    let ca = CliArgs::parse(args)?;
+    let ca = if embedded_image_header().is_some_and(|(_, _, app)| app) {
+        let mut ca = CliArgs::parse(&[])?;
+        ca.cl_args = args.to_vec();
+        ca
+    } else {
+        CliArgs::parse(args)?
+    };
     if ca.help {
         print_help();
         return Ok(0);

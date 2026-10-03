@@ -1031,6 +1031,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
                 .ok_or_else(|| error("output path is not UTF-8"))?,
             false,
             true,
+            false,
             env,
         )
     })?;
@@ -1077,7 +1078,10 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
 /// Drop all historical payloads, including executables produced by older
 /// runtimes which appended new images without removing the preceding one.
 pub(super) fn remove_embedded_images(bytes: &mut Vec<u8>) -> io::Result<()> {
-    while bytes.len() >= 16 && &bytes[bytes.len() - 16..bytes.len() - 8] == EXE_IMAGE_MAGIC {
+    while bytes.len() >= 16
+        && [&EXE_IMAGE_MAGIC[..], &APP_IMAGE_MAGIC[..]]
+            .contains(&&bytes[bytes.len() - 16..bytes.len() - 8])
+    {
         let size = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
         let size = usize::try_from(size)
             .map_err(|_| io::Error::other("embedded image length overflow"))?;

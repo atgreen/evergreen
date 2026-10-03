@@ -3,7 +3,7 @@
 ## `save-lisp-and-die`
 
 ```lisp
-(save-lisp-and-die pathname &key executable toplevel)
+(save-lisp-and-die pathname &key executable toplevel application)
 ```
 
 Writes a core image of the live Lisp world and terminates the saving process.
@@ -34,9 +34,15 @@ Writes a core image of the live Lisp world and terminates the saving process.
 | `pathname` | Output pathname designator |
 | `:executable` | When true, append the core to a copy of the runtime executable |
 | `:toplevel` | Function to call when the saved application starts |
+| `:application` | When true with `:executable`, pass all arguments to the application without interpreting EGCL runtime options |
 
 Without `:toplevel`, an executable starts a REPL. Without `:executable`, the
 output is a core file restored with `egcl --image FILE`.
+
+UIOP executable dumps enable `:application t` automatically. Arguments such as
+`doctor`, `--help`, and `--eval` then belong to the saved application, and `--`
+is passed through unchanged. Ordinary executable images retain the EGCL CLI
+unless this option is enabled. Rebuild existing applications to enable it.
 
 The current implementation accepts some additional SBCL-style keywords,
 including `:compression` and `:save-runtime-options`, without implementing
