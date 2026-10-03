@@ -47,6 +47,35 @@ export PATH="/root/.cargo/bin:$PATH"
 export RUSTUP_TOOLCHAIN="$toolchain"
 case "$phase" in
     source)
+        # ocicl fetches the Lisp dependencies the APK builder pins in
+        # lib/egcl-apk/ocicl.csv. That tree is gitignored, so build.py's
+        # vendor_lisp_dependencies installs it into the source snapshot, and
+        # creating the SRPM is the one step allowed to reach the network.
+        #
+        # Only this phase needs it, and only x86_64 has it: the repo publishes
+        # el8/el9 x86_64 alone, and the `source` phase is the amd64 job (the
+        # POWER-native container runs the `binary` phase). Putting it here
+        # rather than in the shared Containerfile keeps the ppc64le image
+        # buildable.
+        #
+        # GPG-verified but not version-pinned, unlike rustup-init above, and the
+        # difference is deliberate: ocicl.csv pins every dependency by sha256
+        # digest, so which ocicl fetches them cannot change the vendored bytes.
+        # The one output that could drift is the wording of BUNDLED-LICENSES.txt
+        # from `ocicl collect-licenses`; vendor_lisp_dependencies fails the build
+        # if that comes back empty.
+        rpm --import https://ocicl.github.io/ocicl/rpm-repo/RPM-GPG-KEY-ocicl
+        cat > /etc/yum.repos.d/ocicl.repo <<'OCICL_REPO'
+[ocicl]
+name=ocicl - OCI-based Common Lisp package manager
+baseurl=https://ocicl.github.io/ocicl/rpm-repo
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://ocicl.github.io/ocicl/rpm-repo/RPM-GPG-KEY-ocicl
+OCICL_REPO
+        dnf -y install ocicl
+        ocicl version
         rustup component add rust-src
         cargo fetch --locked
         std_manifest=$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml
