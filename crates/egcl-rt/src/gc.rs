@@ -7784,6 +7784,15 @@ mod region_snapshot_tests {
             .unwrap();
         assert_eq!(large.used, object_footprint(large_len).0);
         assert!(large.used > 2 * config.region_size);
+        let encoded = snapshot.encode().unwrap();
+        let decoded = crate::image_heap::HeapImageView::parse(&encoded).unwrap();
+        assert_eq!(decoded.regions.len(), snapshot.regions.len());
+        for (saved, loaded) in snapshot.regions.iter().zip(&decoded.regions) {
+            assert_eq!(loaded.saved_start, saved.saved_start);
+            assert_eq!(loaded.used, saved.used);
+            assert_eq!(loaded.bytes, saved.bytes);
+            assert_eq!(loaded.fixups().collect::<Vec<_>>(), saved.fixups);
+        }
         assert_eq!(
             u64::from_ne_bytes(large.bytes[8..16].try_into().unwrap()),
             object_footprint(large_len).0 as u64
