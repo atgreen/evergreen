@@ -39,6 +39,9 @@ case "$phase" in
         cargo fetch --locked
         std_manifest=$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml
         RUSTC_BOOTSTRAP=1 cargo fetch --locked --manifest-path "$std_manifest"
+        # Here, not in the collector: this is the only job with cargo and a
+        # fetched dependency tree, which `cargo metadata --offline` needs.
+        python3 packaging/fedora/sbom.py --output target/egcl-sbom.cdx.json
         python3 packaging/fedora/source-rpm.py create
         ;;
     binary)

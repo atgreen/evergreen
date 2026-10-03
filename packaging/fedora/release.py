@@ -100,7 +100,7 @@ def merge_provenance(records, srpm_sha256):
     return merged
 
 
-def collect(rpm_dir, destination, plan, source_rpm, provenance_dir):
+def collect(rpm_dir, destination, plan, source_rpm, provenance_dir, sbom=None):
     with source_rpm.open('rb') as stream:
         source_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     # Merge first: the builders' agreed %dist is what package identity is
@@ -129,6 +129,8 @@ def collect(rpm_dir, destination, plan, source_rpm, provenance_dir):
     shutil.copy2(source_rpm, destination / source_rpm.name)
     shutil.copy2(ROOT / 'CHANGELOG.md', destination / 'CHANGELOG.md')
     shutil.copy2(PUBLIC_KEY, destination / PUBLIC_KEY.name)
+    if sbom:
+        shutil.copy2(sbom, destination / sbom.name)
     (destination / 'build.json').write_text(json.dumps(provenance, indent=2) + '\n')
     (destination / 'release.json').write_text(json.dumps(plan, indent=2) + '\n')
     write_checksums(destination)
@@ -238,6 +240,7 @@ def main():
     parser.add_argument('--provenance-dir', type=Path)
     parser.add_argument('--assets', type=Path, default=Path('target/release-assets'))
     parser.add_argument('--passphrase-file', type=Path)
+    parser.add_argument('--sbom', type=Path)
     args = parser.parse_args()
     if args.command == 'plan':
         version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
@@ -261,7 +264,7 @@ def main():
         if not args.source_rpm or not args.provenance_dir:
             parser.error('collect requires --source-rpm and --provenance-dir')
         collect(args.rpm_dir, args.destination, json.loads(args.plan.read_text()),
-                args.source_rpm, args.provenance_dir)
+                args.source_rpm, args.provenance_dir, args.sbom)
 
 
 if __name__ == '__main__':

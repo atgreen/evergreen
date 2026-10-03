@@ -112,6 +112,43 @@ class ReleaseTests(unittest.TestCase):
                 self.assertFalse((root / 'incomplete').exists())
 
 
+    def test_an_sbom_is_carried_into_the_release_and_checksummed(self):
+        plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rpms = root / 'rpms'
+            rpms.mkdir()
+            for name in release.PACKAGES:
+                (rpms / f'{name}.rpm').write_bytes(name.encode())
+            (root / 'CHANGELOG.md').write_text('notes\n')
+            source_rpm = root / 'egcl.src.rpm'
+            source_rpm.write_bytes(b'source archive')
+            sbom = root / 'egcl-sbom.cdx.json'
+            sbom.write_text('{"bomFormat": "CycloneDX"}\n')
+            provenance = root / 'metadata/all.json'
+            provenance.parent.mkdir(parents=True)
+            provenance.write_text(json.dumps({
+                'git': 'c', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44', 'dist': '.fc44',
+                'artifacts': {name: name for name in release.RUNTIMES}, 'rpms': [],
+                'srpm_sha256': hashlib.sha256(source_rpm.read_bytes()).hexdigest()}))
+
+            def identity(command, **kwargs):
+                if Path(command[-1]) == source_rpm:
+                    return 'egcl\t0.0.1\t0.test.123.1.fc44\t1'
+                return f'{Path(command[-1]).stem}\t0.0.1\t0.test.123.1.fc44\tx86_64'
+
+            with patch.object(release, 'ROOT', root), patch.object(
+                    release.subprocess, 'check_output', side_effect=identity):
+                destination = root / 'assets'
+                release.collect(rpms, destination, plan, source_rpm, provenance.parent, sbom)
+            manifest = dict(line.split('  ')[::-1]
+                            for line in (destination / 'SHA256SUMS').read_text().splitlines())
+            # In the manifest, so it is covered by SHA256SUMS.asc as well.
+            self.assertIn(sbom.name, manifest)
+            self.assertEqual(manifest[sbom.name],
+                             hashlib.sha256(sbom.read_bytes()).hexdigest())
+            self.assertEqual(len(manifest), 16)
+
     def test_stable_release_is_paired_with_its_version(self):
         version, number = release.RPM_RELEASE
         self.assertEqual(release.stable_release(version), number)
