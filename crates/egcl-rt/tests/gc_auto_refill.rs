@@ -50,6 +50,32 @@ fn native_blocking_without_collection_reuses_tlab_space() {
         let blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
         drop(blocked);
     }
+    // Only meaningful on a quiet heap. EGCL_GC_STRESS fires a minor collection
+    // on (almost) every allocation BY DESIGN, so under stress this count is
+    // guaranteed to have moved and the assertion would be false regardless of
+    // whether a TLAB was wasted -- it measured the stress knob, not the code.
+    // gc.yml runs -p egcl-rt under stress, so leaving it unguarded made that
+    // workflow permanently red (bliss-mkxoo).
+    //
+    // The loop above still runs under stress, which is the part worth having
+    // there: 100 allocations across 100 native scope transitions is a rooting
+    // probe, and a collection on each one is exactly what should catch a
+    // missing root. Only the nursery-accounting assertion is withheld.
+    //
+    // Checked here rather than through a cached helper because the runtime's
+    // own gc_stress_stride() is private to egcl-rt and this is an integration
+    // test; the parse matches it (unparseable => disabled, so =true is a no-op).
+    let stress = std::env::var("EGCL_GC_STRESS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if stress != 0 {
+        eprintln!(
+            "EGCL_GC_STRESS={stress} forces a collection per allocation — \
+             skipping the nursery-accounting assertion (the loop above still ran)"
+        );
+        return;
+    }
     assert_eq!(
         heap_stats().minor_gc_count,
         before,
