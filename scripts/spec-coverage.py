@@ -61,6 +61,11 @@ _RID_EXACT = re.compile(r"R\d+\.\d+")
 # implementation prose (gc.rs alone cites R1.09/R7.01 in module docs), and
 # counting those would let a comment satisfy a *test*-coverage gate.
 _RID_COVERS = re.compile(r"spec-covers:\s*([R\d.,\s]+)")
+# How far below a `spec-covers:` marker a `#[test]` may sit. Big enough for
+# a marker plus the few comment lines that explain WHICH clause it covers
+# (and any #[ignore]/#[should_panic] between), small enough that a marker
+# in unrelated module prose cannot reach a test further down the file.
+_COVERS_WINDOW = 20
 _RID_PROSE = re.compile(r"^\*\*(R\d+\.\d+)\*\*")
 _LEVEL = re.compile(r"\b(MUST(?:\s*/\s*SHOULD)?|SHOULD|MAY|REQUIRED|SHALL)\b",
                     re.IGNORECASE)
@@ -175,8 +180,21 @@ def parse_citations(repo: Path) -> set[str]:
         # rules do not work -- gc.rs has 14 separate `#[cfg(test)]` blocks
         # interleaved with code, so "after the first one" means "the whole
         # file".
-        for group in _RID_COVERS.findall(text):
-            cited.update(_RID_EXACT.findall(group))
+        #
+        # The marker must SIT ON A TEST: it counts only when a `#[test]`
+        # attribute follows within _COVERS_WINDOW lines. Without that the
+        # marker would be an honour system -- a `spec-covers:` dropped into
+        # module prose would satisfy a TEST-coverage gate with no test behind
+        # it, which is the whole failure this gate exists to prevent.
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            group = _RID_COVERS.search(line)
+            if not group:
+                continue
+            window = lines[i + 1 : i + 1 + _COVERS_WINDOW]
+            if not any("#[test]" in w for w in window):
+                continue
+            cited.update(_RID_EXACT.findall(group.group(1)))
     return cited
 
 
