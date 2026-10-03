@@ -198,6 +198,13 @@ class GenerateTests(unittest.TestCase):
 
 
 class WorkflowAgreementTests(unittest.TestCase):
+    # The SRPM's source tree is an allowlist (build.py source_archive) and does
+    # not ship .github: CI workflows are not part of the software. So this
+    # repository-level invariant cannot be checked from inside the spec's
+    # %check, where it raised FileNotFoundError and failed every binaries job.
+    # Skip there rather than pass silently; the release workflow's own plan job
+    # runs this file on a full checkout, which is where the invariant is real.
+    @unittest.skipUnless(WORKFLOW.is_file(), 'release.yml is not shipped in the source RPM')
     def test_the_test_channel_cap_matches_the_prerelease_prune(self):
         """Cross-file invariant: a channel referencing a pruned release 404s.
 
