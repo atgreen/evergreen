@@ -23055,6 +23055,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return egcl_stdlib::digest::sha256_of_sequence(args[0]);
             }
+            // CRC-32 (ZIP/PNG/gzip). A byte-at-a-time Lisp loop measured
+            // 8641 ms over the 6.76 MB Android runtime -- the largest cost left
+            // in a self-hosted APK build once hashing was native.
+            "EGCL-EXT:CRC32" => {
+                let args = eval_args(cdr, env)?;
+                if args.len() != 1 {
+                    return Err(EgclError::ProgramError(format!(
+                        "EGCL-EXT:CRC32 takes one sequence, got {}",
+                        args.len()
+                    )));
+                }
+                return egcl_stdlib::digest::crc32_of_sequence(args[0]);
+            }
             // Process-wide count of T1 speculative deoptimizations (bliss-jtc.27):
             // observability for the S5 gate's second half — a failed speculation
             // deoptimizes to the interpreter and still returns the correct value.
@@ -23159,11 +23172,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 } else if egcl_stdlib::is_byte_stream(inp) {
                     // Byte (unsigned-byte 8) stream: transfer octets, not chars.
-                    for _ in 0..count {
-                        let b = egcl_stdlib::stream_read_byte(inp)?;
-                        if b == EOF {
-                            break;
-                        }
+                    // In bulk -- a per-octet stream_read_byte takes the stream
+                    // lock each time, which was ~750 ns a byte and 5.1 s to read
+                    // a 6.76 MB file.
+                    for b in egcl_stdlib::streams::stream_read_byte_sequence(inp, count)? {
                         seq_set_elt(seq, pos, b)?;
                         pos += 1;
                     }

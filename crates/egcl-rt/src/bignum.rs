@@ -167,28 +167,126 @@ pub fn mag_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
 }
 /// Truncating division of magnitudes: returns (quotient, remainder). `b` must
 /// be nonzero. Bit-by-bit long division — O(bits · limbs), fine at test sizes.
+/// Shift `m` left by `shift` (< 64) bits into exactly `out_len` limbs.
+fn shl_bits_exact(m: &[u64], shift: u32, out_len: usize) -> Vec<u64> {
+    let mut out = vec![0u64; out_len];
+    if shift == 0 {
+        out[..m.len()].copy_from_slice(m);
+        return out;
+    }
+    let mut carry = 0u64;
+    for (i, &limb) in m.iter().enumerate() {
+        out[i] = (limb << shift) | carry;
+        carry = limb >> (64 - shift);
+    }
+    if m.len() < out_len {
+        out[m.len()] = carry;
+    }
+    out
+}
+
+/// Shift `m` right by `shift` (< 64) bits in place of a fresh magnitude.
+fn shr_bits(m: &[u64], shift: u32) -> Vec<u64> {
+    if shift == 0 {
+        return m.to_vec();
+    }
+    let mut out = vec![0u64; m.len()];
+    let mut carry = 0u64;
+    for i in (0..m.len()).rev() {
+        out[i] = (m[i] >> shift) | carry;
+        carry = m[i] << (64 - shift);
+    }
+    out
+}
+
+/// Truncating division of magnitudes: (quotient, remainder). `b` must be
+/// nonzero, which is `big_divmod`'s documented contract.
+///
+/// Knuth TAOCP 4.3.1 Algorithm D, one limb per step. This was binary long
+/// division -- one iteration per BIT of the dividend, each allocating a fresh
+/// remainder through `mag_shl1` and often another through `mag_sub`. For the
+/// 256-bit operands of P-256 ECDSA that is 256 allocating iterations where this
+/// takes four, and it showed: `mag_divmod` plus `mag_shl1` were 22% of a
+/// self-hosted APK build, all of it in signing.
 pub fn mag_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     if mag_cmp(a, b) == Ordering::Less {
         return (Vec::new(), a.to_vec());
     }
-    let n = mag_bitlen(a);
-    let mut rem: Vec<u64> = Vec::new();
-    let mut quot: Vec<u64> = Vec::new();
-    for i in (0..n).rev() {
-        rem = mag_shl1(&rem);
-        if mag_bit(a, i) == 1 {
-            if rem.is_empty() {
-                rem.push(1);
-            } else {
-                rem[0] |= 1;
+    let n = b.len();
+    debug_assert!(n > 0 && b[n - 1] != 0, "divisor must be nonzero and trimmed");
+
+    // A single-limb divisor needs no normalisation or correction: each step is
+    // one 128-by-64 divide.
+    if n == 1 {
+        let d = b[0] as u128;
+        let mut q = vec![0u64; a.len()];
+        let mut rem: u128 = 0;
+        for i in (0..a.len()).rev() {
+            let cur = (rem << 64) | a[i] as u128;
+            q[i] = (cur / d) as u64;
+            rem = cur % d;
+        }
+        let r = if rem == 0 { Vec::new() } else { vec![rem as u64] };
+        return (mag_trim(q), r);
+    }
+
+    // D1. Normalise so the divisor's top limb has its high bit set; that is
+    // what bounds the error in the two-limb estimate below to at most 2.
+    let shift = b[n - 1].leading_zeros();
+    let v = shl_bits_exact(b, shift, n);
+    let mut u = shl_bits_exact(a, shift, a.len() + 1);
+
+    let m = a.len() - n;
+    let mut q = vec![0u64; m + 1];
+    const BASE: u128 = 1u128 << 64;
+
+    for j in (0..=m).rev() {
+        // D3. Estimate this quotient limb from the top two limbs.
+        let top = ((u[j + n] as u128) << 64) | u[j + n - 1] as u128;
+        let mut qhat = top / v[n - 1] as u128;
+        let mut rhat = top % v[n - 1] as u128;
+        while qhat >= BASE
+            || qhat * v[n - 2] as u128 > (rhat << 64) | u[j + n - 2] as u128
+        {
+            qhat -= 1;
+            rhat += v[n - 1] as u128;
+            if rhat >= BASE {
+                break;
             }
         }
-        if mag_cmp(&rem, b) != Ordering::Less {
-            rem = mag_sub(&rem, b);
-            mag_set_bit(&mut quot, i);
+
+        // D4. Multiply and subtract.
+        let mut borrow = 0u64;
+        let mut carry = 0u128;
+        for i in 0..n {
+            let product = qhat * v[i] as u128 + carry;
+            carry = product >> 64;
+            let (diff, b1) = u[i + j].overflowing_sub(product as u64);
+            let (diff, b2) = diff.overflowing_sub(borrow);
+            u[i + j] = diff;
+            borrow = (b1 as u64) + (b2 as u64);
         }
+        let (diff, b1) = u[j + n].overflowing_sub(carry as u64);
+        let (diff, b2) = diff.overflowing_sub(borrow);
+        u[j + n] = diff;
+
+        // D5/D6. The estimate was one too large (rare): add the divisor back.
+        if b1 || b2 {
+            qhat -= 1;
+            let mut carry = 0u64;
+            for i in 0..n {
+                let (sum, c1) = u[i + j].overflowing_add(v[i]);
+                let (sum, c2) = sum.overflowing_add(carry);
+                u[i + j] = sum;
+                carry = (c1 as u64) + (c2 as u64);
+            }
+            u[j + n] = u[j + n].wrapping_add(carry);
+        }
+        q[j] = qhat as u64;
     }
-    (mag_trim(quot), mag_trim(rem))
+
+    // D8. Undo the normalising shift on the remainder.
+    (mag_trim(q), mag_trim(shr_bits(&u[..n], shift)))
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct BigInt {
@@ -706,4 +804,116 @@ pub fn mag_set_bit(m: &mut Vec<u64>, idx: usize) {
         m.push(0);
     }
     m[w] |= 1u64 << (idx % 64);
+}
+
+#[cfg(test)]
+mod divmod_tests {
+    use super::*;
+
+    /// The binary long division `mag_divmod` used before Algorithm D, kept as a
+    /// differential oracle: it is obviously correct and obviously slow.
+    fn reference_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        if mag_cmp(a, b) == Ordering::Less {
+            return (Vec::new(), a.to_vec());
+        }
+        let n = mag_bitlen(a);
+        let mut rem: Vec<u64> = Vec::new();
+        let mut quot: Vec<u64> = Vec::new();
+        for i in (0..n).rev() {
+            rem = mag_shl1(&rem);
+            if mag_bit(a, i) == 1 {
+                if rem.is_empty() {
+                    rem.push(1);
+                } else {
+                    rem[0] |= 1;
+                }
+            }
+            if mag_cmp(&rem, b) != Ordering::Less {
+                rem = mag_sub(&rem, b);
+                mag_set_bit(&mut quot, i);
+            }
+        }
+        (mag_trim(quot), mag_trim(rem))
+    }
+
+    /// xorshift64*, so the cases are reproducible without a dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn mag(&mut self, limbs: usize) -> Vec<u64> {
+            mag_trim((0..limbs).map(|_| self.next()).collect())
+        }
+    }
+
+    fn check(a: &[u64], b: &[u64]) {
+        let (q, r) = mag_divmod(a, b);
+        let (eq, er) = reference_divmod(a, b);
+        assert_eq!((&q, &r), (&eq, &er), "divmod disagreed for {a:?} / {b:?}");
+        // And independently: a == q*b + r, with r < b.
+        assert_eq!(mag_trim(mag_add(&mag_mul(&q, b), &r)), mag_trim(a.to_vec()));
+        assert_eq!(mag_cmp(&r, b), Ordering::Less);
+    }
+
+    #[test]
+    fn agrees_with_binary_long_division_on_random_inputs() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for _ in 0..400 {
+            for (alimbs, blimbs) in [(1, 1), (2, 1), (4, 2), (8, 3), (9, 4), (16, 7), (5, 5)] {
+                let a = rng.mag(alimbs);
+                let b = rng.mag(blimbs);
+                if b.is_empty() {
+                    continue;
+                }
+                check(&a, &b);
+            }
+        }
+    }
+
+    #[test]
+    fn covers_the_cases_algorithm_d_is_known_to_trip_on() {
+        // Divisor top limb already normalised, and not; quotient limb estimate
+        // needing correction; add-back; equal operands; powers of two.
+        let hard: &[(&[u64], &[u64])] = &[
+            (&[0, 0, 1], &[1, 1]),
+            (&[0, 0, u64::MAX], &[u64::MAX, u64::MAX]),
+            (&[u64::MAX, u64::MAX, u64::MAX], &[u64::MAX, 1]),
+            (&[0, 0, 0, 1], &[1, 0, 1]),
+            (&[u64::MAX; 4], &[u64::MAX; 2]),
+            (&[0, 1], &[1, 1]),
+            (&[1, 1], &[1, 1]),
+            (&[0, 0, 0, 0, 1], &[1]),
+            (&[7], &[7]),
+            (&[0, 0, 1], &[u64::MAX, 0, 1]),
+            // The classic Algorithm D add-back trigger (Knuth 4.3.1 ex. 21).
+            (&[0, 0, 0x8000_0000_0000_0000], &[1, 0x8000_0000_0000_0000]),
+        ];
+        for (a, b) in hard {
+            check(a, b);
+        }
+    }
+
+    #[test]
+    fn single_limb_divisors_and_exact_divisions() {
+        let mut rng = Rng(12345);
+        for _ in 0..200 {
+            let a = rng.mag(6);
+            let d = rng.mag(1);
+            if d.is_empty() || a.is_empty() {
+                continue;
+            }
+            check(&a, &d);
+            // An exact multiple must leave no remainder.
+            let product = mag_mul(&a, &d);
+            let (q, r) = mag_divmod(&product, &d);
+            assert!(r.is_empty(), "exact division left {r:?}");
+            assert_eq!(q, a);
+        }
+    }
 }

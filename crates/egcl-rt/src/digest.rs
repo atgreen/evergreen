@@ -215,3 +215,46 @@ mod tests {
         );
     }
 }
+
+// ── CRC-32 (IEEE 802.3, the ZIP/PNG/gzip polynomial) ───────────────
+
+/// The reversed polynomial table, built once.
+fn crc32_table() -> &'static [u32; 256] {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xedb8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *slot = c;
+        }
+        table
+    })
+}
+
+/// CRC-32 of `data`, as ZIP entries and PNG chunks define it.
+pub fn crc32(data: &[u8]) -> u32 {
+    let table = crc32_table();
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc = (crc >> 8) ^ table[((crc ^ byte as u32) & 0xff) as usize];
+    }
+    crc ^ 0xffff_ffff
+}
+
+#[cfg(test)]
+mod crc_tests {
+    use super::*;
+
+    #[test]
+    fn matches_the_published_check_values() {
+        // The standard CRC-32 check value, and the boundary cases.
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"a"), 0xe8b7_be43);
+        assert_eq!(crc32(&[0u8; 32]), 0x190a_55ad);
+        assert_eq!(crc32(&[0xffu8; 32]), 0xff6c_ab0b);
+    }
+}

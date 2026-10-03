@@ -49,7 +49,13 @@
       (let ((c i))
         (dotimes (j 8) (setf c (logxor (ash c -1) (if (oddp c) #xedb88320 0))))
         (setf (aref table i) c)))))
+;; Every ZIP entry is checksummed, so this runs over the whole archive. The
+;; byte-at-a-time loop below measured 8641 ms on the 6.76 MB Android runtime
+;; alone; the runtime primitive is the same polynomial, checked against the
+;; standard 0xCBF43926 for "123456789".
 (defun crc32 (data)
+  #+egcl (egcl-ext:crc32 data)
+  #-egcl
   (let ((crc #xffffffff))
     (loop for b across data do
       (setf crc (logxor (ash crc -8) (aref *crc-table* (logand (logxor crc b) 255)))))

@@ -2317,6 +2317,30 @@ pub fn stream_read_sequence(stream: EgclVal, count: usize) -> Result<Vec<EgclVal
     with_stream(stream, |guard| guard.stream_read_sequence(count))
 }
 
+/// Read up to COUNT octets, locking the stream once rather than once per byte.
+///
+/// READ-SEQUENCE over an `(unsigned-byte 8)` stream called `stream_read_byte`
+/// per octet, and each of those goes through `with_stream` -- a stream lookup
+/// and lock. Reading the 6.76 MB Android runtime that way measured 5.1 s, about
+/// 750 ns a byte, nearly all of it the per-byte lock rather than the read.
+/// Stops early at end of file, like the character form above.
+pub fn stream_read_byte_sequence(
+    stream: EgclVal,
+    count: usize,
+) -> Result<Vec<EgclVal>, EgclError> {
+    with_stream(stream, |guard| {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let byte = guard.stream_read_byte()?;
+            if byte == crate::streams::EOF {
+                break;
+            }
+            out.push(byte);
+        }
+        Ok(out)
+    })
+}
+
 pub fn stream_write_sequence(stream: EgclVal, elements: &[EgclVal]) -> Result<(), EgclError> {
     let mut elements = elements.to_vec();
     egcl_rt::rooted_ref!(_elements_root = &mut elements);
