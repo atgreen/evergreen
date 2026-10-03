@@ -1970,8 +1970,8 @@ RPM. It supplies native libraries for ARM64 phones and x86-64 emulators, plus
 <code>egcl-android-new</code>. Application builds need Python 3, GNU Make, a JDK, and the
 Android SDK. They do not need Rust, the NDK, a EGCL checkout, or containers.</p>
 <p>If you would rather not install the SDK and a JDK at all, skip to
-<a href="#build-without-the-android-sdk">build without the Android SDK</a>: <code>egcl-apk</code>
-assembles and signs an APK entirely in Lisp.</p>
+<a href="#build-without-the-android-sdk">build without the Android SDK</a>, where
+<code>asdf:make</code> assembles and signs an APK entirely in Lisp.</p>
 <h2 id="generate-the-project">Generate the project<a class="headerlink" href="#generate-the-project" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>egcl-android-new<span class="w"> </span>hello<span class="w"> </span>--package<span class="w"> </span>org.example.hello<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>--name<span class="w"> </span><span class="s2">"Hello EGCL"</span><span class="w"> </span>--host<span class="o">=</span>aarch64-linux-android<span class="w"> </span>--template<span class="o">=</span>egl
@@ -2029,10 +2029,10 @@ debugging. Use <code>adb install</code> explicitly to deploy a release APK; <cod
 builds and installs the debug APK. A differently signed APK cannot update an
 existing installation without addressing the signing mismatch.</p>
 <h2 id="build-without-the-android-sdk">Build without the Android SDK<a class="headerlink" href="#build-without-the-android-sdk" title="Permanent link">&para;</a></h2>
-<p><code>egcl-apk</code>, also from <code>egcl-target-android</code>, builds and signs an APK with no
-SDK, JDK, Make or Python — just the <code>egcl</code> the package already requires. The
+<p><code>egcl-apk-asdf</code>, also from <code>egcl-target-android</code>, builds and signs an APK with
+no SDK, JDK, Make or Python — just the <code>egcl</code> the package already requires. The
 project describes its APK in its own <code>.asd</code> rather than in a manifest and
-Makefile:</p>
+Makefile, and <code>asdf:make</code> is the whole build:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="c1">;; The primary system exists so ASDF accepts the secondary name below. It has</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1">;; no components because an EGL application's sources are target code: they</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="c1">;; call bindings that only exist inside the APK runtime.</span>
@@ -2050,15 +2050,25 @@ Makefile:</p>
 <a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="w">  </span><span class="ss">:apk-version-code</span><span class="w"> </span><span class="mi">1</span>
 <a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="w">  </span><span class="ss">:components</span><span class="w"> </span><span class="p">((</span><span class="ss">:static-file</span><span class="w"> </span><span class="s">"app.lisp"</span><span class="p">)))</span>
 </code></pre></div>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>egcl-apk<span class="w"> </span>hello/
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nb">cd</span><span class="w"> </span>hello
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>egcl<span class="w"> </span>--eval<span class="w"> </span><span class="s1">'(require :asdf)'</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">     </span>--eval<span class="w"> </span><span class="s1">'(asdf:load-asd (truename "hello.asd"))'</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">     </span>--eval<span class="w"> </span><span class="s1">'(asdf:make "hello/apk")'</span>
 </code></pre></div>
 <p>That writes <code>hello/build/hello.apk</code>, signed with a P-256 key it creates once as
-<code>hello/.egcl-apk-key</code> (umask 077). Install it with <code>adb install</code>. The system's
-file components <em>are</em> the APK's assets, in declaration order, so the two cannot
-drift; <code>:apk-entry</code> (default <code>app.lisp</code>) names the one that is loaded first.</p>
-<p>The first build spends about nine seconds saving an image of the loaded builder
-under <code>${XDG_CACHE_HOME:-$HOME/.cache}/egcl</code>; later builds restore it. <code>egcl-apk</code>
-rebuilds that image by itself after an <code>egcl</code> upgrade.</p>
+<code>hello/.egcl-apk-key</code>, mode 0600 whatever your umask is. Install it with
+<code>adb install</code>. The system's file components <em>are</em> the APK's assets, in
+declaration order, so the two cannot drift; <code>:apk-entry</code> (default <code>app.lisp</code>)
+names the one that is loaded first.</p>
+<p>Nothing has to be launched or configured: the builder and its dependencies
+install into <code>/usr/share/common-lisp/source/egcl-apk</code>, which ASDF already
+searches, and <code>:defsystem-depends-on ("egcl-apk-asdf")</code> in the <code>.asd</code> pulls them
+in. <code>(require :asdf)</code> is a no-op on an installed <code>egcl</code> — its appended image
+already holds ASDF — and <code>asdf:load-asd</code> wants an absolute pathname, hence
+<code>truename</code>.</p>
+<p>A build takes about 18 seconds, around 7 of which is loading Ironclad. If you
+build many in a row, <code>save.lisp</code> in the builder's source tree writes an image
+that cuts it to about 11; see the builder's README.</p>
 <p>See the <a href="https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md">builder's README</a>
 for every <code>:apk-*</code> slot, and the
 <a href="../../reference/android/">Android project reference</a> for build paths,
