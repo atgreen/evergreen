@@ -98,8 +98,8 @@ its own default instead of being handed an explicit nothing."
 
 (defvar *allow-identity-creation* nil
   "When true, a build may create a missing signing identity. Set only by a
-caller that has already established a restrictive umask -- see
-`scripts/egcl-apk'. An unencrypted private key must not be written with
+caller that has already established a restrictive umask -- see the
+`egcl-apk' launcher. An unencrypted private key must not be written with
 whatever umask an interactive session happens to carry.")
 
 (defvar *runtime-directory* nil
@@ -150,14 +150,14 @@ against the runtime's own runtime.json."
              (asdf:component-name s) entry (mapcar #'file-namestring files)))
     ;; Do NOT mint a signing key from an ordinary build. create-identity writes
     ;; an unencrypted P-256 private key and relies on the caller's umask, and
-    ;; EGCL exposes no chmod to repair the mode afterwards. `scripts/egcl-apk'
-    ;; sets umask 077 and then binds *allow-identity-creation*, so the
+    ;; EGCL exposes no chmod to repair the mode afterwards. The `egcl-apk'
+    ;; launcher sets umask 077 and then binds *allow-identity-creation*, so the
     ;; permission travels with the only caller that has established the umask;
     ;; a plain `asdf:make' from a REPL inherits whatever the user happens to
     ;; have and is refused.
     (unless (or (probe-file identity-path) *allow-identity-creation*)
       (error "~A: no signing identity at ~A.~%~
-              Create one with `scripts/egcl-apk', which sets umask 077 first:~%~
+              Create one with `egcl-apk', which sets umask 077 first:~%~
               an APK signing key must not be written under an inherited umask."
              (asdf:component-name s) identity-path))
     (egcl-apk::build-apk-from (apk-config s) (apk-runtime-directory)

@@ -5,7 +5,10 @@
 import importlib.util
 from pathlib import Path
 import platform
+import stat
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 def load(name, filename):
@@ -49,6 +52,76 @@ class VendoredLispDependencyTests(unittest.TestCase):
                       SPEC.read_text())
         self.assertIn(build.BUNDLED_LICENSES,
                       (Path(__file__).with_name('build.py')).read_text())
+
+
+VENDORED = build.ROOT / 'lib/egcl-apk/ocicl'
+
+
+class ApkBuilderStagingTests(unittest.TestCase):
+    """egcl-target-android must ship the APK builder, not just the runtimes.
+
+    `egcl-apk' builds an application's APK from the description in its .asd, so
+    it is useless unless the Android package installs the builder's sources, the
+    dependencies ocicl.csv pins, and ASDF -- none of which the host egcl has.
+    """
+
+    def test_a_source_tree_without_vendored_dependencies_is_refused(self):
+        """Rather than staging a builder that cannot load Ironclad."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'lib/egcl-apk').mkdir(parents=True)
+            with patch.object(build, 'ROOT', root), self.assertRaises(SystemExit):
+                build.stage_apk_builder(root / 'stage')
+
+    @unittest.skipUnless(VENDORED.is_dir(), 'run `ocicl install` in lib/egcl-apk')
+    def test_staging_installs_the_launcher_and_everything_it_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            build.stage_apk_builder(stage)
+            launcher = stage / 'usr/bin/egcl-apk'
+            self.assertTrue(launcher.is_file())
+            self.assertTrue(launcher.stat().st_mode & stat.S_IXUSR, 'launcher not executable')
+            builder = stage / 'usr/libexec/egcl/android/apk-builder'
+            # run.lisp drives the saved image, save.lisp writes it, cli.lisp is
+            # the from-source fallback: the launcher loads all three by name.
+            for name in ('run.lisp', 'save.lisp', 'cli.lisp', 'load.lisp',
+                         'egcl-apk.asd', 'egcl-apk-asdf.asd', 'ocicl.csv', 'asdf.lisp'):
+                with self.subTest(name=name):
+                    self.assertTrue((builder / name).is_file(), f'{name} was not staged')
+            pinned = [line.split(',')[2].strip().split('/')[0] for line
+                      in (builder / 'ocicl.csv').read_text().splitlines() if line.strip()]
+            for system in pinned:
+                with self.subTest(system=system):
+                    self.assertTrue((builder / 'ocicl' / system).is_dir())
+            # The tests drive a fixture project and are not part of the install.
+            self.assertFalse((builder / 'tests').exists())
+            self.assertTrue((stage / 'usr/share/licenses/egcl-target-android'
+                             / 'ASDF-LICENSE.txt').is_file(), 'ASDF ships without its notice')
+
+    def test_the_android_package_installs_the_launcher(self):
+        """Staging a file the spec does not list would ship a builder nobody
+        can run (and %files only errors the other way round)."""
+        self.assertIn('%{_bindir}/egcl-apk\n', SPEC.read_text())
+
+    def test_there_is_one_launcher_implementation(self):
+        """scripts/egcl-apk only redirects the packaged launcher at the tree.
+
+        Two copies drifted apart the moment one grew the image cache; keep the
+        source-tree entry point a wrapper.
+        """
+        wrapper = (build.ROOT / 'scripts/egcl-apk').read_text()
+        self.assertIn('packaging/android/egcl-apk', wrapper)
+        for variable in ('EGCL_APK_BUILDER', 'EGCL_APK_ASDF'):
+            with self.subTest(variable=variable):
+                self.assertIn(variable, wrapper)
+
+    def test_the_builder_needs_no_ocicl_in_the_user_home(self):
+        """It used to load ocicl-runtime from ~/.local/share/ocicl, which an
+        RPM user does not have; the pinned tree is registered directly now."""
+        loader = (build.ROOT / 'lib/egcl-apk/load.lisp').read_text()
+        for absent in ('OCICL_RUNTIME', 'user-homedir-pathname'):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, loader)
 
 
 class SubstituteTests(unittest.TestCase):

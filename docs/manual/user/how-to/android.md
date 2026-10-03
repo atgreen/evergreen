@@ -5,6 +5,10 @@ RPM. It supplies native libraries for ARM64 phones and x86-64 emulators, plus
 `egcl-android-new`. Application builds need Python 3, GNU Make, a JDK, and the
 Android SDK. They do not need Rust, the NDK, a EGCL checkout, or containers.
 
+If you would rather not install the SDK and a JDK at all, skip to
+[build without the Android SDK](#build-without-the-android-sdk): `egcl-apk`
+assembles and signs an APK entirely in Lisp.
+
 ## Generate the project
 
 ```sh
@@ -92,5 +96,46 @@ debugging. Use `adb install` explicitly to deploy a release APK; `make install`
 builds and installs the debug APK. A differently signed APK cannot update an
 existing installation without addressing the signing mismatch.
 
-See the [Android project reference](../reference/android.md) for build paths,
+## Build without the Android SDK
+
+`egcl-apk`, also from `egcl-target-android`, builds and signs an APK with no
+SDK, JDK, Make or Python — just the `egcl` the package already requires. The
+project describes its APK in its own `.asd` rather than in a manifest and
+Makefile:
+
+```lisp
+;; The primary system exists so ASDF accepts the secondary name below. It has
+;; no components because an EGL application's sources are target code: they
+;; call bindings that only exist inside the APK runtime.
+(asdf:defsystem "hello"
+  :components ())
+
+(asdf:defsystem "hello/apk"
+  :defsystem-depends-on ("egcl-apk-asdf")
+  :class "egcl-apk-asdf:android-apk"
+  :build-operation "egcl-apk-asdf:apk-op"
+  :pathname "assets/"
+  :version "1.0"
+  :apk-package "org.example.hello"
+  :apk-label "Hello EGCL"
+  :apk-version-code 1
+  :components ((:static-file "app.lisp")))
+```
+
+```sh
+egcl-apk hello/
+```
+
+That writes `hello/build/hello.apk`, signed with a P-256 key it creates once as
+`hello/.egcl-apk-key` (umask 077). Install it with `adb install`. The system's
+file components *are* the APK's assets, in declaration order, so the two cannot
+drift; `:apk-entry` (default `app.lisp`) names the one that is loaded first.
+
+The first build spends about nine seconds saving an image of the loaded builder
+under `${XDG_CACHE_HOME:-$HOME/.cache}/egcl`; later builds restore it. `egcl-apk`
+rebuilds that image by itself after an `egcl` upgrade.
+
+See the [builder's README](https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md)
+for every `:apk-*` slot, and the
+[Android project reference](../reference/android.md) for build paths,
 variables, lifecycle callbacks, and asset limits.

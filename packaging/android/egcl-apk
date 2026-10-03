@@ -1,0 +1,105 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+# SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+#
+# Build and sign the APK described by a project's own .asd.
+#
+# Installed as /usr/bin/egcl-apk by egcl-target-android, and reached in the
+# source tree through scripts/egcl-apk, which only points the variables below
+# at the tree instead of at /usr. Keep this the single implementation.
+#
+# The umask is why this launcher, and not a bare `asdf:make', may create a
+# missing signing identity: the unencrypted private key then lands 0600 rather
+# than under whatever umask the caller happens to carry. run.lisp and cli.lisp
+# bind egcl-apk-asdf:*allow-identity-creation* on that basis.
+set -eu
+umask 077
+
+BUILDER="${EGCL_APK_BUILDER:-/usr/libexec/egcl/android/apk-builder}"
+: "${EGCL_APK_ASDF:=$BUILDER/asdf.lisp}"
+: "${EGCL_APK_RUNTIME:=/usr/libexec/egcl/android/}"
+export EGCL_APK_RUNTIME
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'USAGE'
+Usage: egcl-apk PROJECT-DIRECTORY
+
+Builds the signed APK described by the project's .asd; see the egcl-apk README
+or the EGCL manual for the :apk-* slots. The project directory must hold
+exactly one .asd, defining NAME and NAME/apk.
+
+Environment:
+  EGCL_APK_RUNTIME   extracted egcl-target-android to package
+                     (default /usr/libexec/egcl/android/)
+  EGCL_BIN           the egcl to build with (default egcl)
+  SBCL_BIN           build with this SBCL instead of egcl
+  EGCL_APK_IMAGE     saved builder image to use, instead of one cached under
+                     ${XDG_CACHE_HOME:-$HOME/.cache}/egcl
+  EGCL_APK_BUILDER   the builder's own directory
+USAGE
+    exit 0
+fi
+if [ "$#" -ne 1 ]; then
+    echo 'Usage: egcl-apk PROJECT-DIRECTORY   (--help for details)' >&2
+    exit 2
+fi
+if [ ! -r "$BUILDER/run.lisp" ]; then
+    echo "egcl-apk: no APK builder at $BUILDER" >&2
+    echo 'Install egcl-target-android, or set EGCL_APK_BUILDER.' >&2
+    exit 1
+fi
+
+EGCL_APK_PROJECT=$(CDPATH='' cd -- "$1" && pwd)
+export EGCL_APK_PROJECT
+
+# SBCL has ASDF built in and takes different startup flags, so pick by which
+# Lisp was asked for rather than by substituting one binary for the other. It
+# gets no image: SBCL loads the builder in about a second anyway.
+if [ -n "${SBCL_BIN:-}" ]; then
+    exec "$SBCL_BIN" --noinform --no-userinit --no-sysinit --non-interactive \
+         --load "$BUILDER/cli.lisp"
+fi
+EGCL_BIN="${EGCL_BIN:-egcl}"
+
+# Loading ASDF, ocicl's pinned dependencies, Ironclad and the builder from
+# source costs about nine seconds of every build. A saved image restores that
+# world in about a third of a second, so the first run writes one and later
+# runs reuse it.
+#
+# The image is built here rather than shipped in the RPM for two reasons: the
+# Android package is built in its own rpmbuild, which has no host egcl to write
+# one with, and an image is refused by any egcl but the one that wrote it
+# ("runtime source mismatch"), so a shipped one would die the moment egcl was
+# rebuilt. Building against the installed egcl cannot be stale that way -- and
+# if it somehow is, the retry below rebuilds it.
+IMAGE="${EGCL_APK_IMAGE:-${XDG_CACHE_HOME:-$HOME/.cache}/egcl/apk-builder.core}"
+
+build_image() {
+    mkdir -p "$(dirname -- "$IMAGE")" || return 1
+    # Write under a temporary name: a failed or concurrent build must not leave
+    # a half-written image for the next run to try to restore.
+    tmp="$IMAGE.$$"
+    if EGCL_APK_IMAGE="$tmp" "$EGCL_BIN" --no-init \
+           --load "$EGCL_APK_ASDF" --load "$BUILDER/save.lisp" >/dev/null 2>&1 &&
+       [ -s "$tmp" ]; then
+        mv -f "$tmp" "$IMAGE"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+run_with_image() {
+    "$EGCL_BIN" --no-init --image "$IMAGE" --load "$BUILDER/run.lisp"
+}
+
+if [ ! -r "$IMAGE" ]; then
+    build_image || true          # loading from source is slower, not fatal
+fi
+if [ -r "$IMAGE" ]; then
+    run_with_image && exit 0
+    # An upgraded egcl rejects an image an older one wrote. Rebuild once, then
+    # fall through to source rather than loop.
+    build_image && run_with_image && exit 0
+fi
+exec "$EGCL_BIN" --no-init --load "$EGCL_APK_ASDF" --load "$BUILDER/cli.lisp"

@@ -1,5 +1,5 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
-;;; An APK described entirely here: `scripts/egcl-apk examples/android-egl', or
+;;; An APK described entirely here: `egcl-apk examples/android-egl', or
 ;;; `asdf:make "android-egl/apk"'.
 
 ;; The primary system exists so ASDF accepts the secondary name below. It has no

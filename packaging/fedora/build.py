@@ -199,6 +199,7 @@ def build(args):
             if bundled.is_file():
                 copy(bundled,
                      stage / 'usr/share/licenses/egcl-target-android' / BUNDLED_LICENSES)
+            stage_apk_builder(stage)
         command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'egcl']
         if triple == 's390x-unknown-linux-musl':
             command += ['-Z', 'build-std=std,panic_unwind']
@@ -284,6 +285,51 @@ def vendor_lisp_dependencies(project):
     (project / BUNDLED_LICENSES).write_text(
         'Licences of the Common Lisp dependencies bundled with the EGCL Android\n'
         'APK builder, collected by `ocicl collect-licenses`.\n\n' + notices)
+
+
+def stage_apk_builder(stage):
+    """Install the Lisp APK builder, the dependencies it pins, and ASDF.
+
+    `egcl-apk' builds an application's APK from the description in its own .asd,
+    so it has to ship with the Android package rather than live only in the
+    source tree. Three things it needs are not in the host `egcl': the builder's
+    sources, the dependency tree `ocicl.csv' pins (vendored into the snapshot by
+    vendor_lisp_dependencies when the SRPM is made), and ASDF itself.
+
+    No saved image is staged, even though loading that world from source costs
+    about nine seconds. The Android package is built in its own rpmbuild, which
+    has no host egcl to write an image with, and an image is refused by any egcl
+    but the one that wrote it ("runtime source mismatch") -- so a shipped one
+    would be dead weight the moment egcl is rebuilt. /usr/bin/egcl-apk writes
+    one into the user's cache on first use instead.
+    """
+    source = ROOT / 'lib/egcl-apk'
+    builder = stage / 'usr/libexec/egcl/android/apk-builder'
+    if not (source / 'ocicl').is_dir():
+        raise SystemExit(f'{source}: no vendored ocicl/ tree; run `ocicl install` there')
+    if builder.exists():
+        shutil.rmtree(builder)
+    # tests/ drives the builder against a fixture project and is not part of
+    # what is installed; a fasl belongs to whichever Lisp compiled it.
+    shutil.copytree(source, builder,
+                    ignore=shutil.ignore_patterns('tests', '*.fasl', '__pycache__',
+                                                  '.gitignore', BUNDLED_LICENSES))
+    copy(ROOT / 'lib/asdf.lisp', builder / 'asdf.lisp')
+    copy(ROOT / 'packaging/android/egcl-apk', stage / 'usr/bin/egcl-apk')
+    (stage / 'usr/bin/egcl-apk').chmod(0o755)
+    # ASDF's notice lives in a comment block inside asdf.lisp, which %license
+    # cannot point into, so lift it out into a file of its own.
+    lines = (ROOT / 'lib/asdf.lisp').read_text().splitlines()
+    try:
+        start = lines.index(';;; -- LICENSE START')
+        end = lines.index(';;; -- LICENSE END')
+    except ValueError:
+        raise SystemExit('lib/asdf.lisp: no LICENSE START/END block to extract')
+    notice = '\n'.join(line.removeprefix(';;;').strip() for line in lines[start + 1:end])
+    licenses = stage / 'usr/share/licenses/egcl-target-android'
+    licenses.mkdir(parents=True, exist_ok=True)
+    (licenses / 'ASDF-LICENSE.txt').write_text(
+        'ASDF is bundled with the EGCL APK builder as asdf.lisp.\n\n' + notice + '\n')
 
 
 def source_archive(output, sources, *, include_std=False):

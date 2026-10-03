@@ -10,7 +10,8 @@
 ;;;
 ;;; The image is tied to the exact egcl binary that wrote it -- a different
 ;;; build is refused with "runtime source mismatch" -- so rebuild it whenever
-;;; egcl is rebuilt. `scripts/egcl-apk' uses it when EGCL_APK_IMAGE names one.
+;;; egcl is rebuilt. `egcl-apk' caches one under $XDG_CACHE_HOME/egcl and
+;;; rebuilds it whenever restoring it fails.
 (load (merge-pathnames "load.lisp" *load-truename*))
 (asdf:load-asd (merge-pathnames "egcl-apk-asdf.asd" *load-truename*))
 (asdf:load-system :egcl-apk-asdf)

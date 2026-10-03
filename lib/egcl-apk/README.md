@@ -4,27 +4,50 @@ This builds a NativeActivity APK with Common Lisp code and the precompiled
 libraries from `egcl-target-android`. APK construction needs no Android SDK,
 NDK, JDK, Java, Gradle, Python, or external signing executable.
 
-Install the pinned Lisp dependencies once (ocicl and Git are setup tools):
+Installing `egcl-target-android` installs the builder too, as `/usr/bin/egcl-apk`:
+
+```sh
+egcl-apk my-app/
+```
+
+From this source tree, install the pinned Lisp dependencies once (ocicl and Git
+are setup tools):
 
 ```sh
 cd lib/egcl-apk
 ocicl install
 ```
 
-The launcher uses SBCL by default (override its executable with `SBCL_BIN`).
-Set `EGCL_BIN` instead to build with EGCL, which is self-hosted but slower --
-see the validation section. Then, from the repository root:
+then build from the repository root:
 
 ```sh
 scripts/egcl-apk examples/android-egl
 ```
 
+`scripts/egcl-apk` is a thin wrapper that points the installed launcher
+(`packaging/android/egcl-apk`) at this tree, so there is only one
+implementation. It uses SBCL by default (override its executable with
+`SBCL_BIN`); set `EGCL_BIN` instead to build with EGCL, which is self-hosted
+but slower -- see the validation section. `/usr/bin/egcl-apk` uses EGCL.
+
 Set `EGCL_APK_RUNTIME` if the Android RPM is extracted somewhere other than
 `/usr/libexec/egcl/android`; use an absolute path. The output pathname and the
 signing identity are `:apk-output` and `:apk-identity` in the project's `.asd`,
 not environment variables. The default output is `PROJECT/build/NAME.apk` for
-the project's primary system NAME. `OCICL_RUNTIME` can override the installed
-ocicl runtime Lisp file.
+the project's primary system NAME.
+
+The dependency tree is pinned, so `load.lisp` registers exactly the directories
+`ocicl.csv` names and never consults an installed ocicl runtime -- which is why
+the builder works from an RPM, where there is no ocicl.
+
+Under EGCL, loading ASDF, the pinned dependencies, Ironclad and the builder from
+source costs about 9 s of every build. The launcher therefore saves an image
+(see `save.lisp`) under `${XDG_CACHE_HOME:-$HOME/.cache}/egcl/apk-builder.core`
+on first use, cutting a build of the EGL demo from about 21 s to about 11 s. An
+image is refused by any egcl but the one that wrote it, so the launcher rebuilds
+it whenever restoring fails; `EGCL_APK_IMAGE` names a different one. The RPM
+ships no image, because the Android package is built in its own `rpmbuild` with
+no host egcl to write one with.
 
 The launcher sets umask 077. The first build creates `PROJECT/.egcl-apk-key`
 with a P-256 private key and self-signed certificate; subsequent builds reuse
@@ -60,7 +83,7 @@ build operation:
 ```
 
 Then `asdf:make "my-app/apk"` writes `build/my-app.apk`, and
-`scripts/egcl-apk my-app/` does the same from a shell. ASDF rejects an unknown
+`egcl-apk my-app/` does the same from a shell. ASDF rejects an unknown
 initarg, so a misspelled slot is an error rather than silently ignored. The system's own file
 components become the flat assets in declaration order — the asset list is the
 component list, so the two cannot drift — and `:apk-entry` (default `app.lisp`)
@@ -80,10 +103,10 @@ runtime's own `runtime.json`.
 A plain `asdf:make` will not create a missing signing identity.
 `create-identity` writes an unencrypted P-256 private key and relies on the
 caller's umask, and EGCL exposes no `chmod` to repair the mode afterwards.
-`scripts/egcl-apk` sets umask 077 and then binds
+The `egcl-apk` launcher sets umask 077 and then binds
 `egcl-apk-asdf:*allow-identity-creation*`, so the permission travels with the
 only caller that has established the umask. Mint the key once through the
-script; every later build, by either route, reuses it.
+launcher; every later build, by either route, reuses it.
 
 ## Project contract
 

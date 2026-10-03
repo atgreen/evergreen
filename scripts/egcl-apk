@@ -1,34 +1,18 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 #
-# Build the APK described by a project's .asd. The umask below is the reason
-# this script, and not a bare `asdf:make', is allowed to create a missing
-# signing identity: the unencrypted private key lands 0600 rather than under
-# whatever umask an interactive session happens to carry. cli.lisp binds
-# egcl-apk-asdf:*allow-identity-creation* on that basis.
+# Build a project's APK from the source tree. The real launcher is
+# packaging/android/egcl-apk, which egcl-target-android installs as
+# /usr/bin/egcl-apk; this only points it at the tree instead of at /usr, so the
+# two cannot drift.
+#
+# SBCL is the default here because it loads the builder in about a second; set
+# EGCL_BIN to build with EGCL instead (which then caches a saved image).
 set -eu
-umask 077
-if [ "$#" -ne 1 ]; then
-    echo 'Usage: egcl-apk PROJECT-DIRECTORY' >&2
-    echo 'The project describes its APK in its .asd; see lib/egcl-apk/README.md.' >&2
-    echo 'Set EGCL_BIN to build with EGCL, SBCL_BIN to pick a different SBCL,' >&2
-    echo 'or EGCL_APK_RUNTIME to point at an extracted egcl-target-android.' >&2
-    exit 2
-fi
 repo=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-EGCL_APK_PROJECT=$(CDPATH='' cd -- "$1" && pwd)
-export EGCL_APK_PROJECT
-cd "$repo/lib/egcl-apk"
-# EGCL and SBCL take different startup flags, so choose by which was asked for
-# rather than by substituting one binary for the other. EGCL needs lib/asdf.lisp
-# loaded first; SBCL has ASDF built in.
-if [ -n "${EGCL_BIN:-}" ]; then
-    # A saved image already holds ASDF, ocicl, Ironclad and the builder, which
-    # is about 9.3 s of loading per build. Build one with lib/egcl-apk/save.lisp;
-    # it is tied to the exact egcl that wrote it, so rebuild it with egcl.
-    if [ -n "${EGCL_APK_IMAGE:-}" ] && [ -r "${EGCL_APK_IMAGE}" ]; then
-        exec "$EGCL_BIN" --no-init --image "$EGCL_APK_IMAGE" --load run.lisp
-    fi
-    exec "$EGCL_BIN" --no-init --load "$repo/lib/asdf.lisp" --load cli.lisp
+export EGCL_APK_BUILDER="${EGCL_APK_BUILDER:-$repo/lib/egcl-apk}"
+export EGCL_APK_ASDF="${EGCL_APK_ASDF:-$repo/lib/asdf.lisp}"
+if [ -z "${EGCL_BIN:-}" ]; then
+    export SBCL_BIN="${SBCL_BIN:-sbcl}"
 fi
-exec "${SBCL_BIN:-sbcl}" --noinform --no-userinit --no-sysinit --non-interactive --load cli.lisp
+exec "$repo/packaging/android/egcl-apk" "$@"

@@ -25,7 +25,7 @@ The x86-64 packages:
 | `egcl-target-aarch64-linux-static` | `egcl-aarch64-linux-static` | Linux AArch64, static musl | QEMU |
 | `egcl-target-ppc64le-linux-static` | `egcl-ppc64le-linux-static` | Linux ppc64le, static musl | QEMU |
 | `egcl-target-windows` | `egcl-windows` | Windows x86-64 | Wine |
-| `egcl-target-android` | `egcl-android`, `egcl-android-new` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
+| `egcl-target-android` | `egcl-android`, `egcl-android-new`, `egcl-apk` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
 
 And the POWER-native packages, for installation on a ppc64le Fedora machine:
 
@@ -378,9 +378,28 @@ must follow Android's executable-file and application sandbox rules.
 
 The same Android RPM includes reusable `libegcl_android.so` libraries for both
 `aarch64-linux-android` (`arm64-v8a`) and `x86_64-linux-android` (`x86_64`), plus
-`egcl-android-new`. These libraries support Android's dynamic FFI and load the
-application's Lisp from APK assets. App builds require the Android SDK, a JDK,
-Python 3 and Make; no EGCL source checkout, Rust, NDK or containers are needed.
+`egcl-android-new` and `egcl-apk`. These libraries support Android's dynamic FFI
+and load the application's Lisp from APK assets. No EGCL source checkout, Rust,
+NDK or containers are needed.
+
+There are two routes to an APK. `egcl-apk` builds and signs one entirely in
+Lisp, from the description in the project's own `.asd`:
+
+```sh
+egcl-apk hello/
+```
+
+That needs neither the Android SDK nor a JDK — only the `egcl` this package
+already depends on. The builder and the Lisp dependencies it pins are installed
+under `/usr/libexec/egcl/android/apk-builder`; the first build spends about nine
+seconds saving an image of that loaded world into
+`${XDG_CACHE_HOME:-$HOME/.cache}/egcl` and later builds restore it instead. An
+image only works with the `egcl` that wrote it, so `egcl-apk` rebuilds it after
+an upgrade. See [the builder's README](https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md)
+for the `:apk-*` slots.
+
+The generated-project route below uses the Android SDK, a JDK, Python 3 and
+Make instead, and is what `egcl-android-new` scaffolds.
 
 ```sh
 egcl-android-new hello --package org.example.hello --template egl \

@@ -184,7 +184,7 @@ A Windows x86-64 EGCL runtime and a Wine launcher with a private Wine prefix.
 %if %{egcl_android}
 %package target-android
 Summary: EGCL Android application runtimes and project generator
-License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND BSD-2-Clause AND BSD-3-Clause
+License: (GPL-3.0-or-later WITH Classpath-exception-2.0) AND BSD-2-Clause AND BSD-3-Clause AND MIT AND LicenseRef-Fedora-Public-Domain
 Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-aarch64
 Requires: python3
@@ -199,8 +199,10 @@ Requires: /usr/bin/adb
 %description target-android
 Reusable Android NativeActivity libraries for ARM64 phones and x86-64 emulators,
 plus egcl-android-new and Makefile templates for building signed APKs on Linux.
-The Android SDK and a JDK are needed for APK packaging; Rust and the NDK are
-needed only when building these RPMs. Installing and launching on a device or
+Also includes egcl-apk, which builds and signs an APK entirely in Lisp from the
+description in an application's own .asd, needing neither the Android SDK nor a
+JDK. The Android SDK and a JDK are needed only for the Makefile route; Rust and
+the NDK are needed only when building these RPMs. Installing and launching on a device or
 emulator uses adb, which this package pulls in. Also includes the static
 AArch64 command-line runtime and QEMU launcher.
 %endif
@@ -323,6 +325,7 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %files target-android
 %{_bindir}/egcl-android
 %{_bindir}/egcl-android-new
+%{_bindir}/egcl-apk
 %{_libexecdir}/egcl/android
 %license %{_datadir}/licenses/egcl-target-android
 %endif
