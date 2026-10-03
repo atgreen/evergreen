@@ -1661,8 +1661,7 @@ pub fn subseq(
         // ansi-test's CONS chapter exercises (bliss-9kxg).
         return Ok(crate::streams::make_lisp_string_fresh(&sub));
     }
-    let elems = collect_elements(sequence)?;
-    let len = elems.len();
+    let len = length(sequence)?;
     let actual_end = end.unwrap_or(len);
     if start > actual_end {
         return Err(EgclError::TypeError {
@@ -1676,15 +1675,46 @@ pub fn subseq(
             expected: format!("end ({}) <= length ({})", actual_end, len),
         });
     }
-    let sub = &elems[start..actual_end];
-    if is_list(sequence) {
-        Ok(build_list(sub))
-    } else if is_bit_seq(sequence) {
-        // SUBSEQ of a bit-vector is a bit-vector (and COPY-SEQ = (subseq x 0)),
-        // not a general vector (bliss-8z5f).
-        Ok(build_bit_vector_from_vals(sub))
+    // Do not collect the whole input for a small slice: BTF string-table
+    // lookups take thousands of tiny slices from the same multi-megabyte vector.
+    // Typed element reads may box values, so root both input and output while
+    // collecting just the requested range.
+    egcl_rt::rooted!(sequence = sequence);
+    egcl_rt::rooted!(sub = Vec::with_capacity(actual_end - start));
+    if is_list(*sequence) {
+        let mut cursor = *sequence;
+        for i in 0..actual_end {
+            let cell = unsafe { &*(cursor.as_ptr() as *const ConsCell) };
+            if i >= start {
+                sub.push(cell.car);
+            }
+            cursor = cell.cdr;
+        }
+        return Ok(build_list(&sub));
+    }
+    if is_vector(*sequence) {
+        for i in start..actual_end {
+            let value = vector_elt(*sequence, i);
+            sub.push(value);
+        }
+    } else if is_complex_vector(*sequence) {
+        for i in start..actual_end {
+            let value = cvec_elt(*sequence, i)?;
+            sub.push(value);
+        }
     } else {
-        Ok(build_vector(sub))
+        // LENGTH already validated the sequence; strings were handled above,
+        // leaving only packed bit vectors here.
+        for i in start..actual_end {
+            sub.push(EgclVal::from_fixnum(
+                egcl_rt::types::bit_vector_ref(*sequence, i).unwrap_or(0) as i64,
+            ));
+        }
+    }
+    if is_bit_seq(*sequence) {
+        Ok(build_bit_vector_from_vals(&sub))
+    } else {
+        Ok(build_vector(&sub))
     }
 }
 

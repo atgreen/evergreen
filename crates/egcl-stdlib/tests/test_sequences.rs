@@ -237,6 +237,31 @@ fn subseq_none_end() {
 }
 
 #[test]
+fn subseq_vector_slice_is_fresh_and_handles_empty_tail() {
+    let source = make_vector(&[10, 20, 30, 40]);
+    let slice = sequences::subseq(source, 1, Some(3)).unwrap();
+    assert_eq!(sequences::length(slice).unwrap(), 2);
+    assert_eq!(sequences::elt(slice, 0).unwrap(), EgclVal::from_fixnum(20));
+    assert_eq!(sequences::elt(slice, 1).unwrap(), EgclVal::from_fixnum(30));
+    sequences::set_elt(slice, 0, EgclVal::from_fixnum(99)).unwrap();
+    assert_eq!(sequences::elt(source, 1).unwrap(), EgclVal::from_fixnum(20));
+    assert_eq!(sequences::length(sequences::subseq(source, 4, None).unwrap()).unwrap(), 0);
+    assert!(sequences::subseq(source, 3, Some(5)).is_err());
+}
+
+#[test]
+fn subseq_fill_pointer_bit_vector_stays_a_bit_vector() {
+    let bits = [1, 0, 1, 1].map(EgclVal::from_fixnum);
+    let source = sequences::build_complex_vector(&bits, 4, 3, true, false, true, true);
+    let slice = sequences::subseq(source, 1, Some(3)).unwrap();
+    assert!(egcl_rt::types::bit_vector_p(slice));
+    assert_eq!(egcl_rt::types::bit_vector_len(slice), Some(2));
+    assert_eq!(egcl_rt::types::bit_vector_ref(slice, 0), Some(0));
+    assert_eq!(egcl_rt::types::bit_vector_ref(slice, 1), Some(1));
+    assert!(sequences::subseq(source, 0, Some(4)).is_err());
+}
+
+#[test]
 fn subseq_start_gt_end_errors() {
     assert!(sequences::subseq(make_list(&[1, 2, 3]), 3, Some(1)).is_err());
 }
