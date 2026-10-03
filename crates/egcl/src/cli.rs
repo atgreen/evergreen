@@ -35145,7 +35145,7 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "DISASSEMBLE" {
         return !cfg!(egcl_no_disassembly);
     }
-    if name == "EGCL::%STANDARD-CHARACTER-READER" {
+    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER") {
         return true;
     }
     // EGCL-THREAD is an extension package, not COMMON-LISP. Its names must be

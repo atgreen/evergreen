@@ -41,6 +41,21 @@ pub(super) fn call(
 #[egcl_delivery_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        "EGCL::SET-FILL-POINTER" => Some(|_operator, args, _env| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "SET-FILL-POINTER requires a vector and a new value".into(),
+                ));
+            }
+            if !args[1].is_fixnum() || args[1].as_fixnum() < 0 {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "non-negative fill pointer".into(),
+                });
+            }
+            egcl_stdlib::set_fill_pointer(args[0], args[1].as_fixnum() as usize)?;
+            Ok(args[1])
+        }),
         "PRINT" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 

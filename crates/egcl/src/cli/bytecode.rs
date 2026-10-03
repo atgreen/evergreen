@@ -3496,13 +3496,12 @@ impl<'e> Lowerer<'e> {
                 // Symbol place: identical to SETQ.
                 self.lower_expr(items[2 * i + 1])?;
                 self.store_to_symbol_place(items[2 * i], last)?;
-            } else if let Some((setter, mut cons_arg)) = cons_setf_place(place) {
-                // `(setf (car|cdr X) V)` → the internal store primitive
-                // EGCL::SET-CAR / SET-CDR (cons, value), which writes in place
-                // and returns the value.
-                egcl_rt::rooted_ref!(_cons_arg_root = &mut cons_arg);
+            } else if let Some((setter, mut target)) = unary_setf_place(place) {
+                // Internal store primitives take the target before the value,
+                // preserving SETF's evaluation order, and return that value.
+                egcl_rt::rooted_ref!(_target_root = &mut target);
                 let sym = resolve_sym(setter).ok_or(Bail)?.as_symbol_index();
-                self.lower_expr(cons_arg)?; // cons
+                self.lower_expr(target)?;
                 self.lower_expr(items[2 * i + 1])?; // value
                 self.emit(Instr::CallNamed { sym, nargs: 2 });
                 self.pop_n(2);
@@ -6935,12 +6934,13 @@ fn slot_value_setf_place(place: EgclVal) -> Option<(EgclVal, EgclVal)> {
     }
 }
 
-/// Recognize a `(cXr X)` SETF place — any `c[ad]+r` accessor plus `first`/`rest`
+/// Recognize a one-argument SETF place: FILL-POINTER, or a cons accessor.
+/// Cons places include any `c[ad]+r` accessor plus `first`/`rest`
 /// — returning the internal store primitive (`EGCL::SET-CAR`/`SET-CDR`) and the
 /// target cons subform. For a composed accessor the outermost a/d selects the
 /// primitive and the remaining a/d letters form the inner accessor applied to
 /// `X` (e.g. `(cadr x)` → set-car of `(cdr x)`).
-fn cons_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal)> {
+fn unary_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal)> {
     if !place.is_cons() {
         return None;
     }
@@ -6951,6 +6951,9 @@ fn cons_setf_place(place: EgclVal) -> Option<(&'static str, EgclVal)> {
     let (arg, tail) = cp(rest);
     if !tail.is_nil() {
         return None; // exactly one argument
+    }
+    if sym_name(op) == "FILL-POINTER" {
+        return Some(("EGCL::SET-FILL-POINTER", arg));
     }
     let name = match sym_bare_name_rc(op).as_ref() {
         "FIRST" => "CAR".to_string(),
