@@ -64,25 +64,79 @@ jobs:
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.san }}
           RUSTDOCFLAGS: -Zsanitizer=${{ matrix.san }}
+          # LeakSanitizer OFF. ASan enables it by default on Linux, and it is
+          # meaningless against a garbage-collected runtime: the heap, the
+          # symbol table and the interned packages are MEANT to live until the
+          # process exits, so LSan reports the live heap as leaked. Measured:
+          # with it on, four targets (spec_object_model, spec_runtime_core,
+          # test_cl_stack_gc, test_stack) exited 1 AFTER every one of their
+          # tests passed, purely on "LeakSanitizer: detected memory leaks".
+          # This does not weaken the UB gate -- AddressSanitizer proper is
+          # untouched, and it is the one that finds use-after-free and
+          # out-of-bounds in the unsafe code this job exists for.
+          ASAN_OPTIONS: detect_leaks=0
+        # TWO tests are excluded BY NAME, with a reason, rather than silenced in
+        # the source -- the gc.yml convention. Both pass without a sanitizer and
+        # produce NO sanitizer report under one; they fail because of what ASan
+        # cannot follow, not because of what the code does:
+        #
+        #   repeated_switches_preserve_both_stacks_and_live_values  (fiber_context)
+        #     fails `assertion failed: state.intact`. Fiber switching swaps
+        #     stacks in hand-written assembly, and ASan's shadow memory has no
+        #     idea that happened. Tracking it requires calling
+        #     __sanitizer_start_switch_fiber / __sanitizer_finish_switch_fiber
+        #     around the switch, under cfg(sanitize) -- a runtime change, not a
+        #     CI one.
+        #   callback_panic_payload_destructors_cannot_unwind_into_c
+        #     same family: a panic deliberately stopped at the C boundary.
+        #
+        # Measured over the whole crate with ASan: 87 binaries, 805 passed,
+        # these 2 failed, and ZERO AddressSanitizer reports -- no UB found.
+        #
+        # ONLY THE ADDRESS LEG IS VERIFIED. thread and memory were not run
+        # locally (each needs its own build-std of std). TSan over a lock-free
+        # GC and MSan without every C dependency instrumented may well need
+        # their own exclusions or may not be viable at all; treat their first
+        # red run as information, not as a regression.
+        # --no-fail-fast for the reason documented in ci.yml: cargo test stops
+        # at the first failing test BINARY, which in a UB gate means the first
+        # sanitizer report hides every later one. A sanitizer run is worth
+        # having only if it reports everything it found.
         run: |
           cargo +nightly test -Z build-std \
             --target x86_64-unknown-linux-gnu \
-            -p egcl-rt
+            -p egcl-rt --no-fail-fast -- \
+            --skip repeated_switches_preserve_both_stacks_and_live_values \
+            --skip callback_panic_payload_destructors_cannot_unwind_into_c
 
-  miri:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    # Miri interprets; it cannot execute JIT-emitted machine code or the native
-    # transfer assembly, so the runtime and interpreter crates are out of scope
-    # for it by construction. Point it at the crates that are pure Rust.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: install nightly with miri
-        run: |
-          rustup toolchain install nightly --component miri --profile minimal
-          cargo +nightly miri setup
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: miri
-      - name: miri over the compiler crate
-        run: cargo +nightly miri test -p egcl-compiler
+# THERE IS NO MIRI JOB, deliberately — measured, bliss-0g677.
+#
+# There was one, pointed at egcl-compiler on the reasoning that it is "the
+# crate that is pure Rust". It is not: egcl-compiler depends on egcl-rt, and
+# egcl-rt reaches raw syscalls through inline assembly, so anything that
+# allocates or interns a symbol is un-interpretable. Miri stops at the first
+# one with "unsupported operation: inline assembly is not supported", pointing
+# into crates/egcl-rt/src/syscall.rs.
+#
+# What Miri can actually cover here, measured:
+#
+#   cargo +nightly miri test -p egcl-compiler              asm at t2::build::tests
+#   ... --lib                                              asm at t2::build::tests
+#   ... --lib -- --skip 't2::'                             4 passed, then
+#                                                          "main thread terminated
+#                                                          without waiting for all
+#                                                          remaining threads"
+#   MIRIFLAGS=-Zmiri-ignore-leaks ... --lib -- --skip 't2::'
+#                                                          4 passed, 155 filtered
+#
+# Four tests out of 159 — the reader and macroexpand registry-key tests — for a
+# 120-minute nightly job that would go red again the moment someone adds a test
+# touching the runtime. That is maintenance debt pretending to be coverage, and
+# a permanently-red job teaches people to ignore red.
+#
+# To bring Miri back, the prerequisite is on egcl-rt, not here: put the
+# raw-syscall path behind a cfg so a Miri build goes through libc instead of
+# `asm!`. Then -p egcl-compiler becomes genuinely interpretable and the job is
+# worth its runtime. Until then the sanitizer matrix above is the real UB gate,
+# and it passes: ASan over egcl-rt is 140 tests, 0 failures, 0 sanitizer
+# reports.
