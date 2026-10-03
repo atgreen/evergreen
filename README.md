@@ -90,7 +90,9 @@ pip install -r requirements-docs.txt
 make docs-serve
 ```
 
-Use `make docs` for a strict build. Online publication is not enabled yet.
+Use `make docs` for a strict build. The manual is published at
+<https://atgreen.github.io/evergreen/>, versioned per release with a version
+selector; `latest` follows the newest release and `dev` follows `main`.
 See [Writing documentation](docs/manual/meta/documentation-guidelines.md).
 
 ## Workspace
@@ -121,8 +123,48 @@ Build the CLI binary:
 cargo build -p egcl
 ```
 
-For native x86-64 Fedora RPMs with optional s390x Linux, AArch64 Linux,
-Windows, and Android image-dumping tools, see
+### Install on Fedora
+
+Two dnf repositories are published. `egcl` carries tagged releases; the
+`egcl-testing` channel carries the most recent test builds and ships disabled,
+so it is opt-in. Both are signed, and the packages themselves are signed with
+the same key.
+
+```sh
+sudo dnf config-manager addrepo --from-repofile=https://atgreen.github.io/evergreen/repo/egcl.repo
+sudo dnf install egcl
+```
+
+For a test build, add the testing repository and enable it per command:
+
+```sh
+sudo dnf config-manager addrepo --from-repofile=https://atgreen.github.io/evergreen/repo/egcl-testing.repo
+sudo dnf --enablerepo=egcl-testing install egcl
+```
+
+On first use dnf offers to import the signing key and waits for confirmation.
+Check that the fingerprint it shows is:
+
+```
+6101 7475 407E 35EB 2608 BF2B F2EA EAEE 344F 7576
+```
+
+Confirm it from somewhere other than the repository serving it; a key offered
+alongside the packages it signs proves only that both came from the same place.
+Both repositories set `gpgcheck` and `repo_gpgcheck`, so dnf refuses packages
+and refuses repository metadata that is not signed by that key — including
+metadata altered after signing.
+
+Packages are hosted on the GitHub release they were published in; only the
+repository metadata lives on the documentation site. The optional target
+subpackages — `egcl-static`, and the s390x, AArch64, ppc64le, Windows and
+Android image-dumping tools — install from the same repository:
+
+```sh
+sudo dnf install egcl-static egcl-target-aarch64-linux
+```
+
+For building the RPMs yourself, see
 [container-free Fedora packaging](docs/fedora-rpm.md).
 
 The Android RPM also provides `egcl-android-new` and shared runtimes for ARM64
