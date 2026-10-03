@@ -15,6 +15,15 @@ on:
 permissions:
   contents: read
 
+# One release in flight per ref. Two runs for the same tag otherwise race
+# `gh release create`, and the loser publishes nothing while the winner may
+# publish assets the other run verified. Queue rather than cancel: a cancelled
+# run that has already created the draft leaves that draft behind (the same
+# reasoning as docs.yml's pages group).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   plan:
     runs-on: ubuntu-24.04
@@ -188,6 +197,10 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    # The only job that writes to the repository, and the only one that will
+    # hold the RPM signing key (bliss-5jnze). An environment keeps those secrets
+    # out of every other workflow and restricts which refs may deploy at all.
+    environment: release
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -210,3 +223,18 @@ jobs:
           gh release create "$RELEASE_TAG" --draft "${flags[@]}" \
             --title "EGCL $RELEASE_TAG" --notes-file CHANGELOG.md ./*
           gh release edit "$RELEASE_TAG" --draft=false
+          # Test mode publishes a real prerelease so the publish path itself is
+          # exercised, but nothing ever read the older ones -- they just
+          # accumulate on a public release page. Keep the newest three. The
+          # filter is deliberately narrow: prereleases whose tag starts with
+          # test-v, which only this workflow creates.
+          if [[ "$PRERELEASE" == true ]]; then
+            gh release list --limit 100 --json tagName,isPrerelease,createdAt --jq \
+              '[.[] | select(.isPrerelease and (.tagName | startswith("test-v")))]
+               | sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r stale; do
+                [[ -n "$stale" ]] || continue
+                echo "Pruning stale test prerelease: $stale"
+                gh release delete "$stale" --yes --cleanup-tag
+              done
+          fi
