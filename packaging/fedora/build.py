@@ -193,6 +193,12 @@ def build(args):
             target_env['RUSTFLAGS'] = '-C target-feature=+crt-static'
             runner = ['qemu-aarch64']
             copy(ndk / 'NOTICE', stage / 'usr/share/licenses/egcl-target-android/NOTICE')
+            # The APK builder's bundled Lisp dependencies ship in this package,
+            # so their notices must ship with it (written by source_archive).
+            bundled = ROOT / 'lib/egcl-apk' / BUNDLED_LICENSES
+            if bundled.is_file():
+                copy(bundled,
+                     stage / 'usr/share/licenses/egcl-target-android' / BUNDLED_LICENSES)
         command = ['cargo', 'build', '--locked', '--release', '--target', triple, '-p', 'egcl']
         if triple == 's390x-unknown-linux-musl':
             command += ['-Z', 'build-std=std,panic_unwind']
@@ -250,6 +256,36 @@ def build(args):
     return stage
 
 
+#: Where the APK builder's bundled dependency licences are written, inside the
+#: source snapshot and later installed with the Android package.
+BUNDLED_LICENSES = 'BUNDLED-LICENSES.txt'
+
+
+def vendor_lisp_dependencies(project):
+    """Install the APK builder's pinned Lisp dependencies into the snapshot and
+    record their licences.
+
+    `lib/egcl-apk/ocicl/` is gitignored, so the dependencies are not in the
+    tree; without this the source RPM could not build the APK tooling, because
+    the RPM build is offline. Creating the SRPM is the one step that may reach
+    the network, so the fetch belongs here.
+
+    `ocicl collect-licenses` prints each dependency's notice; the RPMs have to
+    ship those, since they ship the dependencies.
+    """
+    if not (project / 'ocicl.csv').is_file():
+        raise SystemExit(f'{project}: no ocicl.csv to install from')
+    # Deliberately not optional: silently skipping would produce a source RPM
+    # that looks complete and cannot build the Android tooling.
+    run(['ocicl', 'install'], cwd=project)
+    notices = subprocess.check_output(['ocicl', 'collect-licenses'], cwd=project, text=True)
+    if 'Total: 0 licenses' in notices or not notices.strip():
+        raise SystemExit(f'{project}: ocicl collected no licences')
+    (project / BUNDLED_LICENSES).write_text(
+        'Licences of the Common Lisp dependencies bundled with the EGCL Android\n'
+        'APK builder, collected by `ocicl collect-licenses`.\n\n' + notices)
+
+
 def source_archive(output, sources, *, include_std=False):
     """Include current source plus locked, vendored crates for RPM %build."""
     snapshot = output / 'rpm-source' / 'egcl-source'
@@ -264,6 +300,7 @@ def source_archive(output, sources, *, include_std=False):
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc', 'build', '*.fasl'))
     copy(ROOT / 'docs/hooks.py', snapshot / 'docs/hooks.py')
     copy(ROOT / 'docs/fedora-rpm.md', snapshot / 'docs/fedora-rpm.md')
+    vendor_lisp_dependencies(snapshot / 'lib/egcl-apk')
     # Workspace membership includes the linter even though only egcl-android
     # is built. Cargo still needs every member manifest when reading the lock.
     shutil.copytree(ROOT / 'tools/gc-root-lint', snapshot / 'tools/gc-root-lint',

@@ -17,7 +17,38 @@ def load(name, filename):
 
 source_rpm = load('egcl_source_rpm', 'source-rpm.py')
 release = load('egcl_release', 'release.py')
+build = load('egcl_build', 'build.py')
 SPEC = Path(__file__).with_name('egcl.spec')
+
+
+class VendoredLispDependencyTests(unittest.TestCase):
+    """lib/egcl-apk/ocicl/ is gitignored, so the SRPM must fetch it.
+
+    The RPM build is offline; if these dependencies are not vendored while the
+    source RPM is made, it ships a tree that cannot build the Android tooling.
+    And since the packages ship those dependencies, they must ship the notices.
+    """
+
+    def test_a_project_without_an_ocicl_manifest_is_refused(self):
+        # Rather than silently producing an SRPM that looks complete.
+        with self.assertRaises(SystemExit):
+            build.vendor_lisp_dependencies(Path(__file__).parent)
+
+    def test_the_apk_builder_declares_dependencies_to_vendor(self):
+        manifest = build.ROOT / 'lib/egcl-apk/ocicl.csv'
+        self.assertTrue(manifest.is_file(), 'the APK builder lost its ocicl.csv')
+        systems = [line.split(',')[0] for line in
+                   manifest.read_text().splitlines() if line.strip()]
+        # Ironclad is the one the signing path cannot do without.
+        self.assertIn('ironclad', systems)
+
+    def test_the_android_package_ships_the_collected_notices(self):
+        # %license names a directory, so staging the file there is enough --
+        # but only if build.py still writes it under that name.
+        self.assertIn('%license %{_datadir}/licenses/egcl-target-android',
+                      SPEC.read_text())
+        self.assertIn(build.BUNDLED_LICENSES,
+                      (Path(__file__).with_name('build.py')).read_text())
 
 
 class SubstituteTests(unittest.TestCase):
