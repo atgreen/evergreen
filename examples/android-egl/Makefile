@@ -3,9 +3,9 @@
 -include local.mk
 
 EGCL_SRC ?= $(abspath ../..)
-# SBCL builds this about 17x faster than EGCL and has ASDF built in, so it is
-# the default while iterating. Set LISP to an egcl to build self-hosted; it
-# needs the (require :asdf) that SBCL does not.
+# SBCL builds this about 6x faster than EGCL (1.0 s against 6.2 s) and has ASDF
+# built in, so it is the default while iterating. Set LISP to an egcl to build
+# self-hosted; it needs the (require :asdf) that SBCL does not.
 LISP ?= sbcl
 EGCL_APK_RUNTIME ?= /usr/libexec/egcl/android/
 SDK ?= $(if $(ANDROID_HOME),$(ANDROID_HOME),$(if $(ANDROID_SDK_ROOT),$(ANDROID_SDK_ROOT),$(HOME)/Android/Sdk))

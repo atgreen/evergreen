@@ -142,9 +142,10 @@ in. `(require :asdf)` is a no-op on an installed `egcl` — its appended image
 already holds ASDF — and `asdf:load-asd` wants an absolute pathname, hence
 `truename`.
 
-A build takes about 18 seconds, around 7 of which is loading Ironclad. If you
-build many in a row, `save.lisp` in the builder's source tree writes an image
-that cuts it to about 11; see the builder's README.
+A build takes about 6 seconds, around 3 of which is ASDF loading the builder
+and its dependencies. SBCL does the same build in about 1 second. If you build
+many in a row, `save.lisp` in the builder's source tree writes an image of that
+loaded world and takes a build to about 4.5 seconds; see the builder's README.
 
 See the [builder's README](https://github.com/atgreen/evergreen/blob/main/lib/egcl-apk/README.md)
 for every `:apk-*` slot, and the

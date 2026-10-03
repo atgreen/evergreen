@@ -35,9 +35,9 @@ egcl --eval '(require :asdf)' \
      --eval '(asdf:make "android-egl/apk")'
 ```
 
-SBCL builds the same project about 17x faster and is the quicker host while
-iterating -- `sbcl --non-interactive` with the same three forms, and no
-`(require :asdf)` needed.
+SBCL builds the same project about 6x faster (1.0 s against 6.2 s) and is the
+quicker host while iterating -- `sbcl --non-interactive` with the same three
+forms, and no `(require :asdf)` needed.
 
 Set `EGCL_APK_RUNTIME` if the Android RPM is extracted somewhere other than
 `/usr/libexec/egcl/android`; use an absolute path. The output pathname and the
@@ -50,16 +50,33 @@ directories `ocicl.csv` pins, for `tests/run.lisp` and `save.lisp`. It is not
 installed, and the installed builder has no equivalent -- the `(:TREE ...)`
 above does that job.
 
-Loading Ironclad and the builder from source costs about 7 s of every EGCL
-build (ASDF itself is already in the installed image), which is most of the
-17.7 s an EGL demo build takes. `save.lisp` writes an image of that loaded world
-that restores in about 0.3 s, bringing a build to about 11 s:
+Where the 6.2 s of an EGL demo build goes, measured against SBCL phase by
+phase (installed egcl, so ASDF is already in its image):
+
+| | SBCL | EGCL |
+|---|---|---|
+| ASDF loading the builder and its pinned dependencies | 0.39 s | 2.95 s |
+| assembling and signing the APK | 0.39 s | 1.58 s |
+| the rest: startup, `load-asd`, `asdf:make` planning | 0.22 s | 1.67 s |
+| **total** | **1.00 s** | **6.20 s** |
+
+EGCL is slower at every phase except SHA-256, where the native builtin beats
+Ironclad's Lisp (0.093 s against 0.128 s); CRC-32 is at parity. Most of what is
+left is ASDF's own plan computation, which is about 100x SBCL and tracked
+separately -- an `asdf:load-system` of an already-loaded system takes 1.30 s
+under EGCL and 0.013 s under SBCL, doing no I/O either time.
+
+`save.lisp` writes an image with ASDF, the pinned dependencies, Ironclad and the
+builder already loaded, which takes a build to about 4.5 s:
 
 ```sh
 EGCL_APK_IMAGE=~/.cache/egcl/apk.core \
   egcl --eval '(require :asdf)' --eval '(load "lib/egcl-apk/save.lisp")'
 egcl --image ~/.cache/egcl/apk.core --eval '(asdf:make "my-app/apk")'
 ```
+
+(EGCL rejects `--eval` and `--load` in the same command line, hence the
+`(load ...)` form above.)
 
 That is an opt-in for someone building many APKs in a row, not something the
 package manages: an image is refused by any `egcl` but the one that wrote it
