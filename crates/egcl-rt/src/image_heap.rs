@@ -139,6 +139,40 @@ impl<'a> RegionView<'a> {
 }
 
 impl<'a> HeapImageView<'a> {
+    /// Check object boundaries and ensure fixups cannot overwrite headers or
+    /// extend past logical payloads before publishing a native heap mapping.
+    pub fn validate_objects(&self) -> Result<(), EgclError> {
+        use crate::object::{ObjectHeader, gc_bit};
+        for region in &self.regions {
+            let mut cursor = 0;
+            let mut fixups = region.fixups().peekable();
+            while cursor < region.used {
+                let header = ObjectHeader(u64::from_ne_bytes(region.bytes[cursor..cursor + 8].try_into().unwrap()));
+                let body_offset = if header.is_large_object() { 16 } else { 8 };
+                let size = if header.is_large_object() {
+                    usize::try_from(u64::from_ne_bytes(region.bytes[cursor + 8..cursor + 16].try_into().unwrap())).map_err(|_| invalid())?
+                } else { header.size_units() as usize * 8 };
+                let end = add(cursor, size)?;
+                if size < 16 || size % 16 != 0 || end > region.used
+                    || header.gc_bits() & (1 << gc_bit::FORWARDED) != 0
+                    || (header.type_id() != 0 && header.gc_bits() & (1 << gc_bit::PINNED) == 0)
+                    || header.hash() as usize > size - body_offset { return Err(invalid()); }
+                let body = cursor + body_offset;
+                let payload_end = if header.hash() == 0 { end } else { body + header.hash() as usize };
+                while fixups.peek().is_some_and(|&offset| offset < end) {
+                    let offset = fixups.next().unwrap();
+                    if offset < body || offset + 8 > payload_end || header.type_id() == 0 {
+                        return Err(invalid());
+                    }
+                    let raw = u64::from_ne_bytes(region.bytes[offset..offset + 8].try_into().unwrap());
+                    if !crate::gc::is_heap_ref(crate::value::EgclVal(raw)) { return Err(invalid()); }
+                }
+                cursor = end;
+            }
+        }
+        Ok(())
+    }
+
     /// Check directory arithmetic and span boundaries without copying payloads.
     /// This validates the container, not the object layouts inside each span.
     /// Callers must validate the image's platform and runtime contract before
@@ -291,6 +325,28 @@ mod tests {
         .unwrap();
         assert_eq!(encoded.len(), 24);
         assert!(HeapImageView::parse(&encoded).unwrap().regions.is_empty());
+    }
+
+    #[test]
+    fn object_validation_rejects_invalid_strides_and_header_fixups() {
+        let mut snapshot = fixture();
+        let mut header = crate::object::ObjectHeader::new(crate::object::type_id::CONS, 4);
+        header.set_hash(16);
+        header.set_pinned();
+        snapshot.regions[0].bytes[..8].copy_from_slice(&header.0.to_ne_bytes());
+        snapshot.regions[0].bytes[8..16].copy_from_slice(&(0x10008u64 | crate::value::TAG_CONS).to_ne_bytes());
+        snapshot.regions[0].fixups = vec![8];
+        let encoded = snapshot.encode().unwrap();
+        HeapImageView::parse(&encoded).unwrap().validate_objects().unwrap();
+        let data_offset = HeapImageView::parse(&encoded).unwrap().regions[0].data_offset;
+        for raw_header in [0, header.0 & !0xffff | 0xffff, header.0 & !0xffff | 3, header.0 & !(1 << 52)] {
+            let mut bad = encoded.clone();
+            bad[data_offset..data_offset + 8].copy_from_slice(&raw_header.to_ne_bytes());
+            assert!(HeapImageView::parse(&bad).unwrap().validate_objects().is_err());
+        }
+        snapshot.regions[0].fixups = vec![0];
+        let encoded = snapshot.encode().unwrap();
+        assert!(HeapImageView::parse(&encoded).unwrap().validate_objects().is_err());
     }
 
     #[test]

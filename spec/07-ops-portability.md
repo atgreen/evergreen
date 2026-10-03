@@ -65,11 +65,11 @@ Offset  Section              Size
         Checksum Trailer     32 bytes
 ```
 
-Image format 5 adds native runtime requirements in the `Settings` section.
+Image format 6 retains native runtime requirements in the `Settings` section.
 The CLI validates source identity, target triple, Rust toolchain, Cargo features,
 compiler flags, and required native capabilities before restoring the heap
-(R7.04). A full runtime accepts legacy images without this section; a specialized
-runtime requires it. Source identity is a compatibility fingerprint, not a
+(R7.04). Older image formats are rejected; images must be rebuilt with the
+current runtime. Source identity is a compatibility fingerprint, not a
 security signature. Numeric symbol and bytecode identifiers are unchanged.
 
 ### 7.2.3  Header — D7.01
@@ -126,14 +126,29 @@ Each entry in the section directory:
 
 ### 7.2.6  Heap Section
 
-The heap section is a verbatim copy of the EGCL heap regions (§3)
-serialised in region order.  Each region is page-aligned (4 KiB) in
-the file to allow `mmap` with `MAP_FIXED` at the original base or
-a relocated base.
+The heap section begins with `EGCLRGN\0`, followed by little-endian u64
+region size and span count. Each 64-byte directory entry contains eight u64
+fields: saved address, used bytes, region kind, payload offset, payload length,
+fixup offset, fixup count, and a reserved zero word. Offsets are section-relative.
+The sorted fixup arrays contain u64 byte offsets within each span.
 
-When the `COMPRESSED` flag is set, the heap section is a single zstd
-frame.  The loader decompresses into an anonymous mapping before
-pointer relocation.
+Payloads preserve native object layouts and offsets. Payload starts and lengths
+are multiples of 4096 bytes; empty regions and unused trailing capacity are
+omitted. Filtered objects become walkable fillers. Large objects may span
+multiple GC regions. Process-specific handles are cleared in the snapshot.
+
+On Linux, uncompressed payloads use private file mappings inside a separately
+owned heap reservation. `MAP_FIXED` may replace only pages within that
+reservation. Other platforms, incompatible OS page alignments, and compressed
+images use a bulk-copy path. Embedded image starts are also aligned to 4096
+bytes. Image files must not be modified in place while mapped; atomic replacement
+and unlinking preserve existing mappings.
+
+The loader validates region extents, object boundaries, and fixup bounds before
+publishing the new heap. Region address deltas relocate only explicitly recorded
+tagged pointer fields. Integer and unboxed data remain unchanged. Restored
+regions are pinned base-world storage; fresh allocations and write barriers
+continue to participate in GC.
 
 ### 7.2.7  Symbol Table
 
@@ -190,46 +205,11 @@ after relocation.
 
 ### 7.2.10  Relocation Table
 
-The relocation table records every pointer within the serialised heap
-that requires adjustment when the load base differs from
-`original_base`.  Entries are delta-encoded offsets (sorted, u32
-deltas) for compactness.
-
-```text
-reloc_entry ::= delta: u32   // byte offset from previous reloc site
-```
-
-When the gap between two consecutive relocatable pointers exceeds
-2^32 − 2 bytes (≈ 4 GiB), a single u32 delta is insufficient.  The
-escape encoding `delta = 0xFFFFFFFF` signals that the next 8 bytes
-encode the actual delta as a little-endian u64:
-
-```text
-escape_entry ::= 0xFFFFFFFF: u32, extended_delta: u64
-```
-
-This supports arbitrarily large heaps while keeping the common-case
-entry compact (4 bytes).  A delta value of `0xFFFFFFFF` MUST NOT be
-used literally; all gaps of exactly 0xFFFFFFFF bytes MUST also use the
-escape encoding.
-
-**A7.01 — Pointer relocation algorithm:**
-
-```text
-1. offset_delta ← load_base − original_base
-2. IF offset_delta = 0 THEN skip relocation
-3. pos ← 0
-4. FOR EACH entry IN relocation_table:
-5.     delta ← read_u32(entry)
-6.     IF delta = 0xFFFFFFFF THEN delta ← read_u64(entry + 4)   // escape
-7.     pos ← pos + delta
-8.     *(u64 *)(heap + pos) += offset_delta
-9. Flush instruction cache for code regions
-```
-
-This runs in O(n) where n = number of relocatable pointers.  Typical
-images have < 5 M entries; relocation completes in < 20 ms on tier-1
-hardware.
+Format 6 stores precise pointer fixups in the heap-region directory (§7.2.6).
+The separate relocation section is reserved and empty. The loader combines
+region address translations with exact translations for separately restored
+off-heap objects. Native addresses and tagged Lisp values use distinct APIs,
+so a fixnum whose bits resemble an address is never relocated.
 
 ### 7.2.11  Checksum Trailer
 
@@ -608,11 +588,10 @@ the prior interpreted-dispatch behavior.
 | Compat Rule | Behaviour |
 |-------------|-----------|
 | `loader_version == image_version` | Load normally |
-| `loader_version > image_version` | Load with backward-compat shim (if supported) |
+| `loader_version > image_version` | Reject; rebuild the image with the current runtime |
 | `loader_version < image_version` | Reject with `IMAGE-VERSION-MISMATCH` error (R7.15) |
 
-The project SHOULD maintain backward compatibility for at least 2
-prior image format versions.
+Image compatibility with prior formats is not required.
 
 ---
 

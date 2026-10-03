@@ -56,7 +56,7 @@ fn startup_rejects_legacy_images_but_load_accepts_library_fasls() {
 }
 
 #[test]
-fn saved_application_reads_its_image_once() {
+fn saved_application_maps_its_image_without_reading_the_payload() {
     let dir = std::env::temp_dir().join(format!("egcl-startup-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let app = dir.join("app");
@@ -81,6 +81,7 @@ fn saved_application_reads_its_image_once() {
     );
     let bytes = fs::read(&app).unwrap();
     let image_len = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().unwrap());
+    assert_eq!((bytes.len() as u64 - 16 - image_len) % 4096, 0);
     let output = Command::new(&app).output().unwrap();
     let _ = fs::remove_dir_all(&dir);
     assert!(
@@ -97,9 +98,9 @@ fn saved_application_reads_its_image_once() {
         .parse()
         .unwrap();
     // /proc reports bytes returned by read(), even with a warm page cache.
-    // Allow runtime configuration and proc reads, but not a second payload.
+    // Allow runtime configuration and proc reads, but no eager image read.
     assert!(
-        read_bytes < image_len + image_len / 2 + 262144,
+        read_bytes < 262144,
         "read {read_bytes} bytes for a {image_len}-byte image"
     );
 }

@@ -140,7 +140,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // 2 added opaque MUTEX handles with nulled native pointers. Both older layouts
 // remain readable; absent method associations use interpreted dispatch.
 // Version 5 carries native runtime requirements, validated before restoration.
-const FORMAT_VERSION: u32 = 5;
+// Version 6 stores aligned heap spans with precise pointer fixups. Older
+// per-object layouts are deliberately unsupported.
+const FORMAT_VERSION: u32 = 6;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]
@@ -496,16 +498,19 @@ fn decompress_data(compressed: &[u8]) -> Result<Vec<u8>, EgclError> {
 }
 
 /// Save the current heap state to an image file.
-/// Triggers a full GC, stops all threads, serialises, then resumes.
+/// Stops all threads, serialises the current heap, then resumes.
 ///
 /// Per R7.20 the write is atomic: we write to a temp file then rename.
 pub fn save_image(path: &str, options: &SaveImageOptions) -> Result<(), EgclError> {
-    save_image_impl(path, options, false)
+    let _permit = SavePermit::acquire()?;
+    crate::gc::ensure_heap_initialized();
+    crate::gc::with_heap_snapshot(|| save_image_impl(path, options, false))?
 }
 
 /// Save an application-delivery image, omitting unreachable objects even when
 /// restored-world pinning prevents the collector from reclaiming their regions.
 pub fn save_reachable_image(path: &str, options: &SaveImageOptions) -> Result<(), EgclError> {
+    let _permit = SavePermit::acquire()?;
     crate::gc::with_heap_snapshot(|| save_image_impl(path, options, true))?
 }
 
@@ -514,7 +519,6 @@ fn save_image_impl(
     options: &SaveImageOptions,
     reachable_only: bool,
 ) -> Result<(), EgclError> {
-    let _permit = SavePermit::acquire()?;
     use std::io::Write;
 
     let use_compression = options.compression == ImageCompression::Zstd;
@@ -534,18 +538,10 @@ fn save_image_impl(
     // Retrieve the entry continuation from the runtime (§7.2.3).
     let entry_val = crate::gc::get_entry_continuation();
 
-    // Build the heap section: first 8 bytes are the entry continuation,
-    // followed by serialised heap objects from gc::serialize_heap_objects().
-    let serialized_objects = if reachable_only {
-        // SAFETY: save_reachable_image holds the stopped-world snapshot for
-        // this entire save; serialization performs no Lisp allocations.
-        unsafe { crate::gc::serialize_reachable_heap_objects()? }
-    } else {
-        crate::gc::serialize_heap_objects()
-    };
-    let mut heap_data_raw: Vec<u8> = Vec::new();
-    heap_data_raw.extend_from_slice(&entry_val.to_raw().to_ne_bytes());
-    heap_data_raw.extend_from_slice(&serialized_objects);
+    // Both save entry points hold a stopped-world snapshot. The continuation
+    // lives in the image header; putting it before this directory would break
+    // the page alignment of the heap spans.
+    let heap_data_raw = unsafe { crate::gc::snapshot_heap_regions(reachable_only)? }.encode()?;
     let heap_uncompressed_size = heap_data_raw.len();
 
     // Build the symbol table section (§7.2.7) by calling into the
@@ -563,9 +559,9 @@ fn save_image_impl(
     let code_data_raw: Vec<u8> = crate::gc::serialize_code_cache();
     let code_uncompressed_size = code_data_raw.len();
 
-    // Build the relocation table section (R7.03) by scanning heap for
-    // pointer-valued fields that need fixup on load.
-    let reloc_data_raw: Vec<u8> = crate::gc::serialize_relocation_table();
+    // Region payloads carry their own precise fixup offsets. Keep the reserved
+    // relocation section empty; the old conservative word scan is unnecessary.
+    let reloc_data_raw: Vec<u8> = Vec::new();
     let reloc_uncompressed_size = reloc_data_raw.len();
 
     // Build the GC metadata section with all GcStats fields + generation.
@@ -864,17 +860,46 @@ fn save_image_impl(
 /// parses the section directory, restores heap data, and returns the
 /// entry continuation so the caller can resume execution.
 pub fn load_image(path: &str) -> Result<EgclVal, EgclError> {
-    use std::io::Read;
+    let file = std::fs::File::open(path)
+        .map_err(|e| EgclError::InvalidImage(format!("cannot open image: {e}")))?;
+    let len = file.metadata().map_err(|e| EgclError::InvalidImage(e.to_string()))?.len();
+    load_image_from_file(&file, 0, len)
+}
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| EgclError::InvalidImage(format!("cannot open image: {}", e)))?;
-
-    // Read the entire file contents.
-    let mut file_data = Vec::new();
-    file.read_to_end(&mut file_data)
-        .map_err(|e| EgclError::InvalidImage(format!("cannot read image file: {}", e)))?;
-
-    load_image_from_bytes(&file_data)
+/// Restore a standalone or embedded image without reading its heap into a Vec.
+/// Image files must not be modified in place while their restored heap is in
+/// use. Atomic replacement and unlinking are supported: mappings keep the old
+/// inode alive. The file descriptor need not remain open after this returns.
+pub fn load_image_from_file(file: &std::fs::File, offset: u64, len: u64) -> Result<EgclVal, EgclError> {
+    let invalid = || EgclError::InvalidImage("invalid image file extent".into());
+    let end = offset.checked_add(len).ok_or_else(invalid)?;
+    if len == 0 || end > file.metadata().map_err(|e| EgclError::InvalidImage(e.to_string()))?.len()
+        || end > isize::MAX as u64 { return Err(invalid()); }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        struct Mapping { ptr: *mut u8, len: usize }
+        impl Drop for Mapping {
+            fn drop(&mut self) { unsafe { let _ = crate::syscall::munmap(self.ptr, self.len); } }
+        }
+        // Map from offset zero so embedded image offsets need not match the OS
+        // page size. Pages before the image are never touched by this reader.
+        let ptr = unsafe { crate::syscall::mmap(std::ptr::null_mut(), end as usize,
+            crate::syscall::PROT_READ, crate::syscall::MAP_PRIVATE, file.as_raw_fd(), 0) }
+            .map_err(|errno| EgclError::InvalidImage(format!("image mmap failed: errno {errno}")))?;
+        let mapping = Mapping { ptr, len: end as usize };
+        let bytes = unsafe { std::slice::from_raw_parts(mapping.ptr.add(offset as usize), len as usize) };
+        load_image_contents(bytes, Some((file, offset)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut reader = file.try_clone().map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        reader.seek(SeekFrom::Start(offset)).map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        let mut bytes = vec![0; usize::try_from(len).map_err(|_| invalid())?];
+        reader.read_exact(&mut bytes).map_err(|e| EgclError::InvalidImage(e.to_string()))?;
+        load_image_from_bytes(&bytes)
+    }
 }
 
 /// Load an image from an in-memory byte slice (the image header must start at
@@ -882,6 +907,10 @@ pub fn load_image(path: &str) -> Result<EgclVal, EgclError> {
 /// where the loader already holds the extracted image bytes. `load_image` is the
 /// path-based wrapper. The heap must be initialized before calling either.
 pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
+    load_image_contents(file_data, None)
+}
+
+fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>) -> Result<EgclVal, EgclError> {
     if file_data.len() < HEADER_SIZE {
         return Err(EgclError::InvalidImage(
             "image file too small to contain header".into(),
@@ -899,9 +928,9 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
         )));
     }
 
-    if header.format_version > FORMAT_VERSION {
+    if header.format_version != FORMAT_VERSION {
         return Err(EgclError::InvalidImage(format!(
-            "unsupported format version: image has {}, runtime supports up to {}",
+            "unsupported format version: image has {}, runtime requires {}",
             header.format_version, FORMAT_VERSION
         )));
     }
@@ -934,9 +963,10 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
     let is_compressed = (header.flags & image_flags::COMPRESSED) != 0;
 
     // Helper to read and optionally decompress a section's data.
-    let read_section_data = |entry: &SectionEntry| -> Result<Vec<u8>, EgclError> {
-        let data_start = entry.file_offset as usize;
-        let data_end = data_start + entry.size as usize;
+    let read_section_data = |entry: &SectionEntry| -> Result<std::borrow::Cow<'_, [u8]>, EgclError> {
+        let data_start = usize::try_from(entry.file_offset).map_err(|_| EgclError::InvalidImage("section offset overflow".into()))?;
+        let size = usize::try_from(entry.size).map_err(|_| EgclError::InvalidImage("section size overflow".into()))?;
+        let data_end = data_start.checked_add(size).ok_or_else(|| EgclError::InvalidImage("section extent overflow".into()))?;
         if file_data.len() < data_end {
             return Err(EgclError::InvalidImage(
                 "image file too small for section data".into(),
@@ -944,9 +974,9 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
         }
         let raw = &file_data[data_start..data_end];
         if is_compressed && entry.size > 0 {
-            decompress_data(raw)
+            decompress_data(raw).map(std::borrow::Cow::Owned)
         } else {
-            Ok(raw.to_vec())
+            Ok(std::borrow::Cow::Borrowed(raw))
         }
     };
 
@@ -957,15 +987,24 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
     let mut symbol_entry: Option<SectionEntry> = None;
     let mut package_entry: Option<SectionEntry> = None;
     let mut code_entry: Option<SectionEntry> = None;
-    let mut reloc_entry: Option<SectionEntry> = None;
     let mut gc_meta_entry: Option<SectionEntry> = None;
     let mut host_entry: Option<SectionEntry> = None;
     let mut offheap_entry: Option<SectionEntry> = None;
 
+    let mut seen_sections = std::collections::HashSet::new();
+    let mut extents = Vec::new();
     for i in 0..header.section_count as usize {
         let entry_offset = section_dir_start + i * SECTION_ENTRY_SIZE;
         let entry: SectionEntry = bytes_to_struct(&file_data[entry_offset..])
             .ok_or_else(|| EgclError::InvalidImage(format!("cannot parse section entry {}", i)))?;
+
+        let end = entry.file_offset.checked_add(entry.size)
+            .ok_or_else(|| EgclError::InvalidImage("section extent overflow".into()))?;
+        if !seen_sections.insert(entry.section_type) || entry.file_offset < section_dir_end as u64
+            || entry.file_offset % 4096 != 0 || end > file_data.len() as u64 {
+            return Err(EgclError::InvalidImage("invalid or duplicate image section".into()));
+        }
+        if entry.size != 0 { extents.push((entry.file_offset, end)); }
 
         match entry.section_type {
             t if t == SectionType::Settings as u32 => {
@@ -979,7 +1018,6 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
             t if t == SectionType::Symbols as u32 => symbol_entry = Some(entry),
             t if t == SectionType::Packages as u32 => package_entry = Some(entry),
             t if t == SectionType::Code as u32 => code_entry = Some(entry),
-            t if t == SectionType::Reloc as u32 => reloc_entry = Some(entry),
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
             t if t == SectionType::OffHeap as u32 => offheap_entry = Some(entry),
@@ -989,6 +1027,10 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
         }
     }
 
+    extents.sort_unstable();
+    if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(EgclError::InvalidImage("overlapping image sections".into()));
+    }
     let settings = settings_entry
         .as_ref()
         .map(&read_section_data)
@@ -1002,23 +1044,16 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
         ));
     }
 
-    // Read the relocation table first — needed before heap restore if bases differ.
-    let reloc_data = if let Some(entry) = reloc_entry {
-        read_section_data(&entry)?
-    } else {
-        Vec::new()
-    };
-
     // Stash the off-heap-body section so restore_heap can re-materialize those
     // objects between its two passes (bliss-x0f2 M3), then clear it afterward.
     let offheap_bytes = match offheap_entry {
         Some(entry) => read_section_data(&entry)?,
-        None => Vec::new(),
+        None => std::borrow::Cow::Borrowed(&[][..]),
     };
     crate::gc::set_pending_offheap(if offheap_bytes.is_empty() {
         None
     } else {
-        Some(offheap_bytes)
+        Some(offheap_bytes.into_owned())
     });
 
     // Restore the heap section.
@@ -1026,49 +1061,48 @@ pub fn load_image_from_bytes(file_data: &[u8]) -> Result<EgclVal, EgclError> {
         .ok_or_else(|| EgclError::InvalidImage("image contains no heap section".into()))?;
     let heap_bytes = read_section_data(&heap_entry)?;
 
-    if heap_bytes.len() >= 8 {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&heap_bytes[..8]);
-        let raw = u64::from_ne_bytes(buf);
-        if raw != header.entry_continuation {
-            return Err(EgclError::InvalidImage(
-                "heap entry continuation does not match header".into(),
-            ));
-        }
-
-        // Restore heap objects (bytes after the entry continuation word).
-        // restore_heap now relocates every pointer field per-object via the
-        // old→new map it builds while materializing, so no separate uniform-delta
-        // apply_relocations pass is needed (bliss-x0f2 M2.0); `reloc_data` is
-        // retained in the format but unused here.
-        let _ = &reloc_data;
-        let object_data = &heap_bytes[8..];
-        if !object_data.is_empty() {
-            crate::gc::restore_heap(object_data)?;
-        }
-    } else if !heap_bytes.is_empty() {
+    let heap_backing = if is_compressed { None } else {
+        backing.map(|(file, offset)| offset.checked_add(heap_entry.file_offset)
+            .map(|offset| (file, offset)).ok_or_else(|| EgclError::InvalidImage("heap file offset overflow".into())))
+            .transpose()?
+    };
+    // Native images are runtime-specific; the header and runtime contract were
+    // checked above. No Lisp mutators run during startup restoration.
+    let restored = unsafe { crate::gc::restore_heap_regions(&heap_bytes, heap_backing) };
+    if let Err(error) = restored {
         crate::gc::set_pending_offheap(None);
-        return Err(EgclError::InvalidImage(
-            "heap section too small to contain entry continuation".into(),
-        ));
+        return Err(error);
     }
+    // Restore the symbol table (§7.2.7) and the package registry (§7.2.8).
+    // A failure here still has to drop the stashed off-heap section, like the
+    // heap-restore failure above.
+    let registries = (|| {
+        if let Some(entry) = symbol_entry {
+            crate::gc::restore_symbols(&read_section_data(&entry)?)?;
+        }
+        if let Some(entry) = package_entry {
+            crate::gc::restore_packages(&read_section_data(&entry)?)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = registries {
+        crate::gc::set_pending_offheap(None);
+        return Err(error);
+    }
+
     // Phase 2 of off-heap restore: now that restore_heap has released the heap
     // lock and set the final relocation map, populate the off-heap object bodies
     // (hash-table contents). Then clear the stash.
+    //
+    // This MUST run after the symbol and package registries are rebuilt. The
+    // heap restore installs a FRESH heap mapping and unmaps the old one, so
+    // every pre-restore registry entry is a wild pointer until its registry is
+    // replaced. Hashing a symbol key here reads the symbol's name out of the
+    // registry (`symbols::symbol_name`), and populate also allocates (fresh
+    // strings for by-content slots), which can run a root scan over those
+    // registries. Both faulted on the stale old-heap addresses.
     crate::gc::run_offheap_populate();
     crate::gc::set_pending_offheap(None);
-
-    // Restore the symbol table (§7.2.7).
-    if let Some(entry) = symbol_entry {
-        let symbol_bytes = read_section_data(&entry)?;
-        crate::gc::restore_symbols(&symbol_bytes)?;
-    }
-
-    // Restore the package registry (§7.2.8).
-    if let Some(entry) = package_entry {
-        let package_bytes = read_section_data(&entry)?;
-        crate::gc::restore_packages(&package_bytes)?;
-    }
 
     // Restore the compiled code cache.
     if let Some(entry) = code_entry {
@@ -1157,9 +1191,9 @@ pub fn validate_image_header(path: &str) -> Result<ImageHeader, EgclError> {
         )));
     }
 
-    if header.format_version > FORMAT_VERSION {
+    if header.format_version != FORMAT_VERSION {
         return Err(EgclError::InvalidImage(format!(
-            "unsupported format version: image has {}, runtime supports up to {}",
+            "unsupported format version: image has {}, runtime requires {}",
             header.format_version, FORMAT_VERSION
         )));
     }

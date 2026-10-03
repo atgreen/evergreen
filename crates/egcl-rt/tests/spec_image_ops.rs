@@ -18,7 +18,7 @@ fn gc_config() -> GcConfig {
         heap_max: 4 * 1024 * 1024,
         nursery_size: 256 * 1024,
         tlab_size: 256,
-        region_size: 1024,
+        region_size: 4096,
         promotion_threshold: 1,
         pause_target_ms: 10,
         gc_workers: 1,
@@ -78,12 +78,9 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    // Per-object record is [old_body u64][type u8][size u32][data] = 8+1+4+size
-    // (bliss-x0f2 M2.0 added the old-body address); plus the 8-byte entry word.
-    assert_eq!(
-        header.heap_size,
-        8 + (8 + 1 + 4 + 4) as u64 + (8 + 1 + 4 + 5) as u64
-    );
+    assert_eq!(header.format_version, 6);
+    assert!(header.heap_size >= 4096);
+    assert_eq!(header.heap_size % 4096, 0);
 
     init_test_heap();
     let restored = load_image(path.to_str().unwrap()).expect("load_image");
@@ -274,7 +271,7 @@ fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
     let mut holder = vec![0u8; 16];
     holder[..8].copy_from_slice(&cons_ref.to_le_bytes());
     holder[8..].copy_from_slice(&heapobj_ref.to_le_bytes());
-    record_object(0x82, holder);
+    record_object(egcl_rt::object::type_id::CONS, holder);
     set_entry_continuation(EgclVal::from_fixnum(1));
 
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
@@ -289,7 +286,7 @@ fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
         .expect("restored target");
     let holder_data = restored
         .iter()
-        .find(|(_, t, _)| *t == 0x82)
+        .find(|(_, t, _)| *t == egcl_rt::object::type_id::CONS)
         .map(|(_, _, data)| data.clone())
         .expect("restored holder");
     let restored_cons = u64::from_le_bytes(holder_data[..8].try_into().unwrap());
@@ -307,7 +304,7 @@ fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
 }
 
 #[test]
-fn spec_image_loader_relocates_heap_pointers_when_base_changes() {
+fn spec_image_loader_preserves_unboxed_pointer_shaped_data() {
     let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     // Per R7.03, a loaded image must relocate pointer fields when the heap
     // maps at a different base address than the saved image.
@@ -340,7 +337,7 @@ fn spec_image_loader_relocates_heap_pointers_when_base_changes() {
     assert_ne!(restored_base, 0);
 
     let restored = walk_objects_with_data();
-    let new_target = restored
+    let _new_target = restored
         .iter()
         .find(|(_, type_id, _)| *type_id == 0x71)
         .map(|(ptr, _, _)| *ptr as u64)
@@ -350,7 +347,7 @@ fn spec_image_loader_relocates_heap_pointers_when_base_changes() {
         .find(|(_, type_id, _)| *type_id == 0x72)
         .map(|(_, _, data)| u64::from_le_bytes(data[..8].try_into().unwrap()))
         .expect("restored holder");
-    assert_eq!(holder_field, new_target);
+    assert_eq!(holder_field, target_ptr as u64, "unboxed words are not pointer slots");
 }
 
 #[test]
@@ -367,8 +364,8 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-        5,
-        "native runtime requirements require image format version 5"
+        6,
+        "mapped heap regions require image format version 6"
     );
     bytes[0] ^= 0xFF;
     let bad_magic = temp_path("header-bad-magic.bimg");

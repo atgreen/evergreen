@@ -6375,17 +6375,6 @@ pub fn serialize_heap_objects() -> Vec<u8> {
     serialize_heap_objects_matching(|_| true)
 }
 
-/// Serialize the reachable heap without retaining garbage merely because its
-/// region is pinned. Used only by application delivery; pins in the running
-/// process are unchanged. All symbol/package identity records remain roots.
-///
-/// # Safety
-/// Call inside `with_heap_snapshot`, with no concurrent Lisp allocation.
-pub(crate) unsafe fn serialize_reachable_heap_objects() -> Result<Vec<u8>, EgclError> {
-    let retained = unsafe { reachable_heap_objects()? };
-    Ok(serialize_heap_objects_matching(|ptr| retained.contains(&(ptr as usize))))
-}
-
 // Call only while the heap snapshot is stopped; the returned addresses are
 // host-side metadata, not roots that could survive a moving collection.
 unsafe fn reachable_heap_objects() -> Result<std::collections::HashSet<usize>, EgclError> {
@@ -6598,6 +6587,7 @@ pub unsafe fn restore_heap_regions(
 ) -> Result<(), EgclError> {
     use crate::image_relocation::RegionRelocation;
     let image = crate::image_heap::HeapImageView::parse(data)?;
+    image.validate_objects()?;
     let invalid = || EgclError::InvalidImage("invalid restored heap extent".into());
     let mut config = heap_state()
         .lock()
@@ -7117,13 +7107,8 @@ pub fn restore_gc_metadata(data: &[u8]) -> Result<(), EgclError> {
     state.stats.total_major_pause_us = read(3);
     state.stats.bytes_allocated = read(4);
     state.stats.bytes_promoted = read(5);
-    state.stats.nursery_used = read(6);
-    state.stats.nursery_capacity = read(7);
-    state.stats.old_gen_used = read(8);
-    state.stats.old_gen_capacity = read(9);
-    state.stats.large_object_bytes = read(10);
-    state.stats.regions_total = read(12) as u32;
-    state.stats.regions_free = read(13) as u32;
+    // Occupancy and capacities describe the newly installed region layout,
+    // not the pre-save nursery/old-generation split.
     Ok(())
 }
 

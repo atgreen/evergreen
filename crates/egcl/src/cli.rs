@@ -37941,11 +37941,12 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
 /// Wrap `image` into a standalone executable: the current runtime binary with
 /// the image and a locating trailer appended. The OS loader ignores trailing
 /// bytes after the executable, so the concatenation still runs as the original
-/// program, while [`embedded_image`] recovers the image at startup (the same
+/// program, while [`embedded_image_header`] recovers the image at startup (the same
 /// runtime-plus-core scheme SBCL uses for `:executable t`).
 fn wrap_executable(image: &[u8], application: bool) -> std::io::Result<Vec<u8>> {
     let mut bytes = current_runtime_bytes()?;
     delivery::remove_embedded_images(&mut bytes)?;
+    bytes.resize(bytes.len().div_ceil(4096) * 4096, 0);
     bytes.extend_from_slice(image);
     bytes.extend_from_slice(if application { APP_IMAGE_MAGIC } else { EXE_IMAGE_MAGIC });
     bytes.extend_from_slice(&(image.len() as u64).to_le_bytes());
@@ -37959,7 +37960,7 @@ fn wrap_executable(image: &[u8], application: bool) -> std::io::Result<Vec<u8>> 
 /// scanned `GLOBAL_MACROS`/`GLOBAL_SETF_FNS` — carries post-compaction addresses
 /// that match the serialized object bodies. With `executable`, the core is
 /// appended to a copy of the runtime binary (reusing the `EGCLEXE` trailer
-/// scheme, recovered by `embedded_image` at startup). GC-safe: no EGCL
+/// scheme, recovered by `embedded_image_header` at startup). GC-safe: no EGCL
 /// allocation between the GC and the serialize walk.
 fn save_core_and_die(path: &str, executable: bool, application: bool, env: &Env) -> Result<(), EgclError> {
     save_core(path, executable, false, application, env)?;
@@ -38037,9 +38038,9 @@ fn save_core(path: &str, executable: bool, delivery: bool, application: bool, en
 /// The heap must be initialized and empty of mutator objects — call this BEFORE
 /// the bootstrap prelude runs, so no live `EgclVal` in the interpreter's `Env`
 /// is stranded when `restore_heap` clears and re-materializes the heap.
-fn load_core_image_bytes(bytes: &[u8], env: &mut Env) -> Result<(), EgclError> {
+fn load_core_image(file: &std::fs::File, offset: u64, len: u64, env: &mut Env) -> Result<(), EgclError> {
     egcl_rt::gc::ensure_heap_initialized();
-    egcl_rt::image::load_image_from_bytes(bytes)?;
+    egcl_rt::image::load_image_from_file(file, offset, len)?;
     PENDING_SETF_EXPANDERS.with(|p| {
         *env.setf_expanders.borrow_mut() = std::mem::take(&mut *p.borrow_mut());
     });
@@ -38181,14 +38182,6 @@ fn embedded_image_header() -> Option<(std::fs::File, u64, bool)> {
     Some((f, image_len, application))
 }
 
-fn embedded_image() -> Option<Vec<u8>> {
-    use std::io::Read;
-    let (mut f, image_len, _) = embedded_image_header()?;
-    let mut image = vec![0u8; usize::try_from(image_len).ok()?];
-    f.read_exact(&mut image).ok()?;
-    Some(image)
-}
-
 /// Extract the entry-point symbol from a `:toplevel` function designator. A
 /// `#'name` / `'name` form yields its name unevaluated; otherwise the form is
 /// evaluated and reduced to a symbol (a function object via its name).
@@ -38311,13 +38304,16 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // already contains that world (env.frame is still empty here, so nothing is
     // stranded).
     let core_loaded = if let Some(ref image_path) = ca.image {
-        let bytes = std::fs::read(image_path)
+        let file = std::fs::File::open(image_path)
             .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
-        load_core_image_bytes(&bytes, &mut env)?;
+        let len = file.metadata().map_err(|e| EgclError::FileError(e.to_string()))?.len();
+        load_core_image(&file, 0, len, &mut env)?;
         true
     } else if ca.deliver.is_none() {
-        if let Some(bytes) = embedded_image() {
-            load_core_image_bytes(&bytes, &mut env)?;
+        if let Some((mut file, len, _)) = embedded_image_header() {
+            use std::io::Seek;
+            let offset = file.stream_position().map_err(|e| EgclError::FileError(e.to_string()))?;
+            load_core_image(&file, offset, len, &mut env)?;
             true
         } else {
             false

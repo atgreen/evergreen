@@ -1040,6 +1040,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
         "native-bytes = {runtime_bytes}\nimage-bytes = {}\n",
         core.len()
     ));
+    runtime.resize(runtime.len().div_ceil(4096) * 4096, 0);
     runtime.extend_from_slice(&core);
     runtime.extend_from_slice(EXE_IMAGE_MAGIC);
     runtime.extend_from_slice(&(core.len() as u64).to_le_bytes());
