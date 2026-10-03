@@ -6195,7 +6195,20 @@ impl<'e> Lowerer<'e> {
     /// boxed; if any is a plain frame slot (e.g. a `multiple-value-bind` var),
     /// bail so the enclosing function runs on the tree-walker.
     fn emit_closure(&mut self, form: EgclVal, captured: &[String]) -> LowerResult<()> {
-        let c = self.add_const(form);
+        egcl_rt::rooted!(form = form);
+        // LOCALLY declarations are compile-time state. Restore that lexical
+        // context while the host evaluator creates the closure, so its snapshot
+        // does not depend on the caller's runtime declaration scope.
+        if !self.declared_special.is_empty() {
+            egcl_rt::rooted!(specials = vec![resolve_sym("SPECIAL").ok_or(Bail)?]);
+            for name in self.declared_special.keys() {
+                specials.push(resolve_sym(name).ok_or(Bail)?);
+            }
+            egcl_rt::rooted!(declaration = form_list(&specials));
+            *declaration = form_list(&[resolve_sym("DECLARE").ok_or(Bail)?, *declaration]);
+            *form = form_list(&[resolve_sym("LOCALLY").ok_or(Bail)?, *declaration, *form]);
+        }
+        let c = self.add_const(*form);
         if captured.is_empty() {
             self.emit(Instr::EvalHost(c));
         } else {
@@ -6250,6 +6263,7 @@ impl<'e> Lowerer<'e> {
                 params_form,
                 body,
                 self.env,
+                &self.declared_special,
                 self.portable,
                 false,
                 &enclosing_blocks,
@@ -6291,6 +6305,7 @@ impl<'e> Lowerer<'e> {
                 params_form,
                 body,
                 self.env,
+                &self.declared_special,
                 &captures,
                 &callable,
                 &enclosing_blocks,
@@ -6525,6 +6540,7 @@ impl<'e> Lowerer<'e> {
                 params_form,
                 fbody,
                 self.env,
+                &self.declared_special,
                 &body_local_fns,
                 self.portable,
             )
@@ -6668,6 +6684,7 @@ impl<'e> Lowerer<'e> {
                 params_form,
                 fbody,
                 self.env,
+                &self.declared_special,
                 &captures,
                 &callable,
                 &enclosing_blocks,
@@ -6715,6 +6732,7 @@ fn compile_local_function(
     mut params_form: EgclVal,
     mut fbody: EgclVal,
     env: &Env,
+    inherited_specials: &std::collections::HashMap<String, u32>,
     local_fns: &std::collections::HashMap<String, u32>,
     portable: bool,
 ) -> Option<BytecodeFunction> {
@@ -6723,6 +6741,10 @@ fn compile_local_function(
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    lo.declared_special = inherited_specials.clone();
+    for name in &param_names {
+        lo.declared_special.remove(name);
+    }
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.local_fns = local_fns.clone();
@@ -6775,6 +6797,7 @@ fn compile_capturing_local(
     mut params_form: EgclVal,
     mut fbody: EgclVal,
     env: &Env,
+    inherited_specials: &std::collections::HashMap<String, u32>,
     captures: &std::collections::HashSet<String>,
     callable: &std::collections::HashSet<String>,
     enclosing_blocks: &std::collections::HashSet<String>,
@@ -6788,6 +6811,10 @@ fn compile_capturing_local(
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    lo.declared_special = inherited_specials.clone();
+    for name in &param_names {
+        lo.declared_special.remove(name);
+    }
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(fbody);
@@ -8109,6 +8136,7 @@ fn compile_function(
         params_form,
         body,
         env,
+        &std::collections::HashMap::new(),
         portable,
         macro_lambda_list,
         &std::collections::HashSet::new(),
@@ -8162,6 +8190,7 @@ fn compile_function_in(
     params_form: EgclVal,
     body: EgclVal,
     env: &Env,
+    inherited_specials: &std::collections::HashMap<String, u32>,
     portable: bool,
     macro_lambda_list: bool,
     enclosing_blocks: &std::collections::HashSet<String>,
@@ -8186,6 +8215,7 @@ fn compile_function_in(
             *params_form,
             *body,
             env,
+            inherited_specials,
             portable,
             macro_lambda_list,
             enclosing_blocks,
@@ -8213,6 +8243,7 @@ fn compile_function_forcing_boxed(
     params_form: EgclVal,
     body: EgclVal,
     env: &Env,
+    inherited_specials: &std::collections::HashMap<String, u32>,
     portable: bool,
     macro_lambda_list: bool,
     enclosing_blocks: &std::collections::HashSet<String>,
@@ -8306,6 +8337,10 @@ fn compile_function_forcing_boxed(
     }
 
     let mut lo = Lowerer::new(env);
+    lo.declared_special = inherited_specials.clone();
+    for name in &param_names {
+        lo.declared_special.remove(name);
+    }
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     // A hot DEFUN nested in LET still addresses the definition's shared
@@ -12285,6 +12320,7 @@ fn compile_defun(
             *params,
             *body,
             &compile_env,
+            &std::collections::HashMap::new(),
             portable,
             false,
             &empty,

@@ -85,7 +85,7 @@ impl MacroDefinitions {
                 references.push(unsafe { *slot });
             });
             for definition in capture.funs.values_mut() {
-                visit_fun_def_roots(definition, &mut |slot| references.push(unsafe { *slot }));
+                visit_fun_def_roots(definition, &mut EnvRootVisitState::default(), &mut |slot| references.push(unsafe { *slot }));
             }
             references.extend(capture.symbol_macros.values().copied());
             if let Some(&index) = name_indices.get(&name) {

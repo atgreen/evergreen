@@ -1973,6 +1973,8 @@ struct Closure {
     params_form: EgclVal,
     body: EgclVal,
     captured_frame: Arc<SharedCell<EnvFrame>>,
+    /// Local SPECIAL declarations active at the closure's definition site.
+    captured_specials: Vec<u32>,
     /// The lexically-enclosing BLOCK and TAGBODY exit points, captured at
     /// closure-creation time. CL specifies BLOCK/RETURN-FROM and TAGBODY/GO as
     /// LEXICAL: a closure that does `(return-from tag …)` must target the block
@@ -2388,6 +2390,10 @@ struct FunDef {
     /// captured the INNER `done` and returned BAD (ansi BLOCK.10; bliss-wfxx).
     /// `None` for a global defun, which inherits the caller's as before.
     defining_blocks: Option<LexicalExitNames>,
+    /// Variable bindings and declarations belong to the definition site,
+    /// independently of the frame in which this name is called or referenced.
+    defining_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    defining_specials: Vec<u32>,
 }
 
 type LexicalExitNames = (Vec<(String, String)>, Vec<(String, String)>);
@@ -2407,6 +2413,8 @@ impl FunDef {
             def_funs: None,
             closure_ref: None,
             defining_blocks: None,
+            defining_frame: None,
+            defining_specials: Vec::new(),
         }
     }
 }
@@ -3015,6 +3023,12 @@ fn hr_get_str(data: &[u8], off: &mut usize) -> Option<String> {
     Some(s)
 }
 
+fn hr_get_u32(data: &[u8], off: &mut usize) -> Option<u32> {
+    let bytes = data.get(*off..off.checked_add(4)?)?;
+    *off += 4;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 fn hr_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
     if data.len() < *off + 8 {
         return None;
@@ -3389,6 +3403,19 @@ fn host_serialize_registries() -> Vec<u8> {
             }
         }
     }
+    out.extend_from_slice(b"CSPC");
+    {
+        let registry = closure_registry();
+        let closures = registry.borrow();
+        out.extend_from_slice(&(closures.len() as u32).to_le_bytes());
+        for (&id, closure) in closures.iter() {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(closure.captured_specials.len() as u32).to_le_bytes());
+            for &symbol in &closure.captured_specials {
+                out.extend_from_slice(&symbol.to_le_bytes());
+            }
+        }
+    }
     // Bytecode registry (bliss-zz6w): the compiled code behind source-free
     // stub function objects (everything installed from `.bfasl` fasls during
     // an ASDF load), as a synthetic BYTECODE_UNIT executed by the ordinary
@@ -3657,31 +3684,23 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     if off + 4 <= data.len() && &data[off..off + 4] == b"CLSD" {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (classes)".into());
-        let get_u32 = |data: &[u8], off: &mut usize| -> Option<u32> {
-            if data.len() < *off + 4 {
-                return None;
-            }
-            let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
-            *off += 4;
-            Some(v)
-        };
-        let n_classes = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let n_classes = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         let mut classes: Vec<(String, ClassDef)> = Vec::with_capacity(n_classes);
         for _ in 0..n_classes {
             let name = hr_get_str(data, &mut off).ok_or_else(bad)?;
-            let n_supers = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_supers = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut supers = Vec::with_capacity(n_supers);
             for _ in 0..n_supers {
                 supers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
             }
-            let n_defaults = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_defaults = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut default_initargs = Vec::with_capacity(n_defaults);
             for _ in 0..n_defaults {
                 let n = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 let form = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 default_initargs.push((n, EgclVal::from_raw(remap(form))));
             }
-            let n_cells = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_cells = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut cells: HashMap<String, Option<EgclVal>> = HashMap::with_capacity(n_cells);
             for _ in 0..n_cells {
                 let n = hr_get_str(data, &mut off).ok_or_else(bad)?;
@@ -3700,11 +3719,11 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     },
                 );
             }
-            let n_slots = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_slots = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut slots = Vec::with_capacity(n_slots);
             for _ in 0..n_slots {
                 let sname = hr_get_str(data, &mut off).ok_or_else(bad)?;
-                let n_ia = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let n_ia = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
                 let mut initargs = Vec::with_capacity(n_ia);
                 for _ in 0..n_ia {
                     initargs.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
@@ -3719,12 +3738,12 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 } else {
                     None
                 };
-                let n_r = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let n_r = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
                 let mut readers = Vec::with_capacity(n_r);
                 for _ in 0..n_r {
                     readers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
                 }
-                let n_w = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+                let n_w = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
                 let mut writers = Vec::with_capacity(n_w);
                 for _ in 0..n_w {
                     writers.push(hr_get_str(data, &mut off).ok_or_else(bad)?);
@@ -3776,16 +3795,8 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     if off + 4 <= data.len() && &data[off..off + 4] == b"CLSR" {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (closures)".into());
-        let get_u32 = |data: &[u8], off: &mut usize| -> Option<u32> {
-            if data.len() < *off + 4 {
-                return None;
-            }
-            let v = u32::from_le_bytes(data[*off..*off + 4].try_into().unwrap());
-            *off += 4;
-            Some(v)
-        };
         let saved_next = hr_get_u64(data, &mut off).ok_or_else(bad)?;
-        let n_frames = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let n_frames = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         let frames: Vec<Arc<SharedCell<EnvFrame>>> = (0..n_frames)
             .map(|_| {
                 Arc::new(SharedCell::new(EnvFrame {
@@ -3797,21 +3808,21 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             .collect();
         let mut parent_ids: Vec<u32> = Vec::with_capacity(n_frames);
         for frame in &frames {
-            let n_vars = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_vars = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut fb = frame.borrow_mut();
             for _ in 0..n_vars {
                 let k = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 let v = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 fb.vars.insert(k, EgclVal::from_raw(remap(v)));
             }
-            let n_sym = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_sym = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             for _ in 0..n_sym {
-                let idx = get_u32(data, &mut off).ok_or_else(bad)?;
+                let idx = hr_get_u32(data, &mut off).ok_or_else(bad)?;
                 let v = hr_get_u64(data, &mut off).ok_or_else(bad)?;
                 fb.symbol_vars.insert(idx, EgclVal::from_raw(remap(v)));
             }
             drop(fb);
-            parent_ids.push(get_u32(data, &mut off).ok_or_else(bad)?);
+            parent_ids.push(hr_get_u32(data, &mut off).ok_or_else(bad)?);
         }
         for (frame, &pid) in frames.iter().zip(&parent_ids) {
             if pid != u32::MAX {
@@ -3823,21 +3834,21 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         // Publish for the method drain below; parents are linked first so a
         // method resolving a frame gets the whole chain (bliss-mxjr).
         PENDING_CLSR_FRAMES.with(|p| *p.borrow_mut() = frames.clone());
-        let n_closures = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let n_closures = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         let registry = closure_registry();
         for _ in 0..n_closures {
             let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let params = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
-            let fid = get_u32(data, &mut off).ok_or_else(bad)?;
-            let n_blocks = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let n_blocks = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut captured_blocks = Vec::with_capacity(n_blocks);
             for _ in 0..n_blocks {
                 let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 captured_blocks.push((a, b));
             }
-            let n_tags = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_tags = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut captured_tags = Vec::with_capacity(n_tags);
             for _ in 0..n_tags {
                 let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
@@ -3857,6 +3868,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     params_form: EgclVal::from_raw(remap(params)),
                     body: EgclVal::from_raw(remap(body)),
                     captured_frame,
+                    captured_specials: Vec::new(),
                     // Not serialized (see the field's comment): a restored
                     // closure inherits the caller's function namespace, exactly
                     // as it did before the field existed.
@@ -3867,25 +3879,25 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             );
         }
         // Bytecode-closure captured environments + block/tag scopes.
-        let n_bce = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let n_bce = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         for _ in 0..n_bce {
-            let sym = get_u32(data, &mut off).ok_or_else(bad)?;
-            let fid = get_u32(data, &mut off).ok_or_else(bad)?;
+            let sym = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
             if let Some(frame) = frames.get(fid as usize) {
                 bytecode::register_closure_env(sym, Arc::clone(frame));
             }
         }
-        let n_bcc = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        let n_bcc = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
         for _ in 0..n_bcc {
-            let sym = get_u32(data, &mut off).ok_or_else(bad)?;
-            let n_blocks = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let sym = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let n_blocks = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut blocks = Vec::with_capacity(n_blocks);
             for _ in 0..n_blocks {
                 let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 let b = hr_get_str(data, &mut off).ok_or_else(bad)?;
                 blocks.push((a, b));
             }
-            let n_tags = get_u32(data, &mut off).ok_or_else(bad)? as usize;
+            let n_tags = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
             let mut tags = Vec::with_capacity(n_tags);
             for _ in 0..n_tags {
                 let a = hr_get_str(data, &mut off).ok_or_else(bad)?;
@@ -3895,6 +3907,23 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             bytecode::install_closure_control(sym, blocks, tags);
         }
         NEXT_CLOSURE_ID.fetch_max(saved_next, std::sync::atomic::Ordering::Relaxed);
+    }
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CSPC" {
+        off += 4;
+        let bad = || EgclError::InvalidImage("host registry: truncated closure declarations".into());
+        let count = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+        let registry = closure_registry();
+        for _ in 0..count {
+            let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let count = hr_get_u32(data, &mut off).ok_or_else(bad)?;
+            let mut declarations = Vec::new();
+            for _ in 0..count {
+                declarations.push(hr_get_u32(data, &mut off).ok_or_else(bad)?);
+            }
+            if let Some(closure) = registry.borrow_mut().get_mut(&id) {
+                closure.captured_specials = declarations;
+            }
+        }
     }
     // Bytecode-registry unit (bliss-zz6w): stash for the post-Env drain — the
     // BBU loader needs the Env, which this hook does not have.
@@ -7544,10 +7573,10 @@ fn fun_map_scan_claimed(addr: usize) -> bool {
 
 fn visit_fun_map_roots(
     funs: &Arc<SharedCell<HashMap<String, FunDef>>>,
-    _state: &mut EnvRootVisitState,
+    state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
-    visit_shared_fun_map_roots(funs, visit);
+    visit_shared_fun_map_roots(funs, state, visit);
 }
 
 /// Walk one function map's FunDefs, at most once per root-scan pass.
@@ -7565,6 +7594,7 @@ fn visit_fun_map_roots(
 /// either way, and one visit per collection is what the collector needs.
 fn visit_shared_fun_map_roots(
     funs: &Arc<SharedCell<HashMap<String, FunDef>>>,
+    state: &mut EnvRootVisitState,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
     // `try_borrow_mut` (not `borrow_mut`) keeps the existing policy: a map the
@@ -7576,14 +7606,24 @@ fn visit_shared_fun_map_roots(
             return;
         }
         for def in map.values_mut() {
-            visit_fun_def_roots(def, visit);
+            visit_fun_def_roots(def, state, visit);
         }
     }
 }
 
-fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut EgclVal)) {
+fn visit_fun_def_roots(
+    def: &mut FunDef,
+    state: &mut EnvRootVisitState,
+    visit: &mut dyn FnMut(*mut EgclVal),
+) {
     visit(&mut def.params_form);
     visit(&mut def.body);
+    for &index in &def.defining_specials {
+        egcl_rt::symbols::trace_symbol_index(index, visit);
+    }
+    if let Some(frame) = &def.defining_frame {
+        visit_env_frame_roots(frame, state, visit);
+    }
     // The cached `#'name` cons (bliss-1e8t). Visiting it is what keeps its
     // closure-registry entry live: prune_closure_registry decides liveness by
     // walking the heap for reachable `(EGCL::CLOSURE . id)` conses.
@@ -7598,7 +7638,7 @@ fn visit_fun_def_roots(def: &mut FunDef, visit: &mut dyn FnMut(*mut EgclVal)) {
     if let Some(scope) = &def.def_funs {
         // The same shared map every other reference to this scope reaches, so it
         // goes through the once-per-pass walk (see `visit_shared_fun_map_roots`).
-        visit_shared_fun_map_roots(scope, visit);
+        visit_shared_fun_map_roots(scope, state, visit);
     }
 }
 
@@ -7982,6 +8022,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
             for closure in closure_registry().borrow_mut().values_mut() {
                 visit(&mut closure.params_form);
                 visit(&mut closure.body);
+                for &index in &closure.captured_specials {
+                    egcl_rt::symbols::trace_symbol_index(index, visit);
+                }
                 visit_env_frame_roots(&closure.captured_frame, state, visit);
                 if let Some(funs) = &closure.captured_funs {
                     visit_fun_map_roots(funs, state, visit);
@@ -8000,7 +8043,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
         if root_definitions {
             with_global_setf_fns(|functions| {
                 for definition in functions.borrow_mut().values_mut() {
-                    visit_fun_def_roots(definition, visit);
+                    visit_fun_def_roots(definition, state, visit);
                 }
             });
         }
@@ -8035,7 +8078,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
             visit(&mut capture.body);
             visit_frozen_env_frame_roots(&capture.captured_frame, &mut frozen_frames, visit);
             for definition in capture.funs.values_mut() {
-                visit_fun_def_roots(definition, visit);
+                visit_fun_def_roots(definition, state, visit);
             }
             for (&index, expansion) in capture.symbol_macros.iter_mut() {
                 egcl_rt::symbols::trace_symbol_index(index, visit);
@@ -8270,6 +8313,9 @@ impl Env {
             for closure in self.closures.borrow_mut().values_mut() {
                 visit(&mut closure.params_form);
                 visit(&mut closure.body);
+                for &index in &closure.captured_specials {
+                    egcl_rt::symbols::trace_symbol_index(index, visit);
+                }
                 visit_env_frame_roots(&closure.captured_frame, state, visit);
                 // The captured namespace holds FunDefs whose lambda lists and bodies
                 // are heap cons trees; unvisited they would go stale under the moving
@@ -9115,6 +9161,29 @@ fn eval_lambda_call(
     )
 }
 
+struct SavedSpecialDeclarations(Vec<u32>);
+
+impl egcl_rt::gc::TraceHostRoots for SavedSpecialDeclarations {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for &index in &self.0 {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
+        }
+    }
+}
+
+fn with_special_declarations<R>(
+    env: &mut Env,
+    declarations: Vec<u32>,
+    body: impl FnOnce(&mut Env) -> R,
+) -> R {
+    egcl_rt::rooted!(saved = SavedSpecialDeclarations(std::mem::replace(
+        &mut env.locally_specials, declarations,
+    )));
+    let result = body(env);
+    env.locally_specials = std::mem::take(&mut saved.0);
+    result
+}
+
 /// Invoke a named function's body, honoring a FLET function's captured
 /// non-recursive scope (bliss-ayq8). When `is_local` and the local FunDef named
 /// `name` carries a `def_funs` scope (FLET), evaluate the body with `env.funs`
@@ -9142,24 +9211,31 @@ fn eval_named_call_ex(
     // refcount bump and not a copy of the map) out from under the env.funs
     // borrow, and if present run the body with env.funs pointing at it,
     // restoring afterward.
-    let def_scope = if is_local {
-        env.funs.borrow().get(name).and_then(|f| f.def_funs.clone())
+    let definition = if is_local {
+        env.funs.borrow().get(name).cloned()
     } else {
         None
     };
-    match def_scope {
-        Some(scope) => {
-            egcl_rt::rooted!(saved = SuspendedFunsRoot(std::mem::replace(&mut env.funs, scope)));
-            // Keep the swapped-out funs (holding this FLET function's FunDef body,
-            // no longer reachable via env.funs) GC-scanned for the call, or a minor
-            // GC during the body frees the body and a later call reads poison
-            // (bliss-biol).
-            let r = eval_lambda_call_ex(env, params_form, body, args, parent, control);
-            env.funs = Arc::clone(&saved.0);
-            r
+    let parent = definition.as_ref()
+        .and_then(|f| f.defining_frame.clone()).unwrap_or(parent);
+    let specials = definition.as_ref()
+        .map(|f| f.defining_specials.clone()).unwrap_or_default();
+    let def_scope = definition.and_then(|f| f.def_funs);
+    with_special_declarations(env, specials, |env| {
+        match def_scope {
+            Some(scope) => {
+                egcl_rt::rooted!(saved = SuspendedFunsRoot(std::mem::replace(&mut env.funs, scope)));
+                // Keep the swapped-out funs (holding this FLET function's FunDef body,
+                // no longer reachable via env.funs) GC-scanned for the call, or a minor
+                // GC during the body frees the body and a later call reads poison
+                // (bliss-biol).
+                let r = eval_lambda_call_ex(env, params_form, body, args, parent, control);
+                env.funs = Arc::clone(&saved.0);
+                r
+            }
+            None => eval_lambda_call_ex(env, params_form, body, args, parent, control),
         }
-        None => eval_lambda_call_ex(env, params_form, body, args, parent, control),
-    }
+    })
 }
 
 fn eval_lambda_call_ex(
@@ -10485,6 +10561,9 @@ fn next_closure_id() -> u64 {
 
 impl egcl_rt::gc::TraceHostRoots for Closure {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for &index in &self.captured_specials {
+            egcl_rt::symbols::trace_symbol_index(index, visit);
+        }
         visit(&mut self.params_form);
         visit(&mut self.body);
         with_env_visit_state(|state| {
@@ -16146,6 +16225,7 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
         params_form: *params_form,
         body: *body,
         captured_frame: Arc::clone(&env.frame),
+        captured_specials: env.locally_specials.clone(),
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
         captured_funs: Some(Arc::clone(&env.funs)),
@@ -19932,6 +20012,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             params_form,
                             body,
                             captured_frame: Arc::clone(&env.frame),
+                            captured_specials: env.locally_specials.clone(),
                             captured_blocks: env.block_stack.clone(),
                             captured_tags: env.tag_stack.clone(),
                             captured_funs: Some(Arc::clone(&env.funs)),
@@ -19953,6 +20034,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     params_form,
                     body,
                     captured_frame: Arc::clone(&env.frame),
+                    captured_specials: env.locally_specials.clone(),
                     captured_blocks: env.block_stack.clone(),
                     captured_tags: env.tag_stack.clone(),
                     captured_funs: Some(Arc::clone(&env.funs)),
@@ -29089,6 +29171,7 @@ fn eval_let(cdr: EgclVal, env: &mut Env, sequential: bool) -> Result<EgclVal, Eg
             }
             // The body's user-proclaimed declarations govern the body only, not
             // the init forms — which have all run above.
+            env.locally_specials.extend(body_specials.iter().copied());
             let declarations = enter_body_declarations(env, *body);
             let result = eval_progn(*body, env);
             leave_body_declarations(env, declarations);
@@ -29147,6 +29230,7 @@ fn eval_let(cdr: EgclVal, env: &mut Env, sequential: bool) -> Result<EgclVal, Eg
                 env.define_local(&sym_name(symbol), val);
             }
         }
+        env.locally_specials.extend(body_specials.iter().copied());
         let declarations = enter_body_declarations(env, body);
         let result = eval_progn(body, env);
         leave_body_declarations(env, declarations);
@@ -29396,7 +29480,7 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
     // the recursive scope this `#'` is being taken in. Capturing the right one
     // is what lets the closure still resolve its own name after it escapes the
     // binding form (bliss-5q20).
-    let (params_form, body, cached, flet_scope, defining_blocks) =
+    let (params_form, body, cached, flet_scope, defining_blocks, defining_frame, defining_specials) =
         env.funs.borrow().get(name).map(|f| {
             (
                 f.params_form,
@@ -29404,6 +29488,8 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
                 f.closure_ref,
                 f.def_funs.clone(),
                 f.defining_blocks.clone(),
+                f.defining_frame.clone(),
+                f.defining_specials.clone(),
             )
         })?;
     if let Some(existing) = cached {
@@ -29413,7 +29499,8 @@ fn local_fn_closure(env: &mut Env, name: &str) -> Option<EgclVal> {
     let closure = Closure {
         params_form,
         body,
-        captured_frame: Arc::clone(&env.frame),
+        captured_frame: defining_frame.unwrap_or_else(|| Arc::clone(&env.frame)),
+        captured_specials: defining_specials,
         // The exits visible where the function was DEFINED, falling back to the
         // current ones for a function with no recorded scope (bliss-wfxx).
         captured_blocks: defining_blocks
@@ -29568,6 +29655,8 @@ fn eval_flet(cdr: EgclVal, env: &mut Env, recursive: bool) -> Result<EgclVal, Eg
                     // The exits visible HERE, where the function is written —
                     // not where a later `#'name` is evaluated (bliss-wfxx).
                     defining_blocks: Some((env.block_stack.clone(), env.tag_stack.clone())),
+                    defining_frame: Some(Arc::clone(&env.frame)),
+                    defining_specials: env.locally_specials.clone(),
                 },
             );
         }
@@ -29796,6 +29885,13 @@ fn bind_lambda_list(
 /// all applicable methods' keyword parameters, so an individual method must not
 /// reject a keyword another applicable method declares (bliss-lb6.14: ASDF's
 /// OPERATE :around declares :verbose, the primary method does not).
+fn bind_lexical_parameter(env: &mut Env, name: &str, value: EgclVal) {
+    env.define_local(name, value);
+    if let Some(index) = egcl_rt::symbols::find_index(name) {
+        shadow_locally_special(env, EgclVal::from_symbol_index(index));
+    }
+}
+
 fn bind_lambda_list_ex(
     params_form: EgclVal,
     args: &[EgclVal],
@@ -29874,14 +29970,15 @@ fn bind_lambda_list_ex(
                 })?;
                 arg_i += 1;
                 env.define_local_symbol(elem, v);
+                shadow_locally_special(env, elem);
             }
             Mode::Opt => {
                 let (var, default_form, supp) = parse_var_spec(elem);
                 if arg_i < args.len() {
-                    env.define_local(&var, args[arg_i]);
+                    bind_lexical_parameter(env, &var, args[arg_i]);
                     arg_i += 1;
                     if let Some(sp) = supp {
-                        env.define_local(&sp, T);
+                        bind_lexical_parameter(env, &sp, T);
                     }
                 } else {
                     let dv = if default_form == NIL {
@@ -29889,9 +29986,9 @@ fn bind_lambda_list_ex(
                     } else {
                         eval_form(default_form, env)?
                     };
-                    env.define_local(&var, dv);
+                    bind_lexical_parameter(env, &var, dv);
                     if let Some(sp) = supp {
-                        env.define_local(&sp, NIL);
+                        bind_lexical_parameter(env, &sp, NIL);
                     }
                 }
             }
@@ -29902,7 +29999,7 @@ fn bind_lambda_list_ex(
                     ));
                 }
                 let remaining = args.get(arg_i..).unwrap_or(&[]);
-                env.define_local(&sym_name(elem), vec_to_list(remaining));
+                bind_lexical_parameter(env, &sym_name(elem), vec_to_list(remaining));
                 key_start.get_or_insert(arg_i);
                 rest_bound = true;
             }
@@ -29960,16 +30057,16 @@ fn bind_lambda_list_ex(
 
         for (kw_bare, var, default_idx, supp) in &key_specs {
             if let Some(v) = find_key_arg(tail, kw_bare) {
-                env.define_local(var, v);
+                bind_lexical_parameter(env, var, v);
                 if let Some(sp) = supp {
-                    env.define_local(sp, T);
+                    bind_lexical_parameter(env, sp, T);
                 }
             } else {
                 let df = key_default_forms[*default_idx];
                 let dv = if df == NIL { NIL } else { eval_form(df, env)? };
-                env.define_local(var, dv);
+                bind_lexical_parameter(env, var, dv);
                 if let Some(sp) = supp {
-                    env.define_local(sp, NIL);
+                    bind_lexical_parameter(env, sp, NIL);
                 }
             }
         }
@@ -30003,7 +30100,7 @@ fn bind_lambda_list_ex(
     for i in 0..aux_vars.len() {
         let df = aux_default_forms[i];
         let dv = if df == NIL { NIL } else { eval_form(df, env)? };
-        env.define_local(&aux_vars[i], dv);
+        bind_lexical_parameter(env, &aux_vars[i], dv);
     }
 
     Ok(())
@@ -31293,6 +31390,7 @@ fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Eg
             params_form,
             body,
             captured_frame: Arc::clone(&env.frame),
+            captured_specials: env.locally_specials.clone(),
             captured_blocks: env.block_stack.clone(),
             captured_tags: env.tag_stack.clone(),
             captured_funs: Some(Arc::clone(&env.funs)),
@@ -31400,6 +31498,7 @@ fn invoke_compiler_macro_function(
         .ok_or_else(|| EgclError::ProgramError("missing compiler macro definition".into()))?;
     egcl_rt::rooted_ref!(_closure_root = &mut closure);
     env.frame = Arc::clone(&closure.captured_frame);
+    env.locally_specials = closure.captured_specials.clone();
     env.block_stack = closure.captured_blocks.clone();
     env.tag_stack = closure.captured_tags.clone();
     if let Some(funs) = &closure.captured_funs {
@@ -34870,6 +34969,7 @@ fn apply_function(
             }
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
+                egcl_rt::rooted!(closure = closure);
                 // Run the body against the closure's LEXICAL block/tagbody exit
                 // points, not the caller's dynamic ones (bliss-4u5u): a
                 // `(return-from tag …)` in the body must target the block the
@@ -34889,17 +34989,13 @@ fn apply_function(
                         SuspendedFunsRoot(std::mem::replace(&mut env.funs, Arc::clone(funs)))
                     })
                 );
-                let result = eval_lambda_call_ex(
-                    env,
-                    closure.params_form,
-                    closure.body,
-                    args,
-                    Arc::clone(&closure.captured_frame),
-                    LexicalControl::Captured(
-                        closure.captured_blocks.clone(),
-                        closure.captured_tags.clone(),
-                    ),
-                );
+                let result = with_special_declarations(env, closure.captured_specials.clone(), |env| {
+                    eval_lambda_call_ex(
+                        env, closure.params_form, closure.body, args,
+                        Arc::clone(&closure.captured_frame),
+                        LexicalControl::Captured(closure.captured_blocks.clone(), closure.captured_tags.clone()),
+                    )
+                });
                 if let Some(previous) = saved_funs.as_ref() {
                     env.funs = Arc::clone(&previous.0);
                 }
@@ -39159,6 +39255,7 @@ mod env_gc_root_tests {
                 params_form: NIL,
                 body: NIL,
                 captured_frame: Arc::clone(&env.frame),
+                captured_specials: env.locally_specials.clone(),
                 captured_blocks: vec![],
                 captured_tags: vec![],
                 captured_funs: None,
@@ -39243,7 +39340,7 @@ mod env_gc_root_tests {
     }
 
     const BASE: i64 = 900_000_000;
-    const ROOT_COUNT: i64 = 41;
+    const ROOT_COUNT: i64 = 42;
     const RELOCATION_DELTA: i64 = 10_000;
 
     fn marker(offset: i64) -> EgclVal {
@@ -39384,6 +39481,7 @@ mod env_gc_root_tests {
                 params_form: marker(25),
                 body: marker(26),
                 captured_frame: Arc::clone(&parent),
+                captured_specials: Vec::new(),
                 captured_blocks: Vec::new(),
                 captured_tags: Vec::new(),
                 // A closure's captured function namespace holds FunDefs whose
@@ -39406,6 +39504,12 @@ mod env_gc_root_tests {
                             FunDef::plain(Vec::new(), marker(39), marker(40)),
                         )])))),
                         defining_blocks: None,
+                        defining_frame: Some({
+                            let mut frame = EnvFrame::default();
+                            frame.vars.insert("definition-only".into(), marker(41));
+                            Arc::new(SharedCell::new(frame))
+                        }),
+                        defining_specials: Vec::new(),
                     },
                 )])))),
             },
