@@ -752,6 +752,37 @@ fn find_typep_class(type_name: &str) -> Option<u16> {
 /// which is exactly the BOOLEAN type. UIOP's ensure-symbol/ensure-inherited
 /// `(check-type x (member nil t))` expands to `(typep x '(member nil t))`, so
 /// this constant compound is worth inlining on the O(n²) package path.
+/// `(size position)` when LDB's argument list is exactly `((byte S P) value)`
+/// with S and P non-negative literal fixnums, for the open-coding in
+/// `lower_call`. Anything else -- a computed specifier, a variable holding one,
+/// a wrong argument count -- yields None and takes the ordinary call path.
+fn literal_byte_spec(args: EgclVal) -> Option<(u32, u32)> {
+    if !args.is_cons() {
+        return None;
+    }
+    let (spec, rest) = cp(args);
+    // Exactly two arguments to LDB, and the first a (BYTE _ _) form.
+    if !rest.is_cons() || !cp(rest).1.is_nil() || !spec.is_cons() {
+        return None;
+    }
+    let (head, spec_args) = cp(spec);
+    if !head.is_symbol() || sym_bare_name_rc(head).as_ref() != "BYTE" || !spec_args.is_cons() {
+        return None;
+    }
+    let (size, after_size) = cp(spec_args);
+    if !after_size.is_cons() || !cp(after_size).1.is_nil() {
+        return None;
+    }
+    let position = cp(after_size).0;
+    if !size.is_fixnum() || !position.is_fixnum() {
+        return None;
+    }
+    match (u32::try_from(size.as_fixnum()), u32::try_from(position.as_fixnum())) {
+        (Ok(size), Ok(position)) => Some((size, position)),
+        _ => None,
+    }
+}
+
 fn is_member_nil_t(form: EgclVal) -> bool {
     if !form.is_cons() {
         return false;
@@ -3211,6 +3242,58 @@ impl<'e> Lowerer<'e> {
             self.pop_n(nargs);
             self.push_n(1);
             return Ok(());
+        }
+        // `(ldb (byte S P) X)` with a literal byte specifier reduces to
+        // `(logand (ash X -P) mask)`, so emit that instead of calling LDB.
+        //
+        // This is the inner loop of every hash and cipher: Ironclad's mod32+,
+        // rol32 and mod32ash are all LDB, which is why SHA-256 is unusable here
+        // (bliss-omaps). Measured per call, release build, promoted loop: the
+        // boot.lisp LDB costs ~7.1 us -- a cons for the specifier, then
+        // byte-size, byte-position, ash, logand and 1- as separate interpreted
+        // calls -- against ~0.17 us for the LOGAND it reduces to.
+        //
+        // A local LDB or BYTE shadow was already handled above (local_fns /
+        // closure_fns), and redefining a standard function is undefined
+        // behaviour (CLHS 11.1.2.1.2), so the standard meanings hold here.
+        if name == "LDB" {
+            if let Some((size, pos)) = literal_byte_spec(rest) {
+                // Only when the mask survives as a fixnum. A wider field would
+                // need a bignum constant built during lowering; let LDB handle
+                // those. Round-trip rather than assume a tag width: `i64` holds
+                // (1<<62)-1 but an EgclVal fixnum does not, and the wrap made
+                // `(ldb (byte 62 0) x)` mask with -1 and return x unchanged.
+                if let Some(mask) = 1i64
+                    .checked_shl(size)
+                    .map(|m| m - 1)
+                    .filter(|&m| EgclVal::from_fixnum(m).as_fixnum() == m)
+                {
+                    let (_, args) = cp(rest);
+                    let value = cp(args).0;
+                    let ash = resolve_sym("ASH").ok_or(Bail)?.as_symbol_index();
+                    let logand = resolve_sym("LOGAND").ok_or(Bail)?.as_symbol_index();
+                    self.lower_expr(value)?;
+                    // Skip the shift entirely for position 0, the common case.
+                    if pos != 0 {
+                        let c = self.add_const(EgclVal::from_fixnum(-i64::from(pos)));
+                        self.emit(Instr::Const(c));
+                        self.push_n(1);
+                        self.emit(Instr::CallNamed { sym: ash, nargs: 2 });
+                        self.pop_n(2);
+                        self.push_n(1);
+                    }
+                    let c = self.add_const(EgclVal::from_fixnum(mask));
+                    self.emit(Instr::Const(c));
+                    self.push_n(1);
+                    self.emit(Instr::CallNamed {
+                        sym: logand,
+                        nargs: 2,
+                    });
+                    self.pop_n(2);
+                    self.push_n(1);
+                    return Ok(());
+                }
+            }
         }
         // A macro: expand one level (with the same macro functions the
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
