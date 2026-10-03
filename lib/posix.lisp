@@ -6,7 +6,7 @@
   (:use #:cl)
   (:shadow #:open #:close)
   (:export #:syscall-error #:syscall-errno #:syscall-name #:raw-syscall
-           #:getpid #:getppid #:kill #:waitpid #:open #:close #:o-rdonly
+           #:strerror #:getpid #:getppid #:kill #:waitpid #:open #:close #:o-rdonly
            #:getpagesize #:mmap #:munmap #:prot-read #:prot-write #:prot-none
            #:map-shared #:map-private #:map-anon
            #:stat #:stat-dev #:stat-ino #:stat-mode #:stat-nlink #:stat-uid #:stat-gid
@@ -29,6 +29,9 @@
     (when errno (error 'syscall-error :name operation :errno errno))
     (values result secondary)))
 
+(defun strerror (errno)
+  "Return a fresh string describing the native error number ERRNO."
+  (nth-value 0 (%checked-call :strerror errno)))
 (defun getpid () (nth-value 0 (%checked-call :getpid)))
 (defun raw-syscall (number &rest arguments)
   "Call a Linux syscall with up to six native words or foreign pointers.

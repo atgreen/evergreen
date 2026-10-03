@@ -215,3 +215,32 @@ fn raw_syscall_returns_errno_and_writes_foreign_storage() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("RAW-SYSCALL-OK"));
 }
+
+#[test]
+fn posix_strerror_returns_owned_messages() {
+    let source = r#"
+      (require :egcl-posix)
+      (let ((first (egcl-posix:strerror 9)))
+        (assert (search "file descriptor" first :test #'char-equal))
+        (assert (plusp (length (egcl-posix:strerror 2))))
+        (assert (string= first (egcl-posix:strerror 9)))
+        (setf (char first 0) #\X)
+        (assert (not (char= #\X (char (egcl-posix:strerror 9) 0)))))
+      (assert (plusp (length (egcl-posix:strerror -1))))
+      (assert (handler-case (progn (egcl-posix:strerror "bad") nil)
+                (type-error () t)))
+      (format t "POSIX-STRERROR-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env("LC_ALL", "C")
+        .args(["--no-init", "--eval", source])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("POSIX-STRERROR-OK"));
+}

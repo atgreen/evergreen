@@ -80,6 +80,32 @@ pub fn call(args: &[EgclVal]) -> Result<[EgclVal; 3], EgclError> {
             errno = error.map(fix).unwrap_or(NIL);
             egcl_rt::bignum::BigInt::from_i64(result as i64).to_val()
         }
+        ("STRERROR", [code]) => {
+            let code = integer(*code)?;
+            let mut buffer = vec![0u8; 128];
+            let text = loop {
+                // SAFETY: strerror_r writes at most buffer.len() bytes to this
+                // owned buffer. Unlike strerror it does not share static storage.
+                let status =
+                    unsafe { libc::strerror_r(code, buffer.as_mut_ptr().cast(), buffer.len()) };
+                if status == libc::ERANGE {
+                    buffer.resize(buffer.len() * 2, 0);
+                    continue;
+                }
+                let length = buffer
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(buffer.len());
+                break if length == 0 {
+                    format!("Unknown error {code}")
+                } else {
+                    String::from_utf8_lossy(&buffer[..length]).into_owned()
+                };
+            };
+            // All data needed after this allocation is native owned storage;
+            // no unrooted Lisp value or shared libc buffer crosses it.
+            crate::streams::make_lisp_string_fresh(&text)
+        }
         // These libc calls have no pointer arguments and cannot fail.
         ("GETPID", []) => fix(unsafe { libc::getpid() }),
         ("GETPPID", []) => fix(unsafe { libc::getppid() }),
