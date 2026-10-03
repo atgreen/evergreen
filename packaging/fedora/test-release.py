@@ -47,15 +47,18 @@ class ReleaseTests(unittest.TestCase):
     def test_missing_duplicate_or_wrong_build_rpm_blocks_publication(self):
         records = [(name, '0.0.1', '0.test.123.1.fc44', 'x86_64')
                    for name in sorted(release.PACKAGES)]
-        release.validate_packages(records, '0.0.1', '0.test.123.1')
+        release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc44')
         for bad in [records[:-1], records + [records[0]],
                     records[:-1] + [('egcl-static', '0.0.2', '6.fc44', 'x86_64')]]:
             with self.subTest(records=bad), self.assertRaises(ValueError):
-                release.validate_packages(bad, '0.0.1', '0.test.123.1')
+                release.validate_packages(bad, '0.0.1', '0.test.123.1', '.fc44')
+        # Packages built for another Fedora are not this release's packages.
+        with self.assertRaises(ValueError):
+            release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc45')
 
     def test_provenance_rejects_mixed_source_rpms_and_missing_or_duplicate_runtimes(self):
         record = {'git': 'abc', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44',
-                  'srpm_sha256': 'source-hash', 'rpms': [],
+                  'dist': '.fc44', 'srpm_sha256': 'source-hash', 'rpms': [],
                   'artifacts': {name: name for name in release.RUNTIMES}}
         release.merge_provenance([record], 'source-hash')
         for records in ([record], [], [record, record],
@@ -79,6 +82,7 @@ class ReleaseTests(unittest.TestCase):
             source_rpm.write_bytes(b'source archive')
             provenance.write_text(json.dumps({
                 'git': 'test-commit', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44',
+                'dist': '.fc44',
                 'artifacts': {name: name for name in release.RUNTIMES}, 'rpms': [],
                 'srpm_sha256': hashlib.sha256(source_rpm.read_bytes()).hexdigest(),
             }))
@@ -106,6 +110,33 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, '10 RPMs'):
                     release.collect(rpms, root / 'incomplete', plan, source_rpm, provenance.parent)
                 self.assertFalse((root / 'incomplete').exists())
+
+
+    def test_stable_release_is_paired_with_its_version(self):
+        version, number = release.RPM_RELEASE
+        self.assertEqual(release.stable_release(version), number)
+        # A version bump must fail loudly rather than reuse the old release.
+        with self.assertRaisesRegex(ValueError, 'resets Release'):
+            release.stable_release('99.0.0')
+        with self.assertRaisesRegex(ValueError, 'resets Release'):
+            release.make_plan('99.0.0', 'push', 'refs/tags/v99.0.0', '1', '1', '')
+
+    def test_spec_fallback_release_matches_release_py(self):
+        """The two must not drift: a local rpmbuild would produce a different NVR."""
+        spec = Path(__file__).with_name('egcl.spec').read_text()
+        self.assertIn(f'%{{!?egcl_release:%global egcl_release {release.RPM_RELEASE[1]}}}', spec)
+
+    def test_dist_comes_from_the_builders_not_a_literal(self):
+        """A Fedora 45 build must validate against .fc45 without a code change."""
+        record = {'git': 'abc', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc45',
+                  'dist': '.fc45', 'srpm_sha256': 'h', 'rpms': [],
+                  'artifacts': {name: name for name in release.RUNTIMES}}
+        self.assertEqual(release.merge_provenance([record], 'h')['dist'], '.fc45')
+        records = [(name, '0.0.1', '6.fc45', 'x86_64') for name in sorted(release.PACKAGES)]
+        release.validate_packages(records, '0.0.1', '6', '.fc45')
+        # Builders that disagree about their environment must not be merged.
+        with self.assertRaisesRegex(ValueError, 'dist'):
+            release.merge_provenance([record, record | {'dist': '.fc44'}], 'h')
 
 
 class SigningTests(unittest.TestCase):

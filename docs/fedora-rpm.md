@@ -165,9 +165,15 @@ workflow's `fedora44-rpms` artifact without creating a tag or GitHub release.
 
 For a stable release, update the workspace version and changelog, commit them,
 then push a matching version tag, for example `v0.0.1`. The workflow rejects a
-tag that differs from the workspace version. Stable RPMs use the spec's release
-number (currently `6.fc44`). An existing release is never overwritten; a failed
-upload can leave a draft for inspection before retrying.
+tag that differs from the workspace version. Stable RPMs take their release
+number from `RPM_RELEASE` in `packaging/fedora/release.py`, which is paired with
+the version it belongs to: bumping the workspace version without resetting that
+pair (and the spec's matching `%egcl_release` fallback) fails the plan rather
+than shipping a release number Fedora would consider stale. The `%dist` suffix
+comes from the build container and is recorded in build provenance, so the
+collector validates package identity without a hardcoded Fedora version. An
+existing release is never overwritten; a failed upload can leave a draft for
+inspection before retrying.
 
 Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
 release metadata, the `RPM-GPG-KEY-egcl` public key, and `SHA256SUMS` with its

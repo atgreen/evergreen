@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import subprocess
@@ -15,6 +16,18 @@ ROOT = Path(__file__).resolve().parents[2]
 BUILDER = runpy.run_path(str(Path(__file__).with_name('build.py')))
 MUSL = runpy.run_path(str(Path(__file__).with_name('prepare-musl.py')))
 OUTPUT = ROOT / 'target/fedora-rpm'
+
+
+def substitute(spec, pattern, replacement):
+    """Rewrite one spec line, failing if the line it targets is not there.
+
+    str.replace is silent when it matches nothing, which would hand rpmbuild a
+    spec still carrying %{egcl_version} or the fallback release number.
+    """
+    rewritten, count = re.subn(pattern, lambda _: replacement, spec, count=1)
+    if count != 1:
+        raise ValueError(f'Spec line not found for substitution: {pattern}')
+    return rewritten
 
 
 def create(plan, output=OUTPUT):
@@ -28,9 +41,12 @@ def create(plan, output=OUTPUT):
                    f'llvmorg-{version}/libunwind-{version}.src.tar.xz',
                    MUSL['UNWIND_SHA256'], f'libunwind-{version}.src')
     spec = Path(__file__).with_name('egcl.spec').read_text()
-    spec = spec.replace('Version: %{egcl_version}', f'Version: {plan["version"]}')
-    spec = spec.replace('%{!?egcl_release:%global egcl_release 6}',
-                        f'%global egcl_release {plan["rpm_release"]}')
+    spec = substitute(spec, r'Version: %\{egcl_version\}', f'Version: {plan["version"]}')
+    # Matches any fallback number, so changing the spec's %egcl_release (which
+    # happens on every version bump) cannot silently stop this substitution and
+    # leave the SRPM carrying the fallback instead of the planned release.
+    spec = substitute(spec, r'%\{!\?egcl_release:%global egcl_release \d+\}',
+                      f'%global egcl_release {plan["rpm_release"]}')
     specs = output / 'SPECS'
     specs.mkdir(exist_ok=True)
     path = specs / 'egcl.spec'

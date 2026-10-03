@@ -17,6 +17,16 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_KEY = Path(__file__).resolve().with_name('RPM-GPG-KEY-egcl')
 GPG_KEY_NAME = 'EGCL RPM Signing Key'
+# Fedora requires Release to restart at 1 when Version changes, so the stable
+# release number is PAIRED with the version it belongs to: bumping the workspace
+# version without updating this fails `release.py plan` instead of quietly
+# shipping 0.0.2-6. egcl.spec's %egcl_release fallback must match the number
+# here, which test-release.py checks.
+#
+# Not rpmautospec's %autorelease, and not commit counting: the release jobs use
+# actions/checkout at its default depth of 1, where counting commits since the
+# version last changed cannot work. A pinned pair fails loudly instead.
+RPM_RELEASE = ('0.0.1', '6')
 PACKAGES = {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
             'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
             'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
@@ -32,7 +42,7 @@ def make_plan(version, event, ref, run_id, attempt, mode):
         if ref != f'refs/tags/v{version}':
             raise ValueError('Release tag must match the workspace version')
         return {'tag': f'v{version}', 'version': version, 'prerelease': False,
-                'publish': True, 'rpm_release': '6'}
+                'publish': True, 'rpm_release': stable_release(version)}
     if event != 'workflow_dispatch' or mode not in ('test', 'build'):
         raise ValueError('Use a version tag, or manually select test/build')
     if not re.fullmatch(r'[1-9]\d*', run_id) or not re.fullmatch(r'[1-9]\d*', attempt):
@@ -42,11 +52,22 @@ def make_plan(version, event, ref, run_id, attempt, mode):
             'rpm_release': f'0.test.{run_id}.{attempt}'}
 
 
-def validate_packages(records, version, rpm_release):
+def stable_release(version):
+    """The release number for a stable tag, refusing a stale pairing."""
+    paired_version, release = RPM_RELEASE
+    if version != paired_version:
+        raise ValueError(
+            f'RPM_RELEASE is pinned to version {paired_version}, but the workspace '
+            f'is {version}. Fedora resets Release on a version change: set '
+            f"RPM_RELEASE = ('{version}', '1') and egcl.spec's %egcl_release to 1.")
+    return release
+
+
+def validate_packages(records, version, rpm_release, dist):
     """Fail before publishing if even one package is missing or from another build."""
     names = []
     for name, actual_version, actual_release, arch in records:
-        if (actual_version, actual_release, arch) != (version, f'{rpm_release}.fc44', 'x86_64'):
+        if (actual_version, actual_release, arch) != (version, f'{rpm_release}{dist}', 'x86_64'):
             raise ValueError(f'Unexpected RPM identity: {name} {actual_version}-{actual_release}.{arch}')
         names.append(name)
     if len(names) != len(PACKAGES) or set(names) != PACKAGES:
@@ -59,7 +80,7 @@ def merge_provenance(records, srpm_sha256):
     for record in records:
         if record['srpm_sha256'] != srpm_sha256:
             raise ValueError('Builders used different source RPMs')
-        for key in ('git', 'rustc', 'sysroot_release'):
+        for key in ('git', 'rustc', 'sysroot_release', 'dist'):
             if key in merged and merged[key] != record[key]:
                 raise ValueError(f'Builders disagree on {key}')
             merged[key] = record[key]
@@ -80,6 +101,13 @@ def merge_provenance(records, srpm_sha256):
 
 
 def collect(rpm_dir, destination, plan, source_rpm, provenance_dir):
+    with source_rpm.open('rb') as stream:
+        source_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    # Merge first: the builders' agreed %dist is what package identity is
+    # checked against, so it has to be known before validating anything.
+    provenance = merge_provenance(
+        [json.loads(path.read_text()) for path in sorted(provenance_dir.glob('*.json'))], source_digest)
+    dist = provenance['dist']
     rpms = sorted(rpm_dir.glob('*.rpm'))
     records = []
     for rpm in rpms:
@@ -87,15 +115,11 @@ def collect(rpm_dir, destination, plan, source_rpm, provenance_dir):
             ['rpm', '-qp', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}', str(rpm)],
             text=True)
         records.append(identity.split('\t'))
-    validate_packages(records, plan['version'], plan['rpm_release'])
+    validate_packages(records, plan['version'], plan['rpm_release'], dist)
     identity = subprocess.check_output(
         ['rpm', '-qp', '--queryformat', '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{SOURCEPACKAGE}', str(source_rpm)], text=True)
-    if identity.split('\t') != ['egcl', plan['version'], f'{plan["rpm_release"]}.fc44', '1']:
+    if identity.split('\t') != ['egcl', plan['version'], f'{plan["rpm_release"]}{dist}', '1']:
         raise ValueError(f'Unexpected source RPM identity: {identity}')
-    with source_rpm.open('rb') as stream:
-        source_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    provenance = merge_provenance(
-        [json.loads(path.read_text()) for path in sorted(provenance_dir.glob('*.json'))], source_digest)
     destination.mkdir(parents=True, exist_ok=True)
     # A fresh destination prevents stale files being attached to a new release.
     if any(destination.iterdir()):

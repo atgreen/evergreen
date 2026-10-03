@@ -45,6 +45,9 @@
 
 Name: egcl
 Version: %{egcl_version}
+# Fallback for a local rpmbuild; the release jobs always pass --define. Keep it
+# equal to release.py's RPM_RELEASE, which test-release.py enforces, and reset
+# both to 1 whenever Version changes.
 %{!?egcl_release:%global egcl_release 6}
 Release: %{egcl_release}%{?dist}
 Summary: Evergreen Common Lisp — a tiered JIT and saved executable images

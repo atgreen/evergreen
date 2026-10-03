@@ -80,6 +80,11 @@ def build(args):
             head += '-dirty'
     provenance = {'git': head,
                   'rustc': subprocess.check_output(['rustc', '--version'], text=True, env=env).strip(),
+                  # The real %dist of the build environment, so the release
+                  # collector can check package identity without a hardcoded
+                  # Fedora version. NOT sysroot_release, which names the cross
+                  # sysroot directory and only happens to read the same.
+                  'dist': subprocess.check_output(['rpm', '--eval', '%dist'], text=True).strip(),
                   'sysroot_release': args.sysroot_release,
                   'android_ndk': ((ndk / 'source.properties').read_text()
                                   if 'android' in targets else None), 'artifacts': {}}
