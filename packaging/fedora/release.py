@@ -27,12 +27,27 @@ GPG_KEY_NAME = 'EGCL RPM Signing Key'
 # actions/checkout at its default depth of 1, where counting commits since the
 # version last changed cannot work. A pinned pair fails loudly instead.
 RPM_RELEASE = ('0.0.1', '6')
-PACKAGES = {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
-            'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
-            'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
-            'egcl-target-ppc64le-linux-static'}
+# A complete release is every package of every architecture: x86_64 carries the
+# cross-targeting set, ppc64le the two POWER-native runtimes. Keep in step with
+# egcl.spec's ExclusiveArch and its `%ifarch x86_64` guard. A build group that
+# fails still blocks publication -- a partial release is not a release.
+PACKAGES_BY_ARCH = {
+    'x86_64': {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
+               'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
+               'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
+               'egcl-target-ppc64le-linux-static'},
+    'ppc64le': {'egcl', 'egcl-static'},
+}
+PACKAGES = set().union(*PACKAGES_BY_ARCH.values())
+PACKAGE_COUNT = sum(len(names) for names in PACKAGES_BY_ARCH.values())
+# Provenance artifact keys. The x86_64 builders name their payloads after the
+# build.py target; a non-x86_64 builder prefixes its arch, because `native` and
+# `static` mean a different binary on each host and the collector merges every
+# builder's record into one build.json.
 RUNTIMES = {'native', 'static'} | {name.removeprefix('egcl-target-')
-                                 for name in PACKAGES if name.startswith('egcl-target-')}
+                                 for name in PACKAGES if name.startswith('egcl-target-')} \
+         | {f'{arch}-{name}' for arch in PACKAGES_BY_ARCH if arch != 'x86_64'
+            for name in ('native', 'static')}
 
 
 def make_plan(version, event, ref, run_id, attempt, mode):
@@ -65,13 +80,21 @@ def stable_release(version):
 
 def validate_packages(records, version, rpm_release, dist):
     """Fail before publishing if even one package is missing or from another build."""
-    names = []
+    by_arch = {}
     for name, actual_version, actual_release, arch in records:
-        if (actual_version, actual_release, arch) != (version, f'{rpm_release}{dist}', 'x86_64'):
+        if (actual_version, actual_release) != (version, f'{rpm_release}{dist}'):
             raise ValueError(f'Unexpected RPM identity: {name} {actual_version}-{actual_release}.{arch}')
-        names.append(name)
-    if len(names) != len(PACKAGES) or set(names) != PACKAGES:
-        raise ValueError(f'Expected all {len(PACKAGES)} RPMs, got: {sorted(names)}')
+        if arch not in PACKAGES_BY_ARCH:
+            raise ValueError(f'Unexpected RPM architecture: {name} {actual_version}-{actual_release}.{arch}')
+        by_arch.setdefault(arch, []).append(name)
+    if missing := sorted(set(PACKAGES_BY_ARCH) - set(by_arch)):
+        raise ValueError(f'No packages at all for: {", ".join(missing)}')
+    for arch, names in sorted(by_arch.items()):
+        expected = PACKAGES_BY_ARCH[arch]
+        # The length test is not redundant with the set test: it is what
+        # catches the same package appearing twice for one architecture.
+        if len(names) != len(expected) or set(names) != expected:
+            raise ValueError(f'Expected all {len(expected)} {arch} RPMs, got: {sorted(names)}')
 
 
 def merge_provenance(records, srpm_sha256):
@@ -95,12 +118,14 @@ def merge_provenance(records, srpm_sha256):
             merged['artifacts'][name] = digest
         inputs.update(record['rpms'])
     if set(merged['artifacts']) != RUNTIMES:
-        raise ValueError('Provenance must cover all ten runtimes')
+        missing = sorted(RUNTIMES - set(merged['artifacts']))
+        raise ValueError(f'Provenance must cover all {len(RUNTIMES)} runtimes; '
+                         f'missing: {", ".join(missing) or "none"}')
     merged['rpms'] = sorted(inputs)
     return merged
 
 
-def collect(rpm_dir, destination, plan, source_rpm, provenance_dir, sbom=None):
+def collect(rpm_dirs, destination, plan, source_rpm, provenance_dir, sbom=None):
     with source_rpm.open('rb') as stream:
         source_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     # Merge first: the builders' agreed %dist is what package identity is
@@ -108,7 +133,12 @@ def collect(rpm_dir, destination, plan, source_rpm, provenance_dir, sbom=None):
     provenance = merge_provenance(
         [json.loads(path.read_text()) for path in sorted(provenance_dir.glob('*.json'))], source_digest)
     dist = provenance['dist']
-    rpms = sorted(rpm_dir.glob('*.rpm'))
+    # One directory per architecture (rpmbuild writes RPMS/<arch>/), so sort by
+    # filename across all of them rather than by directory.
+    rpms = sorted((rpm for directory in rpm_dirs for rpm in directory.glob('*.rpm')),
+                  key=lambda path: path.name)
+    if len({rpm.name for rpm in rpms}) != len(rpms):
+        raise ValueError('Two build groups produced the same RPM filename')
     records = []
     for rpm in rpms:
         identity = subprocess.check_output(
@@ -157,8 +187,8 @@ def sign(assets, passphrase_file, public_key=None, gpg='/usr/bin/gpg'):
     """
     public_key = public_key or PUBLIC_KEY
     rpms = sorted(assets.glob('*.rpm'))
-    if len(rpms) != len(PACKAGES) + 1:
-        raise ValueError(f'Expected {len(PACKAGES) + 1} packages to sign, got {len(rpms)}')
+    if len(rpms) != PACKAGE_COUNT + 1:
+        raise ValueError(f'Expected {PACKAGE_COUNT + 1} packages to sign, got {len(rpms)}')
     subprocess.run(
         ['rpmsign',
          # Debian/Ubuntu's rpm defaults %__gpg to /usr/bin/gpg2, which Ubuntu
@@ -234,7 +264,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('plan', 'collect', 'sign'))
     parser.add_argument('--plan', type=Path, default=Path('target/release-plan.json'))
-    parser.add_argument('--rpm-dir', type=Path, default=Path('target/fedora-rpm/RPMS/x86_64'))
+    # Repeatable: rpmbuild writes RPMS/<arch>/, so a release spanning two
+    # architectures hands the collector one directory for each.
+    parser.add_argument('--rpm-dir', type=Path, action='append', dest='rpm_dirs',
+                        metavar='DIR', help='Directory of built RPMs (repeat per architecture)')
     parser.add_argument('--destination', type=Path, default=Path('target/release-assets'))
     parser.add_argument('--source-rpm', type=Path)
     parser.add_argument('--provenance-dir', type=Path)
@@ -263,7 +296,9 @@ def main():
     else:
         if not args.source_rpm or not args.provenance_dir:
             parser.error('collect requires --source-rpm and --provenance-dir')
-        collect(args.rpm_dir, args.destination, json.loads(args.plan.read_text()),
+        rpm_dirs = args.rpm_dirs or [Path(f'target/fedora-rpm/RPMS/{arch}')
+                                     for arch in sorted(PACKAGES_BY_ARCH)]
+        collect(rpm_dirs, args.destination, json.loads(args.plan.read_text()),
                 args.source_rpm, args.provenance_dir, args.sbom)
 
 

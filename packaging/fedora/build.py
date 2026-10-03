@@ -230,7 +230,14 @@ def build(args):
             launcher = bin_dir / f'egcl-{name}'
             copy(Path(__file__).with_name('egcl-cross'), launcher)
             launcher.chmod(0o755)
-        provenance['artifacts'][name] = hashlib.sha256(destination.read_bytes()).hexdigest()
+        # `native` and `static` name a different binary on each build host, and
+        # the release collector merges every builder's record into one
+        # build.json -- so off x86_64 they carry an arch prefix rather than
+        # colliding. Cross-target names are already unambiguous. Must agree
+        # with release.py's RUNTIMES.
+        key = name if (HOST_MACHINE == 'x86_64' or name not in ('native', 'static')) \
+            else f'{HOST_MACHINE}-{name}'
+        provenance['artifacts'][key] = hashlib.sha256(destination.read_bytes()).hexdigest()
     provenance['rpms'] = sorted(p.name for p in (tools / 'rpms').glob('*.rpm'))
     docs = stage / 'usr/share/doc/egcl'
     docs.mkdir(parents=True, exist_ok=True)

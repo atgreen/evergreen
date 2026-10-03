@@ -16,6 +16,41 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 
+def complete_records(version='0.0.1', rpm_release='0.test.123.1', dist='.fc44'):
+    """Every package of every architecture: exactly what a release must carry."""
+    return [(name, version, f'{rpm_release}{dist}', arch)
+            for arch, names in sorted(release.PACKAGES_BY_ARCH.items())
+            for name in sorted(names)]
+
+
+def write_rpm_tree(root):
+    """A built tree in rpmbuild's shape: one RPMS/<arch>/ directory per arch.
+
+    `egcl` and `egcl-static` exist for both architectures, so the arch has to
+    be in the filename as well as the directory -- otherwise the two builds
+    would collide the moment the collector copies them into one asset folder.
+    """
+    directories = []
+    for arch, names in sorted(release.PACKAGES_BY_ARCH.items()):
+        directory = root / 'rpms' / arch
+        directory.mkdir(parents=True)
+        for name in sorted(names):
+            (directory / f'{name}.{arch}.rpm').write_bytes(f'{name}.{arch}'.encode())
+        directories.append(directory)
+    return directories
+
+
+def rpm_identity(source_rpm, version='0.0.1', rpm_release='0.test.123.1.fc44'):
+    """Stub `rpm -qp --queryformat`, reading name and arch back from the filename."""
+    def identity(command, **kwargs):
+        path = Path(command[-1])
+        if path == source_rpm:
+            return f'egcl\t{version}\t{rpm_release}\t1'
+        name, arch = path.name.removesuffix('.rpm').rsplit('.', 1)
+        return f'{name}\t{version}\t{rpm_release}\t{arch}'
+    return identity
+
+
 class ReleaseTests(unittest.TestCase):
     def test_tag_must_match_workspace_version(self):
         plan = release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.1', '123', '1', '')
@@ -45,16 +80,25 @@ class ReleaseTests(unittest.TestCase):
                 release.make_plan(*args)
 
     def test_missing_duplicate_or_wrong_build_rpm_blocks_publication(self):
-        records = [(name, '0.0.1', '0.test.123.1.fc44', 'x86_64')
-                   for name in sorted(release.PACKAGES)]
+        records = complete_records()
         release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc44')
         for bad in [records[:-1], records + [records[0]],
-                    records[:-1] + [('egcl-static', '0.0.2', '6.fc44', 'x86_64')]]:
+                    records[:-1] + [('egcl-static', '0.0.2', '6.fc44', 'x86_64')],
+                    # An unknown architecture is not quietly accepted.
+                    records + [('egcl', '0.0.1', '0.test.123.1.fc44', 'riscv64')]]:
             with self.subTest(records=bad), self.assertRaises(ValueError):
                 release.validate_packages(bad, '0.0.1', '0.test.123.1', '.fc44')
         # Packages built for another Fedora are not this release's packages.
         with self.assertRaises(ValueError):
             release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc45')
+
+    def test_every_architecture_must_be_present(self):
+        """A release is complete or it is not published: one arch is not enough."""
+        for arch in release.PACKAGES_BY_ARCH:
+            partial = [record for record in complete_records() if record[3] != arch]
+            with self.subTest(dropped=arch), \
+                    self.assertRaisesRegex(ValueError, f'No packages at all for: {arch}'):
+                release.validate_packages(partial, '0.0.1', '0.test.123.1', '.fc44')
 
     def test_provenance_rejects_mixed_source_rpms_and_missing_or_duplicate_runtimes(self):
         record = {'git': 'abc', 'rustc': 'rustc 1.94.1', 'sysroot_release': 'fc44',
@@ -71,10 +115,7 @@ class ReleaseTests(unittest.TestCase):
         plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            rpms = root / 'rpms'
-            rpms.mkdir()
-            for name in release.PACKAGES:
-                (rpms / f'{name}.rpm').write_bytes(name.encode())
+            rpms = write_rpm_tree(root)
             (root / 'CHANGELOG.md').write_text('Release notes\n')
             provenance = root / 'metadata/all.json'
             provenance.parent.mkdir(parents=True)
@@ -87,18 +128,16 @@ class ReleaseTests(unittest.TestCase):
                 'srpm_sha256': hashlib.sha256(source_rpm.read_bytes()).hexdigest(),
             }))
 
-            def identity(command, **kwargs):
-                if Path(command[-1]) == source_rpm:
-                    return 'egcl\t0.0.1\t0.test.123.1.fc44\t1'
-                return f'{Path(command[-1]).stem}\t0.0.1\t0.test.123.1.fc44\tx86_64'
-
             with patch.object(release, 'ROOT', root), patch.object(
-                    release.subprocess, 'check_output', side_effect=identity):
+                    release.subprocess, 'check_output',
+                    side_effect=rpm_identity(source_rpm)):
                 destination = root / 'assets'
                 release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 self.assertEqual(json.loads((destination / 'release.json').read_text()), plan)
                 entries = (destination / 'SHA256SUMS').read_text().splitlines()
-                self.assertEqual(len(entries), 15)
+                # Every binary RPM, the SRPM, CHANGELOG, the public key,
+                # build.json and release.json.
+                self.assertEqual(len(entries), release.PACKAGE_COUNT + 5)
                 self.assertIn(release.PUBLIC_KEY.name,
                               [entry.split('  ')[1] for entry in entries])
                 for entry in entries:
@@ -106,8 +145,8 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(digest, hashlib.sha256((destination / name).read_bytes()).hexdigest())
                 with self.assertRaisesRegex(ValueError, 'empty'):
                     release.collect(rpms, destination, plan, source_rpm, provenance.parent)
-                (rpms / 'egcl-static.rpm').unlink()
-                with self.assertRaisesRegex(ValueError, '10 RPMs'):
+                (root / 'rpms/x86_64/egcl-static.x86_64.rpm').unlink()
+                with self.assertRaisesRegex(ValueError, '10 x86_64 RPMs'):
                     release.collect(rpms, root / 'incomplete', plan, source_rpm, provenance.parent)
                 self.assertFalse((root / 'incomplete').exists())
 
@@ -116,10 +155,7 @@ class ReleaseTests(unittest.TestCase):
         plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '1', 'build')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            rpms = root / 'rpms'
-            rpms.mkdir()
-            for name in release.PACKAGES:
-                (rpms / f'{name}.rpm').write_bytes(name.encode())
+            rpms = write_rpm_tree(root)
             (root / 'CHANGELOG.md').write_text('notes\n')
             source_rpm = root / 'egcl.src.rpm'
             source_rpm.write_bytes(b'source archive')
@@ -132,13 +168,9 @@ class ReleaseTests(unittest.TestCase):
                 'artifacts': {name: name for name in release.RUNTIMES}, 'rpms': [],
                 'srpm_sha256': hashlib.sha256(source_rpm.read_bytes()).hexdigest()}))
 
-            def identity(command, **kwargs):
-                if Path(command[-1]) == source_rpm:
-                    return 'egcl\t0.0.1\t0.test.123.1.fc44\t1'
-                return f'{Path(command[-1]).stem}\t0.0.1\t0.test.123.1.fc44\tx86_64'
-
             with patch.object(release, 'ROOT', root), patch.object(
-                    release.subprocess, 'check_output', side_effect=identity):
+                    release.subprocess, 'check_output',
+                    side_effect=rpm_identity(source_rpm)):
                 destination = root / 'assets'
                 release.collect(rpms, destination, plan, source_rpm, provenance.parent, sbom)
             manifest = dict(line.split('  ')[::-1]
@@ -147,7 +179,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn(sbom.name, manifest)
             self.assertEqual(manifest[sbom.name],
                              hashlib.sha256(sbom.read_bytes()).hexdigest())
-            self.assertEqual(len(manifest), 16)
+            # As the no-SBOM case, plus the SBOM itself.
+            self.assertEqual(len(manifest), release.PACKAGE_COUNT + 6)
 
     def test_stable_release_is_paired_with_its_version(self):
         version, number = release.RPM_RELEASE
@@ -169,8 +202,7 @@ class ReleaseTests(unittest.TestCase):
                   'dist': '.fc45', 'srpm_sha256': 'h', 'rpms': [],
                   'artifacts': {name: name for name in release.RUNTIMES}}
         self.assertEqual(release.merge_provenance([record], 'h')['dist'], '.fc45')
-        records = [(name, '0.0.1', '6.fc45', 'x86_64') for name in sorted(release.PACKAGES)]
-        release.validate_packages(records, '0.0.1', '6', '.fc45')
+        release.validate_packages(complete_records('0.0.1', '6', '.fc45'), '0.0.1', '6', '.fc45')
         # Builders that disagree about their environment must not be merged.
         with self.assertRaisesRegex(ValueError, 'dist'):
             release.merge_provenance([record, record | {'dist': '.fc44'}], 'h')
@@ -179,7 +211,10 @@ class ReleaseTests(unittest.TestCase):
 class SigningTests(unittest.TestCase):
     """rpmsign and rpmkeys are stubbed; the container probes cover the real tools."""
 
-    def assets(self, directory, count=11):
+    def assets(self, directory, count=None):
+        # The signer expects every binary RPM of every architecture plus the
+        # shared SRPM, so derive the count rather than restating it.
+        count = release.PACKAGE_COUNT + 1 if count is None else count
         assets = Path(directory)
         for index in range(count):
             (assets / f'package{index}.rpm').write_bytes(f'package{index}'.encode())
@@ -226,7 +261,7 @@ class SigningTests(unittest.TestCase):
             assets = self.assets(directory, count=10)
             self.calls = []
             with patch.object(release.subprocess, 'run', side_effect=self.fake_rpm('')):
-                with self.assertRaisesRegex(ValueError, '11 packages'):
+                with self.assertRaisesRegex(ValueError, f'{release.PACKAGE_COUNT + 1} packages'):
                     release.sign(assets, Path('/tmp/pass'), public_key=Path('/tmp/key'))
             self.assertEqual(self.calls, [])
 

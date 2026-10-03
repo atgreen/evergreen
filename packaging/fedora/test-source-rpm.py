@@ -4,6 +4,7 @@
 
 import importlib.util
 from pathlib import Path
+import platform
 import unittest
 
 
@@ -68,22 +69,40 @@ class SubstituteTests(unittest.TestCase):
 
 
 class ExpectedPackageTests(unittest.TestCase):
+    # `native` and `static` are the two runtime names that do not simply take an
+    # egcl-target- prefix, which is the mapping worth pinning down.
+    NAMES = {
+        'native': ['egcl', 'egcl-static'],
+        'windows': ['egcl-target-windows'],
+        's390x': ['egcl-target-s390x-linux', 'egcl-target-s390x-linux-static'],
+    }
+
     def test_runtime_names_map_to_package_names(self):
-        self.assertEqual(source_rpm.expected_packages('native'), ['egcl', 'egcl-static'])
-        self.assertEqual(source_rpm.expected_packages('windows'), ['egcl-target-windows'])
-        self.assertEqual(source_rpm.expected_packages('s390x'),
-                         ['egcl-target-s390x-linux', 'egcl-target-s390x-linux-static'])
+        # Only the native group exists off x86_64 (build.py mirrors egcl.spec's
+        # %ifarch guard), and this file also runs in the spec's %check on the
+        # POWER builder -- so assert each group where that group is offered.
+        for group, packages in self.NAMES.items():
+            if group not in source_rpm.BUILDER['GROUPS']:
+                continue
+            with self.subTest(group=group):
+                self.assertEqual(source_rpm.expected_packages(group), packages)
+        self.assertIn('native', source_rpm.BUILDER['GROUPS'], 'every host builds the native group')
 
     def test_the_groups_together_produce_exactly_the_published_package_set(self):
-        """Cross-file invariant: build groups and release.py's PACKAGES agree.
+        """Cross-file invariant: build groups and release.py's packages agree.
 
         A group gaining a runtime without release.py learning its package name
         would otherwise only surface as a failed release, after a full build.
+
+        Compared against THIS host's package set, because both sides are
+        host-dependent: build.py offers only the native group off x86_64, and
+        release.py expects only the two native packages from such a host. This
+        test also runs inside the spec's %check, on the POWER builder included.
         """
         produced = [name for group in source_rpm.BUILDER['GROUPS']
                     for name in source_rpm.expected_packages(group)]
         self.assertEqual(len(produced), len(set(produced)), 'a package is built by two groups')
-        self.assertEqual(set(produced), release.PACKAGES)
+        self.assertEqual(set(produced), release.PACKAGES_BY_ARCH[platform.machine()])
 
     def test_every_group_covers_only_known_runtimes(self):
         for group, runtimes in source_rpm.BUILDER['GROUPS'].items():
