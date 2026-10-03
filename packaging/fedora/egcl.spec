@@ -28,7 +28,7 @@
 # POWER or Z build therefore produces the two native runtimes and nothing else
 # -- guarded here rather than left to the builder always passing
 # `--define 'egcl_build_group native'`, so an `all` build on a non-x86_64 host
-# degrades to the native group instead of failing deep inside %build.
+# degrades to the native group instead of failing deep inside the build.
 %ifarch x86_64
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "s390x"
 %global egcl_s390x 1
@@ -84,7 +84,7 @@ Requires: coreutils
 BuildRequires: cargo
 %endif
 # x86_64 is the full release, with every cross-target subpackage. ppc64le is
-# POWER-native: the two runtimes only (see the %ifarch guard above). Keep this
+# POWER-native: the two runtimes only (see the ifarch guard above). Keep this
 # list in step with release.py's PACKAGES_BY_ARCH, which the collector enforces.
 ExclusiveArch: x86_64 ppc64le
 
@@ -328,9 +328,10 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %{_bindir}/egcl-android-new
 %{_libexecdir}/egcl/android
 # The APK builder, in the tree ASDF's default source registry already searches.
-# egcl owns these two directories as well; sharing directory ownership is how
-# the other subpackages treat %{_libexecdir}/egcl, and this subpackage Requires
-# egcl anyway.
+# The egcl package owns these two directories as well; sharing directory
+# ownership is how the other subpackages treat the libexec egcl directory, and
+# this subpackage Requires egcl anyway. (No macro names in this comment: rpm
+# expands them even here, and rpmlint fails the release on it.)
 %dir %{_datadir}/common-lisp
 %dir %{_datadir}/common-lisp/source
 %{_datadir}/common-lisp/source/egcl-apk
