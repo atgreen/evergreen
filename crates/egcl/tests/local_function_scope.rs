@@ -79,3 +79,23 @@ fn anonymous_closures_keep_their_special_reference_scope() {
           (let ((x :caller)) (assert (eq (funcall f) :dynamic)))))
     "#);
 }
+
+#[test]
+fn dotimes_preserves_special_bindings_and_result_declarations() {
+    check(r#"
+      (let ((i 0) (seen nil) (bound 4))
+        (declare (special i))
+        (flet ((read-i () i))
+          (dotimes (i bound) (declare (special i)) (push (read-i) seen)))
+        (assert (equal seen '(3 2 1 0))))
+      (let ((x :good))
+        (declare (special x))
+        (let ((x :bad))
+          (assert (eq (dotimes (i 3 x) (declare (special x))) :good))))
+      (assert (= (dotimes (i -3 i)) 0))
+      (assert (= (dotimes (i (return 17))) 17))
+      (let ((closures nil))
+        (dotimes (i 3) (push (lambda () i) closures))
+        (assert (equal (mapcar #'funcall closures) '(2 1 0))))
+    "#);
+}

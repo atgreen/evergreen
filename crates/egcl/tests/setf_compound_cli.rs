@@ -5,6 +5,10 @@
 use std::process::Command;
 
 fn check(body: &str) {
+    check_with_setup("", body);
+}
+
+fn check_with_setup(setup: &str, body: &str) {
     let program = format!(
         r#"
         (defvar *place-events* nil)
@@ -14,6 +18,7 @@ fn check(body: &str) {
             (values (list tmp) (list cell) (list new)
                     `(progn (push :store *place-events*) (rplaca ,tmp ,new) ,new)
                     `(progn (push :read *place-events*) (car ,tmp)))))
+        {setup}
         (defun exercise-compound-place () {body})
         (dotimes (i 3) (exercise-compound-place))
         (format t "COMPOUND-PLACE-OK~%")
@@ -87,13 +92,15 @@ fn mask_field_composes_custom_writeback_and_preserves_other_bits() {
 
 #[test]
 fn nested_getf_expansion_uses_all_inner_store_variables() {
-    check(
+    check_with_setup(
         r#"
         (define-setf-expander multiple-store-place (cell)
           (let ((tmp (gensym)) (new (gensym)) (secondary (gensym)))
             (values (list tmp) (list cell) (list new secondary)
                     `(progn (assert (null ,secondary)) (rplaca ,tmp ,new) ,new)
                     `(values (car ,tmp) :ignored))))
+        "#,
+        r#"
         (let ((cell (list (list :bits #xa0))))
           (assert (= 7 (setf (ldb (byte 4 0)
                                  (getf (multiple-store-place cell) :bits)) 7)))

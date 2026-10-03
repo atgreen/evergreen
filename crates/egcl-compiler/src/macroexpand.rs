@@ -1438,6 +1438,7 @@ fn is_known_special_operator(val: EgclVal) -> bool {
                 // SETF's first subform of each pair is a PLACE, not an
                 // expression, so it must not be walked as a call (bliss-msyk).
                 | "SETF"
+                | "EGCL::%SETF"
                 | "PSETF"
                 // Definers whose LAMBDA LIST binds variables over the body: the
                 // parameters shadow an enclosing symbol macro, and the name,
@@ -1547,7 +1548,7 @@ fn expand_special_form(
         "RETURN-FROM" => expand_return_from(form, env),
         "TAGBODY" => expand_tagbody(form, env),
         "SETQ" => expand_setq(form, env),
-        "SETF" | "PSETF" => expand_setf(form, env),
+        "SETF" | "PSETF" | "EGCL::%SETF" => expand_setf(form, env),
         "MULTIPLE-VALUE-SETQ" => expand_multiple_value_setq(form, env),
         "THE" => expand_the(form, env),
         "EVAL-WHEN" => expand_eval_when(form, env),

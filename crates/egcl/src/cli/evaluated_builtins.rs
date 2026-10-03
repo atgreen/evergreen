@@ -995,7 +995,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "SYMBOL".to_string(),
                 });
             }
-            if is_ansi_special_operator(&sym_bare_name_rc(s)) {
+            if is_special_operator_name(&sym_name(s)) {
                 return Ok(T);
             }
             Ok(NIL)

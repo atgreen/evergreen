@@ -2527,7 +2527,7 @@ impl<'e> Lowerer<'e> {
                 "LET" => self.lower_let(rest, false),
                 "LET*" => self.lower_let(rest, true),
                 "SETQ" => self.lower_setq(rest),
-                "SETF" => self.lower_setf(rest),
+                "SETF" | "EGCL::%SETF" => self.lower_setf(rest),
                 "BLOCK" => self.lower_block(rest),
                 "RETURN-FROM" => self.lower_return_from(rest),
                 "RETURN" => self.lower_return(rest),
@@ -2535,6 +2535,9 @@ impl<'e> Lowerer<'e> {
                 "THROW" => self.lower_throw(rest),
                 "TAGBODY" => self.lower_tagbody(rest),
                 "GO" => self.lower_go(rest),
+                "DOTIMES" if super::lookup_macro(self.env, &name).is_some() => {
+                    self.lower_call(&name, op, rest)
+                }
                 "DOTIMES" => self.lower_dotimes(rest),
                 "DOLIST" => self.lower_dolist(rest),
                 "LOOP" => self.lower_loop(rest),

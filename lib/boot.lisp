@@ -11,8 +11,8 @@
 ;;;; Constraints of the current bootstrap evaluator (see crates/egcl):
 ;;;;   * macro lambda lists are flat — &optional and &rest work, but nested
 ;;;;     destructuring does NOT yet. Keep parameter lists simple.
-;;;;   * user macros are expanded before builtins, so nothing here should
-;;;;     redefine a form the interpreter already special-cases.
+;;;;   * user macros are expanded before builtins. Standard control macros
+;;;;     are installed last, after definitions that bootstrap through builtins.
 ;;;;   * `setq` on an unbound symbol creates a persistent global binding, which
 ;;;;     is what the defining macros below rely on.
 
@@ -1350,21 +1350,29 @@
   ;; UNCONDITIONALLY makes the two macros expand each other forever -- it blew
   ;; the control stack on the first test that used one.
   (let ((uses-symbol-macro nil) (p pairs))
-    (loop while (consp p) do
+    (tagbody
+      scan
+      (unless (consp p) (go done))
       (unless (symbolp (car p))
         (error "PSETQ: ~S is not a variable name" (car p)))
       (multiple-value-bind (expansion expanded) (macroexpand-1 (car p) env)
         (declare (ignore expansion))
         (when expanded (setq uses-symbol-macro t)))
-      (setq p (cddr p)))
+      (setq p (cddr p))
+      (go scan)
+      done)
     (if uses-symbol-macro
         `(psetf ,@pairs)
         (let ((bindings nil) (assigns nil) (q pairs))
-          (loop while (consp (cdr q)) do
+          (tagbody
+            scan
+            (unless (consp (cdr q)) (go done))
             (let ((var (car q)) (tmp (gensym)))
               (setq bindings (cons (list tmp (cadr q)) bindings))
               (setq assigns (cons (list 'setq var tmp) assigns))
-              (setq q (cddr q))))
+              (setq q (cddr q)))
+            (go scan)
+            done)
           `(let ,(reverse bindings) ,@(reverse assigns) nil)))))
 
 ;; Interleave two lists: (a b) (x y) => (a x b y). Helper for DO's step forms.
@@ -1385,11 +1393,16 @@
 ;; would make them inert (DO.17-19, DO*.17-19).
 (defun %split-declares (forms)
   (let ((decls nil))
-    (loop while (and (consp forms)
-                     (consp (car forms))
-                     (eq (car (car forms)) 'declare))
-          do (setq decls (cons (car forms) decls)
-                   forms (cdr forms)))
+    ;; DO is used by LOOP's expander, so this bootstrap helper must not
+    ;; itself invoke LOOP (or DO) while finding declarations.
+    (tagbody
+      scan
+      (unless (and (consp forms) (consp (car forms))
+                   (eq (car (car forms)) 'declare))
+        (go done))
+      (setq decls (cons (car forms) decls) forms (cdr forms))
+      (go scan)
+      done)
     (values (reverse decls) forms)))
 
 (defmacro do (bindings end-test &rest body)
@@ -4313,6 +4326,79 @@ and process-state initialization, before init files or user code. Hooks are not
 called on a cold start. A snapshot of the list is used for each restoration;
 a hook error aborts startup.")
 (export '(egcl-ext::*init-hooks*) :egcl-ext)
+
+;;; Standard control macros also need real expanders for portable code walkers.
+;;; Install these after the bootstrap definitions, whose evaluator fast paths
+;;; supply the same operators while this file is being loaded (bliss-sudup).
+(defmacro when (test &body body) `(if ,test (progn ,@body) nil))
+(defmacro unless (test &body body) `(if ,test nil (progn ,@body)))
+(defmacro and (&rest forms)
+  (if forms
+      (if (cdr forms) `(if ,(car forms) (and ,@(cdr forms)) nil) (car forms))
+      t))
+(defmacro or (&rest forms)
+  (if forms
+      (if (cdr forms)
+          (let ((value (gensym "OR")))
+            `(let ((,value ,(car forms))) (if ,value ,value (or ,@(cdr forms)))))
+          (car forms))
+      nil))
+(defmacro return (&optional value) `(return-from nil ,value))
+(defmacro dolist ((var list &optional result) &body body)
+  (let ((tail (gensym "TAIL")) (top (gensym "TOP")) (end (gensym "END"))
+        (declarations nil))
+    (do () ((not (and (consp (car body)) (eq (caar body) 'declare))))
+      (setq declarations (cons (car body) declarations)
+            body (cdr body)))
+    `(block nil
+       (let ((,tail ,list))
+         (tagbody
+            ,top
+            (if (endp ,tail) (go ,end))
+            (let ((,var (car ,tail)))
+              ,@(reverse declarations)
+              (tagbody ,@body))
+            (setq ,tail (cdr ,tail))
+            (go ,top)
+            ,end)
+         (let ((,var nil)) ,@(reverse declarations) ,result)))))
+
+(defmacro dotimes ((var count &optional result) &body body)
+  (let ((limit (gensym "LIMIT")) (counter (gensym "COUNTER"))
+        (top (gensym "TOP")) (end (gensym "END")))
+    (multiple-value-bind (declarations forms) (%split-declares body)
+      `(block nil
+         (let ((,limit ,count) (,counter 0))
+           (tagbody
+              ,top
+              (if (>= ,counter ,limit) (go ,end))
+              (let ((,var ,counter))
+                ,@declarations
+                (tagbody ,@forms))
+              (setq ,counter (1+ ,counter))
+              (go ,top)
+              ,end)
+           (let ((,var ,counter)) ,@declarations ,result))))))
+
+;; GET-SETF-EXPANSION supplies the place protocol. Built-in stores terminate
+;; at EGCL::%SETF so this public expander never expands back into itself.
+(defmacro setf (&rest pairs &environment env)
+  (let ((tail pairs) (forms nil))
+    (do () ((null tail))
+      (unless (cdr tail) (error 'program-error))
+      (let ((place (macroexpand (car tail) env))
+            (value (cadr tail)))
+        (if (%values-place-p place)
+            (setq forms (cons `(egcl::%setf-values ,(cdr place) ,value) forms))
+            (multiple-value-bind (temps values stores writer reader)
+                (get-setf-expansion place env)
+              (declare (ignore reader))
+              (setq forms
+                    (cons `(let* ,(mapcar #'list temps values)
+                             (multiple-value-bind ,stores ,value ,writer))
+                          forms)))))
+      (setq tail (cddr tail)))
+    `(progn ,@(nreverse forms))))
 
 ;;; Text conversion for syscall buffers, ELF strings, and portable applications.
 (defun egcl-ext::string-to-octets (string &key (external-format :utf-8) (start 0) end null-terminate)

@@ -12154,7 +12154,11 @@ fn bundled_asdf_path() -> String {
 
 /// The bootstrap prelude, embedded at compile time so it is always available
 /// regardless of where the binary runs from.
-const EMBEDDED_BOOT_LISP: &str = include_str!("../../../lib/boot.lisp");
+const EMBEDDED_BOOT_LISP: &str = concat!(
+    include_str!("../../../lib/boot.lisp"),
+    "\n",
+    include_str!("../../../lib/loop.lisp"),
+);
 
 /// Source of the bootstrap prelude: the file named by EGCL_BOOT_FILE if set
 /// (for testing alternate preludes), otherwise the embedded copy.
@@ -16835,7 +16839,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // Costs nothing extra: `shadowed_by_lexical_function` is already
             // computed above for the macro decision.
             _ if shadowed_by_lexical_function
-                && !is_ansi_special_operator(&sym_bare_name_rc(car)) => {}
+                && !is_special_operator_name(&name) => {}
             #[cfg(test)]
             "%FORCE-MINOR-GC-FOR-TEST" => {
                 egcl_rt::collect_t0_minor()?;
@@ -18354,7 +18358,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         // evaluator implements directly are fbound in the CL sense,
                         // so FDEFINITION must not signal (ansi FDEFINITION.2/.3 —
                         // (fdefinition 'cond) / (fdefinition 'setq)).
-                        || is_ansi_special_operator(&bare)
+                        || is_special_operator_name(&n)
                         || is_ansi_standard_macro(&bare)
                     {
                         return Ok(spec);
@@ -18416,7 +18420,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // FDEFINITION already consults both — FBOUNDP did not, so the
                     // two disagreed about the same name, which is the actual bug
                     // (ansi DCF-FUNS, FBOUNDP.3; bliss-uy2q).
-                    || is_ansi_special_operator(&bare)
+                    || is_special_operator_name(&name)
                     || is_ansi_standard_macro(&bare);
                 return Ok(if bound { T } else { NIL });
             }
@@ -18840,7 +18844,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 return Ok(result);
             }
-            "SETF" => {
+            "SETF" | "EGCL::%SETF" => {
                 // (setf place value place value ...) — symbol places behave like
                 // SETQ; a handful of common accessor places are supported by
                 // mutating the target in place. Other places error clearly.
@@ -27905,10 +27909,12 @@ fn eval_args(args: EgclVal, env: &mut Env) -> Result<RootedVals, EgclError> {
 }
 
 // ── COERCE ───────────────────────────────────────────────────────
-/// Extract a sequence (list, vector, or string) into a Vec of its elements.
-/// A symbol's property list, or NIL for a non-symbol.
-/// The 25 ANSI special operators (CLHS 3.1.2.1.2.1). `bare` is the uppercase,
-/// package-stripped symbol name. Used by SPECIAL-OPERATOR-P.
+/// Recognize ANSI and implementation special operators by qualified name.
+fn is_special_operator_name(name: &str) -> bool {
+    name == "EGCL::%SETF" || is_ansi_special_operator(&symbol_bare_name(name))
+}
+
+/// The 25 ANSI special operators, using an uppercase, package-stripped name.
 fn is_ansi_special_operator(bare: &str) -> bool {
     matches!(
         bare,
@@ -30950,7 +30956,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                 egcl_rt::rooted!(getf_place = vec_to_list(&[accessor, plist_temp, ind_temp]));
                 egcl_rt::rooted!(
                     update =
-                        vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *getf_place, store,])
+                        vec_to_list(&[resolve_sym("EGCL::%SETF").unwrap_or(NIL), *getf_place, store,])
                 );
                 egcl_rt::rooted!(store_vars = vec_to_list(&sub.stores));
                 egcl_rt::rooted!(
@@ -31163,7 +31169,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
         }
         // Default expansion for a function place: bind each argument to a
         // temporary and access via `(f t1 t2 …)`. Known built-in places store
-        // through SETF because many intentionally have no callable `(setf f)`
+        // through the internal store operator because many have no callable `(setf f)`
         // writer. Otherwise ANSI requires the canonical `#'(setf f)` form so
         // portable code walkers can recognize an otherwise-undefined function
         // place. Everything below allocates (gensym /
@@ -31227,6 +31233,7 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
                     | "BIT"
                     | "SBIT"
                     | "FILL-POINTER"
+                    | "FIND-CLASS"
                     | "DOCUMENTATION"
             ) || bare_acc
                 .strip_prefix('C')
@@ -31244,9 +31251,10 @@ fn get_setf_expansion(place: EgclVal, env: &mut Env) -> Result<SetfExpansion, Eg
             && !env_has_setf_writer(&acc)
             && !env_has_setf_generic(env, &acc);
         let store_form = if common_lisp_builtin_setf_place || native_accessor_setf_place {
-            // ACCESS-FORM contains only fresh temporaries, so SETF cannot
-            // re-evaluate any original place subform (bliss-42iv).
-            vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *access_form, *store])
+            // This terminal store shares the evaluator/lowerer implementation.
+            // Returning public SETF here would recurse through its macro.
+            // ACCESS-FORM contains only fresh temporaries (bliss-sudup).
+            vec_to_list(&[resolve_sym("EGCL::%SETF").unwrap_or(NIL), *access_form, *store])
         } else {
             // Preserve the ANSI default for an otherwise-undefined function
             // place: `(funcall #'(setf accessor) new t1 t2 …)`. This is also the
@@ -34866,7 +34874,7 @@ fn apply_function(
         {
             let bare = symbol_bare_name(&name);
             if !is_builtin_function(&bare)
-                && (is_ansi_special_operator(&bare) || is_ansi_standard_macro(&bare))
+                && (is_special_operator_name(&name) || is_ansi_standard_macro(&bare))
             {
                 return Err(EgclError::UndefinedFunction(fn_val));
             }
