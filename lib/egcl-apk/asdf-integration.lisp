@@ -1,8 +1,9 @@
 ;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 ;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 ;;;
-;;; Describe an APK in the application's own .asd and let `asdf:make' build it,
-;;; instead of a sibling apk.sexp plus environment variables.
+;;; Describe an APK in the application's own .asd and let `asdf:make' build it.
+;;; This is the ONLY way to describe an APK; the apk.sexp reader it replaced is
+;;; gone.
 ;;;
 ;;;   (defsystem "my-app"                       ; loadable and testable as usual
 ;;;     :components ((:file "scene") (:file "egl") (:file "app")))
@@ -31,12 +32,14 @@
 ;;; application itself, exactly as with a hand-built assets/ directory.
 (defpackage :egcl-apk-asdf
   (:use :cl)
-  (:export #:android-apk #:apk-op #:*runtime-directory*))
+  (:export #:android-apk #:apk-op #:*runtime-directory*
+           #:*allow-identity-creation* #:build-project))
 (in-package :egcl-apk-asdf)
 
 (defclass android-apk (asdf:system)
-  ;; Every slot an apk.sexp could carry. ASDF rejects an unknown initarg, so a
-  ;; misspelled key is an error here as it was there -- reject, don't ignore.
+  ;; ASDF rejects an unknown initarg, so a misspelled slot is an error rather
+  ;; than silently ignored -- the same reject-don't-ignore the removed apk.sexp
+  ;; reader had.
   ;; Readers are all apk-* : a slot named `identity' would collide with
   ;; CL:IDENTITY in this package.
   ((apk-package :initarg :apk-package :initform nil :reader apk-package)
@@ -71,7 +74,7 @@
     (nreverse files)))
 
 (defun apk-config (system)
-  "The apk.sexp-equivalent plist, taken from SYSTEM's slots.
+  "The configuration plist the builder takes, from SYSTEM's slots.
 An unset optional is omitted rather than passed as NIL, so the builder applies
 its own default instead of being handed an explicit nothing."
   (let ((config (list :package (or (apk-package system)
@@ -92,6 +95,12 @@ its own default instead of being handed an explicit nothing."
     (when (apk-runtime-version system)
       (setf config (append config (list :runtime-version (apk-runtime-version system)))))
     config))
+
+(defvar *allow-identity-creation* nil
+  "When true, a build may create a missing signing identity. Set only by a
+caller that has already established a restrictive umask -- see
+`scripts/egcl-apk'. An unencrypted private key must not be written with
+whatever umask an interactive session happens to carry.")
 
 (defvar *runtime-directory* nil
   "Overrides EGCL_APK_RUNTIME when non-NIL, for a caller that would rather bind
@@ -139,15 +148,42 @@ against the runtime's own runtime.json."
     (unless (member (concatenate 'string "assets/" entry) assets :key #'car :test #'equal)
       (error "~A: the :apk-entry ~S is not one of this system's components: ~{~A~^ ~}"
              (asdf:component-name s) entry (mapcar #'file-namestring files)))
-    ;; Do NOT mint a signing key from a build. create-identity writes an
-    ;; unencrypted P-256 private key and relies on the caller's umask -- the
-    ;; CLI sets 077, but `asdf:make' inherits whatever the user happens to have,
-    ;; and EGCL exposes no chmod to repair the mode afterwards. Require a key
-    ;; that was created deliberately.
-    (unless (probe-file identity-path)
+    ;; Do NOT mint a signing key from an ordinary build. create-identity writes
+    ;; an unencrypted P-256 private key and relies on the caller's umask, and
+    ;; EGCL exposes no chmod to repair the mode afterwards. `scripts/egcl-apk'
+    ;; sets umask 077 and then binds *allow-identity-creation*, so the
+    ;; permission travels with the only caller that has established the umask;
+    ;; a plain `asdf:make' from a REPL inherits whatever the user happens to
+    ;; have and is refused.
+    (unless (or (probe-file identity-path) *allow-identity-creation*)
       (error "~A: no signing identity at ~A.~%~
               Create one with `scripts/egcl-apk', which sets umask 077 first:~%~
               an APK signing key must not be written under an inherited umask."
              (asdf:component-name s) identity-path))
     (egcl-apk::build-apk-from (apk-config s) (apk-runtime-directory)
                               assets output identity-path)))
+
+(defun build-project (directory)
+  "Build the APK of the project in DIRECTORY: load its .asd and make the
+system's /apk component. The directory must hold exactly one .asd, whose
+primary system NAME gives the APK system NAME/apk -- the convention the class
+and build operation above are written for."
+  (let* ((directory (uiop:ensure-directory-pathname (truename directory)))
+         (asds (directory (merge-pathnames "*.asd" directory))))
+    (unless asds
+      (error "No .asd in ~A. An APK is described by an ASDF system definition; ~
+              see lib/egcl-apk/README.md." directory))
+    (unless (= 1 (length asds))
+      (error "~A holds ~D .asd files (~{~A~^ ~}); build the one you want with ~
+              asdf:make instead." directory (length asds)
+              (mapcar #'file-namestring asds)))
+    (let* ((asd (first asds))
+           (primary (pathname-name asd))
+           (system (format nil "~A/apk" primary)))
+      (asdf:load-asd asd)
+      (unless (asdf:find-system system nil)
+        (error "~A defines no ~S system. Add one with :class ~
+                \"egcl-apk-asdf:android-apk\" and :build-operation ~
+                \"egcl-apk-asdf:apk-op\"; see lib/egcl-apk/README.md."
+               (file-namestring asd) system))
+      (asdf:make system))))

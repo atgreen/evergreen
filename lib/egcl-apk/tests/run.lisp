@@ -15,14 +15,16 @@
   (egcl-apk:write-apk (merge-pathnames "signed.apk" *apk-test-root*) entries :identity identity)
   (egcl-apk:write-apk (merge-pathnames "signed-again.apk" *apk-test-root*) entries :identity restored))
 (format t "APK-SIGNING-OK~%")
-(when (uiop:getenv "EGCL_APK_RUNTIME")
-  (egcl-apk:build-apk (uiop:getenv "EGCL_APK_TEST_PROJECT") (uiop:getenv "EGCL_APK_RUNTIME")
-                     :output (merge-pathnames "demo.apk" *apk-test-root*)
-                     :identity-path (merge-pathnames "test.identity" *apk-test-root*))
-  (format t "APK-DEMO-OK~%"))
 
-;; The ASDF integration (describing an APK in a .asd) builds against a
-;; synthesised runtime, so it runs without an egcl-target-android install.
+;; An APK is described by an ASDF system definition; that is the only way.
 (asdf:load-asd (merge-pathnames "../egcl-apk-asdf.asd" *load-truename*))
 (asdf:load-system :egcl-apk-asdf)
+;; The integration against a synthesised runtime, so it needs no
+;; egcl-target-android install.
 (load (merge-pathnames "asdf.lisp" *load-truename*))
+
+;; The real demo project, when a real runtime is available.
+(when (uiop:getenv "EGCL_APK_RUNTIME")
+  (let ((egcl-apk-asdf:*allow-identity-creation* t))
+    (egcl-apk-asdf:build-project (uiop:getenv "EGCL_APK_TEST_PROJECT")))
+  (format t "APK-DEMO-OK~%"))

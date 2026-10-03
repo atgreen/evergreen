@@ -47,16 +47,6 @@
     (json:decode-json-from-string (uiop:read-file-string path))))
 (defun field (name object)
   (or (cdr (assoc name object :test #'equal)) (error "Missing runtime field: ~A" name)))
-(defun project-config (path)
-  (with-open-file (in path)
-    (let* ((*read-eval* nil) (config (read in nil nil)))
-      (unless (and (listp config) (evenp (length config)) (eq :eof (read in nil :eof)))
-        (error "APK configuration must be one property list"))
-      (loop for key in config by #'cddr do
-        (unless (member key '(:package :label :version-code :version-name :min-sdk :target-sdk
-                             :debuggable :permissions :hosts :runtime-api :runtime-version))
-          (error "Unsupported APK configuration key: ~S" key)))
-      config)))
 (defun runtime-entry (runtime metadata host)
   (let* ((abi (cond ((equal host "aarch64-linux-android") "arm64-v8a")
                     ((equal host "x86_64-linux-android") "x86_64")
@@ -89,23 +79,12 @@ ENTRIES are the application's own assets, from `asset-entry'."
   (let ((index (format nil "egcl-android-assets-v1~%~{~A~%~}" (mapcar (lambda (e) (subseq (car e) 7)) entries))))
     (append entries (list (cons "assets/egcl-assets.txt" (utf8 index))))))
 
-(defun project-assets (project)
-  "The application's own asset entries, read from PROJECT/assets/."
-  (let* ((root (truename (merge-pathnames "assets/" project))) (entries nil))
-    (when (uiop:subdirectories root) (error "This initial APK builder supports flat assets only"))
-    (dolist (path (uiop:directory-files root) entries)
-      (unless (uiop:subpathp (truename path) root)
-        (error "Invalid or escaping asset: ~A" path))
-      (push (asset-entry (file-namestring path) path) entries))))
-
-(defun asset-entries (project runtime)
-  (finish-assets (project-assets project) runtime))
 (defun build-apk-from (config runtime assets output identity-path)
   "Assemble and sign an APK from an already-validated CONFIG plist.
 ASSETS are the application's own entries from `asset-entry'; the runtime's
-android.lisp and the index are added here. This is the half shared by the
-apk.sexp CLI and the ASDF integration, which differ only in where the
-configuration and the asset list come from."
+android.lisp and the index are added here. CONFIG comes from an ASDF system
+definition (see asdf-integration.lisp), which is the only way to describe an
+APK; the apk.sexp reader this replaced is gone."
   (let* ((runtime (uiop:ensure-directory-pathname (truename runtime)))
          (metadata (json-file (merge-pathnames "runtime.json" runtime)))
          (hosts (getf config :hosts '("aarch64-linux-android"))))
@@ -129,12 +108,3 @@ configuration and the asset list come from."
       (format t "APK: ~A~%Signer SHA256: ~A~%" output
               (ironclad:byte-array-to-hex-string (sha256 (signing-identity-certificate identity))))
       output)))
-
-(defun build-apk (project runtime &key output identity-path)
-  "Package an apk.sexp project with the prebuilt Android RPM, without SDK tools."
-  (let* ((project (uiop:ensure-directory-pathname (truename project)))
-         (runtime-dir (uiop:ensure-directory-pathname (truename runtime)))
-         (config (project-config (merge-pathnames "apk.sexp" project)))
-         (output (or output (merge-pathnames "build/android-egl.apk" project)))
-         (identity-path (or identity-path (merge-pathnames ".egcl-apk-key" project))))
-    (build-apk-from config runtime-dir (project-assets project) output identity-path)))

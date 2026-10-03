@@ -11,18 +11,20 @@ cd lib/egcl-apk
 ocicl install
 ```
 
-The launcher uses SBCL (override its executable with `SBCL_BIN`). Then,
-from the repository root:
+The launcher uses SBCL by default (override its executable with `SBCL_BIN`).
+Set `EGCL_BIN` instead to build with EGCL, which is self-hosted but slower --
+see the validation section. Then, from the repository root:
 
 ```sh
 scripts/egcl-apk examples/android-egl
 ```
 
 Set `EGCL_APK_RUNTIME` if the Android RPM is extracted somewhere other than
-`/usr/libexec/egcl/android`. `EGCL_APK_OUTPUT` selects the output pathname;
-`EGCL_APK_IDENTITY` selects a persistent signing identity. Use absolute paths
-for these overrides. The default output is `PROJECT/build/android-egl.apk`.
-`OCICL_RUNTIME` can override the installed ocicl runtime Lisp file.
+`/usr/libexec/egcl/android`; use an absolute path. The output pathname and the
+signing identity are `:apk-output` and `:apk-identity` in the project's `.asd`,
+not environment variables. The default output is `PROJECT/build/NAME.apk` for
+the project's primary system NAME. `OCICL_RUNTIME` can override the installed
+ocicl runtime Lisp file.
 
 The launcher sets umask 077. The first build creates `PROJECT/.egcl-apk-key`
 with a P-256 private key and self-signed certificate; subsequent builds reuse
@@ -32,10 +34,10 @@ format, not a Java keystore. It is unencrypted; library callers must supply
 an appropriately restrictive umask themselves. No existing signing keys are
 imported or modified. This initial builder is intended for development APKs.
 
-## Describing the APK in an .asd
+## Describing the APK
 
 An application can carry its APK configuration in its own system definition and
-be built by `asdf:make`, instead of keeping a sibling `apk.sexp`. Name
+be built by `asdf:make`. This is the only way to describe an APK. Name
 `egcl-apk-asdf` in `:defsystem-depends-on` and give the system the APK class and
 build operation:
 
@@ -57,9 +59,9 @@ build operation:
   :components ((:static-file "app.lisp") (:static-file "scene.lisp")))
 ```
 
-Then `asdf:make "my-app/apk"` writes `build/my-app.apk`. Every `apk.sexp` field
-has an `:apk-` keyword; ASDF rejects an unknown initarg, so a misspelled one is
-an error rather than silently ignored, as before. The system's own file
+Then `asdf:make "my-app/apk"` writes `build/my-app.apk`, and
+`scripts/egcl-apk my-app/` does the same from a shell. ASDF rejects an unknown
+initarg, so a misspelled slot is an error rather than silently ignored. The system's own file
 components become the flat assets in declaration order — the asset list is the
 component list, so the two cannot drift — and `:apk-entry` (default `app.lisp`)
 must name one of them.
@@ -75,24 +77,30 @@ the application. Set `EGCL_APK_RUNTIME`, or bind
 `:apk-runtime-api` and `:apk-runtime-version`, which are checked against the
 runtime's own `runtime.json`.
 
-Unlike the CLI, this path will not create a signing identity. `create-identity`
-writes an unencrypted P-256 private key and relies on the caller's umask; the
-CLI sets 077 first, but `asdf:make` inherits whatever you happen to have and
-EGCL exposes no `chmod` to repair the mode afterwards. Mint the key once with
-`scripts/egcl-apk`, and the build will reuse it.
+A plain `asdf:make` will not create a missing signing identity.
+`create-identity` writes an unencrypted P-256 private key and relies on the
+caller's umask, and EGCL exposes no `chmod` to repair the mode afterwards.
+`scripts/egcl-apk` sets umask 077 and then binds
+`egcl-apk-asdf:*allow-identity-creation*`, so the permission travels with the
+only caller that has established the umask. Mint the key once through the
+script; every later build, by either route, reuses it.
 
 ## Project contract
 
-`apk.sexp` is a single data-only property list (reader evaluation disabled).
-Supported fields: `:package`, `:label`, `:version-code`, `:version-name`,
-`:min-sdk`, `:target-sdk`, `:debuggable`, `:permissions`, `:hosts`,
-`:runtime-api`, and `:runtime-version`. See `examples/android-egl/apk.sexp`.
+The APK is described by the project's ASDF system definition, and that is the
+only way -- there is no `apk.sexp`. Supported slots: `:apk-package`,
+`:apk-label`, `:apk-version-code`, `:apk-min-sdk`, `:apk-target-sdk`,
+`:apk-debuggable`, `:apk-permissions`, `:apk-hosts`, `:apk-runtime-api`,
+`:apk-runtime-version`, `:apk-entry`, `:apk-identity` and `:apk-output`, with
+ASDF's own `:version` supplying the version name. See
+`examples/android-egl/android-egl.asd`.
 
 The initial scope is deliberately bounded:
 
 - NativeActivity, no Java or DEX; minimum API 28; EGL ES 2.0.
 - Literal Unicode app label and built-in fullscreen Android theme.
-- Flat `assets/` directory with `app.lisp`; each file at most 64 MiB.
+- Flat assets from the system's file components, including `app.lisp`; each
+  file at most 64 MiB.
 - `android.lisp` and the asset index are supplied by the builder/runtime.
 - ARM64 and/or x86-64 libraries from runtime API 4, verified against the
   SHA-256 hashes and architecture recorded in the RPM's `runtime.json`.
@@ -122,9 +130,20 @@ EGCL_APK_RUNTIME=/usr/libexec/egcl/android/ scripts/test-native-apk.sh
 
 The test builds a payload crossing the 1 MiB signing chunk boundary, reloads
 the signing identity, checks signatures and alignment, and rejects a tampered
-APK. Setting `EGCL_APK_RUNTIME` also tests the complete EGL demo.
+APK. It also covers the ASDF integration against a synthesised runtime, so that
+part needs no `egcl-target-android` install. Setting `EGCL_APK_RUNTIME` also
+tests the complete EGL demo.
 
-The Common Lisp implementation was also exercised under EGCL: small APKs
-verify, but the larger signing test hits a stack guard, and increasing the
-stack leaves SHA-256 prohibitively slow. This is tracked as `bliss-omaps`.
-SBCL is the supported build host for now; the packaged Android runtime is EGCL.
+EGCL now builds APKs itself, so the toolchain is self-hosted:
+
+```sh
+EGCL_BIN=/path/to/egcl scripts/egcl-apk examples/android-egl
+egcl --no-init --load lib/asdf.lisp --load lib/egcl-apk/tests/run.lisp
+```
+
+reports `APK-UNIT-OK`, `APK-SIGNING-OK` and `APK-ASDF-OK`. The stack-guard
+crash this previously hit at the default 512 KiB stack is fixed (`bliss-omaps`);
+open-coding `LDB` removed the interpreted frames whose depth caused it. Signing
+is still far slower than SBCL -- the chunk-boundary test takes minutes rather
+than seconds -- so SBCL remains the quicker build host while EGCL is the
+supported self-hosted one.

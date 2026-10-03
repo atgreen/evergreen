@@ -43,7 +43,7 @@
   (asdf:load-asd (merge-pathnames "fixture.asd" root))
   (let ((system (asdf:find-system "fixture/apk"))
         (egcl-apk-asdf:*runtime-directory* runtime))
-    ;; Slots become the apk.sexp-equivalent configuration.
+    ;; Slots become the builder's configuration plist.
     (let ((config (egcl-apk-asdf::apk-config system)))
       (assert (equal (getf config :package) "org.egcl.fixture"))
       (assert (equal (getf config :label) "Fixture"))

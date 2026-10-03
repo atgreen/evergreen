@@ -1,7 +1,7 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 (defpackage :egcl-apk
   (:use :cl)
-  (:export :manifest :write-apk :build-apk :load-identity :create-identity))
+  (:export :manifest :write-apk :build-apk-from :load-identity :create-identity))
 (in-package :egcl-apk)
 
 (defun bytes (&rest parts)

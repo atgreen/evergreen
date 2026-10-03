@@ -23,7 +23,8 @@ is needed. The phone must support ARM64 and Android 9/API 28 or newer.
 Enable USB debugging before installing. Optional `make verify` uses Android
 build-tools (`apksigner`, `zipalign`, and `aapt2`) for independent validation.
 
-Edit `apk.sexp` for package, version, SDK levels, or target architectures.
+Edit `android-egl.asd` for package, version, SDK levels, target
+architectures, or which asset files are included.
 Set machine-specific paths in the ignored `local.mk`:
 
 ```make
@@ -44,7 +45,8 @@ in `.egcl-apk-key`, with private permissions. Keep it to update installed apps;
 - `assets/scene.lisp`: scene data, GLSL generation, camera and animation.
 - `assets/egl.lisp`: EGL setup and rendering through the FFI.
 - `assets/app.lisp`: the `android-main` entry point.
-- `apk.sexp`: the manifest configuration consumed by the Lisp builder.
+- `android-egl.asd`: the APK configuration, and the asset list -- its file
+  components become the APK's assets, in order.
 
 The builder packages these assets with the RPM's native library and shared
 Android Lisp API. The runtime extracts the assets and calls `android-main`
@@ -53,4 +55,4 @@ and pauses with the Activity.
 
 This example was moved from `~/git/torcl-android-egl`. Its former repository
 metadata and signing key remain there. `AndroidManifest.xml` is retained as
-a reference; the builder generates the binary manifest from `apk.sexp`.
+a reference; the builder generates the binary manifest from the `.asd`.
