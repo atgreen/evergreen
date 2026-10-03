@@ -1,5 +1,19 @@
 # Saved images
 
+Startup images supplied through `--image` or embedded in executables must be
+core images. Legacy source-transcript and BFASL startup images are unsupported;
+rebuild old executables. Ordinary library FASLs remain loadable with `LOAD` or
+`--load`.
+
+## `save-image`
+
+```lisp
+(egcl-ext:save-image pathname)
+```
+
+Writes a core image of the live Lisp world, returns `T`, and keeps the current
+process running. Restore the core with `egcl --image FILE`.
+
 ## `save-lisp-and-die`
 
 ```lisp

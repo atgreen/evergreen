@@ -10349,18 +10349,6 @@ fn vec_to_list_with_tail(elems: &[EgclVal], tail: EgclVal) -> EgclVal {
     *result
 }
 
-fn format_body_forms(forms: EgclVal) -> String {
-    let parts = list_to_vec(forms)
-        .into_iter()
-        .map(format_val)
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        "NIL".to_string()
-    } else {
-        parts.join(" ")
-    }
-}
-
 // ── Quasiquote expansion ─────────────────────────────────────────
 /// Expand a quasiquote template, substituting EGCL::UNQUOTE forms with
 /// their evaluated values and splicing EGCL::UNQUOTE-SPLICING forms.
@@ -23267,26 +23255,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "SAVE-IMAGE" | "EGCL-EXT:SAVE-IMAGE" => {
                 let (path_form, _) = cp(cdr);
                 let path_val = eval_form(path_form, env)?;
-                let path = val_as_str(path_val);
-                // Save a minimal image: serialize function definitions — the
-                // lexical/name-map ones plus the global ones now in symbol
-                // function cells (bliss-jtc.6.8).
-                let mut image_data = String::new();
-                for (name, fdef) in env.funs.borrow().iter() {
-                    let params_str = fdef.params.join(" ");
-                    let body_str = format_body_forms(fdef.body);
-                    image_data
-                        .push_str(&format!("(defun {} ({}) {})\n", name, params_str, body_str));
-                }
-                egcl_rt::symbols::for_each_bound_function(|_idx, name, func| {
-                    if egcl_rt::function::is_interpreted_function(func) {
-                        let params_str = format_body_forms(egcl_rt::function::lambda_list(func));
-                        let body_str = format_body_forms(egcl_rt::function::body(func));
-                        image_data.push_str(&format!("(defun {name} {params_str} {body_str})\n"));
-                    }
-                });
-                std::fs::write(&path, &image_data)
-                    .map_err(|e| EgclError::FileError(format!("save-image: {}", e)))?;
+                let path = path_designator_to_string(path_val)?;
+                egcl_rt::rooted_ref!(_save_env_root = &mut *env);
+                save_core(&path, false, false, false, env)?;
                 return Ok(T);
             }
             "SAVE-LISP-AND-DIE"
@@ -23387,8 +23358,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "%SAVE-CORE" | "EGCL-EXT:%SAVE-CORE" => {
                 // (%save-core path &key executable) — write a heap-snapshot CORE
-                // image (bliss-x0f2 M3) and terminate. Unlike SAVE-LISP-AND-DIE's
-                // source-form .bfasl, this captures the live GC heap byte-for-byte
+                // image (bliss-x0f2 M3) and terminate. Like SAVE-LISP-AND-DIE,
+                // this captures the live GC heap byte-for-byte
                 // (hash-tables, instances, closures — any value), plus the symbol
                 // value/function cells, packages, and this crate's macro/setf
                 // registries (via the HostRegistries hook). Restored by `--image`
@@ -38336,27 +38307,24 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // registries) into THIS fresh runtime. It must load before the bootstrap
     // prelude allocates: `restore_heap` clears and re-materializes the heap, so
     // any live object the prelude created first would be stranded. When a core
-    // loads, bootstrap and the source-form image paths are skipped — the core
+    // loads, bootstrap is skipped — the core
     // already contains that world (env.frame is still empty here, so nothing is
     // stranded).
-    let image_magic = egcl_rt::image::IMAGE_MAGIC.to_ne_bytes();
-    let mut core_loaded = false;
-    let embedded = if ca.deliver.is_some() || ca.image.is_some() {
-        None
-    } else {
-        embedded_image()
-    };
-    if let Some(bytes) = embedded.as_ref().filter(|b| b.starts_with(&image_magic)) {
-        load_core_image_bytes(bytes, &mut env)?;
-        core_loaded = true;
-    } else if let Some(ref image_path) = ca.image {
+    let core_loaded = if let Some(ref image_path) = ca.image {
         let bytes = std::fs::read(image_path)
             .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
-        if bytes.starts_with(&image_magic) {
+        load_core_image_bytes(&bytes, &mut env)?;
+        true
+    } else if ca.deliver.is_none() {
+        if let Some(bytes) = embedded_image() {
             load_core_image_bytes(&bytes, &mut env)?;
-            core_loaded = true;
+            true
+        } else {
+            false
         }
-    }
+    } else {
+        false
+    };
 
     if ca.deliver.is_some() {
         if !core_loaded {
@@ -38405,30 +38373,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
     }
 
-    // Reuse the payload read before bootstrap for legacy BFASL executables.
-    // Core images have already been restored; do not read them a second time.
-    if let Some(ref bytes) = embedded {
-        if bytes.starts_with(&egcl_rt::bfasl::BFASL_MAGIC) {
-            load_bfasl_into_env(bytes, &mut env)?;
-        }
-    }
-
-    // Load image if specified (issue #8). A CORE image (EGCLIMG) was already
-    // restored by the fast path above; only the legacy .bfasl/text formats fall
-    // through to here.
-    if let (false, Some(image_path)) = (core_loaded, ca.image.as_ref()) {
-        let bytes = std::fs::read(image_path)
-            .map_err(|e| EgclError::FileError(format!("--image {image_path}: {e}")))?;
-        // A binary image is a `.bfasl` unit (save-lisp-and-die); a legacy text
-        // image is a `.lisp` transcript restored by evaluation.
-        if bytes.starts_with(&egcl_rt::bfasl::BFASL_MAGIC) {
-            load_bfasl_into_env(&bytes, &mut env)?;
-        } else if let Ok(contents) = String::from_utf8(bytes) {
-            read_eval_all_env(&contents, &mut env)?;
-        }
-    }
-
-    if core_loaded || embedded.is_some() || ca.image.is_some() {
+    if core_loaded {
         // A saved pathname default belongs to the builder's process. Refresh
         // it before library/user hooks resolve relative paths (bliss-swoz5).
         // Call the stdlib directly: Lisp TRUENAME would merge against the very
@@ -38456,7 +38401,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // with MISSING-COMPONENT (SBCL's saved REPL images read ~/.sbclrc too).
     if !cfg!(egcl_no_dynamic_code)
         && !ca.no_init
-        && ((embedded.is_none() && ca.image.is_none()) || image_toplevel().is_none())
+        && (!core_loaded || image_toplevel().is_none())
         && ca.eval_forms.is_empty()
         && ca.load.is_none()
         && ca.script.is_none()
@@ -38489,7 +38434,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // (SBCL :toplevel), run it as the program's main; otherwise drop to the REPL.
     // Restricted to the saved-executable / `--image` paths so a plain REPL is
     // never hijacked by a stale entry symbol.
-    if embedded.is_some() || ca.image.is_some() {
+    if core_loaded {
         if let Some(top) = image_toplevel() {
             // Unlike run_eval_env, this path enters a callable directly. Its
             // lexical frames and multiple values must remain visible to GC.

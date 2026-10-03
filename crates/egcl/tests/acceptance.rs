@@ -1965,7 +1965,8 @@ fn image_save_and_load_cycle() {
 
     // Step 1: Define a function and save an image
     let save_expr = format!(
-        "(progn (defun my-fn () 99) (save-image \"{}\"))",
+        "(progn (defun my-fn () 99) (defvar *saved-state* (list 17 23)) \
+         (assert (eq t (save-image \"{}\"))) (format t \"SAVE-RETURNED~%\"))",
         image_path.to_str().unwrap().replace('\\', "\\\\")
     );
     let output = egcl_bin()
@@ -1979,9 +1980,13 @@ fn image_save_and_load_cycle() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Step 2: Load the image and call the function
+    assert!(String::from_utf8_lossy(&output.stdout).contains("SAVE-RETURNED"));
+    let image = std::fs::read(&image_path).unwrap();
+    assert!(image.starts_with(&egcl_rt::image::IMAGE_MAGIC.to_ne_bytes()));
+
+    // Step 2: Restore both code and live data from the core.
     let output = egcl_bin()
-        .args(["--image", image_path.to_str().unwrap(), "--eval", "(my-fn)"])
+        .args(["--image", image_path.to_str().unwrap(), "--eval", "(list (my-fn) *saved-state*)"])
         .output()
         .expect("failed to run egcl for load");
 
@@ -1992,8 +1997,8 @@ fn image_save_and_load_cycle() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("99"),
-        "loading image should restore my-fn returning 99, got: '{}'",
+        stdout.contains("(99 (17 23))"),
+        "loading image should restore my-fn and saved data, got: '{}'",
         stdout
     );
 }

@@ -4,6 +4,58 @@
 use std::{fs, process::Command};
 
 #[test]
+fn startup_rejects_legacy_images_but_load_accepts_library_fasls() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("egcl-legacy-startup-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("legacy.lisp");
+    let fasl = dir.join("legacy.fasl");
+    fs::write(&source, "(format t \"LEGACY-PAYLOAD-RAN~%\")").unwrap();
+    let compile = format!("(compile-file {source:?} :output-file {fasl:?})");
+    let compiled = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &compile])
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let loaded = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--load"])
+        .arg(&fasl)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(String::from_utf8_lossy(&loaded.stdout).contains("LEGACY-PAYLOAD-RAN"));
+    for path in [&source, &fasl] {
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--image"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted obsolete image {path:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("LEGACY-PAYLOAD-RAN"));
+    }
+    let app = dir.join("legacy-app");
+    let mut bytes = fs::read(env!("CARGO_BIN_EXE_egcl")).unwrap();
+    let payload = fs::read(&fasl).unwrap();
+    bytes.extend_from_slice(&payload);
+    bytes.extend_from_slice(b"EGCLAPP\0");
+    bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    fs::write(&app, bytes).unwrap();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(&app).output().unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(!output.status.success(), "accepted obsolete embedded image");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("LEGACY-PAYLOAD-RAN"));
+}
+
+#[test]
 fn saved_application_reads_its_image_once() {
     let dir = std::env::temp_dir().join(format!("egcl-startup-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();

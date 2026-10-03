@@ -199,8 +199,9 @@ environment, and then chooses between image and bootstrap paths:
    rebuilding the registries needed for the saved Lisp world.
 2. Without a restored core, `lib/boot.lisp` is read and evaluated unless the
    raw `--no-bootstrap` mode was requested.
-3. Portable BFASL units, legacy source images, the interactive init file, and
-   user loads are then applied as appropriate for the selected mode.
+3. The interactive init file and user loads (including portable BFASL library
+   units) are applied as appropriate for the selected mode. Startup images must
+   be heap cores; BFASL and source files are loaded with `--load`, not `--image`.
 4. The driver evaluates `--eval` forms, loads a file, runs a script or saved
    top-level, or enters the REPL.
 

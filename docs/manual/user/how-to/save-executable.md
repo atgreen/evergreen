@@ -215,8 +215,8 @@ capabilities; explicit `runtime-keep` entries add roots, never remove required
 ones.
 
 When `dynamic-code` is unreachable, the specialized runtime omits those public
-source-evaluation entry points and rejects `--eval`, `--load`, scripts, the
-REPL, and legacy source images. It also skips init files. Validated saved cores
+source-evaluation entry points and rejects `--eval`, `--load`, scripts, and the
+REPL. It also skips init files. Validated saved cores
 remain supported. Saved raw lambda lists, including constant-pool and global
 data, retain `tree-walker` and the definitions referenced by their bodies.
 A fixed lambda does not by itself retain every function or native capability;
