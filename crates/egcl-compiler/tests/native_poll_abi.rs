@@ -127,7 +127,7 @@ fn poll_enabled_native_emission_has_no_success_return_check() {
     // The poll veneer is an independent hook.  This test uses a body without
     // a loop, so its presence is represented in the transfer metadata rather
     // than in an emitted back-edge; the emitter must still retain it.
-    assert!(framed.code.len() > 0);
+    assert!(!framed.code.is_empty());
     assert!(framed.emitted_safepoints > 0);
 
     // The old emitter does encode the checked-return target when one is

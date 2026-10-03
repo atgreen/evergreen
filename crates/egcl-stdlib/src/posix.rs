@@ -78,7 +78,7 @@ pub fn call(args: &[EgclVal]) -> Result<[EgclVal; 3], EgclError> {
                 Ok((result, error))
             })?;
             errno = error.map(fix).unwrap_or(NIL);
-            egcl_rt::bignum::BigInt::from_i64(result as i64).to_val()
+            egcl_rt::bignum::BigInt::from_i64(result).to_val()
         }
         ("STRERROR", [code]) => {
             let code = integer(*code)?;
@@ -415,7 +415,12 @@ mod tests {
         }
     }
 
+    // `child` is never `wait()`ed through its `Child` handle, and that is the
+    // point of the test: the WAITPID builtin under test reaps it instead. Adding
+    // `child.wait()` would not silence a real leak, it would race the builtin for
+    // the same exit status and leave whichever lost reporting ECHILD.
     #[test]
+    #[allow(clippy::zombie_processes)]
     fn waitpid_reports_running_and_exited_unmanaged_children() {
         // A pipe keeps the child alive until after WNOHANG, without a timing
         // assumption. This child is deliberately outside the managed reaper.
