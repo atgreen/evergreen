@@ -111,8 +111,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-release
+      # --no-fail-fast, because cargo test stops at the first FAILING TEST
+      # BINARY and `acceptance` fails early. Measured on this workflow before
+      # the flag: the job emitted exactly TWO test-result lines -- one lib
+      # target, then acceptance's 379-passed/5-failed -- and stopped. 263
+      # integration test binaries exist and 2 ran; 519 of the repo's 3588
+      # #[test] functions executed. So ~85% of the suite had never run in CI
+      # across 97 runs, and a regression anywhere in it was invisible. The five
+      # standing failures each have a bead (bliss-uth7a/24uua/pj0n, bliss-kfvi2,
+      # bliss-b7sxl, bliss-jmiza); until they are fixed or quarantined the job
+      # still goes red, but it now goes red with the WHOLE picture (bliss-hn1cc).
       - name: cargo test (release, musl)
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --no-fail-fast
 
   # The FFI surface. `c-ffi` is OFF by default because dlopen is incompatible
   # with the static musl executable, so the default `cargo test --workspace`
@@ -141,8 +151,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: test-ffi-gnu
+      # --no-fail-fast for the same reason as the `test` job above.
       - name: cargo test with the C-ABI FFI enabled
-        run: cargo test --release --features egcl-rt/c-ffi -p egcl-rt -p egcl
+        run: cargo test --release --features egcl-rt/c-ffi -p egcl-rt -p egcl --no-fail-fast
 
   # The Linux build can only cross-compile the Win64 adapter. Keep a native
   # Windows gate for the SEH/shadow-space transition itself; mitigation refusal
