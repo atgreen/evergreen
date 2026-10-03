@@ -14537,10 +14537,13 @@ fn typep_matches(
             && orig.as_ref() != "STANDARD-OBJECT"
             && orig.as_ref() != "STRUCTURE-OBJECT"
         {
-            if let Some(names) = instance_class_hierarchy_names(object) {
-                if names.iter().any(|name| name == orig.as_ref()) {
-                    return Ok(true);
-                }
+            if let Some(class) = egcl_stdlib::find_class(type_spec) {
+                // Class symbols carry package identity. Comparing their bare
+                // names conflates unrelated classes from different packages.
+                let cpl = egcl_stdlib::compute_class_precedence_list(
+                    egcl_stdlib::class_of(object),
+                )?;
+                return Ok(cpl.contains(&class));
             }
         }
     }
@@ -14586,10 +14589,12 @@ fn typep_matches(
                 return Ok(true);
             }
             let hierarchy = instance_class_hierarchy_names(object);
-            let in_hierarchy = hierarchy
-                .as_ref()
-                .map(|names| names.iter().any(|name| name == type_name.as_ref()))
-                .unwrap_or(false);
+            let in_hierarchy = if let Some(class) = egcl_stdlib::find_class(type_spec) {
+                egcl_stdlib::compute_class_precedence_list(egcl_stdlib::class_of(object))?
+                    .contains(&class)
+            } else {
+                false
+            };
             let is_condition = hierarchy
                 .as_ref()
                 .map(|names| names.iter().any(|name| name == "CONDITION"))
@@ -33247,7 +33252,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // MAKE-INSTANCE (so inherited slots Just Work); a BOA constructor maps its
     // positional lambda list to slot initargs by name.
     if (constructors.is_empty() || explicit_default_ctor) && !suppress_default_ctor {
-        constructors.push((sym(&format!("MAKE-{}", name_str)), None));
+        constructors.push((sym(&format!("{definition_package}::MAKE-{name_str}")), None));
     }
     for (ctor_name, boa) in &constructors {
         let ctor_defun = match boa {
@@ -33455,7 +33460,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // intermediates so a minor GC while a later element allocates cannot stale
     // them (bliss-bjue).
     let pred_name = match predicate_spec {
-        NameSpec::Default => Some(sym(&format!("{}-P", name_str))),
+        NameSpec::Default => Some(sym(&format!("{definition_package}::{name_str}-P"))),
         NameSpec::Custom(n) => Some(n),
         NameSpec::Suppressed => None,
     };
@@ -33475,7 +33480,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // The copier is COPY-NAME by default, a caller-chosen name for
     // `(:copier name)`, or omitted for `(:copier nil)` (ansi-test struct-test-20/21).
     let copy_name = match copier_spec {
-        NameSpec::Default => Some(sym(&format!("COPY-{}", name_str))),
+        NameSpec::Default => Some(sym(&format!("{definition_package}::COPY-{name_str}"))),
         NameSpec::Custom(n) => Some(n),
         NameSpec::Suppressed => None,
     };
