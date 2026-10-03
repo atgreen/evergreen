@@ -709,6 +709,16 @@ mod elf_backend {
         // The break hid from `cargo test --workspace`, which unifies features and
         // so turns `c-ffi` on and cfg's this whole module out. Only a build that
         // resolves features for this crate alone compiles it.
+        // The ALLOCATOR trio joined this list for the same reason, one build
+        // configuration later (bliss-0g677). A normal build links a prebuilt
+        // std and the check never fires; a build that compiles std FROM SOURCE
+        // -- `-Z build-std`, which every sanitizer job needs, and `cargo miri
+        // setup` -- puts std's own malloc/realloc/free in the same crate graph
+        // and rejects the opaque declarations. That is why sanitizers.yml had
+        // never once passed: both of its jobs died here, in compilation, before
+        // running a single check. `calloc` is moved with them because it is the
+        // same allocator family and its true signature is no less correct; only
+        // malloc, realloc and free actually error today.
         use core::ffi::c_void;
         unsafe extern "C" {
             fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void;
@@ -716,9 +726,13 @@ mod elf_backend {
             fn memset(dest: *mut c_void, c: i32, n: usize) -> *mut c_void;
             fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32;
             fn strlen(s: *const i8) -> usize;
+            fn malloc(size: usize) -> *mut c_void;
+            fn calloc(count: usize, size: usize) -> *mut c_void;
+            fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+            fn free(ptr: *mut c_void);
         }
         let mut syms = host_syms![
-            malloc, calloc, realloc, free, strcmp, strncmp, strcpy, strncpy, strncat, strcat,
+            strcmp, strncmp, strcpy, strncpy, strncat, strcat,
             abort, abs, sqrt, qsort,
         ];
         syms.extend_from_slice(&[
@@ -727,6 +741,10 @@ mod elf_backend {
             ("memset", memset as *const ()),
             ("memcmp", memcmp as *const ()),
             ("strlen", strlen as *const ()),
+            ("malloc", malloc as *const ()),
+            ("calloc", calloc as *const ()),
+            ("realloc", realloc as *const ()),
+            ("free", free as *const ()),
         ]);
         syms
     }
