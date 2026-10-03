@@ -145,7 +145,43 @@ def sign(assets, passphrase_file, public_key=None, gpg='/usr/bin/gpg'):
          '--addsign', *map(str, rpms)], check=True)
     verify_signatures(rpms, public_key)
     write_checksums(assets)
+    sign_manifest(assets, passphrase_file, public_key)
     return rpms
+
+
+def sign_manifest(assets, passphrase_file, public_key=None, gpg='gpg'):
+    """Detached-sign SHA256SUMS, so the manifest can be trusted away from GitHub.
+
+    The checksum file is what ties the individual digests together; unsigned, it
+    can be replaced alongside the artifacts it describes. Signing it gives a
+    check that needs nothing but gpg and our public key -- no network, no
+    GitHub API, no attestation service.
+    """
+    signature = assets / 'SHA256SUMS.asc'
+    signature.unlink(missing_ok=True)
+    subprocess.run(
+        [gpg, '--batch', '--yes', '--pinentry-mode', 'loopback',
+         '--passphrase-file', str(passphrase_file), '--local-user', GPG_KEY_NAME,
+         '--detach-sign', '--armor', '--output', str(signature),
+         str(assets / 'SHA256SUMS')], check=True)
+    verify_manifest(assets / 'SHA256SUMS', signature, public_key)
+    return signature
+
+
+def verify_manifest(manifest, signature, public_key=None, gpg='gpg'):
+    """Check the detached signature the way a user will: only the public key.
+
+    A separate GNUPGHOME holding one key is the point -- verifying inside the
+    signing keyring would also succeed if the signature were made by some other
+    key that happens to be present there.
+    """
+    public_key = public_key or PUBLIC_KEY
+    with tempfile.TemporaryDirectory() as home:
+        environment = os.environ | {'GNUPGHOME': home}
+        subprocess.run([gpg, '--batch', '--quiet', '--import', str(public_key)],
+                       check=True, env=environment)
+        subprocess.run([gpg, '--batch', '--verify', str(signature), str(manifest)],
+                       check=True, env=environment)
 
 
 def verify_signatures(rpms, public_key=None):

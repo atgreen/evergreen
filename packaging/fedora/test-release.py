@@ -119,9 +119,12 @@ class SigningTests(unittest.TestCase):
         (assets / 'SHA256SUMS').write_text('stale manifest\n')
         return assets
 
-    def fake_rpm(self, report):
+    def fake_rpm(self, report, assets=None):
         def run(command, **kwargs):
             self.calls.append(command)
+            # Stand in for gpg --detach-sign, which writes its output file.
+            if '--detach-sign' in command:
+                Path(command[command.index('--output') + 1]).write_text('signature\n')
             return subprocess.CompletedProcess(command, 0, stdout=report, stderr='')
         return run
 
@@ -134,6 +137,7 @@ class SigningTests(unittest.TestCase):
             with patch.object(release.subprocess, 'run', side_effect=self.fake_rpm(report)):
                 signed = release.sign(assets, Path('/tmp/pass'), public_key=Path('/tmp/key'))
             self.assertEqual(signed, rpms)
+            self.assertTrue((assets / 'SHA256SUMS.asc').exists())
             sign_call = self.calls[0]
             self.assertEqual(sign_call[0], 'rpmsign')
             defines = ' '.join(sign_call)
@@ -167,6 +171,43 @@ class SigningTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unsigned.rpm'):
                 release.verify_signatures(rpms, public_key=Path('/tmp/key'))
             release.verify_signatures(rpms[:1], public_key=Path('/tmp/key'))
+
+
+    def test_manifest_signature_is_verified_against_only_the_public_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            (assets / 'SHA256SUMS').write_text('digest  file\n')
+            self.calls = []
+            with patch.object(release.subprocess, 'run', side_effect=self.fake_rpm('')):
+                signature = release.sign_manifest(assets, Path('/tmp/pass'),
+                                                  public_key=Path('/tmp/key'))
+            self.assertEqual(signature, assets / 'SHA256SUMS.asc')
+            detach, import_key, verify = self.calls
+            self.assertIn('--detach-sign', detach)
+            self.assertIn(release.GPG_KEY_NAME, detach)
+            self.assertIn('--pinentry-mode', detach)
+            # Verification must run in a throwaway GNUPGHOME holding one key,
+            # or it would also pass for a signature made by any other key in
+            # the signing keyring.
+            self.assertIn('--import', import_key)
+            self.assertIn('--verify', verify)
+
+    def test_a_failing_manifest_verification_is_not_swallowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            assets = Path(directory)
+            (assets / 'SHA256SUMS').write_text('digest  file\n')
+
+            def run(command, **kwargs):
+                if '--detach-sign' in command:
+                    Path(command[command.index('--output') + 1]).write_text('bad\n')
+                    return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
+                if '--verify' in command:
+                    raise subprocess.CalledProcessError(1, command)
+                return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
+
+            with patch.object(release.subprocess, 'run', side_effect=run):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    release.sign_manifest(assets, Path('/tmp/pass'), public_key=Path('/tmp/key'))
 
 
 if __name__ == '__main__':
