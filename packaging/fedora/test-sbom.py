@@ -107,8 +107,24 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(first['metadata']['component']['version'], '0.0.1')
         # A random serial number or a wall-clock timestamp would make two SBOMs
         # of identical inputs differ, and nothing could be checked against them.
-        self.assertNotIn('serialNumber', first)
+        # The serial number is therefore derived from the contents rather than
+        # omitted: actions/attest needs bomFormat, specVersion AND serialNumber
+        # together to accept a document as CycloneDX. These three are exactly
+        # that check, so a regression fails here and not in the release.
+        self.assertTrue(all((first['bomFormat'], first['specVersion'],
+                             first['serialNumber'])), first)
+        self.assertRegex(first['serialNumber'],
+                         r'^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
         self.assertNotIn('timestamp', first['metadata'])
+
+    def test_the_serial_number_tracks_the_contents(self):
+        """Derived, so identical inputs repeat it and a changed input does not."""
+        with patch.object(sbom.subprocess, 'check_output', return_value=json.dumps(METADATA)):
+            first = sbom.build('0.0.1')
+            again = sbom.build('0.0.1')
+            altered = sbom.build('0.0.2')
+        self.assertEqual(first['serialNumber'], again['serialNumber'])
+        self.assertNotEqual(first['serialNumber'], altered['serialNumber'])
 
     def test_source_date_epoch_supplies_a_reproducible_timestamp(self):
         with patch.object(sbom.subprocess, 'check_output', return_value=json.dumps(METADATA)), \

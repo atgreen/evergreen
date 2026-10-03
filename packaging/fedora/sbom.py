@@ -24,6 +24,7 @@ import re
 import runpy
 import subprocess
 import tomllib
+import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_TOOLS = Path(__file__).resolve().with_name('prepare-tools.sh')
@@ -111,10 +112,16 @@ def native_components(root=ROOT, prepare_tools=PREPARE_TOOLS):
 def build(version, root=ROOT, prepare_tools=PREPARE_TOOLS):
     """Assemble the document.
 
-    No serialNumber and no timestamp unless SOURCE_DATE_EPOCH says what it
-    should be: both are optional in CycloneDX, and a random UUID or a wall
-    clock would make two SBOMs of identical inputs differ, which is the one
-    property that makes an SBOM checkable.
+    No timestamp unless SOURCE_DATE_EPOCH says what it should be: it is
+    optional in CycloneDX, and a wall clock would make two SBOMs of identical
+    inputs differ, which is the one property that makes an SBOM checkable.
+
+    serialNumber is DERIVED, not random, for that same reason. It cannot simply
+    be omitted: actions/attest requires bomFormat, specVersion AND serialNumber
+    to recognise a document as CycloneDX at all, and rejected ours with
+    "Unsupported SBOM format. Must be valid SPDX or CycloneDX JSON." A UUIDv5
+    over the finished document gives the attestable field while keeping two
+    builds of identical inputs byte-identical.
     """
     metadata = {
         'component': {
@@ -128,7 +135,7 @@ def build(version, root=ROOT, prepare_tools=PREPARE_TOOLS):
     if epoch := os.environ.get('SOURCE_DATE_EPOCH'):
         metadata['timestamp'] = datetime.datetime.fromtimestamp(
             int(epoch), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-    return {
+    document = {
         '$schema': SCHEMA,
         'bomFormat': 'CycloneDX',
         'specVersion': '1.6',
@@ -136,6 +143,13 @@ def build(version, root=ROOT, prepare_tools=PREPARE_TOOLS):
         'metadata': metadata,
         'components': native_components(root, prepare_tools) + rust_components(root),
     }
+    # Hash the document that exists so far, so the serial number is a function
+    # of the contents and nothing else. sort_keys makes it independent of the
+    # insertion order above, so reordering a field cannot change the serial
+    # without changing what the SBOM says.
+    digest = json.dumps(document, sort_keys=True, separators=(',', ':'))
+    document['serialNumber'] = f'urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, digest)}'
+    return document
 
 
 def main():
