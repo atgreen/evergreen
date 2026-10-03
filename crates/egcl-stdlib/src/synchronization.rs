@@ -32,15 +32,61 @@ pub fn mutex_p(value: EgclVal) -> bool {
         && unsafe { (*(value.as_ptr() as *const ObjectHeader)).type_id() == type_id::MUTEX }
 }
 
+/// Body layout: the native handle, then the flags that must outlive an image.
+/// The image nulls only the first eight bytes of a MUTEX body (gc.rs), and the
+/// serializer explicitly copies anything past them, so a flag stored here comes
+/// back when the native half does not.
+const MUTEX_RECURSIVE: u64 = 1;
+
 pub fn make_mutex(name: Option<String>, recursive: bool) -> Result<EgclVal, EgclError> {
     crate::streams::install_gc_hooks();
     let mutex = Arc::new(EgclMutex::new(name, recursive));
-    let body = egcl_rt::alloc_typed(8, type_id::MUTEX).ok_or(EgclError::Oom)?;
-    unsafe { *(body as *mut *const EgclMutex) = Arc::into_raw(mutex) };
+    let body = egcl_rt::alloc_typed(16, type_id::MUTEX).ok_or(EgclError::Oom)?;
+    unsafe {
+        *(body as *mut *const EgclMutex) = Arc::into_raw(mutex);
+        *(body.add(8) as *mut u64) = if recursive { MUTEX_RECURSIVE } else { 0 };
+    }
     // No Lisp allocation occurs between allocating the handle and registering
     // its finalizer. The GC finalizer registry keys objects by body address.
     egcl_rt::gc::register_finalizer(EgclVal::from_raw(body as u64), NIL)?;
     Ok(unsafe { EgclVal::from_heap_ptr(body.sub(8)) })
+}
+
+/// Re-create the native half of a mutex that an image restore dropped.
+///
+/// Saving nulls the handle because a host pointer cannot survive the image, and
+/// using the mutex afterwards used to be an error -- which made any saved world
+/// that had ever created one unusable, including every image holding
+/// bordeaux-threads. A saved image has no live threads, so every mutex in it is
+/// by construction unheld, and a fresh unlocked mutex is exactly the right
+/// restored state. Recursiveness is preserved through the flag word; the
+/// diagnostic name is not, because it lived only in the native struct.
+fn restore_mutex(value: EgclVal) -> Result<Arc<EgclMutex>, EgclError> {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    let recursive = unsafe { *(value.as_ptr().add(16) as *const u64) } & MUTEX_RECURSIVE != 0;
+    let fresh = Arc::into_raw(Arc::new(EgclMutex::new(None, recursive))) as *mut EgclMutex;
+    // Two threads can reach this at once; the first to install wins and the
+    // loser drops its copy, so the object keeps exactly one native handle.
+    let slot = unsafe { &*(value.as_ptr().add(8) as *const AtomicPtr<EgclMutex>) };
+    let installed = match slot.compare_exchange(
+        std::ptr::null_mut(),
+        fresh,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => fresh,
+        Err(existing) => {
+            // SAFETY: `fresh` came from Arc::into_raw just above and was never
+            // published, so this drops our own unique reference.
+            unsafe { drop(Arc::from_raw(fresh)) };
+            existing
+        }
+    };
+    // SAFETY: `installed` is a live Arc the object owns; take a counted copy.
+    unsafe {
+        Arc::increment_strong_count(installed);
+        Ok(Arc::from_raw(installed))
+    }
 }
 
 fn native_mutex(value: EgclVal) -> Result<Arc<EgclMutex>, EgclError> {
@@ -53,9 +99,7 @@ fn native_mutex(value: EgclVal) -> Result<Arc<EgclMutex>, EgclError> {
     unsafe {
         let pointer = *(value.as_ptr().add(8) as *const *const EgclMutex);
         if pointer.is_null() {
-            return Err(EgclError::ProgramError(
-                "mutex is unavailable after image restore".into(),
-            ));
+            return restore_mutex(value);
         }
         // Retain stable native storage before entering a blocking region. The
         // handle may move while blocked; never read it again after the wait.

@@ -23,6 +23,12 @@ cd "$repo/lib/egcl-apk"
 # rather than by substituting one binary for the other. EGCL needs lib/asdf.lisp
 # loaded first; SBCL has ASDF built in.
 if [ -n "${EGCL_BIN:-}" ]; then
+    # A saved image already holds ASDF, ocicl, Ironclad and the builder, which
+    # is about 9.3 s of loading per build. Build one with lib/egcl-apk/save.lisp;
+    # it is tied to the exact egcl that wrote it, so rebuild it with egcl.
+    if [ -n "${EGCL_APK_IMAGE:-}" ] && [ -r "${EGCL_APK_IMAGE}" ]; then
+        exec "$EGCL_BIN" --no-init --image "$EGCL_APK_IMAGE" --load run.lisp
+    fi
     exec "$EGCL_BIN" --no-init --load "$repo/lib/asdf.lisp" --load cli.lisp
 fi
 exec "${SBCL_BIN:-sbcl}" --noinform --no-userinit --no-sysinit --non-interactive --load cli.lisp

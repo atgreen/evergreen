@@ -4,8 +4,17 @@
 //! R13.19: real Lisp mutex ownership and unwind-safe locking.
 use std::process::Command;
 
+/// A mutex saved while HELD comes back usable and unheld.
+///
+/// Saving nulls the native handle, and this used to make every later operation
+/// signal PROGRAM-ERROR -- which left any saved world that had created a mutex
+/// unusable, including every image containing bordeaux-threads and therefore
+/// Ironclad. A restored image has no live threads, so the holder is gone and
+/// the lock genuinely is free; reporting it as unheld describes reality, where
+/// refusing merely described our uncertainty. The grab below is on the mutex
+/// that was held at save time.
 #[test]
-fn saved_mutex_is_recognized_but_cannot_reuse_native_ownership() {
+fn saved_mutex_comes_back_usable_and_unheld() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -28,8 +37,18 @@ fn saved_mutex_is_recognized_but_cannot_reuse_native_ownership() {
         r#"
       (assert (egcl-thread:mutex-p *saved-mutex*))
       (assert (eq 'egcl-thread:mutex (type-of *saved-mutex*)))
-      (assert (handler-case (progn (egcl-thread:grab-mutex *saved-mutex*) nil)
-                (program-error () t)))
+      ;; It was held when the image was written; the holder did not survive, so
+      ;; it is free now and this succeeds.
+      (assert (egcl-thread:grab-mutex *saved-mutex*))
+      ;; :RECURSIVE T was passed to MAKE-MUTEX before the save. That flag lives
+      ;; past the bytes the image nulls, so re-grabbing from the owning thread
+      ;; still works rather than deadlocking or refusing.
+      (assert (egcl-thread:grab-mutex *saved-mutex*))
+      (egcl-thread:release-mutex *saved-mutex*)
+      (egcl-thread:release-mutex *saved-mutex*)
+      ;; And it is a real mutex afterwards, not a one-shot.
+      (assert (egcl-thread:grab-mutex *saved-mutex*))
+      (egcl-thread:release-mutex *saved-mutex*)
       (assert (handler-case (progn (egcl-thread:release-mutex *saved-mutex*) nil)
                 (program-error () t)))
       (let ((fresh (egcl-thread:make-mutex)))
