@@ -3968,11 +3968,6 @@ impl<'e> Lowerer<'e> {
         egcl_rt::rooted!(items = list_to_vec(rest));
         let tagbody_id = self.fresh_id();
         let sp_restore = self.cur_stack;
-        self.emit(Instr::PushTag {
-            tagbody_id,
-            sp_restore,
-        });
-        let push_at = self.code.len() - 1;
 
         // Pre-register tag names so forward `go`s resolve to this scope.
         let mut tags: HashMap<String, usize> = HashMap::new();
@@ -3983,6 +3978,29 @@ impl<'e> Lowerer<'e> {
                     tag_order.push(name);
                 }
             }
+        }
+
+        // A TAGBODY WITH NO TAGS NEEDS NO SCOPE. `go` names a tag, so nothing --
+        // not a local `go`, not a non-local `GoNamed` from a captured closure --
+        // can transfer into a tag-less tagbody: its handler is provably dead and
+        // the PushTag/PopHandler pair is pure overhead.
+        //
+        // Eliding it is what lets hot loops stay promoted (bliss-qw4rw). A
+        // DOTIMES/DOLIST body is an implicit tagbody, almost always tag-free, and
+        // OSR-compiled code DEOPTS on PushTag -- deliberately, since an OSR body
+        // runs with T0's handler stack live and eliding scope transitions there
+        // would throw to an expired CATCH (bliss-57da). So every such loop
+        // promoted, deopted on its first iteration, had its back-edge counter
+        // reset as thrash backoff, and re-warmed 100,000 edges forever: measured
+        // exactly 1 deopt per 100,000 iterations, flat at interpreted speed.
+        // This removes the instruction rather than weakening that deopt, which
+        // still guards scopes a transfer can really reach.
+        let scoped = !tag_order.is_empty();
+        if scoped {
+            self.emit(Instr::PushTag {
+                tagbody_id,
+                sp_restore,
+            });
         }
 
         // If this tagbody's body can create a capturing closure, register each
@@ -4024,9 +4042,9 @@ impl<'e> Lowerer<'e> {
         }
 
         let scope = self.tag_scope.pop().unwrap();
-        // `push_at` marks where tags become inactive on normal exit.
-        let _ = push_at;
-        self.emit(Instr::PopHandler);
+        if scoped {
+            self.emit(Instr::PopHandler);
+        }
 
         // Patch `go`s targeting this tagbody now that tag PCs are known.
         let mut i = 0;
@@ -15571,6 +15589,18 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // before the loop, so we simply reposition it at the guard
                         // and keep interpreting — no new frame, no handler replay.
                         DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // This arm used to be silent, which hid bliss-qw4rw for a
+                        // long time: a loop that promotes and is thrown out every
+                        // osr_threshold() edges looks exactly like one that never
+                        // promotes, because the backoff below restores the very
+                        // state OSR was entered from. `bcp` is the guard that
+                        // failed, so it is the one fact worth printing here.
+                        egcl_rt::blog!(
+                            "deopt",
+                            egcl_rt::log::DEBUG,
+                            "[osr] {}: deopt at bcp {bcp} (sp_top {sp_top}), back-edge count reset",
+                            sym_label(acts[top_idx].sym)
+                        );
                         // Backoff: clear the hot-loop counter so the loop must
                         // re-warm before another OSR attempt, bounding
                         // enter/deopt thrash on a loop that keeps overflowing.
