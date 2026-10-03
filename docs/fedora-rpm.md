@@ -139,6 +139,29 @@ removing its line rather than leaving the baseline to rot. The three recorded
 findings are the local-tarball `Source` lines, which a Fedora-reviewable source
 RPM has to replace with URLs.
 
+### Reproducibility
+
+`packaging/fedora/compare-rpms.py` compares two builds of the same packages:
+
+```sh
+python3 packaging/fedora/compare-rpms.py first-build/RPMS/x86_64 second-build/RPMS/x86_64
+```
+
+It compares content — package identity, dependencies, and every packaged file
+with its size, mtime, digest, mode, owner and group — rather than the RPM files
+byte for byte. Signing rewrites the header, so two indistinguishable builds
+differ as files the moment one is signed; the signature tags are therefore not
+compared, and an unsigned build and a signed copy of it report as identical.
+
+One field is reported but not counted. Measured on rpm 6.0.2, two builds of an
+unchanged spec clamp packaged file mtimes to the changelog date, so those match,
+while `BUILDTIME` takes the wall clock and differs by the seconds between the
+builds. Counting it would make the verdict permanently red while saying nothing
+about whether the content is reproducible.
+
+This is a periodic check rather than a release gate: it needs two full builds,
+which the release workflow does not perform.
+
 The same source build can be reproduced locally after installing the pinned Rust
 toolchain, its `rust-src` component and the selected target's standard libraries:
 

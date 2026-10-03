@@ -220,6 +220,7 @@ rm -rf %{egcl_stage}/usr/share/doc/egcl
 %check
 python3 packaging/fedora/test-sbom.py
 python3 packaging/fedora/test-source-rpm.py
+python3 packaging/fedora/test-compare-rpms.py
 python3 packaging/fedora/test-native-content.py
 python3 packaging/fedora/test-static-package.py
 python3 packaging/fedora/test-cross-launcher.py
