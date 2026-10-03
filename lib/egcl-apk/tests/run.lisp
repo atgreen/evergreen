@@ -20,3 +20,9 @@
                      :output (merge-pathnames "demo.apk" *apk-test-root*)
                      :identity-path (merge-pathnames "test.identity" *apk-test-root*))
   (format t "APK-DEMO-OK~%"))
+
+;; The ASDF integration (describing an APK in a .asd) builds against a
+;; synthesised runtime, so it runs without an egcl-target-android install.
+(asdf:load-asd (merge-pathnames "../egcl-apk-asdf.asd" *load-truename*))
+(asdf:load-system :egcl-apk-asdf)
+(load (merge-pathnames "asdf.lisp" *load-truename*))

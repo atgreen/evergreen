@@ -32,6 +32,55 @@ format, not a Java keystore. It is unencrypted; library callers must supply
 an appropriately restrictive umask themselves. No existing signing keys are
 imported or modified. This initial builder is intended for development APKs.
 
+## Describing the APK in an .asd
+
+An application can carry its APK configuration in its own system definition and
+be built by `asdf:make`, instead of keeping a sibling `apk.sexp`. Name
+`egcl-apk-asdf` in `:defsystem-depends-on` and give the system the APK class and
+build operation:
+
+```lisp
+(defsystem "my-app"                       ; loadable and testable as usual
+  :components ((:file "scene") (:file "egl") (:file "app")))
+
+(defsystem "my-app/apk"
+  :defsystem-depends-on ("egcl-apk-asdf")
+  :class "egcl-apk-asdf:android-apk"
+  :build-operation "egcl-apk-asdf:apk-op"
+  :depends-on ("my-app")
+  :version "0.1"                          ; ASDF's :version is the version name
+  :apk-package "org.example.app"
+  :apk-label "My App"
+  :apk-version-code 1
+  :apk-hosts ("aarch64-linux-android" "x86_64-linux-android")
+  :apk-permissions ("android.permission.INTERNET")
+  :components ((:static-file "app.lisp") (:static-file "scene.lisp")))
+```
+
+Then `asdf:make "my-app/apk"` writes `build/my-app.apk`. Every `apk.sexp` field
+has an `:apk-` keyword; ASDF rejects an unknown initarg, so a misspelled one is
+an error rather than silently ignored, as before. The system's own file
+components become the flat assets in declaration order — the asset list is the
+component list, so the two cannot drift — and `:apk-entry` (default `app.lisp`)
+must name one of them.
+
+A **separate** `/apk` system rather than slots on `my-app`, because `:class` and
+`:build-operation` are per-system: putting them on the application would make
+`asdf:make` always mean "build an APK" and would stop the system loading at all
+on a machine with no Android runtime.
+
+The runtime location stays out of the `.asd` — it describes the build host, not
+the application. Set `EGCL_APK_RUNTIME`, or bind
+`egcl-apk-asdf:*runtime-directory*`. The `.asd` may only *constrain* it, through
+`:apk-runtime-api` and `:apk-runtime-version`, which are checked against the
+runtime's own `runtime.json`.
+
+Unlike the CLI, this path will not create a signing identity. `create-identity`
+writes an unencrypted P-256 private key and relies on the caller's umask; the
+CLI sets 077 first, but `asdf:make` inherits whatever you happen to have and
+EGCL exposes no `chmod` to repair the mode afterwards. Mint the key once with
+`scripts/egcl-apk`, and the build will reuse it.
+
 ## Project contract
 
 `apk.sexp` is a single data-only property list (reader evaluation disabled).
