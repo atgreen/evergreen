@@ -1900,6 +1900,7 @@ fn resolve(name: &str) -> Option<Handler> {
             if name.is_symbol() {
                 if let Some(index) = name.symbol_index() {
                     egcl_rt::symbols::set_symbol_function(index, fnval);
+                    bytecode::bump_direct_call_gen();
                 }
             } else {
                 let (_setf, tail) = cp(name);
@@ -1908,6 +1909,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     .and_then(|writer| writer.symbol_index())
                 {
                     egcl_rt::symbols::set_symbol_function(index, fnval);
+                    bytecode::bump_direct_call_gen();
                 }
             }
             Ok(val)
@@ -1930,6 +1932,7 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let fnval = coerce_installed_function(env, val);
             egcl_rt::symbols::set_symbol_function(sym.as_symbol_index(), fnval);
+            bytecode::bump_direct_call_gen();
             Ok(val)
         }),
 

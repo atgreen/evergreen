@@ -208,7 +208,7 @@ pub(super) fn direct_call_gen() -> u64 {
 }
 
 #[inline]
-fn bump_direct_call_gen() {
+pub(super) fn bump_direct_call_gen() {
     DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -853,6 +853,17 @@ fn form_list(items: &[EgclVal]) -> EgclVal {
         acc = arena_cons(x, acc);
     }
     acc
+}
+
+// A named call follows the current function cell. The registry still retains
+// the old body so saved function objects remain callable after replacement.
+fn replacement_function(sym: u32) -> Option<EgclVal> {
+    let function = egcl_rt::symbols::symbol_function(sym)?;
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let name = egcl_rt::function::name(function);
+    (name.symbol_index().is_some_and(|own| own != sym)).then_some(function)
 }
 
 fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
@@ -15054,6 +15065,17 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // genuine producers re-establish it while executing.
                 env.clear_mv();
 
+                if let Some(function) = replacement_function(sym) {
+                    match apply_function(function, args, env) {
+                        Ok(result) => acts[top_idx].push_op(result),
+                        Err(error) => {
+                            let pending = error_to_pending(error, env);
+                            initiate_unwind(acts, stack, env, pending)?;
+                        }
+                    }
+                    continue;
+                }
+
                 // Only saved bytecode callees are body-inlining candidates.
                 // Reuse this lookup for dispatch below and avoid profiling the
                 // much larger population of builtin calls.
@@ -16908,6 +16930,9 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
     // catchable condition rather than aborting across this `extern "C"` frame.
     guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
+        if let Some(function) = replacement_function(sym32) {
+            return apply_function(function, args, env);
+        }
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the EgclStack (bliss-x5y.4). This
         // is what keeps recursion through a native caller bounded: without it, a
@@ -18789,6 +18814,9 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         reachable
             .iter()
             .filter_map(|&symbol| {
+                if replacement_function(symbol).is_some() {
+                    return None;
+                }
                 let body = registry.get(&symbol)?;
                 let ptr = Arc::as_ptr(body) as usize;
                 let (invocations, call_sites) = call_site_profile_snapshot(ptr);
@@ -20338,7 +20366,8 @@ fn emit_native(
                         // same rdi=slots run_native frame ABI. Only the real
                         // has_deopt gates them (a deopting callee would mid-flight
                         // resume to T0, which the direct path can't handle).
-                        if native_transfer_abi_compatible(&cnc)
+                        if replacement_function(*sym).is_none()
+                            && native_transfer_abi_compatible(&cnc)
                             && !cnc.has_deopt
                             && fixed
                             && no_types

@@ -19426,6 +19426,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                             .and_then(|writer| writer.symbol_index())
                                     {
                                         egcl_rt::symbols::set_symbol_function(index, fnval);
+                                        bytecode::bump_direct_call_gen();
                                     }
                                 } else {
                                     if !sym.is_symbol() {
@@ -19439,6 +19440,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     let fnval = coerce_installed_function(env, *val);
                                     if let Some(idx) = sym.symbol_index() {
                                         egcl_rt::symbols::set_symbol_function(idx, fnval);
+                                        bytecode::bump_direct_call_gen();
                                     }
                                 }
                             }
@@ -20088,6 +20090,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if name.is_symbol() && !name.is_nil() {
                     let fnval = coerce_installed_function(env, *func);
                     egcl_rt::symbols::set_symbol_function(name.as_symbol_index(), fnval);
+                    bytecode::bump_direct_call_gen();
                 }
                 let primary = if name.is_nil() { *func } else { *name };
                 env.set_mv(vec![primary, NIL, NIL]);
