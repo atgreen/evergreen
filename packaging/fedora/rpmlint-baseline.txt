@@ -1,0 +1,7 @@
+# rpmlint findings this package is known to produce, tolerated by
+# packaging/fedora/rpmlint.py. A NEW finding fails; a finding here that
+# is no longer reported also fails, so fixing one means removing its
+# line. Regenerate with: python3 packaging/fedora/rpmlint.py --update
+egcl.spec: W: invalid-url Source0: egcl-source.tar.gz
+egcl.spec: W: invalid-url Source2: musl-1.2.5.tar.gz
+egcl.spec: W: invalid-url Source3: libunwind-21.1.8.src.tar.xz

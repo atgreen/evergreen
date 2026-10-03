@@ -132,6 +132,13 @@ records the source RPM's SHA-256 checksum. A final collector requires matching
 source/toolchain provenance and a complete ten-package set before publication.
 A failed matrix job does not cancel the other builds.
 
+`rpmlint` runs in the source job against a ratcheted baseline
+(`packaging/fedora/rpmlint-baseline.txt`). A new finding fails the release, and
+so does a baseline entry that is no longer reported, so fixing one means
+removing its line rather than leaving the baseline to rot. The three recorded
+findings are the local-tarball `Source` lines, which a Fedora-reviewable source
+RPM has to replace with URLs.
+
 The same source build can be reproduced locally after installing the pinned Rust
 toolchain, its `rust-src` component and the selected target's standard libraries:
 

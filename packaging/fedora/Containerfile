@@ -14,7 +14,7 @@ FROM registry.fedoraproject.org/fedora:44@sha256:7011f51bd8089d345be42d41f0aa319
 RUN dnf -y install systemd dbus-daemon dnf5-plugins \
         gcc gcc-c++ clang binutils rpm-build rpm cpio python3 curl unzip git \
         qemu-user wine mingw64-gcc mingw64-binutils glibc make java-devel \
-        mkdocs mkdocs-material procps-ng findutils \
+        mkdocs mkdocs-material procps-ng findutils rpmlint \
     && dnf clean all
 WORKDIR /workspace
 CMD ["/sbin/init"]
