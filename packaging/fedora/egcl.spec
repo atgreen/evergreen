@@ -18,24 +18,33 @@
 %global egcl_native 1
 %endif
 %global egcl_s390x 0
+%global egcl_aarch64 0
+%global egcl_ppc64le 0
+%global egcl_windows 0
+%global egcl_android 0
+# The cross-target subpackages exist only on x86_64. They ship a foreign runtime
+# plus a QEMU or Wine launcher, and both the cross toolchains (prepare-tools.sh
+# downloads Fedora's x86_64-hosted cross GCC) and the NDK are x86_64-hosted. A
+# POWER or Z build therefore produces the two native runtimes and nothing else
+# -- guarded here rather than left to the builder always passing
+# `--define 'egcl_build_group native'`, so an `all` build on a non-x86_64 host
+# degrades to the native group instead of failing deep inside %build.
+%ifarch x86_64
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "s390x"
 %global egcl_s390x 1
 %endif
-%global egcl_aarch64 0
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "aarch64"
 %global egcl_aarch64 1
 %endif
-%global egcl_ppc64le 0
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "ppc64le"
 %global egcl_ppc64le 1
 %endif
-%global egcl_windows 0
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "windows"
 %global egcl_windows 1
 %endif
-%global egcl_android 0
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "android"
 %global egcl_android 1
+%endif
 %endif
 %if %{egcl_prebuilt}
 %global egcl_stage payload
@@ -74,22 +83,25 @@ Requires: coreutils
 %if !0%{?egcl_rustup}
 BuildRequires: cargo
 %endif
-ExclusiveArch: x86_64
+# x86_64 is the full release, with every cross-target subpackage. ppc64le is
+# POWER-native: the two runtimes only (see the %ifarch guard above). Keep this
+# list in step with release.py's PACKAGES_BY_ARCH, which the collector enforces.
+ExclusiveArch: x86_64 ppc64le
 
 %description
-Evergreen Common Lisp (EGCL) for Fedora x86-64, dynamically linked against
+Evergreen Common Lisp (EGCL) for Fedora, dynamically linked against
 glibc, with ASDF preloaded.
 Includes the JAVA and EGCL-JVM APIs, their native JNI bridge, and the HTML
 manual under %{_docdir}/egcl/manual/index.html.
-Optional target packages dump applications for other platforms through QEMU
-or Wine, without containers or a compiler on the user's machine.
+On x86-64, optional target packages dump applications for other platforms
+through QEMU or Wine, without containers or a compiler on the user's machine.
 
 %if %{egcl_native}
 %package static
 Summary: Statically linked musl EGCL runtime
 
 %description static
-EGCL for Linux x86-64, statically linked against musl, with ASDF preloaded.
+EGCL for Linux, statically linked against musl, with ASDF preloaded.
 The egcl-static command runs without a system dynamic loader and produces
 statically linked saved executables. Install egcl for the glibc-based runtime
 and JVM integration.
@@ -177,13 +189,20 @@ Requires: %{name} = %{version}-%{release}
 Requires: /usr/bin/qemu-aarch64
 Requires: python3
 Requires: make
+# Deploying to a phone needs adb. Depend on it rather than shipping a copy:
+# adb's source is Apache-2.0, but Google's prebuilt SDK Platform-Tools is not
+# redistributable, and Fedora's android-tools builds it from AOSP source.
+# Bundling a build of our own would also pull its GPL-2.0-or-later and
+# LGPL-2.1-or-later components into this subpackage's License.
+Requires: /usr/bin/adb
 
 %description target-android
 Reusable Android NativeActivity libraries for ARM64 phones and x86-64 emulators,
 plus egcl-android-new and Makefile templates for building signed APKs on Linux.
 The Android SDK and a JDK are needed for APK packaging; Rust and the NDK are
-needed only when building these RPMs. Also includes the static AArch64
-command-line runtime and QEMU launcher.
+needed only when building these RPMs. Installing and launching on a device or
+emulator uses adb, which this package pulls in. Also includes the static
+AArch64 command-line runtime and QEMU launcher.
 %endif
 
 %prep
