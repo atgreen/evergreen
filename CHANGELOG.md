@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1 - Unreleased
+## 0.0.1 - 2026-10-04
 
 This release establishes the first versioned baseline of Evergreen Common Lisp
 (EGCL). EGCL is an experimental Common Lisp implementation built from scratch
