@@ -2168,12 +2168,7 @@ impl HeapCollector {
     }
 
     fn minor_gc_stop_the_world(&mut self) -> Result<(), EgclError> {
-        crate::safepoint::wait_for_all_threads()?;
-        retire_current_t0_tlab_for_safepoint();
-        let body_result = self.minor_gc_stw_body();
-        let resume_result = crate::safepoint::resume_all_threads();
-        body_result?;
-        resume_result
+        with_stopped_world(|| self.minor_gc_stw_body())
     }
 }
 
@@ -2279,12 +2274,7 @@ impl Collector for HeapCollector {
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), EgclError> {
         let _gc_admission = acquire_gc_admission();
-        crate::safepoint::wait_for_all_threads()?;
-        retire_current_t0_tlab_for_safepoint();
-        let body_result = self.major_gc_stw_body();
-        let resume_result = crate::safepoint::resume_all_threads();
-        body_result?;
-        resume_result
+        with_stopped_world(|| self.major_gc_stw_body())
     }
 
     /// Full GC: runs minor + major collections. Used before image save.
@@ -6068,8 +6058,14 @@ fn walk_heap_records(
 /// until it returns, including against other collectors.
 pub fn with_heap_snapshot<R>(inspect: impl FnOnce() -> R) -> Result<R, EgclError> {
     let _admission = acquire_gc_admission();
+    with_stopped_world(|| Ok(inspect()))
+}
+
+/// Release pause coordination on errors and unwinds alike. A collector panic
+/// still propagates: releasing the world does not repair an interrupted heap,
+/// but must not strand native-thread teardown waiting for a vanished requester.
+fn with_stopped_world<R>(body: impl FnOnce() -> Result<R, EgclError>) -> Result<R, EgclError> {
     crate::safepoint::wait_for_all_threads()?;
-    retire_current_t0_tlab_for_safepoint();
     struct ResumeOnUnwind;
     impl Drop for ResumeOnUnwind {
         fn drop(&mut self) {
@@ -6077,11 +6073,13 @@ pub fn with_heap_snapshot<R>(inspect: impl FnOnce() -> R) -> Result<R, EgclError
         }
     }
     let resume_on_unwind = ResumeOnUnwind;
-    let result = inspect();
+    retire_current_t0_tlab_for_safepoint();
+    let result = body();
     let resumed = crate::safepoint::resume_all_threads();
     std::mem::forget(resume_on_unwind);
+    let value = result?;
     resumed?;
-    Ok(result)
+    Ok(value)
 }
 
 // ── Image / persistence helpers ───────────────────────────────────
