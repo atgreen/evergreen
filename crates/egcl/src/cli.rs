@@ -8919,8 +8919,16 @@ impl Env {
             .insert(symbol.as_symbol_index(), expansion);
     }
 
-    fn define_local(&mut self, name: &str, val: EgclVal) {
-        let idx = egcl_rt::symbols::intern(name);
+    fn define_local(&mut self, name: &str, mut val: EgclVal) {
+        // The usual existing-name path cannot poll. A missing name can enter
+        // a safepoint during pinned symbol allocation: protect this parameter's
+        // own copy, not just a root held by the caller.
+        let idx = if let Some(idx) = egcl_rt::symbols::find_index(name) {
+            idx
+        } else {
+            egcl_rt::rooted_ref!(_value = &mut val);
+            egcl_rt::symbols::intern(name)
+        };
         let mut frame = self.frame.borrow_mut();
         frame.vars.insert(name.to_string(), val);
         // Also bind by symbol index so the symbol-keyed lookup
@@ -31885,7 +31893,12 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             egcl_rt::rooted!(body = body);
             egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
             let new_body = mx_each(*body, env, d);
-            arena_cons(car, arena_cons(*vars, arena_cons(*new_value, new_body)))
+            // Build inside out: copying *vars into an outer call's arguments
+            // before allocating the inner tail leaves that copy stale if GC
+            // relocates the binding list (bliss-ohwle.2).
+            let tail = arena_cons(*new_value, new_body);
+            let tail = arena_cons(*vars, tail);
+            arena_cons(car, tail)
         }
         "DESTRUCTURING-BIND" => {
             // (destructuring-bind pattern value-form body...)
@@ -31895,7 +31908,10 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             egcl_rt::rooted!(body = body);
             egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
             let new_body = mx_each(*body, env, d);
-            arena_cons(car, arena_cons(*pattern, arena_cons(*new_value, new_body)))
+            // As for MVB, re-read the rooted pattern after allocating the tail.
+            let tail = arena_cons(*new_value, new_body);
+            let tail = arena_cons(*pattern, tail);
+            arena_cons(car, tail)
         }
         "COND" => {
             // (cond (test body...) ...) — each clause element is a standalone
@@ -36637,16 +36653,18 @@ fn eval_int_div(
 // ── MULTIPLE-VALUE-BIND ─────────────────────────────────────────
 fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (mut vars_form, rest) = cp(cdr);
-    let (values_form, mut body) = cp(rest);
+    let (values_form, body) = cp(rest);
 
     // Root across the allocating values-form evaluation (moving GC; bliss-8qf).
     egcl_rt::rooted_ref!(_vars_root = &mut vars_form);
-    egcl_rt::rooted_ref!(_body_root = &mut body);
+    // Move the root guard into the binding closure below, not a raw body copy:
+    // cold lexical-name interning can poll while another mutator collects.
+    egcl_rt::rooted!(body = body);
 
     // Evaluate the values form
     env.clear_mv();
     egcl_rt::rooted!(primary = eval_form(values_form, env)?);
-    let mv = env.mv.clone();
+    egcl_rt::rooted!(mv = env.mv.clone());
 
     // Bind variables in a fresh frame on the SAME env (see eval_let) so that
     // global definitions in the body — e.g. INTERN inside UIOP's ENSURE-SYMBOL,
@@ -36658,7 +36676,7 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
     // the same variable in a LET (CLHS 3.3.4; bliss-ge3g). Binding it lexically
     // loses it entirely: references to a special name read the value cell, so the
     // lexical binding is written and never read.
-    let body_specials = let_body_special_decls(body);
+    let body_specials = let_body_special_decls(*body);
     let parent = Arc::clone(&env.frame);
     with_child_frame(env, parent, move |env| {
         // Rooted: each guard's saved cell must stay precise across the body
@@ -36692,8 +36710,8 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
         for idx in &body_specials {
             expose_locally_special(env, EgclVal::from_symbol_index(*idx));
         }
-        let declarations = enter_body_declarations(env, body);
-        let result = eval_progn(body, env);
+        let declarations = enter_body_declarations(env, *body);
+        let result = eval_progn(*body, env);
         leave_body_declarations(env, declarations);
         env.locally_specials = saved_locally;
         result
