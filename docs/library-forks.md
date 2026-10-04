@@ -26,6 +26,7 @@ exercises these forks:
 | usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `9c88be9854200183d7e8e5d3f52fd314743c3ee4` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
+| trivial-backtrace | https://github.com/atgreen/trivial-backtrace | `650da10abfe4b44c70b58a431aec6d9fe7330406` |
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f` |
 | cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
@@ -59,7 +60,7 @@ deliberately left unbound rather than stubbed, so a caller's own `FBOUNDP`
 guard — Serapeum's `macro-tools` uses one — sees the truth. This is what lets
 Trivia load.
 
-Install all thirteen forks into an existing project with the
+Install all documented forks into an existing project with the
 [installer](../scripts/install-egcl-forks):
 
 ```sh
@@ -140,3 +141,9 @@ that workaround into a published compatibility fork as though it were one.
 The [CL-FAD scenario](../tests/cl-fad/README.md) verifies native EGCL environment
 lookup and an optional UIOP fallback on otherwise unsupported implementations.
 Directory listing and recursive deletion still require an EGCL port.
+
+The [trivial-backtrace scenario](../tests/trivial-backtrace/README.md) checks
+printed and structured backtraces, live condition capture, and output destinations
+through cold and cached ASDF loads and all four execution modes. Its EGCL adapter
+uses `EGCL-DEBUG` owned snapshots. Argument values are included only when available;
+native argument locations and source locations are not yet exposed.

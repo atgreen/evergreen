@@ -55,6 +55,7 @@ trivial-features
 trivial-gray-streams
 trivial-cltl2
 trivial-garbage
+trivial-backtrace
 bordeaux-threads
 cl-fad
 usocket

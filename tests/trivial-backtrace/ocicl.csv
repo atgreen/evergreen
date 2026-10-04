@@ -1,0 +1,5 @@
+lift, ghcr.io/ocicl/lift@sha256:199b1578bc976ec669b925524f865e3f40cc20a9c16c2682be6326f2577e9ffc, lift-20240503-a794184/lift.asd
+lift-documentation, ghcr.io/ocicl/lift@sha256:199b1578bc976ec669b925524f865e3f40cc20a9c16c2682be6326f2577e9ffc, lift-20240503-a794184/lift-documentation.asd
+lift-test, ghcr.io/ocicl/lift@sha256:199b1578bc976ec669b925524f865e3f40cc20a9c16c2682be6326f2577e9ffc, lift-20240503-a794184/lift-test.asd
+trivial-backtrace, git+https://github.com/atgreen/trivial-backtrace@650da10abfe4b44c70b58a431aec6d9fe7330406#ref=650da10abfe4b44c70b58a431aec6d9fe7330406, trivial-backtrace-650da10/trivial-backtrace.asd
+trivial-backtrace-test, git+https://github.com/atgreen/trivial-backtrace@650da10abfe4b44c70b58a431aec6d9fe7330406#ref=650da10abfe4b44c70b58a431aec6d9fe7330406, trivial-backtrace-650da10/trivial-backtrace-test.asd
