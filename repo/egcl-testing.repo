@@ -1,0 +1,7 @@
+[egcl-testing]
+name=Evergreen Common Lisp (test builds) - $basearch
+baseurl=https://atgreen.github.io/evergreen/repo/test/fc$releasever/$basearch
+enabled=0
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://atgreen.github.io/evergreen/repo/RPM-GPG-KEY-egcl
