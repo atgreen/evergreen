@@ -17949,7 +17949,7 @@ struct NativeEmission {
 /// marks all `num_slots` slots (an unboxed slot would clear its bit; the T1
 /// baseline emits none). The bitmap and entry table are leaked for the lifetime
 /// of the installed code.
-fn install_stack_map(num_slots: u16) -> Option<&'static CodeInfo> {
+fn install_stack_map(num_slots: u16, name: &str) -> Option<&'static CodeInfo> {
     let n = num_slots as usize;
     let mut bitmap = vec![0u8; n.div_ceil(8)];
     for i in 0..n {
@@ -17962,7 +17962,7 @@ fn install_stack_map(num_slots: u16) -> Option<&'static CodeInfo> {
         len: bitmap.len(),
     };
     let entries: &'static [StackMapEntry] = Box::leak(vec![entry].into_boxed_slice());
-    let ci = CodeInfo::new(&[], entries);
+    let ci = CodeInfo::new_named(&[], entries, (!name.is_empty()).then(|| name.to_owned()));
     // Validate the entry safepoint (pc 0) resolves to the installed map. A frame
     // with reference slots must have a non-empty map; a leaf frame with no
     // reference slots legitimately has none.
@@ -19183,7 +19183,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         return None;
     }
     let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
-    let code_info = install_stack_map(total_slots)?;
+    let code_info = install_stack_map(total_slots, &bf.name)?;
     let metadata = if artifact.rooted_bodies.is_empty() {
         None
     } else {
@@ -21415,7 +21415,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
-    let code_info = install_stack_map(num_slots)?;
+    let code_info = install_stack_map(num_slots, &bf.name)?;
     let buf = install_t1_code(&code, &osr_entries)?;
     let entry = buf.as_ptr();
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
@@ -21998,7 +21998,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
         return None;
     }
     let num_slots = bf.num_slots();
-    let code_info = install_stack_map(num_slots)?;
+    let code_info = install_stack_map(num_slots, &bf.name)?;
     let buf = install_t1_code(&code, &osr)?;
     let entry = buf.as_ptr();
     maybe_write_perf_map(entry as usize, code.len(), sym);
@@ -23612,7 +23612,7 @@ mod jtc4_stack_map_tests {
     /// and its entry safepoint (pc 0) resolves to a ref bitmap of the right size.
     #[test]
     fn install_stack_map_validates_and_covers_all_slots() {
-        let ci = install_stack_map(3).expect("a 3-slot map must install");
+        let ci = install_stack_map(3, "STACK-MAP-TEST").expect("a 3-slot map must install");
         let map = ci
             .stack_map(0)
             .expect("entry safepoint must have a stack map");
@@ -23621,7 +23621,7 @@ mod jtc4_stack_map_tests {
         assert_eq!(map[0] & 0b0000_0111, 0b0000_0111);
 
         // A leaf activation with no reference slots legitimately has no bitmap.
-        let leaf = install_stack_map(0).expect("a 0-slot leaf map must install");
+        let leaf = install_stack_map(0, "STACK-MAP-TEST").expect("a 0-slot leaf map must install");
         assert!(leaf.stack_map(0).is_none());
     }
 
@@ -23813,7 +23813,7 @@ mod jtc4_stack_map_tests {
         ];
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
         let entry = buf.as_ptr();
-        let code_info = install_stack_map(1).unwrap();
+        let code_info = install_stack_map(1, "STACK-MAP-TEST").unwrap();
         let nc = NativeCode {
             _buffer: buf,
             body: None,
@@ -23875,7 +23875,7 @@ mod jtc4_stack_map_tests {
         code.extend_from_slice(&[0x48, 0x89, 0x00]); // mov [rax], rax
         let buf = egcl_rt::jit::JitBuffer::new(&code).unwrap();
         let entry = buf.as_ptr();
-        let code_info = install_stack_map(1).unwrap();
+        let code_info = install_stack_map(1, "STACK-MAP-TEST").unwrap();
         let nc = NativeCode {
             _buffer: buf,
             body: None,

@@ -62,19 +62,26 @@ pub fn capture_fiber(id: FiberId, count: usize) -> Result<Option<Vec<LogicalFram
     crate::thread::fiber_logical_backtrace(id, count)
 }
 
+struct CopiedFrame {
+    address: usize,
+    function: Option<EgclVal>,
+    origin: FrameOrigin,
+    installed_name: Option<String>,
+}
+
 #[derive(Default)]
 pub(crate) struct PendingBacktrace {
     // Control records retain their addresses as interpreter anchors, but do not
     // become function calls in the result.
-    frames: Vec<(usize, Option<EgclVal>, FrameOrigin)>,
+    frames: Vec<CopiedFrame>,
     pub recorded: Vec<RecordedCall>,
 }
 
 impl TraceHostRoots for PendingBacktrace {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.recorded.trace_host_roots(visit);
-        for (_, function, _) in &mut self.frames {
-            if let Some(function) = function {
+        for frame in &mut self.frames {
+            if let Some(function) = &mut frame.function {
                 visit(function);
             }
         }
@@ -86,7 +93,8 @@ impl PendingBacktrace {
     /// allocation or safepoint occurs; only Rust-owned storage is allocated.
     ///
     /// # Safety
-    /// The frame chain must remain valid and immobile throughout this call.
+    /// The frame chain and each non-null CodeInfo must remain valid and immobile
+    /// throughout this call.
     pub unsafe fn copy_stack(&mut self, fp: *const Frame, count: usize) {
         let mut calls = 0;
         for frame in unsafe { FrameWalker::new(fp) } {
@@ -96,19 +104,41 @@ impl PendingBacktrace {
             let record = unsafe { &*frame };
             let function = (record.frame_type() == FrameType::Call).then_some(record.function);
             calls += usize::from(function.is_some());
-            self.frames
-                .push((frame as usize, function, FrameOrigin::Managed));
+            let installed_name = if function.is_some() && !record.code_info.is_null() {
+                unsafe { &*record.code_info }
+                    .function_name()
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+            self.frames.push(CopiedFrame {
+                address: frame as usize,
+                function,
+                origin: FrameOrigin::Managed,
+                installed_name,
+            });
         }
     }
 
     pub fn entry(&mut self, function: EgclVal) {
-        self.frames.push((0, Some(function), FrameOrigin::Entry));
+        self.frames.push(CopiedFrame {
+            address: 0,
+            function: Some(function),
+            origin: FrameOrigin::Entry,
+            installed_name: None,
+        });
     }
 
     pub fn resolve(&self, count: usize) -> Vec<LogicalFrame> {
         let mut frames = Vec::new();
         let mut recorded = self.recorded.iter().rev().peekable();
-        for (address, function, origin) in &self.frames {
+        for CopiedFrame {
+            address,
+            function,
+            origin,
+            installed_name,
+        } in &self.frames
+        {
             let mut recorded_managed = false;
             while recorded.peek().is_some_and(|call| call.anchor == *address) {
                 let frame = &recorded.next().unwrap().frame;
@@ -125,7 +155,9 @@ impl PendingBacktrace {
                     *function
                 };
                 frames.push(LogicalFrame {
-                    function: crate::symbols::symbol_name_of(name),
+                    function: installed_name
+                        .clone()
+                        .or_else(|| crate::symbols::symbol_name_of(name)),
                     origin: *origin,
                     arguments: None,
                 });

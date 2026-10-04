@@ -163,6 +163,30 @@ fn managed_argument_records_merge_without_duplicate_calls() {
 }
 
 #[test]
+fn native_identity_belongs_to_installed_code_and_owned_snapshots() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    let stack = egcl_rt::thread::current_stack();
+    let original = egcl_rt::stack::CodeInfo::new_named(&[], &[], Some("OLD-BODY".into()));
+    let replacement = egcl_rt::stack::CodeInfo::new_named(&[], &[], Some("NEW-BODY".into()));
+    assert!(egcl_rt::stack::CodeInfo::empty().function_name().is_none());
+    // A native frame need not carry a Lisp function object. Its immutable code
+    // metadata supplies the identity even when another body is installed later.
+    stack.push_frame(NIL, original, 0, 0).unwrap();
+    egcl_rt::rooted!(old_snapshot = capture_current(1));
+    stack.push_frame(NIL, replacement, 0, 0).unwrap();
+    let current = capture_current(2);
+    assert_eq!(current[0].function.as_deref(), Some("NEW-BODY"));
+    assert_eq!(current[1].function.as_deref(), Some("OLD-BODY"));
+    assert!(current.iter().all(|frame| frame.arguments.is_none()));
+    stack.pop_frame();
+    stack.pop_frame();
+    egcl_rt::collect_t0_minor().unwrap();
+    assert_eq!(old_snapshot[0].function.as_deref(), Some("OLD-BODY"));
+    assert!(capture_current(1).is_empty());
+}
+
+#[test]
 fn control_records_do_not_consume_the_call_limit() {
     let _serial = TEST_LOCK.lock().unwrap();
     let stack = egcl_rt::thread::current_stack();

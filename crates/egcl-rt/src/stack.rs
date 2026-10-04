@@ -518,6 +518,7 @@ pub struct StackMapEntry {
 }
 
 pub struct CodeInfo {
+    function_name: Option<String>,
     source_locations: &'static [SourceLocationEntry],
     stack_maps: &'static [StackMapEntry],
 }
@@ -526,6 +527,7 @@ impl CodeInfo {
     /// Empty metadata for tests/bootstrap frames that have no compiled maps.
     pub const fn empty() -> Self {
         Self {
+            function_name: None,
             source_locations: &[],
             stack_maps: &[],
         }
@@ -536,10 +538,25 @@ impl CodeInfo {
         source_locations: &'static [SourceLocationEntry],
         stack_maps: &'static [StackMapEntry],
     ) -> &'static Self {
+        Self::new_named(source_locations, stack_maps, None)
+    }
+
+    /// Attach the installed body's identity, independent of later redefinition.
+    /// Like the code maps, this owned name remains immutable for the code's life.
+    pub fn new_named(
+        source_locations: &'static [SourceLocationEntry],
+        stack_maps: &'static [StackMapEntry],
+        function_name: Option<String>,
+    ) -> &'static Self {
         Box::leak(Box::new(CodeInfo {
+            function_name,
             source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
             stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
         }))
+    }
+
+    pub fn function_name(&self) -> Option<&str> {
+        self.function_name.as_deref()
     }
 
     fn source_location_entries(&self) -> &[SourceLocationEntry] {
