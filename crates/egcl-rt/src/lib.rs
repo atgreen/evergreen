@@ -17,6 +17,7 @@ pub mod bignum;
 pub mod bytecode;
 /// Portable fiber context switch (no libc ucontext) — bliss-bca.5.
 pub mod context;
+pub mod debug_stack;
 pub mod digest;
 /// Lisp execution context reached from generated code (§2.3.1, R4.72).
 /// NOT `context` above, which is the machine/stack-pointer switch.

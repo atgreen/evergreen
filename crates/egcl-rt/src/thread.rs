@@ -637,6 +637,7 @@ pub struct NativeThread {
     state: AtomicU8,
     stack: EgclStack,
     tls: OrderedMutex<Vec<EgclVal>>,
+    lisp_frames: Mutex<Vec<(usize, String)>>,
     condition_state: OrderedMutex<ThreadConditionState>,
     result: Arc<ThreadResult>,
     join_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
@@ -676,6 +677,7 @@ impl NativeThread {
             entry: AtomicU64::new(entry.0),
             state: AtomicU8::new(NativeThreadState::Born as u8),
             stack: EgclStack::new(default_stack_size()),
+            lisp_frames: Mutex::new(Vec::new()),
             tls: OrderedMutex::new(
                 LockLevel::ExecutionObject,
                 native_object_order(id, 2),
@@ -2815,75 +2817,97 @@ pub fn fiber_can_yield(id: FiberId) -> Result<bool, EgclError> {
     Ok(lookup_fiber(id)?.can_yield())
 }
 
-/// A tree-walker frame recorded without retaining movable Lisp objects.
-pub struct FiberCallFrame(Option<Arc<Fiber>>);
-impl FiberCallFrame {
-    pub fn enter(name: &str) -> Self {
-        let fiber = current_fiber_id().and_then(|id| lookup_fiber(id).ok());
-        if let Some(fiber) = &fiber {
-            fiber
-                .lisp_frames
-                .lock()
-                .unwrap()
-                .push((current_stack().fp() as usize, name.to_owned()));
-        }
-        Self(fiber)
-    }
+enum CallFrameOwner {
+    Fiber(Arc<Fiber>),
+    Native(Arc<NativeThread>),
 }
-impl Drop for FiberCallFrame {
-    fn drop(&mut self) {
-        if let Some(fiber) = &self.0 {
-            fiber.lisp_frames.lock().unwrap().pop();
+
+impl CallFrameOwner {
+    fn frames(&self) -> &Mutex<Vec<(usize, String)>> {
+        match self {
+            Self::Fiber(fiber) => &fiber.lisp_frames,
+            Self::Native(thread) => &thread.lisp_frames,
         }
     }
 }
 
+/// A tree-walker frame recorded without retaining movable Lisp objects.
+/// The owner follows a fiber across carrier migration. Native calls belong to
+/// their native execution, and are not inherited by fibers mounted there.
+pub struct FiberCallFrame {
+    owner: CallFrameOwner,
+    // Dropping on another execution would violate stack ordering. A fiber's
+    // suspended Rust stack can migrate without sending individual guards.
+    _execution_affine: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl FiberCallFrame {
+    pub fn enter(name: &str) -> Self {
+        let owner = match current_fiber_id() {
+            Some(id) => CallFrameOwner::Fiber(lookup_fiber(id).expect("mounted fiber is registered")),
+            None => CallFrameOwner::Native(ensure_current_native_thread()),
+        };
+        owner
+            .frames()
+            .lock()
+            .unwrap()
+            .push((current_stack().fp() as usize, name.to_owned()));
+        Self {
+            owner,
+            _execution_affine: std::marker::PhantomData,
+        }
+    }
+}
+impl Drop for FiberCallFrame {
+    fn drop(&mut self) {
+        self.owner.frames().lock().unwrap().pop();
+    }
+}
+
+pub(crate) fn current_backtrace(count: usize) -> Vec<crate::debug_stack::LogicalFrame> {
+    let mut snapshot = crate::debug_stack::PendingBacktrace::default();
+    crate::rooted_ref!(_snapshot = &mut snapshot);
+    snapshot.interpreted = if let Some(fiber) = current_fiber() {
+        fiber.lisp_frames.lock().unwrap().clone()
+    } else {
+        current_thread().lisp_frames.lock().unwrap().clone()
+    };
+    // SAFETY: this execution owns its active stack; copying does not yield.
+    unsafe { snapshot.copy_stack(current_stack().fp(), count) };
+    snapshot.resolve(count)
+}
+
 /// Snapshot an unmounted continuation. None means its stack is still running.
 /// The state lock prevents a worker from mounting the stack during the copy.
-pub fn fiber_backtrace(id: FiberId, count: usize) -> Result<Option<Vec<String>>, EgclError> {
+pub(crate) fn fiber_logical_backtrace(
+    id: FiberId,
+    count: usize,
+) -> Result<Option<Vec<crate::debug_stack::LogicalFrame>>, EgclError> {
     let fiber = lookup_fiber(id)?;
-    let mut functions = Vec::new();
-    crate::rooted_ref!(_functions = &mut functions);
-    let mut interpreted;
-    let mut addresses = Vec::new();
+    let mut snapshot = crate::debug_stack::PendingBacktrace::default();
+    crate::rooted_ref!(_snapshot = &mut snapshot);
     {
         let state = fiber.state.lock().unwrap();
         if fiber.mounted.load(Ordering::Acquire) || *state == FiberState::Running {
             return Ok(None);
         }
-        interpreted = fiber.lisp_frames.lock().unwrap().clone();
+        snapshot.interpreted = fiber.lisp_frames.lock().unwrap().clone();
         // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
-        for frame in
-            unsafe { crate::stack::FrameWalker::new(fiber.stack.published_fp()) }.take(count)
-        {
-            addresses.push(frame as usize);
-            functions.push(unsafe { (*frame).function });
-        }
+        unsafe { snapshot.copy_stack(fiber.stack.published_fp(), count) };
         if *state == FiberState::Created && count != 0 {
-            addresses.push(0);
-            functions.push(fiber.entry());
+            snapshot.entry(fiber.entry());
         }
     }
-    let mut names = Vec::new();
-    for (address, function) in addresses.into_iter().zip(functions.iter()) {
-        while interpreted
-            .last()
-            .is_some_and(|(anchor, _)| *anchor == address)
-        {
-            names.push(interpreted.pop().unwrap().1);
-        }
-        let name = if crate::function::is_interpreted_function(*function) {
-            crate::function::name(*function)
-        } else {
-            *function
-        };
-        names.push(
-            crate::symbols::symbol_name_of(name).unwrap_or_else(|| "<anonymous function>".into()),
-        );
-    }
-    names.extend(interpreted.into_iter().rev().map(|(_, name)| name));
-    names.truncate(count);
-    Ok(Some(names))
+    Ok(Some(snapshot.resolve(count)))
+}
+
+/// Compatibility string view of the shared logical-frame snapshot.
+pub fn fiber_backtrace(id: FiberId, count: usize) -> Result<Option<Vec<String>>, EgclError> {
+    Ok(fiber_logical_backtrace(id, count)?.map(|frames| {
+        frames
+            .into_iter()
+            .map(|frame| frame.function.unwrap_or_else(|| "<anonymous function>".into()))
+            .collect()
+    }))
 }
 
 pub fn fiber_yield() -> Result<(), EgclError> {
