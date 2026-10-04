@@ -151,7 +151,10 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
             assert!(env.mv[1].is_cons());
         } else {
             assert!(
-                matches!(&*result, Err(EgclError::Internal(message)) if message == "ERROR: original error"),
+                matches!(&*result, Err(EgclError::Signalled { condition, report, backtrace })
+                    if super::super::super::condition_matches_handler(&env, *condition, "SIMPLE-ERROR")
+                        && report == "original error"
+                        && !backtrace.is_empty()),
                 "{:?}",
                 &*result
             );

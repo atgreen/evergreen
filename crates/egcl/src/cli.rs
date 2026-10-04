@@ -5117,8 +5117,14 @@ fn run_handler_bind_handlers(
 /// failures (unbound slot, no applicable method, no next method) surface as real
 /// catchable condition objects rather than opaque runtime errors.
 fn signal_and_raise(env: &mut Env, condition: EgclVal, msg: String) -> EgclError {
-    match signal_condition_object(condition, env) {
-        Ok(_) => EgclError::Internal(format!("ERROR: {}", msg)),
+    egcl_rt::rooted!(condition = condition);
+    egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
+    match signal_condition_object(*condition, env) {
+        Ok(_) => EgclError::Signalled {
+            condition: *condition,
+            report: msg,
+            backtrace: std::mem::take(&mut *backtrace),
+        },
         Err(error) => error,
     }
 }
@@ -5146,9 +5152,17 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
     // OOM and control-stack overflow use a preallocated STORAGE-CONDITION and a
     // delicate no-allocation path; leave them to the existing post-unwind
     // handling rather than running the allocating in-context signal here.
-    if matches!(error, EgclError::Oom | EgclError::StackOverflow(_)) {
+    if matches!(
+        error,
+        EgclError::Oom
+            | EgclError::StackOverflow(_)
+            | EgclError::Shutdown
+            | EgclError::Signalled { .. }
+    ) || matches!(&error, EgclError::Internal(token) if token.starts_with("__"))
+    {
         return error;
     }
+    egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
     // Render the report now (a plain Rust String, no GC alloc) so the declined
     // Signalled error can be printed at top level without the interpreter.
     let report = describe_err(&error);
@@ -5164,7 +5178,11 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
             match signal_condition_object(condition, env) {
                 // Every handler declined: mark it already-signalled so the
                 // enclosing HANDLER-BIND/HANDLER-CASE fallback skips it.
-                Ok(_) => EgclError::Signalled { condition, report },
+                Ok(_) => EgclError::Signalled {
+                    condition,
+                    report,
+                    backtrace: std::mem::take(&mut *backtrace),
+                },
                 // A handler transferred control (INVOKE-RESTART / HANDLER-CASE).
                 Err(transfer) => transfer,
             }
@@ -9155,10 +9173,13 @@ fn eval_lambda_call(
     args: &[EgclVal],
     parent: Arc<SharedCell<EnvFrame>>,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(params_form = params_form);
+    egcl_rt::rooted!(body = body);
+    let _debug_call = egcl_rt::debug_stack::CallFrame::enter_anonymous_with_args(args);
     eval_lambda_call_ex(
         env,
-        params_form,
-        body,
+        *params_form,
+        *body,
         args,
         parent,
         LexicalControl::Inherit,
@@ -35081,6 +35102,7 @@ fn apply_function(
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
                 egcl_rt::rooted!(closure = closure);
+                let _debug_call = egcl_rt::debug_stack::CallFrame::enter_anonymous_with_args(args);
                 // Run the body against the closure's LEXICAL block/tagbody exit
                 // points, not the caller's dynamic ones (bliss-4u5u): a
                 // `(return-from tag …)` in the body must target the block the
@@ -35171,6 +35193,13 @@ fn apply_function(
                 }
             }
         }
+        // Compiled dispatch above records its own physical activation. Only
+        // the surviving interpreted object path needs this logical call guard.
+        let name = egcl_rt::symbols::symbol_name_of(egcl_rt::function::name(fn_val));
+        let _debug_call = match name.as_deref() {
+            Some(name) => egcl_rt::debug_stack::CallFrame::enter_with_args(name, args),
+            None => egcl_rt::debug_stack::CallFrame::enter_anonymous_with_args(args),
+        };
         let params_form = egcl_rt::function::lambda_list(fn_val);
         let body = egcl_rt::function::body(fn_val);
         // A reified capturing closure runs its interpreted body against the
@@ -37262,6 +37291,8 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         None => make_simple_condition("SIMPLE-ERROR", *datum, &args, env)?,
     };
 
+    egcl_rt::rooted!(condition = condition);
+    egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
     let base_len = env.restarts.len();
     env.restarts.push(RestartEntry {
         captured_blocks: env.block_stack.clone(),
@@ -37277,10 +37308,14 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         report: NIL,
     });
 
-    let result = signal_condition_object(condition, env);
+    let result = signal_condition_object(*condition, env);
     env.restarts.truncate(base_len);
     match result {
-        Ok(_) => Err(EgclError::Internal(format!("ERROR: {}", message))),
+        Ok(_) => Err(EgclError::Signalled {
+            condition: *condition,
+            report: message,
+            backtrace: std::mem::take(&mut *backtrace),
+        }),
         Err(error) => {
             if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
                 return Ok(NIL);
@@ -38764,9 +38799,30 @@ fn run_eval_env(expr: &str, env: &mut Env) -> Result<i32, EgclError> {
             }
             Ok(0)
         }
-        Err(e) => {
-            eprintln!("ERROR: {}", describe_err(&e));
-            Err(e)
+        Err(mut error) => {
+            report_error_with_backtrace(&mut error, env);
+            Err(error)
+        }
+    }
+}
+
+/// Render the terminal error without replacing it if an argument's printer
+/// signals another condition. The retained snapshot is historical, not live.
+fn report_error_with_backtrace(error: &mut EgclError, env: &mut Env) {
+    egcl_rt::rooted_ref!(_error = error);
+    // Evaluation has already unwound, including its Env root. A custom argument
+    // printer can re-enter Lisp, so PRINT_ENV alone is not sufficient.
+    egcl_rt::rooted_ref!(_env = &mut *env);
+    eprintln!("ERROR: {}", describe_err(error));
+    if let EgclError::Signalled { backtrace, .. } = &*error {
+        let count = backtrace.len();
+        egcl_rt::rooted!(snapshot = backtrace.iter().take(20).cloned().collect::<Vec<_>>());
+        let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
+        let frames = egcl_stdlib::devtools::format_backtrace(&snapshot, 20);
+        PRINT_ENV.with(|slot| slot.set(previous));
+        eprintln!("Backtrace ({} of {count} captured frames):", frames.len());
+        for (index, frame) in frames.iter().enumerate() {
+            eprintln!("  {index}: {frame}");
         }
     }
 }
@@ -38790,9 +38846,9 @@ pub fn describe_err(e: &EgclError) -> String {
 fn run_load_env(path: &str, env: &mut Env) -> Result<i32, EgclError> {
     match load_path_into_env(path, env) {
         Ok(_) => Ok(0),
-        Err(e) => {
-            eprintln!("ERROR: {}", describe_err(&e));
-            Err(e)
+        Err(mut error) => {
+            report_error_with_backtrace(&mut error, env);
+            Err(error)
         }
     }
 }
@@ -38802,9 +38858,9 @@ fn run_script_env(path: &str, env: &mut Env) -> Result<i32, EgclError> {
         .map_err(|e| EgclError::FileError(format!("cannot read {}: {}", path, e)))?;
     match read_eval_all_env(&contents, env) {
         Ok(_) => Ok(0),
-        Err(e) => {
-            eprintln!("ERROR: {}", describe_err(&e));
-            Err(e)
+        Err(mut error) => {
+            report_error_with_backtrace(&mut error, env);
+            Err(error)
         }
     }
 }
@@ -41478,5 +41534,54 @@ mod hash_entry_rooting_tests {
         assert_eq!(cp(*entry).1, after);
         assert_eq!(cp(after).0, EgclVal::from_fixnum(171));
         println!("HASH-ENTRIES-RELOCATED");
+    }
+}
+
+#[cfg(test)]
+mod error_backtrace_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn batch_argument_printer_keeps_the_unwound_environment_rooted() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted!(
+            condition = read_eval_all_env(
+                "(make-condition 'simple-error :format-control \"original\")",
+                &mut env,
+            )
+            .unwrap()
+        );
+        egcl_rt::rooted!(
+            error = EgclError::Signalled {
+                condition: *condition,
+                report: "original".into(),
+                backtrace: vec![egcl_rt::debug_stack::LogicalFrame {
+                    function: Some("FAILED".into()),
+                    origin: egcl_rt::debug_stack::FrameOrigin::Interpreted,
+                    arguments: Some(vec![*condition]),
+                }],
+            }
+        );
+        egcl_rt::collect_t0_minor().unwrap();
+        fn collecting_printer(_value: EgclVal, _escape: bool) -> Option<String> {
+            egcl_rt::collect_t0_minor().unwrap();
+            Some("#<COLLECTING-PRINTER>".into())
+        }
+        struct RestorePrinter;
+        impl Drop for RestorePrinter {
+            fn drop(&mut self) {
+                egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+            }
+        }
+        egcl_stdlib::format::set_print_object_hook(Some(collecting_printer));
+        let _restore = RestorePrinter;
+        // No evaluation root is active. Only the reporter's own Env root can
+        // relocate this fresh value while the custom argument printer runs.
+        let original = egcl_rt::gc::alloc_double_float(79.0);
+        env.mv = vec![original];
+        report_error_with_backtrace(&mut error, &mut env);
+        assert_ne!(env.mv[0], original, "the Env-held value must actually move");
+        assert_eq!(env.mv[0].as_double_float(), 79.0);
     }
 }

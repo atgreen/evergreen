@@ -625,6 +625,63 @@ pub fn format_logical_frame(
     Ok(text)
 }
 
+/// Render historical calls with bounded, circular printing. A formatting error
+/// leaves a placeholder and cannot replace the original error. PRINT-OBJECT
+/// hooks retain the standard printer's existing default-object fallback.
+pub fn format_backtrace(
+    frames: &[egcl_rt::debug_stack::LogicalFrame],
+    count: usize,
+) -> Vec<String> {
+    struct PrintBindings(Vec<(u32, Option<EgclVal>)>);
+    impl egcl_rt::gc::TraceHostRoots for PrintBindings {
+        fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+            for (_, previous) in &mut self.0 {
+                egcl_rt::gc::TraceHostRoots::trace_host_roots(previous, visit);
+            }
+        }
+    }
+    impl Drop for PrintBindings {
+        fn drop(&mut self) {
+            for (index, previous) in self.0.drain(..).rev() {
+                egcl_rt::symbols::restore_symbol_binding(index, previous);
+            }
+        }
+    }
+    egcl_rt::rooted!(frames = frames.iter().take(count).cloned().collect::<Vec<_>>());
+    egcl_rt::rooted!(bindings = PrintBindings(Vec::new()));
+    for (name, value) in [
+        (
+            "*PRINT-LEVEL*",
+            EgclVal::from_fixnum(crate::format::print_level().unwrap_or(4).min(4) as i64),
+        ),
+        (
+            "*PRINT-LENGTH*",
+            EgclVal::from_fixnum(crate::format::print_length().unwrap_or(6).min(6) as i64),
+        ),
+        ("*PRINT-CIRCLE*", T),
+        ("*PRINT-READABLY*", NIL),
+    ] {
+        if let Some(index) = egcl_rt::symbols::find_index(name) {
+            bindings
+                .0
+                .push((index, egcl_rt::symbols::bind_symbol_value(index, value)));
+        }
+    }
+    let mut rendered = Vec::with_capacity(frames.len());
+    for index in 0..frames.len() {
+        let text = format_logical_frame(&frames[index]).unwrap_or_else(|_| {
+            let name = frames[index]
+                .function
+                .as_deref()
+                .map(|name| crate::format::print_qualified_symbol_name(name, true))
+                .unwrap_or_else(|| "<anonymous function>".into());
+            format!("({name} <error printing arguments>)")
+        });
+        rendered.push(text);
+    }
+    rendered
+}
+
 /// Debug frame — runtime representation of a single stack frame. D6.02.
 pub struct DebugFrame {
     func: EgclVal,

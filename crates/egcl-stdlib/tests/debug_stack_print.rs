@@ -95,3 +95,53 @@ fn printing_one_argument_can_relocate_later_arguments() {
         )
     );
 }
+
+#[test]
+fn bounded_backtrace_restores_relocated_printer_bindings() {
+    let _serial = test_guard();
+    for name in [
+        "*PRINT-LEVEL*",
+        "*PRINT-LENGTH*",
+        "*PRINT-CIRCLE*",
+        "*PRINT-READABLY*",
+    ] {
+        egcl_rt::symbols::intern(name);
+    }
+    egcl_stdlib::clos::bootstrap_clos().unwrap();
+    let name = egcl_rt::symbols::make_uninterned("BINDING-PRINTER");
+    let class = EgclVal::from_fixnum(401);
+    egcl_stdlib::clos::set_find_class(name, class).unwrap();
+    egcl_rt::rooted!(instance = egcl_stdlib::clos::allocate_instance(class).unwrap());
+    egcl_rt::collect_t0_minor().unwrap();
+    fn collecting_printer(_value: EgclVal, _escape: bool) -> Option<String> {
+        egcl_rt::collect_t0_minor().unwrap();
+        Some("#<BINDING-PRINTER>".into())
+    }
+    struct ResetHook;
+    impl Drop for ResetHook {
+        fn drop(&mut self) {
+            egcl_stdlib::format::set_print_object_hook(None);
+        }
+    }
+    egcl_stdlib::format::set_print_object_hook(Some(collecting_printer));
+    let _reset = ResetHook;
+    let index = egcl_rt::symbols::find_index("*PRINT-READABLY*").unwrap();
+    // An arbitrary non-NIL truth value is temporarily hidden by the printer's
+    // NIL binding. Its saved value must be traced while the argument moves GC.
+    let original = egcl_rt::gc::alloc_double_float(79.0);
+    egcl_rt::rooted!(previous = egcl_rt::symbols::bind_symbol_value(index, original));
+    let frames = [LogicalFrame {
+        function: Some("LEAF".into()),
+        origin: FrameOrigin::Interpreted,
+        arguments: Some(vec![*instance]),
+    }];
+    let text = egcl_stdlib::devtools::format_backtrace(&frames, 20);
+    let restored = egcl_rt::symbols::symbol_value(index).unwrap();
+    egcl_rt::symbols::restore_symbol_binding(index, previous.take());
+    assert_ne!(
+        restored, original,
+        "the saved binding must actually relocate"
+    );
+    assert_eq!(restored.as_double_float(), 79.0);
+    assert_eq!(text, ["(LEAF #<BINDING-PRINTER>)"]);
+}

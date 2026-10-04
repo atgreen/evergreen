@@ -98,7 +98,13 @@ pub enum EgclError {
     /// enclosing handler frame that already had its in-context turn does not run
     /// its handlers a second time. Constructed only from an already-allocated
     /// condition, so producing it allocates nothing new.
-    Signalled { condition: EgclVal, report: String },
+    Signalled {
+        condition: EgclVal,
+        report: String,
+        /// Owned historical calls captured before signalling/unwinding. Values
+        /// are traced with the error; these are not inspectable live frames.
+        backtrace: Vec<crate::debug_stack::LogicalFrame>,
+    },
 }
 
 impl core::fmt::Display for EgclError {

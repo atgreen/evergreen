@@ -2845,21 +2845,25 @@ pub struct FiberCallFrame {
 }
 impl FiberCallFrame {
     pub fn enter(name: &str) -> Self {
-        Self::enter_recorded(name, None, FrameOrigin::Interpreted)
+        Self::enter_recorded(Some(name), None, FrameOrigin::Interpreted)
     }
 
     pub fn enter_with_args(name: &str, arguments: &[EgclVal]) -> Self {
-        Self::enter_recorded(name, Some(arguments.to_vec()), FrameOrigin::Interpreted)
+        Self::enter_recorded(Some(name), Some(arguments.to_vec()), FrameOrigin::Interpreted)
+    }
+
+    pub fn enter_anonymous_with_args(arguments: &[EgclVal]) -> Self {
+        Self::enter_recorded(None, Some(arguments.to_vec()), FrameOrigin::Interpreted)
     }
 
     /// Record original arguments for the current, already-pushed managed call
     /// frame. The guard must be dropped when that activation leaves the stack.
     /// This augments the physical frame rather than adding a second Lisp call.
     pub fn enter_managed(name: &str, arguments: &[EgclVal]) -> Self {
-        Self::enter_recorded(name, Some(arguments.to_vec()), FrameOrigin::Managed)
+        Self::enter_recorded(Some(name), Some(arguments.to_vec()), FrameOrigin::Managed)
     }
 
-    fn enter_recorded(name: &str, arguments: Option<Vec<EgclVal>>, origin: FrameOrigin) -> Self {
+    fn enter_recorded(name: Option<&str>, arguments: Option<Vec<EgclVal>>, origin: FrameOrigin) -> Self {
         // First-time native-thread registration may poll a safepoint. Root the
         // copy before acquiring the owner; never hold its frame lock over GC.
         crate::rooted!(arguments = arguments);
@@ -2873,7 +2877,7 @@ impl FiberCallFrame {
         owner.frames().lock().unwrap().push(RecordedCall {
             anchor,
             frame: LogicalFrame {
-                function: Some(name.to_owned()),
+                function: name.map(str::to_owned),
                 origin,
                 arguments: arguments.take(),
             },

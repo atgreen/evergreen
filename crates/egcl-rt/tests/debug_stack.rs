@@ -163,6 +163,54 @@ fn managed_argument_records_merge_without_duplicate_calls() {
 }
 
 #[test]
+fn anonymous_call_roots_arguments_without_inventing_an_identity() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    egcl_rt::thread::current_stack();
+    let original = egcl_rt::gc::alloc_double_float(81.0);
+    let call = CallFrame::enter_anonymous_with_args(&[original]);
+    egcl_rt::collect_t0_minor().unwrap();
+    let frames = capture_current(1);
+    assert_eq!(frames[0].function, None);
+    let moved = frames[0].arguments.as_ref().unwrap()[0];
+    assert_ne!(moved, original, "the anonymous argument must relocate");
+    assert_eq!(moved.as_double_float(), 81.0);
+    drop(call);
+    assert!(capture_current(1).is_empty());
+}
+
+#[test]
+fn signalled_error_owns_and_relocates_its_historical_arguments() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    egcl_rt::thread::current_stack();
+    let original = egcl_rt::gc::alloc_double_float(79.0);
+    let call = CallFrame::enter_with_args("FAILED", &[original]);
+    egcl_rt::rooted!(
+        error = egcl_rt::EgclError::Signalled {
+            condition: NIL,
+            report: "original failure".into(),
+            backtrace: capture_current(1),
+        }
+    );
+    drop(call);
+    // The returned error is now the only owner/root of the original argument.
+    egcl_rt::collect_t0_minor().unwrap();
+    let egcl_rt::EgclError::Signalled {
+        backtrace, report, ..
+    } = &*error
+    else {
+        unreachable!()
+    };
+    let moved = backtrace[0].arguments.as_ref().unwrap()[0];
+    assert_ne!(moved, original, "the error-owned argument must relocate");
+    assert_eq!(moved.as_double_float(), 79.0);
+    assert_eq!(report, "original failure");
+    assert_eq!(backtrace[0].function.as_deref(), Some("FAILED"));
+    assert!(capture_current(1).is_empty());
+}
+
+#[test]
 fn native_identity_belongs_to_installed_code_and_owned_snapshots() {
     let _serial = TEST_LOCK.lock().unwrap();
     init_heap();

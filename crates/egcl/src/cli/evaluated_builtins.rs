@@ -1520,6 +1520,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // to prepare an unused terminal message (bliss-michh).
             // Root across both handler callbacks and any uncaught-error report.
             egcl_rt::rooted!(condition = condition);
+            egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
             match signal_condition_object(*condition, env) {
                 Ok(_) => {
                     let report = match condition_report_text(env, *condition) {
@@ -1529,7 +1530,11 @@ fn resolve(name: &str) -> Option<Handler> {
                         }
                         None => val_as_str(*control),
                     };
-                    Err(EgclError::Internal(format!("ERROR: {}", report)))
+                    Err(EgclError::Signalled {
+                        condition: *condition,
+                        report,
+                        backtrace: std::mem::take(&mut *backtrace),
+                    })
                 }
                 Err(error) => Err(error),
             }
