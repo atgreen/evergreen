@@ -279,7 +279,15 @@ pub(crate) fn transition_native_state(
     use crate::thread::NativeThreadState;
     if next != NativeThreadState::Running {
         crate::thread::current_stack().publish_top();
-        crate::gc::retire_current_t0_tlab_for_safepoint();
+        // Publish, do not retire: this transition is made on EVERY foreign
+        // call, and retiring discarded the rest of the thread's 256 KB TLAB
+        // each time, so 256 calls exhausted a 64 MB nursery and forced a minor
+        // collection -- 78 of them, 3.2 s, in a 20000-call loop that consed
+        // nothing (bliss-0kxcu). The filler keeps the region walkable while
+        // native code runs; if a collection does occur, alloc_typed sees the
+        // changed GC_MOVE_EPOCH and replaces the allocator before reusing the
+        // reservation, the same contract NativeBlockingScope relies on.
+        crate::gc::publish_current_t0_tlab_for_safepoint();
     }
     let coord = coordinator();
     let mut transition = coord.park_mutex.lock().unwrap();
