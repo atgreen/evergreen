@@ -151,10 +151,10 @@ fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
             assert!(env.mv[1].is_cons());
         } else {
             assert!(
-                matches!(&*result, Err(EgclError::Signalled { condition, report, backtrace })
-                    if super::super::super::condition_matches_handler(&env, *condition, "SIMPLE-ERROR")
-                        && report == "original error"
-                        && !backtrace.is_empty()),
+                matches!(&*result, Err(EgclError::Signalled(details))
+                    if super::super::super::condition_matches_handler(&env, details.condition, "SIMPLE-ERROR")
+                        && details.report == "original error"
+                        && !details.backtrace.is_empty()),
                 "{:?}",
                 &*result
             );
@@ -248,7 +248,7 @@ fn native_v2_fallback_propagates_without_replaying_the_original_definition() {
                 assert_eq!(env.mv[0], args[0]);
                 assert!(env.mv[1].is_cons());
             }
-            1 => assert!(matches!(&*result, Err(EgclError::Signalled { .. }))),
+            1 => assert!(matches!(&*result, Err(EgclError::Signalled(_)))),
             2 => {
                 assert!(
                     matches!(&*result, Err(EgclError::Internal(t)) if t == &token),

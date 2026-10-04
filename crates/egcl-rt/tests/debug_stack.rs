@@ -187,25 +187,20 @@ fn signalled_error_owns_and_relocates_its_historical_arguments() {
     let original = egcl_rt::gc::alloc_double_float(79.0);
     let call = CallFrame::enter_with_args("FAILED", &[original]);
     egcl_rt::rooted!(
-        error = egcl_rt::EgclError::Signalled {
-            condition: NIL,
-            report: "original failure".into(),
-            backtrace: capture_current(1),
-        }
+        error = egcl_rt::EgclError::signalled(NIL, "original failure".into(), capture_current(1))
     );
     drop(call);
     // The returned error is now the only owner/root of the original argument.
     egcl_rt::collect_t0_minor().unwrap();
-    let egcl_rt::EgclError::Signalled {
-        backtrace, report, ..
-    } = &*error
+    let egcl_rt::EgclError::Signalled(details) = &*error
     else {
         unreachable!()
     };
+    let backtrace = &details.backtrace;
     let moved = backtrace[0].arguments.as_ref().unwrap()[0];
     assert_ne!(moved, original, "the error-owned argument must relocate");
     assert_eq!(moved.as_double_float(), 79.0);
-    assert_eq!(report, "original failure");
+    assert_eq!(details.report, "original failure");
     assert_eq!(backtrace[0].function.as_deref(), Some("FAILED"));
     assert!(capture_current(1).is_empty());
 }
@@ -414,3 +409,20 @@ mod fibers {
 #[cfg(egcl_fibers)]
 #[path = "support/native_entry.rs"]
 mod native_entry;
+
+#[test]
+fn boxed_signalled_condition_is_a_relocatable_root() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    egcl_rt::thread::current_stack();
+    // A movable stand-in isolates the condition slot; real condition objects
+    // may be pinned, which would not exercise pointer rewriting here.
+    let original = egcl_rt::gc::alloc_double_float(83.0);
+    egcl_rt::rooted!(error = egcl_rt::EgclError::signalled(
+        original, "condition slot".into(), Vec::new(),
+    ));
+    egcl_rt::collect_t0_minor().unwrap();
+    let egcl_rt::EgclError::Signalled(details) = &*error else { unreachable!() };
+    assert_ne!(details.condition, original, "the boxed condition slot must relocate");
+    assert_eq!(details.condition.as_double_float(), 83.0);
+}

@@ -422,3 +422,12 @@ fn egcl_error_question_mark_propagation() {
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().to_string(), "shutdown requested");
 }
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn historical_error_details_do_not_enlarge_ordinary_results() {
+    // The pre-backtrace error/result representation occupied five words.
+    // Cold diagnostic payloads must not widen every successful runtime return.
+    assert!(std::mem::size_of::<EgclError>() <= 40);
+    assert!(std::mem::size_of::<Result<EgclVal, EgclError>>() <= 40);
+}

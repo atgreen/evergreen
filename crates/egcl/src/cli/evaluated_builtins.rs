@@ -1530,11 +1530,7 @@ fn resolve(name: &str) -> Option<Handler> {
                         }
                         None => val_as_str(*control),
                     };
-                    Err(EgclError::Signalled {
-                        condition: *condition,
-                        report,
-                        backtrace: std::mem::take(&mut *backtrace),
-                    })
+                    Err(EgclError::signalled(*condition, report, std::mem::take(&mut *backtrace)))
                 }
                 Err(error) => Err(error),
             }

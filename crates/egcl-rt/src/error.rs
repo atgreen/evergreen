@@ -91,20 +91,32 @@ pub enum EgclError {
     #[cfg(feature = "python")]
     PythonRaised(Box<crate::python::Raise>),
 
-    /// A condition-denoting raw error that has ALREADY been signalled through the
-    /// live handler stack (bliss-9kc) and declined by every handler. Carries the
-    /// built condition (so it stays reachable/traced) plus a pre-rendered report
-    /// for display. Condition-conversion returns `None` for this variant, so an
-    /// enclosing handler frame that already had its in-context turn does not run
-    /// its handlers a second time. Constructed only from an already-allocated
-    /// condition, so producing it allocates nothing new.
-    Signalled {
+    /// A condition already signalled through the live handler stack and declined
+    /// by every handler. Box the cold details so historical snapshots do not
+    /// enlarge ordinary runtime Result values (bliss-cf672.7.1).
+    Signalled(Box<SignalledError>),
+}
+
+/// Owned details for an already-signalled condition. Condition conversion skips
+/// these errors so enclosing handlers do not run a second time. Construction
+/// allocates on the Rust heap only; it cannot trigger Lisp collection.
+#[derive(Debug)]
+pub struct SignalledError {
+    pub condition: EgclVal,
+    pub report: String,
+    /// Historical calls captured before signalling/unwinding. Values are traced
+    /// with the error; these are not inspectable live frames.
+    pub backtrace: Vec<crate::debug_stack::LogicalFrame>,
+}
+
+impl EgclError {
+    pub fn signalled(
         condition: EgclVal,
         report: String,
-        /// Owned historical calls captured before signalling/unwinding. Values
-        /// are traced with the error; these are not inspectable live frames.
         backtrace: Vec<crate::debug_stack::LogicalFrame>,
-    },
+    ) -> Self {
+        Self::Signalled(Box::new(SignalledError { condition, report, backtrace }))
+    }
 }
 
 impl core::fmt::Display for EgclError {
@@ -154,7 +166,7 @@ impl core::fmt::Display for EgclError {
                 }
                 Ok(())
             }
-            EgclError::Signalled { report, .. } => write!(f, "{}", report),
+            EgclError::Signalled(details) => write!(f, "{}", details.report),
         }
     }
 }

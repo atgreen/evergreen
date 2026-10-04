@@ -16017,7 +16017,7 @@ fn initiate_unwind(
     // as EgclError::Signalled so the per-frame handler logic does not re-run it.
     // Control tokens (Internal) and already-Signalled errors are left untouched.
     if matches!(&pending, Pending::Propagate(e)
-        if !matches!(e, EgclError::Internal(_) | EgclError::Signalled { .. }))
+        if !matches!(e, EgclError::Internal(_) | EgclError::Signalled(_)))
     {
         if let Pending::Propagate(error) = pending {
             pending = error_to_pending(signal_raw_error_in_context(env, error), env);

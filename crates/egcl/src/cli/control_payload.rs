@@ -388,7 +388,7 @@ mod tests {
             )
         );
         assert!(
-            matches!(&*error, EgclError::Signalled { .. }),
+            matches!(&*error, EgclError::Signalled(_)),
             "{:?}",
             &*error
         );

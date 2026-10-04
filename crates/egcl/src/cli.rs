@@ -5086,7 +5086,7 @@ fn run_handler_cluster(env: &mut Env, condition: EgclVal, ci: usize) -> Result<(
             // older handlers have had their turn; restoring it first can call
             // the same handler again while skipping the older ones.
             let result = match eval_handler_impl(&entry.handler, *condition, env) {
-                Err(error) if !matches!(error, EgclError::Internal(_) | EgclError::Signalled { .. }) => {
+                Err(error) if !matches!(error, EgclError::Internal(_) | EgclError::Signalled(_)) => {
                     Err(signal_raw_error_in_context(env, error))
                 }
                 other => other,
@@ -5120,11 +5120,7 @@ fn signal_and_raise(env: &mut Env, condition: EgclVal, msg: String) -> EgclError
     egcl_rt::rooted!(condition = condition);
     egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
     match signal_condition_object(*condition, env) {
-        Ok(_) => EgclError::Signalled {
-            condition: *condition,
-            report: msg,
-            backtrace: std::mem::take(&mut *backtrace),
-        },
+        Ok(_) => EgclError::signalled(*condition, msg, std::mem::take(&mut *backtrace)),
         Err(error) => error,
     }
 }
@@ -5157,7 +5153,7 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
         EgclError::Oom
             | EgclError::StackOverflow(_)
             | EgclError::Shutdown
-            | EgclError::Signalled { .. }
+            | EgclError::Signalled(_)
     ) || matches!(&error, EgclError::Internal(token) if token.starts_with("__"))
     {
         return error;
@@ -5178,11 +5174,7 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
             match signal_condition_object(condition, env) {
                 // Every handler declined: mark it already-signalled so the
                 // enclosing HANDLER-BIND/HANDLER-CASE fallback skips it.
-                Ok(_) => EgclError::Signalled {
-                    condition,
-                    report,
-                    backtrace: std::mem::take(&mut *backtrace),
-                },
+                Ok(_) => EgclError::signalled(condition, report, std::mem::take(&mut *backtrace)),
                 // A handler transferred control (INVOKE-RESTART / HANDLER-CASE).
                 Err(transfer) => transfer,
             }
@@ -37311,11 +37303,7 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let result = signal_condition_object(*condition, env);
     env.restarts.truncate(base_len);
     match result {
-        Ok(_) => Err(EgclError::Signalled {
-            condition: *condition,
-            report: message,
-            backtrace: std::mem::take(&mut *backtrace),
-        }),
+        Ok(_) => Err(EgclError::signalled(*condition, message, std::mem::take(&mut *backtrace))),
         Err(error) => {
             if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
                 return Ok(NIL);
@@ -38814,7 +38802,8 @@ fn report_error_with_backtrace(error: &mut EgclError, env: &mut Env) {
     // printer can re-enter Lisp, so PRINT_ENV alone is not sufficient.
     egcl_rt::rooted_ref!(_env = &mut *env);
     eprintln!("ERROR: {}", describe_err(error));
-    if let EgclError::Signalled { backtrace, .. } = &*error {
+    if let EgclError::Signalled(details) = &*error {
+        let backtrace = &details.backtrace;
         let count = backtrace.len();
         egcl_rt::rooted!(snapshot = backtrace.iter().take(20).cloned().collect::<Vec<_>>());
         let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
@@ -41553,15 +41542,15 @@ mod error_backtrace_rooting_tests {
             .unwrap()
         );
         egcl_rt::rooted!(
-            error = EgclError::Signalled {
-                condition: *condition,
-                report: "original".into(),
-                backtrace: vec![egcl_rt::debug_stack::LogicalFrame {
+            error = EgclError::signalled(
+                *condition,
+                "original".into(),
+                vec![egcl_rt::debug_stack::LogicalFrame {
                     function: Some("FAILED".into()),
                     origin: egcl_rt::debug_stack::FrameOrigin::Interpreted,
                     arguments: Some(vec![*condition]),
                 }],
-            }
+            )
         );
         egcl_rt::collect_t0_minor().unwrap();
         fn collecting_printer(_value: EgclVal, _escape: bool) -> Option<String> {

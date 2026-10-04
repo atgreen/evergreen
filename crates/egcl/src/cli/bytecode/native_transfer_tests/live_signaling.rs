@@ -145,12 +145,12 @@ fn native_v2_live_handlers_select_before_native_cleanup_and_outer_fallback() {
             );
             assert_eq!(env.lookup_var("*LIVE-RESTART-VISIBLE*"), Some(NIL));
         } else {
-            let EgclError::Signalled { condition, .. } = error else {
+            let EgclError::Signalled(details) = error else {
                 panic!("declined error must not be signaled again: {error:?}");
             };
             let datum = resolve_sym("DATUM").unwrap();
             assert_eq!(
-                super::super::super::read_slot_value(*condition, datum, &env).unwrap(),
+                super::super::super::read_slot_value(details.condition, datum, &env).unwrap(),
                 args[0]
             );
         }
@@ -234,12 +234,12 @@ fn native_v2_handler_replacement_signals_only_older_clusters_before_cleanup() {
         env.lookup_var("*REPLACE-DATUM*"),
         Some(EgclVal::from_fixnum(27))
     );
-    let EgclError::Signalled { condition, .. } = result.as_ref().unwrap_err() else {
+    let EgclError::Signalled(details) = result.as_ref().unwrap_err() else {
         panic!("replacement must already be signaled: {:?}", &*result);
     };
     let datum = resolve_sym("DATUM").unwrap();
     assert_eq!(
-        super::super::super::read_slot_value(*condition, datum, &env).unwrap(),
+        super::super::super::read_slot_value(details.condition, datum, &env).unwrap(),
         EgclVal::from_fixnum(27)
     );
 }

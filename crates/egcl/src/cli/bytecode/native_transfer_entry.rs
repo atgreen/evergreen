@@ -1681,7 +1681,7 @@ unsafe fn prepare_transfer(
     if let Some(error) = NATIVE_ERROR.with(|slot| slot.take()) {
         let selected = if matches!(
             error,
-            EgclError::Internal(_) | EgclError::Signalled { .. }
+            EgclError::Internal(_) | EgclError::Signalled(_)
         ) {
             error
         } else {
@@ -1701,7 +1701,7 @@ unsafe fn prepare_transfer(
             // activation. A selected enclosing restart likewise unwinds here
             // before its owner consumes the arguments. Both may run checked
             // local cleanup without guessing an outer native destination.
-            if matches!(error, EgclError::Signalled { .. }) {
+            if matches!(error, EgclError::Signalled(_)) {
                 selected_transfer = true;
             } else if let Some(id) = super::super::restart_invoked_id(error) {
                 selected_transfer = env.restarts.iter().any(|restart| restart.id == id);
