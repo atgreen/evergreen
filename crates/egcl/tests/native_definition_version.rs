@@ -5,6 +5,11 @@
 use std::process::Command;
 
 fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
+    // Per-allocation stress plus heap verification takes about 372 seconds in
+    // the CI release profile (bliss-q2enn). Keep stress, poison, verification,
+    // and every result/path assertion; give that work a bounded budget with
+    // headroom instead of terminating it at the old 240-second deadline.
+    let timeout_seconds = "900";
     let program = format!(
         r#"
       (defun cleanup-root-helper (x)
@@ -27,7 +32,7 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
     let output = Command::new("timeout")
         .args([
             "--kill-after=5",
-            "240",
+            timeout_seconds,
             env!("CARGO_BIN_EXE_egcl"),
             "--no-init",
             "--eval",
@@ -44,7 +49,11 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
         .expect("run deopt cleanup rooting regression");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(
+        output.status.success(),
+        "deopt cleanup probe tier={tier}, status={}, timeout={timeout_seconds}s (124 means timeout):\n{stdout}\n{stderr}",
+        output.status,
+    );
     assert!(
         stdout.contains("DEOPT-CLEANUP-ROOT-OK"),
         "{stdout}\n{stderr}"
