@@ -53,6 +53,106 @@ impl TraceHostRoots for RecordedCall {
     }
 }
 
+struct RecordedCallSlot {
+    anchor: usize,
+    function: String,
+    function_available: bool,
+    origin: FrameOrigin,
+    arguments: Vec<EgclVal>,
+    arguments_available: bool,
+}
+
+const RETAINED_FUNCTION_NAME_CAPACITY: usize = 128;
+const RETAINED_ARGUMENT_CAPACITY: usize = 64;
+
+impl Default for RecordedCallSlot {
+    fn default() -> Self {
+        Self {
+            anchor: 0,
+            function: String::new(),
+            function_available: false,
+            origin: FrameOrigin::Interpreted,
+            arguments: Vec::new(),
+            arguments_available: false,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RecordedCalls {
+    active: usize,
+    slots: Vec<RecordedCallSlot>,
+}
+
+impl RecordedCalls {
+    pub fn push(
+        &mut self,
+        anchor: usize,
+        function: Option<&str>,
+        arguments: Option<&[EgclVal]>,
+        origin: FrameOrigin,
+    ) {
+        if self.active == self.slots.len() {
+            self.slots.push(RecordedCallSlot::default());
+        }
+        let slot = &mut self.slots[self.active];
+        slot.anchor = anchor;
+        slot.function.clear();
+        slot.function_available = function.is_some();
+        if let Some(function) = function {
+            slot.function.push_str(function);
+        }
+        slot.origin = origin;
+        slot.arguments.clear();
+        slot.arguments_available = arguments.is_some();
+        if let Some(arguments) = arguments {
+            slot.arguments.extend_from_slice(arguments);
+        }
+        self.active += 1;
+    }
+
+    pub fn pop(&mut self) {
+        self.active = self
+            .active
+            .checked_sub(1)
+            .expect("recorded call stack underflow");
+        let slot = &mut self.slots[self.active];
+        slot.function.clear();
+        slot.function_available = false;
+        slot.arguments.clear();
+        slot.arguments_available = false;
+        if slot.function.capacity() > RETAINED_FUNCTION_NAME_CAPACITY {
+            slot.function = String::new();
+        }
+        if slot.arguments.capacity() > RETAINED_ARGUMENT_CAPACITY {
+            slot.arguments = Vec::new();
+        }
+    }
+
+    pub fn snapshot(&self, count: usize) -> Vec<RecordedCall> {
+        self.slots[..self.active]
+            .iter()
+            .skip(self.active.saturating_sub(count))
+            .map(|slot| RecordedCall {
+                anchor: slot.anchor,
+                frame: LogicalFrame {
+                    function: slot.function_available.then(|| slot.function.clone()),
+                    origin: slot.origin,
+                    arguments: slot.arguments_available.then(|| slot.arguments.clone()),
+                },
+            })
+            .collect()
+    }
+}
+
+impl TraceHostRoots for RecordedCalls {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for slot in &mut self.slots[..self.active] {
+            slot.arguments.trace_host_roots(visit);
+        }
+    }
+}
+
 /// Capture the current Lisp execution, innermost call first.
 pub fn capture_current(count: usize) -> Vec<LogicalFrame> {
     crate::thread::current_backtrace(count)
@@ -241,5 +341,64 @@ impl Drop for ForeignFrame {
     fn drop(&mut self) {
         debug_assert_eq!(self.stack.fp(), self.frame);
         self.stack.pop_frame();
+    }
+}
+
+#[cfg(test)]
+mod recorded_call_tests {
+    use super::*;
+
+    #[test]
+    fn call_depth_reuses_storage_without_rooting_inactive_values() {
+        let mut calls = RecordedCalls::default();
+        calls.push(
+            17,
+            Some("A-LONG-RECORDED-FUNCTION-NAME"),
+            Some(&[EgclVal::from_fixnum(1), EgclVal::from_fixnum(2)]),
+            FrameOrigin::Interpreted,
+        );
+        let name_storage = calls.slots[0].function.as_ptr();
+        let argument_storage = calls.slots[0].arguments.as_ptr();
+        calls.pop();
+
+        let mut visits = 0;
+        calls.trace_host_roots(&mut |_| visits += 1);
+        assert_eq!(visits, 0, "inactive capacity must not retain Lisp roots");
+
+        calls.push(
+            23,
+            Some("SHORT"),
+            Some(&[EgclVal::from_fixnum(3)]),
+            FrameOrigin::Managed,
+        );
+        assert_eq!(calls.slots[0].function.as_ptr(), name_storage);
+        assert_eq!(calls.slots[0].arguments.as_ptr(), argument_storage);
+        let snapshot = calls.snapshot(1);
+        assert_eq!(snapshot[0].anchor, 23);
+        assert_eq!(snapshot[0].frame.function.as_deref(), Some("SHORT"));
+        assert_eq!(
+            snapshot[0].frame.arguments.as_deref(),
+            Some(&[EgclVal::from_fixnum(3)][..])
+        );
+        assert_eq!(snapshot[0].frame.origin, FrameOrigin::Managed);
+
+        calls.pop();
+        calls.push(29, None, None, FrameOrigin::Interpreted);
+        let snapshot = calls.snapshot(1);
+        assert_eq!(snapshot[0].frame.function, None);
+        assert_eq!(snapshot[0].frame.arguments, None);
+        calls.pop();
+
+        let long_name = "X".repeat(1024);
+        let many_arguments = vec![EgclVal::from_fixnum(7); 256];
+        calls.push(
+            31,
+            Some(&long_name),
+            Some(&many_arguments),
+            FrameOrigin::Interpreted,
+        );
+        calls.pop();
+        assert!(calls.slots[0].function.capacity() <= 128);
+        assert!(calls.slots[0].arguments.capacity() <= 64);
     }
 }
