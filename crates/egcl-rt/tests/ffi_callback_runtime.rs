@@ -3,12 +3,12 @@
 
 //! Managed callback roots, runtime transitions, and errors contained inside C.
 #![cfg(all(target_arch = "x86_64", any(unix, windows)))]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use egcl_rt::ffi::{
     AlienType, ffi_call,
     managed_callback::{LispCallback, set_callback_runner},
 };
 use egcl_rt::thread::NativeThreadState;
+use std::sync::atomic::{AtomicUsize, Ordering};
 static INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
 use egcl_rt::{EgclError, EgclVal};
@@ -334,4 +334,89 @@ fn callback_root_reads_cooperate_with_a_competing_collector() {
     }
     .unwrap();
     assert_eq!(result, 1);
+}
+
+#[test]
+fn first_callback_trace_survives_a_later_callback_collection() {
+    if run_isolated("first_callback_trace_survives_a_later_callback_collection") {
+        return;
+    }
+    static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+    static RETURNED: AtomicUsize = AtomicUsize::new(0);
+    fn trace_runner(_closure: EgclVal, arguments: &[EgclVal]) -> Result<EgclVal, EgclError> {
+        if arguments[0].as_double_float() == 1.25 {
+            ORIGINAL.store(arguments[0].to_raw() as usize, Ordering::SeqCst);
+            let _call =
+                egcl_rt::debug_stack::CallFrame::enter_with_args("ORIGINAL-CALLBACK", arguments);
+            Err(EgclError::ProgramError("original callback failure".into()).capture_backtrace())
+        } else {
+            // The first invocation has returned through C. Its argument is now
+            // reachable only from the pending historical trace, not a live frame.
+            egcl_rt::collect_t0_minor()?;
+            let _call = egcl_rt::debug_stack::CallFrame::enter("LATER-CALLBACK");
+            Err(EgclError::ProgramError("later callback failure".into()).capture_backtrace())
+        }
+    }
+    extern "C" fn invoke_twice(pointer: *const ()) -> f64 {
+        let callback: unsafe extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(pointer) };
+        for value in [1.25, 2.5] {
+            assert_eq!(unsafe { callback(value) }, 0.0);
+            RETURNED.fetch_add(1, Ordering::SeqCst);
+        }
+        17.0
+    }
+    set_callback_runner(trace_runner);
+    let callback = LispCallback::new(
+        EgclVal::from_fixnum(0),
+        AlienType::Double,
+        vec![AlienType::Double],
+    )
+    .unwrap();
+    egcl_rt::rooted!(
+        error = unsafe {
+            ffi_call(
+                invoke_twice as *const (),
+                &AlienType::Double,
+                &[AlienType::Pointer(Box::new(AlienType::Void))],
+                &[callback.as_fn_ptr() as usize as u64],
+            )
+        }
+        .unwrap_err()
+    );
+    assert_eq!(
+        RETURNED.load(Ordering::SeqCst),
+        2,
+        "both C calls must return before signalling"
+    );
+    assert!(matches!(error.without_backtrace(), EgclError::FfiError(_)));
+    assert!(error.to_string().contains("original callback failure"));
+    let frames = error
+        .backtrace()
+        .expect("retain the first callback's historical trace");
+    let frame = frames
+        .iter()
+        .find(|frame| frame.function.as_deref() == Some("ORIGINAL-CALLBACK"))
+        .expect("original callback frame");
+    let arguments = frame.arguments.as_ref().unwrap();
+    assert_eq!(arguments.len(), 1);
+    assert_ne!(
+        arguments[0].to_raw() as usize,
+        ORIGINAL.load(Ordering::SeqCst),
+        "the pending trace's only argument must actually relocate"
+    );
+    assert_eq!(arguments[0].as_double_float(), 1.25);
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.function.as_deref() == Some("LATER-CALLBACK"))
+    );
+    // The explicit diagnostic API still reports the latest text, independently
+    // of the first error propagated by the enclosing outbound call.
+    assert!(
+        callback
+            .take_error()
+            .unwrap()
+            .contains("later callback failure")
+    );
+    assert!(callback.take_error().is_none());
 }

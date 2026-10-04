@@ -41,6 +41,14 @@ chain before native teardown. Their condition signalling still waits for a
 GC-safe interpreter boundary: retaining the trace does not make the retired
 native activation available for live inspection.
 
+A Lisp failure inside a foreign callback retains its historical Lisp frames
+when the enclosing foreign call reports `EGCL-FFI:FFI-ERROR`. C still receives
+the defined zero result and returns normally before that new condition is
+signalled. If C invokes more callbacks before returning, the first failure's
+trace remains protected from GC. `EGCL-FFI:CALLBACK-ERROR` continues to return
+the latest diagnostic text. This does not provide native C internal frames or
+permit Lisp nonlocal exits to cross C.
+
 The debugger displays frames and available restarts. Frame detail depends on
 the execution path and retained metadata. Optimized native code, runtime bridges,
 and foreign frames do not necessarily preserve every source local. Do not

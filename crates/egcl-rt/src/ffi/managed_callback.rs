@@ -18,8 +18,9 @@ pub fn set_callback_runner(runner: CallbackRunner) {
 }
 
 thread_local! {
-    // Native strings only: no unregistered Lisp condition references survive C.
-    static CALL_ERRORS: RefCell<Vec<Option<String>>> = const { RefCell::new(Vec::new()) };
+    // ForeignStateScope pins a fiber while these carrier-local scopes are live.
+    // Successful calls retain only None; failures own separately rooted snapshots.
+    static CALL_ERRORS: RefCell<Vec<Option<Box<CallbackFailure>>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(super) struct ForeignCallErrors;
@@ -31,7 +32,10 @@ impl ForeignCallErrors {
     pub(super) fn finish(self) -> Result<(), EgclError> {
         let error =
             CALL_ERRORS.with(|scopes| scopes.borrow_mut().last_mut().and_then(Option::take));
-        error.map_or(Ok(()), |error| Err(EgclError::FfiError(error)))
+        // The native-state guard has already unpinned the fiber. Restoring the
+        // snapshot can poll and migrate it, so pop this carrier's scope FIRST.
+        drop(self);
+        error.map_or(Ok(()), |error| Err(error.into_error()))
     }
 }
 impl Drop for ForeignCallErrors {
@@ -39,6 +43,53 @@ impl Drop for ForeignCallErrors {
         CALL_ERRORS.with(|scopes| {
             scopes.borrow_mut().pop();
         });
+    }
+}
+
+/// Only error paths allocate this payload. The C boundary retains diagnostic
+/// text and historical frames, never a Lisp condition or a nonlocal-exit token.
+struct CallbackFailure {
+    message: String,
+    backtrace: Option<CrossThreadRoot<Vec<crate::debug_stack::LogicalFrame>>>,
+}
+
+impl CallbackFailure {
+    fn message(message: String) -> Box<Self> {
+        Box::new(Self {
+            message,
+            backtrace: None,
+        })
+    }
+
+    /// Called while the callback is still an admitted Running mutator. Publishing
+    /// the trace before returning to Native state lets later callbacks or other
+    /// mutators relocate its objects even after every original frame has left.
+    fn from_error(error: EgclError) -> Box<Self> {
+        let message = error.to_string();
+        let backtrace = match error {
+            EgclError::Traced(details) => Some(details.backtrace),
+            EgclError::Signalled(details) => Some(details.backtrace),
+            _ => None,
+        };
+        Box::new(Self {
+            message,
+            backtrace: backtrace.map(CrossThreadRoot::new),
+        })
+    }
+
+    /// Called after the outbound call has restored Running state and removed its
+    /// carrier-local error scope. The root reader may acknowledge a collection.
+    fn into_error(self) -> EgclError {
+        let error = EgclError::FfiError(self.message);
+        let Some(backtrace) = self.backtrace else {
+            return error;
+        };
+        crate::rooted!(frames = Vec::new());
+        backtrace.with_gc_stable_mutator(|saved| *frames = saved.clone());
+        EgclError::Traced(Box::new(crate::error::TracedError {
+            error,
+            backtrace: std::mem::take(&mut *frames),
+        }))
     }
 }
 
@@ -70,12 +121,13 @@ impl Context {
         marshal_to_c(*result, &self.result)
     }
 
-    fn record_error(&self, message: String) {
-        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
+    fn record_error(&self, mut failure: Box<CallbackFailure>) {
+        failure.message = format!("foreign callback failed: {}", failure.message);
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(failure.message.clone());
         CALL_ERRORS.with(|scopes| {
             if let Some(error) = scopes.borrow_mut().last_mut() {
                 if error.is_none() {
-                    *error = Some(message);
+                    *error = Some(failure);
                 }
             }
         });
@@ -96,10 +148,11 @@ unsafe extern "C" fn dispatch(context: *mut (), slots: *const u64) -> u64 {
     let _active = ActiveEntry(&context.active);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(unix)]
-        crate::runtime::ensure_signal_stack().map_err(|error| error.to_string())?;
+        crate::runtime::ensure_signal_stack()
+            .map_err(|error| CallbackFailure::message(error.to_string()))?;
         let _state = crate::safepoint::ForeignStateScope::lisp();
         let slots = unsafe { std::slice::from_raw_parts(slots, context.arguments.len()) };
-        context.invoke(slots).map_err(|error| error.to_string())
+        context.invoke(slots).map_err(CallbackFailure::from_error)
     }));
     let error = match result {
         Ok(Ok(value)) => return value,
@@ -124,10 +177,10 @@ unsafe extern "C" fn dispatch(context: *mut (), slots: *const u64) -> u64 {
                 // the C boundary; ordinary payloads are always reclaimed.
                 std::mem::forget(secondary);
             }
-            message
+            CallbackFailure::message(message)
         }
     };
-    context.record_error(format!("foreign callback failed: {error}"));
+    context.record_error(error);
     // A defined zero C result lets foreign frames return normally. The enclosing
     // outbound call then signals FFI-ERROR; foreign threads use take_error().
     0
