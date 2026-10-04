@@ -102,10 +102,7 @@ Keep commits focused and use imperative commit subjects. In the pull request:
   release baseline changes.
 
 If an AI assistant authored part of the change, preserve the agent provenance
-required by `AGENTS.md`, including its `Co-Authored-By` trailer. Do not submit
-EGCL compatibility patches to upstream projects without maintainer approval;
-the project keeps such work in pinned `atgreen` forks as described in
-`docs/library-forks.md`.
+required by `AGENTS.md`, including its `Co-Authored-By` trailer.
 
 Contributions are distributed under
 `GPL-3.0-or-later WITH Classpath-exception-2.0`, the license of this repository.
