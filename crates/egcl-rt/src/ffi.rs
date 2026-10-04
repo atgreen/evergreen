@@ -308,6 +308,7 @@ unsafe fn ffi_call_impl(
     let adapter = call::CallAdapter::get(ret_type, arg_types, fixed_count)?;
     let t1 = t0.map(|_| std::time::Instant::now());
 
+    let foreign_frame = crate::debug_stack::ForeignFrame::enter(fn_ptr)?;
     let errors = managed_callback::ForeignCallErrors::enter();
     let state_guard = crate::safepoint::ForeignStateScope::native();
     let t2 = t0.map(|_| std::time::Instant::now());
@@ -317,6 +318,7 @@ unsafe fn ffi_call_impl(
     let result = unsafe { adapter.invoke(fn_ptr, args) };
     let t3 = t0.map(|_| std::time::Instant::now());
     drop(state_guard);
+    drop(foreign_frame);
     errors.finish()?;
     if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
         ffi_profile_record(
@@ -638,6 +640,68 @@ impl Drop for Callback {
 // targets that load system (glibc) libraries. POWER and IBM Z also use this
 // backend by default because elf_loader has no native relocation support there.
 
+struct ForeignSymbolName {
+    address: usize,
+    name: Box<str>,
+    next: *mut ForeignSymbolName,
+}
+
+static FOREIGN_SYMBOL_NAMES: std::sync::atomic::AtomicPtr<ForeignSymbolName> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn cached_foreign_symbol_name(address: usize) -> Option<&'static str> {
+    use std::sync::atomic::Ordering;
+
+    let mut node = FOREIGN_SYMBOL_NAMES.load(Ordering::Acquire);
+    // SAFETY: successful insertion publishes fully initialized nodes with
+    // Release ordering, and published nodes are never mutated or reclaimed.
+    while let Some(entry) = unsafe { node.as_ref() } {
+        if entry.address == address {
+            return Some(&entry.name);
+        }
+        node = entry.next;
+    }
+    None
+}
+
+pub(super) fn remember_foreign_symbol(address: *const (), name: &str) {
+    use std::sync::atomic::Ordering;
+
+    let address = address as usize;
+    if address == 0 {
+        return;
+    }
+    let entry = Box::into_raw(Box::new(ForeignSymbolName {
+        address,
+        name: name.into(),
+        next: std::ptr::null_mut(),
+    }));
+    loop {
+        let head = FOREIGN_SYMBOL_NAMES.load(Ordering::Acquire);
+        let mut node = head;
+        // SAFETY: the Acquire load observes initialized, permanently retained
+        // nodes; the new entry is still private to this thread.
+        while let Some(existing) = unsafe { node.as_ref() } {
+            if existing.address == address && existing.name.as_ref() == name {
+                // SAFETY: `entry` has not been published by a successful CAS.
+                unsafe { drop(Box::from_raw(entry)) };
+                return;
+            }
+            node = existing.next;
+        }
+        // SAFETY: `entry` remains unpublished, so updating its link is private.
+        unsafe { (*entry).next = head };
+        if FOREIGN_SYMBOL_NAMES
+            .compare_exchange_weak(head, entry, Ordering::Release, Ordering::Acquire)
+            .is_ok()
+        {
+            // Names are durable debug metadata. Nodes are deliberately retained:
+            // active and historical backtraces may outlive a closed provider.
+            return;
+        }
+    }
+}
+
 #[cfg(all(
     unix,
     not(feature = "c-ffi"),
@@ -789,8 +853,11 @@ mod elf_backend {
             .and_then(Option::as_ref)
             .cloned()
             .ok_or_else(|| EgclError::FfiError("invalid or closed library handle".into()))?;
-        lib.symbol(name)
-            .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))
+        let symbol = lib
+            .symbol(name)
+            .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))?;
+        super::remember_foreign_symbol(symbol, name);
+        Ok(symbol)
     }
 
     /// # Safety
@@ -822,14 +889,17 @@ mod elf_backend {
         let libs: Vec<_> = LIBS.lock().unwrap().iter().flatten().cloned().collect();
         for lib in libs {
             if let Some(symbol) = lib.symbol(name) {
+                super::remember_foreign_symbol(symbol, name);
                 return Ok(symbol);
             }
         }
-        host_symbol_addresses()
+        let address = host_symbol_addresses()
             .into_iter()
             .find(|(symbol, _)| *symbol == name)
             .map(|(_, address)| address)
-            .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))
+            .ok_or_else(|| EgclError::FfiError(format!("symbol '{name}' not found")))?;
+        super::remember_foreign_symbol(address, name);
+        Ok(address)
     }
 }
 
@@ -962,7 +1032,9 @@ unsafe fn dynamic_symbol(library: *mut libc::c_void, name: &str) -> Result<*cons
             name, msg
         )))
     } else {
-        Ok(sym as *const ())
+        let symbol = sym as *const ();
+        remember_foreign_symbol(symbol, name);
+        Ok(symbol)
     }
 }
 
@@ -1021,3 +1093,118 @@ mod windows;
 pub use windows::{
     close_foreign_library, foreign_symbol, foreign_symbol_global, load_foreign_library,
 };
+
+/// Cold symbolization of an active outbound call. The lookup itself is lock-free
+/// and loader-independent; returned text is owned so historical snapshots never
+/// retain pointers into a provider's symbol table.
+pub(crate) fn foreign_frame_name(address: usize) -> String {
+    if let Some(name) = cached_foreign_symbol_name(address) {
+        return name.to_owned();
+    }
+    format!("<unknown at 0x{address:x}>")
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu", feature = "c-ffi"))]
+mod foreign_frame_name_tests {
+    use super::{foreign_frame_name, foreign_symbol_global};
+    use std::ffi::CString;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn symbolization_does_not_wait_for_the_dynamic_loader() {
+        let malloc = unsafe { foreign_symbol_global("malloc") }.expect("resolve malloc");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("egcl-loader-lock-{}-{nonce}", std::process::id()));
+        fs::create_dir(&dir).expect("create test directory");
+        let source = dir.join("loader-lock.c");
+        let library = dir.join("loader-lock.so");
+        let ready = dir.join("ready");
+        let release = dir.join("release");
+        fs::write(
+            &source,
+            format!(
+                r#"
+#include <fcntl.h>
+#include <unistd.h>
+
+__attribute__((constructor)) static void hold_loader_lock(void) {{
+    int fd = open("{}", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) close(fd);
+    while (access("{}", F_OK) != 0) usleep(1000);
+}}
+"#,
+                ready.display(),
+                release.display()
+            ),
+        )
+        .expect("write test library source");
+        let compile = Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .output()
+            .expect("run cc");
+        assert!(
+            compile.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let release_after_probe = release.clone();
+        let ready_for_releaser = ready.clone();
+        let probe_done = Arc::new(AtomicBool::new(false));
+        let probe_done_for_releaser = Arc::clone(&probe_done);
+        let releaser_started = Arc::new(Barrier::new(2));
+        let releaser_barrier = Arc::clone(&releaser_started);
+        let releaser = std::thread::spawn(move || {
+            releaser_barrier.wait();
+            while !ready_for_releaser.exists() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !probe_done_for_releaser.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            fs::write(release_after_probe, b"").expect("release constructor");
+        });
+        releaser_started.wait();
+
+        let loader = std::thread::spawn(move || {
+            let path = CString::new(library.as_os_str().as_encoded_bytes()).unwrap();
+            let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW) };
+            assert!(!handle.is_null(), "test dlopen failed");
+            assert_eq!(unsafe { libc::dlclose(handle) }, 0);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "constructor did not start");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let started = Instant::now();
+        let name = foreign_frame_name(malloc as usize);
+        let elapsed = started.elapsed();
+        probe_done.store(true, Ordering::Release);
+
+        releaser.join().unwrap();
+        loader.join().unwrap();
+        assert_eq!(name, "malloc");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "symbolization waited {elapsed:?} for the loader lock"
+        );
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
+}

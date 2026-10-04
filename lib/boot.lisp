@@ -4436,7 +4436,7 @@ a hook error aborts startup.")
             (list :function (first row)
                   :arguments (second row)
                   :arguments-available-p (third row)
-                  :origin (nth (fourth row) '(:interpreted :managed :entry))))
+                  :origin (nth (fourth row) '(:interpreted :managed :entry :foreign))))
           (egcl::%debug-backtrace count start nil)))
 (defun egcl-debug:print-backtrace (&key (stream *debug-io*) (count 20) (start 0))
   "Print a bounded logical snapshot to STREAM and return NIL."

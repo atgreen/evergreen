@@ -233,6 +233,7 @@ unsafe fn call(
     let entry = adapter(stack.len())?;
     // Publish Native state so a collection can proceed while foreign code runs,
     // exactly as the other paths do.
+    let foreign_frame = crate::debug_stack::ForeignFrame::enter(fn_ptr)?;
     let state_guard = crate::safepoint::ForeignStateScope::native();
     // SAFETY: the trampoline reads a fixed count from each register buffer and
     // `stack.len()` from the stack buffer, all initialised above. The caller
@@ -263,6 +264,7 @@ unsafe fn call(
         }
     };
     drop(state_guard);
+    drop(foreign_frame);
     Ok(narrow_result(result, raw))
 }
 

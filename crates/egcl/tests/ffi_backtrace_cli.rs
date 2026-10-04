@@ -123,6 +123,11 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
             }
             let trace_start = stderr.find("Backtrace (").expect("terminal backtrace");
             let trace = &stderr[trace_start..];
+            let boundary = trace
+                .find("[foreign] call_lisp_trace <arguments unavailable>")
+                .unwrap_or_else(|| panic!("missing C boundary: {tier}/{failure}: {stderr}"));
+            assert!(boundary > trace.find("CALLBACK-TRACE-MIDDLE").unwrap());
+            assert!(boundary < trace.find("CALLBACK-TRACE-OUTER").unwrap());
             let mut previous = 0;
             for name in names {
                 assert_eq!(trace.matches(name).count(), 1, "{tier}/{failure}: {stderr}");
@@ -138,6 +143,107 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
                 previous = position;
             }
         }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn nested_foreign_boundaries_follow_execution_and_survive_library_close() {
+    let directory =
+        std::env::temp_dir().join(format!("egcl-ffi-boundaries-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("nested.c");
+    let library = directory.join("nested.so");
+    std::fs::write(
+        &source,
+        r#"
+        int trace_inner_c(int (*callback)(int), int value) { return callback(value); }
+        int trace_outer_c(int (*callback)(int), int value) { return callback(value); }
+    "#,
+    )
+    .unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for (tier, installed) in [("interp", 0), ("t0", 0), ("t1", 1), ("t2", 2)] {
+        let program = format!(
+            r#"
+          (defparameter *boundary-library* (egcl-ffi:load-foreign-library {:?}))
+          (defparameter *inner-c* (egcl-ffi:foreign-symbol-pointer "trace_inner_c" *boundary-library*))
+          (defparameter *outer-c* (egcl-ffi:foreign-symbol-pointer "trace_outer_c" *boundary-library*))
+          (defparameter *capture-boundary* nil)
+          (defparameter *boundary-snapshot* nil)
+          (defun boundary-leaf (value)
+            (when *capture-boundary*
+              (setq *boundary-snapshot* (egcl-debug:list-backtrace :count 100)))
+            (+ value 1))
+          (defparameter *inner-callback* (egcl-ffi:make-callback #'boundary-leaf :int '(:int)))
+          (defun boundary-middle (value)
+            (egcl-ffi:foreign-call *inner-c* :int '(:pointer :int)
+              (list (egcl-ffi:callback-pointer *inner-callback*) value)))
+          (defparameter *outer-callback* (egcl-ffi:make-callback #'boundary-middle :int '(:int)))
+          (defun boundary-outer (value)
+            (egcl-ffi:foreign-call *outer-c* :int '(:pointer :int)
+              (list (egcl-ffi:callback-pointer *outer-callback*) value)))
+          (dotimes (i 100) (assert (= 42 (boundary-outer 41))))
+          (dolist (name '(boundary-leaf boundary-middle boundary-outer))
+            (assert (= {installed} (egcl-ext:function-tier name))))
+          (defun check-boundary-snapshot ()
+            (let ((foreign (remove-if-not
+                             (lambda (frame) (eq :foreign (getf frame :origin)))
+                             *boundary-snapshot*)))
+              (assert (equal '("trace_inner_c" "trace_outer_c")
+                             (mapcar (lambda (frame) (getf frame :function)) foreign)))
+              (dolist (frame foreign)
+                (assert (not (getf frame :arguments-available-p)))
+                (assert (null (getf frame :arguments)))))
+            (let ((names (mapcar (lambda (frame) (getf frame :function)) *boundary-snapshot*)))
+              (let ((expected '("COMMON-LISP-USER::BOUNDARY-LEAF" "trace_inner_c"
+                                "COMMON-LISP-USER::BOUNDARY-MIDDLE" "trace_outer_c"
+                                "COMMON-LISP-USER::BOUNDARY-OUTER")))
+                (assert (equal expected
+                               (remove-if-not (lambda (name) (member name expected :test #'equal))
+                                              names))))))
+          (setq *capture-boundary* t)
+          (assert (= 42 (boundary-outer 41)))
+          (check-boundary-snapshot)
+          (let* ((fiber (egcl-fiber:make-fiber
+                          (lambda ()
+                            (assert (= 42 (boundary-outer 41)))
+                            (check-boundary-snapshot)
+                            (egcl-fiber:fiber-yield)
+                            (assert (notany (lambda (frame) (eq :foreign (getf frame :origin)))
+                                            (egcl-debug:list-backtrace :count 100)))
+                            :done)))
+                 (group (egcl-fiber:start-fibers (list fiber) :carrier-count 2)))
+            (assert (equal '(:done) (egcl-fiber:finish-fibers group))))
+          (egcl-ffi:close-foreign-library *boundary-library*)
+          (check-boundary-snapshot)
+          (assert (notany (lambda (frame) (eq :foreign (getf frame :origin)))
+                          (egcl-debug:list-backtrace :count 100)))
+          (format t "NESTED-FOREIGN-BOUNDARIES-OK~%")
+        "#,
+            library.to_str().unwrap()
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--eval", &program])
+            .env("EGCL_FORCE_TIER", tier)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("NESTED-FOREIGN-BOUNDARIES-OK"),
+            "{tier}: {stdout}\n{stderr}"
+        );
     }
     std::fs::remove_dir_all(directory).unwrap();
 }

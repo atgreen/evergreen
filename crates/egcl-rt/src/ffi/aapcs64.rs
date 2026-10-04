@@ -187,6 +187,7 @@ pub unsafe fn ffi_call(
 
     // Publish Native state so a collection can proceed while foreign code runs,
     // exactly as the x86-64 path does.
+    let foreign_frame = crate::debug_stack::ForeignFrame::enter(fn_ptr)?;
     let state_guard = crate::safepoint::ForeignStateScope::native();
     let t2 = t0.map(|_| std::time::Instant::now());
     // SAFETY: the trampoline reads eight words from each register buffer and
@@ -228,6 +229,7 @@ pub unsafe fn ffi_call(
     };
     let t3 = t0.map(|_| std::time::Instant::now());
     drop(state_guard);
+    drop(foreign_frame);
     if let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) {
         crate::ffi::ffi_profile_record(
             t1.duration_since(t0).as_nanos() as u64,

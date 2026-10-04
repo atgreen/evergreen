@@ -47,9 +47,11 @@ pub unsafe fn foreign_symbol(token: *mut (), name: &str) -> Result<*const (), Eg
     let lib = library(token)?;
     let name_c = std::ffi::CString::new(name)
         .map_err(|_| EgclError::FfiError("symbol name contains null byte".into()))?;
-    unsafe { GetProcAddress(lib.0 as _, name_c.as_ptr().cast()) }
+    let symbol = unsafe { GetProcAddress(lib.0 as _, name_c.as_ptr().cast()) }
         .map(|f| f as *const ())
-        .ok_or_else(|| loader_error(name))
+        .ok_or_else(|| loader_error(name))?;
+    super::remember_foreign_symbol(symbol, name);
+    Ok(symbol)
 }
 /// # Safety
 /// No caller may continue using symbols from the closed library.

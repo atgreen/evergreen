@@ -341,6 +341,18 @@ fn first_callback_trace_survives_a_later_callback_collection() {
     if run_isolated("first_callback_trace_survives_a_later_callback_collection") {
         return;
     }
+    callback_trace_survives_collection(false);
+}
+
+#[test]
+fn buffered_callback_trace_survives_a_later_callback_collection() {
+    if run_isolated("buffered_callback_trace_survives_a_later_callback_collection") {
+        return;
+    }
+    callback_trace_survives_collection(true);
+}
+
+fn callback_trace_survives_collection(buffered: bool) {
     static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
     static RETURNED: AtomicUsize = AtomicUsize::new(0);
     fn trace_runner(_closure: EgclVal, arguments: &[EgclVal]) -> Result<EgclVal, EgclError> {
@@ -374,12 +386,26 @@ fn first_callback_trace_survives_a_later_callback_collection() {
     .unwrap();
     egcl_rt::rooted!(
         error = unsafe {
-            ffi_call(
-                invoke_twice as *const (),
-                &AlienType::Double,
-                &[AlienType::Pointer(Box::new(AlienType::Void))],
-                &[callback.as_fn_ptr() as usize as u64],
-            )
+            if buffered {
+                let pointer = callback.as_fn_ptr();
+                let mut result = 0.0_f64;
+                egcl_rt::ffi::ffi_call_buffered(
+                    invoke_twice as *const (),
+                    &AlienType::Double,
+                    &[AlienType::Pointer(Box::new(AlienType::Void))],
+                    &[(&pointer as *const *const ()).cast()],
+                    (&mut result as *mut f64).cast(),
+                    None,
+                )
+                .map(|()| result.to_bits())
+            } else {
+                ffi_call(
+                    invoke_twice as *const (),
+                    &AlienType::Double,
+                    &[AlienType::Pointer(Box::new(AlienType::Void))],
+                    &[callback.as_fn_ptr() as usize as u64],
+                )
+            }
         }
         .unwrap_err()
     );
@@ -393,6 +419,20 @@ fn first_callback_trace_survives_a_later_callback_collection() {
     let frames = error
         .backtrace()
         .expect("retain the first callback's historical trace");
+    let foreign: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.origin == egcl_rt::debug_stack::FrameOrigin::Foreign)
+        .collect();
+    assert_eq!(foreign.len(), 1);
+    assert_eq!(
+        foreign[0].function.as_deref(),
+        Some(format!("<unknown at 0x{:x}>", invoke_twice as *const () as usize).as_str())
+    );
+    assert_eq!(foreign[0].arguments, None);
+    assert!(
+        egcl_rt::debug_stack::capture_current(100).is_empty(),
+        "returned C boundary must leave the execution stack"
+    );
     let frame = frames
         .iter()
         .find(|frame| frame.function.as_deref() == Some("ORIGINAL-CALLBACK"))

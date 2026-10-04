@@ -158,6 +158,7 @@ pub unsafe fn ffi_call_buffered(
             adapter
         }
     };
+    let foreign_frame = crate::debug_stack::ForeignFrame::enter(target)?;
     let errors = super::managed_callback::ForeignCallErrors::enter();
     let state = crate::safepoint::ForeignStateScope::native();
     let entry: unsafe extern "C" fn(*const (), *const MaybeUninit<u64>, *mut MaybeUninit<u64>) =
@@ -166,6 +167,7 @@ pub unsafe fn ffi_call_buffered(
         entry(target, slots.as_ptr(), result_slots.as_mut_ptr().cast());
     }
     drop(state);
+    drop(foreign_frame);
     errors.finish()?;
     if signature.result.size != 0 {
         unsafe {

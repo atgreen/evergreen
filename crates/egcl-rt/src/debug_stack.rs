@@ -21,6 +21,8 @@ pub enum FrameOrigin {
     Managed,
     /// The entry function of a fiber that has not started executing.
     Entry,
+    /// An outbound C call boundary, not an unwound internal C activation.
+    Foreign,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,7 +108,10 @@ impl PendingBacktrace {
             let record = unsafe { &*frame };
             let function = (record.frame_type() == FrameType::Call).then_some(record.function);
             calls += usize::from(function.is_some());
-            let installed_name = if function.is_some() && !record.code_info.is_null() {
+            let foreign = record.flags & crate::stack::FOREIGN_CALL != 0;
+            let installed_name = if foreign {
+                Some(crate::ffi::foreign_frame_name(record.return_pc as usize))
+            } else if function.is_some() && !record.code_info.is_null() {
                 unsafe { &*record.code_info }.function_name()
             } else {
                 None
@@ -119,7 +124,11 @@ impl PendingBacktrace {
             self.frames.push(CopiedFrame {
                 address: frame as usize,
                 function,
-                origin: FrameOrigin::Managed,
+                origin: if foreign {
+                    FrameOrigin::Foreign
+                } else {
+                    FrameOrigin::Managed
+                },
                 installed_name,
                 arguments,
             });
@@ -174,5 +183,63 @@ impl PendingBacktrace {
         frames.extend(recorded.map(|call| call.frame.clone()));
         frames.truncate(count);
         frames
+    }
+}
+
+/// A zero-slot call record on the execution-owned managed stack. Foreign calls
+/// already publish this stack and pin their fiber. This guard adds no name
+/// lookup, Lisp allocation, mutex, or per-call heap storage. Declare it before
+/// entering Native state and drop it after returning to Running.
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
+))]
+pub(crate) struct ForeignFrame {
+    stack: &'static crate::stack::EgclStack,
+    frame: *const Frame,
+    _execution_affine: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
+))]
+impl ForeignFrame {
+    pub(crate) fn enter(target: *const ()) -> Result<Self, EgclError> {
+        let stack = crate::thread::current_stack();
+        let frame = stack
+            .push_frame(
+                crate::value::NIL,
+                std::ptr::null(),
+                0,
+                crate::stack::FOREIGN_CALL,
+            )
+            .ok_or_else(|| {
+                EgclError::StackOverflow(crate::thread::current_fiber_id().unwrap_or_else(|| {
+                    crate::thread::FiberId(crate::thread::current_thread_id().0)
+                }))
+            })?;
+        // No safepoint occurs between publishing the frame and its target.
+        // This flagged frame contains no Lisp arguments or CodeInfo.
+        unsafe { (*frame).return_pc = target.cast() };
+        Ok(Self {
+            stack,
+            frame,
+            _execution_affine: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
+))]
+impl Drop for ForeignFrame {
+    fn drop(&mut self) {
+        debug_assert_eq!(self.stack.fp(), self.frame);
+        self.stack.pop_frame();
     }
 }

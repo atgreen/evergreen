@@ -46,8 +46,16 @@ when the enclosing foreign call reports `EGCL-FFI:FFI-ERROR`. C still receives
 the defined zero result and returns normally before that new condition is
 signalled. If C invokes more callbacks before returning, the first failure's
 trace remains protected from GC. `EGCL-FFI:CALLBACK-ERROR` continues to return
-the latest diagnostic text. This does not provide native C internal frames or
-permit Lisp nonlocal exits to cross C.
+the latest diagnostic text.
+
+Outbound scalar and buffered C calls appear as `[foreign] name` boundaries in
+these traces, including nested callbacks and calls made by fibers. Their
+`:origin` is `:foreign`, with arguments explicitly unavailable. Names are
+retained when foreign symbols are resolved, so capture does not enter the ELF
+loader or Unix dynamic linker; unavailable symbols show the target address
+instead. Captured names survive library close.
+These boundaries do not unwind internal C activations or permit Lisp nonlocal
+exits to cross C.
 
 The debugger displays frames and available restarts. Frame detail depends on
 the execution path and retained metadata. Optimized native code, runtime bridges,
@@ -94,8 +102,8 @@ inferring execution cost from a disassembly or a single tier label.
 plists. `:count` defaults to 20 and `:start` to zero; both accept nonnegative
 fixnums. The keys are `:function` (a name string or NIL), `:arguments` (the
 original argument list when recorded), `:arguments-available-p`, and `:origin`
-(`:interpreted`, `:managed`, or `:entry`). Managed frames alone do not identify
-which compiler tier is executing.
+(`:interpreted`, `:managed`, `:entry`, or `:foreign`). Managed frames alone do not
+identify which compiler tier is executing.
 
 An empty argument list with `:arguments-available-p` true describes a zero-argument
 call. NIL availability means the arguments are unknown. Argument objects remain

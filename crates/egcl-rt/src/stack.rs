@@ -449,7 +449,7 @@ fn stack_page_size() -> usize {
 pub struct Frame {
     /// Link to previous frame (for stack walking).
     pub prev_fp: *mut Frame,
-    /// Return address in native code.
+    /// Return address in native code, or outbound target when FOREIGN_CALL is set.
     pub return_pc: *const u8,
     /// The function object for this frame.
     pub function: EgclVal,
@@ -461,6 +461,10 @@ pub struct Frame {
     pub num_locals: u16,
     pub _pad: u16,
 }
+
+/// Marks a zero-slot outbound boundary. Low bits still identify a call; its
+/// return_pc holds the C target, function is NIL, and code_info is null.
+pub(crate) const FOREIGN_CALL: u32 = 1 << 2;
 
 /// Frame type (bits 1:0 of `flags`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

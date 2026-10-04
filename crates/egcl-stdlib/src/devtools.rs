@@ -650,6 +650,7 @@ pub fn backtrace_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             egcl_rt::debug_stack::FrameOrigin::Interpreted => 0,
             egcl_rt::debug_stack::FrameOrigin::Managed => 1,
             egcl_rt::debug_stack::FrameOrigin::Entry => 2,
+            egcl_rt::debug_stack::FrameOrigin::Foreign => 3,
         };
         let row = values_to_list(&[*name, *arguments, available, EgclVal::from_fixnum(origin)]);
         rows.push(row);
@@ -717,6 +718,12 @@ pub fn format_logical_frame(
     frame: &egcl_rt::debug_stack::LogicalFrame,
 ) -> Result<String, EgclError> {
     egcl_rt::rooted!(frame = frame.clone());
+    if frame.origin == egcl_rt::debug_stack::FrameOrigin::Foreign {
+        return Ok(format!(
+            "[foreign] {} <arguments unavailable>",
+            frame.function.as_deref().unwrap_or("<unknown>")
+        ));
+    }
     let mut text = format!(
         "({}",
         frame.function.as_deref()
