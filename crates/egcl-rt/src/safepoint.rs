@@ -24,7 +24,7 @@
 //! 6. After being unparked, each thread checks its per-thread yield flag
 //!    and yields to the scheduler if preemption was requested (§2.5.3 step 4).
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 static SAFEPOINT_PAGE_ADDR: AtomicUsize = AtomicUsize::new(0);
@@ -172,6 +172,8 @@ pub(crate) fn recover_poll_page_sigsegv() -> bool {
 
 /// Coordination state shared between the GC requester and mutator threads.
 struct SafepointCoordinator {
+    /// Native thread owning the complete request/resume cycle; zero when idle.
+    owner: AtomicU64,
     /// Number of mutator threads that have arrived at the safepoint.
     arrived: AtomicUsize,
     /// Total number of mutator threads that must arrive (set by requester).
@@ -190,6 +192,7 @@ struct SafepointCoordinator {
 fn coordinator() -> &'static SafepointCoordinator {
     static COORD: OnceLock<SafepointCoordinator> = OnceLock::new();
     COORD.get_or_init(|| SafepointCoordinator {
+        owner: AtomicU64::new(0),
         arrived: AtomicUsize::new(0),
         expected: AtomicUsize::new(0),
         parked: AtomicBool::new(false),
@@ -557,8 +560,30 @@ pub fn enter_safepoint() {
 pub fn wait_for_all_threads() -> Result<(), EgclError> {
     let coord = coordinator();
     let page = global_safepoint_page();
-
+    // Callers can hold carrier-bound resources, notably the GC admission
+    // write guard. Acknowledging a competing pause must not then preempt the
+    // fiber and migrate that guard to another native thread.
+    let _carrier_pin = crate::thread::FiberPin::current();
     let current = crate::thread::current_thread_id();
+
+    // GC admission serializes collectors, but callers can also request a pause
+    // directly. They must not overwrite another request's arrival counters or
+    // resume its mutators. A competing requester remains a mutator: poll while
+    // waiting for ownership so the current owner can finish its handshake.
+    loop {
+        match coord.owner.compare_exchange(
+            0, current.0, Ordering::AcqRel, Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(owner) if owner == current.0 => {
+                return Err(EgclError::Internal("nested safepoint request".into()));
+            }
+            Err(_) => {
+                poll_safepoint();
+                std::thread::yield_now();
+            }
+        }
+    }
     // Native synchronization regions enter/leave Blocked under this same lock.
     // Never take a participant snapshot between their state transition and
     // publication of the stop-the-world flag.
@@ -577,6 +602,7 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
     if let Err(error) = page.request_safepoint() {
         coord.parked.store(false, Ordering::SeqCst);
         coord.park_condvar.notify_all();
+        coord.owner.store(0, Ordering::Release);
         return Err(error);
     }
     drop(transition);
@@ -618,7 +644,10 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
                 // A mutator may be blocked in a syscall and unable to touch the
                 // polling page. Directed SIGUSR1 delivery is flag-only and
                 // exists solely to make that syscall return EINTR.
-                crate::runtime::install_signal_handlers()?;
+                if let Err(error) = crate::runtime::install_signal_handlers() {
+                    let _ = resume_all_threads();
+                    return Err(error);
+                }
                 let _ = crate::thread::signal_safepoint_participants(current);
             }
             // In the bootstrap runtime the thread registry can contain
@@ -643,6 +672,13 @@ pub fn wait_for_all_threads() -> Result<(), EgclError> {
 pub fn resume_all_threads() -> Result<(), EgclError> {
     let coord = coordinator();
     let page = global_safepoint_page();
+    let owner = coord.owner.load(Ordering::Acquire);
+    if owner == 0 {
+        return Ok(());
+    }
+    if owner != crate::thread::current_thread_id().0 {
+        return Err(EgclError::Internal("safepoint resume by a non-owner".into()));
+    }
 
     // Clear the safepoint page — new polls will no longer enter.
     page.resume()?;
@@ -658,6 +694,8 @@ pub fn resume_all_threads() -> Result<(), EgclError> {
     // Reset counters for the next safepoint cycle.
     coord.arrived.store(0, Ordering::SeqCst);
     coord.expected.store(0, Ordering::SeqCst);
+    // Publish idle only after every part of the preceding cycle is cleared.
+    coord.owner.store(0, Ordering::Release);
 
     Ok(())
 }
@@ -666,6 +704,75 @@ pub fn resume_all_threads() -> Result<(), EgclError> {
 mod gc_pause_tests {
     use super::*;
     use crate::gc::{Collector, HeapCollector};
+
+    #[test]
+    fn competing_requester_participates_before_starting_its_own_pause() {
+        const CHILD: &str = "EGCL_TEST_COMPETING_PAUSES_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::gc_pause_tests::competing_requester_participates_before_starting_its_own_pause",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        crate::gc::ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let phase = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker_phase = phase.clone();
+        let worker = std::thread::spawn(move || {
+            crate::thread::current_thread_id();
+            worker_phase.store(1, Ordering::Release);
+            while worker_phase.load(Ordering::Acquire) < 2 {
+                std::thread::yield_now();
+            }
+            let paused = wait_for_all_threads();
+            if paused.is_ok() {
+                worker_phase.store(3, Ordering::Release);
+                resume_all_threads().unwrap();
+            }
+            while worker_phase.load(Ordering::Acquire) < 4 {
+                poll_safepoint();
+                std::thread::yield_now();
+            }
+            paused
+        });
+        while phase.load(Ordering::Acquire) < 1 {
+            std::thread::yield_now();
+        }
+        phase.store(2, Ordering::Release);
+        // The worker has counted this Running thread, which deliberately has
+        // not polled yet. Requesting a second pause must acknowledge the first
+        // rather than replace its counters and strand both requesters.
+        while !global_safepoint_page().is_requested() {
+            std::thread::yield_now();
+        }
+        let paused = wait_for_all_threads();
+        let previous_finished = phase.load(Ordering::Acquire) == 3;
+        if paused.is_ok() {
+            let nested = wait_for_all_threads();
+            assert!(nested.is_err(), "nested pause must not overwrite its owner");
+            resume_all_threads().unwrap();
+        }
+        phase.store(4, Ordering::Release);
+        let worker_result = {
+            let _blocked = unsafe { NativeBlockingScope::enter() };
+            worker.join().unwrap()
+        };
+        assert!(worker_result.is_ok(), "first pause failed: {worker_result:?}");
+        assert!(paused.is_ok(), "second pause failed: {paused:?}");
+        assert!(previous_finished, "second pause overlapped the first");
+    }
 
     #[test]
     fn heap_snapshot_holds_pause_and_resumes_after_unwind() {
@@ -763,8 +870,6 @@ mod gc_pause_tests {
     // spec-covers: R3.14
     // GC pauses run through the cooperative safepoint handshake: the mutator
     // acknowledges and participates rather than being suspended asynchronously.
-    // Coverage, NOT a correctness claim — bliss-ddqhv is an open handshake bug
-    // under EGCL_GC_STRESS, and gc.yml still skips one safepoint test by name.
     #[test]
     fn parked_mutator_participates_in_consecutive_pauses() {
         const CHILD: &str = "EGCL_TEST_CONSECUTIVE_PAUSES_CHILD";

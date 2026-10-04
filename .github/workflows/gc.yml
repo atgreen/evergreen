@@ -103,13 +103,9 @@ jobs:
             --test function_object_dispatch_cli \
             --test defun_redefinition_retires_bytecode_cli \
             --test setf_function_names_cli || status=1
-          # egcl-rt stays: measured at ~5 minutes under stress, so it was never
-          # the expensive part -- I assumed it was and was wrong. One test is
-          # excluded by name, not silenced in the source, because it is a real
-          # unexplained failure and should stay visible: bliss-ddqhv, a safepoint
-          # handshake reporting 0/1 arrived under stress.
-          env ${{ matrix.env }} cargo test --release -p egcl-rt --no-fail-fast -- \
-            --skip t0_alloc_typed_observes_safepoints_before_touching_its_tlab || status=1
+          # Include the allocating-mutator handshake regression: request/resume
+          # ownership now serializes direct pauses with collectors (bliss-ddqhv).
+          env ${{ matrix.env }} cargo test --release -p egcl-rt --no-fail-fast || status=1
           exit $status
 
   # Scheduled: the whole suite under stress, which is where a rarely-exercised
