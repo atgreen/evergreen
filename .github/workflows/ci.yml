@@ -45,6 +45,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -53,14 +55,10 @@ jobs:
       # NOTE: `make fmt-check` is deliberately NOT a gate yet. The tree has
       # pre-existing rustfmt drift, so switching it on fails on unrelated files;
       # it goes in once that is cleaned in its own commit.
-      - name: spec coverage gate
-        run: python3 scripts/spec-coverage.py --gate
-      - name: cargo clippy
-        run: make clippy
-      - name: gc-root-lint (new unrooted-across-alloc candidates fail — bliss-jaf)
-        run: bash scripts/gc-root-lint.sh
-      - name: ansi-test expectations and CI contracts
-        run: cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts
+      # Report every independent gate even if an earlier one fails. The driver
+      # preserves each failure and exits nonzero if any check fails.
+      - name: spec coverage, Clippy, GC-root lint, and validation contracts
+        run: bash scripts/ci-lint.sh
 
   # PGO orchestration contracts. Its own job because it must run AFTER a
   # toolchain exists — in the previous layout it ran before the toolchain step
@@ -70,6 +68,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -115,6 +115,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -155,6 +157,8 @@ jobs:
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - name: add the glibc target
@@ -177,6 +181,8 @@ jobs:
       CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - name: add the host target

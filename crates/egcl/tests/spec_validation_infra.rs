@@ -88,18 +88,21 @@ fn ansi_expected_failures_and_ci_contracts() {
         "branches: [main]",
         "cargo check --workspace",
         "cargo test --workspace",
-        "ansi-test",
         "ubuntu-latest",
     ] {
         assert_has(&ci, needle, "ci.yml");
     }
-    // Clippy is gated through the Makefile, so the contract spans two files: CI
-    // must invoke the target, and the target must carry `-D warnings`. Asserting
-    // the literal command in ci.yml stopped holding when a7c37217 replaced it
-    // with `make clippy`, and this test then failed for months on a workflow that
-    // was in fact still gating clippy correctly -- and because ci.yml's own lint
-    // job RUNS this test, that made the contract gate red on itself.
-    assert_has(&ci, "make clippy", "ci.yml");
+    // Follow the actual command chain: CI runs the gate driver, which invokes
+    // the Makefile target carrying -D warnings. The driver's failure-injection
+    // test checks that failures propagate while the remaining gates still run.
+    assert_has(&ci, "run: bash scripts/ci-lint.sh", "ci.yml");
+    let driver = read("scripts/ci-lint.sh");
+    assert_has(&driver, "make clippy", "lint driver");
+    assert_has(
+        &driver,
+        "cargo test -p egcl --test spec_validation_infra ansi_expected_failures_and_ci_contracts",
+        "ANSI expectations contract command",
+    );
     assert_has(
         &read("Makefile"),
         "clippy --workspace --all-targets -- -D warnings",
