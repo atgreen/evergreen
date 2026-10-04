@@ -281,6 +281,9 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      # workflow_dispatch is the recursion-safe handoff to repository.yml:
+      # release events created with GITHUB_TOKEN do not start more workflows.
+      actions: write
       # Artifact attestations: id-token mints the OIDC token that proves which
       # workflow ran, attestations writes the signed statement to GitHub's store.
       id-token: write
@@ -365,3 +368,8 @@ jobs:
                 gh release delete "$stale" --yes --cleanup-tag
               done
           fi
+      - name: Publish DNF repository metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: gh workflow run repository.yml --ref main -f tag="$RELEASE_TAG"

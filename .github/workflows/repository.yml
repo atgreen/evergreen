@@ -1,0 +1,159 @@
+name: DNF repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Published release tag to add to the repository'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Both this workflow and docs.yml replace GitHub Pages from the complete
+# gh-pages branch. Serializing the whole workflow prevents one publisher from
+# archiving the branch while the other is updating it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          persist-credentials: false
+      - name: Download the published release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          details="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease)"
+          [[ "$(jq -r .isDraft <<<"$details")" == false ]]
+          [[ "$(jq -r .tagName <<<"$details")" == "$RELEASE_TAG" ]]
+          channel=release
+          if [[ "$(jq -r .isPrerelease <<<"$details")" == true ]]; then
+            channel=test
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          mkdir assets
+          gh release download "$RELEASE_TAG" --dir assets
+      - name: Verify every release asset
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y createrepo-c rpm gnupg
+          cmp packaging/fedora/RPM-GPG-KEY-egcl assets/RPM-GPG-KEY-egcl
+          (cd assets && sha256sum --check SHA256SUMS)
+
+          export GNUPGHOME="$RUNNER_TEMP/verify-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --quiet --import assets/RPM-GPG-KEY-egcl
+          gpg --batch --verify assets/SHA256SUMS.asc assets/SHA256SUMS
+
+          mkdir "$RUNNER_TEMP/rpmdb"
+          rpmkeys --dbpath "$RUNNER_TEMP/rpmdb" --import assets/RPM-GPG-KEY-egcl
+          report="$(rpmkeys --dbpath "$RUNNER_TEMP/rpmdb" --checksig assets/*.rpm)"
+          printf '%s\n' "$report"
+          expected="$(find assets -maxdepth 1 -name '*.rpm' -type f | wc -l)"
+          actual="$(grep -c 'signatures OK' <<<"$report")"
+          [[ "$actual" == "$expected" ]]
+          rm -rf "$GNUPGHOME" "$RUNNER_TEMP/rpmdb"
+      - name: Build and sign repository metadata
+        env:
+          CHANNEL: ${{ steps.release.outputs.channel }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          GPG_PRIVATE_KEY: ${{ secrets.EGCL_RELEASE_GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.EGCL_RELEASE_GPG_PASSPHRASE }}
+        run: |
+          mkdir repository-update
+          if [[ -d pages/.repo-store ]]; then
+            cp -a pages/.repo-store repository-update/
+          fi
+          dist="$(jq -r .dist assets/build.json)"
+          python3 packaging/fedora/repo.py record \
+            --assets assets --store repository-update/.repo-store \
+            --channel "$CHANNEL" --dist "$dist" --tag "$RELEASE_TAG" \
+            --repository "$GITHUB_REPOSITORY"
+
+          umask 077
+          export GNUPGHOME="$RUNNER_TEMP/signing-gnupg"
+          mkdir -p "$GNUPGHOME"
+          printf '%s' "$GPG_PASSPHRASE" > "$RUNNER_TEMP/passphrase"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --pinentry-mode loopback \
+            --passphrase-file "$RUNNER_TEMP/passphrase" --import
+          python3 packaging/fedora/repo.py build \
+            --store repository-update/.repo-store --output repository-update \
+            --dist "$dist" --passphrase-file "$RUNNER_TEMP/passphrase" \
+            --repository "$GITHUB_REPOSITORY" \
+            --pages-url "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          shred -u "$RUNNER_TEMP/passphrase"
+          rm -rf "$GNUPGHOME"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dnf-repository-update
+          path: repository-update/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          persist-credentials: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dnf-repository-update
+          path: repository-update
+      - name: Commit the repository to the published branch
+        env:
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          rm -rf pages/repo pages/.repo-store
+          cp -a repository-update/repo pages/
+          cp -a repository-update/.repo-store pages/
+          printf '.repo-store export-ignore\n' > pages/.gitattributes
+          git -C pages config user.name 'github-actions[bot]'
+          git -C pages config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C pages add -f .gitattributes .repo-store repo
+          if ! git -C pages diff --cached --quiet; then
+            git -C pages commit -m "Publish DNF repository for $RELEASE_TAG"
+            git -C pages push origin gh-pages
+          fi
+      - name: Assemble the complete Pages site
+        run: |
+          mkdir publish
+          git -C pages archive HEAD | tar -x -C publish
+          test -f publish/repo/egcl.repo
+          test -n "$(find publish/repo -path '*/repodata/repomd.xml.asc' -print -quit)"
+          test ! -e publish/.repo-store
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: publish/
+      - id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

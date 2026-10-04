@@ -15,6 +15,7 @@ repo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(repo)
 
 WORKFLOW = Path(__file__).resolve().parents[2] / '.github/workflows/release.yml'
+REPOSITORY_WORKFLOW = WORKFLOW.with_name('repository.yml')
 
 
 class PathTests(unittest.TestCase):
@@ -216,6 +217,30 @@ class WorkflowAgreementTests(unittest.TestCase):
         kept = re.search(r'\|\s*\.\[(\d+):\]', workflow)
         self.assertIsNotNone(kept, 'could not find the prune slice in release.yml')
         self.assertEqual(int(kept.group(1)), repo.TEST_CHANNEL_KEEP)
+
+    @unittest.skipUnless(WORKFLOW.is_file(), 'release.yml is not shipped in the source RPM')
+    def test_publishing_a_release_dispatches_the_repository_workflow(self):
+        workflow = WORKFLOW.read_text()
+        self.assertIn('actions: write', workflow)
+        self.assertIn('gh workflow run repository.yml', workflow)
+        self.assertIn('-f tag="$RELEASE_TAG"', workflow)
+
+    @unittest.skipUnless(WORKFLOW.is_file(), 'workflows are not shipped in the source RPM')
+    def test_repository_workflow_verifies_builds_and_deploys_the_repository(self):
+        self.assertTrue(REPOSITORY_WORKFLOW.is_file())
+        workflow = REPOSITORY_WORKFLOW.read_text()
+        for contract in (
+                'gh release download',
+                'sha256sum --check SHA256SUMS',
+                'gpg --batch --verify',
+                '--checksig assets/*.rpm',
+                'python3 packaging/fedora/repo.py record',
+                'python3 packaging/fedora/repo.py build',
+                '.repo-store export-ignore',
+                'actions/deploy-pages@',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, workflow)
 
 
 if __name__ == '__main__':
