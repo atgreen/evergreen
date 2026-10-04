@@ -4424,3 +4424,25 @@ a hook error aborts startup.")
 (defun egcl-ext::load-barrier () (egcl::%memory-fence :read))
 (defun egcl-ext::store-barrier () (egcl::%memory-fence :write))
 (export '(egcl-ext::memory-barrier egcl-ext::load-barrier egcl-ext::store-barrier) :egcl-ext)
+
+;;; Owned logical snapshots: no live stack pointers or invented native locals.
+(defpackage :egcl-debug (:use :common-lisp)
+  (:export :list-backtrace :print-backtrace))
+(defun egcl-debug:list-backtrace (&key (count 20) (start 0))
+  "Return innermost-first frame plists. Arguments are retained, not deep-copied."
+  (check-type count (and fixnum (integer 0)))
+  (check-type start (and fixnum (integer 0)))
+  (mapcar (lambda (row)
+            (list :function (first row)
+                  :arguments (second row)
+                  :arguments-available-p (third row)
+                  :origin (nth (fourth row) '(:interpreted :managed :entry))))
+          (egcl::%debug-backtrace count start nil)))
+(defun egcl-debug:print-backtrace (&key (stream *debug-io*) (count 20) (start 0))
+  "Print a bounded logical snapshot to STREAM and return NIL."
+  (check-type count (and fixnum (integer 0)))
+  (check-type start (and fixnum (integer 0)))
+  (let ((lines (egcl::%debug-backtrace count start t)))
+    (loop for line in lines for index from start
+          do (format (or stream *standard-output*) "~&  ~D: ~A~%" index line)))
+  nil)

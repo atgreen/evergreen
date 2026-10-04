@@ -41,6 +41,12 @@ pub(super) fn call(
 #[egcl_delivery_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        "EGCL::%DEBUG-BACKTRACE" => Some(|_operator, args, env| {
+            let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
+            let result = egcl_stdlib::devtools::backtrace_call(args);
+            PRINT_ENV.with(|c| c.set(prev_env));
+            result
+        }),
         "EGCL::SET-FILL-POINTER" => Some(|_operator, args, _env| {
             if args.len() != 2 {
                 return Err(EgclError::ProgramError(

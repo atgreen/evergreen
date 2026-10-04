@@ -71,6 +71,34 @@ cases.
 For performance investigations, use [profiling](profiling.md) rather than
 inferring execution cost from a disassembly or a single tier label.
 
+## Lisp snapshot functions
+
+`egcl-debug:list-backtrace` returns an innermost-first list of owned frame
+plists. `:count` defaults to 20 and `:start` to zero; both accept nonnegative
+fixnums. The keys are `:function` (a name string or NIL), `:arguments` (the
+original argument list when recorded), `:arguments-available-p`, and `:origin`
+(`:interpreted`, `:managed`, or `:entry`). Managed frames alone do not identify
+which compiler tier is executing.
+
+An empty argument list with `:arguments-available-p` true describes a zero-argument
+call. NIL availability means the arguments are unknown. Argument objects remain
+valid after the call returns or GC moves them, but are shared references: later
+mutation is visible through a retained snapshot. These are historical snapshots,
+not handles for evaluating expressions in a live frame.
+
+`egcl-debug:print-backtrace` accepts the same count/start options and `:stream`
+(default `*debug-io*`), prints with bounded circular argument formatting, and
+returns NIL. A NIL stream designates `*standard-output*`.
+
+```lisp
+(egcl-debug:list-backtrace :count 10)
+(egcl-debug:print-backtrace :stream *error-output* :count 20)
+```
+
+Capture inside a handler before unwinding to retain the failing call chain.
+These functions capture the current Lisp execution; they do not reconstruct an
+already-unwound stack from a condition object.
+
 ## Native debug metadata
 
 Installed T1, T2, and OSR code carries an in-memory ELF/DWARF image describing

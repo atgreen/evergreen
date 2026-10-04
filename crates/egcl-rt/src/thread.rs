@@ -2898,9 +2898,12 @@ pub(crate) fn current_backtrace(count: usize) -> Vec<crate::debug_stack::Logical
     let mut snapshot = crate::debug_stack::PendingBacktrace::default();
     crate::rooted_ref!(_snapshot = &mut snapshot);
     snapshot.recorded = if let Some(fiber) = current_fiber() {
-        fiber.lisp_frames.lock().unwrap().clone()
+        let frames = fiber.lisp_frames.lock().unwrap();
+        frames[frames.len().saturating_sub(count)..].to_vec()
     } else {
-        current_thread().lisp_frames.lock().unwrap().clone()
+        let thread = current_thread();
+        let frames = thread.lisp_frames.lock().unwrap();
+        frames[frames.len().saturating_sub(count)..].to_vec()
     };
     // SAFETY: this execution owns its active stack; copying does not yield.
     unsafe { snapshot.copy_stack(current_stack().fp(), count) };
@@ -2921,7 +2924,10 @@ pub(crate) fn fiber_logical_backtrace(
         if fiber.mounted.load(Ordering::Acquire) || *state == FiberState::Running {
             return Ok(None);
         }
-        snapshot.recorded = fiber.lisp_frames.lock().unwrap().clone();
+        snapshot.recorded = {
+            let frames = fiber.lisp_frames.lock().unwrap();
+            frames[frames.len().saturating_sub(count)..].to_vec()
+        };
         // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
         unsafe { snapshot.copy_stack(fiber.stack.published_fp(), count) };
         if *state == FiberState::Created && count != 0 {

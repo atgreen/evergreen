@@ -593,6 +593,123 @@ pub fn repl_loop(state: &mut ReplState) -> Result<(), EgclError> {
 
 // ── Debugger ───────────────────────────────────────────────────────
 
+/// Private bridge for the public EGCL-DEBUG snapshot API. Rows contain name,
+/// original arguments, argument availability, and logical origin. The Lisp
+/// wrapper assigns the public plist keys without retaining live stack pointers.
+pub fn backtrace_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let [count, start, render] = args else {
+        return Err(EgclError::ProgramError(
+            "backtrace requires count, start and render arguments".into(),
+        ));
+    };
+    fn nonnegative(value: EgclVal) -> Result<usize, EgclError> {
+        if value.is_fixnum() && value.as_fixnum() >= 0 {
+            Ok(value.as_fixnum() as usize)
+        } else {
+            Err(EgclError::TypeError {
+                datum: value,
+                expected: "nonnegative fixnum".into(),
+            })
+        }
+    }
+    let count = nonnegative(*count)?;
+    let start = nonnegative(*start)?;
+    let render = *render != NIL;
+    if count == 0 {
+        return Ok(NIL);
+    }
+    egcl_rt::rooted!(frames = egcl_rt::debug_stack::capture_current(count.saturating_add(start)));
+    let start = start.min(frames.len());
+    if render {
+        let lines = format_backtrace(&frames[start..], count);
+        egcl_rt::rooted!(values = Vec::<EgclVal>::new());
+        for line in lines {
+            let value = crate::streams::make_lisp_string(&line);
+            values.push(value);
+        }
+        return Ok(values_to_list(&values));
+    }
+    egcl_rt::rooted!(rows = Vec::<EgclVal>::new());
+    for index in start..frames.len() {
+        let name = frames[index].function.clone();
+        egcl_rt::rooted!(
+            name = name
+                .as_deref()
+                .map(crate::streams::make_lisp_string)
+                .unwrap_or(NIL)
+        );
+        let available = if frames[index].arguments.is_some() {
+            T
+        } else {
+            NIL
+        };
+        egcl_rt::rooted!(
+            arguments = values_to_list(frames[index].arguments.as_deref().unwrap_or(&[]))
+        );
+        let origin = match frames[index].origin {
+            egcl_rt::debug_stack::FrameOrigin::Interpreted => 0,
+            egcl_rt::debug_stack::FrameOrigin::Managed => 1,
+            egcl_rt::debug_stack::FrameOrigin::Entry => 2,
+        };
+        let row = values_to_list(&[*name, *arguments, available, EgclVal::from_fixnum(origin)]);
+        rows.push(row);
+    }
+    Ok(values_to_list(&rows))
+}
+
+#[cfg(test)]
+mod backtrace_snapshot_gc_tests {
+    use super::*;
+
+    fn nth(mut list: EgclVal, index: usize) -> EgclVal {
+        for _ in 0..index {
+            assert!(list.is_cons());
+            list = unsafe { (*list.as_ptr().cast::<ConsCell>()).cdr };
+        }
+        assert!(list.is_cons());
+        unsafe { (*list.as_ptr().cast::<ConsCell>()).car }
+    }
+
+    #[test]
+    fn lisp_snapshot_owns_arguments_after_the_call_returns_and_gc_moves_them() {
+        let _serial = crate::test_heap_guard();
+        egcl_rt::init_heap(&egcl_rt::GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 16 * 1024 * 1024,
+            nursery_size: 64 * 1024,
+            tlab_size: 4096,
+            region_size: 4096,
+            promotion_threshold: 3,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+        egcl_rt::current_stack();
+        let original = egcl_rt::gc::alloc_double_float(42.0);
+        let call =
+            egcl_rt::debug_stack::CallFrame::enter_with_args("SNAPSHOT-ARGUMENT", &[original, NIL]);
+        egcl_rt::rooted!(
+            rows =
+                backtrace_call(&[EgclVal::from_fixnum(1), EgclVal::from_fixnum(0), NIL]).unwrap()
+        );
+        drop(call);
+        egcl_rt::collect_t0_minor().unwrap();
+        let row = nth(*rows, 0);
+        let arguments = nth(row, 1);
+        let moved = nth(arguments, 0);
+        assert_ne!(
+            moved, original,
+            "the original argument must actually relocate"
+        );
+        assert_eq!(unsafe { moved.as_ptr().add(8).cast::<f64>().read() }, 42.0);
+        assert_eq!(nth(arguments, 1), NIL);
+        assert_eq!(nth(row, 2), T);
+        assert_eq!(nth(row, 0).as_string(), "SNAPSHOT-ARGUMENT");
+    }
+}
+
 /// Render an owned logical call using the standard Lisp printer. The caller's
 /// print settings control argument detail; no execution/stack lock is held
 /// while printing, which may allocate or invoke a user PRINT-OBJECT method.

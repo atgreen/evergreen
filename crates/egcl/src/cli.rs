@@ -17295,6 +17295,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(c = EgclVal::from_fixnum(generations as i64));
                 return Ok(vec_to_list(&[*a, *b, *c]));
             }
+            "EGCL::%DEBUG-BACKTRACE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FN-LAMBDA-LIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NATIVE-MUTEX" => return eval_builtin_arguments(&name, cdr, env),
@@ -35354,6 +35355,7 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         // Introspection / devtools
         "EGCL::%NATIVE-MUTEX"
+            | "EGCL::%DEBUG-BACKTRACE"
             | "EGCL::%POSIX"
             | "EGCL::%TEXT-CODEC"
             | "EGCL::%MEMORY-FENCE"
