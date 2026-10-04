@@ -322,3 +322,51 @@ fn initial_bindings_are_isolated_across_fibers() {
 (format t "FIBER-API-OK~%")
     "##);
 }
+
+/// R2.21: native executions have their own thread identity; fibers share
+/// visible carriers while retaining a different public type and identity.
+/// Native handles are currently integers, while fibers are structures; this
+/// does not claim a dedicated native-thread Lisp class. The runtime test
+/// make_thread_creates_and_joins_a_native_os_thread checks the OS backing.
+#[test]
+fn native_threads_and_fibers_have_distinct_types_and_visible_carriers() {
+    run(r##"
+      (let* ((parent (egcl-thread:current-thread))
+             (worker (egcl-thread:make-thread
+                       (lambda ()
+                         (assert (null (egcl-fiber:current-fiber)))
+                         (egcl-thread:current-thread)))))
+        (assert (not (eql parent worker)))
+        (assert (eql worker (egcl-thread:join-thread worker)))
+        (let* ((group (egcl-fiber:start-fibers nil :carrier-count 1))
+               (carriers (egcl-fiber:scheduler-group-carriers group))
+               (fibers (loop repeat 3 collect
+                         (egcl-fiber:make-fiber
+                           (lambda ()
+                             (let ((fiber (egcl-fiber:current-fiber)))
+                               (assert (egcl-fiber:fiber-p fiber))
+                               (assert (member (egcl-thread:current-thread) carriers))
+                               (assert (eql (egcl-thread:current-thread)
+                                            (egcl-fiber:fiber-carrier-thread fiber)))
+                               (egcl-thread:current-thread)))))))
+          (unwind-protect
+              (progn
+                (assert (= 1 (length carriers)))
+                (assert (= 3 (length (remove-duplicates fibers :test #'eq))))
+                (dolist (carrier carriers)
+                  (assert (not (eql parent carrier)))
+                  (assert (eq (type-of worker) (type-of carrier)))
+                  (assert (not (egcl-fiber:fiber-p carrier)))
+                  (assert (egcl-thread:thread-alive-p carrier))
+                  (assert (member carrier (egcl-thread:all-threads))))
+                (dolist (fiber fibers)
+                  (assert (not (eq (type-of worker) (type-of fiber))))
+                  (assert (typep fiber 'egcl-fiber:fiber))
+                  (assert (not (member fiber (egcl-thread:all-threads))))
+                  (egcl-fiber:submit-fiber group fiber))
+                (assert (equal (make-list 3 :initial-element (first carriers))
+                               (egcl-fiber:finish-fibers group))))
+            (egcl-fiber:finish-fibers group))))
+      (format t "FIBER-API-OK~%")
+    "##);
+}
