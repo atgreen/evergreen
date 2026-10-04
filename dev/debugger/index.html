@@ -816,6 +816,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lisp-snapshot-functions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lisp snapshot functions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-debug-metadata" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native debug metadata
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#reducing-a-failure" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1905,6 +1927,28 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#lisp-snapshot-functions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lisp snapshot functions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#native-debug-metadata" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Native debug metadata
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#reducing-a-failure" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1964,6 +2008,28 @@ must still exist.</p>
 debugger command loop. Piped input and batch runs do not wait indefinitely for
 debugger input. An unhandled batch error instead produces an unsuccessful
 process exit.</p>
+<p>Interpreted primitive failures, such as an unbound variable or <code>(car 42)</code>,
+signal while the failing activation is still present. <code>HANDLER-BIND</code> handlers
+see the live dynamic bindings and restarts before <code>UNWIND-PROTECT</code> cleanup;
+unhandled conditions retain an owned snapshot for the batch report. Native
+unbound-variable and direct-builtin failures also retain their historical call
+chain before native teardown. Their condition signalling still waits for a
+GC-safe interpreter boundary: retaining the trace does not make the retired
+native activation available for live inspection.</p>
+<p>A Lisp failure inside a foreign callback retains its historical Lisp frames
+when the enclosing foreign call reports <code>EGCL-FFI:FFI-ERROR</code>. C still receives
+the defined zero result and returns normally before that new condition is
+signalled. If C invokes more callbacks before returning, the first failure's
+trace remains protected from GC. <code>EGCL-FFI:CALLBACK-ERROR</code> continues to return
+the latest diagnostic text.</p>
+<p>Outbound scalar and buffered C calls appear as <code>[foreign] name</code> boundaries in
+these traces, including nested callbacks and calls made by fibers. Their
+<code>:origin</code> is <code>:foreign</code>, with arguments explicitly unavailable. Names are
+retained when foreign symbols are resolved, so capture does not enter the ELF
+loader or Unix dynamic linker; unavailable symbols show the target address
+instead. Captured names survive library close.
+These boundaries do not unwind internal C activations or permit Lisp nonlocal
+exits to cross C.</p>
 <p>The debugger displays frames and available restarts. Frame detail depends on
 the execution path and retained metadata. Optimized native code, runtime bridges,
 and foreign frames do not necessarily preserve every source local. Do not
@@ -2044,6 +2110,59 @@ tier. The <a href="../compiler/#function-tier">compiler observations</a> disting
 cases.</p>
 <p>For performance investigations, use <a href="../profiling/">profiling</a> rather than
 inferring execution cost from a disassembly or a single tier label.</p>
+<h2 id="lisp-snapshot-functions">Lisp snapshot functions<a class="headerlink" href="#lisp-snapshot-functions" title="Permanent link">&para;</a></h2>
+<p><code>egcl-debug:list-backtrace</code> returns an innermost-first list of owned frame
+plists. <code>:count</code> defaults to 20 and <code>:start</code> to zero; both accept nonnegative
+fixnums. The keys are <code>:function</code> (a name string or NIL), <code>:arguments</code> (the
+original argument list when recorded), <code>:arguments-available-p</code>, and <code>:origin</code>
+(<code>:interpreted</code>, <code>:managed</code>, <code>:entry</code>, or <code>:foreign</code>). Managed frames alone do not
+identify which compiler tier is executing.</p>
+<p>An empty argument list with <code>:arguments-available-p</code> true describes a zero-argument
+call. NIL availability means the arguments are unknown. Argument objects remain
+valid after the call returns or GC moves them, but are shared references: later
+mutation is visible through a retained snapshot. These are historical snapshots,
+not handles for evaluating expressions in a live frame.</p>
+<p>T1/T2 frames can recover original fixed-arity arguments from their managed slots
+when the compiler proves those slots are never overwritten. Variadic or boxed
+parameters, overwritten bindings, and native register-only entries remain
+unavailable. If any argument lacks a proven location, the whole argument list is
+unavailable; it is never filled with current local values or guessed slots.</p>
+<p><code>egcl-debug:print-backtrace</code> accepts the same count/start options and <code>:stream</code>
+(default <code>*debug-io*</code>), prints with bounded circular argument formatting, and
+returns NIL. A NIL stream designates <code>*standard-output*</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nv">egcl-debug:list-backtrace</span><span class="w"> </span><span class="ss">:count</span><span class="w"> </span><span class="mi">10</span><span class="p">)</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nv">egcl-debug:print-backtrace</span><span class="w"> </span><span class="ss">:stream</span><span class="w"> </span><span class="vg">*error-output*</span><span class="w"> </span><span class="ss">:count</span><span class="w"> </span><span class="mi">20</span><span class="p">)</span>
+</code></pre></div>
+<p>Capture inside a handler before unwinding to retain the failing call chain.
+These functions capture the current Lisp execution; they do not reconstruct an
+already-unwound stack from a condition object.</p>
+<h2 id="native-debug-metadata">Native debug metadata<a class="headerlink" href="#native-debug-metadata" title="Permanent link">&para;</a></h2>
+<p>Installed T1, T2, and OSR code carries an in-memory ELF/DWARF image describing
+its function name and exact machine-code range. The logical backtrace collector
+reads that image for native function identities. On supported Linux native
+targets, the same image is registered through GDB's JIT interface, allowing GDB
+to discover generated functions and resolve pending function breakpoints.
+Registration ends before executable memory is freed, even if a backtrace reader
+still retains the immutable metadata. An older active definition keeps its own
+image when the function is redefined.</p>
+<p>Fixed-arity native argument homes are encoded as DWARF formal parameters with
+frame-relative locations. The frame base is the entry value of the platform's
+first C argument register: the managed slot pointer. This follows the standard
+<a href="https://dwarfstd.org/issues/230808.1.html">DWARF entry-value expression</a>.
+The Lisp adapter supplies that known managed activation and checks every slot
+bound before copying values; original homes and copied snapshots are GC roots.</p>
+<p>Source lines, inline frames, and DWARF unwind rules are not yet emitted. GDB
+also needs caller entry-value context to evaluate these locations, so recognizing
+a function or its argument recipes does not guarantee a complete mixed native
+backtrace or printable arguments. Lisp backtraces retain runtime adapters for
+interpreted frames, bytecode frames, and fibers; precise GC maps keep their
+separate collector responsibility.</p>
+<p>Names containing NUL use <code>\0</code> in DWARF; literal backslashes are doubled so those
+names stay distinguishable. Metadata generation and registration happen at code
+installation and retirement. DWARF parsing happens when a trace requests native
+identity and arguments, with no additional operation on each ordinary native
+call. This does add installation work and memory for the debug image; it is not a claim that
+backtrace support as a whole has zero runtime cost.</p>
 <h2 id="reducing-a-failure">Reducing a failure<a class="headerlink" href="#reducing-a-failure" title="Permanent link">&para;</a></h2>
 <p>Record a reproducer before changing compiler controls. Establish whether it
 fails in a clean batch invocation, with the tree-walking backend, and after
