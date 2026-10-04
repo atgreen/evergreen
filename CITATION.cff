@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: >-
+  If you use Evergreen Common Lisp in research, benchmarks, or published work,
+  please cite the software using this metadata.
+title: Evergreen Common Lisp
+type: software
+authors:
+  - family-names: Green
+    given-names: Anthony
+version: 0.0.1
+repository-code: https://github.com/atgreen/evergreen
+url: https://atgreen.github.io/evergreen/
+license: GPL-3.0-or-later
+abstract: >-
+  Evergreen Common Lisp (EGCL) is an experimental Common Lisp implementation
+  written in Rust. It combines bytecode execution, tiered native compilation,
+  on-stack replacement, speculative optimization, a precise moving garbage
+  collector, lightweight fibers, foreign-language interoperability, and saved
+  application images. It is distributed under GPL-3.0-or-later with the
+  Classpath Exception 2.0.
+keywords:
+  - Common Lisp
+  - compiler
+  - just-in-time compilation
+  - virtual machine
+  - garbage collection

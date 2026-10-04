@@ -1,0 +1,75 @@
+name: Feature request
+description: Propose a Common Lisp capability, runtime improvement, or developer tool
+title: "[feature] "
+labels: []
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        EGCL follows a staged specification. Explain the user-visible need first; an implementation sketch is welcome but optional.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What program, workflow, or limitation would this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior
+      description: Show the desired Lisp interface and observable result where possible.
+      placeholder: |
+        (example-call ...)
+        ;; => expected result
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Area
+      options:
+        - ANSI Common Lisp compatibility
+        - Compiler, JIT, OSR, or deoptimization
+        - Garbage collector or runtime
+        - Debugger, profiler, REPL, or tooling
+        - Fibers, threads, or I/O
+        - FFI, JVM, Python, or embedding
+        - Images, delivery, packaging, or platforms
+        - Standard library or ASDF ecosystem
+        - Documentation or contributor experience
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Standards and compatibility
+      description: Cite the ANSI Common Lisp requirement, EGCL specification section, or compatible implementation behavior, if any.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe current workarounds or competing designs.
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting evidence
+      description: Add representative programs, measurements, external documentation, or prior art.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and the specification for related work.
+          required: true
+        - label: I described the observable behavior rather than only an implementation mechanism.
+          required: true

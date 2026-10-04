@@ -1,0 +1,105 @@
+name: Bug report
+description: Report an EGCL crash, incorrect result, hang, or compatibility problem
+title: "[bug] "
+labels: []
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve EGCL. For an undisclosed vulnerability, stop here and use [private vulnerability reporting](https://github.com/atgreen/evergreen/security/advisories/new).
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem and its practical impact.
+      placeholder: EGCL returns ..., crashes when ..., or hangs after ...
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: EGCL version or revision
+      description: Give a release number or the output of `git rev-parse HEAD`.
+      placeholder: v0.0.1 or 0123456789abcdef...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include operating system, architecture, installation or build method, and relevant feature flags.
+      placeholder: Fedora 43, x86-64, locally built musl release binary, default features
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: paths
+    attributes:
+      label: Affected paths
+      description: Select every path known to be involved. Leave unknown paths unchecked.
+      options:
+        - label: Tree-walking evaluator
+        - label: T0 bytecode
+        - label: T1 baseline native code
+        - label: T2 optimized native code or OSR
+        - label: Foreign call or callback
+        - label: Saved image or delivered executable
+        - label: Fibers, native threads, or safepoints
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: Provide the smallest Lisp program and exact bounded command that reproduce the problem.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exit status and complete error or backtrace when available.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gc_stress
+    attributes:
+      label: GC stress and poison
+      description: If the reproducer allocates, compare ordinary output with `EGCL_GC_STRESS=1 EGCL_GC_POISON=1`. Use the memory-limit wrapper documented in AGENTS.md.
+      options:
+        - Not run
+        - Same result as the ordinary run
+        - Different output or behavior
+        - Crashes or aborts only under stress
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Additional evidence
+      description: Add logs, disassembly, tier diagnostics, reduced input, or a link to a repository. Remove secrets and personal data.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: This report does not disclose a security vulnerability or private data.
+          required: true
