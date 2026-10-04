@@ -200,15 +200,24 @@ impl JitBuffer {
         &mut self,
         name: &str,
     ) -> Result<std::sync::Weak<crate::jit_debug::DwarfImage>, String> {
+        self.install_debug_info_with_arguments(name, None)
+    }
+
+    pub fn install_debug_info_with_arguments(
+        &mut self,
+        name: &str,
+        arguments: Option<&crate::jit_debug::NativeArguments>,
+    ) -> Result<std::sync::Weak<crate::jit_debug::DwarfImage>, String> {
         if self.debug_registration.is_some() {
             return Err("JIT debug information already installed".into());
         }
         // SAFETY: this buffer owns the immutable mapping for the whole call.
         let code = unsafe { std::slice::from_raw_parts(self.ptr, self.code_len) };
-        let image = std::sync::Arc::new(crate::jit_debug::DwarfImage::new(
+        let image = std::sync::Arc::new(crate::jit_debug::DwarfImage::with_arguments(
             name,
             self.ptr as u64,
             code,
+            arguments,
         )?);
         let registration = crate::jit_debug::Registration::new(image);
         let weak = registration.image();

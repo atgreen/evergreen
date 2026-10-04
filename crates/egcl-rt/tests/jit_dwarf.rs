@@ -57,3 +57,51 @@ fn logical_native_frames_get_their_name_from_dwarf() {
         Some("COMMON-LISP-USER::DWARF-FRAME")
     );
 }
+
+#[test]
+fn dwarf_argument_homes_distinguish_missing_and_zero_arguments() {
+    use egcl_rt::jit_debug::NativeArguments;
+    if egcl_rt::jit_debug::managed_entry_register().is_none() {
+        let mut buffer = JitBuffer::new(&[0; 16]).unwrap();
+        assert!(buffer
+            .install_debug_info_with_arguments(
+                "UNSUPPORTED-ABI",
+                Some(&NativeArguments { parameters: vec![] }),
+            )
+            .is_err());
+        return;
+    }
+    for (parameters, expected) in [
+        (vec![], Some(vec![])),
+        (
+            vec![("X".into(), Some(0)), ("Y".into(), Some(2))],
+            Some(vec![0, 2]),
+        ),
+        (vec![("X".into(), Some(0)), ("CHANGED".into(), None)], None),
+    ] {
+        let mut buffer = JitBuffer::new(&[0; 16]).unwrap();
+        let image = buffer
+            .install_debug_info_with_arguments(
+                "ARGUMENT-HOMES",
+                Some(&NativeArguments { parameters }),
+            )
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert_eq!(image.argument_slots().unwrap(), expected);
+        let info = egcl_rt::CodeInfo::new_jit(&[], &[], std::sync::Arc::downgrade(&image));
+        if expected.as_ref().is_some_and(|slots| slots.contains(&2)) {
+            assert!(
+                info.original_arguments(&[egcl_rt::value::NIL]).is_none(),
+                "a malformed or undersized frame must not be read out of bounds"
+            );
+        }
+    }
+    let mut buffer = JitBuffer::new(&[0; 16]).unwrap();
+    let image = buffer
+        .install_debug_info("NO-ARGUMENT-METADATA")
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    assert_eq!(image.argument_slots().unwrap(), None);
+}

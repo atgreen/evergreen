@@ -4,7 +4,7 @@
   (declare (ignorable value))
   (let ((frames nil))
     (trivial-backtrace:map-backtrace (lambda (frame) (push frame frames)))
-    (nreverse frames)))
+    (prog1 (nreverse frames) (length value))))
 (defun tb-middle (value capture)
   (if capture (tb-capture value) value))
 (defun tb-find (name frames)
@@ -32,18 +32,15 @@
   (assert (< (position leaf frames) (position middle frames)))
   #+egcl
   (let ((variables (trivial-backtrace::frame-vars leaf)))
-    (if (> (egcl-ext:function-tier 'tb-capture) 0)
-        ;; Native argument locations are not yet emitted. The port must leave
-        ;; them absent rather than inventing values from unrelated slots.
-        (assert (null variables))
-        (progn
-          (assert variables)
-          (assert (equal "Arg-0" (trivial-backtrace::var-name (first variables))))
-          (assert (eq value (trivial-backtrace::var-value (first variables))))
-          (setf (second value) 43)
-          (dotimes (i 1000) (list i i i))
-          (assert (equal '("argument retained" 43)
-                         (trivial-backtrace::var-value (first variables))))))))
+    ;; Keep VALUE live across capture so both native tiers retain a managed
+    ;; argument home, then require the same identity and retention contract.
+    (assert variables)
+    (assert (equal "Arg-0" (trivial-backtrace::var-name (first variables))))
+    (assert (eq value (trivial-backtrace::var-value (first variables))))
+    (setf (second value) 43)
+    (dotimes (i 1000) (list i i i))
+    (assert (equal '("argument retained" 43)
+                   (trivial-backtrace::var-value (first variables))))))
 
 (format t "TB-CHECK: print-stream~%")
 (assert (search "TB-PRINT-LEAF" (tb-print-leaf)))

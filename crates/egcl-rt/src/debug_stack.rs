@@ -67,6 +67,7 @@ struct CopiedFrame {
     function: Option<EgclVal>,
     origin: FrameOrigin,
     installed_name: Option<String>,
+    arguments: Option<Vec<EgclVal>>,
 }
 
 #[derive(Default)]
@@ -81,6 +82,7 @@ impl TraceHostRoots for PendingBacktrace {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.recorded.trace_host_roots(visit);
         for frame in &mut self.frames {
+            frame.arguments.trace_host_roots(visit);
             if let Some(function) = &mut frame.function {
                 visit(function);
             }
@@ -109,11 +111,17 @@ impl PendingBacktrace {
             } else {
                 None
             };
+            let arguments = if function.is_some() && !record.code_info.is_null() {
+                unsafe { &*record.code_info }.original_arguments(unsafe { record.locals() })
+            } else {
+                None
+            };
             self.frames.push(CopiedFrame {
                 address: frame as usize,
                 function,
                 origin: FrameOrigin::Managed,
                 installed_name,
+                arguments,
             });
         }
     }
@@ -124,6 +132,7 @@ impl PendingBacktrace {
             function: Some(function),
             origin: FrameOrigin::Entry,
             installed_name: None,
+            arguments: None,
         });
     }
 
@@ -135,6 +144,7 @@ impl PendingBacktrace {
             function,
             origin,
             installed_name,
+            arguments,
         } in &self.frames
         {
             let mut recorded_managed = false;
@@ -157,7 +167,7 @@ impl PendingBacktrace {
                         .clone()
                         .or_else(|| crate::symbols::symbol_name_of(name)),
                     origin: *origin,
-                    arguments: None,
+                    arguments: arguments.clone(),
                 });
             }
         }

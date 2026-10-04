@@ -97,7 +97,7 @@ fn native_trace(tier: &str, number: u8, redefine: bool) {
         stdout.contains("NATIVE-TRACE-OK"),
         "{tier}: {stdout}\n{stderr}"
     );
-    let native = "(COMMON-LISP-USER::NATIVE-TRACE-MIDDLE <arguments unavailable>)";
+    let native = "(COMMON-LISP-USER::NATIVE-TRACE-MIDDLE 41 ";
     assert_eq!(
         stdout.matches(native).count(),
         1,

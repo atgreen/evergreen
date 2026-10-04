@@ -95,6 +95,12 @@ valid after the call returns or GC moves them, but are shared references: later
 mutation is visible through a retained snapshot. These are historical snapshots,
 not handles for evaluating expressions in a live frame.
 
+T1/T2 frames can recover original fixed-arity arguments from their managed slots
+when the compiler proves those slots are never overwritten. Variadic or boxed
+parameters, overwritten bindings, and native register-only entries remain
+unavailable. If any argument lacks a proven location, the whole argument list is
+unavailable; it is never filled with current local values or guessed slots.
+
 `egcl-debug:print-backtrace` accepts the same count/start options and `:stream`
 (default `*debug-io*`), prints with bounded circular argument formatting, and
 returns NIL. A NIL stream designates `*standard-output*`.
@@ -119,18 +125,25 @@ Registration ends before executable memory is freed, even if a backtrace reader
 still retains the immutable metadata. An older active definition keeps its own
 image when the function is redefined.
 
-This is currently function/range metadata. Real T1/T2 argument locations,
-source lines, inline frames, and DWARF unwind rules are not yet emitted. GDB
-recognizing a native function does not guarantee it can unwind the entire mixed
-stack or recover its arguments. Lisp backtraces still use runtime adapters for
-interpreted frames, bytecode frames, and fibers; precise GC maps retain their
+Fixed-arity native argument homes are encoded as DWARF formal parameters with
+frame-relative locations. The frame base is the entry value of the platform's
+first C argument register: the managed slot pointer. This follows the standard
+[DWARF entry-value expression](https://dwarfstd.org/issues/230808.1.html).
+The Lisp adapter supplies that known managed activation and checks every slot
+bound before copying values; original homes and copied snapshots are GC roots.
+
+Source lines, inline frames, and DWARF unwind rules are not yet emitted. GDB
+also needs caller entry-value context to evaluate these locations, so recognizing
+a function or its argument recipes does not guarantee a complete mixed native
+backtrace or printable arguments. Lisp backtraces retain runtime adapters for
+interpreted frames, bytecode frames, and fibers; precise GC maps keep their
 separate collector responsibility.
 
 Names containing NUL use `\0` in DWARF; literal backslashes are doubled so those
 names stay distinguishable. Metadata generation and registration happen at code
 installation and retirement. DWARF parsing happens when a trace requests native
-identity, with no additional operation on each ordinary native call. This does
-add installation work and memory for the debug image; it is not a claim that
+identity and arguments, with no additional operation on each ordinary native
+call. This does add installation work and memory for the debug image; it is not a claim that
 backtrace support as a whole has zero runtime cost.
 
 ## Reducing a failure

@@ -582,6 +582,18 @@ impl CodeInfo {
         }
     }
 
+    /// Copy proven original arguments from this protected managed activation.
+    /// This only allocates Rust storage; callers must root the result before GC.
+    pub fn original_arguments(&self, locals: &[EgclVal]) -> Option<Vec<EgclVal>> {
+        let image = self.debug_info.as_ref()?.upgrade()?;
+        image
+            .argument_slots()
+            .ok()??
+            .into_iter()
+            .map(|slot| locals.get(usize::from(slot)).copied())
+            .collect()
+    }
+
     fn source_location_entries(&self) -> &[SourceLocationEntry] {
         self.source_locations
     }

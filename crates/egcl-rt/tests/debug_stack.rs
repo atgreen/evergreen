@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use egcl_rt::FrameType;
-use egcl_rt::debug_stack::{CallFrame, FrameOrigin, capture_current};
+use egcl_rt::debug_stack::{capture_current, CallFrame, FrameOrigin};
 use egcl_rt::value::NIL;
+use egcl_rt::FrameType;
 
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -192,8 +192,7 @@ fn signalled_error_owns_and_relocates_its_historical_arguments() {
     drop(call);
     // The returned error is now the only owner/root of the original argument.
     egcl_rt::collect_t0_minor().unwrap();
-    let egcl_rt::EgclError::Signalled(details) = &*error
-    else {
+    let egcl_rt::EgclError::Signalled(details) = &*error else {
         unreachable!()
     };
     let backtrace = &details.backtrace;
@@ -418,11 +417,68 @@ fn boxed_signalled_condition_is_a_relocatable_root() {
     // A movable stand-in isolates the condition slot; real condition objects
     // may be pinned, which would not exercise pointer rewriting here.
     let original = egcl_rt::gc::alloc_double_float(83.0);
-    egcl_rt::rooted!(error = egcl_rt::EgclError::signalled(
-        original, "condition slot".into(), Vec::new(),
-    ));
+    egcl_rt::rooted!(
+        error = egcl_rt::EgclError::signalled(original, "condition slot".into(), Vec::new(),)
+    );
     egcl_rt::collect_t0_minor().unwrap();
-    let egcl_rt::EgclError::Signalled(details) = &*error else { unreachable!() };
-    assert_ne!(details.condition, original, "the boxed condition slot must relocate");
+    let egcl_rt::EgclError::Signalled(details) = &*error else {
+        unreachable!()
+    };
+    assert_ne!(
+        details.condition, original,
+        "the boxed condition slot must relocate"
+    );
     assert_eq!(details.condition.as_double_float(), 83.0);
+}
+
+#[cfg(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "s390x",
+    target_arch = "powerpc64"
+))]
+#[test]
+fn dwarf_argument_homes_relocate_before_capture_and_after_frame_retirement() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    let stack = egcl_rt::current_stack();
+    let mut buffer = egcl_rt::jit::JitBuffer::new(&[0; 16]).unwrap();
+    let image = buffer
+        .install_debug_info_with_arguments(
+            "DWARF-ROOTED-ARGUMENT",
+            Some(&egcl_rt::jit_debug::NativeArguments {
+                parameters: vec![("VALUE".into(), Some(0))],
+            }),
+        )
+        .unwrap();
+    let info = egcl_rt::CodeInfo::new_jit(&[], &[], image);
+    let original = egcl_rt::gc::alloc_double_float(91.0);
+    let frame = stack.push_frame(NIL, info, 1, 0).unwrap();
+    unsafe {
+        egcl_rt::EgclStack::frame_slots_mut(frame)[0] = original;
+    }
+    // Only the real activation slot keeps this object alive before capture.
+    egcl_rt::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(snapshot = capture_current(1));
+    let moved = snapshot[0].arguments.as_ref().unwrap()[0];
+    assert_ne!(moved, original, "the argument home must actually move");
+    assert_eq!(moved.as_double_float(), 91.0);
+    let historical = egcl_rt::gc::alloc_double_float(92.0);
+    unsafe {
+        egcl_rt::EgclStack::frame_slots_mut(frame)[0] = historical;
+    }
+    *snapshot = capture_current(1);
+    stack.pop_frame();
+    drop(buffer);
+    egcl_rt::collect_t0_minor().unwrap();
+    let retained = snapshot[0].arguments.as_ref().unwrap()[0];
+    assert_ne!(
+        retained, historical,
+        "only the historical snapshot now owns the argument"
+    );
+    assert_eq!(retained.as_double_float(), 92.0);
+    assert_eq!(
+        snapshot[0].function.as_deref(),
+        Some("DWARF-ROOTED-ARGUMENT")
+    );
 }

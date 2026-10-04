@@ -18,9 +18,10 @@ The checks assert frame names and order, actual installed tiers, argument identi
 and retention where available, string/stream/file output, append behavior, and
 capture inside a live condition handler. Cold and cached ASDF loads must pass;
 the cached load must not recompile. Pure interpretation, T0, T1, and T2 run the
-same checks. Native frames currently expose names but no argument locations, so
-the test explicitly checks that their variable lists are empty. Source locations
-and additional lexical locals are not provided by this adapter.
+same checks, including native argument identity from proven unmodified managed
+homes. Variadic, boxed, overwritten, or register-entry-only arguments remain
+explicitly unavailable. Source locations and additional lexical locals are not
+provided by this adapter.
 
 Set `SBCL_BIN` to an SBCL executable to run the same contracts against the
 unchanged SBCL adapter. `EGCL_PORT_STRESS=1` additionally requests a full stress,

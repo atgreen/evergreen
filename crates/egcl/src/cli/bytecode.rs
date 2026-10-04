@@ -19214,7 +19214,10 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     };
     #[cfg(not(all(target_arch = "x86_64", windows)))]
     let mut buf = egcl_rt::jit::JitBuffer::new(&artifact.code)?;
-    let debug_info = buf.install_debug_info(&bf.name).ok()?;
+    let arguments = native_debug::arguments(&bf, artifact.compiled_entry != 0);
+    let debug_info = buf
+        .install_debug_info_with_arguments(&bf.name, arguments.as_ref())
+        .ok()?;
     let code_info = install_stack_map(total_slots, debug_info)?;
     let entry = buf.as_ptr();
     maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
@@ -21421,7 +21424,10 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
     let mut buf = install_t1_code(&code, &osr_entries)?;
-    let debug_info = buf.install_debug_info(&bf.name).ok()?;
+    let arguments = native_debug::arguments(&bf, false);
+    let debug_info = buf
+        .install_debug_info_with_arguments(&bf.name, arguments.as_ref())
+        .ok()?;
     let code_info = install_stack_map(num_slots, debug_info)?;
     let entry = buf.as_ptr();
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
@@ -24268,3 +24274,5 @@ mod active_bytecode_root_tests {
 
 #[cfg(test)]
 mod native_error_tests;
+
+mod native_debug;

@@ -3,13 +3,39 @@
 
 //! Shared DWARF for installed native code and debugger consumers.
 //!
-//! Images currently describe function identities and exact code ranges. They do
-//! not claim argument locations or unwind rules: those must come from the real
-//! emitters. Reading an image only allocates Rust storage, never Lisp objects.
+//! Images describe function identities, code ranges and proven original argument
+//! homes. Native unwind/caller context remains a separate responsibility.
+//! Reading an image only allocates Rust storage, never Lisp objects.
 
-use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Sections};
+use gimli::write::{Address, AttributeValue, DwarfUnit, EndianVec, Expression, Sections};
 use object::{Object, ObjectSection};
 use std::sync::Arc;
+
+/// Install-time proof supplied by the compiler. A slot is present only when it
+/// retains the original actual argument for the whole managed activation.
+/// Missing locations remain optimized out; these are not current local values.
+#[derive(Clone, Debug)]
+pub struct NativeArguments {
+    pub parameters: Vec<(String, Option<u16>)>,
+}
+
+/// DWARF register number of the first argument in the native C entry ABI.
+/// Alternate register-only entries must not use the managed-home description.
+pub fn managed_entry_register() -> Option<u16> {
+    if cfg!(all(target_arch = "x86_64", windows)) {
+        Some(2) // RCX
+    } else if cfg!(target_arch = "x86_64") {
+        Some(5) // RDI
+    } else if cfg!(target_arch = "aarch64") {
+        Some(0)
+    } else if cfg!(target_arch = "s390x") {
+        Some(2)
+    } else if cfg!(target_arch = "powerpc64") {
+        Some(3)
+    } else {
+        None
+    }
+}
 
 /// Immutable debug bytes. Readers may retain these after executable code retires;
 /// only the owning JitBuffer controls the external debugger registration.
@@ -19,7 +45,17 @@ pub struct DwarfImage {
 }
 
 impl DwarfImage {
+    #[cfg(test)]
     pub(crate) fn new(name: &str, entry: u64, code: &[u8]) -> Result<Self, String> {
+        Self::with_arguments(name, entry, code, None)
+    }
+
+    pub(crate) fn with_arguments(
+        name: &str,
+        entry: u64,
+        code: &[u8],
+        arguments: Option<&NativeArguments>,
+    ) -> Result<Self, String> {
         // Lisp names may contain NUL, but DWARF strings are NUL-terminated.
         // Escape backslashes too, so a literal "\\0" cannot alias a NUL name.
         let name = name.replace('\\', "\\\\").replace('\0', "\\0");
@@ -33,7 +69,7 @@ impl DwarfImage {
         };
         let mut dwarf = DwarfUnit::new(gimli::Encoding {
             format: gimli::Format::Dwarf32,
-            version: 4,
+            version: 5,
             address_size: std::mem::size_of::<usize>() as u8,
         });
         let root = dwarf.unit.root();
@@ -59,6 +95,54 @@ impl DwarfImage {
                 gimli::DW_AT_high_pc,
                 AttributeValue::Udata(code.len() as u64),
             );
+        }
+        if let Some(arguments) = arguments {
+            let register = managed_entry_register().ok_or("unsupported native argument ABI")?;
+            // The managed slot address was the C entry's first argument. Using
+            // its entry value remains correct after scratch registers change,
+            // including prologues/epilogues. GDB needs caller entry-value context;
+            // the Lisp adapter already owns this exact managed activation.
+            let mut entry_register = Expression::new();
+            entry_register.op_reg(gimli::Register(register));
+            let mut frame_base = Expression::new();
+            frame_base.op_entry_value(entry_register);
+            dwarf
+                .unit
+                .get_mut(function)
+                .set(gimli::DW_AT_frame_base, AttributeValue::Exprloc(frame_base));
+            let value_type = dwarf.unit.add(root, gimli::DW_TAG_base_type);
+            dwarf.unit.get_mut(value_type).set(
+                gimli::DW_AT_name,
+                AttributeValue::String(b"EgclVal".to_vec()),
+            );
+            dwarf
+                .unit
+                .get_mut(value_type)
+                .set(gimli::DW_AT_byte_size, AttributeValue::Udata(8));
+            dwarf.unit.get_mut(value_type).set(
+                gimli::DW_AT_encoding,
+                AttributeValue::Encoding(gimli::DW_ATE_unsigned),
+            );
+            for (name, slot) in &arguments.parameters {
+                let parameter = dwarf.unit.add(function, gimli::DW_TAG_formal_parameter);
+                let name = name.replace('\\', "\\\\").replace('\0', "\\0");
+                dwarf
+                    .unit
+                    .get_mut(parameter)
+                    .set(gimli::DW_AT_name, AttributeValue::String(name.into_bytes()));
+                dwarf
+                    .unit
+                    .get_mut(parameter)
+                    .set(gimli::DW_AT_type, AttributeValue::UnitRef(value_type));
+                if let Some(slot) = slot {
+                    let mut location = Expression::new();
+                    location.op_fbreg(i64::from(*slot) * 8);
+                    dwarf
+                        .unit
+                        .get_mut(parameter)
+                        .set(gimli::DW_AT_location, AttributeValue::Exprloc(location));
+                }
+            }
         }
         let mut sections = Sections::new(EndianVec::new(endian));
         dwarf.write(&mut sections).map_err(|e| e.to_string())?;
@@ -88,6 +172,13 @@ impl DwarfImage {
     /// table. No mapped code is dereferenced, including after code retirement.
     pub fn function_name(&self, pc: u64) -> Result<Option<String>, String> {
         read_function_name(&self.bytes, pc)
+    }
+
+    /// Decode the exact managed-home recipe from the shared DWARF. Missing or
+    /// unsupported locations make the original argument list unavailable.
+    /// Returned indices still require bounds checks against the live frame.
+    pub fn argument_slots(&self) -> Result<Option<Vec<u16>>, String> {
+        read_argument_slots(&self.bytes)
     }
 }
 
@@ -129,6 +220,98 @@ fn read_function_name(bytes: &[u8], pc: u64) -> Result<Option<String>, String> {
                     return Ok(Some(name.to_string_lossy().into_owned()));
                 }
             }
+        }
+    }
+    Ok(None)
+}
+
+fn read_argument_slots(bytes: &[u8]) -> Result<Option<Vec<u16>>, String> {
+    let object = object::File::parse(bytes).map_err(|e| e.to_string())?;
+    let endian = if object.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let dwarf = gimli::Dwarf::load(|id| {
+        let data = object
+            .section_by_name(id.name())
+            .map(|s| s.data())
+            .transpose()
+            .map_err(|e| e.to_string())?
+            .unwrap_or(&[]);
+        Ok::<_, String>(gimli::EndianSlice::new(data, endian))
+    })?;
+    let mut units = dwarf.units();
+    while let Some(header) = units.next().map_err(|e| e.to_string())? {
+        let unit = dwarf.unit(header).map_err(|e| e.to_string())?;
+        let mut entries = unit.entries();
+        let mut depth = 0;
+        let mut function_depth = None;
+        let mut slots = Vec::new();
+        while let Some((delta, entry)) = entries.next_dfs().map_err(|e| e.to_string())? {
+            depth += delta;
+            if function_depth.is_some_and(|function| depth <= function) {
+                return Ok(Some(slots));
+            }
+            if entry.tag() == gimli::DW_TAG_subprogram {
+                let Some(gimli::AttributeValue::Exprloc(base)) = entry
+                    .attr_value(gimli::DW_AT_frame_base)
+                    .map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                let mut ops = base.operations(unit.encoding());
+                let Some(gimli::Operation::EntryValue { expression }) =
+                    ops.next().map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if ops.next().map_err(|e| e.to_string())?.is_some() {
+                    return Ok(None);
+                }
+                let mut inner = gimli::Expression(expression).operations(unit.encoding());
+                let Some(gimli::Operation::Register { register }) =
+                    inner.next().map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if Some(register.0) != managed_entry_register()
+                    || inner.next().map_err(|e| e.to_string())?.is_some()
+                {
+                    return Ok(None);
+                }
+                function_depth = Some(depth);
+            } else if function_depth.is_some_and(|function| depth == function + 1) {
+                if entry.tag() == gimli::DW_TAG_unspecified_parameters {
+                    return Ok(None);
+                }
+                if entry.tag() != gimli::DW_TAG_formal_parameter {
+                    continue;
+                }
+                let Some(gimli::AttributeValue::Exprloc(location)) = entry
+                    .attr_value(gimli::DW_AT_location)
+                    .map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                let mut ops = location.operations(unit.encoding());
+                let Some(gimli::Operation::FrameOffset { offset }) =
+                    ops.next().map_err(|e| e.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if offset < 0 || offset % 8 != 0 || ops.next().map_err(|e| e.to_string())?.is_some()
+                {
+                    return Ok(None);
+                }
+                let Ok(slot) = u16::try_from(offset / 8) else {
+                    return Ok(None);
+                };
+                slots.push(slot);
+            }
+        }
+        if function_depth.is_some() {
+            return Ok(Some(slots));
         }
     }
     Ok(None)
