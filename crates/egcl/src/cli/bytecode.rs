@@ -213,9 +213,11 @@ pub(super) fn bump_direct_call_gen() {
 }
 
 // Captured lexical locations are process-wide, just like function identities.
-fn closure_envs() -> &'static SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>> {
-    static ENVS: std::sync::OnceLock<SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>>> =
-        std::sync::OnceLock::new();
+type ClosureEnvironments =
+    SharedCell<HashMap<u32, Arc<SharedCell<EnvFrame>>, egcl_rt::fxhash::FxBuildHasher>>;
+
+fn closure_envs() -> &'static ClosureEnvironments {
+    static ENVS: std::sync::OnceLock<ClosureEnvironments> = std::sync::OnceLock::new();
     ENVS.get_or_init(|| SharedCell::new(HashMap::default()))
 }
 
@@ -13020,7 +13022,7 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
             }
             new_code.push(Instr::Br(entry as u32));
         } else {
-            new_code.push(instr.clone());
+            new_code.push(*instr);
         }
     }
     // Indices 0..entry are all PushBlock and none of them is a site, so each
@@ -14418,16 +14420,29 @@ fn macro_params_have_whole(params: EgclVal) -> bool {
     false
 }
 
+/// Call-site inputs shared by ordinary and compiled compiler-macro expanders.
+/// Destructure before allocating so the value fields retain their existing
+/// individual roots throughout binding and execution.
+#[derive(Default)]
+struct MacroCallContext<'a> {
+    whole: Option<EgclVal>,
+    environment: Option<EgclVal>,
+    lexical_environment: Option<&'a super::MacroexpandEnv>,
+}
+
 fn bind_macro_variadic(
     func: &BytecodeFunction,
     frame: *mut Frame,
     args: &[EgclVal],
-    explicit_whole: Option<EgclVal>,
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
-    call_menv: Option<&super::MacroexpandEnv>,
-    mut explicit_environment: Option<EgclVal>,
+    context: MacroCallContext<'_>,
 ) -> Result<(), EgclError> {
+    let MacroCallContext {
+        whole: explicit_whole,
+        environment: mut explicit_environment,
+        lexical_environment: call_menv,
+    } = context;
     egcl_rt::rooted_ref!(_explicit_environment_root = &mut explicit_environment);
     let parent = Arc::clone(&env.frame);
     super::with_child_frame(env, parent, |env| {
@@ -14539,7 +14554,7 @@ pub(super) fn run_with_sym(
     sym: u32,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, entry_fn_val, sym, env, false, None, None, None)
+    run_with_binding(entry, args, entry_fn_val, sym, env, false, MacroCallContext::default())
 }
 
 /// Run a compiled macro expander.
@@ -14555,7 +14570,11 @@ pub(super) fn run_macro(
     env: &mut Env,
     call_menv: Option<&super::MacroexpandEnv>,
 ) -> Result<EgclVal, EgclError> {
-    run_with_binding(entry, args, NIL, u32::MAX, env, true, whole, call_menv, None)
+    run_with_binding(entry, args, NIL, u32::MAX, env, true, MacroCallContext {
+        whole,
+        lexical_environment: call_menv,
+        ..MacroCallContext::default()
+    })
 }
 
 pub(super) fn run_compiler_macro_function(
@@ -14575,9 +14594,11 @@ pub(super) fn run_compiler_macro_function(
         name.as_symbol_index(),
         env,
         true,
-        Some(whole),
-        None,
-        Some(environment),
+        MacroCallContext {
+            whole: Some(whole),
+            environment: Some(environment),
+            lexical_environment: None,
+        },
     )
 }
 
@@ -14588,10 +14609,13 @@ fn run_with_binding(
     entry_sym: u32,
     env: &mut Env,
     macro_lambda_list: bool,
-    mut macro_whole: Option<EgclVal>,
-    call_menv: Option<&super::MacroexpandEnv>,
-    mut explicit_environment: Option<EgclVal>,
+    context: MacroCallContext<'_>,
 ) -> Result<EgclVal, EgclError> {
+    let MacroCallContext {
+        whole: mut macro_whole,
+        environment: mut explicit_environment,
+        lexical_environment: call_menv,
+    } = context;
     egcl_rt::rooted!(_active_bytecode_root = ActiveBytecodeRoot::new(&entry));
     egcl_rt::rooted!(args = args.to_vec());
     egcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
@@ -14638,11 +14662,13 @@ fn run_with_binding(
                 &entry,
                 frame,
                 &args,
-                macro_whole,
                 env_frame.as_ref(),
                 env,
-                call_menv,
-                explicit_environment,
+                MacroCallContext {
+                    whole: macro_whole,
+                    environment: explicit_environment,
+                    lexical_environment: call_menv,
+                },
             )
         {
             stack.pop_frame();

@@ -1522,6 +1522,8 @@ pub(in crate::cli) fn bump_accessor_slot_gen() {
     ACCESSOR_SLOT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+type AccessorSlotCache = (u64, HashMap<(u32, u32), u32>);
+
 thread_local! {
     /// (class-name symbol, accessor symbol) -> slot symbol, with the generation it
     /// was built at.
@@ -1532,7 +1534,7 @@ thread_local! {
     /// OBJECT's address would have been cheaper to obtain and quietly wrong — the
     /// class is a heap value the moving collector can relocate, so its address is
     /// not an identity.
-    static ACCESSOR_SLOT_CACHE: RefCell<(u64, HashMap<(u32, u32), u32>)> =
+    static ACCESSOR_SLOT_CACHE: RefCell<AccessorSlotCache> =
         RefCell::new((0, HashMap::new()));
 }
 
@@ -2998,11 +3000,13 @@ thread_local! {
     /// Serialized bytecode-registry BYTECODE_UNIT awaiting the post-Env drain
     /// (bliss-zz6w) — the BBU loader needs an Env the restore hook lacks.
     static PENDING_HOST_BYTECODE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-    static SAVE_SETF_EXPANDERS: RefCell<Option<Rc<RefCell<HashMap<String, SetfExpander>>>>> =
+    static SAVE_SETF_EXPANDERS: RefCell<Option<SavedSetfExpanders>> =
         const { RefCell::new(None) };
     static PENDING_SETF_EXPANDERS: RefCell<HashMap<String, SetfExpander>> =
         RefCell::new(HashMap::new());
 }
+
+type SavedSetfExpanders = Rc<RefCell<HashMap<String, SetfExpander>>>;
 
 fn hr_put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -11966,6 +11970,9 @@ fn compile_file_load_forms(form: EgclVal, env: &mut Env) -> Result<Vec<EgclVal>,
                 // local macros (for example Ironclad's MODE-LAMBDA).
                 let mut menv = macroexpand_environment_from_cli(env);
                 egcl_rt::rooted_ref!(_menv_root = &mut menv);
+                // macroexpand_all may relocate the rooted vector's values.
+                // Do not retain an iterator's mutable element borrow across it.
+                #[allow(clippy::needless_range_loop)]
                 for index in 0..result.len() {
                     result[index] = compiler_macroexpand::macroexpand_all(result[index], &menv)?;
                 }
@@ -16344,7 +16351,7 @@ fn symbol_function_object_ex(
     // (functionp #'gf) NIL where SBCL says T. Reify the same apply-by-name
     // wrapper used for builtins; dispatch still happens per call, so a method
     // added later is still picked up.
-    let is_generic = env.generics.contains_key(&*fn_name) || env.methods.contains_key(&*fn_name);
+    let is_generic = env.generics.contains_key(&fn_name) || env.methods.contains_key(&fn_name);
     if is_generic {
         // Key the wrapper by the FULL name, not the bare one: that is the
         // env.generics/env.methods key, so builtin_wrapper_name() round-trips
