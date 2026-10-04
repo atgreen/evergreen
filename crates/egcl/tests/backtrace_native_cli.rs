@@ -120,3 +120,38 @@ fn t2_identity_in_suspended_mixed_trace() {
     native_trace("t2", 2, false);
     native_trace("t2", 2, true);
 }
+
+#[test]
+fn dwarf_string_encoding_does_not_prevent_native_promotion() {
+    for (tier, number) in [("t1", 1), ("t2", 2)] {
+        // Command arguments cannot contain NUL; load a real source file so the
+        // named call goes through the normal compiler and promotion path.
+        let program = format!(
+            "(defun |DWARF-\0-NAME| (x) (+ x 1))\n\
+             (dotimes (i 100) (assert (= 42 (|DWARF-\0-NAME| 41))))\n\
+             (assert (= {number} (egcl-ext:function-tier '|DWARF-\0-NAME|)))\n\
+             (format t \"DWARF-NUL-NAME-OK~%\")\n"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "egcl-dwarf-name-{}-{tier}.lisp",
+            std::process::id()
+        ));
+        std::fs::write(&path, program).expect("write Lisp source with NUL name");
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--load"])
+            .arg(&path)
+            .env("EGCL_FORCE_TIER", tier)
+            .env_remove("EGCL_DISABLE_T2")
+            .env_remove("EGCL_T2_DISCARD")
+            .output()
+            .expect("run unusual native function name");
+        std::fs::remove_file(path).expect("remove temporary Lisp source");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("DWARF-NUL-NAME-OK"),
+            "{tier}: {stdout}\n{stderr}"
+        );
+    }
+}

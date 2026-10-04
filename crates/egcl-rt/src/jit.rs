@@ -13,6 +13,8 @@
 pub struct JitBuffer {
     ptr: *mut u8,
     len: usize,
+    code_len: usize,
+    debug_registration: Option<crate::jit_debug::Registration>,
     #[cfg(all(windows, target_arch = "x86_64"))]
     unwind:
         Option<Box<[windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY]>>,
@@ -88,6 +90,8 @@ impl JitBuffer {
             Some(JitBuffer {
                 ptr,
                 len,
+                code_len: code.len(),
+                debug_registration: None,
                 #[cfg(all(windows, target_arch = "x86_64"))]
                 unwind: None,
             })
@@ -170,6 +174,7 @@ impl JitBuffer {
             image.extend_from_slice(range.unwind_info);
         }
         let mut buffer = Self::new(&image)?;
+        buffer.code_len = code.len();
         // Box before registration: the OS retains the table's stable address.
         let table = table.into_boxed_slice();
         if !unsafe { RtlAddFunctionTable(table.as_ptr(), count, buffer.ptr as u64) } {
@@ -187,6 +192,28 @@ impl JitBuffer {
     /// Pointer to the executable code.
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
+    }
+
+    /// Emit shared DWARF and register this installed code with supported native
+    /// debuggers. Only Rust memory is allocated; no Lisp GC can run here.
+    pub fn install_debug_info(
+        &mut self,
+        name: &str,
+    ) -> Result<std::sync::Weak<crate::jit_debug::DwarfImage>, String> {
+        if self.debug_registration.is_some() {
+            return Err("JIT debug information already installed".into());
+        }
+        // SAFETY: this buffer owns the immutable mapping for the whole call.
+        let code = unsafe { std::slice::from_raw_parts(self.ptr, self.code_len) };
+        let image = std::sync::Arc::new(crate::jit_debug::DwarfImage::new(
+            name,
+            self.ptr as u64,
+            code,
+        )?);
+        let registration = crate::jit_debug::Registration::new(image);
+        let weak = registration.image();
+        self.debug_registration = Some(registration);
+        Ok(weak)
     }
 
     /// Leak this buffer, returning its code pointer. The mapping lives forever
@@ -263,6 +290,9 @@ unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
 
 impl Drop for JitBuffer {
     fn drop(&mut self) {
+        // Field destruction would happen AFTER munmap. Unregister explicitly,
+        // even when a debugger reader still holds an Arc to the immutable bytes.
+        drop(self.debug_registration.take());
         #[cfg(all(windows, target_arch = "x86_64"))]
         if let Some(table) = self.unwind.take() {
             // Unregister before freeing either the table or its code/xdata.

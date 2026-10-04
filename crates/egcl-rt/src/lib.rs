@@ -38,6 +38,7 @@ pub mod value;
 // ── Memory / GC ───────────────────────────────────────────────────
 pub mod gc;
 pub mod jit;
+pub mod jit_debug;
 pub mod lock_order;
 
 // ── Thread runtime ────────────────────────────────────────────────

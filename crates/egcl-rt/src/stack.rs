@@ -519,6 +519,7 @@ pub struct StackMapEntry {
 
 pub struct CodeInfo {
     function_name: Option<String>,
+    debug_info: Option<std::sync::Weak<crate::jit_debug::DwarfImage>>,
     source_locations: &'static [SourceLocationEntry],
     stack_maps: &'static [StackMapEntry],
 }
@@ -528,6 +529,7 @@ impl CodeInfo {
     pub const fn empty() -> Self {
         Self {
             function_name: None,
+            debug_info: None,
             source_locations: &[],
             stack_maps: &[],
         }
@@ -550,13 +552,34 @@ impl CodeInfo {
     ) -> &'static Self {
         Box::leak(Box::new(CodeInfo {
             function_name,
+            debug_info: None,
             source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
             stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
         }))
     }
 
-    pub fn function_name(&self) -> Option<&str> {
-        self.function_name.as_deref()
+    /// Native debug identity comes from the same DWARF image used by GDB.
+    /// The weak handle cannot extend code/debug registration lifetime.
+    pub fn new_jit(
+        source_locations: &'static [SourceLocationEntry],
+        stack_maps: &'static [StackMapEntry],
+        debug_info: std::sync::Weak<crate::jit_debug::DwarfImage>,
+    ) -> &'static Self {
+        Box::leak(Box::new(Self {
+            function_name: None,
+            debug_info: Some(debug_info),
+            source_locations: Box::leak(source_locations.to_vec().into_boxed_slice()),
+            stack_maps: Box::leak(stack_maps.to_vec().into_boxed_slice()),
+        }))
+    }
+
+    pub fn function_name(&self) -> Option<String> {
+        if let Some(debug_info) = &self.debug_info {
+            let image = debug_info.upgrade()?;
+            image.function_name(image.entry()).ok().flatten()
+        } else {
+            self.function_name.clone()
+        }
     }
 
     fn source_location_entries(&self) -> &[SourceLocationEntry] {

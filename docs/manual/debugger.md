@@ -71,6 +71,31 @@ cases.
 For performance investigations, use [profiling](profiling.md) rather than
 inferring execution cost from a disassembly or a single tier label.
 
+## Native debug metadata
+
+Installed T1, T2, and OSR code carries an in-memory ELF/DWARF image describing
+its function name and exact machine-code range. The logical backtrace collector
+reads that image for native function identities. On supported Linux native
+targets, the same image is registered through GDB's JIT interface, allowing GDB
+to discover generated functions and resolve pending function breakpoints.
+Registration ends before executable memory is freed, even if a backtrace reader
+still retains the immutable metadata. An older active definition keeps its own
+image when the function is redefined.
+
+This is currently function/range metadata. Real T1/T2 argument locations,
+source lines, inline frames, and DWARF unwind rules are not yet emitted. GDB
+recognizing a native function does not guarantee it can unwind the entire mixed
+stack or recover its arguments. Lisp backtraces still use runtime adapters for
+interpreted frames, bytecode frames, and fibers; precise GC maps retain their
+separate collector responsibility.
+
+Names containing NUL use `\0` in DWARF; literal backslashes are doubled so those
+names stay distinguishable. Metadata generation and registration happen at code
+installation and retirement. DWARF parsing happens when a trace requests native
+identity, with no additional operation on each ordinary native call. This does
+add installation work and memory for the debug image; it is not a claim that
+backtrace support as a whole has zero runtime cost.
+
 ## Reducing a failure
 
 Record a reproducer before changing compiler controls. Establish whether it

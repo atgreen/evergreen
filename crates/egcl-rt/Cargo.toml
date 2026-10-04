@@ -7,6 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Shared native-debug representation for the Lisp debugger and GDB.
+# These versions retain compatibility with the workspace Rust minimum.
+gimli = { version = "0.32.3", default-features = false, features = ["read", "write", "std"] }
+object = { version = "0.37.3", default-features = false, features = ["read_core", "write_std", "elf", "std"] }
+
 # On x86-64, internal OS services use direct syscalls (src/syscall.rs), and
 # libc is optional for dlopen-based C-ABI FFI. Other Linux architectures use
 # libc's ABI wrappers below. The default x86-64 musl build remains fully static.

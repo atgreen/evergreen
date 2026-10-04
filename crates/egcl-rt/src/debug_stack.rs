@@ -105,9 +105,7 @@ impl PendingBacktrace {
             let function = (record.frame_type() == FrameType::Call).then_some(record.function);
             calls += usize::from(function.is_some());
             let installed_name = if function.is_some() && !record.code_info.is_null() {
-                unsafe { &*record.code_info }
-                    .function_name()
-                    .map(str::to_owned)
+                unsafe { &*record.code_info }.function_name()
             } else {
                 None
             };
