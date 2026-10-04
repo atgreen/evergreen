@@ -24,6 +24,34 @@ build = load('egcl_build', 'build.py')
 SPEC = Path(__file__).with_name('egcl.spec')
 
 
+class BuildStageTests(unittest.TestCase):
+    def test_a_full_build_starts_with_an_empty_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            stale = output / 'stage/usr/bin/torcl'
+            stale.parent.mkdir(parents=True)
+            stale.write_text('obsolete payload')
+
+            stage = build.fresh_stage(output)
+
+            self.assertEqual(stage, output / 'stage')
+            self.assertTrue(stage.is_dir())
+            self.assertEqual(list(stage.iterdir()), [])
+
+    def test_packaging_starts_with_an_empty_binary_rpm_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            stale = output / 'RPMS/x86_64/torcl-0.1.0.rpm'
+            stale.parent.mkdir(parents=True)
+            stale.write_text('obsolete package')
+
+            destination = build.fresh_binary_rpm_output(output)
+
+            self.assertEqual(destination, output / 'RPMS' / build.HOST_MACHINE)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(list((output / 'RPMS').rglob('*.rpm')), [])
+
+
 class VendoredLispDependencyTests(unittest.TestCase):
     """lib/egcl-apk/ocicl/ is gitignored, so the SRPM must fetch it.
 

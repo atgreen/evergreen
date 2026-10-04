@@ -66,11 +66,28 @@ def copy(source, destination):
     shutil.copy2(source, destination)
 
 
+def fresh_stage(output):
+    stage = output / 'stage'
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+    return stage
+
+
+def fresh_binary_rpm_output(output):
+    rpms = output / 'RPMS'
+    if rpms.exists():
+        shutil.rmtree(rpms)
+    destination = rpms / HOST_MACHINE
+    destination.mkdir(parents=True)
+    return destination
+
+
 def build(args):
     output = args.output.resolve()
     tools = args.tools.resolve()
     ndk = args.android_ndk.resolve()
-    stage = output / 'stage'
+    stage = fresh_stage(output)
     bin_dir = stage / 'usr/bin'
     bin_dir.mkdir(parents=True, exist_ok=True)
     target_dir = ROOT / 'target'
@@ -373,6 +390,7 @@ def package(output, stage, ndk, release=None):
          '--define', f'android_ndk {ndk.resolve()}']
     if release is not None:
         command += ['--define', f'egcl_release {release}']
+    fresh_binary_rpm_output(output)
     run(command)
     extract_and_verify(output, stage)
 
