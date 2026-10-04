@@ -37364,6 +37364,16 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
         i += 2;
     }
 
+    // The stream library uses immediate mode tags rather than Lisp keywords.
+    // Decode evaluated values here for both OPEN and WITH-OPEN-FILE.
+    if_exists = match sym_bare_name_rc(if_exists).as_ref() {
+        "APPEND" => egcl_stdlib::streams::IF_EXISTS_APPEND_VAL,
+        "OVERWRITE" => egcl_stdlib::streams::IF_EXISTS_OVERWRITE_VAL,
+        "ERROR" => egcl_stdlib::streams::IF_EXISTS_ERROR_VAL,
+        "SUPERSEDE" => egcl_stdlib::streams::IF_EXISTS_SUPERSEDE_VAL,
+        _ => if_exists,
+    };
+
     // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
     // (and for output with `:if-exists :overwrite`/`:append`), `:create`
     // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
