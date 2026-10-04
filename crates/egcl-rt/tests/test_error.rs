@@ -431,3 +431,22 @@ fn historical_error_details_do_not_enlarge_ordinary_results() {
     assert!(std::mem::size_of::<EgclError>() <= 40);
     assert!(std::mem::size_of::<Result<EgclVal, EgclError>>() <= 40);
 }
+
+#[test]
+fn capture_keeps_control_and_storage_failures_unwrapped() {
+    assert!(matches!(EgclError::Oom.capture_backtrace(), EgclError::Oom));
+    assert!(matches!(
+        EgclError::StackOverflow(FiberId(7)).capture_backtrace(),
+        EgclError::StackOverflow(FiberId(7))
+    ));
+    assert!(matches!(
+        EgclError::Shutdown.capture_backtrace(),
+        EgclError::Shutdown
+    ));
+    assert!(
+        matches!(EgclError::Internal("transfer".into()).capture_backtrace(), EgclError::Internal(token) if token == "transfer")
+    );
+    let error =
+        EgclError::signalled(egcl_rt::value::NIL, "original".into(), Vec::new()).capture_backtrace();
+    assert!(matches!(error, EgclError::Signalled(_)));
+}

@@ -4705,7 +4705,7 @@ fn egcl_error_to_condition(
     error: &EgclError,
 ) -> Result<Option<EgclVal>, EgclError> {
     let name_sym = resolve_sym("NAME").unwrap_or(NIL);
-    let mut condition = match error {
+    let mut condition = match error.without_backtrace() {
         EgclError::TypeError { datum, expected } => {
             // Build allocating siblings before copying either value into the
             // initarg array: rooting the error does not repair an earlier copy.
@@ -5166,7 +5166,10 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
     {
         return error;
     }
-    egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
+    // Native helpers may already own the original chain, captured before their
+    // machine frames returned. Do not replace it with this later safe boundary.
+    egcl_rt::rooted!(backtrace = error.backtrace().map(<[_]>::to_vec)
+        .unwrap_or_else(|| egcl_rt::debug_stack::capture_current(usize::MAX)));
     // Render the report now (a plain Rust String, no GC alloc) so the declined
     // Signalled error can be printed at top level without the interpreter.
     let report = describe_err(&error);
@@ -7029,7 +7032,7 @@ fn calltrace_note(name: &str, e: &EgclError) {
     // TYPE-ERRORs always; ETYPECASE misses surface as Internal/ProgramError
     // with an identifying message (bliss-4bp successor debugging); any error
     // matching EGCL_CALLTRACE_MATCH.
-    let matches = match e {
+    let matches = match e.without_backtrace() {
         EgclError::TypeError { .. } => true,
         EgclError::Internal(msg) | EgclError::ProgramError(msg) => {
             msg.contains("ETYPECASE") || calltrace_match().is_some_and(|m| msg.contains(m))
@@ -38850,8 +38853,7 @@ fn report_error_with_backtrace(error: &mut EgclError, env: &mut Env) {
     // printer can re-enter Lisp, so PRINT_ENV alone is not sufficient.
     egcl_rt::rooted_ref!(_env = &mut *env);
     eprintln!("ERROR: {}", describe_err(error));
-    if let EgclError::Signalled(details) = &*error {
-        let backtrace = &details.backtrace;
+    if let Some(backtrace) = error.backtrace() {
         let count = backtrace.len();
         egcl_rt::rooted!(snapshot = backtrace.iter().take(20).cloned().collect::<Vec<_>>());
         let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
@@ -38867,7 +38869,7 @@ fn report_error_with_backtrace(error: &mut EgclError, env: &mut Env) {
 /// Render an error for display, resolving symbol indices to their names so
 /// messages read `undefined function: FOO` instead of `... Symbol(147)`.
 pub fn describe_err(e: &EgclError) -> String {
-    match e {
+    match e.without_backtrace() {
         EgclError::UndefinedFunction(s) => format!(
             "undefined function: {}",
             egcl_stdlib::format::symbol_name_for_print(*s)

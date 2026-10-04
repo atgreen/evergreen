@@ -16694,7 +16694,12 @@ fn emit_native_transfer_check(c: &mut Asm) {
 
 fn stash_native_error(error: EgclError) {
     NATIVE_ERROR.with(|cell| {
-        cell.set_first(error);
+        if !cell.is_some() {
+            // No Lisp allocation or safepoint: some callers have not published
+            // native register roots, and others hold an EnvFrame borrow. The
+            // execution-owned slot traces the snapshot even while suspended.
+            cell.set_first(error.capture_backtrace());
+        }
     });
 }
 
@@ -17123,9 +17128,7 @@ extern "C" fn c2i_call_builtin(
         // unwind native code, so stash it and return NIL for run_native to
         // re-raise on exit, without overwriting an earlier pending error.
         Err(e) => {
-            NATIVE_ERROR.with(|c| {
-                c.set_first(e);
-            });
+            stash_native_error(e);
             NIL.0
         }
     }
@@ -17206,9 +17209,7 @@ fn c2i_call_args(sym: u64, args: &[EgclVal], profile_site: u64) -> u64 {
         // to run_native for delivery. Keep first-error-wins defensively for
         // other native paths that may still continue with the placeholder.
         Err(e) => {
-            NATIVE_ERROR.with(|c| {
-                c.set_first(e);
-            });
+            stash_native_error(e);
             NIL.0
         }
     }
@@ -17259,7 +17260,7 @@ unsafe extern "C" fn c2i_call_legacy_v2(
                 exit: NativeExit::Returned,
             },
             Err(error) => {
-                NATIVE_ERROR.with(|slot| slot.set_first(error));
+                stash_native_error(error);
                 NativeOutcome {
                     value: NIL,
                     exit: NativeExit::Transfer,
@@ -17349,9 +17350,7 @@ fn native_loop_should_exit() -> u64 {
         return 1;
     }
     if let Some(error) = pending_signal_error_for_current_execution() {
-        NATIVE_ERROR.with(|c| {
-            c.set_first(error);
-        });
+        stash_native_error(error);
         return 1;
     }
     0
@@ -19541,6 +19540,7 @@ fn run_native(
     }
     if let Some(bf) = bf.as_ref().filter(|b| b.variadic) {
         if let Err(e) = bind_variadic(bf, frame, args, env_frame.as_ref(), env) {
+            let e = e.capture_backtrace();
             stack.pop_frame();
             return Err(e);
         }
@@ -19563,7 +19563,7 @@ fn run_native(
     // error from an outer native frame, run with a fresh slot, then restore the
     // outer's on exit — otherwise a nested call would clobber a first-error-wins
     // error stashed by an enclosing native function.
-    let saved_err = NATIVE_ERROR.with(|c| c.take());
+    egcl_rt::rooted!(saved_err = NATIVE_ERROR.with(|c| c.take()));
     NATIVE_DEOPT.with(|d| d.set(false));
     let saved_null_recovery = egcl_rt::runtime::current_sigsegv_null_guard_recovery_ip();
     let saved_stack_recovery = egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip();
@@ -19592,8 +19592,9 @@ fn run_native(
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.take());
-    NATIVE_ERROR.with(|c| c.replace(saved_err));
+    NATIVE_ERROR.with(|c| c.replace(std::mem::take(&mut *saved_err)));
     if let Some(error) = pending_signal_error_for_current_execution() {
+        let error = error.capture_backtrace();
         stack.pop_frame();
         return Err(error);
     }
@@ -22064,7 +22065,7 @@ fn run_native_osr(
         std::mem::replace(&mut *slot.borrow_mut(), env_frame)
             .map(super::SuspendedFrameRoot)
     }));
-    let saved_err = NATIVE_ERROR.with(|c| c.take());
+    egcl_rt::rooted!(saved_err = NATIVE_ERROR.with(|c| c.take()));
     NATIVE_DEOPT.with(|d| d.set(false));
     // OSR executes inside the interpreter activation, so its fault-recovery
     // window must be established just like a normal native entry. In
@@ -22098,11 +22099,11 @@ fn run_native_osr(
     let deopt = NATIVE_DEOPT.with(|d| d.replace(false));
     let resume = NATIVE_DEOPT_RESUME.with(|c| c.borrow_mut().take());
     let my_err = NATIVE_ERROR.with(|c| c.take());
-    NATIVE_ERROR.with(|c| c.replace(saved_err));
+    NATIVE_ERROR.with(|c| c.replace(std::mem::take(&mut *saved_err)));
     let _ = osr.num_slots;
     let _ = osr.code_info;
     if let Some(error) = pending_signal_error_for_current_execution() {
-        return Err(error);
+        return Err(error.capture_backtrace());
     }
     if let Some(err) = my_err {
         return Err(err);
@@ -23849,12 +23850,16 @@ mod jtc4_stack_map_tests {
         assert!(!native_transfer_abi_compatible(&legacy));
 
         assert!(matches!(
-            error,
+            error.without_backtrace(),
             EgclError::TypeError {
                 datum,
                 expected
-            } if datum == NIL && expected == "non-null object reference"
+            } if *datum == NIL && expected == "non-null object reference"
         ));
+        let trace = error
+            .backtrace()
+            .expect("capture native fault before frame teardown");
+        assert_eq!(trace[0].origin, egcl_rt::debug_stack::FrameOrigin::Managed);
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]
@@ -24260,3 +24265,6 @@ mod active_bytecode_root_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod native_error_tests;

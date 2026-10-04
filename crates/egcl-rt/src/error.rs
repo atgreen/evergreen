@@ -95,6 +95,17 @@ pub enum EgclError {
     /// by every handler. Box the cold details so historical snapshots do not
     /// enlarge ordinary runtime Result values (bliss-cf672.7.1).
     Signalled(Box<SignalledError>),
+
+    /// A raw failure with a historical call chain, not yet signalled. Native
+    /// helpers can capture this without allocating a Lisp condition at an
+    /// unpublished safepoint. Keep the cold payload boxed to preserve Result size.
+    Traced(Box<TracedError>),
+}
+
+#[derive(Debug)]
+pub struct TracedError {
+    pub error: EgclError,
+    pub backtrace: Vec<crate::debug_stack::LogicalFrame>,
 }
 
 /// Owned details for an already-signalled condition. Condition conversion skips
@@ -110,12 +121,53 @@ pub struct SignalledError {
 }
 
 impl EgclError {
+    /// Retain the first failure's current call chain using Rust allocation only.
+    /// Control transfers and storage exhaustion keep their no-capture paths.
+    /// Root the returned error across any subsequent Lisp allocation/safepoint.
+    pub fn capture_backtrace(self) -> Self {
+        if matches!(
+            self,
+            Self::Oom
+                | Self::StackOverflow(_)
+                | Self::Shutdown
+                | Self::Internal(_)
+                | Self::Signalled(_)
+                | Self::Traced(_)
+        ) {
+            return self;
+        }
+        let backtrace = crate::debug_stack::capture_current(usize::MAX);
+        Self::Traced(Box::new(TracedError {
+            error: self,
+            backtrace,
+        }))
+    }
+
+    pub fn without_backtrace(&self) -> &Self {
+        match self {
+            Self::Traced(details) => details.error.without_backtrace(),
+            _ => self,
+        }
+    }
+
+    pub fn backtrace(&self) -> Option<&[crate::debug_stack::LogicalFrame]> {
+        match self {
+            Self::Traced(details) => Some(&details.backtrace),
+            Self::Signalled(details) => Some(&details.backtrace),
+            _ => None,
+        }
+    }
+
     pub fn signalled(
         condition: EgclVal,
         report: String,
         backtrace: Vec<crate::debug_stack::LogicalFrame>,
     ) -> Self {
-        Self::Signalled(Box::new(SignalledError { condition, report, backtrace }))
+        Self::Signalled(Box::new(SignalledError {
+            condition,
+            report,
+            backtrace,
+        }))
     }
 }
 
@@ -167,6 +219,7 @@ impl core::fmt::Display for EgclError {
                 Ok(())
             }
             EgclError::Signalled(details) => write!(f, "{}", details.report),
+            EgclError::Traced(details) => details.error.fmt(f),
         }
     }
 }

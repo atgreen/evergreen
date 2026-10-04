@@ -3361,6 +3361,10 @@ impl TraceHostRoots for EgclError {
                 details.condition.trace_host_roots(visit);
                 details.backtrace.trace_host_roots(visit);
             }
+            EgclError::Traced(details) => {
+                details.error.trace_host_roots(visit);
+                details.backtrace.trace_host_roots(visit);
+            }
             // A Python raise carries strings and a PyObject pointer. The pointer
             // names an object in CPython's heap, which this collector neither
             // moves nor traces, so there is nothing here to visit.
