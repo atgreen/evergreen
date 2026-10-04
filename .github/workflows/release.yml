@@ -133,17 +133,20 @@ jobs:
           # the `ppc64le` cross job, which dumps and verifies under qemu today.
           - { name: ppc64le-native, group: native, arch: ppc64le,
               platform: linux/ppc64le, timeout: 300 }
-          # The same arrangement for the other two ExclusiveArch hosts. s390x is
-          # the one to watch: it is big-endian, so it exercises code paths the
-          # little-endian hosts never do (bliss-99s56 is an image-restore test
-          # that fails there), and `aarch64` here means NATIVE arm64 packages,
-          # not the x86_64-hosted egcl-target-aarch64-linux cross set above.
-          # linux/arm64 is the OCI spelling; the uname/rpm arch stays aarch64,
-          # which is what the binfmt handler and rpm's RPMS/<arch> use.
-          - { name: s390x-native, group: native, arch: s390x,
-              platform: linux/s390x, timeout: 300 }
-          - { name: aarch64-native, group: native, arch: aarch64,
-              platform: linux/arm64, timeout: 300 }
+          # Native s390x and aarch64 are NOT here yet, and the reason is
+          # specific: they need contradictory qemu versions. aarch64 cannot
+          # extract the source tarball under qemu 9.2.2 (tar gets EINVAL on
+          # every mkdir), and under 10.2.2 -- which does extract it -- systemd's
+          # user@0.service never starts, on every architecture including this
+          # one. So the version that fixes tar breaks the container, and no
+          # single version works for both yet. The likely lever is the binfmt
+          # registration flags rather than the version: this image registers
+          # OCF, while Fedora's shipped conf uses only F, and C (credentials)
+          # is a plausible requirement of user@0.service. Everything else for
+          # those two arches is already in place -- ExclusiveArch, the pinned
+          # rustup digests, release.py's package sets and verify.py's
+          # HOST_FEATURES -- so re-adding them is two matrix entries and two
+          # --rpm-dir lines once that is settled.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -162,52 +165,31 @@ jobs:
         env:
           BUILD_ARCH: ${{ matrix.arch }}
         run: |
-          # The emulator comes from the SAME digest-pinned Fedora 44 image these
-          # packages are built in. Two reasons, one of which cost three release
-          # runs to establish.
-          #
-          # It has to be 10.x. Measured, extracting this project's source
-          # tarball with each architecture's own Fedora 44 tar:
-          #
-          #   qemu 8.2  (Ubuntu 24.04 apt)  ppc64le ENOSYS   aarch64 --
-          #   qemu 9.2.2 (binfmt image)     ppc64le OK       aarch64 EINVAL
-          #   qemu 10.2.2 (Fedora 44)       ppc64le OK       aarch64 OK   s390x OK
-          #
-          # The symptom either way is rpmbuild's %prep dying with GNU tar unable
-          # to create a single directory --
+          # Ubuntu 24.04's qemu-user-static is QEMU 8.2, and it is too old to
+          # emulate a Fedora 44 userland: the container builds and dnf runs, but
+          # rpmbuild's %prep dies with GNU tar unable to create a single
+          # directory --
           #     tar: egcl-source/.cargo: Cannot mkdir: Function not implemented
-          # -- thousands of errors having extracted nothing, while %mkbuilddir
-          # created directories in that same path moments before. So it is not
-          # the bind mount, not permissions, and not podman's seccomp (whose
-          # defaultErrnoRet is also 38/ENOSYS, but dnf installs hundreds of
-          # packages under the same emulation). It is the emulator being older
-          # than the glibc 2.43 userland it is asked to run, and each
-          # architecture needs its own fix, hence the per-arch table above.
+          # -- 6732 ENOSYS errors, having extracted nothing, while %mkbuilddir
+          # created directories in the same place moments earlier. The same
+          # extraction of the same ppc64le tar succeeds under QEMU 10.2.2
+          # locally, so this is a syscall glibc 2.43 needs and 8.2 lacks.
           #
-          # And it makes the emulator a pinned input like every other one, which
-          # apt's snapshot never was and a floating image tag would not be.
+          # Hence a binfmt installer image, pinned by digest -- the objection to
+          # one was that it was an unpinned input, not that it was third-party,
+          # and apt's snapshot is itself unpinned. It registers handlers with
+          # binfmt's F flag, so the static qemu is opened at registration time
+          # and stays reachable from a container that ships no qemu itself --
+          # without F, execve in the container returns ENOEXEC.
           #
-          # The interpreter must be an x86_64-hosted static binary, so it comes
-          # from the amd64 side of the image, not the foreign-arch container.
-          # Fedora ships both it and its binfmt registration line, and that line
-          # is already in /proc register syntax ending in :F -- F is what keeps
-          # the interpreter reachable from a container carrying no qemu of its
-          # own; without it execve in the container returns ENOEXEC.
-          mkdir -p /tmp/binfmt
-          sudo podman run --rm --platform linux/amd64 --security-opt label=disable \
-            --volume /usr/bin:/hostbin:rw --volume /tmp/binfmt:/hostconf:rw \
-            registry.fedoraproject.org/fedora:44@sha256:7011f51bd8089d345be42d41f0aa3190d258823528852a5e7ec976fe2fd20f53 \
-            /bin/sh -c "dnf -y install qemu-user-static >/dev/null \
-              && cp /usr/bin/qemu-$BUILD_ARCH-static /hostbin/ \
-              && cp /usr/lib/binfmt.d/qemu-$BUILD_ARCH-static.conf /hostconf/"
-          # Replace any handler the runner image already registered for this
-          # architecture: two handlers for one magic is a silent coin toss over
-          # which qemu runs.
-          if [ -e "/proc/sys/fs/binfmt_misc/qemu-$BUILD_ARCH" ]; then
-            echo -1 | sudo tee "/proc/sys/fs/binfmt_misc/qemu-$BUILD_ARCH" >/dev/null
-          fi
-          sudo sh -c "cat /tmp/binfmt/qemu-$BUILD_ARCH-static.conf \
-            > /proc/sys/fs/binfmt_misc/register"
+          # qemu-v9.2.2 is the newest tag this image publishes. It is ahead of
+          # the 8.2 that fails and behind the 10.2.2 known to work; whether it
+          # carries the missing syscall is the open question this pin answers.
+          sudo podman run --privileged --rm \
+            docker.io/tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6 \
+            --install "$BUILD_ARCH"
+          # Prove the handler exists before starting an hours-long build that
+          # would otherwise fail on the container's first RUN.
           test -f "/proc/sys/fs/binfmt_misc/qemu-$BUILD_ARCH"
       - name: Rebuild and verify package group
         env:
@@ -289,8 +271,6 @@ jobs:
           python3 packaging/fedora/release.py collect \
             --rpm-dir target/release-input/fedora-rpm/RPMS/x86_64 \
             --rpm-dir target/release-input/fedora-rpm/RPMS/ppc64le \
-            --rpm-dir target/release-input/fedora-rpm/RPMS/s390x \
-            --rpm-dir target/release-input/fedora-rpm/RPMS/aarch64 \
             --source-rpm "${srpms[0]}" --provenance-dir target/release-input/build-provenance \
             --sbom target/sbom/egcl-sbom.cdx.json
       - name: Upload complete release assets
