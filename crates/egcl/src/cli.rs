@@ -39249,31 +39249,36 @@ mod env_gc_root_tests {
     fn compiler_macro_temporaries_survive_allocation_pressure() {
         const CHILD: &str = "EGCL_TEST_COMPILER_MACRO_SYMBOL_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new("timeout")
-                .args(["--kill-after=5", "45"])
-                .arg(std::env::current_exe().unwrap())
-                .args(["--exact", "cli::env_gc_root_tests::compiler_macro_temporaries_survive_allocation_pressure", "--nocapture"])
-                .env(CHILD, "1")
-                .env("EGCL_GC_STRESS", "1")
-                .env("EGCL_GC_POISON", "1")
-                .env_remove("EGCL_GC_DISABLE")
-                .env_remove("EGCL_GC_STRESS_SKIP")
-                .env_remove("EGCL_GC_STRESS_AT")
-                .output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            // Keep the original fine-grained rooting probe and the larger
+            // sparse-region shape that used to exhaust old-gen (bliss-copxf).
+            for region_size in ["4096", "65536"] {
+                let output = std::process::Command::new("timeout")
+                    .args(["--kill-after=5", "45"])
+                    .arg(std::env::current_exe().unwrap())
+                    .args(["--exact", "cli::env_gc_root_tests::compiler_macro_temporaries_survive_allocation_pressure", "--nocapture"])
+                    .env(CHILD, region_size)
+                    .env("EGCL_GC_STRESS", "1")
+                    .env("EGCL_GC_POISON", "1")
+                    .env_remove("EGCL_GC_DISABLE")
+                    .env_remove("EGCL_GC_STRESS_SKIP")
+                    .env_remove("EGCL_GC_STRESS_AT")
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "region size {region_size}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
             return;
         }
+        let large_regions = std::env::var(CHILD).as_deref() == Ok("65536");
         egcl_rt::init_heap(&egcl_rt::GcConfig {
             heap_size: 4 * 1024 * 1024,
             heap_max: 4 * 1024 * 1024,
-            nursery_size: 8 * 1024,
-            tlab_size: 256,
-            region_size: 4096,
+            nursery_size: if large_regions { 512 * 1024 } else { 8 * 1024 },
+            tlab_size: if large_regions { 1024 } else { 256 },
+            region_size: if large_regions { 64 * 1024 } else { 4096 },
             promotion_threshold: 1,
             pause_target_ms: 10,
             gc_workers: 1,

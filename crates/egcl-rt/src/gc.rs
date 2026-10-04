@@ -1467,7 +1467,16 @@ impl HeapCollector {
                 }
             }
         }
-        // Convert a Free region.
+        Self::allocate_target_region(state, kind, gen_age)
+    }
+
+    /// Start a fresh evacuation destination. Major collections must not copy
+    /// into another source region that may itself be evacuated and freed.
+    fn allocate_target_region(
+        state: &mut HeapState,
+        kind: RegionKind,
+        gen_age: u8,
+    ) -> Option<usize> {
         for (idx, region) in state.regions.iter_mut().enumerate() {
             if region.header.kind == RegionKind::Free {
                 region.header.kind = kind;
@@ -2269,7 +2278,7 @@ impl Collector for HeapCollector {
     /// 1. Mark phase: walk all old-gen/survivor/large-object regions, scan objects
     ///    from base to alloc_top, and compute accurate live_bytes per region.
     /// 2. Region selection: identify regions with high garbage ratio
-    ///    (live_bytes / used_bytes < 0.5) as candidates for evacuation.
+    ///    (live_bytes / region_capacity < 0.5), sparsest first.
     /// 3. Evacuation: copy live objects from selected regions to fresh old-gen
     ///    regions, install forwarding pointers, and free evacuated regions.
     fn major_gc(&mut self) -> Result<(), EgclError> {
@@ -2583,7 +2592,9 @@ impl HeapCollector {
         state.free_pinned_slots.extend(dead_function_slots);
 
         // Phase 2: Region selection — find old-gen regions with high garbage ratio.
-        // A region is a candidate if live_bytes < 50% of used bytes (i.e. mostly garbage).
+        // Measure density against capacity, not the allocation high-water mark:
+        // a tiny fully-live survivor cohort otherwise permanently occupies one
+        // old region per major collection (bliss-copxf).
         let mut evacuation_set: Vec<usize> = Vec::new();
         for (idx, region) in state.regions.iter().enumerate() {
             // Survivor regions are candidates too: minor collections do not
@@ -2616,11 +2627,11 @@ impl HeapCollector {
             if unsafe { region_has_pinned(base, top) } {
                 continue;
             }
-            // Select regions where less than half the used space is live.
-            if (region.header.live_bytes as u64) < (used as u64 / 2) {
+            if (region.header.live_bytes as usize) < state.config.region_size / 2 {
                 evacuation_set.push(idx);
             }
         }
+        evacuation_set.sort_by_key(|&idx| state.regions[idx].header.live_bytes);
 
         // Phase 3: Evacuation — copy live objects from selected regions to fresh
         // ones. A region may only be freed afterwards if EVERY live object in it
@@ -2630,6 +2641,10 @@ impl HeapCollector {
         // the minor-evacuation loss (bliss-wc4t), and newly reachable now that
         // major collections run automatically.
         let mut fully_evacuated: Vec<usize> = Vec::with_capacity(evacuation_set.len());
+        // Destinations belong only to this collection. Reusing arbitrary old
+        // regions could choose a source, then free its newly copied objects
+        // when that source's turn in the collection set arrives.
+        let mut evacuation_target: Option<usize> = None;
         for &evac_idx in &evacuation_set {
             let base = state.regions[evac_idx].base as usize;
             let top = state.regions[evac_idx].header.alloc_top as usize;
@@ -2651,14 +2666,16 @@ impl HeapCollector {
                 let body_addr = cursor + OBJECT_HEADER_SIZE;
                 if !unsafe { header_is_forwarded(header_ptr) } && object_map.is_marked(body_addr) {
                     let mut copied = false;
-                    if let Some(tidx) =
-                        Self::find_or_create_target_region(state, RegionKind::OldGen, 0, total_size)
-                    {
-                        if tidx != evac_idx
-                            && Self::copy_object(state, header_ptr, body_size, tidx).is_some()
-                        {
-                            copied = true;
-                        }
+                    if !evacuation_target.is_some_and(|idx| {
+                        let region = &state.regions[idx];
+                        (region.header.alloc_limit as usize)
+                            .saturating_sub(region.header.alloc_top as usize) >= total_size
+                    }) {
+                        evacuation_target =
+                            Self::allocate_target_region(state, RegionKind::OldGen, 0);
+                    }
+                    if let Some(tidx) = evacuation_target {
+                        copied = Self::copy_object(state, header_ptr, body_size, tidx).is_some();
                     }
                     if !copied {
                         all_copied = false;
