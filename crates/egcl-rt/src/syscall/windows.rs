@@ -130,6 +130,28 @@ pub fn thread_cpu_time_ns() -> Result<u64, i32> {
     }
 }
 
+/// User and kernel CPU time consumed by all threads in this process.
+pub fn process_cpu_time_ns() -> Result<u64, i32> {
+    unsafe {
+        let mut creation: FILETIME = std::mem::zeroed();
+        let mut exit = creation;
+        let mut kernel = creation;
+        let mut user = creation;
+        if GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        ) == 0
+        {
+            return Err(GetLastError() as i32);
+        }
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        Ok(ticks(kernel).saturating_add(ticks(user)).saturating_mul(100))
+    }
+}
+
 /// Bounds of the current OS thread's reserved stack.
 pub fn thread_stack_limits() -> (usize, usize) {
     let (mut low, mut high) = (0, 0);

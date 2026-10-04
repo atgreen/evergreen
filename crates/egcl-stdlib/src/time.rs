@@ -145,14 +145,19 @@ pub fn get_real_time_nanos() -> i64 {
     origin().elapsed().as_nanos() as i64
 }
 
-/// `get-internal-run-time`: CLHS 25.1.4.3 leaves the meaning
-/// implementation-defined; egcl currently reports elapsed REAL time from the
-/// same origin. (Process-CPU time would need a libc clock_gettime call, and
-/// stdlib deliberately carries no libc dependency — bliss-bca.5 is removing it
-/// for fully static builds. Swap the body when a std/egcl-rt CPU-time source
-/// exists.)
-pub fn get_internal_run_time() -> i64 {
-    get_internal_real_time()
+/// `get-internal-run-time`: user and kernel CPU time consumed by this process,
+/// including its worker threads, in milliseconds. Sleeping is not CPU work.
+/// The runtime supplies the platform clock without adding a libc dependency
+/// to the static x86-64 build. Report clock failure rather than substituting a
+/// wall clock or a constant that would silently corrupt timing results.
+pub fn get_internal_run_time() -> Result<i64, egcl_rt::error::EgclError> {
+    egcl_rt::syscall::process_cpu_time_ns()
+        .map(|nanoseconds| (nanoseconds / 1_000_000) as i64)
+        .map_err(|error| {
+            egcl_rt::error::EgclError::Internal(format!(
+                "cannot read process CPU time: OS error {error}"
+            ))
+        })
 }
 
 #[cfg(test)]

@@ -21272,7 +21272,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "GET-INTERNAL-RUN-TIME" => {
                 return Ok(EgclVal::from_fixnum(
-                    egcl_stdlib::time::get_internal_run_time(),
+                    egcl_stdlib::time::get_internal_run_time()?,
                 ));
             }
             // Atomic wall-clock sample for libraries that need a fractional
@@ -21292,7 +21292,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // (bliss-kfy4). A special form — it controls FORM's evaluation.
                 let (form, _rest) = cp(cdr);
                 let t0_real = egcl_stdlib::time::get_internal_real_time();
-                let t0_run = egcl_stdlib::time::get_internal_run_time();
+                let t0_run = egcl_stdlib::time::get_internal_run_time()?;
                 let g0 = egcl_rt::heap_stats();
                 // Root the result AND the saved multiple values: the report write
                 // below allocates (make_lisp_string / arena_str), which can move
@@ -21301,7 +21301,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let saved_mv_active = env.mv_active;
                 egcl_rt::rooted!(saved_mv = std::mem::take(&mut env.mv));
                 let t1_real = egcl_stdlib::time::get_internal_real_time();
-                let t1_run = egcl_stdlib::time::get_internal_run_time();
+                let t1_run = egcl_stdlib::time::get_internal_run_time()?;
                 let g1 = egcl_rt::heap_stats();
                 // internal-time-units-per-second is 1000 (milliseconds).
                 let secs = |units: i64| units as f64 / 1000.0;

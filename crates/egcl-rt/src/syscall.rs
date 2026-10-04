@@ -416,6 +416,7 @@ pub const SA_ONSTACK: u64 = 0x0800_0000;
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 pub const SS_DISABLE: i32 = 2;
 pub const MIN_SIGSTKSZ: usize = 2048;
+pub const CLOCK_PROCESS_CPUTIME_ID: i32 = 2;
 pub const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
 
 #[repr(C)]
@@ -524,15 +525,24 @@ pub unsafe fn clock_gettime(clock_id: i32, ts: *mut TimeSpec) -> Result<(), i32>
     .map(|_| ())
 }
 
-pub fn thread_cpu_time_ns() -> Result<u64, i32> {
+fn cpu_time_ns(clock_id: i32) -> Result<u64, i32> {
     let mut ts = TimeSpec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts as *mut TimeSpec) }?;
+    unsafe { clock_gettime(clock_id, &mut ts as *mut TimeSpec) }?;
     let secs = u64::try_from(ts.tv_sec).map_err(|_| -1_i32)?;
     let nanos = u64::try_from(ts.tv_nsec).map_err(|_| -1_i32)?;
     Ok(secs.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+pub fn thread_cpu_time_ns() -> Result<u64, i32> {
+    cpu_time_ns(CLOCK_THREAD_CPUTIME_ID)
+}
+
+/// User and kernel CPU time consumed by all threads in this process.
+pub fn process_cpu_time_ns() -> Result<u64, i32> {
+    cpu_time_ns(CLOCK_PROCESS_CPUTIME_ID)
 }
 
 // poll.
