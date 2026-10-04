@@ -107,8 +107,11 @@ mod tcache {
 
     pub struct ThreadCached;
 
+    // A yielding caller can resume on another carrier. Keep every allocator
+    // operation out of line so LLVM cannot retain this native-thread TLS cache
+    // address across that migration. No operation below yields or polls.
     unsafe impl GlobalAlloc for ThreadCached {
-        #[inline]
+        #[inline(never)]
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             let Some(class) = class_of(layout) else {
                 return unsafe { System.alloc(layout) };
@@ -131,7 +134,7 @@ mod tcache {
             }
         }
 
-        #[inline]
+        #[inline(never)]
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             let Some(class) = class_of(layout) else {
                 return unsafe { System.dealloc(ptr, layout) };
@@ -153,7 +156,7 @@ mod tcache {
             }
         }
 
-        #[inline]
+        #[inline(never)]
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             // Anything `System` serves directly keeps its `calloc` path, which
             // can hand back pre-zeroed pages. A pooled block has to be zeroed by
@@ -168,7 +171,7 @@ mod tcache {
             ptr
         }
 
-        #[inline]
+        #[inline(never)]
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             // A pooled block was allocated with its CLASS layout, not the
             // caller's, so it cannot be handed to `System.realloc` with the
