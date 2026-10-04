@@ -91,6 +91,8 @@ complete conformance, compatibility stability, or production readiness.
   musl runtime, glibc and static image-dumping tools for AArch64, ppc64le, and
   s390x, a Windows image-dumping tool, and Android CLI/application tooling.
 - The same source RPM can build native glibc and static packages on ppc64le.
+  Those POWER-native RPMs are not published as 0.0.1 assets because the release
+  service does not yet provide the native OpenJDK required by that builder.
   Cross runtimes are executed under QEMU or Wine during package validation;
   packaged payloads are extracted and checked again for architecture, ASDF,
   dump/restart, and GC-stress behavior.

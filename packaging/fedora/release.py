@@ -27,10 +27,8 @@ GPG_KEY_NAME = 'EGCL RPM Signing Key'
 # actions/checkout at its default depth of 1, where counting commits since the
 # version last changed cannot work. A pinned pair fails loudly instead.
 RPM_RELEASE = ('0.0.1', '6')
-# A complete release is every package of every architecture: x86_64 carries the
-# cross-targeting set, ppc64le the two POWER-native runtimes. Keep in step with
-# egcl.spec's ExclusiveArch and its `%ifarch x86_64` guard. A build group that
-# fails still blocks publication -- a partial release is not a release.
+# Architectures the source RPM knows how to build. Keep this capability map in
+# step with egcl.spec's ExclusiveArch and its `%ifarch x86_64` guard.
 PACKAGES_BY_ARCH = {
     'x86_64': {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
                'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
@@ -38,15 +36,34 @@ PACKAGES_BY_ARCH = {
                'egcl-target-ppc64le-linux-static'},
     'ppc64le': {'egcl', 'egcl-static'},
 }
-PACKAGES = set().union(*PACKAGES_BY_ARCH.values())
-PACKAGE_COUNT = sum(len(names) for names in PACKAGES_BY_ARCH.values())
+# Builders enabled in .github/workflows/release.yml. The regression test reads
+# the active matrix entries so commenting out a builder cannot leave the
+# collector demanding artifacts that no job produces.
+RELEASE_BUILDERS = {
+    ('native', 'native', 'x86_64'),
+    ('s390x', 's390x', 'x86_64'),
+    ('aarch64', 'aarch64', 'x86_64'),
+    ('ppc64le', 'ppc64le', 'x86_64'),
+    ('windows', 'windows', 'x86_64'),
+    ('android', 'android', 'x86_64'),
+}
+# A complete published release is every package for every architecture that
+# has an enabled builder. POWER-native packages remain supported by the SRPM,
+# but are not release assets until the disabled builder can run with native
+# OpenJDK. A failed enabled build group still blocks publication.
+RELEASE_PACKAGES_BY_ARCH = {
+    arch: PACKAGES_BY_ARCH[arch]
+    for arch in {builder[2] for builder in RELEASE_BUILDERS}
+}
+PACKAGES = set().union(*RELEASE_PACKAGES_BY_ARCH.values())
+PACKAGE_COUNT = sum(len(names) for names in RELEASE_PACKAGES_BY_ARCH.values())
 # Provenance artifact keys. The x86_64 builders name their payloads after the
 # build.py target; a non-x86_64 builder prefixes its arch, because `native` and
 # `static` mean a different binary on each host and the collector merges every
 # builder's record into one build.json.
 RUNTIMES = {'native', 'static'} | {name.removeprefix('egcl-target-')
                                  for name in PACKAGES if name.startswith('egcl-target-')} \
-         | {f'{arch}-{name}' for arch in PACKAGES_BY_ARCH if arch != 'x86_64'
+         | {f'{arch}-{name}' for arch in RELEASE_PACKAGES_BY_ARCH if arch != 'x86_64'
             for name in ('native', 'static')}
 
 
@@ -84,13 +101,13 @@ def validate_packages(records, version, rpm_release, dist):
     for name, actual_version, actual_release, arch in records:
         if (actual_version, actual_release) != (version, f'{rpm_release}{dist}'):
             raise ValueError(f'Unexpected RPM identity: {name} {actual_version}-{actual_release}.{arch}')
-        if arch not in PACKAGES_BY_ARCH:
+        if arch not in RELEASE_PACKAGES_BY_ARCH:
             raise ValueError(f'Unexpected RPM architecture: {name} {actual_version}-{actual_release}.{arch}')
         by_arch.setdefault(arch, []).append(name)
-    if missing := sorted(set(PACKAGES_BY_ARCH) - set(by_arch)):
+    if missing := sorted(set(RELEASE_PACKAGES_BY_ARCH) - set(by_arch)):
         raise ValueError(f'No packages at all for: {", ".join(missing)}')
     for arch, names in sorted(by_arch.items()):
-        expected = PACKAGES_BY_ARCH[arch]
+        expected = RELEASE_PACKAGES_BY_ARCH[arch]
         # The length test is not redundant with the set test: it is what
         # catches the same package appearing twice for one architecture.
         if len(names) != len(expected) or set(names) != expected:
@@ -297,7 +314,7 @@ def main():
         if not args.source_rpm or not args.provenance_dir:
             parser.error('collect requires --source-rpm and --provenance-dir')
         rpm_dirs = args.rpm_dirs or [Path(f'target/fedora-rpm/RPMS/{arch}')
-                                     for arch in sorted(PACKAGES_BY_ARCH)]
+                                     for arch in sorted(RELEASE_PACKAGES_BY_ARCH)]
         collect(rpm_dirs, args.destination, json.loads(args.plan.read_text()),
                 args.source_rpm, args.provenance_dir, args.sbom)
 

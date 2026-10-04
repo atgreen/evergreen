@@ -141,45 +141,30 @@ verifies that payload without producing an incomplete RPM release. Repeat
 
 ## GitHub releases
 
-The **Fedora releases** workflow builds and verifies all twelve RPMs on Fedora
-44 — the ten x86-64 packages and the two POWER-native ones. It runs the same
+The **Fedora releases** workflow builds and verifies all ten x86-64 RPMs on
+Fedora 44. It runs the same
 packaging checks described above, with systemd memory limits inside its Fedora
 container. Runs finish independently when newer commits are pushed.
 A source job builds one SRPM containing EGCL source, vendored Rust dependencies,
 and the musl and LLVM unwinder sources, then uploads the `fedora44-srpm` artifact.
-Seven parallel builder jobs download that exact SRPM and rebuild the native,
-s390x, AArch64, POWER, Windows and Android package groups, plus the
-POWER-native group described below. Each cross Linux group
+Six parallel builder jobs download that exact SRPM and rebuild the native,
+s390x, AArch64, POWER, Windows and Android package groups. Each cross Linux group
 produces both glibc and musl RPMs. Each builder verifies its extracted RPMs and
 records the source RPM's SHA-256 checksum. A final collector requires matching
-source/toolchain provenance and every architecture's complete package set
+source/toolchain provenance and the complete published package set
 before publication: a build group that fails blocks the release rather than
 publishing a partial one.
 A failed matrix job does not cancel the other builds.
 
-### The POWER-native builder
+### POWER-native release status
 
-GitHub offers no POWER runner, so the `ppc64le-native` job runs the *same*
-pinned Fedora 44 container for `linux/ppc64le` under `qemu-user`, registered
-through `binfmt_misc` from Ubuntu's `qemu-user-static`. The whole build is
-emulated, `rustc` included. The container pin needs no change for this: the
-digest in `packaging/fedora/Containerfile` is an OCI image index that already
-covers amd64, arm64, ppc64le and s390x, so one pin serves every architecture
-and reproducibility is unaffected.
-
-Emulation costs about **9x** on this workspace's Rust compilation — measured at
-183s native against 1661s emulated, on four cores with identical container
-contents and the same cargo command. Since the x86-64 `native` job takes about
-eight minutes, the POWER job is given a 300-minute timeout against GitHub's
-six-hour hard cap. Note that the emulated *runtime* cost was already being paid
-before this job existed: the `ppc64le` cross job has always dumped its image and
-run the whole of `verify.py`, GC-stress probe included, under `qemu-ppc64le`.
-
-Because two builder jobs now build the `native` group and differ only in the
-architecture they build *for*, each matrix entry carries an explicit `name`
-alongside its `group`, and a builder off x86-64 prefixes its architecture onto
-its provenance record — otherwise both would write `native.json` and one would
-overwrite the other in the collector's merged download.
+The source RPM supports native ppc64le `egcl` and `egcl-static` builds, but the
+GitHub release workflow does not currently publish those two RPMs. GitHub has
+no POWER runner, and the emulated Fedora build does not yet have the native
+OpenJDK required by the glibc runtime. The `ppc64le-native` matrix entry remains
+disabled until that dependency can be provided and validated. This does not
+affect the x86-64-hosted POWER cross tools: their builder still dumps and tests
+ppc64le glibc and musl images under QEMU.
 
 `rpmlint` runs in the source job against a ratcheted baseline
 (`packaging/fedora/rpmlint-baseline.txt`). A new finding fails the release, and
@@ -254,7 +239,7 @@ collector validates package identity without a hardcoded Fedora version. An
 existing release is never overwritten; a failed upload can leave a draft for
 inspection before retrying.
 
-Published assets include all twelve binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
+Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
 release metadata, the `RPM-GPG-KEY-egcl` public key, a CycloneDX SBOM, and
 `SHA256SUMS` with its detached signature `SHA256SUMS.asc`.
 Publication runs only after package identity, payload, and runtime checks pass.

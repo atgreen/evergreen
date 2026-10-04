@@ -85,7 +85,8 @@ BuildRequires: cargo
 %endif
 # x86_64 is the full release, with every cross-target subpackage. ppc64le is
 # POWER-native: the two runtimes only (see the ifarch guard above). Keep this
-# list in step with release.py's PACKAGES_BY_ARCH, which the collector enforces.
+# list in step with release.py's PACKAGES_BY_ARCH; the source-RPM tests enforce
+# that build-capability map even when an architecture is not a published asset.
 ExclusiveArch: x86_64 ppc64le s390x aarch64
 
 %description

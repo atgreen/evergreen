@@ -6,6 +6,7 @@ import importlib.util
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -17,9 +18,9 @@ spec.loader.exec_module(release)
 
 
 def complete_records(version='0.0.1', rpm_release='0.test.123.1', dist='.fc44'):
-    """Every package of every architecture: exactly what a release must carry."""
+    """Every published package: exactly what a release must carry."""
     return [(name, version, f'{rpm_release}{dist}', arch)
-            for arch, names in sorted(release.PACKAGES_BY_ARCH.items())
+            for arch, names in sorted(release.RELEASE_PACKAGES_BY_ARCH.items())
             for name in sorted(names)]
 
 
@@ -31,7 +32,7 @@ def write_rpm_tree(root):
     would collide the moment the collector copies them into one asset folder.
     """
     directories = []
-    for arch, names in sorted(release.PACKAGES_BY_ARCH.items()):
+    for arch, names in sorted(release.RELEASE_PACKAGES_BY_ARCH.items()):
         directory = root / 'rpms' / arch
         directory.mkdir(parents=True)
         for name in sorted(names):
@@ -52,6 +53,22 @@ def rpm_identity(source_rpm, version='0.0.1', rpm_release='0.test.123.1.fc44'):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_published_architectures_match_enabled_workflow_builders(self):
+        """Disabling a builder must also change what the collector requires."""
+        workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
+        enabled = {
+            tuple(match.groups())
+            for match in re.finditer(
+                r'^\s+- \{ name: ([^,]+),\s+group: ([^,]+),\s+'
+                r'arch: ([^,]+),',
+                workflow,
+                re.MULTILINE,
+            )
+        }
+        self.assertEqual(enabled, release.RELEASE_BUILDERS)
+        self.assertEqual({arch for _, _, arch in enabled},
+                         set(release.RELEASE_PACKAGES_BY_ARCH))
+
     def test_tag_must_match_workspace_version(self):
         plan = release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.1', '123', '1', '')
         self.assertEqual(plan['tag'], 'v0.0.1')
@@ -94,7 +111,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_every_architecture_must_be_present(self):
         """A release is complete or it is not published: one arch is not enough."""
-        for arch in release.PACKAGES_BY_ARCH:
+        for arch in release.RELEASE_PACKAGES_BY_ARCH:
             partial = [record for record in complete_records() if record[3] != arch]
             with self.subTest(dropped=arch), \
                     self.assertRaisesRegex(ValueError, f'No packages at all for: {arch}'):

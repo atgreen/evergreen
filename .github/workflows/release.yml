@@ -123,15 +123,8 @@ jobs:
           - { name: ppc64le, group: ppc64le, arch: x86_64, platform: '', timeout: 120 }
           - { name: windows, group: windows, arch: x86_64, platform: '', timeout: 120 }
           - { name: android, group: android, arch: x86_64, platform: '', timeout: 120 }
-          # POWER-native packages. GitHub has no POWER runner, so the Fedora
-          # container itself runs under qemu-user and the whole build -- rustc
-          # included -- is emulated. Measured 9.1x on this workspace's Rust
-          # compilation (183s native vs 1661s emulated, 4 cores, same container
-          # contents and command). The x86_64 `native` job takes 8 min, so
-          # budget generously rather than tightly: 300, well under GitHub's 6h
-          # hard cap, and the emulated runtime cost was already being paid by
-          # the `ppc64le` cross job, which dumps and verifies under qemu today.
-	  # [DISABLED FOR NOW.. Need native openjdk.. more work]
+          # POWER-native packages remain supported by the SRPM, but this job is
+          # disabled until the emulated build has a usable native OpenJDK.
           # - { name: ppc64le-native, group: native, arch: ppc64le,
           #     platform: linux/ppc64le, timeout: 300 }
           # Native s390x and aarch64 are NOT here yet, and the reason is
@@ -266,12 +259,10 @@ jobs:
           shopt -s nullglob
           srpms=(target/srpm/*.src.rpm)
           [[ ${#srpms[@]} == 1 ]]
-          # One --rpm-dir per architecture: rpmbuild writes RPMS/<arch>/, and
-          # the collector requires every architecture's complete package set
-          # before anything is published.
+          # The collector requires the complete package set from every enabled
+          # builder before anything is published.
           python3 packaging/fedora/release.py collect \
             --rpm-dir target/release-input/fedora-rpm/RPMS/x86_64 \
-            --rpm-dir target/release-input/fedora-rpm/RPMS/ppc64le \
             --source-rpm "${srpms[0]}" --provenance-dir target/release-input/build-provenance \
             --sbom target/sbom/egcl-sbom.cdx.json
       - name: Upload complete release assets
