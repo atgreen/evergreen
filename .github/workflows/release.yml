@@ -131,8 +131,9 @@ jobs:
           # budget generously rather than tightly: 300, well under GitHub's 6h
           # hard cap, and the emulated runtime cost was already being paid by
           # the `ppc64le` cross job, which dumps and verifies under qemu today.
-          - { name: ppc64le-native, group: native, arch: ppc64le,
-              platform: linux/ppc64le, timeout: 300 }
+	  # [DISABLED FOR NOW.. Need native openjdk.. more work]
+          # - { name: ppc64le-native, group: native, arch: ppc64le,
+          #     platform: linux/ppc64le, timeout: 300 }
           # Native s390x and aarch64 are NOT here yet, and the reason is
           # specific: they need contradictory qemu versions. aarch64 cannot
           # extract the source tarball under qemu 9.2.2 (tar gets EINVAL on
