@@ -1704,3 +1704,54 @@ fn backend_lowers_and_allocates_straight_line() {
         "P6 must assign a location to each vreg"
     );
 }
+
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
+    use egcl_compiler::t2::build::build_from_bytecode_for_transfers;
+    use egcl_compiler::t2::emit::emit_framed;
+    let bf = bytecode_fn(
+        "entry-loop",
+        vec![
+            Instr::LoadLocal(0),
+            Instr::Const(0),
+            Instr::CallNamed { sym: egcl_rt::symbols::intern(">"), nargs: 2 },
+            Instr::BrIfFalse(9),
+            Instr::LoadLocal(0),
+            Instr::Const(1),
+            Instr::CallNamed { sym: egcl_rt::symbols::intern("-"), nargs: 2 },
+            Instr::StoreLocal(0),
+            Instr::Br(0),
+            Instr::LoadLocal(0),
+            Instr::Return,
+        ],
+        vec![EgclVal::from_fixnum(0), EgclVal::from_fixnum(1)],
+        1, 2, 1,
+    );
+    let transfer = build_from_bytecode_for_transfers(&bf).unwrap();
+    verify(&transfer).unwrap();
+    let mut function = build_from_bytecode(&bf).unwrap();
+    use egcl_compiler::t2::speculate::{speculate, SpecType};
+    assert_eq!(speculate(&mut function, &|bcp| {
+        (bcp == 2 || bcp == 6).then_some(SpecType::Fixnum)
+    }), 2);
+    verify(&function).unwrap();
+    assert_eq!(function.osr_entries.len(), 1);
+    assert_ne!(function.osr_entries[0].block, function.entry());
+    let framed = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0, 0, None).unwrap();
+    assert_eq!(framed.osr_entries.len(), 1, "OSR entry must be emitted");
+    assert_eq!(framed.osr_entries[0].0, 0);
+    let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+    let entries = std::iter::once(0).chain(framed.osr_entries.iter().map(|&(_, offset)| offset));
+    for offset in entries {
+        let run: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr().add(offset)) };
+        for iterations in [0, 1, 254, 255, 256, 511, 1024, 10_000, 1] {
+            let mut frame = vec![NIL.0; 3 + framed.shadow_root_slots as usize];
+            frame[0] = EgclVal::from_fixnum(iterations).0;
+            assert_eq!(run(frame.as_mut_ptr()), EgclVal::from_fixnum(0).0,
+                "entry {offset}, iterations {iterations}");
+        }
+    }
+}

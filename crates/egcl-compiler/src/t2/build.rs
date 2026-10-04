@@ -561,6 +561,16 @@ impl<'a> Builder<'a> {
             remat: vec![],
         });
         self.f.entry_frame_state = Some(entry_fs);
+        let first_body = self.block_of[&0];
+        if first_body != entry {
+            // Function parameters belong to a one-shot entry. The bytecode
+            // header needs ordinary phis joining those initial values with
+            // loop-carried values, including initially NIL non-parameters.
+            self.total_preds[first_body.index()] += 1;
+            self.sealed[entry.index()] = true;
+            let term = self.f.set_terminator(entry, jump(first_body));
+            self.record_edges(entry, term, vec![first_body]);
+        }
         self.process_blocks()?;
         self.capture_osr_entries();
         self.simplify_trivial_phis();
@@ -852,8 +862,13 @@ impl<'a> Builder<'a> {
 
     fn create_blocks(&mut self) {
         let leaders = self.leaders.clone();
+        let entry_is_loop_header = self.bf.code.iter().any(|instr| {
+            matches!(instr,
+                Instr::Br(0) | Instr::BrIfFalse(0) | Instr::BrIfTrue(0)
+                | Instr::Go { target_bcp: 0, .. })
+        });
         for &l in &leaders {
-            let b = if l == 0 {
+            let b = if l == 0 && !entry_is_loop_header {
                 self.f.entry()
             } else {
                 self.f.make_block()
