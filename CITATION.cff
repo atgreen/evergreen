@@ -10,7 +10,11 @@ authors:
 version: 0.0.1
 repository-code: https://github.com/atgreen/evergreen
 url: https://atgreen.github.io/evergreen/
+# CFF 1.2 accepts individual SPDX license identifiers here, but not a `WITH`
+# exception expression. The URL and abstract record the complete licensing
+# arrangement: GPL-3.0-or-later WITH Classpath-exception-2.0.
 license: GPL-3.0-or-later
+license-url: https://github.com/atgreen/evergreen#license
 abstract: >-
   Evergreen Common Lisp (EGCL) is an experimental Common Lisp implementation
   written in Rust. It combines bytecode execution, tiered native compilation,
