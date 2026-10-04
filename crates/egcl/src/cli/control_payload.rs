@@ -327,29 +327,45 @@ mod tests {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let mut env = Env::new(false);
-        egcl_rt::rooted_ref!(_env = &mut env);
-        egcl_rt::rooted!(
-            form = reader::read_from_string(
-                "(unwind-protect (car private-error-datum) (%force-minor-gc-for-test))"
-            )
-            .unwrap()
-            .0
-        );
-        egcl_rt::rooted!(datum = arena_str("wrong datum"));
-        env.set_var("PRIVATE-ERROR-DATUM", *datum);
-        let before = datum.to_raw();
-        egcl_rt::rooted!(result = eval_form(*form, &mut env));
-        assert_ne!(datum.to_raw(), before, "cleanup moved the error datum");
-        let Err(EgclError::TypeError {
-            datum: recovered, ..
-        }) = &*result
-        else {
-            panic!("expected original type error: {:?}", &*result);
-        };
-        assert_eq!(*recovered, *datum);
-        assert_eq!(val_as_str(*recovered), "wrong datum");
+        // Keep the raw cleanup path covered as well as normal eager signalling.
+        for speculative in [true, false] {
+            let mut env = Env::new(false);
+            env.speculative_evaluation = speculative;
+            egcl_rt::rooted_ref!(_env = &mut env);
+            let datum_slot = resolve_sym("DATUM").unwrap();
+            egcl_rt::rooted!(
+                form = reader::read_from_string(
+                    "(unwind-protect (car private-error-datum) (%force-minor-gc-for-test))"
+                )
+                .unwrap()
+                .0
+            );
+            egcl_rt::rooted!(datum = arena_str("wrong datum"));
+            env.set_var("PRIVATE-ERROR-DATUM", *datum);
+            let call = egcl_rt::debug_stack::CallFrame::enter_with_args(
+                "RAW-ERROR-OWNER", &[*datum],
+            );
+            let before = datum.to_raw();
+            egcl_rt::rooted!(result = eval_form(*form, &mut env));
+            drop(call);
+            assert_ne!(datum.to_raw(), before, "cleanup moved the error datum");
+            let recovered = match &*result {
+                Err(EgclError::TypeError { datum, .. }) if speculative => *datum,
+                Err(EgclError::Signalled(error)) if !speculative => {
+                    assert!(condition_matches_handler(&env, error.condition, "TYPE-ERROR"));
+                    let frame = error.backtrace.iter()
+                        .find(|frame| frame.function.as_deref() == Some("RAW-ERROR-OWNER"))
+                        .expect("raw error snapshot retained the failing activation");
+                    assert_eq!(frame.arguments.as_deref(), Some(&[*datum][..]));
+                    read_slot_value(error.condition, datum_slot, &env).unwrap()
+                }
+                other => panic!("expected original type error, speculative={speculative}: {other:?}"),
+            };
+            assert_eq!(recovered, *datum);
+            assert_eq!(val_as_str(recovered), "wrong datum");
+        }
     }
+
     #[test]
     fn raw_handler_error_reaches_only_older_clusters() {
         let _lock = super::super::heap_test_lock()

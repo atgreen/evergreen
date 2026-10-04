@@ -2072,6 +2072,9 @@ struct Env {
     tag_stack: Vec<(String, String)>,
     method_context: Vec<MethodContext>,
     eval_context: EvalContext,
+    /// Compiler seeding probes may fail before their helpers are defined.
+    /// Keep raw probe failures out of the caller's live condition handlers.
+    speculative_evaluation: bool,
     /// Symbol indices a lexically enclosing `(locally (declare (special v)) …)`
     /// declared special. Such a declaration establishes no binding; it only
     /// makes *references* to `v` in its body read the dynamic value, bypassing
@@ -5145,6 +5148,9 @@ fn signal_and_raise(env: &mut Env, condition: EgclVal, msg: String) -> EgclError
 ///  * [`EgclError::Signalled`] when every handler declined, so an enclosing
 ///    handler frame that already had its in-context turn does not re-run.
 fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError {
+    if env.speculative_evaluation {
+        return error;
+    }
     // OOM and control-stack overflow use a preallocated STORAGE-CONDITION and a
     // delicate no-allocation path; leave them to the existing post-unwind
     // handling rather than running the allocating in-context signal here.
@@ -5154,7 +5160,9 @@ fn signal_raw_error_in_context(env: &mut Env, mut error: EgclError) -> EgclError
             | EgclError::StackOverflow(_)
             | EgclError::Shutdown
             | EgclError::Signalled(_)
-    ) || matches!(&error, EgclError::Internal(token) if token.starts_with("__"))
+    ) || matches!(&error, EgclError::Internal(token)
+        if token.starts_with("__")
+            || CONTROL_VALUES.with(|values| values.borrow().contains_key(token)))
     {
         return error;
     }
@@ -8374,6 +8382,7 @@ impl Env {
             // returns. Cloning these fields performs no Lisp allocation; no
             // borrow of the snapshot survives an allocation or callback.
             let dynamic = unsafe { &*dynamic };
+            env.speculative_evaluation = dynamic.speculative_evaluation;
             env.handlers = dynamic.handlers.clone();
             env.restarts = dynamic.restarts.clone();
             env.condition_restarts = dynamic.condition_restarts.clone();
@@ -8432,6 +8441,7 @@ impl Env {
             tag_stack: Vec::new(),
             method_context: Vec::new(),
             eval_context: EvalContext::Repl,
+            speculative_evaluation: false,
             locally_specials: Vec::new(),
             active_declarations: Vec::new(),
         };
@@ -8730,6 +8740,7 @@ impl Env {
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
+            speculative_evaluation: self.speculative_evaluation,
             locally_specials: self.locally_specials.clone(),
             active_declarations: self.active_declarations.clone(),
         }
@@ -8763,6 +8774,7 @@ impl Env {
             tag_stack: self.tag_stack.clone(),
             method_context: self.method_context.clone(),
             eval_context: self.eval_context,
+            speculative_evaluation: self.speculative_evaluation,
             locally_specials: self.locally_specials.clone(),
             active_declarations: self.active_declarations.clone(),
         }
@@ -11555,6 +11567,23 @@ fn read_forms_for_compile(
     })
 }
 
+/// Best-effort seeding precedes actual compile-time execution. Raw probe
+/// failures remain ordinary Err results; actual evaluation signals normally.
+/// The mode travels with Env (and its children), including across fiber yields.
+fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Option<EgclVal> {
+    let previous = std::mem::replace(&mut env.speculative_evaluation, true);
+    match eval_form(form, env) {
+        Ok(value) => {
+            env.speculative_evaluation = previous;
+            Some(value)
+        }
+        Err(_) => {
+            env.speculative_evaluation = previous;
+            None
+        }
+    }
+}
+
 fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
     if !form.is_cons() {
         return;
@@ -11583,7 +11612,7 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                         // EGCL sent HTTP requests with no CRLF anywhere — one
                         // unparseable line that servers reject (bliss-2pmq).
                         if env.lookup_var_symbol(symbol).is_none() {
-                            if let Ok(value) = eval_form(cp(rest).0, env) {
+                            if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
                                 seed_compile_time_binding(env, symbol, value);
                             }
                         }
@@ -11616,7 +11645,7 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                         // be re-assigned later, but a seeded NIL is still visible
                         // to every compile-time form in between, and DEFCONSTANT
                         // makes it permanent (bliss-2pmq).
-                        if let Ok(value) = eval_form(cp(rest).0, env) {
+                        if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
                             seed_compile_time_binding(env, symbol, value);
                             if constant {
                                 mark_constant_name(symbol);
@@ -15733,115 +15762,118 @@ fn eval_diag_check(form: EgclVal, what: &str) {
 }
 
 fn eval_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    // The delivery proof excludes every reachable source-evaluation path.
-    // Keep a checked boundary for incompatible internal calls; constant folding
-    // removes the source dispatcher and its helpers from this native runtime.
-    if cfg!(egcl_no_tree_walker) {
-        return Err(EgclError::ProgramError(
-            "source evaluation is absent from this delivered runtime".into(),
-        ));
-    }
-    poison_trap(form, "eval_form entry");
-    eval_diag_check(form, "eval_form entry");
-    egcl_rt::rooted!(form = form);
-    let form = *form;
-    // Atoms, self-evaluating constants, and variable references each produce
-    // exactly ONE value, so evaluating one must reset the multiple-values
-    // register. Without this, when such an atom is the last form evaluated in a
-    // body (e.g. `(let ((y ...)) (g) y)` where `g` returned several values), the
-    // prior call's `set_mv` state persists and leaks into an enclosing
-    // MULTIPLE-VALUE-LIST / MULTIPLE-VALUE-BIND (bliss-i66o). Cons forms are left
-    // to eval_list, which sets the register for its own result. A symbol-macro
-    // whose expansion is multi-valued re-sets the register when the expansion is
-    // evaluated below, so clearing here first is harmless.
-    if !form.is_cons() {
-        env.clear_mv();
-    }
-    if form.is_nil() || form == T {
-        return Ok(form);
-    }
-    if form.is_fixnum() || form.is_single_float() || form.is_character() {
-        return Ok(form);
-    }
-    if form.is_heap_object() {
-        unsafe {
-            let hdr = *(form.as_ptr() as *const ObjectHeader);
-            if hdr.type_id() == type_id::SIMPLE_BASE_STRING
-                || hdr.type_id() == type_id::SIMPLE_CHARACTER_STRING
-            {
-                egcl_stdlib::register_string(form, &val_as_str(form));
-                return Ok(form);
-            }
+    (|| {
+        // The delivery proof excludes every reachable source-evaluation path.
+        // Keep a checked boundary for incompatible internal calls; constant folding
+        // removes the source dispatcher and its helpers from this native runtime.
+        if cfg!(egcl_no_tree_walker) {
+            return Err(EgclError::ProgramError(
+                "source evaluation is absent from this delivered runtime".into(),
+            ));
         }
-    }
-    if form.is_symbol() {
-        if let Some(expansion) = env.lookup_symbol_macro(form) {
-            if expansion == form {
-                return Err(EgclError::Internal(format!(
-                    "circular symbol macro expansion for {}",
-                    sym_name(form)
-                )));
-            }
-            return eval_form(expansion, env);
-        }
-        if let Some(val) = env.lookup_var_symbol(form) {
-            return Ok(val);
-        }
-        let name = sym_name(form);
-        // Keyword symbols are self-evaluating
-        if name.starts_with("KEYWORD:") {
-            return Ok(form);
-        }
-        // Check variable environment
-        if let Some(val) = env.lookup_var(&name) {
-            return Ok(val);
-        }
-        if std::env::var_os("EGCL_UNBOUND_DBG").is_some() {
-            eprintln!(
-                ";; unbound {name:?} idx={} key={:?}",
-                form.as_symbol_index(),
-                egcl_rt::symbols::registry_key(form.as_symbol_index())
-            );
-        }
-        return Err(EgclError::UnboundVariable(form));
-    }
-    if form.is_cons() {
-        // Multiple values propagate only out of value-transparent forms (control
-        // and binding special forms, and function calls) and genuine multiple-value
-        // producers. Every other compound form is a single-value context: after it
-        // computes its result, any extra values left in `env.mv` by a nested
-        // producer (e.g. the second value of a GETHASH evaluated as an argument)
-        // must be discarded so an enclosing multiple-value consumer does not see
-        // them leak through. See bliss-2pt.12.
-        let preserve = {
-            let (car, _) = cp(form);
-            if car.is_symbol() {
-                // An UNINTERNED operator (a gensym with an installed function cell)
-                // is a function call, so it propagates its callee's values — but its
-                // name is not fbound by-name, so `mv_form_preserves_values` misses
-                // it and would truncate them (symbol-function.1). Detect it by index.
-                let uninterned_fn = car
-                    .symbol_index()
-                    .filter(|idx| reader::is_uninterned(*idx))
-                    .and_then(egcl_rt::symbols::symbol_function)
-                    .is_some_and(egcl_rt::function::is_interpreted_function);
-                uninterned_fn
-                    || setf_stores_into_values_place(form)
-                    || mv_form_preserves_values(&sym_name_rc(car), env)
-            } else {
-                // Lambda application `((lambda ...) ...)` — dispatches through
-                // eval_lambda_call, which sets mv from the body's tail form.
-                true
-            }
-        };
-
-        let result = eval_list(form, env)?;
-        if !preserve {
+        poison_trap(form, "eval_form entry");
+        eval_diag_check(form, "eval_form entry");
+        egcl_rt::rooted!(form = form);
+        let form = *form;
+        // Atoms, self-evaluating constants, and variable references each produce
+        // exactly ONE value, so evaluating one must reset the multiple-values
+        // register. Without this, when such an atom is the last form evaluated in a
+        // body (e.g. `(let ((y ...)) (g) y)` where `g` returned several values), the
+        // prior call's `set_mv` state persists and leaks into an enclosing
+        // MULTIPLE-VALUE-LIST / MULTIPLE-VALUE-BIND (bliss-i66o). Cons forms are left
+        // to eval_list, which sets the register for its own result. A symbol-macro
+        // whose expansion is multi-valued re-sets the register when the expansion is
+        // evaluated below, so clearing here first is harmless.
+        if !form.is_cons() {
             env.clear_mv();
         }
-        return Ok(result);
-    }
-    Ok(form)
+        if form.is_nil() || form == T {
+            return Ok(form);
+        }
+        if form.is_fixnum() || form.is_single_float() || form.is_character() {
+            return Ok(form);
+        }
+        if form.is_heap_object() {
+            unsafe {
+                let hdr = *(form.as_ptr() as *const ObjectHeader);
+                if hdr.type_id() == type_id::SIMPLE_BASE_STRING
+                    || hdr.type_id() == type_id::SIMPLE_CHARACTER_STRING
+                {
+                    egcl_stdlib::register_string(form, &val_as_str(form));
+                    return Ok(form);
+                }
+            }
+        }
+        if form.is_symbol() {
+            if let Some(expansion) = env.lookup_symbol_macro(form) {
+                if expansion == form {
+                    return Err(EgclError::Internal(format!(
+                        "circular symbol macro expansion for {}",
+                        sym_name(form)
+                    )));
+                }
+                return eval_form(expansion, env);
+            }
+            if let Some(val) = env.lookup_var_symbol(form) {
+                return Ok(val);
+            }
+            let name = sym_name(form);
+            // Keyword symbols are self-evaluating
+            if name.starts_with("KEYWORD:") {
+                return Ok(form);
+            }
+            // Check variable environment
+            if let Some(val) = env.lookup_var(&name) {
+                return Ok(val);
+            }
+            if std::env::var_os("EGCL_UNBOUND_DBG").is_some() {
+                eprintln!(
+                    ";; unbound {name:?} idx={} key={:?}",
+                    form.as_symbol_index(),
+                    egcl_rt::symbols::registry_key(form.as_symbol_index())
+                );
+            }
+            return Err(EgclError::UnboundVariable(form));
+        }
+        if form.is_cons() {
+            // Multiple values propagate only out of value-transparent forms (control
+            // and binding special forms, and function calls) and genuine multiple-value
+            // producers. Every other compound form is a single-value context: after it
+            // computes its result, any extra values left in `env.mv` by a nested
+            // producer (e.g. the second value of a GETHASH evaluated as an argument)
+            // must be discarded so an enclosing multiple-value consumer does not see
+            // them leak through. See bliss-2pt.12.
+            let preserve = {
+                let (car, _) = cp(form);
+                if car.is_symbol() {
+                    // An UNINTERNED operator (a gensym with an installed function cell)
+                    // is a function call, so it propagates its callee's values — but its
+                    // name is not fbound by-name, so `mv_form_preserves_values` misses
+                    // it and would truncate them (symbol-function.1). Detect it by index.
+                    let uninterned_fn = car
+                        .symbol_index()
+                        .filter(|idx| reader::is_uninterned(*idx))
+                        .and_then(egcl_rt::symbols::symbol_function)
+                        .is_some_and(egcl_rt::function::is_interpreted_function);
+                    uninterned_fn
+                        || setf_stores_into_values_place(form)
+                        || mv_form_preserves_values(&sym_name_rc(car), env)
+                } else {
+                    // Lambda application `((lambda ...) ...)` — dispatches through
+                    // eval_lambda_call, which sets mv from the body's tail form.
+                    true
+                }
+            };
+
+            let result = eval_list(form, env)?;
+            if !preserve {
+                env.clear_mv();
+            }
+            return Ok(result);
+        }
+        Ok(form)
+    })()
+    .map_err(|error| signal_raw_error_in_context(env, error))
 }
 
 /// Whether a compound form headed by `name` propagates multiple values (either
@@ -23417,7 +23449,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
-                                let _ = eval_form(vform, env);
+                                eval_form(vform, env)?;
                                 key = kr2;
                             }
                         }
@@ -23469,7 +23501,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
-                                let _ = eval_form(vform, env);
+                                eval_form(vform, env)?;
                                 key = kr2;
                             }
                         }
@@ -29319,14 +29351,15 @@ fn eval_let(cdr: EgclVal, env: &mut Env, sequential: bool) -> Result<EgclVal, Eg
 ///
 /// A leading string is a docstring only when the body has something after it;
 /// `(defun f () "text")` returns that string instead.
-fn record_function_documentation(name: EgclVal, body: EgclVal, env: &mut Env) {
+fn record_function_documentation(name: EgclVal, body: EgclVal, env: &mut Env) -> Result<(), EgclError> {
     if !name.is_symbol() || !body.is_cons() {
-        return;
+        return Ok(());
     }
     let (first, rest) = cp(body);
     if !rest.is_cons() || !is_string_value(first) {
-        return;
+        return Ok(());
     }
+    egcl_rt::rooted!(doc = first);
     // boot.lisp defines functions of its own before the documentation table
     // exists; until then there is nowhere to record one.
     let (Some(setter), Some(quote), Some(kind)) = (
@@ -29334,20 +29367,20 @@ fn record_function_documentation(name: EgclVal, body: EgclVal, env: &mut Env) {
         resolve_sym("QUOTE"),
         resolve_sym("FUNCTION"),
     ) else {
-        return;
+        return Ok(());
     };
     if !fn_bound(env, &sym_name(setter)) {
-        return;
+        return Ok(());
     }
-    egcl_rt::rooted!(doc = first);
     egcl_rt::rooted!(quoted_name = quote_form(quote, name));
     egcl_rt::rooted!(quoted_kind = quote_form(quote, kind));
     egcl_rt::rooted!(args = arena_cons(*doc, NIL));
     *args = arena_cons(*quoted_kind, *args);
     *args = arena_cons(*quoted_name, *args);
     egcl_rt::rooted!(call = arena_cons(setter, *args));
-    // A failure here must not fail the definition: the docstring is metadata.
-    let _ = eval_form(*call, env);
+    // The setter is Lisp code: preserve conditions and handler-requested exits.
+    eval_form(*call, env)?;
+    Ok(())
 }
 
 /// `(quote value)` as a fresh rooted form.
@@ -29385,7 +29418,7 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
     }
     // Record the docstring before the wrap below replaces `body`.
-    record_function_documentation(name_form, body, env);
+    record_function_documentation(name_form, body, env)?;
     // A defun body is wrapped in an implicit block named after the function
     // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
     // body — including inside nested flet/loop/etypecase forms. For `(setf x)`
@@ -30796,7 +30829,7 @@ fn eval_defmacro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         },
     );
     // CFFI's DEFCFUN defines a variadic binding as a macro, docstring and all.
-    record_function_documentation(name_form, body, env);
+    record_function_documentation(name_form, body, env)?;
     Ok(name_form)
 }
 
@@ -31602,6 +31635,7 @@ fn invoke_compiler_macro_function(
     let mut env = Env::new_for_macro_expansion(caller.sandbox);
     egcl_rt::rooted_ref!(_env_root = &mut env);
     env.eval_context = caller.eval_context;
+    env.speculative_evaluation = caller.speculative_evaluation;
     env.current_package = package;
     env.define_local("*PACKAGE*", *package_value);
     egcl_rt::symbols::set_symbol_value(package_symbol.as_symbol_index(), *package_value);
@@ -34188,17 +34222,18 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     // as a (slot-symbol value) pair so the ordinary initarg path binds it. This
     // covers both instance- and class-allocated slots (e.g. ASDF's operation
     // classes default a :allocation :class selfward-operation slot, bliss-x4p).
-    let defaults = effective_default_initargs(env, &class_name);
-    if !defaults.is_empty() {
-        // The eval_form calls below (supplied-initarg detection + each default's
-        // value form) allocate and can trigger a relocating minor GC, so every
+    let (default_names, default_forms): (Vec<_>, Vec<_>) =
+        effective_default_initargs(env, &class_name).into_iter().unzip();
+    egcl_rt::rooted!(default_forms = default_forms);
+    if !default_names.is_empty() {
+        // Each default's value form can trigger a relocating minor GC, so every
         // already-evaluated initarg AND each new value must be rooted across
         // them — otherwise a nursery value moves and the bare Vec copy goes
-        // stale (bliss-6b2). Mirror evaluated_initargs' ShadowRoot discipline.
+        // stale (bliss-6b2).
         egcl_rt::rooted!(rooted = initargs.clone());
-        let supplied: std::collections::HashSet<String> = list_to_vec(init_args)
+        let supplied: std::collections::HashSet<String> = supplied_initargs
             .chunks_exact(2)
-            .filter_map(|pair| eval_form(pair[0], env).ok())
+            .map(|pair| pair[0])
             .filter(|k| k.is_symbol())
             .map(|k| {
                 sym_bare_name_rc(k)
@@ -34207,7 +34242,8 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     .to_string()
             })
             .collect();
-        for (initarg, form) in defaults {
+        for (index, initarg) in default_names.into_iter().enumerate() {
+            egcl_rt::rooted!(form = default_forms[index]);
             if supplied.contains(&initarg) {
                 continue;
             }
@@ -34215,7 +34251,7 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
             // resolve_slot_symbol interns (allocates); root the slot symbol
             // before the value form's eval_form can GC.
             egcl_rt::rooted!(slot_root = resolve_slot_symbol(&class_name, *initarg_kw_root, env)?);
-            let value = eval_form(form, env)?;
+            let value = eval_form(*form, env)?;
             rooted.push(*slot_root);
             rooted.push(value);
             // A default-initarg reaches the protocol under its own name too.
@@ -41584,5 +41620,83 @@ mod error_backtrace_rooting_tests {
         report_error_with_backtrace(&mut error, &mut env);
         assert_ne!(env.mv[0], original, "the Env-held value must actually move");
         assert_eq!(env.mv[0].as_double_float(), 79.0);
+    }
+}
+
+#[cfg(test)]
+mod evaluator_error_boundary_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn documentation_setter_keeps_a_relocated_docstring() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        read_eval_all_env(
+            "(defun egcl-internal::%set-documentation (name kind doc)
+               (%force-minor-gc-for-test) (setq *recorded-doc* doc))",
+            &mut env,
+        )
+        .unwrap();
+        let name = resolve_sym("DOCUMENTED-PROBE").unwrap();
+        egcl_rt::rooted!(tail = arena_cons(EgclVal::from_fixnum(1), NIL));
+        egcl_rt::rooted!(body = arena_cons(NIL, *tail));
+        // Allocate the observed value last: stress must not promote it while
+        // constructing the fixture, before documentation recording begins.
+        egcl_rt::rooted!(doc = arena_str("relocating documentation"));
+        store_cons_field(*body, *doc, true).unwrap();
+        let before = doc.to_raw();
+        record_function_documentation(name, *body, &mut env).unwrap();
+        assert_ne!(
+            doc.to_raw(),
+            before,
+            "documentation recording must really relocate its argument"
+        );
+        assert_eq!(env.lookup_var("*RECORDED-DOC*").unwrap(), *doc);
+        assert_eq!(val_as_str(*doc), "relocating documentation");
+    }
+
+    #[test]
+    fn later_default_initarg_forms_survive_an_earlier_collecting_default() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        read_eval_all_env(
+            "(defclass root-default-probe () ((a :initarg :a) (b :initarg :b)))",
+            &mut env,
+        )
+        .unwrap();
+        let class_name = sym_name(resolve_sym("ROOT-DEFAULT-PROBE").unwrap());
+        let a = resolve_sym("A").unwrap();
+        let b = resolve_sym("B").unwrap();
+        egcl_rt::rooted!(
+            call = reader::read_from_string("(make-instance 'root-default-probe)")
+                .unwrap()
+                .0
+        );
+        egcl_rt::rooted!(
+            first = reader::read_from_string("(progn (%force-minor-gc-for-test) 41)")
+                .unwrap()
+                .0
+        );
+        egcl_rt::rooted!(second = reader::read_from_string("(list 42)").unwrap().0);
+        env.classes
+            .borrow_mut()
+            .get_mut(&class_name)
+            .unwrap()
+            .default_initargs = vec![("A".into(), *first), ("B".into(), *second)];
+        let before = second.to_raw();
+        egcl_rt::rooted!(instance = eval_form(*call, &mut env).unwrap());
+        assert_ne!(
+            second.to_raw(),
+            before,
+            "a pending default form must actually move"
+        );
+        assert_eq!(
+            read_slot_value(*instance, a, &env).unwrap(),
+            EgclVal::from_fixnum(41)
+        );
+        let value = read_slot_value(*instance, b, &env).unwrap();
+        assert_eq!(cp(value), (EgclVal::from_fixnum(42), NIL));
     }
 }

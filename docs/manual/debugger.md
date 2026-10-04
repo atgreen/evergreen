@@ -32,6 +32,12 @@ debugger command loop. Piped input and batch runs do not wait indefinitely for
 debugger input. An unhandled batch error instead produces an unsuccessful
 process exit.
 
+Interpreted primitive failures, such as an unbound variable or `(car 42)`,
+signal while the failing activation is still present. `HANDLER-BIND` handlers
+see the live dynamic bindings and restarts before `UNWIND-PROTECT` cleanup;
+unhandled conditions retain an owned snapshot for the batch report. Native
+helper failures do not yet all preserve the innermost compiled frame.
+
 The debugger displays frames and available restarts. Frame detail depends on
 the execution path and retained metadata. Optimized native code, runtime bridges,
 and foreign frames do not necessarily preserve every source local. Do not
