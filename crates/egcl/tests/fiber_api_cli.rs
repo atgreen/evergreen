@@ -21,6 +21,10 @@
 use std::process::Command;
 
 fn run(program: &str) {
+    run_expect(program, &[]);
+}
+
+fn run_expect(program: &str, expected: &[&str]) {
     for backend in ["tree-walker", "bytecode"] {
         let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
             .args(["--no-init", "--eval", program])
@@ -34,6 +38,12 @@ fn run(program: &str) {
             stdout.contains("FIBER-API-OK"),
             "{backend}: {stdout}\n{stderr}"
         );
+        for fragment in expected {
+            assert!(
+                stdout.contains(fragment),
+                "{backend}: missing {fragment:?}: {stdout}\n{stderr}"
+            );
+        }
     }
 }
 
@@ -222,11 +232,15 @@ fn submission_zero_values_and_closed_groups() {
 
 #[test]
 fn backtrace_of_suspended_fiber_and_self_join() {
-    run(r##"
-      (defun fiber-trace-leaf (lock)
+    run_expect(
+        r##"
+      (defvar *trace-ready* nil)
+      (defun fiber-trace-leaf (value lock)
+        (setq *trace-ready* t)
         (egcl-thread:with-mutex (lock) nil)
+        (assert (= value 42))
         :done)
-      (defun fiber-trace-middle (lock) (fiber-trace-leaf lock))
+      (defun fiber-trace-middle (value lock) (fiber-trace-leaf (+ value 1) lock))
       (let* ((semaphore (egcl-thread:make-mutex))
              (locked (egcl-thread:grab-mutex semaphore))
              (fiber (egcl-fiber:make-fiber
@@ -235,32 +249,95 @@ fn backtrace_of_suspended_fiber_and_self_join() {
                                   (progn (egcl-fiber:fiber-join (egcl-fiber:current-fiber)) nil)
                                   (error () t)))
                         (assert (null (egcl-fiber:fiber-result (egcl-fiber:current-fiber))))
-                        (fiber-trace-middle semaphore)) :name "suspended"))
+                        (fiber-trace-middle 41 semaphore)) :name "suspended"))
              (group (egcl-fiber:start-fibers (list fiber) :carrier-count 1)))
-        (loop until (eq :suspended (egcl-fiber:fiber-state fiber)) do
-          (when (eq :dead (egcl-fiber:fiber-state fiber)) (egcl-fiber:fiber-join fiber)
-            (error "Fiber exited before it could be inspected"))
-          (sleep 0.001))
-        ;; :SUSPENDED may describe a preemption before the mutex wait, and the
-        ;; carrier may still be unmounting. Retry the documented snapshot race.
-        (let ((deadline (+ (get-internal-real-time)
-                           (* 10 internal-time-units-per-second))))
-          (loop
-            (assert (< (get-internal-real-time) deadline))
-            (let* ((stream (make-string-output-stream))
-                   (text (handler-case
-                           (progn
-                             (egcl-fiber:print-fiber-backtrace fiber :stream stream)
-                             (get-output-stream-string stream))
-                           (egcl-fiber:fiber-still-running () nil))))
-              (when (and text (search "FIBER-TRACE-LEAF" text)
-                              (search "FIBER-TRACE-MIDDLE" text))
-                (return)))
-            (sleep 0.001)))
-        (egcl-thread:release-mutex semaphore)
+        ;; Full allocation stress measured 30.5s to enter the leaf and 43s
+        ;; to print it. Keep the normal budget; check output in the host so
+        ;; the assertions themselves do not force collections while SEARCHing.
+        (unwind-protect
+            (let ((deadline (+ (get-internal-real-time)
+                               (* (if (egcl-ext:getenv "EGCL_GC_STRESS") 120 10)
+                                  internal-time-units-per-second))))
+              (loop
+                (assert (< (get-internal-real-time) deadline))
+                (when (eq :dead (egcl-fiber:fiber-state fiber))
+                  (egcl-fiber:fiber-join fiber)
+                  (error "Fiber exited before it could be inspected"))
+                (when *trace-ready*
+                  (let* ((stream (make-string-output-stream))
+                         (text (handler-case
+                                 (progn
+                                   (egcl-fiber:print-fiber-backtrace fiber :stream stream)
+                                   (get-output-stream-string stream))
+                                 (egcl-fiber:fiber-still-running () nil))))
+                    (when text (format t "~A" text) (return))))
+                (sleep 0.001)))
+          (egcl-thread:release-mutex semaphore))
         (assert (equal '(:done) (egcl-fiber:finish-fibers group))))
       (format t "FIBER-API-OK~%")
-    "##);
+    "##,
+        &["FIBER-TRACE-LEAF 42 ", "FIBER-TRACE-MIDDLE 41 "],
+    );
+}
+
+#[test]
+fn backtrace_arguments_use_bounded_standard_printer() {
+    run_expect(
+        r##"
+      (defclass trace-payload () ((value :initarg :value :reader trace-value)))
+      (defmethod print-object ((object trace-payload) stream)
+        ;; Allocate while printing: the remaining snapshot arguments must stay
+        ;; rooted even if PRINT-OBJECT runs Lisp and triggers a collection.
+        (let ((scratch (make-list 20 :initial-element 1)))
+          (format stream "#<TRACE-PAYLOAD ~D>" (+ (trace-value object) (length scratch)))))
+      (defvar *trace-release* nil)
+      (defvar *trace-ready* nil)
+      (defun argument-trace-leaf (object circular text nil-value long-list)
+        (setq *trace-ready* t)
+        (loop until *trace-release* do (egcl-fiber:fiber-sleep 0.005))
+        (assert (= (trace-value object) 79))
+        (assert (eq circular (cdr circular)))
+        (assert (string= text "hello"))
+        (assert (null nil-value))
+        (assert (= (length long-list) 20))
+        :done)
+      (let* ((circular (list :head))
+             (fiber (egcl-fiber:make-fiber
+                      (lambda ()
+                        (argument-trace-leaf (make-instance 'trace-payload :value 79)
+                                             circular (copy-seq "hello") nil
+                                             (make-list 20 :initial-element 7)))))
+             (ignored (setf (cdr circular) circular))
+             (group (egcl-fiber:start-fibers (list fiber) :carrier-count 1)))
+        ;; Use the same measured full-stress budget as the mutex trace above.
+        (unwind-protect
+            (let ((deadline (+ (get-internal-real-time)
+                               (* (if (egcl-ext:getenv "EGCL_GC_STRESS") 120 10)
+                              internal-time-units-per-second))))
+              (loop
+                (assert (< (get-internal-real-time) deadline))
+                (when *trace-ready*
+                  (let* ((stream (make-string-output-stream))
+                         (text (handler-case
+                                 (progn
+                                   (egcl-fiber:print-fiber-backtrace fiber :stream stream)
+                                   (get-output-stream-string stream))
+                                 (egcl-fiber:fiber-still-running () nil))))
+                    (when text (format t "~A" text) (return))))
+                (sleep 0.001)))
+          (setf *trace-release* t)
+          (assert (equal '(:done) (egcl-fiber:finish-fibers group)))))
+      (format t "FIBER-API-OK~%")
+    "##,
+        &[
+            "ARGUMENT-TRACE-LEAF",
+            "#<TRACE-PAYLOAD 99>",
+            "#1=",
+            "#1#",
+            "\"hello\" NIL",
+            "(7 7 7 7 7 7 ...)",
+        ],
+    );
 }
 
 #[test]

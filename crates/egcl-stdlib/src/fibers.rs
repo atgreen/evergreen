@@ -189,17 +189,19 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 ));
             };
             let fiber_id = FiberId(id(*number)?);
-            let frames = match thread::fiber_backtrace(fiber_id, count) {
+            let frames = match egcl_rt::debug_stack::capture_fiber(fiber_id, count) {
                 Ok(frames) => frames,
                 Err(_) if thread::fiber_state(fiber_id).is_none() => Some(Vec::new()),
                 Err(error) => return Err(error),
             };
-            let Some(names) = frames else {
+            let Some(frames) = frames else {
                 return Ok(NIL);
             };
+            egcl_rt::rooted!(frames = frames);
             egcl_rt::rooted!(values = Vec::<EgclVal>::new());
-            for name in names {
-                values.push(crate::streams::make_lisp_string(&name));
+            for index in 0..frames.len() {
+                let text = crate::devtools::format_logical_frame(&frames[index])?;
+                values.push(crate::streams::make_lisp_string(&text));
             }
             Ok(crate::sequences::build_simple_vector(&values))
         }

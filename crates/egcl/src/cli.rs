@@ -9208,7 +9208,7 @@ fn eval_named_call_ex(
     // Lisp-aware statistical profiler (bliss-sc4t): this is the tree-walked call
     // path — record the Lisp frame so a sampled stack shows the function, not the
     // interpreter. The guard pops on every exit (return, `?`, non-local).
-    let _fiber_frame = egcl_rt::thread::FiberCallFrame::enter(name);
+    let _fiber_frame = egcl_rt::thread::FiberCallFrame::enter_with_args(name, args);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
     // Take the FLET function's captured scope (a shared handle, so this is a
@@ -17293,7 +17293,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 let args = eval_args(cdr, env)?;
                 env.clear_mv();
-                return egcl_stdlib::fibers::call(&args);
+                return apply_builtin(&name, &args, env);
             }
             "EGCL::%POSIX" | "EGCL::%TEXT-CODEC" | "EGCL::%MEMORY-FENCE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FOREIGN-MEMORY" => {
@@ -36304,7 +36304,12 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
                     "fiber runtime access denied".into(),
                 ));
             }
-            egcl_stdlib::fibers::call(args)
+            // Backtrace arguments use the standard printer, including Lisp
+            // PRINT-OBJECT methods. Both evaluator paths dispatch here.
+            let prev_env = PRINT_ENV.with(|c| c.replace(_env as *mut Env));
+            let result = egcl_stdlib::fibers::call(args);
+            PRINT_ENV.with(|c| c.set(prev_env));
+            result
         }
         // CL:DISASSEMBLE — show the function's current tier: annotated bytecode
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).

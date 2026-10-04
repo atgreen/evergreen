@@ -593,6 +593,38 @@ pub fn repl_loop(state: &mut ReplState) -> Result<(), EgclError> {
 
 // ── Debugger ───────────────────────────────────────────────────────
 
+/// Render an owned logical call using the standard Lisp printer. The caller's
+/// print settings control argument detail; no execution/stack lock is held
+/// while printing, which may allocate or invoke a user PRINT-OBJECT method.
+pub fn format_logical_frame(
+    frame: &egcl_rt::debug_stack::LogicalFrame,
+) -> Result<String, EgclError> {
+    egcl_rt::rooted!(frame = frame.clone());
+    let mut text = format!(
+        "({}",
+        frame.function.as_deref()
+            .map(|name| crate::format::print_qualified_symbol_name(name, true))
+            .unwrap_or_else(|| "<anonymous function>".into())
+    );
+    if let Some(arguments) = &frame.arguments {
+        let count = arguments.len();
+        let shown = crate::format::print_length().unwrap_or(count).min(count);
+        for index in 0..shown {
+            let value = frame.arguments.as_ref().unwrap()[index];
+            let printed = crate::format::format(NIL, "~S", &[value])?;
+            text.push(' ');
+            text.push_str(&printed.as_string());
+        }
+        if shown < count {
+            text.push_str(" ...");
+        }
+    } else {
+        text.push_str(" <arguments unavailable>");
+    }
+    text.push(')');
+    Ok(text)
+}
+
 /// Debug frame — runtime representation of a single stack frame. D6.02.
 pub struct DebugFrame {
     func: EgclVal,

@@ -5,6 +5,7 @@
 //!
 //! See §2.3 of the spec.
 
+use crate::debug_stack::{FrameOrigin, LogicalFrame, RecordedCall};
 use crate::error::EgclError;
 use crate::gc::{TraceHostRoots, register_root_scanner};
 use crate::lock_order::{LockLevel, OrderedMutex};
@@ -637,7 +638,7 @@ pub struct NativeThread {
     state: AtomicU8,
     stack: EgclStack,
     tls: OrderedMutex<Vec<EgclVal>>,
-    lisp_frames: Mutex<Vec<(usize, String)>>,
+    lisp_frames: Mutex<Vec<RecordedCall>>,
     condition_state: OrderedMutex<ThreadConditionState>,
     result: Arc<ThreadResult>,
     join_handle: OrderedMutex<Option<std::thread::JoinHandle<()>>>,
@@ -870,6 +871,7 @@ impl NativeThread {
 
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut EgclVal)) {
         trace_atomic_egcl_val(&self.entry, visit);
+        self.lisp_frames.lock().unwrap().trace_host_roots(visit);
         self.tls.lock().unwrap().trace_host_roots(visit);
         self.condition_state.lock().unwrap().trace_host_roots(visit);
         self.interrupt_value.lock().unwrap().trace_host_roots(visit);
@@ -1218,7 +1220,7 @@ pub struct Fiber {
     /// The CL function (entry point) this fiber was created to execute.
     entry: AtomicU64,
     state: OrderedMutex<FiberState>,
-    lisp_frames: Mutex<Vec<(usize, String)>>,
+    lisp_frames: Mutex<Vec<RecordedCall>>,
     // Unregister roots before either stack is destroyed (field drop order).
     host_roots: crate::gc::FiberRoots,
     native_faults: crate::runtime::FiberFaultState,
@@ -1549,6 +1551,7 @@ impl Fiber {
 
     fn trace_execution_roots(&self, visit: &mut dyn FnMut(*mut EgclVal)) {
         trace_atomic_egcl_val(&self.entry, visit);
+        self.lisp_frames.lock().unwrap().trace_host_roots(visit);
         self.tls.lock().unwrap().trace_host_roots(visit);
         self.dynamic_bindings
             .lock()
@@ -2823,7 +2826,7 @@ enum CallFrameOwner {
 }
 
 impl CallFrameOwner {
-    fn frames(&self) -> &Mutex<Vec<(usize, String)>> {
+    fn frames(&self) -> &Mutex<Vec<RecordedCall>> {
         match self {
             Self::Fiber(fiber) => &fiber.lisp_frames,
             Self::Native(thread) => &thread.lisp_frames,
@@ -2831,7 +2834,7 @@ impl CallFrameOwner {
     }
 }
 
-/// A tree-walker frame recorded without retaining movable Lisp objects.
+/// An interpreter call whose arguments are traced with its execution's roots.
 /// The owner follows a fiber across carrier migration. Native calls belong to
 /// their native execution, and are not inherited by fibers mounted there.
 pub struct FiberCallFrame {
@@ -2842,15 +2845,39 @@ pub struct FiberCallFrame {
 }
 impl FiberCallFrame {
     pub fn enter(name: &str) -> Self {
+        Self::enter_recorded(name, None, FrameOrigin::Interpreted)
+    }
+
+    pub fn enter_with_args(name: &str, arguments: &[EgclVal]) -> Self {
+        Self::enter_recorded(name, Some(arguments.to_vec()), FrameOrigin::Interpreted)
+    }
+
+    /// Record original arguments for the current, already-pushed managed call
+    /// frame. The guard must be dropped when that activation leaves the stack.
+    /// This augments the physical frame rather than adding a second Lisp call.
+    pub fn enter_managed(name: &str, arguments: &[EgclVal]) -> Self {
+        Self::enter_recorded(name, Some(arguments.to_vec()), FrameOrigin::Managed)
+    }
+
+    fn enter_recorded(name: &str, arguments: Option<Vec<EgclVal>>, origin: FrameOrigin) -> Self {
+        // First-time native-thread registration may poll a safepoint. Root the
+        // copy before acquiring the owner; never hold its frame lock over GC.
+        crate::rooted!(arguments = arguments);
         let owner = match current_fiber_id() {
             Some(id) => CallFrameOwner::Fiber(lookup_fiber(id).expect("mounted fiber is registered")),
             None => CallFrameOwner::Native(ensure_current_native_thread()),
         };
-        owner
-            .frames()
-            .lock()
-            .unwrap()
-            .push((current_stack().fp() as usize, name.to_owned()));
+        let anchor = current_stack().fp() as usize;
+        // No Lisp allocation or safepoint occurs while moving the rooted
+        // arguments into their execution-owned record.
+        owner.frames().lock().unwrap().push(RecordedCall {
+            anchor,
+            frame: LogicalFrame {
+                function: Some(name.to_owned()),
+                origin,
+                arguments: arguments.take(),
+            },
+        });
         Self {
             owner,
             _execution_affine: std::marker::PhantomData,
@@ -2866,7 +2893,7 @@ impl Drop for FiberCallFrame {
 pub(crate) fn current_backtrace(count: usize) -> Vec<crate::debug_stack::LogicalFrame> {
     let mut snapshot = crate::debug_stack::PendingBacktrace::default();
     crate::rooted_ref!(_snapshot = &mut snapshot);
-    snapshot.interpreted = if let Some(fiber) = current_fiber() {
+    snapshot.recorded = if let Some(fiber) = current_fiber() {
         fiber.lisp_frames.lock().unwrap().clone()
     } else {
         current_thread().lisp_frames.lock().unwrap().clone()
@@ -2890,7 +2917,7 @@ pub(crate) fn fiber_logical_backtrace(
         if fiber.mounted.load(Ordering::Acquire) || *state == FiberState::Running {
             return Ok(None);
         }
-        snapshot.interpreted = fiber.lisp_frames.lock().unwrap().clone();
+        snapshot.recorded = fiber.lisp_frames.lock().unwrap().clone();
         // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
         unsafe { snapshot.copy_stack(fiber.stack.published_fp(), count) };
         if *state == FiberState::Created && count != 0 {

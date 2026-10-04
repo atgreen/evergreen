@@ -662,6 +662,7 @@ impl TransferCode {
                 dynamic_scopes.clear();
                 let mut acts = vec![Activation {
                     frame,
+                    _debug_call: None,
                     func: self.body.clone(),
                     bcp: saved.resume_pc as usize,
                     sp_top: saved.stack.len() as u16,

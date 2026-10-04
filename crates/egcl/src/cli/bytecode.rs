@@ -14155,6 +14155,9 @@ impl egcl_rt::gc::TraceHostRoots for CleanupCont {
 /// in-frame for precise GC).
 struct Activation {
     frame: *mut Frame,
+    /// Original call arguments, rooted by the execution's logical stack. A
+    /// deopt reconstruction without original entry arguments leaves this None.
+    _debug_call: Option<egcl_rt::debug_stack::CallFrame>,
     func: Arc<BytecodeFunction>,
     bcp: usize,
     sp_top: u16,
@@ -14651,6 +14654,7 @@ fn run_with_binding(
     // closure with its own boxed locals gets a fresh child of the captured
     // frame; one that only reads the enclosing scope uses the captured frame
     // directly.
+    let debug_call = egcl_rt::debug_stack::CallFrame::enter_managed(&entry.name, &args);
     let closure_env = closure_captured_env(entry_fn_val);
     let parent = closure_env
         .clone()
@@ -14685,6 +14689,7 @@ fn run_with_binding(
     let entry_obj = Some(entry_fn_val).filter(|&v| egcl_rt::function::is_interpreted_function(v));
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
+        _debug_call: Some(debug_call),
         n_locals: entry.n_locals,
         env_frame,
         func: entry,
@@ -15340,6 +15345,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // A named DEFUN can close over a surrounding LET just
                         // like an anonymous closure. Match run_with_binding and
                         // run_native instead of borrowing the caller's scope.
+                        let debug_call = egcl_rt::debug_stack::CallFrame::enter_managed(&callee.name, args);
                         let captured = closure_envs().borrow().get(&sym).cloned();
                         let parent = captured.clone()
                             .unwrap_or_else(|| Arc::clone(&env.frame));
@@ -15349,6 +15355,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                                 bind_variadic(&callee, frame, args, env_frame.as_ref(), env)
                             {
                                 stack.pop_frame();
+                                drop(debug_call);
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
                                 continue;
                             }
@@ -15358,6 +15365,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         record_profiled_invocation(Arc::as_ptr(&callee) as usize);
                         acts.push(Activation {
                             frame,
+                            _debug_call: Some(debug_call),
                             n_locals: callee.n_locals,
                             env_frame,
                             func: callee,
@@ -19751,6 +19759,7 @@ fn resume_in_t0(
     let n_locals = entry.n_locals;
     let mut acts: Vec<Activation> = vec![Activation {
         frame,
+        _debug_call: None,
         n_locals,
         env_frame,
         func: entry,
@@ -19861,6 +19870,7 @@ fn resume_inlined_in_t0(
             .filter(|&v| egcl_rt::function::is_interpreted_function(v));
         acts.push(Activation {
             frame: scope.frame,
+            _debug_call: None,
             n_locals: entry.n_locals,
             env_frame: None,
             func: entry,
