@@ -37,6 +37,8 @@ PACKAGES_BY_ARCH = {
                'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
                'egcl-target-ppc64le-linux-static'},
     'ppc64le': {'egcl', 'egcl-static'},
+    's390x': {'egcl', 'egcl-static'},
+    'aarch64': {'egcl', 'egcl-static'},
 }
 PACKAGES = set().union(*PACKAGES_BY_ARCH.values())
 PACKAGE_COUNT = sum(len(names) for names in PACKAGES_BY_ARCH.values())

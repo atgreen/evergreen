@@ -133,6 +133,17 @@ jobs:
           # the `ppc64le` cross job, which dumps and verifies under qemu today.
           - { name: ppc64le-native, group: native, arch: ppc64le,
               platform: linux/ppc64le, timeout: 300 }
+          # The same arrangement for the other two ExclusiveArch hosts. s390x is
+          # the one to watch: it is big-endian, so it exercises code paths the
+          # little-endian hosts never do (bliss-99s56 is an image-restore test
+          # that fails there), and `aarch64` here means NATIVE arm64 packages,
+          # not the x86_64-hosted egcl-target-aarch64-linux cross set above.
+          # linux/arm64 is the OCI spelling; the uname/rpm arch stays aarch64,
+          # which is what the binfmt handler and rpm's RPMS/<arch> use.
+          - { name: s390x-native, group: native, arch: s390x,
+              platform: linux/s390x, timeout: 300 }
+          - { name: aarch64-native, group: native, arch: aarch64,
+              platform: linux/arm64, timeout: 300 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -257,6 +268,8 @@ jobs:
           python3 packaging/fedora/release.py collect \
             --rpm-dir target/release-input/fedora-rpm/RPMS/x86_64 \
             --rpm-dir target/release-input/fedora-rpm/RPMS/ppc64le \
+            --rpm-dir target/release-input/fedora-rpm/RPMS/s390x \
+            --rpm-dir target/release-input/fedora-rpm/RPMS/aarch64 \
             --source-rpm "${srpms[0]}" --provenance-dir target/release-input/build-provenance \
             --sbom target/sbom/egcl-sbom.cdx.json
       - name: Upload complete release assets

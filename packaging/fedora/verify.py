@@ -16,6 +16,9 @@ import tempfile
 HOST_FEATURES = {
     'x86_64': (':x86-64', ':linux'),
     'ppc64le': (':ppc64le', ':little-endian', ':linux'),
+    # Mirrors the cross entries below for the same architectures.
+    's390x': (':s390x', ':big-endian', ':linux'),
+    'aarch64': (':arm64', ':linux'),
 }
 # Linux/rpm architecture names to Rust's spelling, for the --runtime-info
 # triple check below. Only ppc64le actually differs; the rest pass through.

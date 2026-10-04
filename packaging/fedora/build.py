@@ -382,7 +382,11 @@ def extract_and_verify(output, stage, targets=None):
     if extracted.exists():
         shutil.rmtree(extracted)
     extracted.mkdir(parents=True, exist_ok=True)
-    for rpm in sorted((output / 'RPMS/x86_64').glob('*.rpm')):
+    # RPMS/<arch>, not RPMS/x86_64: the POWER-native group builds in a ppc64le
+    # container, where this globbed an empty directory, left `extracted` empty,
+    # and surfaced 44 minutes later as a missing usr/bin/egcl rather than as the
+    # wrong path. HOST_MACHINE is what source-rpm.py already keys this on.
+    for rpm in sorted((output / 'RPMS' / HOST_MACHINE).glob('*.rpm')):
         # cpio can exit before rpm2cpio has flushed its archive padding, giving
         # a harmless SIGPIPE on a direct pipe. A disk-backed archive avoids it.
         with tempfile.TemporaryFile(dir=output) as archive:
@@ -404,7 +408,7 @@ def extract_and_verify(output, stage, targets=None):
     if targets is None or 'native' in targets:
         run(['python3', ROOT / 'packaging/fedora/verify-native-content.py', extracted])
     if targets is not None and 'android' not in targets:
-        print(f'RPMs built and verified: {output / "RPMS/x86_64"}')
+        print(f'RPMs built and verified: {output / "RPMS" / HOST_MACHINE}')
         return
     metadata = json.loads((extracted / 'usr/libexec/egcl/android/runtime.json').read_text())
     checker_spec = importlib.util.spec_from_file_location(
@@ -417,7 +421,7 @@ def extract_and_verify(output, stage, targets=None):
         if hashlib.sha256(library.read_bytes()).hexdigest() != metadata['hosts'][host]['sha256']:
             raise RuntimeError(f'RPM changed Android library: {library}')
     run(['python3', extracted / 'usr/bin/egcl-android-new', '--help'])
-    print(f'RPMs built and verified: {output / "RPMS/x86_64"}')
+    print(f'RPMs built and verified: {output / "RPMS" / HOST_MACHINE}')
 
 
 if __name__ == '__main__':

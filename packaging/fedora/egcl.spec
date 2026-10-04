@@ -86,7 +86,7 @@ BuildRequires: cargo
 # x86_64 is the full release, with every cross-target subpackage. ppc64le is
 # POWER-native: the two runtimes only (see the ifarch guard above). Keep this
 # list in step with release.py's PACKAGES_BY_ARCH, which the collector enforces.
-ExclusiveArch: x86_64 ppc64le
+ExclusiveArch: x86_64 ppc64le s390x aarch64
 
 %description
 Evergreen Common Lisp (EGCL) for Fedora, dynamically linked against

@@ -30,8 +30,14 @@ case "$(uname -m)" in
     ppc64le)
         rustup_triple=powerpc64le-unknown-linux-gnu
         rustup_sha256=86ebc5b46b20013fca57dff4f83aa0c325ee90914626ce1c80ae76e126e48afb ;;
+    s390x)
+        rustup_triple=s390x-unknown-linux-gnu
+        rustup_sha256=312ac9390467fd7870f8aff6557c7cb3bff0a04bb11b263173fdfd81586da641 ;;
+    aarch64)
+        rustup_triple=aarch64-unknown-linux-gnu
+        rustup_sha256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433 ;;
     *)
-        echo "No pinned rustup-init for $(uname -m); egcl.spec allows x86_64 and ppc64le" >&2
+        echo "No pinned rustup-init for $(uname -m); see egcl.spec's ExclusiveArch" >&2
         exit 2 ;;
 esac
 # The basename must stay rustup-init: the binary is multi-call and dispatches on
