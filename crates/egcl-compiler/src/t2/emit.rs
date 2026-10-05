@@ -1422,7 +1422,10 @@ fn emit_call(
                                                  // worth far too much to simply drop: without it fib(30) goes from 3ms to
                                                  // 498ms, a 166x regression.
         let self_call_disabled = std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_some();
-        if !self_call_disabled && sym == ss && nargs <= ARG_REGS.len() {
+        // Wider calls need an activation-backed argument slice, including on
+        // the stack-limit path; they cannot use this register-only entry.
+        const C2I_ARGS_SELF: [u8; 3] = [2, 1, 8];
+        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() {
             // Stack guard. The direct call below takes a REAL C frame and does
             // not reach c2i_call_args, so it never sees native_depth_cap() —
             // and the T2 prologue has no guard of its own. Unbounded, a deeply
@@ -1464,40 +1467,22 @@ fn emit_call(
             // Slow path: the ordinary three-register c2i dispatch, emitted
             // inline so the guard has somewhere to go.
             a.bind(slow);
-            const C2I_ARGS_SELF: [u8; 3] = [2, 1, 8];
-            if nargs <= C2I_ARGS_SELF.len() {
-                let mut moves = Vec::with_capacity(nargs);
-                for (i, &arg) in data.args.iter().enumerate() {
-                    let src = if let Some(&bits) = const_tagged.get(&arg) {
-                        ArgMoveSrc::Imm(bits)
-                    } else {
-                        ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
-                    };
-                    moves.push((C2I_ARGS_SELF[i], src));
-                }
-                emit_call_arg_moves(a, moves)?;
-                mov_imm64(a, 7, sym as i64); // rdi = sym
-                mov_imm64(a, 6, nargs as i64); // rsi = nargs
-                mov_imm64(a, 9, 0); // r9 = no call-site profile
-                mov_imm64(a, 0, c2i_call_addr as i64);
-                // The common join checks both the helper and direct entries.
-                emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
-            } else {
-                // Four self-call arguments do not fit c2i's register ABI. Keep
-                // the direct call rather than emit a wrong dispatch — the guard
-                // simply does not apply at this arity.
-                let mut moves = Vec::with_capacity(nargs);
-                for (i, &arg) in data.args.iter().enumerate() {
-                    let src = if let Some(&bits) = const_tagged.get(&arg) {
-                        ArgMoveSrc::Imm(bits)
-                    } else {
-                        ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
-                    };
-                    moves.push((ARG_REGS[i], src));
-                }
-                emit_call_arg_moves(a, moves)?;
-                a.call(entry);
+            let mut moves = Vec::with_capacity(nargs);
+            for (i, &arg) in data.args.iter().enumerate() {
+                let src = if let Some(&bits) = const_tagged.get(&arg) {
+                    ArgMoveSrc::Imm(bits)
+                } else {
+                    ArgMoveSrc::Reg(*reg.get(&arg).ok_or(EmitError::UnsupportedOp(0xF2))?)
+                };
+                moves.push((C2I_ARGS_SELF[i], src));
             }
+            emit_call_arg_moves(a, moves)?;
+            mov_imm64(a, 7, sym as i64); // rdi = sym
+            mov_imm64(a, 6, nargs as i64); // rsi = nargs
+            mov_imm64(a, 9, 0); // r9 = no call-site profile
+            mov_imm64(a, 0, c2i_call_addr as i64);
+            // The common join checks both the helper and direct entries.
+            emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
 
             a.bind(join);
             emit_transfer_check(a, transfer_check);
@@ -3939,62 +3924,10 @@ fn emit_framed_inner(
         && !f.is_variadic()
         && frame_base_home.is_none()
         && f.block(entry).params.len() <= arg_regs.len();
-    // A closed, pure self-recursive function has no operation that can create
-    // a pending transfer: its only calls return to the same native entry and
-    // every other instruction is local arithmetic/control flow.  Those calls
-    // use the direct native ABI, so a post-return status branch would be dead
-    // work. Mixed calls retain the check until the versioned transfer ABI gate
-    // proves their bridge contract.
-    let direct_self_calls =
-        has_reg_entry && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none();
-    let transfer_free_self = direct_self_calls && self_sym.is_some_and(|sym| {
-        f.block_order().iter().all(|&block| {
-            f.block(block).insts.iter().all(|&inst| {
-                let data = f.inst(inst);
-                match data.opcode {
-                    Opcode::Call => {
-                        data.args.len() <= arg_regs.len()
-                            && matches!(data.aux, AuxData::CallTarget(target) if target == sym)
-                    }
-                    Opcode::ConstFixnum
-                    | Opcode::ConstFloat
-                    | Opcode::ConstChar
-                    | Opcode::ConstSymbol
-                    | Opcode::ConstNil
-                    | Opcode::ConstT
-                    | Opcode::ConstHeapObj
-                    | Opcode::FixnumAdd
-                    | Opcode::FixnumSub
-                    | Opcode::FixnumMul
-                    | Opcode::FixnumDiv
-                    | Opcode::FixnumRem
-                    | Opcode::FixnumMod
-                    | Opcode::FixnumNeg
-                    | Opcode::FixnumShl
-                    | Opcode::FixnumShr
-                    | Opcode::FloatAdd
-                    | Opcode::FloatSub
-                    | Opcode::FloatMul
-                    | Opcode::FloatDiv
-                    | Opcode::FixnumCmpEq
-                    | Opcode::FixnumCmpLt
-                    | Opcode::FixnumCmpLe
-                    | Opcode::FixnumCmpGt
-                    | Opcode::FixnumCmpGe
-                    | Opcode::FloatCmpEq
-                    | Opcode::FloatCmpLt
-                    | Opcode::Guard
-                    | Opcode::Jump
-                    | Opcode::Brif
-                    | Opcode::Return
-                    | Opcode::Trap => true,
-                    _ => false,
-                }
-            })
-        })
-    });
+    // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
+    // Every native caller must propagate a transfer raised by that fallback.
     let transfer_check =
-        (c2i_transfer_pending_addr != 0 && !transfer_free_self).then(|| NativeTransferCheck {
+        (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
             pending_addr: c2i_transfer_pending_addr,
             exit: a.label(),
         });
