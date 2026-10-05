@@ -23831,7 +23831,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // string name) falls back to interning by name.
                 let mut resolved = Vec::with_capacity(sym_vals.len());
                 for sv in sym_vals {
-                    let name = symbol_bare_name(&val_as_str(sv));
+                    let name = if sv.is_symbol() {
+                        symbol_name_of(sv)
+                    } else {
+                        symbol_bare_name(&val_as_str(sv))
+                    };
                     let sym = if sv.is_symbol() {
                         sv
                     } else {
@@ -23847,7 +23851,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if export_mode {
                     for (name, sym) in &resolved {
                         let accessible = matches!(
-                            find_symbol_in_package(env, &pkg_name, name),
+                            find_symbol_in_package_cased(env, &pkg_name, name, true),
                             Some((found, _)) if found == *sym
                         );
                         if !accessible {
@@ -23868,14 +23872,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 }
                                 let shadowed = egcl_stdlib::package_shadowing_symbols(other)
                                     .iter()
-                                    .any(|s| string_designator_name(*s).eq_ignore_ascii_case(name));
+                                    .any(|s| symbol_name_of(*s) == *name);
                                 if shadowed {
                                     continue;
                                 }
                                 let other_name =
                                     egcl_stdlib::package_name(other).unwrap_or_default();
                                 if let Some((existing, _)) =
-                                    find_symbol_in_package(env, &other_name, name)
+                                    find_symbol_in_package_cased(env, &other_name, name, true)
                                 {
                                     if existing != *sym {
                                         return Err(EgclError::PackageError(format!(
