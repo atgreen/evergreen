@@ -57,10 +57,19 @@ instead. Captured names survive library close.
 These boundaries do not unwind internal C activations or permit Lisp nonlocal
 exits to cross C.
 
-The debugger displays frames and available restarts. Frame detail depends on
-the execution path and retained metadata. Optimized native code, runtime bridges,
-and foreign frames do not necessarily preserve every source local. Do not
-assume SBCL's debugger feature set or commands apply unchanged.
+The interactive debugger displays the same owned pre-unwind Lisp snapshot as a
+batch error report. Initial output and `backtrace` therefore preserve the
+failing call chain and available original arguments after the activations have
+unwound. Such rows are marked `historical snapshot`. Selecting one can display
+its retained data, but lexical evaluation and locals are unavailable because
+the activation is no longer live; the debugger reports that limitation instead
+of evaluating in an unrelated runtime frame. When an error carries no logical
+snapshot, the debugger falls back to the current native stack.
+
+Frame detail depends on the execution path and retained metadata. Optimized
+native code, runtime bridges, and foreign frames do not necessarily preserve
+every source local. Do not assume SBCL's debugger feature set or commands apply
+unchanged.
 
 ## Command dictionary
 
@@ -173,4 +182,4 @@ should follow the [GC safety procedure](contributing/how-to/gc-safety.md);
 application users should include the relevant environment settings in the bug
 report instead of interpreting every abort as an application condition.
 
-Implementation reference: [Debugger command implementation](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl-stdlib/src/devtools.rs).
+Implementation reference: [Debugger command implementation](https://github.com/atgreen/evergreen/blob/main/crates/egcl-stdlib/src/devtools.rs).
