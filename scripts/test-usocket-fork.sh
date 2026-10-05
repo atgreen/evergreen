@@ -16,7 +16,11 @@ cd "$work"
 export OCICL_LOCAL_ONLY=1 EGCL_PORT_RUNTIME="$runtime"
 "$repo/scripts/egcl-limited.sh" "$ocicl" install >install.log 2>&1
 cmp -- "$repo/tests/usocket-fork/ocicl.csv" ocicl.csv
-fixture=ocicl/usocket-9c88be9/tests/egcl-client-fixture.py
+fixture=$(awk -F', ' '$1 == "usocket" {
+    sub(/usocket\.asd$/, "tests/egcl-client-fixture.py", $3)
+    print "ocicl/" $3
+}' ocicl.csv)
+[[ -f $fixture ]] || { echo 'Missing pinned usocket fixture' >&2; exit 1; }
 export EGCL_PORT_CACHE="$work/cache/"
 for phase in cold cached; do
     "$repo/scripts/egcl-limited.sh" python3 "$fixture" \

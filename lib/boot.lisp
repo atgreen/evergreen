@@ -1774,7 +1774,7 @@
          (iel-cell (member :initial-element keys))
          (ic-cell (member :initial-contents keys))
          (et-cell (member :element-type keys))
-         (et (if et-cell (car (cdr et-cell)) t))
+         (et (%expand-type-spec (if et-cell (car (cdr et-cell)) t)))
          ;; Numeric storage is currently general storage (upgraded to T), but
          ;; use numeric zero rather than NIL for common numeric requests. This
          ;; lets read-modify-write users such as (SETF LDB) work without an
@@ -3538,7 +3538,8 @@
 ;;; ---------------------------------------------------------------------------
 
 ;;; 5.5.2.1  Base classes.
-(defclass fundamental-stream (standard-object) ())
+(defclass fundamental-stream (standard-object)
+  ((egcl::%gray-open-p :initform t)))
 (defclass fundamental-input-stream (fundamental-stream) ())
 (defclass fundamental-output-stream (fundamental-stream) ())
 (defclass fundamental-character-stream (fundamental-stream) ())
@@ -3561,6 +3562,7 @@
 (defgeneric stream-read-line (stream))
 (defgeneric stream-clear-input (stream))
 (defgeneric stream-read-byte (stream))
+(defgeneric gray-read-sequence (stream sequence start end))
 
 (defgeneric stream-write-char (stream character))
 (defgeneric stream-line-column (stream))
@@ -3581,10 +3583,16 @@
 ;;; native stream; adding a wrapper method must not discard native support.
 (defmethod open-stream-p ((stream t))
   (egcl::%native-open-stream-p stream))
+(defmethod open-stream-p ((stream fundamental-stream))
+  (slot-value stream 'egcl::%gray-open-p))
 (defmethod input-stream-p ((stream t))
   (egcl::%native-input-stream-p stream))
+(defmethod input-stream-p ((stream fundamental-stream)) nil)
+(defmethod input-stream-p ((stream fundamental-input-stream)) t)
 (defmethod output-stream-p ((stream t))
   (egcl::%native-output-stream-p stream))
+(defmethod output-stream-p ((stream fundamental-stream)) nil)
+(defmethod output-stream-p ((stream fundamental-output-stream)) t)
 (defmethod stream-element-type ((stream t))
   (let ((element-type (egcl::%native-stream-element-type stream)))
     (cond ((eq element-type t) 'character)
@@ -3594,6 +3602,9 @@
   (gray-stream-element-type stream))
 (defmethod close ((stream t) &key abort)
   (egcl::%native-close stream :abort abort))
+(defmethod close ((stream fundamental-stream) &key abort)
+  (declare (ignore abort))
+  (gray-close stream))
 
 ;;; Required-to-implement operations: a subclass that does not provide a method
 ;;; gets a clear error rather than a mysterious no-applicable-method.
@@ -3619,6 +3630,17 @@
           (t (stream-unread-char stream c) t))))
 
 (defmethod stream-clear-input ((stream fundamental-input-stream)) nil)
+
+(defmethod gray-read-sequence ((stream fundamental-input-stream) sequence start end)
+  (let ((read-element (if (subtypep (stream-element-type stream) 'character)
+                          #'stream-read-char
+                          #'stream-read-byte)))
+    (do ((index start (1+ index)))
+        ((>= index end) index)
+      (let ((element (funcall read-element stream)))
+        (when (eq element :eof)
+          (return index))
+        (setf (elt sequence index) element)))))
 
 (defmethod stream-read-line ((stream fundamental-character-input-stream))
   (let ((chars nil))
@@ -3659,7 +3681,9 @@
 ;;; Query / lifecycle defaults (§5.5.2.4).
 (defmethod gray-stream-element-type ((stream fundamental-character-stream)) 'character)
 (defmethod gray-stream-element-type ((stream fundamental-binary-stream)) '(unsigned-byte 8))
-(defmethod gray-close ((stream fundamental-stream)) t)
+(defmethod gray-close ((stream fundamental-stream))
+  (setf (slot-value stream 'egcl::%gray-open-p) nil)
+  t)
 
 ;;; Publish the existing protocol symbols, not a second same-named protocol.
 ;;; Portable libraries import these symbols and specialize their methods.

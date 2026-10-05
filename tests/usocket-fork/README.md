@@ -1,7 +1,7 @@
 # Native TCP client through the pinned usocket fork
 
 This scenario installs `atgreen/usocket` at
-`5f8ba3596b4be3b3962a26957ff5508d4d02cbcc` using ocicl's Git source support.
+`fa0df448d5582c0d637afe3799cf53b28e1586c9` using ocicl's Git source support.
 It uses an isolated source registry and FASL cache, with runtime downloads
 disabled. No installed libraries or user configuration are modified.
 
@@ -22,6 +22,8 @@ The script retains logs in its printed temporary directory and runs:
   first byte before sending the remainder. Buffering until EOF cannot pass.
 - Receive-timeout configuration, octet-stream metadata, EOF, close, and explicit
   rejection of unsupported EGCL connection options.
+- Literal octet types and one-hop/two-hop DEFTYPE aliases, each with its own
+  full duplex connection; character and non-octet integer widths stay rejected.
 - Optional GC stress at stride 1,000 with poisoning and heap verification.
   Its child timeout is 330 seconds to allow stressed ASDF startup.
 - Optional SBCL control using the same fixture and a separate FASL cache.
