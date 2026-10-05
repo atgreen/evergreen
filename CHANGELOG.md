@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Mutexes restored from saved images now retain their names, recursive behavior,
+  and shared identity while restarting unlocked with fresh native state
+  ([#17](https://github.com/atgreen/evergreen/pull/17)).
+
 - `UNINTERN` now removes the requested symbol by identity without folding its
   name, checks shadowing conflicts before changing the package, and reports
   invalid symbols and missing packages
