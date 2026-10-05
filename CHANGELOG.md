@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Package export and import operations now preserve symbol-name case, and
+  export conflict checks distinguish differently cased and shadowed names
+  ([#13](https://github.com/atgreen/evergreen/pull/13)).
+
 - Reader symbol lookup now preserves escaped names and readtable case modes
   even when an uppercase symbol with the same spelling already exists
   ([#12](https://github.com/atgreen/evergreen/pull/12)).
