@@ -9,6 +9,24 @@ fn run(program: &str, tier: &str) -> Output {
         .output()
         .unwrap()
 }
+
+fn run_with_gc_relocation(program: &str) -> Output {
+    Command::new("timeout")
+        .args([
+            "--kill-after=5",
+            "90",
+            env!("CARGO_BIN_EXE_egcl"),
+            "--no-init",
+            "--eval",
+            program,
+        ])
+        .env("EGCL_FORCE_TIER", "interp")
+        .env("EGCL_GC_POISON", "1")
+        .env("EGCL_GC_VERIFY", "1")
+        .env("EGCL_SAVE_OPTION_CURSOR_LOG", "1")
+        .output()
+        .unwrap()
+}
 fn passes(output: Output, marker: &str) {
     assert!(
         output.status.success(),
@@ -77,6 +95,54 @@ fn image_option_evaluation_does_not_discard_handler_exits() {
         let _ = std::fs::remove_file(path);
         passes(output, "SAVE-TRANSFER-OK");
         assert!(!wrote_image, "handler exit must prevent image creation");
+    }
+}
+
+#[test]
+fn image_option_traversal_survives_relocation_during_value_evaluation() {
+    for (index, operation) in ["egcl-ext:save-lisp-and-die", "egcl-ext:%save-core"]
+        .iter()
+        .enumerate()
+    {
+        let path = std::env::temp_dir().join(format!(
+            "egcl-relocated-save-options-{}-{index}",
+            std::process::id()
+        ));
+        let output = run_with_gc_relocation(&format!(
+            r#"
+          (eval (list '{operation} {path:?}
+                      :unknown-option
+                        '(progn (dotimes (i 400) (make-array 30000)) nil)
+                      :executable t))
+        "#
+        ));
+        let image = std::fs::read(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let cursor_moved = stderr.lines().any(|line| {
+            let Some(fields) = line.strip_prefix("[save-option-cursor] before=") else {
+                return false;
+            };
+            let Some((before, after)) = fields.split_once(" after=") else {
+                return false;
+            };
+            before != after
+        });
+        assert!(
+            cursor_moved,
+            "the fixture must relocate the exact unread option tail:\n{stderr}"
+        );
+        let image = image.expect("successful image save must create its destination");
+        assert!(
+            image.len() >= 16 && &image[image.len() - 16..image.len() - 8] == b"EGCLEXE\0",
+            "the option following the allocating value must still select an executable image"
+        );
     }
 }
 #[test]
