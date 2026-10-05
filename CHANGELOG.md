@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Symbol lookup now preserves literal colons in imported and keyword names,
+  including lookup through exports, inherited symbols, and the reader
+  ([#15](https://github.com/atgreen/evergreen/pull/15)).
+
 - `SHADOWING-IMPORT` now accepts fresh and previously uninterned symbols,
   preserving their names and identities, and propagates failures instead of
   silently reporting success
