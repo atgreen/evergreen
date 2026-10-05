@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Retained generic-function values now continue dispatching through their
+  generic methods after the function name is replaced by an advice closure
+  ([#19](https://github.com/atgreen/evergreen/pull/19)).
+
 - `REMF`, `PSETF`, `SHIFTF`, `ROTATEF`, and `SETF` of `VALUES` now honor
   custom place storing forms and preserve multiple store values
   ([#18](https://github.com/atgreen/evergreen/pull/18)).
