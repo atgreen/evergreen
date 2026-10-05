@@ -157,6 +157,66 @@ fn native_transfer_check_is_omitted_only_for_pure_self_recursion() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
+fn self_calls_through_activation_slices_stop_on_pending_transfers() {
+    use egcl_compiler::t2::emit::emit_framed_with_activation_slots;
+
+    extern "C" fn call_slice(_: u64, _: u64, _: *const EgclVal, _: u64) -> u64 {
+        NIL.0
+    }
+    extern "C" fn pending() -> u64 {
+        1
+    }
+
+    let sym = egcl_rt::symbols::intern("TRANSFER-SLICE-SELF");
+    for arity in [4u16, 5, 7] {
+        let mut instructions: Vec<_> = (0..arity).map(Instr::LoadLocal).collect();
+        instructions.extend([
+            Instr::CallNamed { sym, nargs: arity },
+            Instr::Pop,
+            Instr::Const(0),
+            Instr::Return,
+        ]);
+        let bf = bytecode_fn(
+            "TRANSFER-SLICE-SELF",
+            instructions,
+            vec![EgclVal::from_fixnum(99)],
+            arity,
+            arity + 1,
+            arity,
+        );
+        let ir = build_from_bytecode(&bf).expect("build self-call slice");
+        let framed = emit_framed_with_activation_slots(
+            &ir,
+            0,
+            0,
+            0,
+            call_slice as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            pending as *const () as usize as u64,
+            0,
+            bf.num_slots(),
+            Some(sym),
+        )
+        .expect("emit self-call slice");
+        assert_eq!(framed.compiled_entry, 0, "slice call needs an activation");
+        let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).expect("executable memory");
+        let run: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = vec![NIL.0; usize::from(bf.num_slots() + framed.shadow_root_slots)];
+        assert_eq!(
+            run(frame.as_mut_ptr()),
+            NIL.0,
+            "arity {arity}: pending transfer must exit before returning 99"
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
 fn emitted_heap_literal_is_loaded_from_its_constant_pool_slot() {
     use egcl_compiler::t2::emit::emit_framed;
 
