@@ -2,13 +2,6 @@
 
 ## Unreleased
 
-### Release tooling
-
-- Publish only the matching version's changelog section as release notes,
-  validate it before building, and use `Unreleased` for test builds while
-  retaining the full changelog as a download
-  ([#26](https://github.com/atgreen/evergreen/pull/26)).
-
 ### Documentation
 
 - Reorganize the README around installation and a first Lisp result, clarify
