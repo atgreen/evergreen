@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Compiled direct recursion now preserves errors and nonlocal exits raised
+  by its stack-limit fallback instead of continuing through native callers
+  ([#11](https://github.com/atgreen/evergreen/pull/11)).
+
 - Compiled self-calls that use runtime dispatch now preserve pending errors
   and nonlocal exits instead of continuing execution after the call
   ([#10](https://github.com/atgreen/evergreen/pull/10)).

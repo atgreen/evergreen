@@ -61,7 +61,7 @@ fn bytecode_fn(
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn native_transfer_check_is_omitted_only_for_pure_self_recursion() {
+fn native_transfer_check_covers_pure_self_recursion_and_mixed_calls() {
     use egcl_compiler::t2::emit::emit_framed_with_activation_slots;
 
     let self_sym = egcl_rt::symbols::intern("TRANSFER-CHECK-SELF");
@@ -124,10 +124,10 @@ fn native_transfer_check_is_omitted_only_for_pure_self_recursion() {
         &pure_ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, Some(self_sym),
     )
     .expect("emit pure self without transfer poll");
-    assert_eq!(
+    assert_ne!(
         pure_with_poll.code,
         pure_without_poll.code,
-        "pure self recursion must not grow a dead transfer-status branch"
+        "pure self recursion must check transfers from its stack-limit fallback"
     );
 
     let mixed_with_poll = emit(&mixed_ir, mixed_sym);
@@ -153,6 +153,122 @@ fn native_transfer_check_is_omitted_only_for_pure_self_recursion() {
         mixed_without_poll.code,
         "mixed calls must retain the transfer-status branch"
     );
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn direct_self_call_stack_fallback_propagates_transfers() {
+    use egcl_compiler::t2::emit::emit_framed_with_activation_slots;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const CHILD: &str = "EGCL_TEST_SELF_STACK_FALLBACK";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "direct_self_call_stack_fallback_propagates_transfers",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("EGCL_NO_DIRECT_SELF_CALL")
+            .output()
+            .expect("run isolated stack-limit test");
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static PENDING: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn call(_: u64, _: u64, _: u64, _: u64, _: u64, _: u64) -> u64 {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        EgclVal::from_fixnum(42).0
+    }
+    extern "C" fn pending() -> u64 {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        PENDING.load(Ordering::Relaxed) as u64
+    }
+
+    let sym = egcl_rt::symbols::intern("STACK-FALLBACK-SELF");
+    for arity in [0u16, 1, 3] {
+        let mut instructions: Vec<_> = (0..arity).map(Instr::LoadLocal).collect();
+        instructions.extend([
+            Instr::CallNamed { sym, nargs: arity },
+            Instr::Pop,
+            Instr::Const(0),
+            Instr::Return,
+        ]);
+        let bf = bytecode_fn(
+            "STACK-FALLBACK-SELF",
+            instructions,
+            vec![EgclVal::from_fixnum(99)],
+            arity,
+            arity + 1,
+            arity,
+        );
+        let mut ir = build_from_bytecode(&bf).expect("build recursive function");
+        // Model fixnum-specialized inputs so GC roots do not require an
+        // activation frame and disable direct register calls in this probe.
+        for param in ir.block(ir.entry()).params.clone() {
+            ir.refine_type(
+                param,
+                egcl_compiler::t2::ir::IRType::of(egcl_compiler::t2::ir::TypeBits::FIXNUM),
+            );
+        }
+        let framed = emit_framed_with_activation_slots(
+            &ir,
+            0,
+            0,
+            call as *const () as usize as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            pending as *const () as usize as u64,
+            0,
+            bf.num_slots(),
+            Some(sym),
+        )
+        .expect("emit recursive function");
+        assert_ne!(framed.compiled_entry, 0, "exercise direct register recursion");
+        let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = vec![EgclVal::from_fixnum(12).0; usize::from(bf.num_slots())];
+        for nested in [false, true] {
+            for transfer in [false, true] {
+                CALLS.store(0, Ordering::Relaxed);
+                POLLS.store(0, Ordering::Relaxed);
+                PENDING.store(usize::from(transfer), Ordering::Relaxed);
+                let rsp: u64;
+                unsafe {
+                    core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+                }
+                let limit = if nested { rsp - 1024 } else { i64::MAX as u64 };
+                egcl_rt::stack::NATIVE_STACK_LIMIT.store(limit, Ordering::Release);
+                let result = run(frame.as_mut_ptr());
+                egcl_rt::stack::NATIVE_STACK_LIMIT.store(0, Ordering::Release);
+                assert_eq!(
+                    CALLS.load(Ordering::Relaxed), 1,
+                    "must reach the bounded fallback"
+                );
+                assert_eq!(
+                    result,
+                    if transfer { NIL.0 } else { EgclVal::from_fixnum(99).0 },
+                    "arity {arity}, nested {nested}, transfer {transfer}"
+                );
+                if nested && transfer {
+                    assert!(POLLS.load(Ordering::Relaxed) > 1, "unwind native callers too");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
