@@ -1,78 +1,64 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! `egcl-compiler` — Evergreen Common Lisp compiler pipeline.
+//! `egcl-compiler`: the Evergreen Common Lisp front end and the T2 optimising
+//! compiler.
 //!
-//! Reader → macro-expansion → sea-of-nodes IR → tiered compilation
-//! (T0 interpreter, T1 baseline, T2 optimising) → register allocation
-//! → code emission → inline caches → profiling → OSR/deopt.
+//! # Crate map
+//!
+//! * [`reader`] — the Common Lisp reader: character slices or live streams to
+//!   Lisp objects. Used by the `egcl` evaluator, `egcl-stdlib`, and the REPL.
+//! * [`mod@macroexpand`] — lexical `Environment`, global/compiler/local macro
+//!   tables, `macroexpand-1` / `macroexpand` / `macroexpand-all`, and the
+//!   special-operator code walker. Used by the evaluator and the bytecode
+//!   compiler.
+//! * [`t2`] — the block-based SSA optimising compiler: bytecode → SSA
+//!   (`t2::build`), verification, inference, optimisation passes, lowering,
+//!   `regalloc2` allocation, per-target emission, deopt metadata, and the
+//!   native exception-transfer tables.
+//! * [`control_scope`] and [`native_unwind`] — logical handler-scope analysis
+//!   over bytecode and the next-unwind-action selector, shared by the bytecode
+//!   tier's native-transfer entry code and the T2 transfer tables.
+//! * [`tiered`] — a standalone tree-walking evaluator over Lisp forms, kept
+//!   only because `egcl-stdlib`'s debugger evaluates forms in a frame with it.
+//!   It is not the production T0 and should be replaced by the real evaluator.
+//!
+//! The bytecode compiler, the T0 bytecode interpreter, the T1 baseline JIT,
+//! the tier thresholds (`EGCL_T0_T1_THRESHOLD`, `EGCL_T1_T2_THRESHOLD`,
+//! `EGCL_OSR_THRESHOLD`) and the production type profiles are **not** in this
+//! crate: they live in `crates/egcl/src/cli/bytecode.rs`, with the bytecode
+//! types and the executable buffer in `egcl-rt`. That code calls into this
+//! crate for everything above.
+//!
+//! # Re-exports
+//!
+//! The flat `pub use` list below exists for the older tests and tools that
+//! import `egcl_compiler::X` directly. New code should name the module.
 
 // ── Front-end ─────────────────────────────────────────────────────
 pub mod macroexpand;
 pub mod reader;
 
-// ── Intermediate representation ───────────────────────────────────
+// ── Bytecode control-scope analysis ───────────────────────────────
 pub mod control_scope;
 pub mod native_unwind;
-pub mod ir;
 
-// ── T2 optimising compiler (block-based SSA, spec §4.3–§4.10) ──────
-// New pipeline; supersedes the sea-of-nodes ir/opt/codegen/osr modules above.
+// ── T2 optimising compiler (block-based SSA) ──────────────────────
 pub mod t2;
 
-// ── Tiered compilation ────────────────────────────────────────────
+// ── Standalone tree-walking evaluator (debugger only) ─────────────
 pub mod tiered;
 
-// ── Optimisation passes ───────────────────────────────────────────
-pub mod opt;
-
-// ── On-stack replacement / deoptimisation ─────────────────────────
-pub mod osr;
-
-// ── Code generation ───────────────────────────────────────────────
-pub mod codegen;
-
-// ── Inline caches ─────────────────────────────────────────────────
-pub mod ic;
-
-// ── Profiling infrastructure ──────────────────────────────────────
-pub mod profiling;
-
-// ── Error types ──────────────────────────────────────────────────
-pub mod error;
-
 // ── Re-exports for convenience ────────────────────────────────────
-pub use codegen::{
-    Aarch64Backend, CodeBuffer, CodegenBackend, LinearScanAllocator, RegisterAllocation, RelocKind,
-    Relocation, StackMap, TargetArch, X86_64Backend, native_arch,
-};
-pub use error::CompilerError;
-pub use ic::{IcEntry, IcState, InlineCache, ic_generation, init_ic_registry, reset_all_caches};
-pub use ir::{Edge, EdgeKind, IrBuilder, IrGraph, IrSourceInfo, NodeId, NodeKind, verify};
 pub use macroexpand::{
     CompilerMacroFn, DeclInfo, Environment, FunctionInfo, InlinePolicy, MacroexpandHook,
     OptimizeQualities, VariableInfo, define_compiler_macro, define_global_macro, macroexpand,
     macroexpand_1, macroexpand_all, set_macroexpand_hook, set_macroexpand_limit,
     undefine_compiler_macro, undefine_global_macro,
 };
-pub use opt::{
-    ConstantFolding, DeadCodeElimination, EscapeAnalysis, FunctionRegistry, Inlining,
-    InliningConfig, Licm, NullCheckElimination, Pass, PassManager, StrengthReduction,
-    TypePropagation,
-};
-pub use osr::{
-    ConversionKind, DeoptConfig, DeoptEntry, DeoptLog, DeoptReason, DeoptResult, LocalMapping,
-    Location, OsrEntryMap, OsrEntryResult, OsrSlotDesc, TypeGuard, clear_global_deopt_logs,
-    deoptimize, is_function_blacklisted, is_function_in_backoff, osr_entry,
-};
-pub use profiling::{BackEdgeCounter, FunctionProfile, InvocationCounter, TypeProfile};
 pub use reader::{
     ReaderState, SourcePos, SyntaxType, copy_readtable, get_dispatch_macro_character,
     get_macro_character, intern_symbol, make_dispatch_macro_character, make_readtable, read,
     read_from_string, read_from_string_with_base, register_package, set_dispatch_macro_character,
     set_macro_character, set_read_eval_hook, symbol_name,
-};
-pub use tiered::{
-    BaselineCompiler, CompiledCode, Interpreter, OptimisingCompiler, Tier, TierConfig,
-    check_promotion, pop_compilation_request, process_compilation_request, request_compilation,
 };

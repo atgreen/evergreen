@@ -1,10 +1,81 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Macro expansion engine.
+//! Macro expansion: the compile-time lexical [`Environment`], the global,
+//! compiler-macro and local macro tables, `macroexpand-1` / `macroexpand` /
+//! `macroexpand-all`, and the special-operator code walker that
+//! `macroexpand-all` is built on.
 //!
-//! Expansion runs after reading and before IR construction.
-//! Implements the algorithm from spec §4.2 / A4.01.
+//! Expansion runs after reading and before bytecode compilation or
+//! evaluation. The evaluator in `crates/egcl` and the bytecode compiler both
+//! call in here; the T2 compiler never sees unexpanded code.
+//!
+//! # Environment
+//!
+//! [`Environment`] is a chain of frames linked by `Arc` parents. Each frame
+//! holds variable bindings ([`VariableInfo`]: lexical, special, constant,
+//! symbol-macro), function bindings ([`FunctionInfo`]: lexical, global, macro,
+//! special operator), declarations ([`DeclInfo`], including
+//! [`OptimizeQualities`] and [`InlinePolicy`]), and the block and tag names in
+//! scope. `augment_*` return a child frame; `variable_information`,
+//! `function_information` and `declaration_information` walk the chain. The
+//! environment holds `EgclVal`s that can move under GC, so it implements
+//! `TraceHostRoots` and callers keep it rooted with `rooted_ref!`. The cached
+//! global-macro base frame is marked `no_gc_roots` so tracing stops there
+//! instead of cloning a shared `Arc` on every collection (bliss-htff).
+//!
+//! # Macro tables
+//!
+//! * The global macro table maps a symbol to an expander handle. Expanders
+//!   written in Rust are registered as closures in the macro-function
+//!   registry under a fresh handle (`register_macro_function`); Lisp-defined
+//!   expanders are handles the host evaluator understands.
+//! * Compiler macros are a separate table of Rust functions
+//!   (`define_compiler_macro`); `compiler_macroexpand_1` applies one unless
+//!   the operator is declared NOTINLINE in the environment.
+//! * `MACROLET` definitions are parsed into [`ParsedMacro`]s and `enclose`d
+//!   with their defining environment; their bodies run through a host
+//!   `LocalMacroEvaluator` when one is installed, otherwise through the small
+//!   built-in evaluator that understands the lambda-list binding, quasiquote,
+//!   and the handful of operators macro bodies typically use.
+//!
+//! # Expansion
+//!
+//! * [`macroexpand_1`] — one step. A symbol with a symbol-macro binding
+//!   expands through the hook like a macro call does. A compound form whose
+//!   operator has a local macro binding, else a global macro definition, is
+//!   handed to the current `*macroexpand-hook*` as `(expander form env)`.
+//!   The default hook looks the expander up in the registry and calls it;
+//!   for symbol macros the expansion value is passed in both positions so the
+//!   default hook returns it unchanged. `*PACKAGE*` is snapshotted and
+//!   restored around every expansion because an expander running in another
+//!   package otherwise leaks its package into the caller's reads
+//!   (bliss-cpm9).
+//! * [`macroexpand`] — repeats `macroexpand_1` until no change, with two
+//!   guards: a per-thread iteration limit (`set_macroexpand_limit`, default
+//!   65 536) for divergent expansions and a hash of seen forms for circular
+//!   ones.
+//! * [`macroexpand_all`] — the code walker. Expands the head, then: quoted
+//!   data is left alone; quasiquote templates are walked depth-aware so only
+//!   unquoted sub-forms are expanded; special operators go to their
+//!   `expand_*` handler (COND, BLOCK/RETURN-FROM, TAGBODY, SETQ/SETF and
+//!   places, THE, EVAL-WHEN, FUNCTION, LAMBDA, LET/LET*, FLET/LABELS,
+//!   LOCALLY, MACROLET/SYMBOL-MACROLET, MULTIPLE-VALUE-SETQ), which augment
+//!   the environment for their bodies and strip the binding forms whose job
+//!   is done; a lambda expression in operator position is expanded in place;
+//!   compiler macros are tried on ordinary calls; argument forms are walked
+//!   but the operator position of an ordinary call is not.
+//!
+//! All conses the walker builds are allocated on the GC heap through the
+//! same path the reader uses and rooted across allocation, so rebuilt forms
+//! survive a moving collection (bliss-noh).
+//!
+//! # Hooks the runtime installs
+//!
+//! `set_macroexpand_hook` (`*macroexpand-hook*`), `set_local_macro_evaluator`
+//! (full Lisp evaluation of MACROLET bodies), and the macro-function
+//! registry are per-thread or global state the `egcl` evaluator configures
+//! at startup.
 
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
@@ -22,7 +93,7 @@ use crate::reader::{intern_symbol, symbol_name};
 // ── Constants ─────────────────────────────────────────────────────
 
 /// Default maximum number of macroexpand-1 iterations per macroexpand call.
-/// Catches non-repeating divergent expansions (spec §4.2.13, §4.2.3 Phase 2 step 2.f).
+/// Catches non-repeating divergent expansions.
 const DEFAULT_MACROEXPAND_LIMIT: usize = 65536;
 
 thread_local! {
@@ -84,11 +155,11 @@ pub enum DeclInfo {
 
 // ── Environment protocol ───────────────────────────────────────────
 
-/// Lexical environment for macro expansion (CLtL2 §8.5).
+/// Lexical environment for macro expansion.
 ///
 /// Uses a parent chain for nested lexical scopes: each augmentation creates
 /// a new frame with only the new bindings, pointing to the previous environment
-/// as parent. Lookups walk up the chain (spec §4.2.9 R4.14, §4.2.10).
+/// as parent. Lookups walk up the chain.
 #[derive(Clone, Debug)]
 pub struct Environment {
     /// Parent environment (lexical chain).
@@ -285,7 +356,7 @@ impl Environment {
     /// Supports standard queries:
     /// - For 'optimize': returns optimize qualities as a EgclVal encoding.
     /// - For 'declaration': returns list of valid declaration names.
-    ///   Walks the parent chain to find declarations (spec §4.2.9 R4.14).
+    ///   Walks the parent chain to find declarations.
     pub fn declaration_information(&self, decl_name: EgclVal) -> Option<EgclVal> {
         let mut frame = self;
         loop {
@@ -562,34 +633,6 @@ impl Environment {
         }
         false
     }
-
-    /// Check if a block name is in scope.
-    pub fn has_block(&self, name: EgclVal) -> bool {
-        let mut frame = self;
-        loop {
-            if frame.blocks.contains(&name.0) {
-                return true;
-            }
-            match frame.parent {
-                Some(ref parent) => frame = parent,
-                None => return false,
-            }
-        }
-    }
-
-    /// Check if a tag name is in scope.
-    pub fn has_tag(&self, name: EgclVal) -> bool {
-        let mut frame = self;
-        loop {
-            if frame.tags.contains(&name.0) {
-                return true;
-            }
-            match frame.parent {
-                Some(ref parent) => frame = parent,
-                None => return false,
-            }
-        }
-    }
 }
 
 /// Sentinel value used to mark notinline declarations in DeclInfo::Custom.
@@ -598,7 +641,7 @@ const NOTINLINE_SENTINEL: u64 = 0xFFFF_FFFF_DEAD_BEEF;
 // ── Global macro table ────────────────────────────────────────────
 
 /// Global macro table: maps operator symbol keys to expander EgclVals.
-/// Protected by RwLock for concurrent compilation (spec §4.2.12).
+/// Protected by RwLock for concurrent compilation.
 static GLOBAL_MACRO_TABLE: LazyLock<OrderedRwLock<HashMap<u64, EgclVal>>> = LazyLock::new(|| {
     OrderedRwLock::new(
         LockLevel::GcWorld,
@@ -624,7 +667,7 @@ fn install_global_macro_root_scanner() {
 }
 
 /// Global compiler macro table: maps function name keys to compiler macro
-/// expander functions. Protected by RwLock (spec §4.2.4, §4.2.12).
+/// expander functions. Protected by RwLock.
 /// The expander takes (form, env) and returns either a replacement form
 /// or the original form (to decline).
 static COMPILER_MACRO_TABLE: LazyLock<OrderedRwLock<HashMap<u64, CompilerMacroFn>>> =
@@ -752,7 +795,7 @@ pub fn compiler_macroexpand_1(
 
 /// Registry mapping EgclVal expander identities to callable Rust functions.
 /// This enables the default_hook (funcall) to actually invoke macro expanders
-/// that are represented as EgclVal handles (spec §4.2.8 R4.15).
+/// that are represented as EgclVal handles.
 static MACRO_FUNCTION_REGISTRY: LazyLock<OrderedRwLock<HashMap<u64, Arc<MacroFn>>>> =
     LazyLock::new(|| {
         OrderedRwLock::new(
@@ -910,7 +953,7 @@ fn lookup_macro_function(key: EgclVal) -> Option<Arc<MacroFn>> {
 /// Signature: `(expander form env) -> expanded_form`.
 pub type MacroexpandHook = fn(EgclVal, EgclVal, &Environment) -> Result<EgclVal, EgclError>;
 
-/// Default hook: implements `funcall` semantics (spec §4.2.8 R4.15).
+/// Default hook: implements `funcall` semantics.
 ///
 /// For function macros (FunctionInfo::Macro), the expander is a EgclVal handle.
 /// The hook looks up the registered Rust-side callable in MACRO_FUNCTION_REGISTRY
@@ -1017,7 +1060,7 @@ fn alloc_cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
 /// (result, true).
 ///
 /// If the operator is not found in the local environment, consults the
-/// global macro table (spec §4.2.3 Phase 1 step 2.e).
+/// global macro table.
 ///
 /// Otherwise returns (form, false).
 /// Restores the `*PACKAGE*` value cell when dropped. Macro expansion must be
@@ -1116,8 +1159,8 @@ pub fn macroexpand_1(
 
 /// Fully expand a form (iterate `macroexpand_1` until no change).
 /// Returns `(expanded_form, expanded_p)`.
-/// Detects circular expansion by tracking seen forms (R4.16).
-/// Enforces *macroexpand-limit* iteration cap (spec §4.2.13, default 65536).
+/// Detects circular expansion by tracking seen forms.
+/// Enforces *macroexpand-limit* iteration cap (default 65536).
 pub fn macroexpand(form: EgclVal, env: &Environment) -> Result<(EgclVal, bool), EgclError> {
     macroexpand_until(form, env, |_| false)
 }
@@ -1150,7 +1193,7 @@ pub fn macroexpand_until(
         ever_expanded = true;
         iteration_count += 1;
 
-        // Check iteration limit (spec §4.2.3 Phase 2 step 2.f, §4.2.13)
+        // Check iteration limit
         if iteration_count > limit {
             return Err(EgclError::Internal(format!(
                 "Macro expansion limit ({}) exceeded",
@@ -1158,7 +1201,7 @@ pub fn macroexpand_until(
             )));
         }
 
-        // Check for circular expansion (R4.16)
+        // Check for circular expansion
         if !seen.insert(structural_fingerprint(expanded, 8)) {
             return Err(EgclError::Internal("circular macro expansion".into()));
         }
@@ -1316,18 +1359,18 @@ fn is_lambda_expression(val: EgclVal) -> bool {
 
 /// Fully expand a form and all its subforms (recursive code-walk).
 ///
-/// Implements the `expand-form` algorithm from spec §4.2.3 Phase 3:
+/// The code-walk algorithm:
 /// 1. Macroexpand the top-level form.
 /// 2. If the result is a self-evaluating atom or symbol, return it.
 /// 3. If the result is a cons (compound form):
 ///    a. Check for QUOTE — quoted data is opaque, no sub-form expansion
-///    occurs (spec §4.2.7).
-///    b. Dispatch to special-form handlers for special operators (spec §4.2.7).
-///    c. Handle lambda expressions in operator position (spec §4.2.3 step 4.c).
-///    d. Check for compiler macros (spec §4.2.4, R4.12) — if a compiler
+///    occurs.
+///    b. Dispatch to special-form handlers for special operators.
+///    c. Handle lambda expressions in operator position.
+///    d. Check for compiler macros — if a compiler
 ///    macro exists for the operator and notinline is NOT declared,
 ///    invoke it. If it declines (returns form unchanged), fall through.
-///    e. Per spec §4.2.3 Phase 3 step 4.d.ii, the operator is NOT
+///    e. The operator is NOT
 ///    recursively code-walked (only arguments are expanded). The
 ///    operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
@@ -1347,7 +1390,7 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
     egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
     egcl_rt::rooted_ref!(_operator_root = &mut operator);
 
-    // Step 3.a: QUOTE suppression (spec §4.2.7).
+    // Step 3.a: QUOTE suppression.
     // Quoted data is opaque — no sub-form expansion should occur.
     if is_quote_symbol(operator) {
         return Ok(expanded);
@@ -1377,7 +1420,7 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
         ));
     }
 
-    // Step 3.b: Special operator dispatch (spec §4.2.7).
+    // Step 3.b: Special operator dispatch.
     // Special operators have structural subforms (binding names, block names,
     // tag labels) that must NOT be expanded as expressions.
     let is_special = matches!(
@@ -1388,13 +1431,13 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
         return expand_special_form(operator, expanded, env);
     }
 
-    // Step 3.c: Lambda expression in operator position (spec §4.2.3 step 4.c).
+    // Step 3.c: Lambda expression in operator position.
     // A form like ((lambda (x) x) 42) should have its lambda body expanded.
     if is_lambda_expression(operator) {
         return expand_lambda_call(operator, expanded, env);
     }
 
-    // Step 3.d: Compiler macro check (spec §4.2.4, R4.12).
+    // Step 3.d: Compiler macro check.
     // Only applies to function-call forms (not special operators or macros
     // after full macroexpansion).
     if !env.is_notinline(operator) {
@@ -1410,7 +1453,6 @@ pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
     }
 
     // Step 3.e: Function call — expand arguments only, not the operator.
-    // Per spec §4.2.3 Phase 3 step 4.d.ii.
     expand_function_call_args(operator, expanded, env)
 }
 
@@ -1496,7 +1538,7 @@ fn is_known_special_operator(val: EgclVal) -> bool {
     }
 }
 
-/// Dispatch to the correct special-form expansion handler (spec §4.2.7).
+/// Dispatch to the correct special-form expansion handler.
 /// Walk a quasiquote template as data, macroexpanding ONLY the argument of each
 /// UNQUOTE / UNQUOTE-SPLICING at the outermost level. Nested EGCL::QUASIQUOTE
 /// raises the depth; an UNQUOTE lowers it, so only a `depth == 1` unquote holds
@@ -1929,7 +1971,6 @@ enum PlaceArgument {
 /// Expand SETQ: (setq {var value}*)
 /// For each pair: if var is a symbol macro, convert to (setf expansion expanded-value).
 /// Otherwise, expand value only (var is NOT expanded).
-/// Spec §4.2.6, R4.13.
 fn expand_setq(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_form_root = &mut form);
@@ -2574,7 +2615,7 @@ fn expand_locally(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclE
 
 /// Expand MACROLET: (macrolet ((name lambda-list macro-body...) ...) body...)
 /// Install local macro definitions into a new environment.
-/// Expand body in the augmented env. Strip MACROLET from output (spec §4.2.7).
+/// Expand body in the augmented env. Strip MACROLET from output.
 fn expand_macrolet(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     // Root across the allocating expand recursion (moving GC; bliss-noh).
     egcl_rt::rooted_ref!(_form_root = &mut form);
@@ -2618,7 +2659,7 @@ fn expand_macrolet(mut form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
 
 /// Expand SYMBOL-MACROLET: (symbol-macrolet ((sym expansion)...) body...)
 /// Install symbol-macro bindings in the environment.
-/// Expand body in the augmented env. Strip SYMBOL-MACROLET from output (spec §4.2.7).
+/// Expand body in the augmented env. Strip SYMBOL-MACROLET from output.
 fn expand_symbol_macrolet(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted_ref!(_form_root = &mut form);
     let args = unsafe { cons_cdr(form) };

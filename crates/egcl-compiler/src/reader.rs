@@ -1,9 +1,87 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! CL Reader — converts character streams into Lisp objects.
+//! The Common Lisp reader: characters to Lisp objects, over an in-memory
+//! buffer or a live stream, honouring readtables, `*read-base*`,
+//! `*read-suppress*`, `*read-eval*`, `*read-default-float-format*`, and
+//! circular-structure labels.
 //!
-//! Implements the CLHS §2.2 reader algorithm. See spec §4.1.
+//! # Purpose and boundaries
+//!
+//! This module parses. It does not own symbols, packages, readtable objects,
+//! or evaluation: symbol interning and lookup delegate to `egcl_rt::symbols`,
+//! package existence to `egcl_rt::packages`, and everything that needs the
+//! evaluator or the standard library is reached through hooks the runtime
+//! installs at startup:
+//!
+//! * `set_read_eval_hook` — evaluates `#.` forms (a built-in evaluator
+//!   handles constant arithmetic when no hook is installed).
+//! * `set_macro_handler_invoker` / `set_plain_macro_invoker` — call
+//!   user-defined reader macros and dispatch sub-characters (bliss-r4mk).
+//! * `set_readtable_getter` — the current `*readtable*` object.
+//! * `set_symbol_resolver` — package-aware symbol resolution for
+//!   `pkg:sym` / `pkg::sym` / `:keyword` tokens.
+//! * `set_pathname_constructor` / `set_struct_constructor` — `#P` and `#S`.
+//!
+//! # Entry points
+//!
+//! * [`read_from_string`] / [`read_from_string_with_base`] — one form from a
+//!   `&str`; returns the object and the index just past it.
+//! * [`read_form_at`] — one form from an already-collected `&[char]` at a
+//!   position. Reading N forms from one buffer this way is linear in the
+//!   buffer length rather than quadratic (bliss-lb6.5); callers that loop
+//!   should run [`check_nesting`] once up front.
+//! * [`read_from_stream`] — one form from a [`ReaderStream`], pulling
+//!   characters on demand and leaving exactly the lookahead the stream's
+//!   one-character unread buffer can hold. No prefix retries.
+//! * [`read`] over a [`ReaderState`] — only for simple-string-backed stream
+//!   objects; other inputs are a stream error. `ReaderState` bundles the
+//!   per-read settings (base, suppress, eval, circular labels).
+//! * [`read_symbol_token`], [`read_char_literal`], `make_bit_vector` and the
+//!   readtable operations (`make_readtable`, `copy_readtable`,
+//!   `set_macro_character`, `set_dispatch_macro_character`,
+//!   `set_syntax_from_char`, …) are used directly by the standard library.
+//!
+//! # Algorithm
+//!
+//! `read_form_input` is the core. It skips whitespace and comments (`;`,
+//! `#|…|#`), gives any user macro character bound in the current readtable
+//! first refusal, then dispatches on the first character:
+//!
+//! * `(` → `read_list`, with dotted-pair handling;
+//! * `"` → `read_string`, with `\` escapes;
+//! * `'`, `` ` ``, `,`, `,@`, `,.` → the quote family as two-element lists;
+//! * `#` → `read_sharpsign`: `#\` characters, `#(` vectors, `#*` bit
+//!   vectors, `#:` uninterned symbols, `#.` read-time eval, `#+`/`#-` feature
+//!   expressions evaluated against the runtime feature list (a suppressed
+//!   form is skipped by the `skip_*` family without allocating), `#|` block
+//!   comments, `#'`, `#C`, `#P`, `#S`, `#nA`, `#B`/`#O`/`#X`/`#nR` radix
+//!   integers and ratios, and `#n=`/`#n#` circular labels resolved through a
+//!   label table after the enclosing form is complete;
+//! * otherwise an atom: `collect_token` accumulates constituents with `\`
+//!   and `|…|` escapes, then `parse_token_with_base` tries a number (integer
+//!   in the current base, ratio reduced by GCD, decimal float whose exponent
+//!   marker or the default float format picks single or double, bignums
+//!   beyond fixnum range) and otherwise produces a symbol after readtable-case
+//!   folding and package resolution.
+//!
+//! Every allocation that can trigger a moving GC roots the partially-built
+//! object (`rooted!`); the circular-label table is itself rooted.
+//!
+//! # Readtables
+//!
+//! Macro-character and dispatch tables are global `OrderedMutex` maps keyed
+//! by `(readtable identity, char)`, and per-readtable character syntax
+//! overrides support `SET-SYNTAX-FROM-CHAR`. Three atomic flags
+//! (`ANY_NONUPCASE_CASE`, `ANY_CUSTOM_MACROS`, `ANY_CHAR_SYNTAX_OVERRIDE`)
+//! let the common case — the standard readtable, untouched — skip the table
+//! lookups entirely.
+//!
+//! # Limits
+//!
+//! Nesting is capped at `MAX_READER_NESTING` (4096) and reported as a reader
+//! error rather than a stack overflow. `read` over a `ReaderState` accepts
+//! only simple strings; live streams must use `read_from_stream`.
 
 use std::collections::HashMap;
 use egcl_rt::error::EgclError;
@@ -545,7 +623,7 @@ fn alloc_cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
 }
 
 fn alloc_string(s: &str) -> EgclVal {
-    // Compact simple string (SBCL model, spec §1.6.3). A reader literal is
+    // Compact simple string (SBCL model). A reader literal is
     // immutable (mutating an interned literal is undefined and rejected), so it
     // is stored at the NARROWEST width — an 8-bit SIMPLE_BASE_STRING when every
     // code point < 256, else a 32-bit SIMPLE_CHARACTER_STRING (bliss-em3p).
@@ -917,9 +995,6 @@ impl ReaderState {
     }
     pub fn set_read_eval(&mut self, eval: bool) {
         self.read_eval = eval;
-    }
-    pub fn set_read_circular(&mut self, circular: bool) {
-        self.read_circular = circular;
     }
 }
 
@@ -2352,7 +2427,7 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<EgclVal>
     }
     // Integer with read_base. Integers that fit the 61-bit fixnum range are
     // immediates; anything larger (including values that overflow i64) becomes
-    // a bignum (§1.8.1) rather than silently degrading to a symbol.
+    // a bignum rather than silently degrading to a symbol.
     let trimmed = s.trim_start_matches('+');
     if let Ok(n) = i64::from_str_radix(trimmed, read_base) {
         if fits_fixnum(n) {
@@ -2584,7 +2659,7 @@ fn parse_bignum(s: &str, base: u32) -> Option<EgclVal> {
     Some(alloc_bignum(sign, &limbs))
 }
 
-/// Allocate a BIGNUM heap object (§1.8.1): header + sign + n_limbs + limbs.
+/// Allocate a BIGNUM heap object: header + sign + n_limbs + limbs.
 fn alloc_bignum(sign: i32, limbs: &[u64]) -> EgclVal {
     let n = limbs.len();
     let total_size = 16 + n * 8;
