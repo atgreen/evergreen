@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Compiled self-calls that use runtime dispatch now preserve pending errors
+  and nonlocal exits instead of continuing execution after the call
+  ([#10](https://github.com/atgreen/evergreen/pull/10)).
+
 - Image-saving options now remain valid when pathname or option evaluation
   triggers a moving garbage collection, preventing corrupted option traversal
   in `SAVE-LISP-AND-DIE` and `%SAVE-CORE`
