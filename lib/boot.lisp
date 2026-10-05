@@ -4407,6 +4407,101 @@ a hook error aborts startup.")
 (defun egcl-ext::store-barrier () (egcl::%memory-fence :write))
 (export '(egcl-ext::memory-barrier egcl-ext::load-barrier egcl-ext::store-barrier) :egcl-ext)
 
+(export (mapcar (lambda (name) (intern name :egcl-ext))
+                '("CAS" "ATOMIC-INCF" "ATOMIC-DECF"))
+        :egcl-ext)
+
+(in-package :egcl-ext)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun egcl::%cas-expansion (access old new)
+    (cond
+      ((symbolp access)
+       `(egcl::%cas-symbol-value ',access ,old ,new))
+      ((and (consp access) (eq (car access) 'quote)
+            (symbolp (cadr access)) (null (cddr access)))
+       `(egcl::%cas-symbol-value ',(cadr access) ,old ,new))
+      ((not (consp access))
+       (error "CAS does not support the place ~s" access))
+      ((eq (car access) 'car)
+       `(egcl::%cas-car ,(cadr access) ,old ,new))
+      ((eq (car access) 'cdr)
+       `(egcl::%cas-cdr ,(cadr access) ,old ,new))
+      ((eq (car access) 'svref)
+       `(egcl::%cas-svref ,(cadr access) ,(caddr access) ,old ,new))
+      ((eq (car access) 'symbol-value)
+       `(egcl::%cas-symbol-value ,(cadr access) ,old ,new))
+      ((eq (car access) 'symbol-plist)
+       `(egcl::%cas-symbol-plist ,(cadr access) ,old ,new))
+      ((eq (car access) 'slot-value)
+       `(egcl::%cas-slot ,(cadr access) ,(caddr access) ,old ,new))
+      ((and (symbolp (car access)) (null (cddr access)))
+       `(egcl::%cas-accessor ,(cadr access) ',(car access) ,old ,new))
+      (t (error "CAS does not support the place ~s" access))))
+
+  (defmacro cas (place old new &environment env)
+    (let ((original-place place)
+          (place (egcl::%macroexpand-place place env)))
+      (multiple-value-bind (temps values stores writer reader)
+          (get-setf-expansion place env)
+        (declare (ignore stores writer))
+        (let ((expected (gensym "EXPECTED"))
+              (replacement (gensym "REPLACEMENT")))
+          `(let* (,@(mapcar #'list temps values)
+                  (,expected ,old)
+                  (,replacement ,new))
+             ,(if (symbolp original-place)
+                  `(egcl::%cas-symbol-value
+                     ',original-place ,expected ,replacement)
+                  (egcl::%cas-expansion reader expected replacement)))))))
+
+  (defun egcl::%atomic-update-expansion (operation place delta subtract env)
+    (let ((amount (gensym "DELTA")))
+      (if (symbolp place)
+          `(let ((,amount ,delta))
+             (egcl::%atomic-update-symbol ',place ,amount ,subtract))
+          (let ((place (egcl::%macroexpand-place place env)))
+            (multiple-value-bind (temps values stores writer reader)
+                (get-setf-expansion place env)
+              (declare (ignore stores writer))
+              `(let* (,@(mapcar #'list temps values) (,amount ,delta))
+                 ,(cond
+                    ((and (consp reader) (eq (car reader) 'svref))
+                     `(egcl::%atomic-update-svref
+                        ,(cadr reader) ,(caddr reader) ,amount ,subtract))
+                    ((and (consp reader) (symbolp (car reader))
+                          (not (eq (car reader) 'quote))
+                          (null (cddr reader)))
+                     `(egcl::%atomic-update-accessor
+                        ,(cadr reader)
+                        ,(intern (symbol-name (car reader)) :keyword)
+                        ,amount ,subtract))
+                    (t (error "~a does not support the place ~s"
+                              operation place)))))))))
+
+  (defmacro atomic-incf (place &optional (delta 1) &environment env)
+    (egcl::%atomic-update-expansion "ATOMIC-INCF" place delta nil env))
+
+  (defmacro atomic-decf (place &optional (delta 1) &environment env)
+    (egcl::%atomic-update-expansion "ATOMIC-DECF" place delta t env)))
+
+(in-package :common-lisp)
+
+(let ((extensions '(egcl-ext:cas egcl-ext:atomic-incf egcl-ext:atomic-decf
+                    egcl-ext:memory-barrier egcl-ext:load-barrier
+                    egcl-ext:store-barrier)))
+  (import extensions :sb-ext)
+  (export extensions :sb-ext))
+
+(let ((thread-symbols nil))
+  (do-external-symbols (symbol :egcl-thread)
+    (push symbol thread-symbols))
+  (setq thread-symbols
+        (append thread-symbols
+                '(egcl-ext:cas egcl-ext:atomic-incf egcl-ext:atomic-decf)))
+  (import thread-symbols :sb-thread)
+  (export thread-symbols :sb-thread))
+
 ;;; Owned logical snapshots: no live stack pointers or invented native locals.
 (defpackage :egcl-debug (:use :common-lisp)
   (:export :list-backtrace :print-backtrace))

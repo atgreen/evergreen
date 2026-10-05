@@ -486,8 +486,8 @@ pub struct ConsCell {
 pub struct SymbolData {
     pub header: ObjectHeader,
     pub name: EgclVal,
-    pub value: EgclVal,
-    pub function: EgclVal,
+    pub value: core::sync::atomic::AtomicU64,
+    pub function: core::sync::atomic::AtomicU64,
     pub plist: EgclVal,
     pub package: EgclVal,
     pub flags: u32,

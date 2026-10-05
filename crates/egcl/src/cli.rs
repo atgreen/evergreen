@@ -689,11 +689,13 @@ fn seed_standard_packages_registry() {
     let _ = egcl_stdlib::make_package("KEYWORD", &[], &[]);
     let _ = egcl_stdlib::make_package("EGCL-INTERNAL", &[], &[]);
     let _ = egcl_stdlib::make_package("EGCL-EXT", &[], &["COMMON-LISP"]);
+    let _ = egcl_stdlib::make_package("SB-EXT", &[], &["COMMON-LISP"]);
     let _ = egcl_stdlib::make_package("EGCL-FFI", &[], &["COMMON-LISP"]);
     // Native-thread API package (§13.9). EGCL-THREADS is the deprecated
     // compatibility nickname (spec §13.9.1). Fibers get a separate EGCL-FIBER
     // package (bliss-l3wy).
     let _ = egcl_stdlib::make_package("EGCL-THREAD", &["EGCL-THREADS"], &["COMMON-LISP"]);
+    let _ = egcl_stdlib::make_package("SB-THREAD", &[], &["COMMON-LISP"]);
     let _ = egcl_stdlib::make_package("EGCL-FIBER", &[], &["COMMON-LISP"]);
     // CLtL2 lexical-environment access (§4.14), the package a portability layer
     // such as trivial-cltl2 USEs — EGCL's counterpart of SB-CLTL2.
@@ -712,8 +714,10 @@ fn seed_standard_packages_registry() {
         "KEYWORD",
         "EGCL-INTERNAL",
         "EGCL-EXT",
+        "SB-EXT",
         "EGCL-FFI",
         "EGCL-THREAD",
+        "SB-THREAD",
         "EGCL-FIBER",
         "EGCL-CLTL2",
         "EGCL-PYTHON",
@@ -2847,6 +2851,13 @@ fn global_macro_insert(name: String, def: MacroDef) {
     install_evaluator_global_root_scanner();
     debug_validate_form("defmacro", &name, def.params_form);
     debug_validate_form("defmacro", &name, def.body);
+    let name = if let Some(rest) = name.strip_prefix("EGCL-EXT::") {
+        format!("EGCL-EXT:{rest}")
+    } else if let Some(rest) = name.strip_prefix("EGCL-INTERNAL::") {
+        format!("EGCL-INTERNAL:{rest}")
+    } else {
+        name
+    };
     let mut macros = GLOBAL_MACROS.lock().unwrap();
     macros.insert(name, def);
     bump_macro_env_generation();
@@ -16810,6 +16821,88 @@ fn eval_builtin_arguments(
     evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler")
 }
 
+fn eval_atomic_update_form(
+    name: &str,
+    forms: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    let forms = RootedVals::new(list_to_vec(forms));
+    if forms.is_empty() || forms.len() > 2 {
+        return Err(EgclError::ProgramError(format!(
+            "{name} requires a place and an optional delta"
+        )));
+    }
+    let subtract = name.ends_with("ATOMIC-DECF");
+    let place = forms[0];
+    let delta_form = forms.get(1).copied();
+
+    if place.is_symbol() {
+        egcl_rt::rooted!(delta = match delta_form {
+            Some(form) => eval_form(form, env)?,
+            None => EgclVal::from_fixnum(1),
+        });
+        return egcl_rt::symbols::atomic_update_symbol_value(
+            place.as_symbol_index(),
+            *delta,
+            subtract,
+        )
+        .ok_or_else(|| EgclError::Internal("unknown atomic symbol cell".into()))?;
+    }
+    if !place.is_cons() {
+        return Err(EgclError::ProgramError(format!(
+            "{name} does not support this place"
+        )));
+    }
+
+    let (operator, arguments) = cp(place);
+    if !operator.is_symbol() {
+        return Err(EgclError::ProgramError(format!(
+            "{name} does not support this place"
+        )));
+    }
+    let operator_name = sym_name(operator);
+    let place_arguments = RootedVals::new(list_to_vec(arguments));
+    if symbol_bare_name(&operator_name) == "SVREF" && place_arguments.len() == 2 {
+        egcl_rt::rooted!(vector = eval_form(place_arguments[0], env)?);
+        egcl_rt::rooted!(index = eval_form(place_arguments[1], env)?);
+        egcl_rt::rooted!(delta = match delta_form {
+            Some(form) => eval_form(form, env)?,
+            None => EgclVal::from_fixnum(1),
+        });
+        if !index.is_fixnum() || index.as_fixnum() < 0 {
+            return Err(EgclError::TypeError {
+                datum: *index,
+                expected: "non-negative FIXNUM index".into(),
+            });
+        }
+        return egcl_stdlib::sequences::atomic_update_svref(
+            *vector,
+            index.as_fixnum() as usize,
+            *delta,
+            subtract,
+        );
+    }
+    if place_arguments.len() == 1 {
+        egcl_rt::rooted!(instance = eval_form(place_arguments[0], env)?);
+        egcl_rt::rooted!(delta = match delta_form {
+            Some(form) => eval_form(form, env)?,
+            None => EgclVal::from_fixnum(1),
+        });
+        let slot = accessor_slot_symbol_cached_by_name(env, *instance, &operator_name)
+            .ok_or_else(|| {
+                EgclError::ProgramError(format!(
+                    "{operator_name} is not a structure-slot accessor"
+                ))
+            })?;
+        return egcl_stdlib::clos::atomic_update_slot_value(
+            *instance, slot, *delta, subtract,
+        );
+    }
+    Err(EgclError::ProgramError(format!(
+        "{name} does not support this place"
+    )))
+}
+
 fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // FORM itself outlives several allocating lookups before it is handed to
     // EXPAND-MACRO below, so it is rooted with the other two rather than left as
@@ -16860,9 +16953,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             (funs.contains_key(&name) || funs.contains_key(&*bare))
                 && !(macros.contains_key(&name) || macros.contains_key(&*bare))
         };
+        if matches!(
+            symbol_bare_name(&name).as_str(),
+            "ATOMIC-INCF" | "ATOMIC-DECF"
+        ) {
+            return eval_atomic_update_form(&name, cdr, env);
+        }
         if !shadowed_by_lexical_function && let Some(mdef) = lookup_macro(env, &name) {
-            let expanded = expand_macro(&mdef, cdr, env, form)?;
-            return eval_form(expanded, env);
+            egcl_rt::rooted!(expanded = expand_macro(&mdef, cdr, env, form)?);
+            return eval_form(*expanded, env);
         }
 
         // Fixed-arity builtin arg-count check: calling a function with the wrong
@@ -17382,7 +17481,21 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.clear_mv();
                 return apply_builtin(&name, &args, env);
             }
-            "EGCL::%POSIX" | "EGCL::%TEXT-CODEC" | "EGCL::%MEMORY-FENCE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%POSIX"
+            | "EGCL::%TEXT-CODEC"
+            | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%CAS-CAR"
+            | "EGCL::%CAS-CDR"
+            | "EGCL::%CAS-SVREF"
+            | "EGCL::%CAS-SYMBOL-VALUE"
+            | "EGCL::%CAS-SYMBOL-PLIST"
+            | "EGCL::%CAS-SLOT"
+            | "EGCL::%CAS-ACCESSOR"
+            | "EGCL::%ATOMIC-UPDATE-SYMBOL"
+            | "EGCL::%ATOMIC-UPDATE-SVREF"
+            | "EGCL::%ATOMIC-UPDATE-ACCESSOR" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "EGCL::%FOREIGN-MEMORY" => {
                 if env.sandbox {
                     return Err(EgclError::SandboxViolation("FFI access denied".into()));
@@ -31888,6 +32001,12 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         return form;
     }
     let name = sym_name(car);
+    if matches!(
+        symbol_bare_name(&name).as_str(),
+        "ATOMIC-INCF" | "ATOMIC-DECF"
+    ) {
+        return form;
+    }
 
     // 1. Macro call → expand once, then recurse into the expansion. On any
     //    expander error, leave the original form for the lazy path.
@@ -35468,6 +35587,16 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%POSIX"
             | "EGCL::%TEXT-CODEC"
             | "EGCL::%MEMORY-FENCE"
+            | "EGCL::%CAS-CAR"
+            | "EGCL::%CAS-CDR"
+            | "EGCL::%CAS-SVREF"
+            | "EGCL::%CAS-SYMBOL-VALUE"
+            | "EGCL::%CAS-SYMBOL-PLIST"
+            | "EGCL::%CAS-SLOT"
+            | "EGCL::%CAS-ACCESSOR"
+            | "EGCL::%ATOMIC-UPDATE-SYMBOL"
+            | "EGCL::%ATOMIC-UPDATE-SVREF"
+            | "EGCL::%ATOMIC-UPDATE-ACCESSOR"
             | "EGCL::%NATIVE-FIBER"
             | "EGCL::%FOREIGN-MEMORY"
             | "EGCL::%FOREIGN-LIBRARY"

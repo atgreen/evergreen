@@ -14,6 +14,7 @@ pub const RUNTIME_BUILD_FEATURES: &[&str] = &[
 ];
 
 mod ansi_symbols;
+pub mod atomics;
 
 /// Unit fixtures that reset the shared heap or CLOS definitions must not
 /// invalidate another fixture's objects or derived-cache measurements.
