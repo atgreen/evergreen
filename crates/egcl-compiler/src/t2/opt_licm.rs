@@ -1,24 +1,77 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4b — Loop-invariant code motion (spec §4.5 R4.34, §4.5.6).
+//! Loop-invariant code motion over the T2 SSA IR.
 //!
-//! **Parcel P4b.** Detect natural loops via back-edge analysis over the
-//! dominator tree, insert (or reuse) a loop **preheader**, and hoist pure,
-//! loop-invariant instructions into it. MUST NOT hoist effectful / guard /
-//! call instructions, memory accesses, or anything that could change deopt
-//! behaviour. All loop-detection logic lives here (the frozen
-//! `pass::LoopForest::compute` stub is a no-op we deliberately do not depend
-//! on).
+//! # Purpose
 //!
-//! Correctness notes:
-//!  * SSA dominance is preserved: a preheader is the sole non-back-edge
-//!    predecessor of its header, so it dominates the header and (transitively)
-//!    every loop-body block — a value defined in the preheader still dominates
-//!    all of its original in-loop uses.
-//!  * The deopt invariant (spec §4.10 R4.60) holds trivially: we only relocate
-//!    pure, non-guard instructions (which carry no `FrameState`) and never
-//!    change any value's identity, so no `FrameState` operand is orphaned.
+//! [`Licm`] finds natural loops, gives each a preheader, and moves pure
+//! loop-invariant instructions out of the body into that preheader. It owns
+//! its own loop detection (a back-edge scan over the dominator tree), as does
+//! `opt_guard`; `pass::Analyses` caches only the dominator tree. The pass never
+//! touches effectful, guard, call, safepoint, or
+//! terminator instructions and never hoists memory accesses, so it cannot
+//! change deopt behaviour: nothing it moves carries a `FrameState`, and no
+//! value identity changes.
+//!
+//! Not in the production T2 pipeline today (the driver runs fold, GVN, guard
+//! elimination, DCE); exercised by the integration tests.
+//!
+//! # Contract
+//!
+//! **Input:** a well-formed `Function` in block-parameter SSA. Loops may have
+//! several back-edges and several entry edges.
+//!
+//! **Output:** the same function with, for each loop that had something to
+//! hoist, a preheader block that is the header's sole non-back-edge
+//! predecessor and the hoisted instructions appended to it just before its
+//! `Jump`. If the header already had exactly one outside predecessor that
+//! jumps only to the header, that block is reused; otherwise a fresh block is
+//! synthesised, given parameters mirroring the header's, and every outside
+//! entry edge is redirected to it with its existing arguments. SSA dominance
+//! is preserved because the preheader dominates the header and hence every
+//! body block. `Analyses::invalidate` is called when anything moved.
+//!
+//! # Algorithm
+//!
+//! 1. **Loop detection.** For each edge `b → h` where `h` dominates `b`, the
+//!    body is `{h} ∪ {n : n reaches b without passing through h}` (backward
+//!    flood from `b` that never expands past `h`). Bodies for back-edges that
+//!    share a header are unioned into one `NaturalLoop`.
+//! 2. **Candidate selection**, to a fixpoint per loop. An instruction is
+//!    hoistable when `is_pure_hoistable` accepts it (no effectful / guard /
+//!    call / terminator / safepoint flag, and its opcode is on the
+//!    `opcode_hoist_safe` allow-list: constants, fixnum/float/generic
+//!    arithmetic, logic, box/unbox, comparisons, `TypeCheck`, `InstanceOf`)
+//!    and every operand is defined outside the body or is itself already
+//!    marked for hoisting. The fixpoint is what lets a chain of invariants
+//!    hoist together; discovery order respects operand dependencies.
+//! 3. **Preheader** via `ensure_preheader` (reuse or synthesise, above).
+//! 4. **Relocation.** Hoisted instructions are removed from their body blocks
+//!    and inserted into the preheader before its terminator, in discovery
+//!    order.
+//!
+//! # OSR interaction (bliss-enc)
+//!
+//! An OSR entry block is an alternate CFG entry that jumps straight into the
+//! loop header importing the live loop-carried slots. The header does not
+//! dominate it (it is not even reachable from the function entry), so it
+//! classifies as an outside predecessor and is redirected through the
+//! synthesised preheader like the normal entry edge. That is what makes
+//! hoisting safe on the OSR path. The ordering requirement this implies: the
+//! OSR entry region must be materialised in the CFG **before** LICM runs. An
+//! OSR edge added after hoisting would bypass the preheader and skip the
+//! hoisted computations. `hoist_respects_preexisting_osr_entry` pins this.
+//!
+//! # Limits
+//!
+//! * No alias analysis, so every memory opcode is pinned, including loads
+//!   whose address is invariant.
+//! * Nested loops are treated as independent flat bodies; an instruction is
+//!   hoisted one level per pass run, not to the outermost valid loop.
+//! * Hoisting is unconditional with respect to execution frequency: an
+//!   instruction on a conditional path inside the body is still hoisted if
+//!   pure and invariant, which is safe (pure) but may compute an unused value.
 
 use crate::t2::ir::{
     AuxData, Block, BlockCall, DominatorTree, Function, Inst, InstData, InstFlags, Opcode, ValueDef,
@@ -66,7 +119,7 @@ impl NaturalLoop {
     }
 }
 
-/// Identify natural loops (spec §4.5.6.1): a CFG edge `b → h` is a back-edge
+/// Identify natural loops: a CFG edge `b → h` is a back-edge
 /// when `h` dominates `b`; the loop body is `{h} ∪ {n : n reaches b without
 /// passing through h}`. Bodies for back-edges that share a header are unioned.
 fn detect_loops(f: &Function, dom: &DominatorTree) -> Vec<NaturalLoop> {
@@ -191,10 +244,10 @@ fn build_inst_block(f: &Function) -> Vec<Option<Block>> {
 }
 
 /// Is instruction `i` pure and shape-eligible for hoisting? Rejects anything
-/// effectful / guard / call / terminator / safepoint (spec §4.5.6.2), and —
-/// conservatively — every memory-access opcode, honouring §4.5.6.3 rules 2 & 4
-/// (loads need proven-invariant addresses; write-barriers must stay adjacent to
-/// their stores). We do not yet do alias analysis, so memory ops are pinned.
+/// effectful / guard / call / terminator / safepoint, and — conservatively —
+/// every memory-access opcode: a load would need a proven-invariant address and
+/// a write barrier must stay adjacent to its store. We do not yet do alias
+/// analysis, so memory ops are pinned.
 fn is_pure_hoistable(f: &Function, i: Inst) -> bool {
     let data = f.inst(i);
     let fl: InstFlags = data.flags;
@@ -290,8 +343,8 @@ fn operands_invariant(
 /// existing clean entry predecessor when possible, otherwise synthesises one
 /// and redirects all non-back-edge entry edges through it.
 ///
-/// OSR safety (bliss-enc, spec §4.6). An OSR entry block (`osr_entry::
-/// build_osr_entry`) is an alternate CFG entry that jumps straight into the loop
+/// OSR safety (bliss-enc). An OSR entry block is an alternate CFG entry that
+/// jumps straight into the loop
 /// header importing the live loop-carried slots. It is a genuine non-back-edge
 /// predecessor of the header (the header does not dominate it — it is not even
 /// reachable from `f.entry()`), so it lands in `outside` and is redirected
@@ -682,17 +735,34 @@ mod tests {
         );
     }
 
-    /// OSR pre-header-bypass guardrail (bliss-enc, spec §4.6).
+    /// OSR pre-header-bypass guardrail (bliss-enc).
     ///
     /// Build a counted loop with a hoistable loop-invariant, then materialise an
     /// OSR entry block (the alternate entry that jumps straight into the header)
     /// *before* running LICM. LICM must treat the OSR edge as a genuine
     /// alternate predecessor and route it *through* the synthesised preheader so
     /// the hoisted invariant is still computed on the OSR path — never bypassed.
+    /// An alternate entry block whose parameters mirror `header`'s and whose
+    /// terminator jumps into `header` with them: the IR shape an OSR entry
+    /// region takes once its imports have been materialised.
+    fn build_osr_entry(f: &mut Function, header: Block) -> Block {
+        let slots: Vec<_> = f
+            .block(header)
+            .params
+            .iter()
+            .map(|&p| (f.value(p).ty, f.value(p).repr))
+            .collect();
+        let entry_block = f.make_block();
+        let args: Vec<Value> = slots
+            .into_iter()
+            .map(|(ty, repr)| f.add_block_param(entry_block, ty, repr))
+            .collect();
+        f.set_terminator(entry_block, jump(header, args));
+        entry_block
+    }
+
     #[test]
     fn hoist_respects_preexisting_osr_entry() {
-        use crate::t2::osr_entry::build_osr_entry;
-
         let mut f = Function::new("osr_loop");
         let (ty, repr) = tagged_fixnum();
 
@@ -742,9 +812,9 @@ mod tests {
 
         // Materialise the OSR entry region BEFORE LICM (the required ordering).
         // It becomes an alternate, non-dominated predecessor of the header.
-        let osr = build_osr_entry(&mut f, header);
+        let osr_entry = build_osr_entry(&mut f, header);
         assert_eq!(
-            f.succs(osr.entry_block),
+            f.succs(osr_entry),
             vec![header],
             "freshly built OSR entry jumps straight to the header"
         );
@@ -778,7 +848,7 @@ mod tests {
         //     preheader, not left bypassing it into the header. So execution
         //     entering via OSR still computes the hoisted invariant.
         assert_eq!(
-            f.succs(osr.entry_block),
+            f.succs(osr_entry),
             vec![ph],
             "OSR entry must route through the preheader so the hoisted invariant \
              is not bypassed on the OSR path"
@@ -802,7 +872,11 @@ mod tests {
         // imported into the OSR block's own param (rerouting only changed the
         // terminator's target, not the imports).
         let _ = b;
-        assert_eq!(osr.imports.len(), 1, "one loop-carried slot imported");
+        assert_eq!(
+            f.block(osr_entry).params.len(),
+            1,
+            "one loop-carried slot imported"
+        );
     }
 
     // ── small InstData builders ──

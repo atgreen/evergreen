@@ -1,7 +1,109 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! System Z emission for the optimized SSA pipeline.
+//! System Z (s390x) machine-code emission for the T2 framed pipeline.
+//!
+//! # Purpose
+//!
+//! Turns an optimised SSA [`Function`] into executable z/Architecture code
+//! using the same activation contract as the x86 framed emitter: the body
+//! runs over an `EgclStack` activation of `activation_slots` tagged words,
+//! extended by the shadow-root slots this emitter needs at runtime calls. The
+//! module owns instruction selection for the opcode subset listed below, the
+//! native frame layout, GC-root synchronisation around every runtime call,
+//! sampled back-edge safepoint polls, OSR entry prologues, and the
+//! guard-failure exits that serialise a `FrameState` for the T0 resume
+//! adapter. It does not own the native transfer protocol: on this target a
+//! runtime call still ends with the checked `transfer_pending` test, and the
+//! s390x native-segment entry admits only call-free, scope-free bodies.
+//!
+//! The AArch64 and ppc64le emitters are structured identically and share
+//! [`RuntimeCalls`] and `rematerialization_order` from this file.
+//!
+//! # Design
+//!
+//! Register allocation runs (`allocate_framed_s390x`), but emission is
+//! home-based rather than allocation-driven. A value whose every reported
+//! `value_locations` range names the same location keeps it as its *home*
+//! (a callee-saved register r6–r12 or a frame slot); a value with split ranges
+//! gets a fresh stable frame slot. Each instruction loads its operands into
+//! fixed working registers, operates, and stores the result to its home. That
+//! costs moves an allocation-driven emitter would avoid, but keeps selection
+//! small and confines the architecture to this file.
+//!
+//! | role                                          | register |
+//! |-----------------------------------------------|----------|
+//! | primary working / first argument / result     | r2       |
+//! | secondary working / second argument           | r3       |
+//! | temporaries / third and fourth arguments      | r4, r5   |
+//! | address scratch (helper targets)              | r1       |
+//! | activation (frame-slots) pointer, whole body  | r13      |
+//! | stack pointer                                 | r15      |
+//!
+//! `PhysReg.encoding` is the architectural register number on this target.
+//!
+//! # Frame
+//!
+//! The prologue is `STMG r6,r15` into the caller's save area, the 160-byte
+//! linkage area, then `frame_bytes` more. Above r15+160, in order: spill slots
+//! (regalloc2's plus the stable homes added for split values), the edge
+//! parallel-copy buffer (max block-param count), the deopt serialisation buffer
+//! (max over frame states of four header words plus locals plus stack per
+//! scope), the remat buffer (max recipe count), and two words holding the saved
+//! call result and the poll countdown. Every access must fit a signed 20-bit
+//! displacement, so an oversized frame declines.
+//!
+//! The entry prologue copies the entry block's parameters from activation
+//! slots `0..n` into their homes. OSR entries are additional prologues, one per
+//! `osr_entries` record whose frame state is single-scope, stack-empty and
+//! all-tagged and whose every live home at the loop header can be imported from
+//! a slot; they are published as `(bcp, offset)` pairs in [`FramedCode`].
+//!
+//! # Runtime calls and GC roots
+//!
+//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv` and
+//! `TakeValuesToLocals` go through the C-ABI adapters in [`RuntimeCalls`]. The
+//! collector moves objects and cannot see a home register or native spill
+//! slot, so `runtime_call` clears every shadow slot to NIL, writes each live
+//! tagged value into the shadow area that follows `activation_slots` (roots
+//! first, then call arguments), makes the call, and reloads each root from its
+//! shadow before assigning results, so a dying argument that shares a home
+//! with the result cannot overwrite it. The live set per call is derived from
+//! the same regalloc2 ranges that chose homes: ranges covering the
+//! instruction's Late program point, plus its uses, minus its defs. Each site
+//! is recorded as a [`RootSyncSite`] and installation checks that the count
+//! matches `emitted_safepoints`.
+//!
+//! When `RuntimeCalls::transfer_pending` is nonzero it is called after every
+//! runtime call and a nonzero result takes the shared exit (NIL, epilogue).
+//! That is the checked legacy ABI; native transfer dispatch is x86-only.
+//!
+//! Back-edge polls: a block with a successor at or before itself in block
+//! order polls before its edge moves, decrementing a 256-count frame word and
+//! calling `poll` through the same root-synchronising path when it reaches
+//! zero. A function with a cycle but no `poll` adapter declines.
+//!
+//! # Supported opcodes
+//!
+//! Constants (`Const*` are folded; heap literals are loaded through their
+//! rooted constant-pool slot, never baked in), `Return`, `Jump`, two-way
+//! `Brif`, `Guard` for the FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on
+//! tagged single-floats, and `FixnumAdd/Sub/Mul/Neg` plus the five fixnum
+//! comparisons, all tag-guarded and deopting on overflow. Multiply uses the
+//! unsigned 128-bit `MLGR` product with a sign correction and requires the
+//! high half to equal the low half's sign extension. Everything else, including
+//! `Car`/`Cdr`, logical ops, shifts and any unboxed representation, returns
+//! `UnsupportedOp(0x390)` and the function stays at its current tier.
+//!
+//! # Deopt exits
+//!
+//! Each guard gets a cold label. The exit evaluates the frame state's remat
+//! recipes in dependency order into the remat buffer, serialises each scope as
+//! `(function, bcp, nlocals, nstack)` followed by its slot words into the
+//! deopt buffer, and calls `deopt_t2` with `(nscopes, nwords, buffer, 0)`. No
+//! home is written before an instruction's guards pass, so the exit always
+//! observes pre-instruction state. The adapter must root the stream before it
+//! allocates.
 
 use super::emit::{EmitError, FramedCode, RootSyncSite};
 use super::frame_state::{FrameState, FrameStateId, RematOp, ValueSource};

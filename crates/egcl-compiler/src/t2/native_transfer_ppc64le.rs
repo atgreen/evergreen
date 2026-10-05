@@ -1,13 +1,41 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! ELFv2 machine stubs for the native transfer ABI.
+//! ELFv2 (ppc64le) machine stubs for the native transfer ABI.
 //!
-//! The x86 transfer compiler uses a SysV capture image and x86 byte encodings.
-//! POWER has a different nonvolatile set and a fixed linkage area, so it gets a
-//! separate emitter rather than a target test around those encodings.  These
-//! stubs are usable by the future ppc64le transfer entry; keeping them here
-//! makes accidental installation of x86 bytes on Power impossible.
+//! The x86-64 stubs in native_transfer.rs define the protocol: a helper
+//! veneer that tests only the `NativeOutcome::exit` word and tail-jumps to a
+//! cold entry with `(request, value, exit)`, and a landing stub that enters a
+//! retained pad from a `(stack_pointer, entry)` packet. POWER has a different
+//! nonvolatile set, a fixed linkage area, a link register and a TOC, so it
+//! gets its own emitter rather than a target test around x86 byte encodings;
+//! keeping the two apart also makes accidental installation of x86 bytes on
+//! Power impossible.
+//!
+//! # What this file owns
+//!
+//! * [`emit_helper_veneer`] — a callable ELFv2 adapter owning a 64-byte
+//!   temporary frame. It saves LR and r2 in the ABI's linkage slots, keeps the
+//!   request at a fixed frame offset, calls the [`NativeHelperV2`] through the
+//!   count register with an outcome area in the same frame, then loads value
+//!   and exit into r4/r5. `Returned` moves the primary to r3, restores the
+//!   frame and returns; otherwise it reloads the request into r3, restores the
+//!   frame and branches to `cold_entry` with `(request, value, exit)` in
+//!   r3–r5. No Rust frame is crossed by the branch.
+//! * [`emit_native_landing_stub`] — loads r1 and the target from the packet
+//!   in r3, moves the primary from r4 to r3, and branches through CTR. The
+//!   source frame stays live; the selected pad owns its retirement.
+//!
+//! # What is missing
+//!
+//! There is no ppc64le capture stub: nothing here snapshots nonvolatile
+//! registers or calls a preparation routine, so the `SysvTransferCapture` /
+//! `SysvCaptureLocation` machinery has no counterpart on this target. The
+//! ppc64le native-segment entry therefore admits only bodies that cannot call
+//! back into Lisp, cross a control scope, or deopt; everything else uses the
+//! checked ABI. The unit test checks only that both stubs are non-empty
+//! 4-byte-aligned word sequences; execution is covered by the runtime's
+//! ppc64le segment probe.
 
 use egcl_rt::asm::Cc;
 use egcl_rt::asm_ppc64le::{frame, Asm};

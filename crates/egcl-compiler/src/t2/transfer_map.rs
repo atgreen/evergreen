@@ -1,11 +1,55 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Resolve exception capture at the throwing call, before physical frames retire.
-//! These maps name machine instruction indices and location keys, NOT
-//! emitted PCs or hardware save offsets. Emission must translate both and retain
-//! the executing definitions before installation can publish an unwind site.
-//! The framed variant resolves keys from the rich emitter's final stable homes.
+//! Per-call-site exception capture maps: which locations a transfer must read
+//! at a throwing `Invoke`, resolved before any physical frame retires.
+//!
+//! # Place in the transfer pipeline
+//!
+//! This is the first compiler-side step of the native transfer ABI. For every
+//! `Invoke` in a verified [`Function`] it produces a [`TransferCaptureMap`]
+//! naming the machine instruction, the throwing bytecode origin, the ordered
+//! control scopes active there, the lowered frame slots, and the subset of
+//! locations that are tagged GC roots. transfer_sites.rs later binds each map
+//! to an emitted return PC and physical access recipes; transfer_capture.rs
+//! allocates the run-time snapshot from it. Maps name machine instruction
+//! indices and `Location` keys only, never emitted PCs or hardware save
+//! offsets, and nothing here retains code or bytecode definitions.
+//!
+//! # Algorithm (`lower_transfer_maps`)
+//!
+//! 1. Verify the IR; collect the `Invoke` instructions in block order and
+//!    reject any machine `INVOKE` that does not trace to one of them.
+//! 2. For each call, find its unique machine `INVOKE` (safepoint set, same
+//!    frame state), require a single-scope frame state, and require the cold
+//!    successor to end in an `NlxTransfer` carrying `AuxData::TransferSite`
+//!    with the same frame state. That aux supplies `origin_bcp` and the
+//!    control scopes.
+//! 3. Read the call's own operand allocations from `inst_allocations`, taking
+//!    the `deopt_uses` tail as the `Value → Location` binding. The coarse
+//!    `MachFunc::allocation` table is never consulted: a split live range can
+//!    sit in different locations at two calls of one function, and the cold
+//!    continuation's allocations are not yet live at the throwing call.
+//! 4. Lower the frame state through `deopt::lower_one` against that binding
+//!    and collect the tagged roots (`InLocation` with `Rebox::None`, recursing
+//!    into remat inputs).
+//! 5. Require exactly one regalloc stack map at that instruction index, with
+//!    the same frame state, whose `live_refs` contain every collected root.
+//!
+//! Any failure is a `TransferMapError` and the function declines the transfer
+//! emitter rather than shipping a partial map.
+//!
+//! `lower_framed_transfer_maps` is the variant the rich x86 emitter uses. It
+//! runs the same checks, then rebinds every slot through the emitter's final
+//! stable homes (`FrameHomes`) rather than regalloc2's transient locations,
+//! substituting `Const` sources for values the emitter materialises as
+//! constants; a movable heap literal is still rejected by shared descriptor
+//! lowering. The emitter must publish roots from those final homes.
+//!
+//! # Limits
+//!
+//! Inlined scope composition is refused (`UnsupportedLogicalScopes`) until
+//! each logical frame carries its own ordered control-scope map.
 
 use crate::control_scope::ControlScope;
 use crate::t2::deopt::{self, LoweredScope, Rebox, SlotDescriptor};

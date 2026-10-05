@@ -418,3 +418,101 @@ fn function_info_clone_and_debug() {
     let _ = info.clone();
     assert!(format!("{:?}", FunctionInfo::Global).contains("Global"));
 }
+
+// ── Reader → macroexpand (ported from the retired pipeline suite) ──
+
+fn read_form(s: &str) -> EgclVal {
+    let (val, _) = egcl_compiler::reader::read_from_string(s).expect("read_from_string failed");
+    val
+}
+
+#[test]
+fn reader_to_macroexpand_self_evaluating() {
+    type Predicate = fn(EgclVal) -> bool;
+    let cases: &[(&str, Predicate)] = &[
+        ("42", |v| v.is_fixnum() && v.as_fixnum() == 42),
+        ("t", |v| v == T),
+        ("nil", |v| v == NIL),
+    ];
+    for &(src, check_fn) in cases {
+        let form = read_form(src);
+        assert!(check_fn(form), "read('{}') produced unexpected value", src);
+        let env = Environment::null();
+        let (expanded, did) = macroexpand_1(form, &env).unwrap();
+        assert!(!did, "'{}' should not be macro-expanded", src);
+        assert_eq!(expanded, form);
+    }
+}
+
+#[test]
+fn reader_to_macroexpand_symbol_macro() {
+    let form = read_form("MY-VAR");
+    let replacement = EgclVal::from_fixnum(99);
+    let env = Environment::null().augment_variable(form, VariableInfo::SymbolMacro(replacement));
+    let (expanded, did) = macroexpand_1(form, &env).unwrap();
+    assert!(did, "symbol macro should trigger expansion");
+    assert_eq!(expanded.as_fixnum(), 99);
+}
+
+#[test]
+fn reader_to_macroexpand_chained_expansion() {
+    let sym_a = read_form("CHAIN-A");
+    let sym_b = read_form("CHAIN-B");
+    let sym_c = read_form("CHAIN-C");
+    let env = Environment::null()
+        .augment_variable(sym_a, VariableInfo::SymbolMacro(sym_b))
+        .augment_variable(sym_b, VariableInfo::SymbolMacro(sym_c));
+    let (expanded, did) = macroexpand(sym_a, &env).unwrap();
+    assert!(did);
+    assert_eq!(expanded, sym_c);
+}
+
+#[test]
+fn reader_to_macroexpand_quoted_form_no_expand() {
+    let form = read_form("'foo");
+    assert!(form.is_cons());
+    let env = Environment::null();
+    let (expanded, did) = macroexpand(form, &env).unwrap();
+    assert!(!did);
+    assert_eq!(expanded, form);
+}
+
+#[test]
+fn macroexpand_all_on_atom() {
+    let form = read_form("123");
+    let env = Environment::null();
+    let result = macroexpand_all(form, &env).unwrap();
+    assert_eq!(result.as_fixnum(), 123);
+}
+
+#[test]
+fn macroexpand_all_on_compound_form() {
+    // A symbol macro inside (if MY-SM 1 2) is expanded only by a recursive walk.
+    let sym = read_form("MY-SM");
+    let replacement = EgclVal::from_fixnum(99);
+    let env = Environment::null().augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+    let form = read_form("(if MY-SM 1 2)");
+    assert!(form.is_cons());
+    let result = macroexpand_all(form, &env).unwrap();
+    assert!(result.is_cons());
+    assert_ne!(
+        result, form,
+        "macroexpand_all should expand symbol macros within subforms"
+    );
+}
+
+#[test]
+fn macroexpand_all_on_nested_compound_form() {
+    // The symbol macro sits inside an inner cons, so the walk must descend.
+    let sym = read_form("NESTED-SM");
+    let replacement = EgclVal::from_fixnum(42);
+    let env = Environment::null().augment_variable(sym, VariableInfo::SymbolMacro(replacement));
+    let form = read_form("(progn (+ NESTED-SM 2) 3)");
+    assert!(form.is_cons());
+    let result = macroexpand_all(form, &env).unwrap();
+    assert!(result.is_cons());
+    assert_ne!(
+        result, form,
+        "macroexpand_all should expand symbol macros in nested subforms"
+    );
+}

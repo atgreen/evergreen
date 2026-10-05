@@ -1,35 +1,99 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! The single per-safepoint source of truth for `{which slots are live, each
-//! slot's representation}` (bliss-ht4; spec §4.6 D4.09, §4.10 D4.15).
+//! The single per-safepoint producer of `{which interpreter slots are live,
+//! in what order, in what machine representation}` (bliss-ht4).
 //!
-//! OSR is deopt in reverse. At one safepoint two consumers describe the *same*
-//! interpreter frame:
+//! # Purpose
 //!
-//! * **export** — [`crate::t2::deopt`] lowers a [`FrameState`] into the A4.14
-//!   stack map that reconstructs a T0 frame on a failed guard. Each slot gets a
-//!   [`Rebox`] derived from its representation.
-//! * **import** — the OSR entry map (D4.09) transfers a live T0/T1 frame *into*
-//!   optimised code at a loop header. Each slot gets a [`ConversionKind`].
+//! One [`FrameState`] at a safepoint is read in two directions:
 //!
-//! If import and export derive liveness or representation by separate code
-//! paths they will drift — one deciding a slot is `UnboxedFixnum` while the
-//! other calls it `Tagged`. That is a miscompile no non-OSR test can see,
-//! because the export path is exercised constantly and the import path only on
-//! a loop that actually osr's. This module is the shared producer both sides
-//! read, so the two can only ever disagree by someone deliberately bypassing
-//! it.
+//! * **Export** (deopt.rs, and the native emitters' guard-deopt paths): lower
+//!   the frame state to the descriptors that rebuild an interpreter frame on a
+//!   failed guard. Each slot gets a rebox step derived from its representation.
+//! * **Import** (the OSR entry path): transfer a running lower-tier frame into
+//!   optimised code at a loop header. Each slot gets a conversion derived from
+//!   the same representation.
 //!
-//! ## The enumeration order is part of the contract
+//! If the two sides derived liveness, order, or representation by separate
+//! code, they would drift: one calling a slot `UnboxedFixnum` while the other
+//! calls it `Tagged` is a miscompile that no non-OSR test observes, because the
+//! export path runs constantly and the import path only on a loop that actually
+//! OSRs. This module is the one place both sides obtain those facts, so they
+//! can disagree only by bypassing it.
 //!
-//! [`slot_specs`] yields locals first (in slot order), then operand-stack slots
-//! bottom-to-top. `LoweredScope::slots` / `num_locals` and the OSR import list
-//! both index into that order, so changing it changes both consumers at once —
-//! which is the point.
+//! # Contract
+//!
+//! * [`slot_specs`] enumerates one [`FrameScope`]'s slots as [`SlotSpec`]s:
+//!   locals first in slot order, then operand-stack slots bottom to top. The
+//!   order is part of the contract: `LoweredScope::slots` / `num_locals` on the
+//!   export side and the OSR import list both index into it, so a change here
+//!   moves both consumers together.
+//! * [`source_repr`] is the only function that answers "what representation
+//!   does this slot have". `Value` reports its own `repr`; `Const` and
+//!   `Unbound` are `Tagged` by construction (an immediate and the unbound
+//!   marker are never raw machine words); `Remat` reports the recipe's declared
+//!   `result_repr`.
+//! * The producer is total. A dangling `Remat` id is a malformed frame state
+//!   that deopt lowering rejects, but `source_repr` still reports `Tagged` for
+//!   it so both consumers see the same slot count and fail on the same slot.
+//! * `SlotSpec.repr` is the machine representation only. It does not decide
+//!   GC-rootness: a `Const` heap literal is `Tagged` yet rooted by the constant
+//!   pool, and a `Remat` slot is recomputed cold rather than scanned. The
+//!   live-ref rule used by the export side is
+//!   `matches!(source, ValueSource::Value { .. }) && repr == Tagged`.
+//!
+//! The unit tests pin the type-level half of the invariant: for every
+//! `ValueRepresentation`, the export rebox and the import conversion must be
+//! inverses, so a representation that only one side learns about fails here
+//! rather than in an OSR'd loop.
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::ir::ValueRepresentation;
+
+/// Representation conversion applied to one slot when a lower-tier frame is
+/// imported into T2 code at an OSR entry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConversionKind {
+    /// No conversion needed.
+    None,
+    /// Unbox a tagged fixnum to a raw i64.
+    UnboxFixnum,
+    /// Unbox a tagged float to a raw f64.
+    UnboxFloat,
+    /// Box a raw i64 into a tagged fixnum.
+    BoxFixnum,
+    /// Box a raw f64 into a tagged float.
+    BoxFloat,
+    /// Widen a 32-bit integer to 64-bit.
+    WidenI32ToI64,
+}
+
+impl ConversionKind {
+    /// The OSR *import* conversion implied by a T2 value's machine
+    /// representation — the exact inverse of the deopt *export*
+    /// [`crate::t2::deopt::Rebox::for_repr`] (bliss-ht4).
+    ///
+    /// Both directions are derived here and there rather than by separate
+    /// ad-hoc matches, or a representation one side learns about and the other
+    /// does not becomes a miscompile visible only on an OSR'd loop.
+    ///
+    /// Returns `None` when this conversion vocabulary cannot express the
+    /// import. That is the case for `UnboxedF64`: export reboxes it by
+    /// heap-allocating a double-float, but `ConversionKind` distinguishes only
+    /// `UnboxFloat` (the single-float immediate), so there is no inverse. A
+    /// caller that gets `None` must decline the OSR entry rather than transfer
+    /// the slot unconverted.
+    pub fn for_repr(repr: ValueRepresentation) -> Option<ConversionKind> {
+        use ValueRepresentation as R;
+        match repr {
+            R::Tagged => Some(ConversionKind::None),
+            R::UnboxedFixnum => Some(ConversionKind::UnboxFixnum),
+            R::UnboxedF32 => Some(ConversionKind::UnboxFloat),
+            R::UnboxedF64 => None,
+        }
+    }
+}
 
 /// One interpreter slot at a safepoint, with the representation both the deopt
 /// export and the OSR import must agree on.
@@ -47,7 +111,7 @@ pub struct SlotSpec {
     /// Note this is the *machine* representation only. It does not by itself
     /// decide GC-rootness: a `Const` heap literal is `Tagged` yet is rooted
     /// immortally in the constant pool, and a `Remat` slot is recomputed on the
-    /// cold path rather than scanned. The A4.14 live-ref rule is
+    /// cold path rather than scanned. The export-side live-ref rule is
     /// `matches!(source, ValueSource::Value { .. }) && repr == Tagged`.
     pub repr: ValueRepresentation,
 }
@@ -101,7 +165,6 @@ pub fn num_locals(scope: &FrameScope) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::osr::ConversionKind;
     use crate::t2::deopt::Rebox;
     use crate::t2::frame_state::{RematOp, RematRecipe, RematRecipeId};
     use crate::t2::ir::Value;
@@ -136,7 +199,7 @@ mod tests {
                     Some(ConversionKind::UnboxFloat),
                 ) => {}
                 // Export can rebox an f64 (it heap-allocates a double-float);
-                // D4.09's ConversionKind vocabulary has no single/double
+                // the `ConversionKind` vocabulary has no single/double
                 // distinction, so there is no import conversion that can undo
                 // it. `None` records that honestly and the OSR entry is
                 // declined rather than emitted wrong.

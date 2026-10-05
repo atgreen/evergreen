@@ -1,56 +1,82 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P7 — FrameState metadata lowering & deopt runtime (spec §4.10 A4.14, §4.6 A4.04).
+//! FrameState lowering to resolved deopt descriptors, and the reference
+//! reconstruction that replays them.
 //!
-//! **Parcel P7. Owner: (sub-agent).** Lower each deoptimising instruction's
-//! `FrameState` (frame_state.rs, frozen) to the compiled `StackMap` form
-//! (mach.rs) once P6 has assigned locations: for each interpreter slot resolve
-//! its `ValueSource` — `Value` → its allocated `Location` (+ rebox note if the
-//! representation is unboxed), `Const` → materialise-immediate, `Unbound` →
-//! unbound-marker, `Remat` → cold-path recipe — producing exactly the shape the
-//! §4.6 A4.04 deopt handler consumes. Also sketch the resume-state reconstruction
-//! (given a StackMap + machine state → interpreter locals/stack). The
-//! `FrameScope.function` symbol is resolvable from the bytecode function name via
-//! `egcl_rt::symbols`. Unit-test the lowering on a hand-built FrameState +
-//! allocation, asserting each slot resolves to the expected descriptor.
+//! # Purpose
 //!
-//! ## The `Value → Location` assumption (contract gap owed by P5/P6)
+//! After register allocation has bound every SSA value to a [`Location`], each
+//! deoptimising instruction's [`FrameState`] can be resolved from "which value"
+//! to "which register or stack slot, and what to do with the raw word". This
+//! module owns that lowering ([`lower_one`], [`lower_frame_states`]) and its
+//! output model ([`LoweredDeopt`], [`LoweredScope`], [`SlotDescriptor`],
+//! [`Rebox`], [`RematDescriptor`]), plus [`reconstruct`], which evaluates the
+//! descriptors against a [`MachineState`] to produce tagged interpreter frames.
+//! Which slots exist and in what representation comes from slot_map.rs, not
+//! from here.
 //!
-//! A frozen `FrameState` names each live slot by its **SSA `Value`** (ir.rs),
-//! but the register allocator's result (`MachFunc.allocation`, mach.rs) is a
-//! `Vec<(VReg, Location)>` — a **`VReg → Location`** map. The missing link is
-//! `Value → VReg`, which lowering (P5) establishes when it selects machine
-//! instructions for each SSA value, and which nothing in the frozen surface yet
-//! exposes. The full binding A4.14 needs is therefore the composition
+//! # Contract
 //!
-//! ```text
-//!   Value  --(P5 lowering)-->  VReg  --(P6 regalloc)-->  Location
-//! ```
+//! **Input:** a `FrameState`, a `code_offset` to stamp on the result, and a
+//! `loc_of: Fn(Value) -> Option<Location>` binding. Lowering names slots by SSA
+//! `Value` while the allocator reports locations per `VReg`; the two are joined
+//! by the caller, since VReg numbers are assigned as the `Value` index. The
+//! production caller is transfer_map.rs, which builds `loc_of` from the
+//! `deopt_uses` positions of `inst_allocations` at the throwing call. There is
+//! no field on `mach::StackMap` for the resolved form, so lowering returns a
+//! side table rather than writing into `mf.stack_maps`.
 //!
-//! Until P5/P6 publish that composition, P7 takes it as an injected parameter:
-//! `lower_frame_states` accepts a `loc_of: Fn(Value) -> Option<Location>`
-//! closure. A real driver builds it from `mf.allocation` plus P5's value→vreg
-//! side table; `None` means "no location for a deopt-live value", which per
-//! R4.65 is a hard compile failure (`LowerError::Unallocated`) — the function
-//! stays at T1, never ships partial metadata.
+//! **Output:** one `LoweredDeopt` per frame state: `code_offset` plus one
+//! `LoweredScope` per `FrameState` scope, outermost first. A scope carries
+//! `resume_pc`, `function`, `slots` (locals then operand stack, in slot_map
+//! order), `num_locals` to split them, and `live_ref_bitmap`, set exactly for
+//! a `Tagged` `Value` slot. Each slot is one of:
 //!
-//! ## Other contract gaps noted for downstream parcels
+//! * `InLocation(loc, rebox)` — read `loc`, apply `rebox` (`None` for tagged,
+//!   `ReboxFixnum` = tag-shift, `ReboxF32` = pack a single-float immediate,
+//!   `ReboxF64` = heap-allocate a double-float).
+//! * `MaterializeConst(k)` — write the immediate. Only non-moving immediates
+//!   are accepted; a cons, heap object, or function presented as a constant is
+//!   `LowerError::MovingConst`, because such a value must stay a located SSA
+//!   value loaded from its rooted constant-pool slot.
+//! * `Unbound` — write the unbound marker.
+//! * `Remat(recipe)` — a `RematOp` over inputs that are themselves descriptors.
 //!
-//! * **No home for the lowered form in `mach::StackMap`.** `StackMap` carries a
-//!   `frame_state: Option<FrameStateId>` but no field for the *resolved*
-//!   descriptors. So `lower_frame_states` **returns** a `Vec<LoweredDeopt>`
-//!   side table (one per deopt stack map) rather than writing back into
-//!   `mf.stack_maps`. When mach.rs grows a `lowered: Option<LoweredDeopt>`
-//!   field, the driver can store these back; the algorithm is unchanged.
-//! * **F64 rebox needs a runtime double-float allocator.** A4.04 step 3 heap-
-//!   allocates a `double-float` when reboxing an `UnboxedF64`. That allocator is
-//!   a runtime service, not compiler state, so `reconstruct` obtains it through
-//!   the `MachineState::box_double` hook (mocked in tests).
-//! * **Heap-literal GC roots.** Moving heap literals remain ordinary `Value`
-//!   sources loaded through their rooted function constant-pool slots. They are
-//!   therefore covered by the same tagged-value liveness rule as other values;
-//!   `Const` sources are restricted to non-moving tagged immediates.
+//! **Failure** is a [`LowerError`]: an unallocated deopt-live value, a missing
+//! or over-deep (probably cyclic) recipe, a bad frame-state id, or a moving
+//! constant. Any of these aborts the compile; partial metadata is never
+//! installed.
+//!
+//! # Algorithm
+//!
+//! 1. For each scope, enumerate slots through `slot_map::slot_specs` so the
+//!    order and representation match the OSR import side.
+//! 2. Lower each source: `Value` → `loc_of` (or `Unallocated`) plus
+//!    `Rebox::for_repr`; `Const` → moving-reference check; `Remat` → fetch the
+//!    recipe and recurse on its inputs, bounded by `REMAT_MAX_DEPTH`.
+//! 3. Set the live-ref bit from the slot's source kind and `slot_map` repr.
+//!    A rematerialised value is never a root: it is recomputed, not scanned.
+//! 4. Assemble the `LoweredScope`s into a `LoweredDeopt`.
+//!
+//! [`reconstruct`] is the inverse: for each scope it reads every `InLocation`
+//! through `MachineState::read`, reboxes, replays recipes at the tagged level
+//! (box/unbox ops are no-ops on a tagged fixnum, arithmetic reads fixnums), and
+//! splits the results into `locals` and `stack`. `ReboxF64` needs the runtime's
+//! double-float allocator, supplied through `MachineState::box_double`; because
+//! that may collect, completed frames and the frame under construction are
+//! rooted for the duration, and the caller must root the returned frames
+//! before its next allocation. transfer_capture.rs is the production
+//! `MachineState`, replaying a captured transfer snapshot.
+//!
+//! # Scope limit
+//!
+//! The native emitters' own guard-deopt paths read `FrameState` and
+//! `slot_map` directly and emit their slot code inline; they do not go through
+//! `SlotDescriptor`. This module is the authority for the exception-transfer
+//! path and the round-trip tests, and `reconstruct` evaluates recipes at the
+//! tagged level rather than honouring `result_repr` for unboxed intermediates
+//! (the field is carried so that refinement is local).
 
 use crate::t2::frame_state::{FrameState, RematOp, RematRecipeId, ValueSource};
 use crate::t2::ir::{Value, ValueRepresentation};
@@ -58,15 +84,15 @@ use crate::t2::mach::{Location, MachFunc};
 use egcl_rt::value::{EgclVal, UNBOUND};
 
 /// Maximum rematerialisation-recipe nesting depth we will lower before giving
-/// up. A cyclic recipe (rejected by the verifier, R4.64) or a pathologically
+/// up. A cyclic recipe (rejected by the verifier) or a pathologically
 /// deep one fails lowering rather than blowing the stack.
 const REMAT_MAX_DEPTH: usize = 32;
 
-// ── Lowered descriptor model (the A4.14 output shape) ───────────────────────
+// ── Lowered descriptor model ────────────────────────────────────────────────
 
-/// The rebox step A4.04 step 3 applies to a slot's raw machine word before it is
-/// written into a tagged interpreter slot. Derived purely from the value's
-/// [`ValueRepresentation`] (D4.16): only `Tagged` needs no rebox.
+/// The rebox step applied to a slot's raw machine word before it is written
+/// into a tagged interpreter slot. Derived purely from the value's
+/// [`ValueRepresentation`]: only `Tagged` needs no rebox.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Rebox {
     /// Already a tagged `EgclVal`; write through unchanged.
@@ -81,7 +107,7 @@ pub enum Rebox {
 }
 
 impl Rebox {
-    /// The rebox implied by a value's machine representation (A4.14 `box_kind`).
+    /// The rebox implied by a value's machine representation.
     pub fn for_repr(repr: ValueRepresentation) -> Rebox {
         match repr {
             ValueRepresentation::Tagged => Rebox::None,
@@ -93,19 +119,18 @@ impl Rebox {
 }
 
 /// One interpreter slot resolved to a concrete deopt descriptor — the lowered
-/// form of a [`ValueSource`] (spec §4.10 A4.14). This is exactly what the §4.6
-/// A4.04 deopt handler consumes when reconstructing an interpreter frame.
+/// form of a [`ValueSource`]. This is what frame reconstruction consumes.
 #[derive(Clone, PartialEq, Debug)]
 pub enum SlotDescriptor {
     /// The value lives in `Location`; apply `Rebox` to the raw word before
-    /// writing the tagged interpreter slot (A4.04 step 3).
+    /// writing the tagged interpreter slot.
     InLocation(Location, Rebox),
-    /// Materialise a compile-time-constant immediate (A4.04 writes it directly).
+    /// Materialise a compile-time-constant immediate (written directly).
     MaterializeConst(EgclVal),
-    /// Not live in T2 → the interpreter slot receives UNBOUND-MARKER (A4.04
-    /// step 6). A later reference signals the correct CL error.
+    /// Not live in T2 → the interpreter slot receives UNBOUND-MARKER. A later
+    /// reference signals the correct CL error.
     Unbound,
-    /// Recompute on the cold deopt path from a lowered recipe (A4.13). Recipe
+    /// Recompute on the cold deopt path from a lowered recipe. Recipe
     /// inputs are themselves `SlotDescriptor`s, so rematerialisation composes.
     Remat(RematDescriptor),
 }
@@ -121,8 +146,7 @@ pub struct RematDescriptor {
     pub result_repr: ValueRepresentation,
 }
 
-/// The lowered deopt metadata for one trap site — the A4.14 `StackMapEntry`.
-/// Corresponds one-to-one with a deopt [`crate::t2::mach::StackMap`].
+/// The lowered deopt metadata for one trap site. Corresponds one-to-one with a deopt [`crate::t2::mach::StackMap`].
 #[derive(Clone, PartialEq, Debug)]
 pub struct LoweredDeopt {
     /// Native code offset of the trap (copied from the source `StackMap`).
@@ -134,7 +158,7 @@ pub struct LoweredDeopt {
 /// Resolved descriptors for one logical interpreter frame at a deopt site.
 #[derive(Clone, PartialEq, Debug)]
 pub struct LoweredScope {
-    /// Bytecode PC T0 resumes at (`resume_pc`, §4.6 D4.10 / A4.04 step 1b).
+    /// Bytecode PC T0 resumes at.
     pub resume_pc: u32,
     /// Symbol id of the function whose interpreter frame is reconstructed
     /// (`FrameScope.function`; resolvable to a name via `egcl_rt::symbols`).
@@ -149,17 +173,17 @@ pub struct LoweredScope {
     pub live_ref_bitmap: Vec<bool>,
 }
 
-/// Why a FrameState could not be fully lowered. Per R4.65 any of these MUST fail
-/// compilation (the function stays at T1); partial metadata is never installed.
+/// Why a FrameState could not be fully lowered. Any of these fails compilation
+/// (the function stays at its current tier); partial metadata is never installed.
 #[derive(Clone, PartialEq, Debug)]
 pub enum LowerError {
     /// A deopt-live `Value` had no allocated `Location` (the `loc_of` map
-    /// returned `None`). Violates R4.60/R4.65.
+    /// returned `None`): a deopt-live value was orphaned.
     Unallocated(Value),
     /// A `Remat` source referenced a recipe index absent from the pool.
     MissingRecipe(RematRecipeId),
-    /// Rematerialisation recipes nested past [`REMAT_MAX_DEPTH`] — treated as a
-    /// (probable) cycle, which the verifier is required to reject (R4.64).
+    /// Rematerialisation recipes nested past `REMAT_MAX_DEPTH` — treated as a
+    /// (probable) cycle, which the verifier is required to reject.
     RematTooDeep,
     /// A deopt `StackMap` named a `FrameStateId` out of range for the table.
     BadFrameStateId(u32),
@@ -168,23 +192,18 @@ pub enum LowerError {
     MovingConst(EgclVal),
 }
 
-// ── A4.14 — FrameState lowering ─────────────────────────────────────────────
+// ── FrameState lowering ─────────────────────────────────────────────────────
 
-/// Lower every deopt `StackMap` in `mf` to its resolved [`LoweredDeopt`] form
-/// (spec §4.10 A4.14). Called after P6 has assigned locations.
+/// Lower every deopt `StackMap` in `mf` to its resolved [`LoweredDeopt`] form.
+/// Called after register allocation has assigned locations.
 ///
 /// `loc_of` resolves an SSA `Value` to the `Location` the allocator bound it to
-/// — the `Value → VReg → Location` composition documented at the module top;
-/// returning `None` is a hard failure (R4.65).
+/// (see the module docs for how callers build it); returning `None` is a hard
+/// failure.
 ///
 /// Returns one entry per deopt stack map (those whose `frame_state` is `Some`),
-/// in stack-map order. See the module docs for why this is a returned side table
-/// rather than an in-place write into `mf.stack_maps`.
-///
-/// Signature note: the parcel stub took `&mut MachFunc` and returned `()`; since
-/// `mach::StackMap` has nowhere to store the lowered form (contract gap), P7
-/// reads `mf` immutably, threads the `loc_of` binding P5/P6 owe, and returns the
-/// metadata instead.
+/// in stack-map order, as a side table: `mach::StackMap` has no field for the
+/// resolved form.
 pub fn lower_frame_states(
     mf: &MachFunc,
     frame_states: &[FrameState],
@@ -201,7 +220,7 @@ pub fn lower_frame_states(
     Ok(out)
 }
 
-/// Lower a single FrameState against a code offset and location map (A4.14 body).
+/// Lower a single FrameState against a code offset and location map.
 pub fn lower_one(
     code_offset: u32,
     fs: &FrameState,
@@ -218,7 +237,7 @@ pub fn lower_one(
         for spec in &specs {
             let (desc, _) = lower_source(&spec.source, fs, loc_of, 0)?;
             slots.push(desc);
-            // A4.14 sets the live-ref bit only for a `Value` that is `Tagged`.
+            // The live-ref bit is set only for a `Value` that is `Tagged`.
             // Representation alone is NOT the rule: a `Remat` slot is
             // recomputed cold rather than scanned (see the module header). The
             // representation half of the test comes from `slot_map`, so it
@@ -254,7 +273,7 @@ fn lower_source(
         ValueSource::Value { value, repr } => {
             let loc = loc_of(*value).ok_or(LowerError::Unallocated(*value))?;
             let rebox = Rebox::for_repr(*repr);
-            // Only a Tagged value may hold a GC pointer (D4.16); unboxed forms
+            // Only a Tagged value may hold a GC pointer; unboxed forms
             // are never roots.
             let is_ref = matches!(repr, ValueRepresentation::Tagged);
             Ok((SlotDescriptor::InLocation(loc, rebox), is_ref))
@@ -291,24 +310,24 @@ fn lower_source(
     }
 }
 
-// ── A4.04 — resume-state reconstruction (the round-trip sketch) ──────────────
+// ── Resume-state reconstruction (the round-trip inverse) ────────────────────
 
 /// A read-only view of the trapped T2 machine frame, plus the runtime services
-/// the deopt handler needs. Mirrors what A4.04 reads from `t2_frame`. Mocked in
-/// tests; backed by the real register file / spill area + heap in production.
+/// the deopt handler needs. Mocked in tests; backed by a captured transfer
+/// snapshot in production (transfer_capture.rs).
 pub trait MachineState {
     /// Read the raw machine word currently held at `loc` (register or spill).
     fn read(&self, loc: Location) -> u64;
 
     /// Heap-allocate a `double-float` and return its tagged `EgclVal`. Used to
-    /// rebox an `UnboxedF64` (A4.04 step 3). Default panics: only frames that
+    /// rebox an `UnboxedF64`. Default panics: only frames that
     /// carry a `ReboxF64` slot need to supply it.
     fn box_double(&self, _x: f64) -> EgclVal {
         panic!("MachineState::box_double required to rebox an UnboxedF64 slot")
     }
 }
 
-/// A reconstructed interpreter frame — the output of A4.04 steps 3 & 6.
+/// A reconstructed interpreter frame.
 #[derive(Clone, PartialEq, Debug)]
 pub struct ReconstructedFrame {
     pub function: u32,
@@ -327,15 +346,14 @@ impl egcl_rt::gc::TraceHostRoots for ReconstructedFrame {
 }
 
 /// Reconstruct the interpreter frame from lowered deopt metadata and a machine
-/// state (spec §4.6 A4.04 steps 3 & 6). This is the round-trip inverse of
+/// state. This is the round-trip inverse of
 /// [`lower_one`]: every descriptor `lower_source` produced is resolved back to a
 /// tagged `EgclVal`, applying reboxing and replaying rematerialisation recipes.
 ///
-/// Mirrors A4.04:
-/// * `InLocation` → read the location, box if `needs_boxing` (step 3);
+/// * `InLocation` → read the location, rebox if needed;
 /// * `MaterializeConst` → write the immediate directly;
-/// * `Unbound` → UNBOUND-MARKER (step 6);
-/// * `Remat` → replay the cold recipe (A4.13).
+/// * `Unbound` → UNBOUND-MARKER;
+/// * `Remat` → replay the cold recipe.
 ///
 /// The machine's tagged inputs must remain rooted and its `read` operation must
 /// observe relocated values. Completed frames and the frame being constructed
@@ -379,7 +397,7 @@ fn eval_slot(slot: &SlotDescriptor, mach: &impl MachineState) -> EgclVal {
     }
 }
 
-/// Apply a rebox step to a raw machine word (A4.04 step 3 `box_value`).
+/// Apply a rebox step to a raw machine word.
 fn apply_rebox(rebox: Rebox, raw: u64, mach: &impl MachineState) -> EgclVal {
     match rebox {
         Rebox::None => EgclVal(raw),
@@ -389,7 +407,7 @@ fn apply_rebox(rebox: Rebox, raw: u64, mach: &impl MachineState) -> EgclVal {
     }
 }
 
-/// Replay a rematerialisation recipe on the cold deopt path (A4.13).
+/// Replay a rematerialisation recipe on the cold deopt path.
 ///
 /// The interpreter's slots are always tagged, so this sketch evaluates the whole
 /// recipe at the tagged `EgclVal` level: box/unbox ops are representation
@@ -477,7 +495,7 @@ mod tests {
     }
 
     // spec-covers: R4.65
-    // FrameState lowers to the descriptor set that A4.04 (deopt) consumes.
+    // FrameState lowers to the descriptor set that frame reconstruction consumes.
     #[test]
     fn each_slot_lowers_to_expected_descriptor() {
         let (fs, v_n, v_i) = fixture();
@@ -709,7 +727,7 @@ mod tests {
 
     // spec-covers: R4.67
     // A FrameState is a non-empty stack of scopes, outermost first; inlining
-    // prefixes caller scopes and A4.04 reconstructs every one in that order.
+    // prefixes caller scopes and reconstruction rebuilds every one in that order.
     #[test]
     fn lowers_and_reconstructs_every_inlined_scope_in_order() {
         let outer_value = Value(0);

@@ -15,12 +15,12 @@
 //!
 //! These tests pin the agreement to the shared producer, `t2::slot_map`.
 
-use egcl_compiler::osr::ConversionKind;
 use egcl_compiler::t2::build::build_from_bytecode;
 use egcl_compiler::t2::deopt::{self, SlotDescriptor};
 use egcl_compiler::t2::ir::ValueRepresentation;
 use egcl_compiler::t2::mach::{Location, StackSlot};
 use egcl_compiler::t2::slot_map;
+use egcl_compiler::t2::slot_map::ConversionKind;
 use egcl_rt::bytecode::{BytecodeFunction, Instr};
 use egcl_rt::value::EgclVal;
 
@@ -98,6 +98,7 @@ fn back_edges() -> Vec<(&'static str, Instr)> {
 /// `Go`. Before bliss-izt.4 only `Go` was scanned for, so DO/DOTIMES/DOLIST
 /// loops — which lower to `Br` — got no OSR entry at all and could never be
 /// entered at T2 once already running.
+// spec-covers: R4.66
 #[test]
 fn every_backward_branch_shape_yields_an_osr_safepoint() {
     for (label, back) in back_edges() {

@@ -1,54 +1,85 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P2 — IR verifier, algorithm A4.07 (spec §4.3.8).
+//! IR verifier: well-formedness checks for a T2 [`Function`].
 //!
-//! **Parcel P2.** `verify` checks the well-formedness rules V1–V10 from spec
-//! §4.3.8.1 against the frozen `ir` contract. The checks that the frozen
-//! contract makes decidable are implemented here:
+//! # Purpose
 //!
-//! - **V1** (partial) — no dangling handles: every `Value` referenced in an
-//!   `args`/`BlockCall.args` slot must be a live SSA value, and every successor
-//!   `Block` must exist. Inst-handle liveness and a full arena walk are not
-//!   checkable because the contract exposes no `num_values`/`num_insts`
-//!   accessor; block/value handle liveness is covered here (value liveness via
-//!   the reconstructed def set, block liveness folded into V10).
-//! - **V3** — SSA dominance: every value operand's definition dominates its use
-//!   (block-level dominance, refined to program order within a block); a
-//!   block-call argument's definition dominates the terminator.
-//! - **V4** — block-parameter agreement: every terminator `BlockCall` to block
-//!   B passes exactly `B.params.len()` args, each arg's `IRType` a subtype of /
-//!   and `ValueRepresentation` equal to the corresponding parameter's.
-//! - **V6** — terminator well-formedness: every block ends in exactly one
-//!   terminator, no earlier instruction is a terminator, no non-terminator
-//!   carries `targets`, and the entry block has no predecessors.
-//! - **V8** — guard/FrameState well-formedness: every `flags.guard` instruction
-//!   carries a `frame_state`; the referenced `FrameState`'s named SSA values
-//!   dominate the guard and its rematerialisation recipes are acyclic (spec
-//!   §4.10 R4.64, the portions decidable without the source bytecode frame).
-//! - **V10** — all successor blocks exist and the CFG is reducible (every
-//!   retreating edge targets a block that dominates its source).
+//! [`verify`] reports every violation it can find as a [`VerifyError`] naming
+//! the check and the offending block or value. It runs after the builder and
+//! again after the mid-end; the promotion path declines T2 on any error rather
+//! than emit from IR a pass has broken. Hand-built fixtures in tests use it as
+//! the contract for what an IR producer must satisfy.
 //!
-//! **Skipped** (missing contract surface, noted for the parcel owner):
-//! - **V2** use-list/pred-list consistency — the contract exposes no reverse
-//!   use map; `preds` is derived from terminators, so it is consistent by
-//!   construction and there is nothing independent to cross-check.
-//! - **V5** type consistency vs. per-opcode input schema — no opcode
-//!   input-type schema is exposed.
-//! - **V7** effect ordering vs. the alias model — no alias model is exposed.
-//! - **V8** slot-count-vs-`bcp` and representation-producibility clauses of
-//!   R4.64 — require the source `BytecodeFunction`'s abstract frame, not
-//!   available here.
-//! - **V9** source position present — instructions carry a `source_pos` id but
-//!   block parameters carry none, and it is only a Warning; skipped so
-//!   hand-built positive fixtures stay clean.
+//! # Structure
+//!
+//! 1. **Live-set reconstruction.** Walk every block, collecting block
+//!    parameters and instruction results into the set of live `Value`
+//!    handles and mapping each `Inst` to its (block, position). An
+//!    instruction not listed in any block is therefore dead, and a value
+//!    defined only by such an instruction is dangling.
+//! 2. **Structural pass**, which never computes dominators and so is safe on
+//!    IR with out-of-range handles. It also records whether every successor
+//!    handle is in range.
+//! 3. **Dominator pass**, run only when the CFG is sound.
+//!
+//! # Checks
+//!
+//! * **V1 dangling-value** — every `args` and `BlockCall.args` entry is a live
+//!   value.
+//! * **V3 dominance** — every value operand's definition dominates its use,
+//!   refined to program order within a block; a block-call argument's
+//!   definition dominates the terminator. An `Invoke` result exists only on
+//!   its normal edge, so a use must go through that successor's parameter.
+//! * **V4 block-param arity / type / repr** — every `BlockCall` to block B
+//!   passes exactly `B.params.len()` arguments, each with an `IRType` that
+//!   fits and a `ValueRepresentation` equal to the corresponding parameter's.
+//! * **V6 terminator / entry-preds** — exactly one terminator per block, last;
+//!   no non-terminator carries `targets`; the entry has no predecessors.
+//! * **V8 guard-framestate / framestate-handle / framestate-dominance /
+//!   remat-recipe** — every `flags.guard` instruction carries a `frame_state`;
+//!   the id is in range; every SSA value the state names (in scopes and in
+//!   rematerialisation inputs) is live and dominates the instruction; recipes
+//!   are acyclic.
+//! * **V8 layout-proof / layout-guard-contract** — `StringByteLength` and
+//!   `StringAsciiCharAt` consume the result of a `Guard` carrying
+//!   `StringLayout`; the former is a pure load (no guard, effect, or frame
+//!   state), the latter remains an ordered deopt guard.
+//! * **V10 succ-exists / reducibility** — every successor block exists, and
+//!   every retreating edge targets a block that dominates its source.
+//! * **V11 invoke-shape / invoke-result** — an `Invoke` has two distinct
+//!   edges, the call/effect/safepoint flags, a transfer-capable `AuxData`, and
+//!   its results are not used on the exceptional edge or directly elsewhere.
+//! * **V12 transfer-shape** — an `NlxTransfer` carries `TransferSite`
+//!   metadata whose origin matches its frame state, the call/effect flags, and
+//!   no normal successor.
+//! * **V13 cleanup, V14 catch, V15 handler, V16 handler-bind, V17
+//!   restart-case** — the native-transfer landing and scope instructions have
+//!   the operand, result, flag, and position shape their emitters assume, and
+//!   each scope enter/exit identity agrees with its frame state or its cold
+//!   `TransferSite`. `verify_cleanup_continuations` additionally checks that
+//!   every join agrees on the complete ordered continuation stack, not merely
+//!   its depth.
+//!
+//! The V-numbers are the stable labels in `VerifyError::check`; gaps are
+//! checks that are not implemented here:
+//!
+//! * **V2** use-list/pred-list consistency — `preds` is derived from
+//!   terminators, so there is no independent structure to cross-check.
+//! * **V5** per-opcode input-type schema — no such schema is defined.
+//! * **V7** effect ordering against an alias model — no alias model exists.
+//! * The slot-count-versus-bcp and representation-producibility clauses of
+//!   the frame-state check need the source `BytecodeFunction`'s abstract
+//!   frame, which the verifier does not have.
+//! * **V9** source-position presence — block parameters carry none and it
+//!   would only be a warning; skipped so hand-built fixtures stay clean.
 
 use std::collections::{HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameState, ValueSource};
 use crate::t2::ir::{AuxData, Block, Function, Opcode, Value, ValueDef};
 
-/// A single verification failure (spec §4.3.8.1 checks V1–V10).
+/// A single verification failure.
 #[derive(Clone, Debug)]
 pub struct VerifyError {
     /// Which check failed, e.g. "V3 dominance".
@@ -75,7 +106,7 @@ struct DefLoc {
     pos: Option<usize>,
 }
 
-/// Verify a function; `Ok(())` iff it is well-formed (spec R4.20).
+/// Verify a function; `Ok(())` iff it is well-formed.
 pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
     let mut errors: Vec<VerifyError> = Vec::new();
     let n_blocks = f.num_blocks();
@@ -978,7 +1009,7 @@ fn verify_cleanup_continuations(f: &Function, errors: &mut Vec<VerifyError>) {
     }
 }
 
-/// V8 / spec §4.10 R4.64 (decidable portion): every SSA value named by a
+/// V8 (decidable portion): every SSA value named by a
 /// `FrameState` must dominate the deoptimising instruction, and the
 /// rematerialisation recipes must be acyclic.
 fn check_frame_state(

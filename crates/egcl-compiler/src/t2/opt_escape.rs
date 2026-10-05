@@ -1,85 +1,85 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4e — Escape analysis + scalar replacement / stack allocation (spec §4.5
-//! R4.33, §4.5.5; deopt preservation §4.10 R4.60).
+//! Escape analysis and scalar replacement of non-escaping conses.
 //!
-//! **Parcel P4e. Owner: (sub-agent).**
+//! # Purpose
 //!
-//! ## What this pass does
+//! Two things live here. [`analyse`] is a pure intraprocedural analysis that
+//! classifies every `Alloc` / `AllocCons` site as [`EscapeState::NoEscape`]
+//! or [`EscapeState::GlobalEscape`] and exposes the answer through
+//! [`EscapeResult`]; this is the substrate a stack-allocation lowering would
+//! consume, and no such lowering exists yet. [`EscapeAnalysis`] is the `Pass`
+//! that applies the one transform currently implemented on top of it: scalar
+//! replacement of a non-escaping `AllocCons` whose only uses are `Car`/`Cdr`
+//! loads.
 //!
-//! *Analysis (always).* [`analyse`] walks a [`Function`], finds every allocation
-//! site (`Alloc` / `AllocCons`), and computes an [`EscapeState`] for each one. An
-//! allocation **escapes** its allocating function when its result value is used
-//! in a way that could make it reachable after the frame is gone:
+//! Not in the production T2 pipeline today; exercised by the integration
+//! tests.
 //!
-//! - returned or tail-called out (`Return` / `TailCall` operand, and likewise
-//!   `Throw` / `NlxTransfer`),
-//! - stored *as the value* into another heap object (`Store` / `SetCar` /
-//!   `SetCdr` / `VecSet` / `WriteBarrier` — the value operand, not the object
-//!   operand being mutated),
-//! - passed to a `Call` (any operand — conservatively `GlobalEscape`; a future
-//!   interprocedural pass may refine capture-free callees to `ArgEscape`),
-//! - passed as a block-call argument (it flows into a block parameter / φ we do
-//!   not trace here — conservative escape), or
-//! - used by any opcode not on the small allow-list of provably-local uses
-//!   (`Car`/`Cdr`/`Load`/`VecRef`/`SymbolValue` reads; the *object* operand of a
-//!   mutation; `TypeCheck`/`InstanceOf`/`Guard` inspections).
+//! # Contract
 //!
-//! Being named by a `FrameState` value source does **not** make an allocation
-//! escape — that is deopt metadata, not a heap reference (spec §4.10). It does,
-//! however, gate the transform below.
+//! **Operand conventions assumed:** `AllocCons.args == [car, cdr]`,
+//! `Car.args == [cons]`, `Cdr.args == [cons]`, and mutations
+//! `== [object, value, …]`. The constants `CAR_ARG` / `CDR_ARG` and the
+//! position predicates in `use_keeps_local` are the single place to adjust if
+//! the builder's layout changes.
 //!
-//! The escape *criterion* is monotone-conservative: when in doubt the use is
-//! treated as an escape (spec §4.5.11 — an uncertain analysis defaults to
-//! no-transform).
+//! **Analysis output:** one `EscapeState` per allocation result value. A
+//! value that is not an allocation site is untracked (`escape_state` returns
+//! `None`; `escapes` returns `false`).
 //!
-//! ## What we MARK vs. what we TRANSFORM
+//! **Transform output:** for each replaced cons, every `Car` result is
+//! substituted by the cons's car operand and every `Cdr` result by its cdr
+//! operand, across instruction operands, terminator edge arguments, and
+//! FrameState value sources (including remat-recipe inputs). The `AllocCons`
+//! and the `Car`/`Cdr` instructions are removed by rebuilding block `insts`
+//! lists (the IR has no removal API; the arena entries stay, unreferenced).
+//! `Analyses::invalidate` is called when anything changed.
 //!
-//! - **Marked (exposed, no IR change):** every `Alloc` / `AllocCons`, with its
-//!   `NoEscape` / `GlobalEscape` state, queryable through [`EscapeResult`]. This
-//!   is the substrate a later stack-allocation lowering (spec §4.5.5.3, the
-//!   `≤ 256`-byte `alloca` rule) consumes; this parcel does not emit stack
-//!   allocations itself.
-//! - **Transformed (scalar replacement):** the simplest fully-analysable case —
-//!   an `AllocCons` that is `NoEscape`, whose result's *only* uses are `Car` /
-//!   `Cdr` loads, and which is **not** named directly by any `FrameState`. Each
-//!   `Car` is replaced by the cons's car operand and each `Cdr` by its cdr
-//!   operand (SSA rename, spec §4.5.5.4); the `AllocCons` and the now-dead
-//!   `Car`/`Cdr` instructions are removed from the schedule. Allocations that
-//!   are `NoEscape` but also mutated (`SetCar`/`SetCdr`), type-checked, or of a
-//!   non-cons shape are left in place for a later, more complete transform.
+//! # Escape criterion
 //!
-//! ## FrameState handling (spec §4.10 R4.60)
+//! An allocation escapes when its result is used in any way not on the
+//! allow-list in `use_keeps_local`:
 //!
-//! Scalar replacement deletes value definitions, so it must not orphan a
-//! `ValueSource::Value` in any `FrameState`:
+//! * returned, tail-called, thrown or non-locally transferred;
+//! * stored **as the value** into another object (`Store`, `SetCar`, `SetCdr`,
+//!   `VecSet`, `WriteBarrier` value operands; the object operand being
+//!   mutated is local);
+//! * passed to a `Call` in any position (conservatively global; there is no
+//!   interprocedural refinement to `ArgEscape`, which is declared but never
+//!   produced);
+//! * passed as a terminator edge argument (flow into block parameters is not
+//!   traced);
+//! * used by any other opcode.
 //!
-//! - A `Car`/`Cdr` **result** named by a FrameState is fine — we substitute it
-//!   with the cons's car/cdr operand, which is a *surviving* dominating value, so
-//!   the slot's source stays valid (a rename, exactly what R4.60 permits).
-//! - The **cons** value itself named by a FrameState is the hard case: a cons is
-//!   a heap object and there is no `RematOp` that rebuilds one (see
-//!   `frame_state::RematOp`), so it cannot be rematerialised on the cold path. We
-//!   therefore **do not** scalar-replace such a cons — the allocation is kept so
-//!   the FrameState reference stays live. (A future extension could teach the
-//!   remat vocabulary an `AllocCons` recipe and rematerialise the object in the
-//!   deopt path; that is out of scope here.)
+//! Local uses are field/element reads (`Car`, `Cdr`, `Load`, `VecRef`,
+//! `SymbolValue`, object operand), the object operand of a mutation, and the
+//! header inspections `TypeCheck`, `InstanceOf`, `Guard`. Being named by a
+//! `FrameState` is not an escape; it is deopt metadata. The classification is
+//! a single pass because escape is a sink and no through-object flow is
+//! modelled, so no fixpoint is needed. When in doubt, a use is an escape.
 //!
-//! ## Contract gaps worked around
+//! # Scalar replacement and FrameStates
 //!
-//! - **AllocCons operand layout is not pinned by the frozen IR contract.** This
-//!   parcel adopts the convention `AllocCons.args == [car, cdr]` and `Car.args ==
-//!   [cons]`, `Cdr.args == [cons]`, mutations `== [object, value, …]`. If P1's
-//!   builder chooses a different order, the two constants [`CAR_ARG`]/[`CDR_ARG`]
-//!   and the operand-position predicates below are the single place to adjust.
-//! - **No instruction-removal API** on `Function` (arenas are append-only). As in
-//!   `opt_dce`, deletion is modelled by rebuilding each block's public
-//!   `BlockData::insts` list without the dead instructions; the dead
-//!   `InstData`/`ValueData` remain unreferenced in the arenas.
-//! - **No value-substitution helper.** We build a substitution vector and rewrite
-//!   every instruction operand, block-call argument, and FrameState value source
-//!   by hand.
+//! A candidate is a `NoEscape` `AllocCons` all of whose uses are `Car`/`Cdr`
+//! loads in the object position. Two FrameState cases matter:
+//!
+//! * A `Car`/`Cdr` **result** named by a FrameState is fine: it is renamed to
+//!   the cons's car/cdr operand, a surviving dominating value.
+//! * The **cons itself** named by a FrameState is not replaced. A cons is a
+//!   heap object and there is no `RematOp` that rebuilds one on the deopt
+//!   path, so the allocation must stay to keep the slot valid. Teaching the
+//!   remat vocabulary an `AllocCons` recipe would lift this.
+//!
+//! # Limits
+//!
+//! * Only conses are scalar-replaced; `Alloc` sites are classified but never
+//!   transformed, and a `NoEscape` cons that is mutated, type-checked, or
+//!   passed along an edge is left in place.
+//! * No stack allocation is emitted from the `NoEscape` classification.
+//! * Block-parameter flow is not traced, so a cons passed around a loop
+//!   through a header parameter always escapes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -94,7 +94,7 @@ const CDR_ARG: usize = 1;
 
 // ── Escape state & result ───────────────────────────────────────────
 
-/// Escape classification of an allocation site (spec §4.5.5.2). This parcel
+/// Escape classification of an allocation site. This analysis
 /// produces `NoEscape` and `GlobalEscape`; `ArgEscape` is reserved for a future
 /// interprocedural refinement of capture-free callees.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -104,7 +104,7 @@ pub enum EscapeState {
     /// replacement candidate.
     NoEscape,
     /// Passed to a callee that does not capture it past its return (or is
-    /// inlined). Not produced yet; reserved (spec §4.5.5.2).
+    /// inlined). Not produced yet; reserved.
     ArgEscape,
     /// May become reachable from the heap, is returned, or is stored into a
     /// global / another heap object. Must stay heap-allocated.
@@ -144,11 +144,6 @@ impl EscapeResult {
         matches!(self.states.get(&v), Some(s) if !s.is_non_escaping())
     }
 
-    /// Every allocation site and its state (result value → state).
-    pub fn alloc_sites(&self) -> impl Iterator<Item = (Value, EscapeState)> + '_ {
-        self.states.iter().map(|(&v, &s)| (v, s))
-    }
-
     /// The result value of every non-escaping allocation (the stack-alloc /
     /// scalar-replacement candidate set).
     pub fn non_escaping(&self) -> impl Iterator<Item = Value> + '_ {
@@ -173,7 +168,7 @@ fn is_alloc(op: Opcode) -> bool {
 
 /// Whether a use of an allocation as operand `pos` of `op` is *provably local* —
 /// i.e. it does NOT let the object escape the frame. Everything not on this
-/// allow-list is treated as an escape (conservative default, spec §4.5.11).
+/// allow-list is treated as an escape (conservative default).
 fn use_keeps_local(op: Opcode, pos: usize) -> bool {
     use Opcode::*;
     match op {
@@ -190,7 +185,7 @@ fn use_keeps_local(op: Opcode, pos: usize) -> bool {
     }
 }
 
-/// Run escape analysis over `f` (spec §4.5.5). Pure — does not mutate the IR.
+/// Run escape analysis over `f`. Pure — does not mutate the IR.
 pub fn analyse(f: &Function) -> EscapeResult {
     let mut states: HashMap<Value, EscapeState> = HashMap::new();
 
@@ -715,7 +710,7 @@ mod tests {
 
     /// FrameState handling — the blocked case: a cons named directly by a
     /// FrameState is NOT scalar-replaced (a cons cannot be rematerialised), so the
-    /// allocation is kept and the slot stays valid (R4.60).
+    /// allocation is kept and the slot stays valid.
     #[test]
     fn framestate_named_cons_is_not_scalar_replaced() {
         let mut f = Function::new("fs-cons");

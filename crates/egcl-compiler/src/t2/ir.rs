@@ -1,19 +1,96 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! T2 block-based SSA IR — core types (spec §4.3).
+//! T2 block-based SSA IR: the data structures every T2 stage operates on.
 //!
-//! **Phase-0 foundation / frozen contract.** Every T2 parcel builds against the
-//! types and signatures here. The arena/CFG mechanics are implemented; the
-//! parcel-owned algorithms (IR construction from bytecode → P1; verification →
-//! P2) live in their own files and are only referenced here.
+//! # Purpose
 //!
-//! A `Function` is a CFG of `Block`s over three arenas (`blocks`, `insts`,
-//! `values`). Data flow is SSA values (instruction results + typed block
-//! parameters); control flow is terminator instructions carrying `BlockCall`
-//! successor edges; effect ordering is the program order of effectful
-//! instructions within a block. There is no memory-token chain and no Region/Phi
-//! (spec §4.3).
+//! Defines [`Function`] and its arenas, the [`Opcode`] set, instruction and
+//! value metadata, the type lattice, and the CFG queries passes share
+//! (successors, predecessors, reverse postorder, dominators). Construction from
+//! bytecode lives in build.rs and well-formedness checking in verify.rs; this
+//! file holds only the representation and the structural editing primitives.
+//!
+//! # Representation
+//!
+//! * **Arenas and handles.** `Function` owns three arenas indexed by the `u32`
+//!   newtypes [`Block`], [`Inst`], and [`Value`]. `block_order` is the layout;
+//!   `block_order[0]` is the entry block.
+//! * **Data flow.** An SSA value is either an instruction result
+//!   (`ValueDef::Result`) or a typed block parameter (`ValueDef::Param`). Block
+//!   parameters are the φ mechanism: there is no Phi instruction and no Region
+//!   node. A value's [`ValueData`] carries an [`IRType`] and a
+//!   [`ValueRepresentation`].
+//! * **Control flow.** Every finished block ends in exactly one terminator
+//!   (`Opcode::is_terminator`), whose `targets: Vec<BlockCall>` name each
+//!   successor and the arguments bound to its parameters on that edge.
+//!   `succs` and `preds` are derived from terminators on demand, never stored.
+//! * **Effect ordering.** There is no memory-token chain. Instructions with
+//!   `InstFlags::effectful` keep their program order within a block; pure
+//!   instructions may be reordered, duplicated, or merged by passes.
+//! * **Type vs. representation.** [`IRType`] is a [`TypeBits`] tag bitset
+//!   (meet = intersection, join = union) plus optional integer [`Range`] and
+//!   `class_id` refinements. [`ValueRepresentation`] is orthogonal:
+//!   `Tagged`, `UnboxedFixnum`, `UnboxedF32`, `UnboxedF64`. The Box*/Unbox*
+//!   opcodes change representation only. `Tagged` is the only representation
+//!   an interpreter slot can hold and the only one that may be a GC pointer,
+//!   which is what makes representation a deopt concern.
+//! * **Instructions.** [`InstData`] holds the opcode, `args`, `results`, an
+//!   [`AuxData`] immediate payload, [`InstFlags`] (`effectful`, `guard`,
+//!   `safepoint`, `terminator`, `call`, `commutative`), the terminator
+//!   `targets`, an optional `frame_state` for deoptimising instructions, and
+//!   an interned `source_pos` (id 0 is unknown).
+//!
+//! # Opcode groups
+//!
+//! Constants; fixnum, float, and generic arithmetic with box/unbox
+//! conversions; comparisons and type checks; memory and object access (loads,
+//! stores, allocation, symbol value and function cells, multiple-value state,
+//! and the cleanup/catch/handler landings used by native transfer);
+//! non-terminator control (`Call`, `Guard`); and terminators (`Invoke`,
+//! `Jump`, `Brif`, `BrTable`, `Return`, `TailCall`, `Throw`, `NlxTransfer`,
+//! `Trap`). `Invoke` is a call with a normal edge (target 0) and an exceptional
+//! edge (target 1); its results exist only on the normal edge and must reach
+//! users as that successor's block parameters.
+//!
+//! # Function-level metadata
+//!
+//! * `frame_states` — the interned `FrameStateTable`; deoptimising
+//!   instructions refer to entries by `FrameStateId`.
+//! * `entry_frame_state` — the interpreter state at bcp 0 with an empty
+//!   stack, recorded so speculation can place parameter pre-guards whose deopt
+//!   re-runs the whole function in T0 (bliss-x5y.25).
+//! * `osr_entries` — loop headers that may be entered from a running
+//!   lower-tier activation, each with the header's `FrameState`.
+//! * `checked_entry_params` — parameters whose declared type the runtime call
+//!   boundary enforces. Deliberately separate from `ValueData::ty`: an
+//!   inferred or speculated type is not permission to omit the runtime check.
+//! * `variadic` — the entry parameters are pre-collected frame slots filled by
+//!   the shared variadic binding path, not positional arguments, so a
+//!   positional register self-call entry must be suppressed (bliss-32l).
+//! * `handler_cases` — HANDLER-CASE clause metadata consumed by the opt-in
+//!   native transfer edges; inlining must remap this before admitting inlined
+//!   handler scopes.
+//!
+//! # Editing primitives
+//!
+//! `make_block`, `add_block_param`, `push_inst`, `set_terminator` and
+//! `set_terminator_with_results`, `refine_type`, `set_repr`;
+//! `make_call_exceptional` splits a mapped `Call` into an `Invoke` with a fresh
+//! normal-continuation block, projecting the results into that block and into
+//! downstream frame states; `inline_call` (crate-private) clones a callee body
+//! at a call site, prefixes the suspended caller scopes to every cloned
+//! `FrameState`, and joins all callee returns at one continuation block whose
+//! parameter replaces the call result.
+//!
+//! # Analyses
+//!
+//! `reverse_postorder` is an iterative DFS that skips an out-of-range
+//! successor handle instead of panicking, so malformed IR reaches the verifier
+//! as a finding. `dominators` computes immediate dominators with the
+//! Cooper–Harvey–Kennedy iterative fixpoint over RPO numbering;
+//! [`DominatorTree::dominates`] is reflexive and walks the idom chain, with the
+//! entry as its own idom.
 
 use crate::t2::frame_state::FrameStateId;
 
@@ -40,7 +117,7 @@ handle!(/// An SSA value (an instruction result or a block parameter).
 // ── Representation & type ───────────────────────────────────────────
 
 /// The machine representation of an SSA value, orthogonal to its CL type
-/// (spec §4.10 D4.16). Box/unbox instructions change representation, not type.
+///. Box/unbox instructions change representation, not type.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ValueRepresentation {
     /// A tagged `EgclVal` in a GPR; the only representation an interpreter slot
@@ -54,7 +131,7 @@ pub enum ValueRepresentation {
     UnboxedF64,
 }
 
-/// Bitset of possible CL type tags (spec §4.3.2.6). One bit per major type.
+/// Bitset of possible CL type tags. One bit per major type.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct TypeBits(pub u16);
 
@@ -96,14 +173,14 @@ impl TypeBits {
 }
 
 /// Inclusive integer sub-range refinement, load-bearing for overflow-guard
-/// elimination (spec §4.10 T2-c).
+/// elimination.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Range {
     pub lo: i64,
     pub hi: i64,
 }
 
-/// The IR type lattice (spec D4.08): a tag bitset plus optional refinements.
+/// The IR type lattice: a tag bitset plus optional refinements.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct IRType {
     pub bits: TypeBits,
@@ -133,8 +210,8 @@ impl IRType {
 
 // ── Opcodes & instructions ──────────────────────────────────────────
 
-/// Instruction opcodes (spec §4.3.2.5). Representative-but-complete set; extend
-/// as parcels need. Terminators are the last group and set `InstFlags.terminator`.
+/// Instruction opcodes. Representative-but-complete set; extended
+/// as needed. Terminators are the last group and set `InstFlags.terminator`.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum Opcode {
     // Cat 1 — constants (payload in AuxData). Block parameters are the params.
@@ -262,7 +339,7 @@ impl Opcode {
     }
 }
 
-/// Per-instruction flags (spec §4.3.2.4). Pure by default (all-false).
+/// Per-instruction flags. Pure by default (all-false).
 #[derive(Copy, Clone, Default, Eq, PartialEq, Debug)]
 pub struct InstFlags {
     /// Observable side effect: program order fixed relative to other effects.
@@ -287,7 +364,7 @@ pub struct BlockCall {
     pub args: Vec<Value>,
 }
 
-/// Opcode-specific immediate payload (spec §4.3.2.7).
+/// Opcode-specific immediate payload.
 #[derive(Clone, Debug)]
 pub enum AuxData {
     None,
@@ -380,13 +457,13 @@ pub struct InstData {
     pub flags: InstFlags,
     /// Successor edges — non-empty only for terminators.
     pub targets: Vec<BlockCall>,
-    /// Present on guards / deoptimising insts (spec §4.10 R4.59).
+    /// Present on guards / deoptimising insts.
     pub frame_state: Option<FrameStateId>,
-    /// Source position id (spec §4.3.7); interned in `Function::source_positions`.
+    /// Source position id; interned in `Function::source_positions`.
     pub source_pos: u32,
 }
 
-/// How a value is defined (spec §4.3.2.3).
+/// How a value is defined.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum ValueDef {
     /// The `num`-th result of an instruction.
@@ -425,7 +502,7 @@ pub struct OsrEntry {
 
 // ── Function ────────────────────────────────────────────────────────
 
-/// A block-based SSA function (spec §4.3.2.1).
+/// A block-based SSA function.
 #[derive(Clone, Debug)]
 pub struct Function {
     blocks: Vec<BlockData>,
@@ -434,9 +511,9 @@ pub struct Function {
     /// Block layout order; `block_order[0]` is the entry block.
     block_order: Vec<Block>,
     entry: Block,
-    /// Frame-state table for deoptimising instructions (spec §4.10 D4.15).
+    /// Frame-state table for deoptimising instructions.
     pub frame_states: crate::t2::frame_state::FrameStateTable,
-    /// Interned source positions (spec §4.3.7); id 0 is "unknown".
+    /// Interned source positions; id 0 is "unknown".
     pub source_positions: Vec<SourcePosition>,
     /// Root-function loop headers eligible for on-stack replacement.
     pub osr_entries: Vec<OsrEntry>,
@@ -470,7 +547,7 @@ pub struct SourcePosition {
 
 impl Function {
     /// Create a function with a single empty entry block (no parameters yet;
-    /// P1 adds the function parameters as entry-block parameters).
+    /// the builder adds the function parameters as entry-block parameters).
     pub fn new(name: impl Into<String>) -> Function {
         let mut f = Function {
             blocks: Vec::new(),
@@ -546,7 +623,7 @@ impl Function {
     }
 
     /// Whether a handle is in range for this function's arenas. Verification
-    /// (P2) and any pass handling possibly-malformed IR should gate on these
+    /// (verify.rs) and any pass handling possibly-malformed IR should gate on these
     /// before indexing, since the CFG traversals assume in-range successors.
     pub fn is_valid_block(&self, b: Block) -> bool {
         b.index() < self.blocks.len()
@@ -558,7 +635,7 @@ impl Function {
         v.index() < self.values.len()
     }
 
-    // ── Inferred-fact channel (spec §4.5 R4.31, §4.10) ──
+    // ── Inferred-fact channel ──
     // The sanctioned way for an analysis (type inference, unboxing) to write a
     // refined type / chosen representation back onto a value, instead of a
     // side table. Type refinement is monotone (narrowing): the tag bits are met
@@ -581,7 +658,7 @@ impl Function {
         self.values[v.index()].repr = repr;
     }
 
-    // ── Construction primitives (used by P1 builder & the passes) ──
+    // ── Construction primitives (used by the builder and the passes) ──
 
     /// Allocate a fresh empty block and append it to the layout.
     pub fn make_block(&mut self) -> Block {
@@ -650,7 +727,7 @@ impl Function {
         (inst, results)
     }
 
-    /// Finish `block` with a terminator instruction (spec §4.3: exactly one,
+    /// Finish `block` with a terminator instruction (exactly one,
     /// last). Panics if the block already has a terminator.
     pub fn set_terminator(&mut self, block: Block, mut data: InstData) -> Inst {
         debug_assert!(
@@ -741,7 +818,7 @@ impl Function {
                 stack.push((b, idx + 1));
                 let s = succs[idx];
                 // Skip an out-of-range successor rather than panicking: malformed
-                // IR (a dangling block handle) is a verifier finding (P2 V10),
+                // IR (a dangling block handle) is a verifier finding (V10),
                 // not a reason to abort traversal.
                 if s.index() < visited.len() && !visited[s.index()] {
                     visited[s.index()] = true;
@@ -755,7 +832,7 @@ impl Function {
         post
     }
 
-    /// Compute the dominator tree (spec §4.3.4; Cooper–Harvey–Kennedy).
+    /// Compute the dominator tree (Cooper–Harvey–Kennedy).
     pub fn dominators(&self) -> DominatorTree {
         DominatorTree::compute(self)
     }
@@ -1101,7 +1178,7 @@ impl Function {
 
 // ── Dominator tree ──────────────────────────────────────────────────
 
-/// Immediate-dominator tree over the CFG (spec §4.3.4). `idom[entry] = entry`.
+/// Immediate-dominator tree over the CFG. `idom[entry] = entry`.
 #[derive(Clone, Debug)]
 pub struct DominatorTree {
     /// Immediate dominator per block index; the entry dominates itself.
@@ -1188,7 +1265,7 @@ mod tests {
     use super::*;
 
     // Diamond CFG: entry -> {b1, b2} -> merge. Exercises make_block, terminators,
-    // succ/pred derivation, RPO, and dominance — the fixture shape parcels use.
+    // succ/pred derivation, RPO, and dominance — the fixture shape tests use.
     fn jump_to(b: Block) -> InstData {
         InstData {
             opcode: Opcode::Jump,

@@ -1,9 +1,73 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! SysV machine adapters for the native transfer ABI. These adapters are not
-//! installed by the legacy T2 pipeline; call-site capture and landing metadata
-//! must be supplied by the new ABI's installer.
+//! SysV x86-64 machine stubs for the native transfer ABI.
+//!
+//! # The transfer ABI in one paragraph
+//!
+//! Under the segment ABI a successful native-to-native call returns its value
+//! directly, with no pending-error test afterwards. An escaping error or
+//! non-local exit instead leaves the Rust helper through a *cold route*: the
+//! helper returns normally with a `NativeOutcome` whose `exit` is `Transfer`
+//! or `Deopt`, a veneer tests that word and tail-jumps to a capture stub, the
+//! stub snapshots the still-live caller frame and calls Rust preparation,
+//! preparation consults the compiler's per-call-site maps (transfer_map.rs,
+//! transfer_sites.rs) and the control-scope model (control_scope.rs,
+//! native_unwind.rs) to select cleanup and landing pads, and a landing stub
+//! finally re-enters retained native code at the chosen pad. No Rust or
+//! foreign frame is ever jumped over; every Rust call returns before assembly
+//! adjusts a generated frame.
+//!
+//! # What this file owns
+//!
+//! The three x86-64 stubs and the capture image they share:
+//!
+//! * [`emit_helper_veneer`] — the callable adapter `(request) -> primary` a
+//!   generated caller invokes instead of the raw helper. It calls a
+//!   [`NativeHelperV2`] with an out-parameter [`NativeOutcome`], and only the
+//!   `exit` word is tested (never the Lisp value). `Returned` returns the
+//!   primary in RAX; anything else removes the veneer's 24-byte frame and
+//!   tail-jumps to the cold entry with `(request, value, exit)` in
+//!   RDI/RSI/RDX, leaving the caller's frame and return address intact.
+//! * [`emit_capture_stub`] — the cold entry. It writes a
+//!   [`SysvTransferCapture`] on its own stack (request, value, exit, the six
+//!   callee-saved GPRs RBX/RBP/R12–R15, the caller's RSP above the return
+//!   address, and the return PC), calls a [`NativeTransferPrepare`] with a
+//!   pointer to it, then reloads the possibly-updated image and tail-jumps to
+//!   the dispatch address with the same three-register convention. Only the
+//!   stub's temporary frame is removed.
+//! * [`emit_native_landing_stub`] — the tail adapter from
+//!   `(landing_packet, primary, exit)` to a landing pad: it loads RSP and the
+//!   entry from a [`SysvNativeLanding`] packet, moves the primary to RAX and
+//!   jumps. Every pad begins with `ENDBR64`.
+//! * [`SysvCaptureLocation`] — a checked recipe for reading or writing one
+//!   value's home through the capture image: a callee-saved register index
+//!   into `preserved`, or a byte offset from `caller_sp` for a frame slot,
+//!   including any temporary stack adjustment present at the CALL.
+//!
+//! # Contract
+//!
+//! Caller-saved GPRs and all XMM registers are clobbered by the time the
+//! capture runs, so any value that must survive a throwing call needs a
+//! call-preserved home; transfer-map lowering and the framed emitter's home
+//! selection guarantee that. The capture image is stack-resident and
+//! temporary: it registers no GC roots itself, so preparation must publish the
+//! payload and every mapped root before allocating or yielding, must update
+//! native homes for anything the collector moved, and must not retain the
+//! image by address. The source frame stays live until the dispatcher retires
+//! it. Lisp errors inside helpers and preparation are reported through the
+//! outcome, never by panic.
+//!
+//! These stubs are machine interfaces, not admission checks. The installer
+//! (the runtime's native_transfer_entry module) must retain both branch
+//! targets, validate every physical capture recipe against the emitted frame,
+//! gate on the platform's segment and control-flow-hardening support, and
+//! publish complete call-site coverage before any of this code runs. Layout
+//! assumptions (`NativeOutcome` is 16 bytes, `SysvTransferCapture` is 88,
+//! `Returned == 0`) are enforced by `const` assertions.
+//!
+//! The ppc64le equivalents are in native_transfer_ppc64le.rs; AArch64 and
+//! s390x have no transfer stubs yet and stay on the checked ABI.
 
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};

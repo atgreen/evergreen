@@ -1,42 +1,67 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4a — Global value numbering / CSE (spec §4.5).
+//! Global value numbering (dominance-based common-subexpression elimination).
 //!
-//! **Parcel P4a. Owner: (sub-agent).** Deduplicate pure instructions computing
-//! the same value (same opcode + aux + operand value-numbers), dominance-aware:
-//! a redundant pure instruction is replaced by the dominating one. Skip EFFECTFUL
-//! instructions. Preserve the deopt invariant (spec §4.10 R4.60): when replacing
-//! a value, update FrameState references too. Implement `Pass`; unit-test on
-//! hand-built IR.
+//! # Purpose
 //!
-//! ## Approach
+//! [`Gvn`] replaces a pure instruction with an earlier, dominating instruction
+//! that computes the same value, and reroutes every use, including deopt
+//! metadata, to the survivor. It runs second in the production mid-end
+//! (fold, GVN, guard elimination, DCE). It does not delete anything: the
+//! redundant instructions are left as dead definitions for DCE.
 //!
-//! One reverse-postorder scan value-numbers pure instructions. Two pure
-//! instructions are *congruent* when they share an opcode, an aux payload, and
-//! the value-numbers of their operands (operands are resolved through the
-//! running replacement map, so congruence is transitive across earlier CSE
-//! steps). For a `flags.commutative` opcode the operand list is sorted first so
-//! `a+b` and `b+a` collapse.
+//! # Contract
 //!
-//! A `leaders` table keyed by that congruence key holds, for each class, the
-//! representative instruction seen so far and the block that defines it. Because
-//! blocks are visited in RPO and a block's instructions in program order, the
-//! representative is always an *earlier* definition. When a later congruent
-//! instruction's block is dominated by the representative's block (reflexive, so
-//! same-block earlier defs count), the later instruction is redundant: each of
-//! its results is mapped to the corresponding representative result. Congruent
-//! instructions in incomparable blocks (sibling CFG branches) do not dominate
-//! one another and are left alone — the table simply adopts the newer one as the
-//! representative for subsequent, possibly-dominated, definitions.
+//! **Input:** a well-formed `Function` in block-parameter SSA.
 //!
-//! A second pass rewrites every use of a replaced value — instruction `args`,
-//! terminator `BlockCall.args`, and every `FrameState` `ValueSource::Value`
-//! (including rematerialisation-recipe inputs) — to its representative. The
-//! frozen IR carries no use-list, so this pass *is* the value→uses map: it scans
-//! the whole function once and remaps in place. Redundant instructions are left
-//! in the IR as dead (their results now unused); removing them is the DCE
-//! parcel's job (P4c), not GVN's.
+//! **Participation:** an instruction is value-numbered only if it produces a
+//! result and has none of the `effectful`, `guard`, `call` flags and is not a
+//! terminator. Two instructions are *congruent* when they have the same
+//! opcode, the same `aux` payload, and the same operand value-numbers after
+//! resolving each operand through the running replacement map (so
+//! congruence is transitive across earlier replacements). For a
+//! `commutative` opcode the operand list is sorted first, so `a+b` and `b+a`
+//! collapse. `AuxData` is neither `Hash` nor `Eq`, so its `Debug` rendering,
+//! which is structural and stable, stands in for it in the key.
+//!
+//! **Output:** every use of a replaced value, in instruction operands,
+//! terminator edge arguments, and `FrameState` value sources (locals, stack,
+//! remat-recipe inputs), now names the representative. A value named by a
+//! FrameState is deopt-live; rerouting it to a dominating equivalent keeps
+//! the slot valid, deleting it would orphan the slot. `Analyses::invalidate`
+//! is called if any replacement was made.
+//!
+//! # Algorithm
+//!
+//! 1. **Number.** One reverse-postorder scan, instructions in program order.
+//!    A `leaders` table maps each congruence key to the representative
+//!    instruction seen so far and its block. Because of the visit order the
+//!    representative is always an earlier definition. When a congruent
+//!    instruction's block is dominated by the representative's block
+//!    (reflexively, so an earlier definition in the same block qualifies),
+//!    each of its results is mapped to the corresponding representative
+//!    result. Congruent instructions in incomparable blocks (sibling
+//!    branches) are left alone and the newer one becomes the representative
+//!    for later, possibly dominated, definitions.
+//! 2. **Rewrite.** If any replacement exists, one scan over all instructions
+//!    and all FrameStates resolves every value through the replacement chain.
+//!    The IR has no use lists; this scan is the value-to-uses map.
+//!
+//! # Limits
+//!
+//! * **No memory-dependence model.** Congruence ignores intervening stores
+//!   and calls. Field loads such as `Car`/`Cdr` carry default (pure) flags,
+//!   so two loads of one field would be congruent even across a mutation.
+//!   This is not reached in the production pipeline only because each
+//!   inlined accessor guards its own operand, giving the loads distinct
+//!   operand values, and GVN runs **before** guard elimination merges those
+//!   guards. Reordering the pipeline or running GVN twice needs a memory
+//!   token or an `effectful` flag on loads first.
+//! * No hoisting to a common dominator: congruent instructions in sibling
+//!   branches both survive.
+//! * The key is built with `format!`, one string allocation per candidate
+//!   instruction.
 
 use std::collections::HashMap;
 

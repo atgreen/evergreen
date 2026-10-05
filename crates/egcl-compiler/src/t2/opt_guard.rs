@@ -1,39 +1,77 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4d — Guard elimination & hoisting (spec §4.5 R4.37, §4.3.6.3, §4.10 R4.63).
+//! Guard elimination and loop-invariant guard hoisting.
 //!
-//! **Parcel P4d. Owner: (sub-agent).** Remove redundant guards and hoist
-//! loop-invariant ones. Three transforms, in order:
+//! # Purpose
 //!
-//!  1. **Inference-proven removal.** A guard-flagged instruction that checks a
-//!     value `v` against a type `τ` (aux `TypeTag(τ)`, `args[0] = v`) is dead if
-//!     P3's inference (`crate::t2::infer::infer`) already proves `v`'s tag bits
-//!     are a subtype of `τ` (`τ.bits ⊇ ty(v).bits`) — and, conservatively, `τ`'s
-//!     range/class refinements are covered too. The guard can never fire.
+//! [`GuardElim`] removes deoptimising guards whose check cannot fail or has
+//! already been discharged on every path, and moves loop-invariant guards to
+//! the loop preheader so they execute once instead of per iteration. It runs
+//! third in the production mid-end (fold, GVN, guard elimination, DCE),
+//! after the builder's body inlining, so equivalent proofs cloned from
+//! separate callees collapse to one dominating guard.
 //!
-//!  2. **Dominating-duplicate removal.** A guard is dead if an *equivalent* guard
-//!     (same opcode, checked operands, and proof kind) dominates it (strict block
-//!     dominance, or an earlier position in the same block). Proof kinds include
-//!     both type tags and representation refinements such as `StringLayout`.
-//!     The dominating guard already discharged the speculation for the whole
-//!     dominated region (spec R4.63), so the second check is redundant. Refined
-//!     SSA results are forwarded to the dominating guard's corresponding result.
+//! # Contract
 //!
-//!  3. **Loop-invariant hoisting.** A guard inside a natural loop whose checked
-//!     operands are all defined outside the loop, that dominates every loop
-//!     latch (so it runs each iteration), and whose `FrameState` names only
-//!     values that dominate the preheader, is moved to the preheader. Its
-//!     `FrameState` stays valid because every value it references still
-//!     dominates the new location (spec R4.63). Loops are found here with a
-//!     local back-edge scan over the dominator tree (the shared `LoopForest` is
-//!     not yet populated).
+//! **Input:** a well-formed `Function`. A guard is an instruction with the
+//! `guard` flag; it carries a `FrameState`, checks `args[0]`, and may define
+//! a refined result that passes the operand through. Its proof is either a
+//! type (`AuxData::TypeTag`) or a layout refinement (`AuxData::StringLayout`);
+//! the two are distinct `GuardKind`s, because knowing a value is a string
+//! does not prove it has a directly addressable simple layout.
 //!
-//! **Deopt-preservation (spec §4.10 R4.60).** When a guard is *removed*, any
-//! result value it defined is forwarded to its checked operand `args[0]` — a
-//! value that dominates the guard and hence every use of the result — across
-//! instruction operands, terminator edge arguments, *and* `FrameState` value
-//! sources. No `FrameState` of any surviving instruction is ever orphaned.
+//! **Output:** removed guards are unlinked from their block (arena entries
+//! stay, unreferenced). Every result a removed guard defined is forwarded to
+//! a surviving dominating value, in instruction operands, terminator edge
+//! arguments, and FrameState value sources, so no FrameState slot is
+//! orphaned. Hoisted guards keep their instruction, results and FrameState;
+//! only their block changes. The CFG never changes. `Analyses::invalidate`
+//! is called if anything changed.
+//!
+//! # Transforms, in order
+//!
+//! 1. **Inference-proven removal.** Run [`infer`](crate::t2::infer::infer)
+//!    and delete every `TypeTag(τ)` guard on `v` where the inferred fact for
+//!    `v` is not `⊥`, its tag bits are a subset of `τ`'s, and any range or
+//!    class refinement `τ` carries is already met (`refinements_covered`).
+//!    Results forward to `args[0]`, which dominates the guard and hence every
+//!    use of the result.
+//! 2. **Dominating-duplicate removal.** Collect every guard with a `TypeTag`
+//!    or `StringLayout` proof. A guard is redundant when an equivalent guard
+//!    (same opcode, same operands, same kind) precedes it on every path:
+//!    earlier in the same block, or in a strictly dominating block. Its
+//!    results forward to the leader's corresponding results, so a consumer of
+//!    the refined value keeps an explicit proof dependency; a result-less
+//!    guard simply disappears.
+//! 3. **Loop-invariant hoisting.** Loops are found by a back-edge scan over
+//!    the dominator tree (the same scan `opt_licm` does); the body is
+//!    the reverse-reachable set from the latches stopping at the header. A
+//!    guard moves to the preheader when (a) every operand is defined outside
+//!    the body, (b) its block dominates every latch, so it already ran on
+//!    every iteration and hoisting adds no deopt the original schedule did not
+//!    have, and (c) every value its FrameState names dominates the preheader,
+//!    so the FrameState stays valid at the new position. Only an existing
+//!    preheader is used (the unique out-of-loop predecessor that jumps solely
+//!    to the header); none is synthesised.
+//!
+//! # Rationale
+//!
+//! A guard that succeeded dominates the region it protects, so a second check
+//! of the same fact in that region cannot fail: speculation is discharged
+//! once per dominance region. Forwarding a dominated guard's result to the
+//! leader's result rather than to the raw operand matters when the result is
+//! a refined SSA identity (as speculation and the inlined `CAR`/`CDR`
+//! templates produce), since downstream type facts hang off that identity.
+//!
+//! # Limits
+//!
+//! * Transform 1 handles `TypeTag` guards only; layout guards are never
+//!   proven by inference.
+//! * No guard is hoisted out of a loop that lacks a ready-made preheader;
+//!   LICM can synthesise one but is not in the production pipeline.
+//! * Duplicate detection is pairwise over all guards (quadratic in guard
+//!   count).
 
 use std::collections::{HashMap, HashSet};
 
@@ -211,7 +249,7 @@ fn guard_precedes(g1: &GuardInfo, g2: &GuardInfo, dom: &crate::t2::ir::Dominator
 
 // ── Transform 3: loop-invariant guard hoisting ──────────────────────
 
-/// Move loop-invariant guards to their loop's preheader (spec R4.63).
+/// Move loop-invariant guards to their loop's preheader.
 fn hoist_loop_invariant(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
     let inst_block = inst_block_map(f);
 
@@ -345,7 +383,7 @@ fn frame_state_dominates(
 // ── Shared mutation helpers ─────────────────────────────────────────
 
 /// Remove a guard instruction, forwarding any result to its checked operand and
-/// preserving the deopt invariant (spec R4.60) across all use sites.
+/// keeping every FrameState reference valid across all use sites.
 fn remove_guard(f: &mut Function, inst: Inst) {
     let (operand, results) = {
         let d = f.inst(inst);

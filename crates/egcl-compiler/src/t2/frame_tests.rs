@@ -1,8 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Execute frame shapes and independently ask the OS to unwind every decoded
-//! instruction boundary, including stack probes and temporary helper storage.
+//! End-to-end checks of emitted x86-64 frames: call the compiled entry through
+//! a JIT'd host-ABI wrapper and, on Windows, ask the OS unwinder to walk every
+//! decoded instruction boundary.
+//!
+//! Mounted from emit.rs via `#[path]` so the tests see its private assembler
+//! and frame helpers. Covered:
+//!
+//! * The compiled-entry convention (arguments in the four compiler argument
+//!   registers) survives every arity, rotation and reversal of argument use,
+//!   so an entry that reads its arguments in an order different from the one
+//!   they arrive in cannot clobber one before it is consumed.
+//! * Windows only: a large precise-deopt buffer keeps frame values intact; the
+//!   `WindowsFrame` prologue/epilogue produce unwind info that
+//!   `RtlVirtualUnwind` accepts at every instruction, including inside stack
+//!   probes and temporary helper storage; and a two-page stack probe
+//!   preserves all four argument registers.
+//!
+//! `call_compiled_entry` is the bridge from the host ABI to the compiler's
+//! register convention and is shared by the Linux and Windows cases.
 use super::*;
 #[cfg(windows)]
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};

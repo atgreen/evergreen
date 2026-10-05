@@ -1,64 +1,115 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P5 — Lowering / x86-64 instruction selection (spec §4.7 R4.42, §4.7.2).
+//! T2 lowering: block-based SSA → `MachFunc` instruction selection.
 //!
-//! **Parcel P5. Owner: (sub-agent).** Lower a block-based SSA [`Function`] to a
-//! [`MachFunc`] of [`MachInst`]s over virtual registers (`mach.rs` is the frozen
-//! interface). This is instruction *selection*, not emission: we pick a
-//! mnemonic (`op: u32`, encoded by the [`op`] constants below) and the
-//! virtual-register operand shape for each IR instruction. Actual byte encoding
-//! / addressing-mode assembly is a later emit step (spec §4.7.2 rule 2 folding
-//! is therefore only modelled at the mnemonic level here).
+//! # Purpose
 //!
-//! ## What this pass does
+//! Turn an optimised, verified SSA [`Function`] into a [`MachFunc`]: a flat
+//! vector of [`MachInst`]s over virtual registers plus a machine-block CFG. This
+//! is instruction *selection* only. Each IR instruction becomes one or a short
+//! sequence of mnemonics (the [`op`] constants) with a VReg operand shape; byte
+//! encoding, addressing modes, and template expansion belong to the emitters.
+//! The mnemonics carry x86 names (`SETE`, `UCOMIS`, `MOVSXD`) but the pass is
+//! target-independent: all four backends (emit.rs, emit_a64.rs, emit_ppc64le.rs,
+//! emit_s390x.rs) and the driver call [`lower`] and interpret the same `op`
+//! values.
 //!
-//! * Walks blocks in **layout order** (`Function::block_order`), emitting each
-//!   IR block's instructions contiguously into the flat `insts` vector and
-//!   recording a parallel [`MachBlock`] whose `[start,end)` covers them (P5b).
-//!   `blocks[i]` corresponds to `block_order[i]`; `blocks[0]` is the IR entry.
-//! * Maps every SSA [`Value`] to a [`VReg`] whose [`RegClass`] follows the
-//!   value's [`ValueRepresentation`] (`Tagged`/`UnboxedFixnum` → `Gpr`;
-//!   `UnboxedF32`/`UnboxedF64` → `Xmm`). The VReg number is the value's arena
-//!   index, so the mapping is stable and injective.
-//! * Selects one or a short sequence of [`MachInst`]s per IR instruction via a
-//!   maximal-munch-flavoured `match` (spec §4.7.2). Compares expand to a
-//!   flag-setting `CMP`/`UCOMISD` + a `SETcc` materialising the boolean.
-//! * Models block parameters + [`BlockCall`] args **two ways** (P5b): the
-//!   authoritative out-of-SSA form is now [`MachSucc::args`] on each CFG edge
-//!   (regalloc2 / P6b turns block-param args into moves). For backward
-//!   compatibility we *also* still emit the inline parallel-move `MachInst`s just
-//!   before the terminator; a later parcel can drop the explicit moves once P6b
-//!   consumes `MachSucc::args` directly. The two encodings are redundant but
-//!   consistent — both name the same (param ← arg) VReg pairs.
-//! * Carries the `FrameStateId` and safepoint bit of any guarding / safepointing
-//!   IR instruction onto the emitted `MachInst`, so P6 can pin the frame-state
-//!   locations and record the GC stack map (spec §4.10 R4.65, §4.7 R4.46).
+//! What this pass deliberately does not do: fuse compare+branch (the framed
+//! emitters do that from the IR), choose registers, or decide frame layout.
 //!
-//! ## Contract gaps worked around here (noted for the leads)
+//! # Contract
 //!
-//! * [`MachInst::op`] is an opaque `u32` with no ISA-level operand/addressing
-//!   model, immediate fields, or condition-code slot in the frozen `mach.rs`.
-//!   We therefore encode the mnemonic in `op` (see [`op`]) and stash any
-//!   condition-code / immediate discriminator *in the mnemonic itself* (e.g.
-//!   distinct `SETE`/`SETL` opcodes). Constant immediates and memory
-//!   displacements have nowhere to live on `MachInst`, so they are implied by
-//!   the mnemonic and the (single) def; a real emitter needs an immediate field.
-//! * Block structure now lives in `MachFunc::blocks` (P5b): each [`MachBlock`]
-//!   carries its `[start,end)` inst range, param VRegs, and `succs` edges with
-//!   per-edge VReg args. Individual `MachInst`s still have no successor field,
-//!   so the branch *mnemonic* (`JMP`/`BR_COND`/`BR_TABLE`) records only the
-//!   condition is held by a zero-code `LIVENESS` anchor immediately before the
-//!   mnemonic; the actual targets are on the owning block's `succs`, in
-//!   `Function::block_order` position order. The terminator's `targets[k]` maps
-//!   1:1 to `succs[k]`, so P6/emit can recover which mnemonic operand selects
-//!   which successor edge.
-//! * Parallel moves are lowered **sequentially** (no cycle breaking / temp
-//!   insertion) and edge moves for the two-way `Brif` / `BrTable` are emitted
-//!   before the branch without **critical-edge splitting**. Both are only
-//!   correct when edge moves don't form cycles / both edges don't need
-//!   conflicting moves; the general fix belongs in P6 alongside real edge
-//!   handling. Documented rather than solved because it needs new CFG surface.
+//! **Input:** a `Function` that has passed the verifier, with `block_order()`
+//! fixed and every block terminated. Lowering trusts the IR: an arity mismatch
+//! between edge args and block params is a verifier finding and is silently
+//! truncated here, and a block missing from the layout maps to `u32::MAX`.
+//!
+//! **Output:** a `MachFunc` with `insts` and `blocks` populated and every
+//! allocation field empty. Invariants the consumers (regalloc.rs, the emitters)
+//! rely on:
+//!
+//! * **VReg numbering.** SSA `Value(n)` lowers to `VReg { class, num: n }`, with
+//!   `class` derived from the value's [`ValueRepresentation`] via [`class_of`]
+//!   (`Tagged`/`UnboxedFixnum` → `Gpr`, `UnboxedF32`/`UnboxedF64` → `Xmm`). The
+//!   mapping is the identity on numbers, so emitters recover the SSA value from
+//!   a VReg without a side table. Temporaries, if any, number from
+//!   `num_values()` upward.
+//! * **Block layout.** `blocks[i]` corresponds to `block_order()[i]`; block 0 is
+//!   the entry. Each `MachBlock` covers the half-open `[start, end)` range of
+//!   `insts` its IR block produced, and its last instruction is the terminator.
+//! * **Edges.** One `MachSucc` per terminator `BlockCall`, in target order
+//!   (`targets[k]` ↔ `succs[k]`), carrying the interned edge args. This is the
+//!   authoritative out-of-SSA form: the allocator binds `succs[k].args` to the
+//!   target's `params` as parallel moves.
+//! * **No critical edges.** After the main walk, every edge from a
+//!   multi-successor block to a multi-predecessor block is split with a
+//!   synthetic param-less block containing a single `JMP` whose sole `MachSucc`
+//!   forwards the original args. The conditional predecessor's edge to the
+//!   synthetic block carries no args.
+//! * **Operand-free branches.** `BR_COND` and `BR_TABLE` carry no operands; the
+//!   condition or index is held by a zero-code `LIVENESS` instruction emitted
+//!   immediately before them. `INVOKE` is followed by an operand-free
+//!   `INVOKE_ROUTES` terminator for the same reason: regalloc2 forbids register
+//!   operands on a branch into a multi-predecessor block.
+//! * **Deopt/safepoint annotations.** An IR instruction flagged `guard`,
+//!   `call`, or carrying a `frame_state` keeps its `FrameStateId` on the
+//!   `MachInst`; a `safepoint` flag is copied through. The two are independent.
+//! * **`deopt_uses`.** For every instruction that carries a frame state, the
+//!   register-sourced values that FrameState names (walking `Remat` recipes to
+//!   their inputs, each recipe once) are listed in `deopt_uses`, deduplicated
+//!   against `defs` and against each other but **not** against `uses`. The
+//!   allocator turns these into late-position `Any` operands so the values stay
+//!   locatable past the instruction's own writes. Deduplicating against `uses`
+//!   would let an early-position use be coalesced with the destination and
+//!   clobbered by a destructive sequence before the deopting `jo`
+//!   (bliss-ad1e, bliss-x9c9).
+//! * **Immediates.** `MOV_IMM` and `MOV_TAGGED` carry the materialised bits in
+//!   `MachInst::imm` (a tagged `EgclVal` for `ConstNil`/`ConstT`/fixnums).
+//!   Other constants (`LOAD_FCONST`, `ConstHeapObj`) define a VReg and leave
+//!   the emitter to fetch the payload from the IR.
+//!
+//! # Algorithm
+//!
+//! 1. For each block in layout order: lower its params to VRegs, lower each
+//!    non-terminator via `lower_inst`, then the terminator via
+//!    `lower_terminator`; record the `MachBlock` and its `MachSucc`s.
+//! 2. `lower_inst` is a single `match` on the opcode. Constants with a
+//!    non-moving tagged encoding become `MOV_IMM`/`MOV_TAGGED` with `imm` set.
+//!    Arithmetic, logic, box/unbox, loads, stores, allocation, calls and guards
+//!    map 1:1 to a mnemonic. Compares expand to a flag-setting `CMP`/`UCOMIS`
+//!    plus a `SETcc` that defines the boolean; the `SETcc` half carries the
+//!    frame state, since it is the write that could clobber a coalesced
+//!    operand. Generic arithmetic, global reads/writes, MV helpers and cleanup
+//!    helpers become `CALL_RUNTIME` so the allocator treats them as clobbering
+//!    calls (modelling a global read as a plain `LOAD` once let a live value sit
+//!    in a caller-saved register across the helper; bliss-x5y.29).
+//! 3. `lower_terminator` emits sequential edge moves (`MOV`/`FMOV`,
+//!    `param ← arg`) for every successor, then the branch mnemonic preceded by
+//!    its `LIVENESS` anchor. `RET`, `TAILCALL`, `THROW`, `NLX_TRANSFER`, `TRAP`
+//!    take their operands directly.
+//! 4. Critical-edge splitting over the finished `blocks` vector.
+//!
+//! Arithmetic and most other value-producing instructions go through
+//! `emit_annotated` rather than a plain emit, so a speculated op that ends in a
+//! deopting overflow check carries its FrameState and `deopt_uses`. For a
+//! non-deopting instruction `emit_annotated` records nothing extra.
+//!
+//! # Known limits
+//!
+//! * The inline edge moves in step 3 are emitted **in addition to**
+//!   `MachSucc::args`, as sequential moves with no cycle breaking or temporary
+//!   insertion. They are redundant with the edge args and correct only when the
+//!   moves on an edge form no cycle. The framed emitters ignore them (they
+//!   build parallel moves from the IR `BlockCall`s directly); the compact
+//!   emitter executes them. Because a block param is thereby defined both by
+//!   the move and by being a param, the input is not strictly SSA, which
+//!   regalloc.rs tolerates by leaving regalloc2's SSA validator off.
+//! * `MachInst` has no fused-operand or condition-code model, so each `SETcc`
+//!   variant is a distinct mnemonic and compare+branch fusion is left to the
+//!   emitters.
+//! * Opcodes with no selection rule produce `PSEUDO_UNSUPPORTED` rather than
+//!   aborting, so the downstream emitter reports the exact unsupported shape.
 
 use crate::t2::ir::{Function, Inst, Opcode, Value, ValueRepresentation};
 use crate::t2::mach::{MachBlock, MachBlockId, MachFunc, MachInst, MachSucc, RegClass, VReg};
@@ -71,9 +122,9 @@ use crate::t2::mach::{MachBlock, MachBlockId, MachFunc, MachInst, MachSucc, RegC
 #[allow(non_upper_case_globals)]
 pub mod op {
     // ── 0x00 pseudo / moves ──────────────────────────────────────────
-    /// Unselected opcode — a tagged placeholder (spec R4.42 says unlowered
-    /// nodes MUST abort compilation; here we mark them so P6/verify can find
-    /// them instead of silently dropping the instruction).
+    /// Unselected opcode — a tagged placeholder. An IR instruction with no
+    /// selection rule is marked rather than dropped, so the emitter reports the
+    /// exact unsupported shape and the function declines to T1.
     pub const PSEUDO_UNSUPPORTED: u32 = 0x0000;
     /// GPR register-register move (parallel-move lowering, out-of-SSA at edges).
     pub const MOV: u32 = 0x0001;
@@ -180,9 +231,8 @@ pub mod op {
     pub const INVOKE_ROUTES: u32 = 0x0088;
 }
 
-/// The register class a value with representation `repr` lives in (spec §4.7
-/// R4.45): tagged values / unboxed integers / pointers → GPR, unboxed floats →
-/// XMM.
+/// The register class a value with representation `repr` lives in: tagged
+/// values / unboxed integers / pointers → GPR, unboxed floats → XMM.
 #[inline]
 pub fn class_of(repr: ValueRepresentation) -> RegClass {
     match repr {
@@ -272,9 +322,9 @@ impl<'f> Lowering<'f> {
     }
 
     /// Emit a MachInst that carries the deopt/safepoint annotations of IR
-    /// instruction `i` (spec §4.10 R4.65): a guarding or deoptimising inst keeps
-    /// its `FrameStateId`; a safepoint inst sets `safepoint` so P6 records a
-    /// stack map. The two are independent (a guard is a safepoint; a plain call
+    /// instruction `i`: a guarding or deoptimising inst keeps its
+    /// `FrameStateId`; a safepoint inst sets `safepoint` so the allocator records
+    /// a stack map. The two are independent (a guard is a safepoint; a plain call
     /// is a safepoint without a guard flag).
     fn emit_annotated(&mut self, i: Inst, op: u32, defs: Vec<VReg>, uses: Vec<VReg>) {
         let data = self.f.inst(i);
@@ -342,8 +392,8 @@ impl<'f> Lowering<'f> {
 
     /// Lower the block-argument bindings on one edge into sequential register
     /// moves: `param[k] <- arg[k]` for the target block's parameters. This is
-    /// the out-of-SSA parallel-move at the edge (spec §4.7 — modelled without
-    /// cycle-breaking; see module-level caveat).
+    /// the out-of-SSA parallel-move at the edge, modelled without cycle-breaking
+    /// (see the module-level limits).
     fn emit_edge_moves(&mut self, target: crate::t2::ir::Block, args: &[Value]) {
         let params = self.f.block(target).params.clone();
         for (k, &arg) in args.iter().enumerate() {
@@ -364,11 +414,11 @@ impl<'f> Lowering<'f> {
     }
 }
 
-/// Lower `f` to machine instructions over virtual registers (spec §4.7 R4.42).
+/// Lower `f` to machine instructions over virtual registers.
 ///
 /// Walks blocks in layout order; selects a `MachInst` sequence per IR
 /// instruction; models edges as parallel moves; preserves frame-state /
-/// safepoint annotations for P6.
+/// safepoint annotations for the allocator; splits critical edges.
 pub fn lower(f: &Function) -> MachFunc {
     let mut lo = Lowering::new(f);
     let order = f.block_order();
@@ -477,7 +527,8 @@ pub fn lower(f: &Function) -> MachFunc {
     }
 }
 
-/// Select a non-terminator IR instruction (spec §4.7.2 maximal munch).
+/// Select a non-terminator IR instruction (one mnemonic or short sequence per
+/// opcode).
 fn lower_inst(lo: &mut Lowering, inst: Inst) {
     use Opcode::*;
     let data = lo.f.inst(inst);
@@ -485,7 +536,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     let uses = lo.vregs(&data.args);
 
     // Non-moving constants materialise a tagged immediate the emitter can move
-    // directly (spec §4.7). Heap literals instead define an allocated value and
+    // directly. Heap literals instead define an allocated value and
     // are loaded from their rooted pool slot by the rich emitter.
     // (Unboxed-representation materialisation + box/unbox insertion is future
     // work; a bare constant feeding a Return is naturally tagged.)
@@ -649,8 +700,8 @@ fn un_or_bin(lo: &mut Lowering, inst: Inst, op: u32, defs: Vec<VReg>, uses: Vec<
 }
 
 /// Select a terminator: emit edge parallel-moves first (out-of-SSA), then the
-/// branch/return mnemonic. Spec §4.7.2 rule (4) would fuse compare+branch; we
-/// keep them separate because `MachInst` has no fused-operand model.
+/// branch/return mnemonic. Compare+branch fusion is left to the emitters
+/// because `MachInst` has no fused-operand model.
 fn lower_terminator(lo: &mut Lowering, inst: Inst) {
     use Opcode::*;
     let data = lo.f.inst(inst);

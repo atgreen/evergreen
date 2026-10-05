@@ -1,59 +1,82 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4c — Deopt-aware dead-code elimination + rematerialisation (spec §4.5 R4.35,
-//! §4.10 A4.13, R4.60/R4.62).
+//! Deopt-aware dead-code elimination with rematerialisation.
 //!
-//! **Parcel P4c. Owner: (sub-agent).** Mark liveness from NON-deopt uses only
-//! (real fast-path / effect uses); FrameState `ValueSource::Value` uses do NOT
-//! seed liveness. Then for each unmarked value: delete if it has no FrameState
-//! uses; else if it is rematerialisable (pure/total/cheap — see
-//! `frame_state::RematOp`) build a `RematRecipe`, replace its FrameState uses
-//! with `ValueSource::Remat`, and remove it from the fast path; else keep it
-//! (deopt-live). Never break the preservation invariant (spec §4.10 R4.60).
+//! # Purpose
 //!
-//! ## Approach
+//! [`Dce`] removes instructions whose results have no real use, where "real"
+//! means a fast-path or effect use. A reference from a `FrameState` (deopt
+//! metadata) is deliberately **not** a real use: a value kept alive only so a
+//! deopt could rebuild the interpreter frame is exactly the kind of value that
+//! should leave the fast path. When such a value can be recomputed from
+//! surviving inputs, its FrameState slots are rewritten to a `Remat` recipe
+//! that the deopt path replays; when it cannot, it stays live. The pass never
+//! orphans a FrameState slot.
 //!
-//! *Mark.* Liveness is a boolean vector over `Value`s. Roots are the operands of
-//! every **pinned** instruction (effectful / guard / call / safepoint /
-//! terminator) plus every terminator successor-edge (`BlockCall.args`). Liveness
-//! propagates backward through instruction operands to a fixpoint. FrameState
-//! `ValueSource::Value` references are deliberately *not* roots — that is the
-//! whole point of A4.13.
+//! Runs last in the production mid-end (fold, GVN, guard elimination, DCE),
+//! so it also reaps the dead definitions those passes leave behind.
 //!
-//! *Deopt-live promotion.* A FrameState value whose defining instruction is
-//! removable but whose opcode is **not** rematerialisable (or whose remat recipe
-//! cannot be fully resolved) is genuinely deopt-live: it is promoted to a
-//! liveness root and re-propagated to a fixpoint, so it (and its operands) stay
-//! on the fast path.
+//! # Contract
 //!
-//! *Sweep / rematerialise.* Each surviving-but-removable FrameState value source
-//! is replaced by a `ValueSource::Remat` whose recipe is built by `resolve`,
-//! recursing through operands so pure chains (const → add → box) compose into a
-//! single cold-path recipe. Recipes are appended to the owning FrameState's
-//! `remat` pool.
+//! **Input:** a well-formed `Function`; `f.frame_states` holds every
+//! `FrameState` with `ValueSource::Value` slots naming SSA values.
 //!
-//! *Deletion.* The Phase-0 IR is a frozen contract with **no instruction-removal
-//! API**. We model deletion by rebuilding each block's public `insts` list
-//! (`BlockData::insts`) without the dead instructions, via the public
-//! `block`/`block_mut` accessors. The dead `InstData`/`ValueData` remain in the
-//! arenas (unreferenced) — the arenas are append-only by contract — but no block
-//! lists them, so they never lower. An instruction is deleted iff it is not
-//! pinned, has no live result, and has no surviving FrameState reference (the
-//! last clause is belt-and-braces against orphaning a slot, R4.60).
+//! **Output:** block instruction lists rebuilt without dead instructions.
+//! FrameState slots whose value was removed now hold `ValueSource::Const`
+//! (for constant opcodes, carrying the exact tagged payload) or
+//! `ValueSource::Remat(id)` into that FrameState's `remat` pool. The IR has
+//! no instruction-removal API and its arenas are append-only, so a deleted
+//! instruction's `InstData`/`ValueData` remain in the arenas, unreferenced
+//! by any block; they never lower. `Analyses::invalidate` is called when
+//! anything was removed.
 //!
-//! ## Contract gaps worked around
+//! An instruction is deleted iff it is not pinned, no result is live, and no
+//! result is still named by any FrameState (directly or through a recipe
+//! input). Pinned means any of the `effectful`, `guard`, `call`, `safepoint`
+//! or `terminator` flags.
 //!
-//! - **No instruction-removal helper** on `Function`: modelled by rebuilding
-//!   `BlockData::insts` (see above). A future `Function::remove_inst` /
-//!   dead-value compaction would let us reclaim the arenas.
-//! - `RematRecipeId` is scoped to a single FrameState's `remat` vec, so a value
-//!   named by two FrameStates gets an independent recipe built into each. That
-//!   matches the data model (cold-path code is per-deopt-point) and needs no new
-//!   API, but there is no cross-FrameState recipe sharing.
-//! - `FrameStateTable` exposes `iter`/`get_mut`/`len` but no borrow that lets us
-//!   read the IR (`&Function`) while mutating the table, so we `std::mem::take`
-//!   the table out of the function for the rewrite and put it back.
+//! # Algorithm
+//!
+//! 1. **Mark.** Roots are the operands of every pinned instruction and every
+//!    terminator edge argument. Liveness propagates backward through operands
+//!    (`propagate`) to a fixpoint. FrameState references do not seed it.
+//! 2. **Promote deopt-live values.** For each FrameState `Value` slot whose
+//!    defining instruction is currently removable, dry-run `resolve`. If no
+//!    recipe can be built (opcode not in `remat_op`, or an operand is itself
+//!    unresolvable), the value is genuinely deopt-live: it becomes a root and
+//!    liveness is re-propagated. Repeat until no promotion happens.
+//! 3. **Sweep / rematerialise.** Every remaining removable FrameState slot is
+//!    rewritten by `resolve`: constants become `Const`; other rematerialisable
+//!    opcodes (`BoxFixnum`, `UnboxFixnum`, `BoxFloat`, `UnboxFloat`,
+//!    `FixnumAdd`, `FixnumSub`) get a `RematRecipe` whose inputs are resolved
+//!    recursively, so pure chains compose into one recipe. A `visiting` stack
+//!    refuses cyclic recipes (malformed IR).
+//! 4. **Collect** every value still referenced by any FrameState, through
+//!    recipes, as a final guard against orphaning.
+//! 5. **Delete** by rebuilding each block's `insts` list.
+//!
+//! The FrameState table is `std::mem::take`n out of the function during
+//! steps 2–4 so the IR can be read immutably while the table is mutated,
+//! then put back.
+//!
+//! # Rationale
+//!
+//! Seeding liveness from deopt uses would keep every value any guard might
+//! need, which in guard-heavy speculative code is most of them. Excluding
+//! them and rematerialising on the cold path is what lets speculation be
+//! cheap on the hot path. Constants are stored as `Const` payloads rather
+//! than zero-input recipes because a `RematOp::Const` recipe has no field for
+//! which constant it was.
+//!
+//! # Limits
+//!
+//! * `RematRecipeId` is scoped to one FrameState's `remat` vector, so a value
+//!   named by two FrameStates gets an independent recipe in each. There is no
+//!   cross-FrameState sharing.
+//! * The rematerialisable opcode set is small and fixed in `remat_op`; a cons
+//!   or other heap object named by a FrameState is always deopt-live.
+//! * Block parameters are never removed, even when unused.
 
 use crate::t2::frame_state::{
     FrameState, FrameStateId, RematOp, RematRecipe, RematRecipeId, ValueSource,
@@ -195,7 +218,7 @@ impl Pass for Dce {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Instructions the optimiser must never remove and whose operands are real
-/// fast-path uses (spec §4.5 R4.35 "proven side-effect-free" is the negation).
+/// fast-path uses.
 fn is_pinned(d: &InstData) -> bool {
     d.flags.effectful || d.flags.guard || d.flags.call || d.flags.safepoint || d.flags.terminator
 }
@@ -227,7 +250,7 @@ fn is_removable(f: &Function, live: &[bool], v: Value) -> bool {
 }
 
 /// Map a fast-path opcode to the pure/total/cheap `RematOp` it replays as, or
-/// `None` if the opcode is not rematerialisable (spec D4.17 eligibility).
+/// `None` if the opcode is not rematerialisable.
 fn remat_op(op: Opcode) -> Option<RematOp> {
     use Opcode::*;
     Some(match op {
@@ -250,7 +273,7 @@ fn remat_op(op: Opcode) -> Option<RematOp> {
 ///   operands, so pure chains compose).
 /// - Otherwise `None` (not rematerialisable; the caller keeps it deopt-live).
 ///
-/// `visiting` guards against a cyclic recipe (malformed IR, spec R4.64).
+/// `visiting` guards against a cyclic recipe (malformed IR).
 fn resolve(
     f: &Function,
     live: &[bool],
@@ -324,7 +347,7 @@ fn frame_value_refs(fs: &FrameState) -> impl Iterator<Item = &ValueSource> {
 }
 
 /// Mark every SSA `Value` still referenced by `fs` — directly or transitively
-/// through a `Remat` recipe's inputs — so deletion never orphans it (R4.60).
+/// through a `Remat` recipe's inputs — so deletion never orphans it.
 fn collect_value_refs(fs: &FrameState, out: &mut [bool]) {
     fn mark(src: &ValueSource, fs: &FrameState, out: &mut [bool]) {
         match src {

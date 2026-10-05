@@ -1,37 +1,105 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! ppc64le emission for the optimized SSA pipeline.
+//! ppc64le (ELFv2) machine-code emission for the T2 framed pipeline.
 //!
-//! The fourth backend of this shape, and structured like the other three:
-//! register allocation assigns each SSA value a *home* (a nonvolatile register or a
-//! frame slot), and emission loads operands into fixed working registers, operates,
-//! and stores the result back. That keeps instruction selection readable and
-//! confines the architecture to this file.
+//! # Purpose
 //!
-//! Register roles map onto the System Z and AArch64 emitters'. ELFv2 passes the
-//! first arguments in r3 onwards and returns in r3, so the working registers double
-//! as argument registers, exactly as they do on System Z (r2) and AArch64 (x0):
+//! Turns an optimised SSA [`Function`] into ELFv2 code over the shared
+//! activation contract: an `EgclStack` activation of `activation_slots` tagged
+//! words, extended by the shadow-root slots needed at runtime calls. The module
+//! owns instruction selection for the opcode subset below, the frame layout,
+//! GC-root synchronisation around runtime calls, sampled back-edge polls, OSR
+//! entry prologues and guard-failure deopt exits. Native transfer dispatch is
+//! not here: the ppc64le transfer stubs live in native_transfer_ppc64le.rs,
+//! and the ppc64le native-segment entry uses `emit_framed` (no adapters) for
+//! allocation-free, scope-free, deopt-free bodies only.
 //!
-//! | role                                  | System Z | AArch64 | ppc64le |
-//! |---------------------------------------|----------|---------|---------|
-//! | primary working / first argument      | r2       | x0      | r3      |
-//! | secondary working / second argument   | r3       | x1      | r4      |
-//! | temporaries / third and fourth args   | r4, r5   | x2, x3  | r5, r6  |
-//! | address scratch                       | r1       | x16     | r11     |
-//! | frame-slots pointer, whole body       | r13      | x28     | r14     |
-//! | stack pointer                         | r15      | sp      | r1      |
+//! The fourth backend of this shape, structured like the other three and
+//! sharing [`RuntimeCalls`] and `rematerialization_order` with System Z.
 //!
-//! Two things POWER forces that the others did not. An indirect call goes through
-//! the count register and clobbers the link register, and the ABI expects the target
-//! in r12 so a callee entered at its global entry point can compute its own TOC —
-//! which is why r2 is saved and restored around every call. Get that wrong and leaf
-//! arithmetic works while anything calling out corrupts.
+//! # Design
 //!
-//! Overflow does NOT go through `XER[SO]`: it is sticky, and the instruction that
-//! cheaply cleared it no longer exists at this ISA level (bliss-lpgl1). A fixnum
-//! multiply therefore compares `mulhd` against the low half's sign, and add and
-//! subtract test the operand signs.
+//! Register allocation runs (`allocate_framed_ppc64le`, pool r20–r29, all
+//! nonvolatile), but emission is home-based: a value whose every
+//! `value_locations` range agrees keeps that register or frame slot as its
+//! *home*; a split value gets a fresh stable frame slot. Each instruction loads
+//! operands into fixed working registers, operates, and stores back.
+//!
+//! ELFv2 passes the first arguments from r3 and returns in r3, so the working
+//! registers double as argument registers as on the other two targets:
+//!
+//! | role                                          | System Z | AArch64 | ppc64le |
+//! |-----------------------------------------------|----------|---------|---------|
+//! | primary working / first argument / result     | r2       | x0      | r3      |
+//! | secondary working / second argument           | r3       | x1      | r4      |
+//! | temporaries / third and fourth arguments      | r4, r5   | x2, x3  | r5, r6  |
+//! | address scratch                               | r1       | x16     | r11     |
+//! | activation (frame-slots) pointer, whole body  | r13      | x28     | r14     |
+//! | stack pointer                                 | r15      | sp      | r1      |
+//!
+//! Two things POWER forces that the others do not. An indirect call goes
+//! through the count register and clobbers the link register, and the ABI
+//! expects the target in r12 so a callee entered at its global entry point can
+//! compute its own TOC, which is why r2 is saved and restored around every call
+//! (`emit_call`). And overflow cannot use `XER[SO]`: it is sticky, and the
+//! instruction that cheaply cleared it no longer exists at this ISA level
+//! (bliss-lpgl1), so add/sub test operand signs explicitly and multiply
+//! compares `mulhd` against the low half's sign.
+//!
+//! # Frame
+//!
+//! The link register is saved in the caller's frame at `frame::LINK_SLOT`
+//! before `stdu` claims this one, as the ABI prescribes; `frame::SAVED`
+//! (r14–r16, r20–r29) go at the top of the frame. From `frame::LOCALS_BASE`
+//! upward: spill slots (regalloc2's plus stable homes for split values), the
+//! edge parallel-copy buffer, the deopt serialisation buffer and the remat
+//! buffer; the call result and poll countdown use the fixed
+//! `frame::SCRATCH_SLOT` and `frame::POLL_SLOT`. Every access uses a signed
+//! 16-bit displacement, so a frame over 32752 bytes declines.
+//!
+//! The entry prologue imports the entry block's parameters from activation
+//! slots `0..n`. OSR entries are extra prologues for each `osr_entries` record
+//! whose frame state is single-scope, stack-empty and all-tagged and whose
+//! every live home at the loop header is importable from a slot; they are
+//! published as `(bcp, offset)` in [`FramedCode`].
+//!
+//! # Runtime calls and GC roots
+//!
+//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue` and
+//! `TakeValuesToLocals` go through [`RuntimeCalls`] adapters. `ClearMv` is a
+//! local no-op on this target: a direct native segment enters with the
+//! caller's multiple-value state already cleared, and routing the marker
+//! through an adapter would make otherwise leaf bodies ineligible for the
+//! adapter-free emitter. Around each call `runtime_call` clears every shadow
+//! slot to NIL, writes each live tagged value into the shadow area after
+//! `activation_slots` (roots, then arguments), calls, and reloads each root
+//! from its shadow before assigning results. The live set is derived from the
+//! regalloc2 ranges covering the instruction's Late point plus its uses and
+//! edge args, minus its defs. Each site is a [`RootSyncSite`] and installation
+//! checks the count against `emitted_safepoints`. A nonzero `transfer_pending`
+//! is consulted after each call and a nonzero answer takes the shared NIL exit
+//! (the checked legacy ABI). Back-edge polls decrement a 256-count frame word
+//! and call `poll` through the same path at zero; a cycle without a `poll`
+//! adapter declines.
+//!
+//! # Supported opcodes
+//!
+//! Constants (`Const*` folded; heap literals loaded through their rooted
+//! constant-pool slot), `Return`, `Jump`, two-way `Brif`, `Guard` for the
+//! FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on tagged single-floats
+//! (unboxed through the direct GPR↔FPR move), `FixnumAdd/Sub/Mul/Neg` and the
+//! five comparisons (branchless via `isel`), all tag-guarded and deopting on
+//! overflow. Anything else returns `UnsupportedOp(0x9C)`.
+//!
+//! # Deopt exits
+//!
+//! Each guard gets a cold label. The exit evaluates remat recipes in
+//! dependency order into the remat buffer, serialises each scope as
+//! `(function, bcp, nlocals, nstack)` followed by its slot words, and calls
+//! `deopt_t2` with `(nscopes, nwords, buffer, 0)`; no home is written before
+//! an instruction's guards pass. The adapter must root the stream before it
+//! allocates.
 
 use super::emit::{EmitError, FramedCode, RootSyncSite};
 use super::emit_s390x::rematerialization_order;

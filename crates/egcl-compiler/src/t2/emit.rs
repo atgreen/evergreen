@@ -1,33 +1,140 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! T2 machine-code emission — MachFunc → executable x86-64 bytes (spec §4.7).
+//! T2 x86-64 machine-code emission.
 //!
-//! The final lowering stage: after P5 selected `MachInst`s and P6 assigned every
-//! `VReg` a `Location`, this walks the `MachFunc` and emits real x86-64 machine
-//! code through the shared label assembler (`egcl_rt::asm`). The result is a
-//! byte buffer that `egcl_rt::jit::JitBuffer` can make executable.
+//! # Purpose
 //!
-//! The compact [`emit`] backend consumes regalloc2's exact per-instruction
-//! allocations and edit stream, including spill/reload moves. The live
-//! interpreter-facing [`emit_framed`] backend uses the same lowering and
-//! allocation pipeline, then gives split ranges stable native-stack homes while
-//! its richer call, guard, deopt, and OSR templates are emitted. Unsupported
-//! instruction shapes return [`EmitError`] and leave the function at T1.
+//! Produce executable x86-64 bytes for a T2 function through the shared label
+//! assembler (`egcl_rt::asm::Asm`); the caller maps the result with
+//! `egcl_rt::jit::JitBuffer`. Two emitters live here:
+//!
+//! * [`emit`], the **compact** backend: walks a [`MachFunc`] after register
+//!   allocation and encodes each `MachInst` from `inst_allocations`, replaying
+//!   `allocation_edits` before and after it. Integer-only, straight-line, and
+//!   limited to a handful of mnemonics (`MOV`, `MOV_IMM`/`MOV_TAGGED`,
+//!   `ADD`/`SUB`, `LIVENESS`, `RET`). It is the exact-allocation reference path
+//!   used by drive.rs and the unit tests; it refuses `INVOKE`.
+//! * [`emit_framed`] / [`emit_framed_with_activation_slots`], the **framed**
+//!   backend that produces production T2 code. It works from the IR
+//!   [`Function`] directly, expanding each instruction from a template with
+//!   guards, deopt stubs, runtime-call sequences, shadow-root synchronisation,
+//!   OSR entries, and (on Linux) the native-transfer protocol. Lowering and
+//!   regalloc2 run only to decide where values live.
+//!
+//! On AArch64, ppc64le and s390x, `emit_framed_with_activation_slots` dispatches
+//! to the sibling emitters; this file is the x86-64 implementation and the
+//! shared entry point. Any shape an emitter cannot encode returns an
+//! [`EmitError`] and the function stays at T1.
+//!
+//! # Framed route: value homes and registers
+//!
+//! 1. `lower::lower` then `regalloc::allocate_framed` (reduced pool first, full
+//!    pool on `TooManyLiveRegs`).
+//! 2. `x64_frame::select_frame_homes` turns the allocator's split-aware
+//!    `value_locations` into one [`ValueHome`](crate::t2::x64_frame::ValueHome)
+//!    per value: a callee-saved register if every range agrees, otherwise an
+//!    RSP-relative stack slot. Templates address operands only through these
+//!    homes.
+//! 3. Register discipline: value homes come from the allocator's framed pool
+//!    (rcx, r8, rsi, rbx; plus r12–r15 in the full pool). `rax`/`rdx` are
+//!    template scratch, `r9`–`r11` are the per-instruction temporary bank
+//!    `prepare_framed_inst` loads spilled operands into, and `rdi` holds the
+//!    activation slots pointer on entry. The prologue pushes exactly the
+//!    callee-saved registers that homes use, pads to keep `rsp` 16-aligned at
+//!    calls, and reserves `native_spill_slots * 8` bytes.
+//!
+//! # Framed route: entries
+//!
+//! * **Interpreter entry** at offset 0: `extern "C" fn(*mut u64) -> u64`
+//!   receiving the EgclStack activation's slots pointer (the frame header is
+//!   0x28 bytes below it; see docs/design/t2-frame-layout.md). The prologue
+//!   stores that pointer into `frame_base_home` if the function needs it,
+//!   loads entry params from `slots[i]` into their homes, and falls into the
+//!   entry block.
+//! * **Register entry** (`FramedCode::compiled_entry`), when the function is
+//!   non-variadic, has no checked parameter declarations, needs no frame base,
+//!   and takes at most four params: args arrive in rcx, r8, r9, r10 and are
+//!   moved into their homes as one parallel move. Self-calls use it directly
+//!   (`emit_call`), bypassing c2i dispatch, with an `rsp` guard that falls back
+//!   to the c2i path when the published stack limit is near (bliss-b4fd).
+//! * **OSR entries** (`FramedCode::osr_entries`), one per IR `osr_entries`
+//!   record: load the live interpreter slots into the homes of the values that
+//!   are live at the target block and jump into the loop body.
+//!
+//! # Framed route: deoptimisation
+//!
+//! A function with no call-like instruction is pure here and uses one shared
+//! whole-function stub that re-enters T0 from the start via `c2i_deopt`. A
+//! function that can commit a side effect before a later guard fails gets
+//! **precise** per-guard stubs (bliss-mba): each serialises the guard's
+//! FrameState scopes, outermost first, as `[function, bcp, nlocals, nstack,
+//! locals…, stack…]` into an `rsp` buffer, with each slot read from its home,
+//! an immediate, or a `Remat` recipe evaluated in `rax`, then calls
+//! `c2i_deopt_t2`. Every instruction that can reach a guard template must carry
+//! a FrameState or emission declines. Values named by any FrameState or OSR
+//! entry form the deopt-live set and are never recycled early.
+//!
+//! # Framed route: safepoints and GC roots
+//!
+//! The collector does not inspect registers. Before every runtime call the
+//! emitter stores the exact set of live tagged values into **shadow root
+//! slots** appended to the activation after `activation_slots`, clears unused
+//! shadow slots to NIL, and after the call reloads each value into its home,
+//! because a moving collection updates the activation slot, not the host-stack
+//! home. Liveness comes from `value_locations` at program point `mi*2 + 1`
+//! (live *after* the call), plus the call's own early uses, restricted to
+//! `Tagged`-represented values with a home and excluding values whose inferred
+//! type is confined to non-pointer immediates. `shadow_root_slots` is the
+//! maximum root count over all sites plus the slice reserved for wide calls
+//! (more than three args, or `Invoke`) whose arguments are passed through the
+//! activation. Each site is recorded in `root_sync_sites` with its native
+//! offset and root counts, and installation refuses the artifact if the count
+//! disagrees with `emitted_safepoints`.
+//!
+//! # Native transfers (Linux x86-64 only)
+//!
+//! `emit_framed_transfers*` and `emit_framed_native_*` emit through a helper-v2
+//! veneer: calls pass a [`TransferCallRequest`] and receive either a value or a
+//! pending transfer, cleanup/catch/handler landings are emitted as verified
+//! cold edges, and polls are placed at loop headers and every 64 straight-line
+//! instructions so any cycle reaches a GC/signal check. The result carries a
+//! `SysvTransferTable` binding each site to its emitted return PC
+//! (transfer_sites.rs). Ordinary `emit_framed` rejects IR containing cleanup,
+//! catch, handler, `Invoke` or `NlxTransfer` instructions.
+//!
+//! # Output
+//!
+//! [`FramedCode`]: the bytes, entry offsets, OSR entries, spill and
+//! shadow-slot counts, root-sync sites, heap-constant pool slots the client
+//! must keep rooted, a sparse bcp→offset map for the JIT viewer, and
+//! `has_deopt` (true iff some deopt stub is actually referenced), which gates
+//! direct native→native calls.
+//!
+//! # Debugging
+//!
+//! * `EGCL_IR_FULL=1` — dump the IR as the emitter sees it.
+//! * `EGCL_RA_DBG=1` — each value's home with its allocator ranges, every
+//!   FrameState-carrying `MachInst`, every FrameState, and OSR slot decisions.
+//! * `EGCL_SAFEPOINT_DBG=1` — roots chosen at each safepoint and the raw
+//!   allocator ranges.
+//! * `EGCL_FRAMESTATE_DBG=1`, `EGCL_DEOPT_SRC_DBG=1` — the scopes and slot
+//!   sources serialised by each precise deopt stub.
+//! * `EGCL_NO_DIRECT_SELF_CALL=1` — route self-calls through c2i.
 
 use egcl_rt::asm::{Asm, Cc};
 
-use crate::osr::ConversionKind;
 use crate::t2::ir::Function;
 use crate::t2::mach::{EditPosition, Location, MachFunc, MachInst, PhysReg, RegClass, VReg};
 use crate::t2::slot_map;
+use crate::t2::slot_map::ConversionKind;
 use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
 mod frame_tests;
 
-/// Why emission could not complete (the function stays at T1, spec R4.28/R4.42).
+/// Why emission could not complete (the function stays at T1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmitError {
     /// An opcode this emitter does not encode yet.
@@ -523,7 +630,7 @@ fn float_operand_to_xmm(
     Ok(())
 }
 
-/// A framed T2 compilation with its two entry points (spec: compiled-caller ABI).
+/// A framed T2 compilation with its entry points.
 ///
 /// The code has a single body reached by two entries:
 /// - **interpreter entry** at offset 0 — `extern "C" fn(*mut u64 slots) -> u64`
@@ -2806,36 +2913,6 @@ pub fn emit_framed_native_cleanups(
             complete,
             clear_mv,
             catch_landing: 0,
-            handler_landing: 0,
-        }),
-        None,
-    )
-}
-
-/// Add a noncollecting `(push_bcp, resume_bcp, unused) -> primary` helper that
-/// consumes an already rooted, selected catch payload and restores all values.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub fn emit_framed_native_catches(
-    f: &Function,
-    call_veneer: u64,
-    activation_slots: u16,
-    save: u64,
-    complete: u64,
-    clear_mv: u64,
-    catch_landing: u64,
-) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
-    if catch_landing == 0 {
-        return Err(EmitError::UnsupportedOp(0xFA));
-    }
-    emit_transfer_function(
-        f,
-        call_veneer,
-        activation_slots,
-        Some(CleanupEmission::Native {
-            save,
-            complete,
-            clear_mv,
-            catch_landing,
             handler_landing: 0,
         }),
         None,

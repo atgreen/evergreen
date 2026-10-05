@@ -1,32 +1,104 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! AArch64 emission for the optimized SSA pipeline.
+//! AArch64 machine-code emission for the T2 framed pipeline.
 //!
-//! Structured as the System Z emitter is, and for the same reasons: register
-//! allocation assigns each SSA value a *home* (a callee-saved register or a frame
-//! slot), and emission then loads operands into fixed working registers, operates,
-//! and stores the result back to its home. That keeps instruction selection
-//! readable and confines the architecture to this file, at the cost of some moves
-//! a fully allocation-driven emitter would avoid.
+//! # Purpose
 //!
-//! Register roles map one-to-one onto the System Z emitter's, which is why the two
-//! read alike. AAPCS64 passes the first arguments in x0–x7 and returns in x0, and
-//! System Z uses r2–r6 and returns in r2, so the working registers double as
-//! argument registers on both:
+//! Turns an optimised SSA [`Function`] into AAPCS64 code over the shared
+//! activation contract: an `EgclStack` activation of `activation_slots` tagged
+//! words, extended by the shadow-root slots needed at runtime calls. The module
+//! owns instruction selection for the opcode subset below, the frame layout,
+//! GC-root synchronisation around runtime calls, sampled back-edge polls, OSR
+//! entry prologues and guard-failure deopt exits. It does not own native
+//! transfer dispatch: runtime calls end with the checked `transfer_pending`
+//! test, and the AArch64 native-segment entry admits only call-free,
+//! scope-free bodies.
 //!
-//! | role                                  | System Z | AArch64 |
-//! |---------------------------------------|----------|---------|
-//! | primary working / first argument      | r2       | x0      |
-//! | secondary working / second argument   | r3       | x1      |
-//! | temporaries / third and fourth args   | r4, r5   | x2, x3  |
-//! | address scratch                       | r1       | x16     |
-//! | frame-slots pointer, whole body       | r13      | x28     |
-//! | stack pointer                         | r15      | sp      |
+//! Structured as the System Z emitter is, for the same reasons, and sharing
+//! [`RuntimeCalls`] and `rematerialization_order` with it.
 //!
-//! Homes come from [`super::regalloc::allocate_framed_a64`], whose pool is x19–x27
-//! — callee-saved, so a value survives a runtime call without the emitter spilling
-//! it. Unlike x86, `PhysReg.encoding` here is the architectural register number.
+//! # Design
+//!
+//! Register allocation runs (`allocate_framed_a64`, pool x19–x27, all
+//! callee-saved so a value survives a runtime call without the emitter
+//! spilling it), but emission is home-based: a value whose every
+//! `value_locations` range agrees keeps that register or frame slot as its
+//! *home*; a split value gets a fresh stable frame slot. Each instruction loads
+//! operands into fixed working registers, operates, and stores back.
+//!
+//! Register roles map one-to-one onto the System Z emitter's, which is why the
+//! two read alike. AAPCS64 passes the first arguments in x0–x7 and returns in
+//! x0, so the working registers double as argument registers:
+//!
+//! | role                                          | System Z | AArch64 |
+//! |-----------------------------------------------|----------|---------|
+//! | primary working / first argument / result     | r2       | x0      |
+//! | secondary working / second argument           | r3       | x1      |
+//! | temporaries / third and fourth arguments      | r4, r5   | x2, x3  |
+//! | address scratch                               | r1       | x16     |
+//! | activation (frame-slots) pointer, whole body  | r13      | x28     |
+//! | stack pointer                                 | r15      | sp      |
+//!
+//! x16 is IP0, already call-clobbered scratch by the architecture, so no home
+//! can live there. `PhysReg.encoding` is the architectural register number.
+//!
+//! # Frame
+//!
+//! The prologue pushes the frame record (`stp x29, x30`), sets x29, and saves
+//! x19–x28 into a `JIT_SAVE_BYTES` area whose layout T1 and the SIGSEGV
+//! recovery epilogue share, so one recovery address can unwind either tier.
+//! Below that: spill slots (regalloc2's plus stable homes for split values),
+//! the edge parallel-copy buffer, the deopt serialisation buffer, the remat
+//! buffer, and two words for the saved call result and the poll countdown,
+//! rounded to a pair so sp stays 16-byte aligned at calls. Frames over 0x1000
+//! words decline rather than materialise addresses per access.
+//!
+//! The entry prologue imports the entry block's parameters from activation
+//! slots `0..n`. OSR entries are extra prologues for each `osr_entries` record
+//! whose frame state is single-scope, stack-empty and all-tagged and whose
+//! every live home at the loop header is importable from a slot; they are
+//! published as `(bcp, offset)` in [`FramedCode`].
+//!
+//! # Runtime calls and GC roots
+//!
+//! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv` and
+//! `TakeValuesToLocals` go through [`RuntimeCalls`] adapters. Because the
+//! collector cannot see a home register or native spill slot, `runtime_call`
+//! clears every shadow slot to NIL, writes each live tagged value into the
+//! shadow area after `activation_slots` (roots, then call arguments), calls,
+//! and reloads each root from its shadow before assigning results. The live
+//! set is derived from the regalloc2 ranges covering the instruction's Late
+//! point plus its uses and edge args, minus its defs. Each site is recorded as
+//! a [`RootSyncSite`] and installation checks the count against
+//! `emitted_safepoints`. A nonzero `transfer_pending` is consulted after each
+//! call and a nonzero answer takes the shared NIL exit (the checked legacy
+//! ABI). Back-edge polls decrement a 256-count frame word and call `poll`
+//! through the same path at zero; a cycle without a `poll` adapter declines.
+//!
+//! # Supported opcodes
+//!
+//! Everything the System Z emitter supports, plus: `Guard` for the CONS tag
+//! (build.rs emits one before every `Car`/`Cdr`, so refusing it cost whole
+//! functions their T2 code, bliss-2yews); unguarded, effect-free `Car`/`Cdr`
+//! by masking the low three bits of the headerless cons pointer; `LogAnd`,
+//! `LogOr`, `LogXor` directly on tagged bits; `LogNot` with the tag re-cleared;
+//! and `FixnumShl`/`FixnumShr` by a constant amount, where a negative `Shl`
+//! constant is a right shift (that is how `(ash x -2)` lowers) and a left
+//! shift deopts when the value does not survive the round trip. Fixnum
+//! comparisons are branchless (`csel`); add/sub use the overflow flag of
+//! `adds`/`subs`; multiply uses `smulh`/`mul` and requires the high half to
+//! equal the low half's sign extension. Anything else returns
+//! `UnsupportedOp(0xA64)`.
+//!
+//! # Deopt exits
+//!
+//! Each guard gets a cold label. The exit evaluates remat recipes in
+//! dependency order into the remat buffer, serialises each scope as
+//! `(function, bcp, nlocals, nstack)` followed by its slot words, and calls
+//! `deopt_t2` with `(nscopes, nwords, buffer, 0)`; no home is written before
+//! an instruction's guards pass. The adapter must root the stream before it
+//! allocates.
 
 use super::emit::{EmitError, FramedCode, RootSyncSite};
 use super::emit_s390x::rematerialization_order;
