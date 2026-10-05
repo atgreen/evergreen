@@ -1035,9 +1035,26 @@ pub fn shadowing_import(symbols: &[EgclVal], package: EgclVal) -> Result<(), Egc
     let resolved = symbols
         .iter()
         .map(|&sym| {
-            find_symbol_name_in_store(&registry, sym)?.ok_or_else(|| {
-                EgclError::PackageError("Symbol not found in any package".to_string())
-            })
+            if let Some(name) = find_symbol_name_in_store(&registry, sym)? {
+                return Ok(name);
+            }
+            // A fresh or previously uninterned symbol need not occur in any
+            // package table. Its pinned symbol object still owns its name.
+            let idx = sym.symbol_index().ok_or_else(|| EgclError::TypeError {
+                datum: sym,
+                expected: "SYMBOL".to_string(),
+            })?;
+            let name = egcl_rt::symbols::symbol_name(idx).ok_or_else(|| {
+                EgclError::PackageError("Unknown symbol in SHADOWING-IMPORT".to_string())
+            })?;
+            if egcl_rt::symbols::is_uninterned(idx) {
+                return Ok(name);
+            }
+            // Interned registry keys retain their original package prefix even
+            // after UNINTERN. Fresh symbols have literal names, including colons.
+            Ok(egcl_rt::symbols::split_registry_key(&name)
+                .map_or(name.as_str(), |(_, bare)| bare)
+                .to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut target = target
