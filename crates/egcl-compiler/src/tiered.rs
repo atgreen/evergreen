@@ -50,7 +50,6 @@ use egcl_rt::value::{
     NIL_BITS, T_BITS, TAG_CONS, TAG_FUNCTION, TAG_SPECIAL, TAG_SYMBOL, EgclVal,
 };
 
-/// Compilation tier.
 // ── FnMeta: per-function metadata shared across tiers ──
 
 /// Flags for FnMeta.
