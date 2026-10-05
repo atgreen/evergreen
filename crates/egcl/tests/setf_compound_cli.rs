@@ -127,6 +127,112 @@ fn decf_composes_custom_writeback_after_the_delta() {
 }
 
 #[test]
+fn remf_shiftf_and_rotatef_use_custom_storing_forms() {
+    check(
+        r#"
+        (setf *place-events* nil)
+        (let ((cell (list (list :a 1 :b 2))))
+          (assert (remf (opaque-place (progn (push :cell *place-events*) cell))
+                        (progn (push :indicator *place-events*) :a)))
+          (assert (equal (car cell) '(:b 2)))
+          (assert (equal (reverse *place-events*)
+                         '(:cell :indicator :read :store))))
+
+        (setf *place-events* nil)
+        (let ((left (list 1)) (right (list 2)))
+          (assert (= 1 (shiftf (opaque-place left) (opaque-place right) 3)))
+          (assert (= (car left) 2))
+          (assert (= (car right) 3))
+          (assert (equal (reverse *place-events*)
+                         '(:read :read :store :store))))
+
+        (setf *place-events* nil)
+        (let ((left (list 1)) (right (list 2)))
+          (assert (null (rotatef (opaque-place left) (opaque-place right))))
+          (assert (= (car left) 2))
+          (assert (= (car right) 1))
+          (assert (equal (reverse *place-events*)
+                         '(:read :read :store :store))))
+        "#,
+    );
+}
+
+#[test]
+fn shiftf_and_rotatef_preserve_multiple_store_values() {
+    check_with_setup(
+        r#"
+        (define-setf-expander pair-place (cell)
+          (let ((tmp (gensym)) (first (gensym)) (second (gensym)))
+            (values (list tmp) (list cell) (list first second)
+                    `(progn (rplaca ,tmp ,first) (rplacd ,tmp ,second)
+                            (values ,first ,second))
+                    `(values (car ,tmp) (cdr ,tmp)))))
+        "#,
+        r#"
+        (let ((left (cons 1 2)) (right (cons 3 4)))
+          (assert (equal (multiple-value-list
+                           (shiftf (pair-place left) (pair-place right)
+                                   (values 5 6)))
+                         '(1 2)))
+          (assert (equal left '(3 . 4)))
+          (assert (equal right '(5 . 6))))
+        (let ((left (cons 1 2)) (right (cons 3 4)))
+          (assert (null (rotatef (pair-place left) (pair-place right))))
+          (assert (equal left '(3 . 4)))
+          (assert (equal right '(1 . 2))))
+        "#,
+    );
+}
+
+#[test]
+fn psetf_and_values_setf_use_custom_storing_forms() {
+    check(
+        r#"
+        (setf *place-events* nil)
+        (let ((left (list 1)) (right (list 2)))
+          (assert (null
+                    (psetf (opaque-place (progn (push :left *place-events*) left))
+                           (progn (push :left-value *place-events*) 10)
+                           (opaque-place (progn (push :right *place-events*) right))
+                           (progn (push :right-value *place-events*) 20))))
+          (assert (= (car left) 10))
+          (assert (= (car right) 20))
+          (assert (equal (reverse *place-events*)
+                         '(:left :left-value :right :right-value :store :store))))
+
+        (setf *place-events* nil)
+        (let ((left (list 1)) (right (list 2)))
+          (assert (equal (multiple-value-list
+                           (setf (values (opaque-place left) (opaque-place right))
+                                 (values 30 40)))
+                         '(30 40)))
+          (assert (= (car left) 30))
+          (assert (= (car right) 40))
+          (assert (equal (reverse *place-events*) '(:store :store))))
+        "#,
+    );
+}
+
+#[test]
+fn psetf_preserves_multiple_store_values() {
+    check_with_setup(
+        r#"
+        (define-setf-expander pair-place (cell)
+          (let ((tmp (gensym)) (first (gensym)) (second (gensym)))
+            (values (list tmp) (list cell) (list first second)
+                    `(progn (rplaca ,tmp ,first) (rplacd ,tmp ,second)
+                            (values ,first ,second))
+                    `(values (car ,tmp) (cdr ,tmp)))))
+        "#,
+        r#"
+        (let ((cell (cons 1 2)))
+          (assert (null (psetf (pair-place cell) (values 5 6))))
+          (assert (equal cell '(5 . 6))))
+        "#,
+    );
+}
+
+#[test]
 fn getf_returns_only_the_new_value_when_its_writer_returns_multiple_values() {
     check(
         r#"
