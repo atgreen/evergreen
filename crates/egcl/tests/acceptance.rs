@@ -16421,9 +16421,57 @@ fn string_comparison_takes_symbol_name_as_the_designator() {
         ("(string-equal 'abc \"ABC\")", "T"),
         ("(string 'abc)", "\"ABC\""),
     ];
-    // Reading ABC before |abc| currently aliases their names (bliss-341ou).
-    // Keep the existing fresh-process coverage until that reader bug is fixed.
-    run_expression_cases(&cases);
+    run_expression_cases_batched(&cases);
+}
+
+#[test]
+fn reader_preserves_case_when_resolving_existing_symbols() {
+    let cases = [
+        ("(symbol-name 'case-probe)", "\"CASE-PROBE\""),
+        ("(symbol-name '|case-probe|)", "\"case-probe\""),
+        ("(eq 'case-probe '|case-probe|)", "NIL"),
+        ("(eq '|case-probe| (intern \"case-probe\"))", "T"),
+        ("(symbol-name '|Case-Probe|)", "\"Case-Probe\""),
+        ("(symbol-name 'c\\ase-probe)", "\"CaSE-PROBE\""),
+        ("(symbol-name 'cl-user::|case-probe|)", "\"case-probe\""),
+        ("(eq 'cl-user::|case-probe| '|case-probe|)", "T"),
+        ("(symbol-name '|reverse-first|)", "\"reverse-first\""),
+        ("(symbol-name 'reverse-first)", "\"REVERSE-FIRST\""),
+        ("(eq 'reverse-first '|reverse-first|)", "NIL"),
+        ("(symbol-name '|car|)", "\"car\""),
+        ("(eq 'car '|car|)", "NIL"),
+        ("(symbol-name :|car|)", "\"car\""),
+        (
+            "(let ((*readtable* (copy-readtable nil))) \
+               (setf (readtable-case *readtable*) :preserve) \
+               (symbol-name (read-from-string \"case-probe\")))",
+            "\"case-probe\"",
+        ),
+        (
+            "(let ((*readtable* (copy-readtable nil))) \
+               (setf (readtable-case *readtable*) :downcase) \
+               (symbol-name (read-from-string \"CASE-PROBE\")))",
+            "\"case-probe\"",
+        ),
+        (
+            "(let ((*readtable* (copy-readtable nil))) \
+               (setf (readtable-case *readtable*) :invert) \
+               (symbol-name (read-from-string \"CASE-PROBE\")))",
+            "\"case-probe\"",
+        ),
+        (
+            "(progn (make-package \"CASE-SOURCE\" :use nil) \
+               (export (intern \"LOW\" \"CASE-SOURCE\") \"CASE-SOURCE\") \
+               (make-package \"CASE-USER\" :use '(\"CASE-SOURCE\")) \
+               (let ((*package* (find-package \"CASE-USER\"))) \
+                 (list (not (eq (read-from-string \"|low|\") \
+                                (find-symbol \"LOW\" \"CASE-SOURCE\"))) \
+                       (eq (read-from-string \"LOW\") \
+                           (find-symbol \"LOW\" \"CASE-SOURCE\")))))",
+            "(T T)",
+        ),
+    ];
+    run_expression_cases_batched(&cases);
 }
 
 /// bliss-l3d7: a SIMPLE_BASE_STRING's payload is one BYTE per character, but

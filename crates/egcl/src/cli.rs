@@ -11091,8 +11091,10 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
         .is_some_and(|cl| egcl_stdlib::find_present_symbol(cl, name).is_some());
     // Keep package/name helper reads from recursively entering this hook.
     RESOLVING_SYMBOL.with(|c| c.set(true));
+    // The tokenizer has already applied readtable case conversion. Folding
+    // again here would alias escaped or preserved names with uppercase ones.
     let found = if BOOT_COMPLETE.with(|c| c.get()) {
-        find_symbol_in_package(env, &pkg_name, name)
+        find_symbol_in_package_cased(env, &pkg_name, name, true)
             .map(|pair| pair.0)
             .or_else(|| {
                 // Rust builtin/private bootstrap identities predate the package
@@ -11164,7 +11166,7 @@ fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
                 egcl_stdlib::intern(name, package).ok().map(|pair| pair.0)
             })
     } else {
-        find_symbol_in_package(env, &pkg_name, name).map(|pair| pair.0)
+        find_symbol_in_package_cased(env, &pkg_name, name, true).map(|pair| pair.0)
     };
     RESOLVING_SYMBOL.with(|c| c.set(false));
     found.and_then(EgclVal::symbol_index)
@@ -12584,8 +12586,8 @@ fn find_symbol_in_package(
     pkg_name: &str,
     bare_name: &str,
 ) -> Option<(EgclVal, &'static str)> {
-    // Default: fold to the reader's readtable-case (:upcase). Reader/intern
-    // callers rely on this; only the FIND-SYMBOL builtin opts out (case-exact).
+    // Internal bootstrap helpers use uppercase names. Reader tokens and the
+    // FIND-SYMBOL builtin use the case-exact helper directly.
     find_symbol_in_package_cased(env, pkg_name, bare_name, false)
 }
 
