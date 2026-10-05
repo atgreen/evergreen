@@ -4,6 +4,11 @@
 
 ### Correctness and reliability
 
+- `UNINTERN` now removes the requested symbol by identity without folding its
+  name, checks shadowing conflicts before changing the package, and reports
+  invalid symbols and missing packages
+  ([#16](https://github.com/atgreen/evergreen/pull/16)).
+
 - Symbol lookup now preserves literal colons in imported and keyword names,
   including lookup through exports, inherited symbols, and the reader
   ([#15](https://github.com/atgreen/evergreen/pull/15)).
