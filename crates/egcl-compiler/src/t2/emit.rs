@@ -3933,19 +3933,28 @@ fn emit_framed_inner(
 
     let mut a = Asm::new();
     let deopt = a.label();
+    let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
+    // Variadic and activation-backed functions require the frame entry.
+    let has_reg_entry = !has_declared_params
+        && !f.is_variadic()
+        && frame_base_home.is_none()
+        && f.block(entry).params.len() <= arg_regs.len();
     // A closed, pure self-recursive function has no operation that can create
     // a pending transfer: its only calls return to the same native entry and
     // every other instruction is local arithmetic/control flow.  Those calls
     // use the direct native ABI, so a post-return status branch would be dead
     // work. Mixed calls retain the check until the versioned transfer ABI gate
     // proves their bridge contract.
-    let transfer_free_self = self_sym.is_some_and(|sym| {
+    let direct_self_calls =
+        has_reg_entry && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none();
+    let transfer_free_self = direct_self_calls && self_sym.is_some_and(|sym| {
         f.block_order().iter().all(|&block| {
             f.block(block).insts.iter().all(|&inst| {
                 let data = f.inst(inst);
                 match data.opcode {
                     Opcode::Call => {
-                        matches!(data.aux, AuxData::CallTarget(target) if target == sym)
+                        data.args.len() <= arg_regs.len()
+                            && matches!(data.aux, AuxData::CallTarget(target) if target == sym)
                     }
                     Opcode::ConstFixnum
                     | Opcode::ConstFloat
@@ -4091,15 +4100,6 @@ fn emit_framed_inner(
     // A call function with ≤4 params also gets a REGISTER entry, so a self-call can
     // enter directly (args in registers) instead of paying c2i dispatch.
     let reg_entry_label = a.label();
-    let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-                                    // A variadic function's entry params are pre-collected frame slots (the
-                                    // &rest list etc.), not positional call args, so it must NOT get a register
-                                    // entry — a register self-call would pass raw args into those slots
-                                    // (bliss-32l). Its self-calls take the interpreter/c2i entry instead.
-    let has_reg_entry = !has_declared_params
-        && !f.is_variadic()
-        && frame_base_home.is_none()
-        && f.block(entry).params.len() <= arg_regs.len();
 
     // Interpreter entry (offset 0): with calls, push the callee-saved value
     // registers and pad; then load entry params from the frame slots into their
