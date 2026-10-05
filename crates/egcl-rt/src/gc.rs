@@ -1171,6 +1171,11 @@ unsafe fn trace_object(
         }
     };
     match type_id {
+        tid::MUTEX => {
+            if words >= 3 && word(1).to_raw() & crate::object::mutex_flags::HAS_NAME_SLOT != 0 {
+                visit_word(2);
+            }
+        }
         // ── Reference-free leaves: numbers and byte/character payloads. Their
         //    bodies are raw bits and must never be scanned for pointers. ──
         tid::BIGNUM
@@ -6478,7 +6483,8 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
         // segfaulted (bliss-agmi). Streams are re-opened on load; the loader
         // re-creates the standard ones.
         // Mutexes also own process-local native state. Preserve the Lisp handle
-        // but restore it as unavailable, never as a dangling native pointer.
+        // and metadata, but never a dangling native pointer. The stdlib lazily
+        // recreates a fresh, unlocked mutex when the restored handle is used.
         if matches!(
             type_id,
             crate::object::type_id::FOREIGN_POINTER
