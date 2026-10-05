@@ -34,7 +34,7 @@ use crate::lock_order::{LockLevel, OrderedRwLock};
 use crate::object::{ObjectHeader, SymbolData, type_id};
 use crate::value::{NIL, EgclVal, UNBOUND};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `SymbolData` payload size (everything past the 8-byte header): name, value,
 /// function, plist, package (5×8) + flags + tls_index (2×4) = 48 bytes.
@@ -132,8 +132,8 @@ fn alloc_pinned_symbol(name: EgclVal, package: EgclVal) -> EgclVal {
         let header = body.sub(header_size());
         let sym = header as *mut SymbolData;
         (*sym).name = *name;
-        (*sym).value = UNBOUND;
-        (*sym).function = UNBOUND;
+        std::ptr::write(&raw mut (*sym).value, AtomicU64::new(UNBOUND.0));
+        std::ptr::write(&raw mut (*sym).function, AtomicU64::new(UNBOUND.0));
         (*sym).plist = NIL;
         (*sym).package = *package;
         (*sym).flags = 0;
@@ -424,8 +424,8 @@ pub(crate) fn for_each_root_slot(mut f: impl FnMut(*mut EgclVal)) {
         unsafe {
             let sym = symbol_data(obj);
             f(&raw mut (*sym).name);
-            f(&raw mut (*sym).value);
-            f(&raw mut (*sym).function);
+            f((*sym).value.get_mut() as *mut u64 as *mut EgclVal);
+            f((*sym).function.get_mut() as *mut u64 as *mut EgclVal);
             f(&raw mut (*sym).plist);
             f(&raw mut (*sym).package);
         }
@@ -458,8 +458,8 @@ pub(crate) fn visit_interned_roots(mut visit: impl FnMut(EgclVal)) {
             let symbol = &*symbol_data(object);
             for value in [
                 symbol.name,
-                symbol.value,
-                symbol.function,
+                EgclVal(symbol.value.load(Ordering::Acquire)),
+                EgclVal(symbol.function.load(Ordering::Acquire)),
                 symbol.plist,
                 symbol.package,
             ] {
@@ -710,11 +710,19 @@ pub fn restore_objects(data: &[u8]) -> Result<(), EgclError> {
 // ── Cell accessors (used by later staging; symbols carry their own cells) ────
 
 /// Read one of a symbol's cells by field, or `None` if the index is unknown.
-fn read_cell(idx: u32, get: impl FnOnce(&SymbolData) -> EgclVal) -> Option<EgclVal> {
+fn read_cell<R>(idx: u32, get: impl FnOnce(&SymbolData) -> R) -> Option<R> {
     with_registry(|reg| {
         let obj = object_for_index(reg?, idx)?;
         // SAFETY: registry objects are pinned live symbols.
         Some(get(unsafe { &*symbol_data(obj) }))
+    })
+}
+
+fn symbol_value_slot(idx: u32) -> Option<*mut EgclVal> {
+    with_registry(|reg| {
+        let obj = object_for_index(reg?, idx)?;
+        let symbol = unsafe { symbol_data(obj) };
+        Some(unsafe { &(*symbol).value as *const AtomicU64 as *mut EgclVal })
     })
 }
 
@@ -778,7 +786,7 @@ pub fn restore_symbol_binding(idx: u32, previous: Option<EgclVal>) {
 pub fn symbol_value(idx: u32) -> Option<EgclVal> {
     DYNAMIC_VALUES
         .with(|values| values.borrow().get(&idx).copied())
-        .or_else(|| read_cell(idx, |s| s.value))
+        .or_else(|| read_cell(idx, |s| EgclVal(s.value.load(Ordering::Acquire))))
 }
 
 /// Assign the current binding, falling back to the global cell.
@@ -793,8 +801,47 @@ pub fn set_symbol_value(idx: u32, value: EgclVal) {
         }
     });
     if !local {
-        write_cell(idx, |s| s.value = value);
+        read_cell(idx, |s| s.value.store(value.0, Ordering::Release));
     }
+}
+
+/// Compare and exchange the current dynamic binding, or the global value cell.
+/// Returns the value observed by the operation.
+pub fn compare_exchange_symbol_value(idx: u32, old: EgclVal, new: EgclVal) -> Option<EgclVal> {
+    let local = DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        values.get_mut(&idx).map(|slot| {
+            let actual = *slot;
+            if actual == old {
+                *slot = new;
+            }
+            actual
+        })
+    });
+    local.or_else(|| {
+        let slot = symbol_value_slot(idx)?;
+        Some(unsafe { crate::sync::atomic::compare_exchange_ref(slot, old, new) })
+    })
+}
+
+pub fn atomic_update_symbol_value(
+    idx: u32,
+    delta: EgclVal,
+    subtract: bool,
+) -> Option<Result<EgclVal, EgclError>> {
+    let local = DYNAMIC_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        values.get_mut(&idx).map(|slot| {
+            let old = *slot;
+            let new = crate::sync::atomic::checked_fixnum_update(old, delta, subtract)?;
+            *slot = new;
+            Ok(old)
+        })
+    });
+    local.or_else(|| {
+        let slot = symbol_value_slot(idx)?;
+        Some(unsafe { crate::sync::atomic::update_fixnum_ref(slot, delta, subtract) })
+    })
 }
 
 /// The printed name of `v` when it is a symbol whose name is known, for error
@@ -808,12 +855,12 @@ pub fn symbol_name_of(v: crate::value::EgclVal) -> Option<String> {
 
 /// The global function cell (`UNBOUND` if undefined).
 pub fn symbol_function(idx: u32) -> Option<EgclVal> {
-    read_cell(idx, |s| s.function)
+    read_cell(idx, |s| EgclVal(s.function.load(Ordering::Acquire)))
 }
 
 /// Set the global function cell.
 pub fn set_symbol_function(idx: u32, function: EgclVal) {
-    write_cell(idx, |s| s.function = function);
+    read_cell(idx, |s| s.function.store(function.0, Ordering::Release));
 }
 
 /// Diagnostic: the raw address of a symbol's pinned `SymbolData` object, or
@@ -832,6 +879,19 @@ pub fn symbol_plist(idx: u32) -> Option<EgclVal> {
 /// Set the property list.
 pub fn set_symbol_plist(idx: u32, plist: EgclVal) {
     write_cell(idx, |s| s.plist = plist);
+}
+
+/// Compare and exchange a symbol's property-list cell, returning the observed
+/// value. Property lists share the registry's exclusive cell lock.
+pub fn compare_exchange_symbol_plist(idx: u32, old: EgclVal, new: EgclVal) -> Option<EgclVal> {
+    let mut observed = None;
+    write_cell(idx, |symbol| {
+        observed = Some(symbol.plist);
+        if symbol.plist == old {
+            symbol.plist = new;
+        }
+    });
+    observed
 }
 
 /// The home package (`NIL` for uninterned).
@@ -861,7 +921,7 @@ pub fn for_each_bound_function(mut f: impl FnMut(u32, String, EgclVal)) {
                     // SAFETY: registry entries are pinned live symbols.
                     let (func, name) = unsafe {
                         let d = symbol_data(obj);
-                        ((*d).function, (*d).name)
+                        (EgclVal((*d).function.load(Ordering::Acquire)), (*d).name)
                     };
                     (func != UNBOUND).then(|| (idx as u32, name.as_string(), func))
                 })
@@ -884,14 +944,18 @@ pub fn delivery_roots(candidates: &std::collections::HashSet<u32>) -> Vec<EgclVa
             for (index, &obj) in reg.interned.iter().enumerate() {
                 // SAFETY: registry entries are pinned live SymbolData objects.
                 let data = unsafe { &*symbol_data(obj) };
-                roots.extend([data.value, data.plist]);
+                roots.extend([EgclVal(data.value.load(Ordering::Acquire)), data.plist]);
                 if !candidates.contains(&(index as u32)) {
-                    roots.push(data.function);
+                    roots.push(EgclVal(data.function.load(Ordering::Acquire)));
                 }
             }
             for &obj in reg.uninterned.values() {
                 let data = unsafe { &*symbol_data(obj) };
-                roots.extend([data.value, data.plist, data.function]);
+                roots.extend([
+                    EgclVal(data.value.load(Ordering::Acquire)),
+                    data.plist,
+                    EgclVal(data.function.load(Ordering::Acquire)),
+                ]);
             }
         }
         roots

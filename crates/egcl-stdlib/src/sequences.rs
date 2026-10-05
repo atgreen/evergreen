@@ -468,6 +468,57 @@ fn vector_set_elt(v: EgclVal, idx: usize, val: EgclVal) {
     }
 }
 
+/// Atomically compare and exchange one SIMPLE-VECTOR element.
+pub fn compare_exchange_svref(
+    vector: EgclVal,
+    index: usize,
+    old: EgclVal,
+    new: EgclVal,
+) -> Result<EgclVal, EgclError> {
+    if !is_vector(vector) {
+        return Err(EgclError::TypeError {
+            datum: vector,
+            expected: "SIMPLE-VECTOR".into(),
+        });
+    }
+    let len = vector_length(vector);
+    if index >= len {
+        return Err(EgclError::TypeError {
+            datum: EgclVal::from_fixnum(index as i64),
+            expected: format!("index in bounds (length {len})"),
+        });
+    }
+    let ptr = unsafe { vector.as_ptr() };
+    let offset = vector_payload_offset(ptr) + 8 + index * 8;
+    let slot = unsafe { ptr.add(offset).cast::<EgclVal>() };
+    Ok(unsafe { egcl_rt::sync::atomic::compare_exchange_ref(slot, old, new) })
+}
+
+pub fn atomic_update_svref(
+    vector: EgclVal,
+    index: usize,
+    delta: EgclVal,
+    subtract: bool,
+) -> Result<EgclVal, EgclError> {
+    if !is_vector(vector) {
+        return Err(EgclError::TypeError {
+            datum: vector,
+            expected: "SIMPLE-VECTOR".into(),
+        });
+    }
+    let len = vector_length(vector);
+    if index >= len {
+        return Err(EgclError::TypeError {
+            datum: EgclVal::from_fixnum(index as i64),
+            expected: format!("index in bounds (length {len})"),
+        });
+    }
+    let ptr = unsafe { vector.as_ptr() };
+    let offset = vector_payload_offset(ptr) + 8 + index * 8;
+    let slot = unsafe { ptr.add(offset).cast::<EgclVal>() };
+    unsafe { egcl_rt::sync::atomic::update_fixnum_ref(slot, delta, subtract) }
+}
+
 // ── COMPLEX_ARRAY: rank-1 vectors with a fill pointer and/or adjustability ──
 //
 // Like simple-vectors, these are leaked (off-GC) heap objects (egcl allocates

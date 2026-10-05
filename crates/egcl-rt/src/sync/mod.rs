@@ -7,6 +7,7 @@
 //! Native threads, and pinned fibers under the configured policy, use the
 //! corresponding OS-blocking path.
 
+pub mod atomic;
 mod condvar;
 mod io;
 mod mutex;

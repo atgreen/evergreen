@@ -1374,6 +1374,17 @@ fn is_lambda_expression(val: EgclVal) -> bool {
 ///    recursively code-walked (only arguments are expanded). The
 ///    operator was already checked for macros by macroexpand above.
 pub fn macroexpand_all(form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    if form.is_cons() {
+        let operator = unsafe { cons_car(form) };
+        if get_symbol_name(operator).is_some_and(|name| {
+            matches!(
+                name.rsplit(':').next().unwrap_or(&name),
+                "ATOMIC-INCF" | "ATOMIC-DECF"
+            )
+        }) {
+            return Ok(form);
+        }
+    }
     // Step 1: Macroexpand the top-level form
     let (mut expanded, _) = macroexpand(form, env)?;
 

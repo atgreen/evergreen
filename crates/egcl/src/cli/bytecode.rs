@@ -22449,6 +22449,14 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
         }
     }
 
+    // Atomic update macros need their place argument as source syntax. A
+    // top-level thunk may bail after macro expansion, leaving the fallback to
+    // see an already-transformed place. Interpret these one-shot forms after
+    // definitions have taken their dedicated compilation path above.
+    if form_contains_atomic_update(form) {
+        return eval_form(form, env);
+    }
+
     // Any other form: compile a thunk, else fall back. On an opportunistic bail
     // (a capturing flet/labels or closure needs the heap-frame machinery) retry
     // in portable mode before tree-walking — same rationale as lazy_compile_defun
@@ -22469,6 +22477,35 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
             eval_form(form, env)
         }
     }
+}
+
+fn form_contains_atomic_update(form: EgclVal) -> bool {
+    if !form.is_cons() {
+        return false;
+    }
+    let (head, mut tail) = cp(form);
+    if head.is_symbol()
+        && matches!(
+            symbol_bare_name(&sym_name(head)).as_str(),
+            "ATOMIC-INCF" | "ATOMIC-DECF"
+        )
+    {
+        return true;
+    }
+    if head.is_symbol() && symbol_bare_name(&sym_name(head)) == "QUOTE" {
+        return false;
+    }
+    if form_contains_atomic_update(head) {
+        return true;
+    }
+    while tail.is_cons() {
+        let (item, rest) = cp(tail);
+        if form_contains_atomic_update(item) {
+            return true;
+        }
+        tail = rest;
+    }
+    false
 }
 
 /// Emit a one-word trace line when `EGCL_BYTECODE_TRACE` is set — used by the

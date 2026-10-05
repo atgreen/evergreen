@@ -661,6 +661,126 @@ fn resolve(name: &str) -> Option<Handler> {
             env.clear_mv();
             egcl_stdlib::synchronization::memory_barrier(args)
         }),
+        "EGCL::%CAS-CAR" | "EGCL::%CAS-CDR" => Some(|operator, args, _env| {
+            if args.len() != 3 {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a cons, old value, and new value"
+                )));
+            }
+            egcl_stdlib::atomics::compare_exchange_cons(
+                args[0],
+                operator.ends_with("CAR"),
+                args[1],
+                args[2],
+            )
+        }),
+        "EGCL::%CAS-SVREF" => Some(|operator, args, _env| {
+            if args.len() != 4 || !args[1].is_fixnum() || args[1].as_fixnum() < 0 {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a simple vector, non-negative index, old value, and new value"
+                )));
+            }
+            egcl_stdlib::sequences::compare_exchange_svref(
+                args[0],
+                args[1].as_fixnum() as usize,
+                args[2],
+                args[3],
+            )
+        }),
+        "EGCL::%CAS-SYMBOL-VALUE" => Some(|operator, args, _env| {
+            if args.len() != 3 || !args[0].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a symbol, old value, and new value"
+                )));
+            }
+            egcl_rt::symbols::compare_exchange_symbol_value(
+                args[0].as_symbol_index(),
+                args[1],
+                args[2],
+            )
+            .ok_or_else(|| EgclError::Internal("unknown symbol value cell".into()))
+        }),
+        "EGCL::%CAS-SYMBOL-PLIST" => Some(|operator, args, _env| {
+            if args.len() != 3 || !args[0].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a symbol, old value, and new value"
+                )));
+            }
+            egcl_rt::symbols::compare_exchange_symbol_plist(
+                args[0].as_symbol_index(),
+                args[1],
+                args[2],
+            )
+            .ok_or_else(|| EgclError::Internal("unknown symbol plist cell".into()))
+        }),
+        "EGCL::%CAS-SLOT" => Some(|operator, args, _env| {
+            if args.len() != 4 || !args[1].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires an instance, slot symbol, old value, and new value"
+                )));
+            }
+            egcl_stdlib::clos::compare_exchange_slot_value(args[0], args[1], args[2], args[3])
+        }),
+        "EGCL::%CAS-ACCESSOR" => Some(|operator, args, env| {
+            if args.len() != 4 || !args[1].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires an instance, accessor symbol, old value, and new value"
+                )));
+            }
+            let args = RootedVals::new(args.to_vec());
+            let slot = accessor_slot_symbol_cached(env, args[0], args[1]).ok_or_else(|| {
+                EgclError::ProgramError(format!(
+                    "{} is not a structure-slot accessor",
+                    sym_name(args[1])
+                ))
+            })?;
+            egcl_stdlib::clos::compare_exchange_slot_value(args[0], slot, args[2], args[3])
+        }),
+        "EGCL::%ATOMIC-UPDATE-SYMBOL" => Some(|operator, args, _env| {
+            if args.len() != 3 || !args[0].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a symbol, delta, and subtraction flag"
+                )));
+            }
+            egcl_rt::symbols::atomic_update_symbol_value(
+                args[0].as_symbol_index(),
+                args[1],
+                !args[2].is_nil(),
+            )
+            .ok_or_else(|| EgclError::Internal("unknown symbol value cell".into()))?
+        }),
+        "EGCL::%ATOMIC-UPDATE-SVREF" => Some(|operator, args, _env| {
+            if args.len() != 4 || !args[1].is_fixnum() || args[1].as_fixnum() < 0 {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires a vector, non-negative index, delta, and subtraction flag"
+                )));
+            }
+            egcl_stdlib::sequences::atomic_update_svref(
+                args[0],
+                args[1].as_fixnum() as usize,
+                args[2],
+                !args[3].is_nil(),
+            )
+        }),
+        "EGCL::%ATOMIC-UPDATE-ACCESSOR" => Some(|operator, args, env| {
+            if args.len() != 4 || !args[1].is_symbol() {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires an instance, accessor symbol, delta, and subtraction flag"
+                )));
+            }
+            let args = RootedVals::new(args.to_vec());
+            let accessor = symbol_bare_name(&sym_name(args[1]));
+            let slot = accessor_slot_symbol_cached_by_name(env, args[0], &accessor)
+                .ok_or_else(|| {
+                    EgclError::ProgramError(format!(
+                        "{} is not a structure-slot accessor",
+                        accessor
+                    ))
+            })?;
+            egcl_stdlib::clos::atomic_update_slot_value(
+                args[0], slot, args[2], !args[3].is_nil(),
+            )
+        }),
         "EGCL::%TEXT-CODEC" => Some(|_operator, args, env| {
             env.clear_mv();
             egcl_stdlib::text_codec::call(args)

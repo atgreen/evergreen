@@ -2287,6 +2287,59 @@ pub fn set_slot_value(
     }
 }
 
+/// Atomically compare and exchange an inline instance slot.
+pub fn compare_exchange_slot_value(
+    instance: EgclVal,
+    slot_name: EgclVal,
+    old: EgclVal,
+    new: EgclVal,
+) -> Result<EgclVal, EgclError> {
+    if !is_instance(instance) {
+        return Err(EgclError::TypeError {
+            datum: instance,
+            expected: "STANDARD-OBJECT".into(),
+        });
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        let Some(index) = instance_slot_index(instance, slot_name) else {
+            return Err(EgclError::Internal(format!(
+                "slot not present in class layout: {}",
+                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+            )));
+        };
+        Ok(egcl_rt::sync::atomic::compare_exchange_ref(
+            slot_cell(instance, index),
+            old,
+            new,
+        ))
+    }
+}
+
+pub fn atomic_update_slot_value(
+    instance: EgclVal,
+    slot_name: EgclVal,
+    delta: EgclVal,
+    subtract: bool,
+) -> Result<EgclVal, EgclError> {
+    if !is_instance(instance) {
+        return Err(EgclError::TypeError {
+            datum: instance,
+            expected: "STANDARD-OBJECT".into(),
+        });
+    }
+    unsafe {
+        update_if_obsolete(instance);
+        let Some(index) = instance_slot_index(instance, slot_name) else {
+            return Err(EgclError::Internal(format!(
+                "slot not present in class layout: {}",
+                egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
+            )));
+        };
+        egcl_rt::sync::atomic::update_fixnum_ref(slot_cell(instance, index), delta, subtract)
+    }
+}
+
 /// Check if a slot is bound (SLOT-BOUNDP). A name outside the layout is treated
 /// as unbound (returns `false`) rather than an error.
 pub fn slot_boundp(instance: EgclVal, slot_name: EgclVal) -> Result<bool, EgclError> {
