@@ -25,6 +25,18 @@ sync it when the work is complete. A first-time contributor who does not yet
 have Beads configured can start with a GitHub issue; a maintainer will associate
 the work with a Bead before it lands.
 
+## Work on a branch
+
+Start each change from the current `main` and put it on a focused branch. Use a
+short descriptive name such as `fix/bliss-abcde-reader-labels` or
+`docs/install-guide`. Do not commit directly to `main`.
+
+Keep one coherent change in each branch and leave unrelated local files out of
+its commits. If another change becomes necessary, record it in Beads and use a
+separate branch unless it is required for the current change to work. Rebase
+the branch onto current `main` before requesting its final review, and resolve
+conflicts on the branch.
+
 ## Build the project
 
 The workspace uses the Rust toolchain pinned by `rust-toolchain.toml`.
@@ -103,6 +115,12 @@ Keep commits focused and use imperative commit subjects. In the pull request:
 
 If an AI assistant authored part of the change, preserve the agent provenance
 required by `AGENTS.md`, including its `Co-Authored-By` trailer.
+
+Maintainers merge completed pull requests with **squash and merge**, then delete
+the source branch. The PR title becomes the commit subject on `main`, so write it
+in the imperative mood and keep the description current with the final patch.
+All review conversations must be resolved before merge. After merging, update
+your local `main` with a fast-forward pull before starting the next branch.
 
 Contributions are distributed under
 `GPL-3.0-or-later WITH Classpath-exception-2.0`, the license of this repository.

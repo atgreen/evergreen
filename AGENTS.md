@@ -1,5 +1,33 @@
 # Agent Instructions
 
+## Git workflow
+
+Since v0.0.1, all repository changes go through focused branches and pull
+requests. Do not commit or push directly to `main`.
+
+1. Start from current `github/main`. If the working tree contains unrelated
+   changes, preserve them and use a worktree or switch branches only when doing
+   so will not disturb them.
+2. Claim or create the Bead, then create a descriptively named branch such as
+   `fix/<bead>-<topic>`, `feat/<bead>-<topic>`, or `docs/<topic>`.
+3. Keep the branch limited to one coherent change. Do not include unrelated
+   scratch files, Beads interaction logs, build output, or another session's
+   edits.
+4. Commit validated increments on the branch with imperative subjects and the
+   required `Co-Authored-By` trailer. Push the branch and open a PR whose title,
+   description, validation, and Bead references describe the final patch.
+5. Before merge, rebase onto current `main`, rerun the affected checks, inspect
+   the final diff, and resolve every review conversation.
+6. Use GitHub's **squash and merge** operation. Delete the merged branch, update
+   local `main` with `git pull --ff-only github main`, then close and sync the
+   Bead with the merge commit and validation evidence.
+
+GitHub Actions may write its dedicated `gh-pages` publication branch. Release
+tags and release assets follow the release procedure; they do not permit a
+direct push to `main`. Until the comprehensive CI bead (`bliss-hn1cc`) is
+complete, run and report the relevant checks without making known-unreliable
+jobs required merge gates.
+
 ## Session Startup
 
 At the start of each session, orient yourself in the spec before doing work.
