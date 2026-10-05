@@ -42,6 +42,8 @@ GC-safety evidence or reason it is not applicable:
 
 - [ ] User-facing documentation is updated, or behavior is unchanged.
 - [ ] Relevant specification requirements and coverage markers are updated, or the specification is unchanged.
-- [ ] `CHANGELOG.md` is updated, or this change does not alter the release baseline.
+- [ ] Relevant user-facing changes have a `CHANGELOG.md` entry with the actual PR
+      link. GHA, CI, release automation, and other SDLC-only changes do not need
+      entries (see the changelog policy in `AGENTS.md`).
 - [ ] Performance claims use a release build and include the workload, warmup, sample count, and comparison.
 - [ ] AI-authored changes preserve the provenance required by `AGENTS.md`, or no AI assistant authored the change.

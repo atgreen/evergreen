@@ -28,6 +28,19 @@ direct push to `main`. Until the comprehensive CI bead (`bliss-hn1cc`) is
 complete, run and report the relevant checks without making known-unreliable
 jobs required merge gates.
 
+## Changelog policy
+
+`CHANGELOG.md` records user-facing changes, not the project's development
+process. Add entries for relevant runtime behavior, public APIs, fixes,
+performance improvements, and user-facing documentation. Entries after
+v0.0.1 must link to the actual pull request.
+
+Do **not** add entries for GitHub Actions (GHA), CI, release automation,
+agent instructions, task tracking, or other software-development lifecycle
+(SDLC) tooling-only changes. Describe those changes in the PR and Bead instead.
+For a mixed change, document only its user-facing effect in the changelog.
+Changes to this policy do not themselves need a changelog entry.
+
 ## Session Startup
 
 At the start of each session, orient yourself in the spec before doing work.
