@@ -14435,6 +14435,26 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 }
 
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    if t1.is_cons() && t2.is_cons() {
+        let (head1, args1) = cp(t1);
+        let (head2, args2) = cp(t2);
+        let minimum_width = match sym_bare_name_rc(head1).as_ref() {
+            "UNSIGNED-BYTE" => Some(0),
+            "SIGNED-BYTE" => Some(1),
+            _ => None,
+        };
+        if let Some(minimum) = minimum_width
+            && head1 == head2 && args1.is_cons() && args2.is_cons()
+        {
+            let (width1, rest1) = cp(args1);
+            let (width2, rest2) = cp(args2);
+            if rest1.is_nil() && rest2.is_nil() && width1 == width2
+                && width1.is_fixnum() && width1.as_fixnum() >= minimum
+            {
+                return (true, true);
+            }
+        }
+    }
     // `(not A) ⊆ (not B)` ⟺ `B ⊆ A` (contrapositive) — exact and definite.
     if let (Some(a), Some(b)) = (parse_not_type(t1), parse_not_type(t2)) {
         egcl_rt::rooted!(a = a);
@@ -14599,6 +14619,17 @@ fn vector_length_matches(size_args: &[EgclVal], object: EgclVal) -> bool {
     true
 }
 
+fn is_stream_type_specifier(spec: EgclVal) -> bool {
+    let name = if spec.is_symbol() {
+        spec
+    } else {
+        egcl_stdlib::class_name(spec)
+    };
+    name.is_symbol()
+        && sym_bare_name_rc(name).as_ref() == "STREAM"
+        && symbol_home_package_name(name) == "COMMON-LISP"
+}
+
 fn typep_matches(
     env: &mut Env,
     mut object: EgclVal,
@@ -14609,6 +14640,9 @@ fn typep_matches(
     // the caller updates only the caller's slot when the nursery moves.
     egcl_rt::rooted_ref!(_object_root = &mut object);
     egcl_rt::rooted_ref!(_type_spec_root = &mut type_spec);
+    if is_stream_type_specifier(type_spec) && is_gray_stream(object) {
+        return Ok(true);
+    }
     // A class metaobject used directly as a type specifier — e.g.
     // `(typep ht (find-class 'hash-table))` / `(typep cond (find-class 'foo))`.
     // Class handles are neither symbols nor conses; `class_name` is non-NIL only
@@ -14667,6 +14701,9 @@ fn typep_matches(
         }
     }
     type_spec = resolve_type_spec(env, type_spec)?;
+    if is_stream_type_specifier(type_spec) && is_gray_stream(object) {
+        return Ok(true);
+    }
     if type_spec.is_symbol() {
         let type_name = sym_bare_name_rc(type_spec);
         // Interpreter closures are physically tagged cons cells, but their
@@ -23365,14 +23402,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let count = end - start;
                 let mut pos = start;
                 if is_gray_stream(inp) {
-                    for _ in 0..count {
-                        let c = invoke_generic_function("STREAM-READ-CHAR", &[inp], env)?;
-                        if c.is_nil() || c == EOF {
-                            break;
-                        }
-                        seq_set_elt(seq, pos, c)?;
-                        pos += 1;
-                    }
+                    return invoke_generic_function(
+                        "GRAY-READ-SEQUENCE",
+                        &[
+                            inp,
+                            seq,
+                            EgclVal::from_fixnum(start as i64),
+                            EgclVal::from_fixnum(end as i64),
+                        ],
+                        env,
+                    );
                 } else if egcl_stdlib::is_byte_stream(inp) {
                     // Byte (unsigned-byte 8) stream: transfer octets, not chars,
                     // and do it in bulk at both ends. Taking the stream lock per

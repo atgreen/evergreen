@@ -4,6 +4,61 @@
 use std::process::Command;
 
 #[test]
+fn gray_stream_predicates_recognize_inherited_directions() {
+    for backend in ["bytecode", "tree-walker"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .env("EGCL_BACKEND", backend)
+            .args([
+                "--no-init",
+                "--eval",
+                r#"
+              (defclass probe-input (egcl-gray-streams:fundamental-binary-input-stream) ())
+              (defclass probe-output (egcl-gray-streams:fundamental-character-output-stream) ())
+              (defclass probe-io (probe-input probe-output) ())
+              (deftype stream-alias () 'stream)
+              (defclass non-stream () ())
+              (defun check-directions (s expected)
+                (assert (equal expected (list (streamp s) (input-stream-p s) (output-stream-p s)))))
+              (let ((input (make-instance 'probe-input))
+                    (output (make-instance 'probe-output))
+                    (io (make-instance 'probe-io)))
+                ;; Warm the function to exercise the compiled path as well.
+                (dotimes (i 500)
+                  (check-directions input '(t t nil))
+                  (check-directions output '(t nil t))
+                  (check-directions io '(t t t)))
+                (assert (funcall #'streamp io))
+                (assert (typep io 'stream))
+                (assert (typep io 'stream-alias))
+                (assert (not (typep io 'file-stream)))
+                (assert (funcall #'input-stream-p io))
+                (assert (apply #'output-stream-p (list io)))
+                (assert (open-stream-p io))
+                (assert (close io :abort t))
+                (assert (not (open-stream-p io)))
+                (assert (close io))
+                (assert (not (open-stream-p io)))
+                (check-directions io '(t t t)))
+              (check-directions (make-string-input-stream "x") '(t t nil))
+              (check-directions (make-string-output-stream) '(t nil t))
+              (assert (not (streamp (make-instance 'non-stream))))
+              (assert (not (streamp 42)))
+              (format t "GRAY-PREDICATES-OK~%")
+            "#,
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{backend}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("GRAY-PREDICATES-OK"), "{backend}: {stdout}");
+    }
+}
+
+#[test]
 fn format_writes_to_gray_output_streams() {
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args([

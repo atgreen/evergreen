@@ -58,7 +58,7 @@ trivial-garbage
 trivial-backtrace
 bordeaux-threads
 cl-fad
-usocket
+usocket@egcl-support
 precise-time
 fset
 closer-mop@egcl

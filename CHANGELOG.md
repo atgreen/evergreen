@@ -10,6 +10,12 @@
 
 ### Correctness and reliability
 
+- Drakma plain HTTP GET and POST now work through the native TCP backend.
+  The fork installer selects USOCKET's EGCL branch, and Gray-stream predicates,
+  EOF handling, binary sequence reads, and array element-type aliases behave
+  correctly for its stream wrappers
+  ([#22](https://github.com/atgreen/evergreen/pull/22)).
+
 - Retained generic-function values now continue dispatching through their
   generic methods after the function name is replaced by an advice closure
   ([#19](https://github.com/atgreen/evergreen/pull/19)).

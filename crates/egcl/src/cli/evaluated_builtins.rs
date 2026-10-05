@@ -317,7 +317,11 @@ fn resolve(name: &str) -> Option<Handler> {
             // (streamp object) → T if object is a stream.
 
             let obj = args.first().copied().unwrap_or(NIL);
-            Ok(if is_stream(obj) { T } else { NIL })
+            Ok(if is_stream(obj) || is_gray_stream(obj) {
+                T
+            } else {
+                NIL
+            })
         }),
 
         "INPUT-STREAM-P" | "EGCL::%NATIVE-INPUT-STREAM-P" => Some(|_operator, args, _env| {
@@ -1040,12 +1044,13 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let inp = resolve_input_stream(args[0], env);
             let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
-            let b = if is_gray_stream(inp) {
+            let gray = is_gray_stream(inp);
+            let b = if gray {
                 invoke_generic_function("STREAM-READ-BYTE", &[inp], env)?
             } else {
                 egcl_stdlib::stream_read_byte(inp)?
             };
-            if b == EOF {
+            if b == EOF || (gray && b.is_symbol() && sym_name_rc(b).as_ref() == "KEYWORD:EOF") {
                 if eof_error {
                     return Err(EgclError::StreamError("end of file on READ-BYTE".into()));
                 }

@@ -23,7 +23,7 @@ exercises these forks:
 |---|---|---|
 | trivial-features | https://github.com/atgreen/trivial-features | `651e8ea90db0b143d39b9a414ee382ec62efad2f` |
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `0554d306864d252985c23923ef872a1b177894a6` |
-| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `9c88be9854200183d7e8e5d3f52fd314743c3ee4` |
+| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `fa0df448d5582c0d637afe3799cf53b28e1586c9` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
 | trivial-backtrace | https://github.com/atgreen/trivial-backtrace | `650da10abfe4b44c70b58a431aec6d9fe7330406` |
@@ -40,6 +40,10 @@ exercises these forks:
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads. It requires the new
 EGCL client primitives and is not a claim of HTTPS support.
+
+The [Drakma scenario](../tests/drakma/README.md) checks plain HTTP GET and POST
+through USOCKET, Chunga, and Flexi Streams, including response text decoding.
+Use USOCKET's `egcl-support` branch; its default branch lacks the EGCL backend.
 
 The [Completions scenario](../tests/completions/README.md) is the end-to-end
 client: it drives Dexador and Completions through a real HTTP request/response
@@ -74,7 +78,8 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-SLIME and SLY (`egcl` branches), where their ports live. No commit revisions
+USOCKET (`egcl-support`), closer-mop, SLIME and SLY (`egcl`), where their ports
+live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
 commit it in your project for reproducibility. The script downloads and
