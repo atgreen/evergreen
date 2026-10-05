@@ -2030,10 +2030,18 @@ loader or Unix dynamic linker; unavailable symbols show the target address
 instead. Captured names survive library close.
 These boundaries do not unwind internal C activations or permit Lisp nonlocal
 exits to cross C.</p>
-<p>The debugger displays frames and available restarts. Frame detail depends on
-the execution path and retained metadata. Optimized native code, runtime bridges,
-and foreign frames do not necessarily preserve every source local. Do not
-assume SBCL's debugger feature set or commands apply unchanged.</p>
+<p>The interactive debugger displays the same owned pre-unwind Lisp snapshot as a
+batch error report. Initial output and <code>backtrace</code> therefore preserve the
+failing call chain and available original arguments after the activations have
+unwound. Such rows are marked <code>historical snapshot</code>. Selecting one can display
+its retained data, but lexical evaluation and locals are unavailable because
+the activation is no longer live; the debugger reports that limitation instead
+of evaluating in an unrelated runtime frame. When an error carries no logical
+snapshot, the debugger falls back to the current native stack.</p>
+<p>Frame detail depends on the execution path and retained metadata. Optimized
+native code, runtime bridges, and foreign frames do not necessarily preserve
+every source local. Do not assume SBCL's debugger feature set or commands apply
+unchanged.</p>
 <h2 id="command-dictionary">Command dictionary<a class="headerlink" href="#command-dictionary" title="Permanent link">&para;</a></h2>
 <p>Enter commands at the debugger prompt, without wrapping the command name in a
 Lisp list.</p>
@@ -2171,7 +2179,7 @@ loading a saved image. Preserve the exact input and output for each run.</p>
 should follow the <a href="../contributing/how-to/gc-safety/">GC safety procedure</a>;
 application users should include the relevant environment settings in the bug
 report instead of interpreting every abort as an application condition.</p>
-<p>Implementation reference: <a href="https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl-stdlib/src/devtools.rs">Debugger command implementation</a>.</p>
+<p>Implementation reference: <a href="https://github.com/atgreen/evergreen/blob/main/crates/egcl-stdlib/src/devtools.rs">Debugger command implementation</a>.</p>
 
 
 
