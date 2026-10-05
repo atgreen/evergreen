@@ -4,6 +4,10 @@
 
 Tracking: <!-- GitHub issue and Bead, for example: Closes #123; bliss-abcde -->
 
+- [ ] This PR contains one coherent change and no unrelated files.
+- [ ] The branch is rebased onto current `main`, and the final diff has been
+      reviewed.
+
 ## Validation
 
 <!-- List the exact commands and results. Distinguish new failures from failures already present on the base revision. -->
