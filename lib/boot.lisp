@@ -4487,21 +4487,6 @@ a hook error aborts startup.")
 
 (in-package :common-lisp)
 
-(let ((extensions '(egcl-ext:cas egcl-ext:atomic-incf egcl-ext:atomic-decf
-                    egcl-ext:memory-barrier egcl-ext:load-barrier
-                    egcl-ext:store-barrier)))
-  (import extensions :sb-ext)
-  (export extensions :sb-ext))
-
-(let ((thread-symbols nil))
-  (do-external-symbols (symbol :egcl-thread)
-    (push symbol thread-symbols))
-  (setq thread-symbols
-        (append thread-symbols
-                '(egcl-ext:cas egcl-ext:atomic-incf egcl-ext:atomic-decf)))
-  (import thread-symbols :sb-thread)
-  (export thread-symbols :sb-thread))
-
 ;;; Owned logical snapshots: no live stack pointers or invented native locals.
 (defpackage :egcl-debug (:use :common-lisp)
   (:export :list-backtrace :print-backtrace))

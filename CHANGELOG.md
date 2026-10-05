@@ -5,8 +5,7 @@
 ### Common Lisp extensions
 
 - `EGCL-EXT:CAS`, `ATOMIC-INCF`, and `ATOMIC-DECF` now provide lock-free
-  updates for supported places and are re-exported from `SB-EXT` and
-  `SB-THREAD` for library compatibility
+  updates for supported places
   ([#20](https://github.com/atgreen/evergreen/pull/20)).
 
 ### Correctness and reliability
