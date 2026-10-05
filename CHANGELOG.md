@@ -7,7 +7,8 @@
 - Interactive debugger backtraces now preserve the failing Lisp call chain and
   available original arguments after activations unwind. Historical frames are
   labeled explicitly, and frame evaluation and locals are reported unavailable
-  instead of being applied to unrelated live frames.
+  instead of being applied to unrelated live frames
+  ([#3](https://github.com/atgreen/evergreen/pull/3)).
 
 ## 0.0.1 - 2026-10-04
 
