@@ -2196,9 +2196,16 @@ the body if acquisition fails.</p>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">    </span><span class="p">(</span><span class="nb">values</span><span class="w"> </span><span class="mi">40</span><span class="w"> </span><span class="mi">2</span><span class="p">)))</span>
 <a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1">;; =&gt; 40, 2</span>
 </code></pre></div>
-<p>Saved images do not recreate a usable operating-system mutex from an old live
-handle. Create fresh synchronization objects for a restarted application's
-runtime state rather than assuming locks survive an image boundary.</p>
+<p>Saved images retain each mutex's name, recursive flag, and shared Lisp identity.
+On first use after restore, the handle lazily creates a fresh, unlocked native
+mutex. Concurrent callers share that single native mutex. Native pointers are
+never stored in the image.</p>
+<p>This is a <strong>reset</strong>, not a continuation: ownership, recursive acquisition depth,
+and waiting threads are discarded, even if the mutex was held when saved.
+Save application state at a consistent boundary; resetting a mutex cannot repair
+partially updated protected data. Use image initialization hooks to reinitialize
+application state and process-local resources that need it. Condition variables
+do not yet have this mutex restoration policy.</p>
 <h2 id="condition-variables">Condition variables<a class="headerlink" href="#condition-variables" title="Permanent link">&para;</a></h2>
 <h3 id="condition-wait">Construction and waiting<a class="headerlink" href="#condition-wait" title="Permanent link">&para;</a></h3>
 <p><strong>Functions</strong></p>
