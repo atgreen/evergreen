@@ -194,7 +194,7 @@ pub mod type_id {
     /// a SIMPLE_VECTOR of the fixnum dimensions. Both are heap references the GC
     /// traces; rank is an immediate fixnum. Rank-1 arrays stay plain vectors.
     pub const MD_ARRAY: u8 = 0x18;
-    /// Opaque mutex handle: one untraced word owning a process-local Arc.
+    /// Mutex handle: native Arc, persistent flags, and optional traced name.
     pub const MUTEX: u8 = 0x19;
     /// Opaque condition-variable handle: one untraced process-local Arc.
     pub const CONDITION_VARIABLE: u8 = 0x1A;
@@ -209,6 +209,13 @@ pub mod type_id {
     /// ours; the reference is released when the collector finalizes the proxy,
     /// by queueing it rather than by calling CPython (see `python::PyRef`).
     pub const PYTHON_OBJECT: u8 = 0x1E;
+}
+
+/// Persistent flags in word 1 of a MUTEX body.
+pub mod mutex_flags {
+    pub const RECURSIVE: u64 = 1;
+    // Older handles have padding, not a Lisp value, in body word 2.
+    pub const HAS_NAME_SLOT: u64 = 2;
 }
 
 // ── Simple string on-heap encoding (SBCL model, spec §1.6.3) ───────

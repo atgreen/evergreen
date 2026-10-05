@@ -94,9 +94,17 @@ the body if acquisition fails.
 ;; => 40, 2
 ```
 
-Saved images do not recreate a usable operating-system mutex from an old live
-handle. Create fresh synchronization objects for a restarted application's
-runtime state rather than assuming locks survive an image boundary.
+Saved images retain each mutex's name, recursive flag, and shared Lisp identity.
+On first use after restore, the handle lazily creates a fresh, unlocked native
+mutex. Concurrent callers share that single native mutex. Native pointers are
+never stored in the image.
+
+This is a **reset**, not a continuation: ownership, recursive acquisition depth,
+and waiting threads are discarded, even if the mutex was held when saved.
+Save application state at a consistent boundary; resetting a mutex cannot repair
+partially updated protected data. Use image initialization hooks to reinitialize
+application state and process-local resources that need it. Condition variables
+do not yet have this mutex restoration policy.
 
 ## Condition variables
 
