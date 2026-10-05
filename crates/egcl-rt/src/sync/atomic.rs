@@ -66,4 +66,3 @@ pub unsafe fn update_fixnum_ref(
         }
     }
 }
-

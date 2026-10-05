@@ -25,4 +25,3 @@ pub fn compare_exchange_cons(
     };
     Ok(unsafe { egcl_rt::sync::atomic::compare_exchange_ref(slot, old, new) })
 }
-
