@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- `REMF`, `PSETF`, `SHIFTF`, `ROTATEF`, and `SETF` of `VALUES` now honor
+  custom place storing forms and preserve multiple store values
+  ([#18](https://github.com/atgreen/evergreen/pull/18)).
+
 - Mutexes restored from saved images now retain their names, recursive behavior,
   and shared identity while restarting unlocked with fresh native state
   ([#17](https://github.com/atgreen/evergreen/pull/17)).
