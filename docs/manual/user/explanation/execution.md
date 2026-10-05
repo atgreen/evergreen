@@ -7,8 +7,11 @@ before the program can run.
 ## Interpretation and compilation
 
 The reader turns text into Lisp forms. Macro expansion and lowering turn
-supported forms into bytecode. Some forms use the tree-walking evaluator as a
-compatibility or bootstrap path. Bytecode executes in T0 while the runtime
+supported forms into bytecode. Cold source functions can defer compilation and
+run in the tree-walking evaluator until they become hot; source functions
+containing loops attempt compilation eagerly so they can use OSR.
+Unsupported forms also use the tree-walking evaluator as a compatibility path.
+Bytecode executes in T0 while the runtime
 collects information about calls and loop back edges.
 
 | Tier | Role |

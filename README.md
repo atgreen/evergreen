@@ -2,389 +2,188 @@
   <img src="docs/assets/evergreen-banner2x.png" alt="Evergreen Common Lisp" width="1280">
 </p>
 
+**Evergreen Common Lisp (EGCL)** is an experimental Common Lisp implementation
+written in Rust, with a HotSpot-inspired tiered JIT, a moving generational
+garbage collector, and tools for delivering standalone applications.
+
 > [!WARNING]
-> **This is an experiment.**
+> **This is an experiment.** Evergreen is for people interested in trying and
+> developing a new Lisp implementation. It does not promise complete ANSI
+> conformance, compatibility stability, or production readiness. Programs may
+> fail or behave incorrectly, and performance varies widely by workload.
 >
-> Evergreen is under active development. The parts that do work may not behave
-> the way you expect, or the way the standard says they should. It may never work.
->
-> Everything below describes what Evergreen is *trying* to be. Read it as a
-> statement of intent, not as a description of something you can depend on.
-> Evergreen can be both incredibly fast and embarrassingly slow.  Just know that 
-> this is a work in progress.
->
-> Evergreen exists to find out
-> whether a real language implementation (a tiered JIT, a moving generational
-> collector, a standard library) can be built through arms-length expert guidance
-> of AI-driven development. 
-> See [Authorship & Governance](#authorship--governance).
+> The project also explores whether a language implementation can be built
+> through expert guidance of AI-driven development, with minimal manual code
+> review. It may never meet its goals. See [Authorship & Governance](#authorship--governance).
 
-Common Lisp is an evergreen language: mature, enduring, and remarkably
-resistant to obsolescence. **Evergreen Common Lisp (EGCL)** is a new
-implementation built to carry it forward.
+[Read the manual](https://atgreen.github.io/evergreen/) ·
+[Version history](CHANGELOG.md) ·
+[Report a bug](https://github.com/atgreen/evergreen/issues)
 
-**Evergreen is Common Lisp with a HotSpot-inspired native runtime**,
-built from scratch in Rust. It starts executing in bytecode, compiles
-hot code to native instructions, and specializes dynamically typed
-programs as they run.
+## What you can explore
 
-- **Tiered compilation with on-stack replacement.** Execution progresses from
-  bytecode through a baseline native compiler to an optimizing compiler. Hot
-  loops can enter compiled code during the current invocation, without waiting
-  for the function to return. See [how Lisp runs](docs/manual/user/explanation/execution.md).
-- **Speculative optimization without required type declarations.** The compiler
-  specializes supported operations under guarded assumptions about runtime
-  values. When an assumption fails, precise deoptimization resumes less
-  specialized execution while preserving program semantics. Live function
-  redefinition remains part of the programming model.
-- **Lightweight fibers with synchronous socket I/O.** On x86-64, AArch64,
-  ppc64le, and s390x, many fibers
-  share native carrier threads. Reads, writes, and readiness waits on established
-  TCP streams park an unpinned fiber so other work can run, while Lisp code stays
-  sequential. Connect, accept, and DNS are not yet cooperative. See
-  [fibers and socket I/O](docs/manual/fibers.md#socket-io).
-- **Multiple architectures and operating systems.** Targets include x86-64
-  Linux, Windows, and Android; AArch64 Linux and Android; and Power (`ppc64le`)
-  and IBM Z (`s390x`) Linux. Compiler and FFI coverage varies by target; see
-  [cross-compilation and platform details](docs/cross-compilation.md) and
-  [Windows support](docs/windows.md).
-- **Native interoperability.** Call C libraries through the
-  [foreign function interface](docs/manual/foreign.md), and access the JVM through
-  `egcl-jvm`. The `PY` package provides Lisp-facing CPython object and calling
-  APIs in builds with Python support enabled.
-- **Standalone applications and saved images.** Save a running Lisp environment
-  with its libraries preloaded, restore it later, or package it as a native
-  executable. The default x86-64 Linux build is fully static. See
-  [saved images and executables](docs/manual/user/reference/images.md).
-- **Tree shaking of Lisp and Rust.** Deliver a saved image with unreachable
-  functions, macros, methods, closures, and heap objects removed. Supported
-  source functions can be compiled during delivery. Native specialization can
-  omit unused builtin implementations, disassembly, and the tree walker when
-  reachable code permits. Choose `max-tier = t1` to omit T2, or `max-tier = t0`
-  to omit both native compilers. Explicit retention roots and `--dry-run` explain
-  what stays and why. See [application delivery](docs/manual/user/how-to/save-executable.md#deliver-an-application-from-a-saved-image).
-- **Native Android applications.** Generate and package APKs with Lisp lifecycle,
-  touch-input, and EGL/OpenGL ES code using `egcl-android-new`. See
-  [building Android applications](docs/manual/user/how-to/android.md).
+- **Adaptive native compilation.** Supported code runs in bytecode and can
+  advance to baseline and optimizing native compilers. Hot loops can enter
+  native code during the current call through on-stack replacement. Cold
+  functions and unsupported forms can use the tree-walking evaluator.
+- **Optimization without required type declarations.** The compiler can
+  specialize supported operations using observed values and guarded assumptions.
+  Failed guards deoptimize to less specialized execution. Functions remain
+  redefinable. See [how Lisp runs](docs/manual/user/explanation/execution.md).
+- **Lightweight concurrency.** Fibers share native carrier threads. Reads,
+  writes, and readiness waits on established TCP streams can park an unpinned
+  fiber while other work runs. Connect, accept, and DNS still block the carrier.
+  See [fibers and socket I/O](docs/manual/fibers.md#socket-io).
+- **Application delivery.** Save a Lisp environment with libraries preloaded,
+  or deliver it as an executable. Delivery can remove unreachable Lisp code
+  and objects; specialized runtime builds can also omit unused builtins and
+  compiler tiers. See [saved executables and delivery](docs/manual/user/how-to/save-executable.md).
+- **Interoperability and Android.** Call C libraries through the
+  [FFI](docs/manual/foreign.md), use [Java through `egcl-jvm`](docs/manual/java.md),
+  or enable the Lisp-facing `PY` CPython API in a Python-enabled build.
+  [Android tooling](docs/manual/user/how-to/android.md) generates NativeActivity
+  applications with Lisp lifecycle and EGL/OpenGL ES code. These capabilities
+  require the appropriate runtime build and platform.
 
-EGCL combines a precise generational garbage collector with Common Lisp's
-macros, CLOS, conditions, and restarts. It targets ANSI Common Lisp, supports
-ASDF systems, and provides selected SBCL-compatible extensions. The project is
-under active development; the manual describes current interfaces and
-limitations, while `spec/` records the design and self-hosting roadmap.
+EGCL implements macros, CLOS, conditions and restarts, and supports ASDF
+systems and selected SBCL-compatible extensions. Existing libraries may need
+compatibility changes; the [library fork guide](docs/library-forks.md) records
+maintained ports and their validation scenarios. The manual describes current
+interfaces and limits; `spec/` also contains requirements for future stages.
 
-See the [changelog](CHANGELOG.md) for version history.
+## Try it
 
-## Manual
+### Install on Fedora 44 x86-64
 
-The [EGCL manual](docs/manual/index.md) covers running Lisp, ASDF systems,
-saved executables, cross-target tools, Android applications, and runtime
-contributions. It uses Material for MkDocs with a subject-oriented implementation
-reference inspired by the SBCL manual, plus symbol and concept indexes. Preview
-it locally:
-
-```sh
-python3 -m venv .venv-docs
-. .venv-docs/bin/activate
-pip install -r requirements-docs.txt
-make docs-serve
-```
-
-Use `make docs` for a strict build. The manual is published at
-<https://atgreen.github.io/evergreen/>, versioned per release with a version
-selector; `latest` follows the newest release and `dev` follows `main`.
-See [Writing documentation](docs/manual/meta/documentation-guidelines.md).
-
-## Workspace
-
-This is a Cargo workspace using Rust 2024 and requiring Rust 1.85 or newer.
-
-| Path | Purpose |
-| --- | --- |
-| `crates/egcl-rt` | Runtime core: object model, values, GC, threads, FFI, sandboxing, images |
-| `crates/egcl-compiler` | Bootstrap compiler pieces: reader, macro expansion, IR, optimisation, codegen, tiering, OSR, profiling |
-| `crates/egcl-stdlib` | Standard-library support: packages, CLOS, conditions, streams, sequences, hash tables, FORMAT, pathnames, devtools |
-| `crates/egcl` | User-facing CLI, REPL, script loading, image loading, and evaluation driver |
-| `lib/` | Lisp-side prelude (`boot.lisp`) and bundled sources loaded at startup |
-| `tests/` | Cross-cutting suites: ANSI conformance, differential, integration, property, and sanitizer configs |
-| `fuzz/` | `cargo-fuzz` targets and corpora for the reader, compiler, evaluator, FORMAT, FFI, and image loader |
-| `spec/` | Technical specification and roadmap |
-| `scripts/spec-coverage.py` | Requirement-to-test traceability report |
-
-## Build
-
-```sh
-cargo build
-```
-
-Build the CLI binary:
-
-```sh
-cargo build -p egcl
-```
-
-### Install on Fedora
-
-Two dnf repositories are published. `egcl` carries tagged releases; the
-`egcl-testing` channel carries the most recent test builds and ships disabled,
-so it is opt-in. Both are signed, and the packages themselves are signed with
-the same key.
+The published release repository currently supplies **Fedora 44 x86-64**
+packages. Install the runtime with ASDF preloaded:
 
 ```sh
 sudo dnf config-manager addrepo --from-repofile=https://atgreen.github.io/evergreen/repo/egcl.repo
 sudo dnf install egcl
 ```
 
-For a test build, add the testing repository and enable it per command:
+On first use, dnf asks to import the signing key. Check its fingerprint:
 
-```sh
-sudo dnf config-manager addrepo --from-repofile=https://atgreen.github.io/evergreen/repo/egcl-testing.repo
-sudo dnf --enablerepo=egcl-testing install egcl
-```
-
-On first use dnf offers to import the signing key and waits for confirmation.
-Check that the fingerprint it shows is:
-
-```
+```text
 6101 7475 407E 35EB 2608 BF2B F2EA EAEE 344F 7576
 ```
 
-Confirm it from somewhere other than the repository serving it; a key offered
-alongside the packages it signs proves only that both came from the same place.
-Both repositories set `gpgcheck` and `repo_gpgcheck`, so dnf refuses packages
-and refuses repository metadata that is not signed by that key — including
-metadata altered after signing.
+Confirm the fingerprint through a channel independent of the package server.
+Both package and repository-metadata signature checks are enabled. Packages
+are hosted on GitHub Releases; repository metadata is hosted on the manual site.
+Use the release repository above: the testing repository definition may exist
+without published test-build metadata.
 
-Packages are hosted on the GitHub release they were published in; only the
-repository metadata lives on the documentation site. The optional target
-subpackages — `egcl-static`, and the s390x, AArch64, ppc64le, Windows and
-Android image-dumping tools — install from the same repository:
+Other runtime targets do not imply native Fedora packages for those hosts.
+See [platform support](#platform-support) and the
+[source build guide](docs/manual/user/how-to/build.md).
+
+### Run your first Lisp expression
 
 ```sh
-sudo dnf install egcl-static egcl-target-aarch64-linux
+egcl --no-init --eval '(+ 1 2)'
 ```
 
-For building the RPMs yourself, see
-[container-free Fedora packaging](docs/fedora-rpm.md).
+This prints `3` and exits. Start an interactive REPL with `egcl`, or run a
+Lisp file with `egcl --load path/to/file.lisp`. Enter `(quit)` to leave the REPL.
+Continue with [your first program](docs/manual/user/tutorials/first-program.md)
+for a function, a script, and command-line arguments, then
+[load an ASDF system](docs/manual/user/how-to/asdf.md).
 
-The Android RPM also provides `egcl-android-new` and shared runtimes for ARM64
-phones and x86-64 emulators. Generate an EGL app with
-`egcl-android-new hello --host=aarch64-linux-android --template egl`, then run
-`make install` and `make run` in `hello`. Use `make HOST=x86_64-linux-android`
-to build for an emulator. App builds use the installed runtime and Android SDK;
-they do not require rebuilding EGCL.
+Use `egcl --help` or the [CLI reference](docs/manual/user/reference/cli.md)
+for options. The REPL reads `~/.egclrc` (or `EGCL_INIT_FILE`); `--no-init`
+skips it. Batch evaluation and file loading skip the init file automatically.
 
-For Linux AArch64, ppc64le, and s390x CLI cross-builds from x86-64, see
-[cross-compilation and QEMU validation](docs/cross-compilation.md). All four
-Fedora primary architectures — x86-64, AArch64, ppc64le and s390x — run the
-native T1 baseline and T2 optimizing JITs, with on-stack replacement (OSR) for
-running loops and precise deoptimization. Native runtime calls and loops support
-the moving garbage collector; validation under QEMU includes GC stress and
-poisoning, compiled-file loading, and saved-image round trips, and on AArch64
-also a differential run on a physical device.
+### Build from source on x86-64 Linux
 
-Stackful fibers run on Unix x86-64 and AArch64 (including Android), Linux
-ppc64le and s390x, and Windows x86-64. Unix ports use native context switches
-without libc `ucontext`; fibers can suspend and migrate between carriers.
-
-What the non-x86-64 ports do not yet have. s390x reaches foreign code through the bootstrap
-dispatcher's fixed set of call shapes, while AArch64 and ppc64le support scalar
-foreign calls through AAPCS64 and ELFv2 respectively; aggregate arguments are
-unported everywhere but x86-64. The AArch64 and ppc64le T2 emitters cover a
-smaller opcode set than the x86-64 one and leave the rest at T1.
-
-For in-process Java calls and Java interfaces implemented by Lisp functions,
-see [Java integration in the manual](docs/manual/java.md). The current
-implementation uses a native x86-64 glibc build and a local JDK, with explicit
-reference ownership and checks for JVM startup, signals, callbacks, and shutdown.
-The primary `JAVA` API provides inferred calls, named bindings, Lisp callbacks
-and `with-scope` cleanup; the explicit `EGCL-JVM` descriptor API remains available.
-
-For the Windows x86-64 CLI, see [Windows cross-builds and Wine validation](docs/windows.md).
-The Android AArch64 CLI is built and validated the same way — same kernel, a
-different libc — and is
-[documented alongside the Linux ports](docs/cross-compilation.md#android-aarch64),
-including how the installable executable is dumped under emulation, since
-`make image` runs the target binary and so cannot cross-compile.
-
-Build the standalone `egcl` executable with ASDF preloaded, then install it:
+You need Git, a C compiler/linker, and Rust installed through rustup. The
+repository pins Rust **1.94.1** and the `x86_64-unknown-linux-musl` target;
+let rustup use that pin. The Cargo manifests declare Rust 1.85 as the minimum,
+but that is not a guarantee that any newer compiler builds this checkout.
 
 ```sh
-make image              # trains PGO and produces target/egcl
-sudo make install       # installs /usr/local/bin/egcl
+git clone https://github.com/atgreen/evergreen.git
+cd evergreen
+cargo build -p egcl
+cargo run -p egcl -- --no-init --eval '(+ 1 2)'
 ```
 
-`make image` uses profile-guided optimization (PGO) by default, with dependency-free
-synthetic training to optimize the Rust runtime. It requires `llvm-profdata` matching the LLVM
-version printed by `rustc -vV` (the Rust `llvm-tools-preview` component is
-preferred; alternatively set `LLVM_PROFDATA` to a matching executable):
+This development binary uses static musl and a built-in ELF loader with limited
+library compatibility. The Fedora `egcl` package uses glibc and the system
+dynamic loader. For an installed standalone command, a dynamic FFI build, or profile-guided
+optimization, follow the [build guide](docs/manual/user/how-to/build.md).
+
+## Platform support
+
+Runtime targets include Linux x86-64, AArch64, ppc64le, and s390x; Windows
+x86-64; and Android ARM64 and x86-64 application runtimes. Native compiler
+coverage and foreign-call support vary by target. Linux's four architectures
+have T1 and T2 backends, OSR, and deoptimization for supported code shapes;
+unsupported shapes remain at a lower tier. macOS is not a supported runtime
+target in the current port set.
+
+The Fedora x86-64 repository also offers `egcl-static` and `egcl-target-*`
+packages. Target tools run foreign-architecture runtimes through QEMU or Wine
+to create executables for those targets. They are installed on the x86-64
+host, not on the target machine. See the
+[platform matrix](docs/manual/user/reference/platforms.md),
+[cross-build guide](docs/cross-compilation.md), and
+[Windows guide](docs/windows.md) for capabilities and validation boundaries.
+
+## Documentation
+
+The [published manual](https://atgreen.github.io/evergreen/) has a version
+selector: `latest` follows the newest release and `dev` follows `main`.
+
+| Start here | Purpose |
+| --- | --- |
+| [First program](docs/manual/user/tutorials/first-program.md) | Expressions, the REPL, scripts, and arguments |
+| [ASDF systems](docs/manual/user/how-to/asdf.md) | Load a local Lisp project |
+| [Saved executables](docs/manual/user/how-to/save-executable.md) | Save and deliver an application |
+| [Implementation reference](docs/manual/index.md) | Runtime behavior and EGCL-specific interfaces |
+| [Contributing](docs/manual/contributing/index.md) | Repository structure, validation, and runtime development |
+| [Specification](spec/INDEX.md) | Requirements, design, and staged roadmap |
+
+## Development
+
+This is a Rust 2024 Cargo workspace. The runtime, compiler, standard library,
+and CLI live under `crates/`; Lisp sources are in `lib/`. See the
+[repository map](docs/manual/contributing/reference/repository.md) for details.
+
+Run workspace tests with `cargo test --workspace`. CI configures Linux
+workspace tests and Clippy, targeted native Windows checks, scheduled fuzzing,
+and sanitizer jobs. A configured job does not establish that all tests pass;
+check the [current workflow results](https://github.com/atgreen/evergreen/actions).
+Contributor runtime checks use [memory limits and GC stress](docs/manual/contributing/how-to/gc-safety.md).
+
+Fuzzing requires a nightly toolchain:
 
 ```sh
-rustup component add llvm-tools-preview
-EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh make image
-```
-
-This performs two release builds plus training, then saves and restarts the
-ASDF image before atomically replacing `target/egcl`. It does not install it.
-`make pgo-image` remains an alias. For an ordinary release image without training
-or `llvm-profdata`, use `make image-no-pgo`; ordinary Cargo builds are unchanged.
-PGO failures are reported, never silently replaced with a non-PGO build. Build logs, private
-training caches, and profiles are retained under a fresh `target/pgo/run.*`
-directory; preparation profiles are excluded from optimization training.
-Profiles are local build artifacts, not distributable inputs to unrelated
-source revisions or toolchains. Allow several minutes and extra build storage.
-
-Overrides: `EGCL_PGO_TARGET` (default `x86_64-unknown-linux-musl`, must be
-runnable on the build host), `EGCL_PGO_ROOT` (artifact directory),
-`EGCL_IMAGE_OUT` (output executable), and `CARGO_BUILD_JOBS` (build parallelism).
-Both compiler passes preserve the same `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS`.
-Failures leave the previous output executable intact and retain logs; failed
-image stages may also leave a `.egcl-pgo.*` directory beside the output.
-Run `make test-pgo-build` for the orchestration tests (Python 3, no Rust build).
-Performance evidence and outstanding validation are in
-[the load-performance handoff](docs/design/load-performance-handoff.md).
-
-The implementation identifies itself as `EGCL` and provides the `:egcl`
-feature. Configuration uses `~/.egclrc` and `EGCL_*` environment variables.
-When migrating an existing installation, update initialization files and
-library feature conditionals, and rebuild saved images and compiled caches.
-The rename does not install compatibility aliases for the previous names.
-
-Run the test suite:
-
-```sh
-cargo test
-```
-
-Run tests for one crate:
-
-```sh
-cargo test -p egcl-rt
-cargo test -p egcl-compiler
-cargo test -p egcl-stdlib
-cargo test -p egcl
-```
-
-Fuzz targets live under `fuzz/` and run via `cargo-fuzz`:
-
-```sh
+rustup toolchain install nightly --profile minimal
 cargo install cargo-fuzz
-cargo fuzz list
-cargo fuzz run fuzz_reader
+cargo +nightly fuzz run fuzz_reader
 ```
 
-Continuous integration (`.github/workflows/`) runs the workspace tests and
-clippy on Linux and macOS, a nightly fuzzing job, and sanitizer builds.
-
-## CLI Usage
-
-The [EGCL-specific Lisp API manual](docs/egcl-lisp-api.md) documents the
-currently callable extensions and the status of the complete planned Lisp API,
-including fibers, native threads, synchronization, compiler introspection,
-sandboxing, and developer tools.
-
-Run the REPL:
-
-```sh
-cargo run -p egcl
-```
-
-Evaluate an expression:
-
-```sh
-cargo run -p egcl -- --eval "(+ 1 2)"
-```
-
-Load a file:
-
-```sh
-cargo run -p egcl -- --load path/to/file.lisp
-```
-
-Run a script and pass arguments through to Lisp as `*COMMAND-LINE-ARGS*`:
-
-```sh
-cargo run -p egcl -- path/to/script.lisp -- arg1 arg2
-```
-
-The CLI currently accepts:
-
-```text
-Usage: egcl [OPTIONS] [SCRIPT] [-- CL-ARGS...]
-
-Evergreen Common Lisp
-
-Options:
-  --help               Print this help message and exit
-  --version            Print version information and exit
-  --eval, -e EXPR      Evaluate EXPR and exit
-  --load FILE          Load FILE and exit
-  --image FILE         Path to the boot image
-  --no-image           Start without loading an image
-  --bootstrap          Deprecated; the prelude now loads by default
-  --no-bootstrap       Skip the bootstrap prelude (raw evaluator)
-  --workers N          Number of worker threads
-  --heap-size SIZE     Heap size (e.g. 512M, 1G)
-  --tlab-size SIZE     Per-thread TLAB size
-  --nursery-size SIZE  Nursery size
-  --stack-size SIZE    CL stack size per green thread
-  --gc-log FILE        Write GC logs to FILE
-  --jit-dump           Emit jitdump metadata
-  --log-level LEVEL    Set log level (error|warn|info|debug|trace)
-  --sandbox            Enable sandbox mode
-  --no-init            Skip loading the init file
-
-Arguments after -- are passed through to CL as *command-line-args*.
-```
-
-The bootstrap prelude (`lib/boot.lisp`) now loads by default; `--bootstrap`
-is retained only for compatibility, and `--no-bootstrap` starts the raw
-evaluator without it.
-
-When starting the REPL without `--no-init`, EGCL attempts to load the file
-specified by `EGCL_INIT_FILE`; if that is unset, it falls back to `~/.egclrc`.
-
-## Specification
-
-Start with:
-
-- `spec/INDEX.md` for the master chapter index
-- `spec/00-overview.md` for goals, architecture, and design decisions
-- `spec/conventions.md` for requirement notation
-
-Source modules cite spec sections as `§N.M`. Tests are expected to cite
-requirement IDs such as `R6.45` when they cover normative behavior.
-
-Generate a human-readable traceability report:
-
-```sh
-python3 scripts/spec-coverage.py
-```
-
-Use the gate mode when uncovered `MUST` requirements should fail the check:
-
-```sh
-python3 scripts/spec-coverage.py --gate
-```
-
-## Development Notes
-
-- The implementation is still in bootstrap form. Some spec goals describe the
-  intended architecture rather than fully completed behavior.
-- Keep runtime and compiler code aligned with the relevant `spec/` sections.
-- Prefer adding focused tests under the crate that owns the behavior.
-- If a test implements a normative spec requirement, include the requirement ID
-  in the test source so `scripts/spec-coverage.py` can find it.
+To build or preview the manual, follow
+[Writing documentation](docs/manual/meta/documentation-guidelines.md).
+When reporting a bug, include `egcl --version`, your OS and architecture,
+how you installed or built EGCL, and a small reproducing Lisp program with
+expected and actual results.
 
 ## Authorship & Governance
 
-Anthony Green is the creator and maintainer of Evergreen Common Lisp,
-however, this repository was created using an **AI-driven development
-model**.
+Anthony Green is the creator and maintainer of Evergreen Common Lisp.
+Core code, test suites, and documentation were almost entirely generated by
+AI assistants following high-level human prompts and specifications. Human
+work focuses on architecture, direction, and repository orchestration, with
+minimal manual code review or line-by-line verification. Agent usage is
+recorded in commit history.
 
-* **Authorship:** Core code, test suites, and documentation were almost entirely generated by AI assistants following high-level human prompts and specification.
-* **Human Role:** Conceptual architecture, prompt direction, and repository orchestration (minimal manual code review or line-by-line verification).
-* **Provenance & Models:** Agent usage is logged per-change in the git commit history.
+The project uses regression tests, differential checks, and GC stress testing
+to find defects; those checks do not establish complete language conformance
+or correctness. See the [contributor guide](docs/manual/contributing/index.md)
+for the validation workflow and the [changelog](CHANGELOG.md) for release limits.
 
 ## License
 

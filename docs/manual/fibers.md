@@ -82,9 +82,10 @@ its carrier. Sleep durations and timeouts are expressed in seconds. A yield is
 a scheduling opportunity, not a synchronization protocol. Shared state still
 requires a mutex, condition variable, or another explicit protocol.
 
-Subprocess pipe operations and process waits park unpinned fibers. Ordinary file,
-socket-stream, and terminal I/O still use blocking OS calls and can occupy the
-carrier; the runtime readiness service is not yet connected to all stream paths.
+Subprocess pipe operations and process waits park unpinned fibers. Ordinary file
+and terminal I/O still use blocking OS calls and can occupy the carrier.
+Established TCP streams use the fiber-aware waits described under
+[Socket I/O](#socket-io).
 Foreign calls can also block a carrier. The pinned-blocking policy below applies
 to operations that participate in the fiber-aware blocking protocol.
 

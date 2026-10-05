@@ -4,6 +4,10 @@
 
 ### Documentation
 
+- Reorganize the README around installation and a first Lisp result, clarify
+  published package and toolchain requirements, and reconcile execution,
+  platform, and socket documentation with the current implementation.
+
 - Document atomic-update semantics, supported places, memory ordering, and
   current Gray-stream availability
   ([#23](https://github.com/atgreen/evergreen/pull/23)).

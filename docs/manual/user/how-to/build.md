@@ -33,8 +33,40 @@ sudo make install
 
 To build without profile-guided optimization, use `make image-no-pgo` instead
 of `make image`. See the repository's
-[build Makefile](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/Makefile)
+[build Makefile](https://github.com/atgreen/evergreen/blob/main/Makefile)
 for installation prefix overrides.
+
+## Profile-guided build details
+
+`make image` uses profile-guided optimization (PGO) by default, with dependency-free
+synthetic training to optimize the Rust runtime. It requires `llvm-profdata` matching the LLVM
+version printed by `rustc -vV` (the Rust `llvm-tools-preview` component is
+preferred; alternatively set `LLVM_PROFDATA` to a matching executable):
+
+```sh
+rustup component add llvm-tools-preview
+EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh make image
+```
+
+This performs two release builds plus training, then saves and restarts the
+ASDF image before atomically replacing `target/egcl`. It does not install it.
+`make pgo-image` remains an alias. For an ordinary release image without training
+or `llvm-profdata`, use `make image-no-pgo`; ordinary Cargo builds are unchanged.
+PGO failures are reported, never silently replaced with a non-PGO build. Build logs, private
+training caches, and profiles are retained under a fresh `target/pgo/run.*`
+directory; preparation profiles are excluded from optimization training.
+Profiles are local build artifacts, not distributable inputs to unrelated
+source revisions or toolchains. Allow several minutes and extra build storage.
+
+Overrides: `EGCL_PGO_TARGET` (default `x86_64-unknown-linux-musl`, must be
+runnable on the build host), `EGCL_PGO_ROOT` (artifact directory),
+`EGCL_IMAGE_OUT` (output executable), and `CARGO_BUILD_JOBS` (build parallelism).
+Both compiler passes preserve the same `CARGO_ENCODED_RUSTFLAGS` or `RUSTFLAGS`.
+Failures leave the previous output executable intact and retain logs; failed
+image stages may also leave a `.egcl-pgo.*` directory beside the output.
+Run `make test-pgo-build` for the orchestration tests (Python 3, no Rust build).
+Performance evidence and outstanding validation are in
+[the load-performance handoff](https://github.com/atgreen/evergreen/blob/main/docs/design/load-performance-handoff.md).
 
 ## Enable dynamic foreign libraries
 
@@ -45,15 +77,18 @@ cargo build --release -p egcl --target x86_64-unknown-linux-gnu \
   --features egcl-rt/c-ffi
 ```
 
-Run `target/x86_64-unknown-linux-gnu/release/egcl`. The default static musl
-binary cannot dynamically load shared libraries. The Fedora native RPM uses a
-dynamic runtime; the Android APK runtime is also a separate dynamic build.
+Run `target/x86_64-unknown-linux-gnu/release/egcl`. This build uses the system
+dynamic loader for foreign libraries. The default static musl binary instead
+uses a built-in ELF loader with limited library compatibility; it does not
+provide the glibc loader. The Fedora native RPM uses a dynamic runtime; the
+Android APK runtime is also a separate dynamic build.
 
 ## Install locally built Fedora RPMs
 
 The project provides a container-free RPM build procedure in
-[the packaging guide](https://cave.moxielogic.com/atgreen/bliss/src/branch/main/docs/fedora-rpm.md).
-It produces local packages; these instructions do not assume a public package
-repository. Install matching versions of `egcl` and each `egcl-target-*`
-package you need. Keep the base and installed target packages together when
-upgrading: target packages require the exact base version and release.
+[the packaging guide](https://github.com/atgreen/evergreen/blob/main/docs/fedora-rpm.md).
+For published Fedora 44 x86-64 packages, use the
+[release repository instructions](https://github.com/atgreen/evergreen#install-on-fedora-44-x86-64).
+Install matching versions of `egcl` and each `egcl-target-*` package you need.
+Keep the base and installed target packages together when upgrading: target
+packages require the exact base version and release.
