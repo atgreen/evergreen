@@ -8022,6 +8022,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
         for value in builtin_wrapper_cache().borrow_mut().values.values_mut() {
             visit(value);
         }
+        for value in generic_wrapper_cache().borrow_mut().values.values_mut() {
+            visit(value);
+        }
         MACROEXPAND_ENVIRONMENTS.scan(|environments| {
             for environment in environments.borrow_mut().values_mut() {
                 environment.visit_gc_roots(visit);
@@ -16219,11 +16222,50 @@ struct BuiltinWrapperCache {
     symbols: HashMap<u64, u32>,
 }
 
+#[derive(Default)]
+struct GenericWrapperCache {
+    values: HashMap<String, EgclVal>,
+    names: HashMap<u64, String>,
+}
+
 /// One process-wide identity per builtin, rooted regardless of which thread
 /// collects. Build wrappers outside the mutex and publish one winning value.
 fn builtin_wrapper_cache() -> &'static SharedCell<BuiltinWrapperCache> {
     static CACHE: std::sync::OnceLock<SharedCell<BuiltinWrapperCache>> = std::sync::OnceLock::new();
     CACHE.get_or_init(|| SharedCell::new(BuiltinWrapperCache::default()))
+}
+
+fn generic_wrapper_cache() -> &'static SharedCell<GenericWrapperCache> {
+    static CACHE: std::sync::OnceLock<SharedCell<GenericWrapperCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| SharedCell::new(GenericWrapperCache::default()))
+}
+
+fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal) -> EgclVal {
+    // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
+    // intermediate across the allocating arena_cons calls (moving minor GC).
+    egcl_rt::rooted!(name_sym = name_sym);
+    let rest_kw = resolve_sym("&REST").unwrap_or(NIL);
+    let args_sym = resolve_sym("EGCL::%BUILTIN-WRAPPER-ARGS").unwrap_or(NIL);
+    let apply_sym = resolve_sym("APPLY").unwrap_or(NIL);
+    let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
+    egcl_rt::rooted!(params_form = arena_cons(args_sym, NIL));
+    *params_form = arena_cons(rest_kw, *params_form);
+    egcl_rt::rooted!(quoted = arena_cons(*name_sym, NIL));
+    *quoted = arena_cons(quote_sym, *quoted);
+    egcl_rt::rooted!(call = arena_cons(args_sym, NIL));
+    *call = arena_cons(*quoted, *call);
+    *call = arena_cons(apply_sym, *call);
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    register_tree_closure(Closure {
+        params_form: *params_form,
+        body: *body,
+        captured_frame: Arc::clone(&env.frame),
+        captured_specials: env.locally_specials.clone(),
+        captured_blocks: env.block_stack.clone(),
+        captured_tags: env.tag_stack.clone(),
+        captured_funs: Some(Arc::clone(&env.funs)),
+    })
 }
 
 /// Reify (and cache) a callable, FUNCTIONP wrapper closure for the builtin named
@@ -16240,37 +16282,47 @@ fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
             return reference;
         }
     }
-    // Build (&REST %args) and ((APPLY (QUOTE <name>) %args)), rooting each
-    // intermediate across the allocating arena_cons calls (moving minor GC).
-    egcl_rt::rooted!(name_sym = name_sym);
-    let rest_kw = resolve_sym("&REST").unwrap_or(NIL);
-    let args_sym = resolve_sym("EGCL::%BUILTIN-WRAPPER-ARGS").unwrap_or(NIL);
-    let apply_sym = resolve_sym("APPLY").unwrap_or(NIL);
-    let quote_sym = resolve_sym("QUOTE").unwrap_or(NIL);
-    egcl_rt::rooted!(params_form = arena_cons(args_sym, NIL));
-    *params_form = arena_cons(rest_kw, *params_form);
-    egcl_rt::rooted!(quoted = arena_cons(*name_sym, NIL));
-    *quoted = arena_cons(quote_sym, *quoted);
-    egcl_rt::rooted!(call = arena_cons(args_sym, NIL));
-    *call = arena_cons(*quoted, *call);
-    *call = arena_cons(apply_sym, *call);
-    egcl_rt::rooted!(body = arena_cons(*call, NIL));
-    let closure = Closure {
-        params_form: *params_form,
-        body: *body,
-        captured_frame: Arc::clone(&env.frame),
-        captured_specials: env.locally_specials.clone(),
-        captured_blocks: env.block_stack.clone(),
-        captured_tags: env.tag_stack.clone(),
-        captured_funs: Some(Arc::clone(&env.funs)),
-    };
-    egcl_rt::rooted!(v = register_tree_closure(closure));
+    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym));
     let mut cache = builtin_wrapper_cache().borrow_mut();
     let winner = *cache.values.entry(bare.to_string()).or_insert(*v);
     if let Some(sym) = name_sym.symbol_index() {
         cache.symbols.insert(cp(winner).1.as_fixnum() as u64, sym);
     }
     winner
+}
+
+fn generic_fn_wrapper(env: &mut Env, name_sym: EgclVal, name: &str) -> EgclVal {
+    {
+        let cache = generic_wrapper_cache().borrow();
+        if let Some(reference) = cache.values.get(name).copied() {
+            return reference;
+        }
+    }
+    egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym));
+    let mut cache = generic_wrapper_cache().borrow_mut();
+    let winner = *cache.values.entry(name.to_string()).or_insert(*v);
+    cache
+        .names
+        .insert(cp(winner).1.as_fixnum() as u64, name.to_string());
+    winner
+}
+
+/// Recover the generic name carried by a cached callable wrapper. Generic
+/// wrappers dispatch through the method registry directly, so replacing the
+/// symbol's function cell cannot redirect a previously retained wrapper.
+fn generic_wrapper_name(v: EgclVal) -> Option<String> {
+    if !v.is_cons() {
+        return None;
+    }
+    let (car, cdr) = cp(v);
+    if !cdr.is_fixnum() || !car.is_symbol() || sym_name(car) != "EGCL::CLOSURE" {
+        return None;
+    }
+    generic_wrapper_cache()
+        .borrow()
+        .names
+        .get(&(cdr.as_fixnum() as u64))
+        .cloned()
 }
 
 /// If `v` is a reified builtin wrapper closure `(EGCL::CLOSURE . id)` produced by
@@ -16388,9 +16440,9 @@ fn symbol_function_object_ex(
     let is_generic = env.generics.contains_key(&fn_name) || env.methods.contains_key(&fn_name);
     if is_generic {
         // Key the wrapper by the FULL name, not the bare one: that is the
-        // env.generics/env.methods key, so builtin_wrapper_name() round-trips
+        // env.generics/env.methods key, so generic_wrapper_name() round-trips
         // the wrapper back to a generic-function designator (see FIND-METHOD).
-        return Some(builtin_fn_wrapper(env, name_sym, &fn_name));
+        return Some(generic_fn_wrapper(env, name_sym, &fn_name));
     }
     None
 }
@@ -35123,6 +35175,10 @@ fn apply_function(
         // Check for closure: (EGCL::CLOSURE . id)
         if lh.is_symbol() && sym_name(lh) == "EGCL::CLOSURE" && lr.is_fixnum() {
             let id = lr.as_fixnum() as u64;
+            let generic_name = generic_wrapper_cache().borrow().names.get(&id).cloned();
+            if let Some(name) = generic_name {
+                return invoke_generic_function(&name, args, env);
+            }
             // `#'<builtin>` is a reified wrapper whose body is literally
             // `(apply 'NAME %args)`. Interpreting that trampoline -- binding a
             // &rest list, evaluating the body, then re-dispatching by NAME --

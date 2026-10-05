@@ -3036,8 +3036,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // (find-method generic-function qualifiers specializers &optional
             // errorp) → the method with those qualifiers and specializers, or
             // (when errorp, the default, is NIL) NIL, else signal an error
-            // (CLHS 7.6.2; bliss-7y1s). `#'gf` on a generic function yields its
-            // NAME symbol here, so accept a symbol designator or a GF object.
+            // (CLHS 7.6.2; bliss-7y1s). Accept a symbol designator, a reified
+            // generic wrapper, or the generic registry's underlying object.
 
             if args.len() < 3 {
                 return Err(EgclError::ProgramError(
@@ -3051,7 +3051,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let gf_name = if gf.is_symbol() {
                 Some(sym_name(gf))
-            } else if let Some(n) = builtin_wrapper_name(gf)
+            } else if let Some(n) = generic_wrapper_name(gf)
                 .filter(|n| env.generics.contains_key(n) || env.methods.contains_key(n))
             {
                 // `#'gf` reifies a FUNCTIONP wrapper rather than the bare
