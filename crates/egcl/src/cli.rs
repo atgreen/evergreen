@@ -689,13 +689,11 @@ fn seed_standard_packages_registry() {
     let _ = egcl_stdlib::make_package("KEYWORD", &[], &[]);
     let _ = egcl_stdlib::make_package("EGCL-INTERNAL", &[], &[]);
     let _ = egcl_stdlib::make_package("EGCL-EXT", &[], &["COMMON-LISP"]);
-    let _ = egcl_stdlib::make_package("SB-EXT", &[], &["COMMON-LISP"]);
     let _ = egcl_stdlib::make_package("EGCL-FFI", &[], &["COMMON-LISP"]);
     // Native-thread API package (§13.9). EGCL-THREADS is the deprecated
     // compatibility nickname (spec §13.9.1). Fibers get a separate EGCL-FIBER
     // package (bliss-l3wy).
     let _ = egcl_stdlib::make_package("EGCL-THREAD", &["EGCL-THREADS"], &["COMMON-LISP"]);
-    let _ = egcl_stdlib::make_package("SB-THREAD", &[], &["COMMON-LISP"]);
     let _ = egcl_stdlib::make_package("EGCL-FIBER", &[], &["COMMON-LISP"]);
     // CLtL2 lexical-environment access (§4.14), the package a portability layer
     // such as trivial-cltl2 USEs — EGCL's counterpart of SB-CLTL2.
@@ -714,10 +712,8 @@ fn seed_standard_packages_registry() {
         "KEYWORD",
         "EGCL-INTERNAL",
         "EGCL-EXT",
-        "SB-EXT",
         "EGCL-FFI",
         "EGCL-THREAD",
-        "SB-THREAD",
         "EGCL-FIBER",
         "EGCL-CLTL2",
         "EGCL-PYTHON",

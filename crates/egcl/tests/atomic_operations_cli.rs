@@ -22,7 +22,7 @@ fn run(program: &str) -> std::process::Output {
 }
 
 #[test]
-fn cas_supports_all_documented_places_and_compatibility_packages() {
+fn cas_supports_all_documented_places_in_egcl_ext_only() {
     let output = run(r#"
         (defparameter *atomic-special* 10)
         (defstruct atomic-record (value 20 :type fixnum))
@@ -63,17 +63,13 @@ fn cas_supports_all_documented_places_and_compatibility_packages() {
           (assert (= 61 (svref vector 0)))
           (assert (= 71 (symbol-value symbol)))
           (assert (equal '(81) (symbol-plist symbol))))
-        (dolist (package '(egcl-ext sb-ext sb-thread))
-          (assert (find-package package)))
+        (assert (find-package :egcl-ext))
+        (assert (null (find-package :sb-ext)))
+        (assert (null (find-package :sb-thread)))
         (dolist (name '("CAS" "ATOMIC-INCF" "ATOMIC-DECF"))
           (multiple-value-bind (egcl status) (find-symbol name :egcl-ext)
-            (assert (eq :external status))
-            (multiple-value-bind (sb-ext sb-status) (find-symbol name :sb-ext)
-              (assert (eq :external sb-status))
-              (assert (eq egcl sb-ext)))
-            (multiple-value-bind (sb-thread thread-status) (find-symbol name :sb-thread)
-              (assert (eq :external thread-status))
-              (assert (eq egcl sb-thread)))))
+            (declare (ignore egcl))
+            (assert (eq :external status))))
         (format t "ATOMIC-PLACES-OK~%")
         "#);
     let stdout = String::from_utf8_lossy(&output.stdout);
