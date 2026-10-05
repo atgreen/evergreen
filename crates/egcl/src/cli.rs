@@ -39066,7 +39066,9 @@ fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result
                         // Promote allocations from this eval (they may be stored in env)
                         ARENA.with(|a| a.borrow_mut().promote_all());
                     }
-                    Err(e) => {
+                    Err(mut e) => {
+                        egcl_rt::rooted_ref!(_error_root = &mut e);
+                        egcl_rt::rooted_ref!(_env_root = &mut *env);
                         eprintln!("ERROR: {}", describe_err(&e));
                         // Enter the full devtools debugger (R6.13, A6.02): supports
                         // step/next/out/continue, backtrace, frame, eval, restart, and
@@ -39074,13 +39076,21 @@ fn run_repl_reader<R: std::io::BufRead>(env: &mut Env, reader: &mut R) -> Result
                         // continues, aborts, or requests stepping. In non-interactive
                         // sessions (piped stdin/scripts) it returns immediately so the
                         // REPL keeps consuming input rather than blocking.
-                        let condition = arena_str(&format!("{}", e));
+                        let description = format!("{}", e);
+                        egcl_rt::rooted!(condition = arena_str(&description));
                         // Pass the REPL's OWN reader: this loop holds the process
                         // StdinLock, and Rust's stdin lock is not reentrant, so a
                         // debugger that re-locked stdin deadlocked instantly
                         // (bliss-bxlq).
-                        let _ =
-                            egcl_stdlib::invoke_debugger_ui(condition, &mut repl_state, reader);
+                        let previous = PRINT_ENV.with(|slot| slot.replace(env as *mut Env));
+                        let result = egcl_stdlib::invoke_debugger_ui(
+                            *condition,
+                            e.backtrace(),
+                            &mut repl_state,
+                            reader,
+                        );
+                        PRINT_ENV.with(|slot| slot.set(previous));
+                        let _ = result;
                         // On error, temporary allocations can be freed
                         ARENA.with(|a| {
                             let mut arena = a.borrow_mut();

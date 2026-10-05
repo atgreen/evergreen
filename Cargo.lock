@@ -93,6 +93,7 @@ dependencies = [
  "egcl-rt",
  "egcl-stdlib",
  "iced-x86",
+ "libc",
  "windows-sys",
 ]
 

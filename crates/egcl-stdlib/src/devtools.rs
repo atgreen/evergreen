@@ -930,6 +930,7 @@ fn thread_id_current() -> u64 {
 /// (bliss-bxlq).
 pub fn invoke_debugger_ui(
     condition: EgclVal,
+    historical_frames: Option<&[egcl_rt::debug_stack::LogicalFrame]>,
     repl_state: &mut ReplState,
     reader: &mut dyn io::BufRead,
 ) -> Result<(), EgclError> {
@@ -937,6 +938,12 @@ pub fn invoke_debugger_ui(
         return Ok(());
     }
 
+    let mut condition = condition;
+    egcl_rt::rooted_ref!(_condition_root = &mut condition);
+    let mut historical_frames = historical_frames
+        .filter(|frames| !frames.is_empty())
+        .map(<[egcl_rt::debug_stack::LogicalFrame]>::to_vec);
+    egcl_rt::rooted_ref!(_historical_frames_root = &mut historical_frames);
     let mut stdout = io::stdout();
 
     // Display the condition. Conditions surfaced from the REPL are string
@@ -949,12 +956,21 @@ pub fn invoke_debugger_ui(
     };
     writeln!(stdout, "\nDebugger entered: {}", condition_desc).unwrap_or(());
 
-    // Walk the stack and display backtrace
-    let frames = walk_stack();
-    writeln!(stdout, "\nBacktrace ({} frames):", frames.len()).unwrap_or(());
-    let initial_count = std::cmp::min(frames.len(), 10);
-    for (i, frame) in frames.iter().enumerate().take(initial_count) {
-        print_frame(&mut stdout, i, frame);
+    // An error snapshot was captured before the Lisp activations unwound. Keep
+    // it distinct from the fallback's live Rust frames: its values are useful
+    // for diagnosis, but it cannot support lexical evaluation after unwind.
+    let frames = historical_frames.is_none().then(walk_stack);
+    let frame_count = historical_frames
+        .as_ref()
+        .map_or_else(|| frames.as_ref().unwrap().len(), Vec::len);
+    writeln!(stdout, "\nBacktrace ({} frames):", frame_count).unwrap_or(());
+    let initial_count = frame_count.min(10);
+    if let Some(historical) = &historical_frames {
+        print_historical_frames(&mut stdout, historical, initial_count, 0);
+    } else {
+        for (i, frame) in frames.as_ref().unwrap().iter().enumerate().take(initial_count) {
+            print_frame(&mut stdout, i, frame);
+        }
     }
 
     // Display available restarts
@@ -1018,37 +1034,70 @@ pub fn invoke_debugger_ui(
             }
             // Backtrace display
             "backtrace" | "bt" => {
-                let count: usize = arg.and_then(|a| a.parse().ok()).unwrap_or(frames.len());
-                for (i, frame) in frames.iter().enumerate().take(count) {
-                    print_frame(&mut stdout, i, frame);
+                let count: usize = arg.and_then(|a| a.parse().ok()).unwrap_or(frame_count);
+                if let Some(historical) = &historical_frames {
+                    print_historical_frames(&mut stdout, historical, count, 0);
+                } else {
+                    for (i, frame) in frames
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .take(count)
+                    {
+                        print_frame(&mut stdout, i, frame);
+                    }
                 }
             }
             // Frame selection
             "frame" | "f" => {
                 if let Some(n) = arg.and_then(|a| a.parse::<usize>().ok()) {
-                    if n < frames.len() {
+                    if n < frame_count {
                         selected_frame = n;
-                        let frame = &frames[selected_frame];
                         writeln!(stdout, "Selected frame {}:", selected_frame).unwrap_or(());
-                        print_frame(&mut stdout, selected_frame, frame);
-                        // Show locals
-                        if let Some(ref locals) = frame.local_bindings {
-                            writeln!(stdout, "  Locals:").unwrap_or(());
-                            for (name, value) in locals {
-                                writeln!(stdout, "    {:?} = {:?}", name, value).unwrap_or(());
+                        if let Some(historical) = &historical_frames {
+                            print_historical_frames(
+                                &mut stdout,
+                                &historical[selected_frame..=selected_frame],
+                                1,
+                                selected_frame,
+                            );
+                            writeln!(
+                                stdout,
+                                "  This is a historical snapshot; locals and frame evaluation are unavailable after unwind."
+                            )
+                            .unwrap_or(());
+                        } else {
+                            let frame = &frames.as_ref().unwrap()[selected_frame];
+                            print_frame(&mut stdout, selected_frame, frame);
+                            // Show locals
+                            if let Some(ref locals) = frame.local_bindings {
+                                writeln!(stdout, "  Locals:").unwrap_or(());
+                                for (name, value) in locals {
+                                    writeln!(stdout, "    {:?} = {:?}", name, value).unwrap_or(());
+                                }
                             }
                         }
                     } else {
-                        writeln!(stdout, "Frame {} out of range (0..{})", n, frames.len() - 1)
+                        writeln!(stdout, "Frame {} out of range (0..{})", n, frame_count - 1)
                             .unwrap_or(());
                     }
                 }
             }
             // Eval in frame (R6.18)
             "eval" | "e" => {
+                if historical_frames.is_some() {
+                    writeln!(
+                        stdout,
+                        "Frame evaluation unavailable: the selected frame is a historical snapshot."
+                    )
+                    .unwrap_or(());
+                    continue;
+                }
                 if let Some(expr) = arg {
                     match egcl_compiler::reader::read_from_string(expr) {
                         Ok((form, _)) => {
+                            let frames = frames.as_ref().unwrap();
                             let frame = &frames[selected_frame.min(frames.len() - 1)];
                             match eval_in_frame(form, frame) {
                                 Ok(val) => {
@@ -1122,9 +1171,18 @@ pub fn invoke_debugger_ui(
                 }
             }
             _ => {
+                if historical_frames.is_some() {
+                    writeln!(
+                        stdout,
+                        "Frame evaluation unavailable: the selected frame is a historical snapshot."
+                    )
+                    .unwrap_or(());
+                    continue;
+                }
                 // Try to evaluate as a Lisp form
                 match egcl_compiler::reader::read_from_string(trimmed) {
                     Ok((form, _)) => {
+                        let frames = frames.as_ref().unwrap();
                         let frame = &frames[selected_frame.min(frames.len() - 1)];
                         match eval_in_frame(form, frame) {
                             Ok(val) => {
@@ -1146,6 +1204,18 @@ pub fn invoke_debugger_ui(
 
     repl_state.level -= 1;
     Ok(())
+}
+
+fn print_historical_frames(
+    out: &mut impl IoWrite,
+    frames: &[egcl_rt::debug_stack::LogicalFrame],
+    count: usize,
+    start_index: usize,
+) {
+    for (index, frame) in format_backtrace(frames, count).iter().enumerate() {
+        let index = start_index + index;
+        writeln!(out, "  {index}: {frame} [historical snapshot]").unwrap_or(());
+    }
 }
 
 /// Pretty-print a debug frame.
