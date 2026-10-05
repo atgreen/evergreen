@@ -489,11 +489,11 @@ users porting existing code.
 
 | Area | SBCL | EGCL | Migration action |
 |------|------|-------|------------------|
-| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `EGCL-EXT`, `EGCL-THREAD`, etc.; `EGCL` and `EGCL-THREADS` are deprecated compatibility spellings | Use compatibility package (see below) or `#+`/`#-` conditionals |
+| Package for extensions | `SB-EXT`, `SB-THREAD`, etc. | `EGCL-EXT`, `EGCL-THREAD`, etc. | Use implementation-specific package names with `#+`/`#-` conditionals |
 | Thread API | `sb-thread:make-thread` | `egcl-thread:make-thread` (BORDEAUX-THREADS compatible) | Use `bordeaux-threads` for portability |
 | GC control | `(sb-ext:gc)`, `sb-ext:*gc-run-time*` | `(egcl-ext:gc)`, `egcl-ext:*gc-run-time*` | Rename calls |
 | Compiler policy | `(declare (optimize (speed 3)))` | Same ANSI syntax; EGCL interprets values similarly | No change needed |
-| `defglobal` | `sb-ext:defglobal` | `egcl-ext:defglobal` | Rename or use compat package |
+| `defglobal` | `sb-ext:defglobal` | `egcl-ext:defglobal` | Rename with implementation conditionals |
 | Image save | `sb-ext:save-lisp-and-die` | `egcl-ext:save-image` | Rename; keyword args differ (see §7) |
 | Foreign calls | `sb-alien:define-alien-routine` | `egcl-ffi:define-foreign-function` | Rewrite FFI declarations |
 | Weak pointers | `sb-ext:make-weak-pointer` | `egcl-ext:make-weak-pointer` | Rename |
@@ -501,36 +501,20 @@ users porting existing code.
 | `*posix-argv*` | `sb-ext:*posix-argv*` | `egcl-ext:*command-line-arguments*` | Rename |
 | Exit | `sb-ext:exit` | `egcl-ext:exit` | Rename; compatible keyword args |
 
-### 11.12.2  Compatibility Package
+### 11.12.2  Explicit Package Selection
 
-**R11.18** EGCL MUST provide a `EGCL-SBCL-COMPAT` package that
-re-exports EGCL equivalents under SBCL symbol names for the most
-commonly used SBCL extensions:
-
-```lisp
-(defpackage :egcl-sbcl-compat
-  (:use :cl)
-  (:export
-   ;; sb-ext equivalents
-   #:defglobal #:save-lisp-and-die #:exit #:quit
-   #:*posix-argv* #:gc #:*gc-run-time*
-   #:make-weak-pointer #:weak-pointer-value
-   ;; sb-thread equivalents
-   #:make-thread #:join-thread #:thread-alive-p
-   #:make-mutex #:grab-mutex #:release-mutex #:with-mutex
-   #:make-condition-variable #:condition-wait #:condition-notify
-   #:condition-broadcast))
-```
-
-The compatibility package may additionally export deprecated aliases such as
-`MAKE-WAITQUEUE`, but new examples use `MAKE-CONDITION-VARIABLE`.
+**R11.18** EGCL MUST document its own extension package names and the
+implementation conditionals needed by portable libraries. It MUST NOT
+provide an `EGCL-SBCL-COMPAT` migration package or `SB-*` package aliases
+and re-exports. Use portable libraries such as `BORDEAUX-THREADS` and
+`CLOSER-MOP`, or select the appropriate EGCL package explicitly.
 
 ### 11.12.3  Porting Checklist
 
 1. Replace `#+sbcl` conditionals with `#+egcl` (or `#+(or sbcl egcl)`
    for code that should work on both).
 2. Replace `sb-ext:`, `sb-thread:`, `sb-alien:` package prefixes with
-   EGCL equivalents, or `(:use :egcl-sbcl-compat)`.
+   EGCL equivalents under implementation conditionals.
 3. Audit FFI declarations — EGCL uses `egcl-ffi:define-foreign-function`
    with keyword syntax closer to CFFI than to `sb-alien`.
 4. Test `defstruct` `:include` chains — EGCL Phase 2 supports them but
