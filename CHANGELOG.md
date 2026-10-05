@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Correctness and reliability
+
+- Image-saving options now remain valid when pathname or option evaluation
+  triggers a moving garbage collection, preventing corrupted option traversal
+  in `SAVE-LISP-AND-DIE` and `%SAVE-CORE`
+  ([#8](https://github.com/atgreen/evergreen/pull/8)).
+
 ### Debugging and observability
 
 - Interactive debugger backtraces now preserve the failing Lisp call chain and
