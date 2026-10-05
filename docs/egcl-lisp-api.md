@@ -23,34 +23,34 @@ section therefore carries one of these labels:
 The status in this document reflects Stage 5 (`spec/stages.json`) on
 2026-08-20. The technical specification remains normative for future behavior;
 the availability labels below have not been comprehensively re-audited against
-the current bootstrap.
+the current bootstrap. The atomics, memory-barrier, and Gray-stream sections
+below have been refreshed for the current implementation.
 
 ## Package map
 
 | Package | Purpose | Current status | Compatibility |
 | --- | --- | --- | --- |
-| `EGCL-EXT` | General runtime, compiler, process, package, image, atomic, and memory-barrier extensions | Package and selected functions available | Planned `SB-EXT` re-exports |
-| `EGCL` | Deprecated nickname for `EGCL-EXT` | Specified compatibility alias; not created today | Older spelling only |
-| `EGCL-THREAD` | OS-backed native threads and synchronization objects | Specified | Planned `SB-THREAD` re-exports |
-| `EGCL-THREADS` | Deprecated nickname for `EGCL-THREAD` | Specified compatibility alias; not created today | Older spelling only |
+| `EGCL-EXT` | General runtime, compiler, process, package, image, atomic, and memory-barrier extensions | Package and selected functions available | Use the EGCL public names |
+| `EGCL` | Bootstrap implementation entry points | Internal | Not a public nickname for `EGCL-EXT` |
+| `EGCL-THREAD` | OS-backed native threads and synchronization objects | Native thread and mutex operations available; see the manual for the implemented subset | Use the EGCL public names |
+| `EGCL-THREADS` | Nickname for `EGCL-THREAD` | Available | Prefer the canonical name |
 | `EGCL-FIBER` | Lightweight M:N fibers and scheduler groups | Specified | Deliberately distinct from native threads |
-| `EGCL-MOP` | Metaobject protocol | Partial internals; public package specified | Planned `SB-MOP` re-exports |
-| `EGCL-CLTL2` | Compile-time environment inspection | Specified | Planned `SB-CLTL2` alias |
-| `EGCL-GRAY-STREAMS` | Gray stream classes and generic functions | Partial internal dispatch | Intended to be re-exported from `COMMON-LISP` |
+| `EGCL-MOP` | Metaobject protocol | Specified public package; not installed by the bootstrap | Planned EGCL namespace |
+| `EGCL-CLTL2` | Compile-time environment inspection | Package available; see the manual for the implemented subset | Use the EGCL public names |
+| `EGCL-GRAY-STREAMS` | Gray stream classes and generic functions | Public classes and elemental protocol available; bulk protocol incomplete | Import from this package |
 | `EGCL-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
 | `EGCL-PYTHON` (nickname `PY`) | Embedded CPython as a second object system | Available in a build with the `python` feature | EGCL-specific; deliberately not CFFI-shaped |
 | `EGCL-DEBUG` | Breakpoints, watchpoints, and debugger plumbing | Partial Rust library; Lisp API specified | EGCL-specific |
 | `EGCL-PROFILER` | Runtime profiling controls and reports | Specified; tier counters have separate available accessors | EGCL-specific |
 | `EGCL-GC` | GC counters used by developer tools | Specified | EGCL-specific |
 | `EGCL-SYS` | OS timing and page-fault counters | Specified | EGCL-specific |
-| `EGCL-SBCL-COMPAT` | Opt-in SBCL migration re-exports | Specified | Transition aid, not a new semantic API |
 
 `COMMON-LISP-USER` uses `COMMON-LISP` and `EGCL-EXT`, but portable code
 should still qualify extension names. The canonical public names are
-`EGCL-EXT`, `EGCL-THREAD`, `EGCL-FIBER`, and `EGCL-FFI`. Older `EGCL` and
-`EGCL-THREADS` references are compatibility spellings only; new spec text must
-not introduce fresh primary APIs under those package names. Compatibility
-packages are not yet created by the bootstrap package initializer.
+`EGCL-EXT`, `EGCL-THREAD`, `EGCL-FIBER`, and `EGCL-FFI`. `EGCL-THREADS` is a
+nickname for `EGCL-THREAD`; `EGCL::%...` names are internal entry points, not
+public extensions. EGCL does not provide `SB-*` package aliases or re-exports.
+Portable library ports should select EGCL's packages explicitly.
 
 `EGCL-INTERNALS`/`BI` is an unstable implementation package and is
 intentionally not a supported API.
@@ -281,8 +281,8 @@ specified-only.
 
 | API | Contract |
 | --- | --- |
-| `(egcl-ext:save-image path &key executable compression purify)` | Save a full relocatable heap image and return its pathname; `:COMPRESSION` is `:NONE` or `:ZSTD`; deprecated alias `EGCL:SAVE-IMAGE` |
-| `(sb-ext:save-lisp-and-die path &rest options)` | Compatibility alias that saves and exits |
+| `(egcl-ext:save-image path &key executable compression purify)` | Historical signature; see the [current image reference](manual/user/reference/images.md) for implemented options |
+| `(egcl-ext:save-lisp-and-die path &rest options)` | Save and exit; see the [current image reference](manual/user/reference/images.md) |
 | `(egcl-ext:exit &key (code 0) abort timeout)` | Orderly process exit; `:ABORT` skips cleanup and `:TIMEOUT` bounds joins |
 | `(egcl-ext:quit &key (unix-status 0) recklessly-p)` | SBCL-compatible spelling of `EXIT` |
 | `(egcl-ext:with-timeout (seconds timeout-form*) body*)` | Run `body`; on expiry evaluate timeout forms and signal `TIMEOUT` |
@@ -301,21 +301,9 @@ The extension condition/type surface comprises:
 - `EGCL-EXT:NOT-YET-IMPLEMENTED`;
 - `EGCL-EXT:FOREIGN-POINTER`, an opaque validated foreign-address wrapper.
 
-`EGCL-EXT:INTERNAL-ERROR` denotes a EGCL bug and is not a recoverable
-application condition. `EGCL:IMAGE-ERROR` is a deprecated compatibility
-spelling.
-
-The deprecated `EGCL` compatibility package additionally specifies:
-
-| API | Contract |
-| --- | --- |
-| `(egcl:gc &rest options)` | Older-package spelling of `EGCL-EXT:GC` |
-| `egcl:*gc-run-time*` | Older-package spelling of `EGCL-EXT:*GC-RUN-TIME*` |
-| `(egcl:defglobal name value &optional documentation)` | Older-package spelling of `EGCL-EXT:DEFGLOBAL` |
-| `(egcl:make-weak-pointer object)` | Older-package spelling of `EGCL-EXT:MAKE-WEAK-POINTER` |
-| `(egcl:exit &key code abort timeout)` | Older-package spelling of `EGCL-EXT:EXIT` |
-| `(egcl:struct-slot-offset structure-type slot-name)` | Older-package spelling of `EGCL-EXT:STRUCT-SLOT-OFFSET` |
-| `(egcl:deprecated-symbols)` | Return `(symbol replacement removal-version)` entries |
+`EGCL-EXT:INTERNAL-ERROR` denotes an EGCL bug and is not a recoverable
+application condition. Use the documented public `EGCL-EXT` names rather
+than the older inventory's proposed `EGCL` aliases.
 
 The public tuning specials are `EGCL-EXT:*DEFAULT-EXTERNAL-FORMAT*` (default
 `:UTF-8`), `EGCL-EXT:*HASH-TABLE-DEFAULT-SIZE*` (16),
@@ -434,7 +422,7 @@ thread holds at least one read acquisition.
 
 Every successful recursive acquisition must be matched by a release.
 
-### Atomics and barriers
+### Atomics and barriers — **Available**
 
 ```lisp
 (egcl-ext:cas place old new) -> previous-value
@@ -443,19 +431,33 @@ Every successful recursive acquisition must be matched by a release.
 (egcl-ext:memory-barrier &optional (kind :full)) -> nil
 (egcl-ext:load-barrier) -> nil
 (egcl-ext:store-barrier) -> nil
-(egcl-ext:with-atomic () body*)
 ```
 
-`CAS` compares with `EQ`, stores only on a match, and returns the actual old
-value. Specified places are special variables, structure slots, `SVREF`,
-`CAR`, `CDR`, `SYMBOL-PLIST`, `SYMBOL-VALUE`, and `SLOT-VALUE`.
-`ATOMIC-INCF` and `ATOMIC-DECF` support fixnum cells and return the value before
-the update; overflow signals `ARITHMETIC-ERROR`.
+`CAS`, `ATOMIC-INCF`, and `ATOMIC-DECF` are macros. `CAS` compares with `EQ`,
+stores only on a match, and returns the actual previous value on success or
+failure. Supported places are special-variable symbols, structure-slot
+accessors, `SVREF`, `CAR`, `CDR`, `SYMBOL-PLIST`, `SYMBOL-VALUE`, and
+instance-allocated `SLOT-VALUE` slots. Arbitrary SETF places and ordinary
+lexical variables are not supported.
 
-Memory-barrier kinds are `:READ`, `:WRITE`, `:FULL`, and
-`:DATA-DEPENDENCY`.
-`WITH-ATOMIC` suppresses scheduler preemption for a short dynamic extent but
-does not suppress GC safepoints.
+`ATOMIC-INCF` and `ATOMIC-DECF` support special-variable symbols,
+structure-slot accessors, and `SVREF`. Both the current value and delta must
+be fixnums (`TYPE-ERROR` otherwise); overflow signals `ARITHMETIC-ERROR`
+without storing a replacement. They return the value before the update.
+See the [user manual](manual/user/reference/extensions.md#atomic-updates) for
+the supported-place table, evaluation rules, memory ordering, and examples.
+
+The three barrier functions return `NIL`. Kinds are `:READ` (acquire),
+`:WRITE` (release), `:FULL` (sequentially consistent), and
+`:DATA-DEPENDENCY` (implemented as acquire). Unknown kinds signal
+`PROGRAM-ERROR`. `LOAD-BARRIER` and `STORE-BARRIER` select `:READ` and
+`:WRITE`. These fences are not rendezvous barriers and do not make ordinary
+accesses atomic. See [memory ordering](manual/user/reference/extensions.md#memory-ordering).
+Dedicated x86 T1/T2 intrinsic lowering remains pending; the public functions
+currently call the runtime fence helper.
+
+`WITH-ATOMIC` is not part of the implemented public API; do not rely on the
+older planned scheduler-preemption interface.
 
 ### N-party barriers
 
@@ -653,8 +655,8 @@ least one.
 `TRULY-THE` suppresses all checks; a false assertion has undefined behavior.
 `ALWAYS-BOUND` removes unbound checks. `FREEZE-TYPE` permits stamp-based type
 and slot optimizations and makes later redefinition exceptional. The muffling
-declarations control compiler warnings/notes. `SB-EXT` aliases are specified
-for all declaration identifiers.
+declarations control compiler warnings/notes. Use the `EGCL-EXT` names; no
+aliases in another implementation's extension package are provided.
 
 ### CLtL2 environment protocol — **Specified**
 
@@ -679,9 +681,10 @@ compile-time environment.
 
 ## Metaobject protocol
 
-The `EGCL-MOP` surface is **Specified** and intended to be re-exported from
-`SB-MOP`. The bootstrap has CLOS internals but does not expose this complete
-package contract yet.
+The `EGCL-MOP` surface below is **Specified**. The bootstrap has CLOS
+internals but does not install this public package. When exposed, the public
+protocol belongs in EGCL's own package, not an alias in another
+implementation's package. This inventory is not an availability guarantee.
 
 ### Class introspection and metaclasses
 
@@ -774,9 +777,11 @@ Adding/removing a method also invalidates relevant EGCL inline caches.
 
 ## Gray streams
 
-The `EGCL-GRAY-STREAMS` protocol is **Partial**. Built-in stream operations
-contain Gray-dispatch paths, but the complete documented class hierarchy and
-package are not yet installed by the bootstrap.
+The `EGCL-GRAY-STREAMS` protocol is **Partial**. The bootstrap installs the
+public package, the class hierarchy below, and the elemental input/output
+generics. Import protocol symbols from `EGCL-GRAY-STREAMS`; query and lifecycle
+functions such as `STREAM-ELEMENT-TYPE` and `CLOSE` retain their Common Lisp
+names.
 
 ### Classes
 
@@ -785,30 +790,39 @@ package are not yet installed by the bootstrap.
 `FUNDAMENTAL-CHARACTER-STREAM`, `FUNDAMENTAL-BINARY-STREAM`, and their four
 character/binary input/output combinations.
 
-### Generic functions
+### Available elemental generic functions
 
 | Input | Output | Query/lifecycle |
 | --- | --- | --- |
 | `stream-read-char` | `stream-write-char` | `stream-element-type` |
 | `stream-unread-char` | `stream-line-column` | `open-stream-p` |
 | `stream-read-char-no-hang` | `stream-start-line-p` | `close` |
-| `stream-peek-char` | `stream-write-string` | `interactive-stream-p` |
-| `stream-listen` | `stream-terpri` | `stream-external-format` |
-| `stream-read-line` | `stream-fresh-line` | `stream-file-position` |
-| `stream-clear-input` | `stream-finish-output` | `stream-file-length` |
+| `stream-peek-char` | `stream-write-string` | `input-stream-p` |
+| `stream-listen` | `stream-terpri` | `output-stream-p` |
+| `stream-read-line` | `stream-fresh-line` |  |
+| `stream-clear-input` | `stream-finish-output` |  |
 | `stream-read-byte` | `stream-force-output` |  |
-| `stream-read-sequence` | `stream-clear-output` |  |
-|  | `stream-advance-to-column` |  |
+|  | `stream-clear-output` |  |
 |  | `stream-write-byte` |  |
-|  | `stream-write-sequence` |  |
 
-The standard CL stream functions dispatch to these generics for fundamental
-stream subclasses. A subclass must implement the elemental operation for its
-direction; bulk and convenience operations have protocol defaults.
+Standard stream operations use the elemental methods for fundamental-stream
+subclasses. `STREAMP` and `(TYPEP object 'STREAM)` recognize those instances;
+direction predicates follow the input/output classes. The default lifecycle
+starts open and `CLOSE` marks the stream closed; wrapper classes may specialize
+these methods to delegate to an underlying stream.
 
-External formats are extensible through `CODEC-ENCODE`, `CODEC-DECODE`,
-`CODEC-NAME`, and `CODEC-REPLACEMENT-CHARACTER` generic functions. Their
-defining contract currently does not assign a separate public codec package.
+Elemental readers return `:EOF` at end of input. `READ-BYTE` translates that
+marker according to its `eof-error-p` and `eof-value` arguments.
+`READ-SEQUENCE` uses character or byte methods according to
+`STREAM-ELEMENT-TYPE`, honors `:START`/`:END`, and returns the first unread
+index. Its binary-aware fallback is internal, not a new public bulk generic.
+
+`STREAM-ADVANCE-TO-COLUMN` is exported but has no installed function.
+Portable `STREAM-READ-SEQUENCE` / `STREAM-WRITE-SEQUENCE` method adapters and
+the planned position, external-format, and codec extension protocols are not
+covered by this implemented subset. Do not infer their availability from the
+older inventory. See the [Drakma scenario](../tests/drakma/README.md) for the
+pinned plain-HTTP regression using Chunga and Flexi Streams.
 
 ## Debugger and profiling API
 
@@ -1099,9 +1113,8 @@ would not be one.
 
 ## Deferred extensible sequences
 
-`SB-SEQUENCE:DEFINE-SEQUENCE-CLASS` is **Deferred** to v2. In v1 the specified
-macro signals `EGCL-EXT:NOT-YET-IMPLEMENTED` with a message identifying that
-deferral.
+User-defined sequence classes are **Deferred** to v2. No public class-definition
+macro or placeholder protocol is installed for this extension in v1.
 
 ## Configuration used by the extension APIs
 

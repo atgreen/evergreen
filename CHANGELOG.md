@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Documentation
+
+- Document atomic-update semantics, supported places, memory ordering, and
+  current Gray-stream availability
+  ([#23](https://github.com/atgreen/evergreen/pull/23)).
+
 ### Common Lisp extensions
 
 - `EGCL-EXT:CAS`, `ATOMIC-INCF`, and `ATOMIC-DECF` now provide lock-free

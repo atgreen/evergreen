@@ -24,9 +24,9 @@ a declaration is not evidence that every associated behavior is implemented.
 The test suites and the behavior described in this manual are more useful than
 a blanket “supported” label.
 
-Selected SBCL-compatible interfaces help existing libraries run on EGCL.
-Compatibility does not make every `SB-*` package available, and a similar
-function name does not guarantee the same lambda list. Use the actual EGCL
+Selected interfaces have semantics familiar to SBCL users, but EGCL exposes
+them through its own packages, not `SB-*` aliases or re-exports. A similar
+function name does not guarantee the same lambda list. Use the documented EGCL
 signature, especially for subprocesses and foreign calls.
 
 ## Public and internal names

@@ -11,18 +11,19 @@ An SBCL extension is adopted when ALL of the following hold:
 1. **Ecosystem demand** — used by ≥3 popular libraries (Quicklisp top-100)
    or essential for practical CL development.
 2. **No ANSI conflict** — operates in an unspecified or implementation-defined area.
-3. **Clean namespace** — exported from `EGCL-EXT` (not `CL`), with
-   `SB-EXT`-compatible symbol names via a compatibility package.
+3. **Clean namespace** — exported from the appropriate `EGCL-*` package
+   (not `CL`), without aliases or re-exports in `SB-*` packages.
 4. **Documented divergence** — any behavioural difference from SBCL listed explicitly.
 
 **R9.01** EGCL MUST provide a `EGCL-EXT` package exporting all adopted extensions.
-**R9.02** EGCL MUST provide `SB-EXT`, `SB-THREAD`, `SB-MOP` compatibility
-packages that re-export the corresponding EGCL symbols.
+**R9.02** EGCL MUST expose adopted extensions through its own public packages
+and MUST NOT provide `SB-*` package aliases or re-exports. Library ports use
+implementation conditionals or portable libraries to select the EGCL names.
 **R9.03** Each adopted extension MUST include a test verifying SBCL-compatible behaviour.
 
 ---
 
-## 9.2  Native Threads and Fibers (`SB-THREAD` Compatibility)
+## 9.2  Native Threads and Fibers
 
 **Design decision (2026-08-20).** EGCL adopts the scheduler-group and fiber
 lifecycle shape described by the SBCL Fibers proposal, but deliberately uses a
@@ -35,8 +36,7 @@ earlier design in which `MAKE-THREAD` secretly returned a managed fiber.
 **R9.04** EGCL MUST expose OS-backed platform/carrier threads through the
 `EGCL-THREAD` package and lightweight managed fibers through the distinct
 `EGCL-FIBER` package. `EGCL-THREADS` is a deprecated nickname for
-`EGCL-THREAD`. `SB-THREAD` re-exports the compatible native-thread and
-synchronisation symbols; it MUST NOT make a fiber appear to be an OS thread.
+`EGCL-THREAD`. These interfaces MUST NOT make a fiber appear to be an OS thread.
 
 ### 9.2.1  Native/Carrier Thread Lifecycle
 
@@ -175,9 +175,7 @@ cooperatively brought to a safepoint or the operation signals
 
 ### 9.2.7  Atomic Operations (CAS)
 
-**R9.37** EGCL MUST provide SBCL-compatible atomic operations in `EGCL-EXT`,
-re-exported via `SB-EXT` and, where SBCL compatibility requires it,
-`SB-THREAD`.
+**R9.37** EGCL MUST provide the adopted atomic operations in `EGCL-EXT`.
 
 ```lisp
 (egcl-ext:cas place old new)
@@ -354,7 +352,7 @@ work-stealing deque and scheduler state (§13.5).
 
 ## 9.6  Sequence Extensions
 
-**R9.13** Extensible sequences via `SB-SEQUENCE:DEFINE-SEQUENCE-CLASS`.
+**R9.13** An EGCL-owned extensible sequence interface is deferred to v2.
 
 **Status:** Out-of-scope for v1. **Rationale:** The SBCL extensible sequence
 protocol requires deep integration with every standard sequence function
@@ -362,16 +360,16 @@ protocol requires deep integration with every standard sequence function
 few Quicklisp libraries depend on it). The implementation cost is disproportionate
 to adoption benefit for v1. Will be revisited for v2 based on user demand.
 
-**R9.40** When user code calls `sb-sequence:define-sequence-class` in EGCL v1,
-the macro MUST signal a `EGCL-EXT:NOT-YET-IMPLEMENTED` error with a descriptive
-message referencing v2.
+**R9.40** EGCL v1 documentation MUST identify user-defined sequence classes
+as deferred, not advertise an implemented placeholder macro. EGCL MUST NOT
+create an `SB-SEQUENCE` package to expose this deferred interface.
 
 ---
 
-## 9.7  MOP Extensions (`SB-MOP` / Closer-MOP Compatibility)
+## 9.7  MOP Extensions (Closer-MOP Support)
 
 **R9.14** EGCL MUST export enough MOP symbols for `CLOSER-MOP` to load.
-All symbols exported from `EGCL-MOP`, re-exported via `SB-MOP`.
+All symbols are exported from `EGCL-MOP`.
 
 ### 9.7.1  Class Introspection
 
@@ -392,7 +390,7 @@ All symbols exported from `EGCL-MOP`, re-exported via `SB-MOP`.
 ### 9.7.1b  MOP Metaclasses
 
 **R9.39** EGCL MUST export the following metaclass and slot-definition classes
-from `EGCL-MOP` (re-exported via `SB-MOP`):
+from `EGCL-MOP`:
 
 | Class | Superclass | Purpose |
 |-------|------------|---------|
@@ -526,7 +524,7 @@ EGCL name: `SAVE-IMAGE`; compatibility alias provided.
 |---------|------|-------|------------|
 | `save-lisp-and-die` | primary name | alias for `save-image` | alias provided |
 | `exit :timeout` | not supported | supported | EGCL addition |
-| `with-timeout` condition | `sb-ext:timeout` | `egcl-ext:timeout` | `sb-ext` alias provided |
+| `with-timeout` condition | `sb-ext:timeout` | `egcl-ext:timeout` | Use the implementation-specific package |
 | `definition-source` | struct | plist `(:file :line :form)` | accessor compat macros provided |
 
 ---
@@ -663,13 +661,10 @@ asserted type for downstream propagation and specialised code selection.
 **R9.28** Compiler MUST elide unbound checks. If unbound at runtime: undefined
 behaviour (UNBOUND-MARKER treated as valid object; no GC corruption).
 
-**R9.41** The compiler's declaration-identifier resolver MUST recognise both
-`egcl-ext:always-bound` and `sb-ext:always-bound` as equivalent declaration
-identifiers. Declarations are resolved by symbol identity (via the compatibility
-package re-export in R9.02), so `(declaim (sb-ext:always-bound *var*))` MUST
-work identically. The same applies to `freeze-type` and `muffle-conditions` /
-`unmuffle-conditions` — all four declaration identifiers MUST be recognised
-under both `EGCL-EXT` and `SB-EXT` prefixes.
+**R9.41** The compiler's declaration-identifier resolver MUST recognise
+`egcl-ext:always-bound`, `egcl-ext:freeze-type`, `egcl-ext:muffle-conditions`,
+and `egcl-ext:unmuffle-conditions` by symbol identity. No alternate
+implementation-package prefix is provided.
 
 ### 9.12.3  `freeze-type`
 
@@ -698,10 +693,10 @@ under both `EGCL-EXT` and `SB-EXT` prefixes.
 | Feature | SBCL | EGCL | Divergence |
 |---------|------|-------|------------|
 | `truly-the` | special form | special form | identical |
-| `always-bound` | declaration (`sb-ext:`) | declaration (`egcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
-| `freeze-type` | declaration (`sb-ext:`) | declaration (`egcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| `always-bound` | declaration (`sb-ext:`) | declaration (`egcl-ext:`) | Use the implementation-specific package |
+| `freeze-type` | declaration (`sb-ext:`) | declaration (`egcl-ext:`) | Use the implementation-specific package |
 | `freeze-type` redef | `style-warning` | `style-warning` + continuable `error` at load | EGCL stricter |
-| `muffle-conditions` | declaration (`sb-ext:`) | declaration (`egcl-ext:` + `sb-ext:` alias) | identical; both prefixes recognised |
+| `muffle-conditions` | declaration (`sb-ext:`) | declaration (`egcl-ext:`) | Use the implementation-specific package |
 | Trust violation | undefined | undefined (but GC-safe) | EGCL guarantees no GC corruption |
 
 ---

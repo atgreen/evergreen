@@ -2,7 +2,7 @@
 
 **Scope:** How EGCL exposes single-instruction/multiple-data hardware to Lisp
 code: the SIMD pack data type (§14.3), the `EGCL-SIMD` package family and its
-`SB-SIMD` compatibility layer (§14.4), unboxed codegen and register allocation
+architecture-specific EGCL packages (§14.4), unboxed codegen and register allocation
 for vector values (§14.5), instruction-set detection and dispatch across image
 save/restore (§14.6), and the staged plan that gets there from where EGCL is
 today (§14.2). SIMD is stage 7 (`numeric-performance`) work: every requirement
@@ -148,7 +148,7 @@ that starts at `f64.4+` is describing a different compiler.
 | P0 | Specialized arrays for `u8/u16/u32/u64`, `s8…s64`, `f32`, `f64`: packed storage, `ARRAY-ELEMENT-TYPE`, `AREF`/`(setf AREF)`, `UPGRADED-ARRAY-ELEMENT-TYPE`, sequence functions, printer, BFASL externalisation | `(typep (make-array 4 :element-type '(unsigned-byte 8)) '(simple-array (unsigned-byte 8) (4)))` is true; a `u8` array costs 1 byte/element; ansi-test array chapter no worse |
 | P1 | XMM/YMM in the assembler and register allocator; unboxed `f32`/`f64` locals and array element access in T1/T2; boxing only at frame boundaries | A `double-float` dot-product loop over specialized arrays runs with no heap allocation in steady state and within 2× of SBCL |
 | P2 | `EGCL-SIMD-SSE2`/`-AVX`/`-AVX2`/`-FMA` packages: pack types, casts, constructors, arithmetic, comparisons/masks, `-if`, `X.Y-aref`, scalar twins, `MISSING-INSTRUCTION` | A hand-written `f64.4` kernel beats the scalar loop by ≥2× on the same machine; every unavailable instruction signals `MISSING-INSTRUCTION` |
-| P3 | `instruction-set-case` + save/restore-safe dispatch; `SB-SIMD*` compatibility packages | An image dumped with AVX2 selected runs correctly when restored with `EGCL_SIMD_MAX=sse2`; sb-simd's own test-suite shape passes against the compatibility packages |
+| P3 | `instruction-set-case` + save/restore-safe dispatch | An image dumped with AVX2 selected runs correctly when restored with `EGCL_SIMD_MAX=sse2`; equivalent kernels agree with SBCL using implementation-specific package names |
 | P4 | Portable `EGCL-SIMD` layer: width-agnostic types, `.LEN`-driven striding, partial-tail loads, explicit emulation | The same source kernel produces correct results at 128-bit, 256-bit and emulated widths, selected at run time |
 | P5 | aarch64/NEON behind the same two layers | The P4 kernel runs correctly and faster-than-scalar on aarch64 |
 
@@ -205,7 +205,7 @@ chapter is not stage 5 work.
 | R14.34 | EGCL MUST provide `instruction-set-case`, selecting among per-instruction-set implementations through a jump table whose index is recomputed on every image startup `[S7]` | MUST |
 | R14.35 | A saved image MUST remain correct when restored on a machine supporting fewer instruction sets than the one that saved it; code compiled for an unavailable set MUST NOT be entered `[S7]` | MUST |
 | R14.36 | `EGCL_SIMD_MAX` MUST cap the instruction sets reported as available, so narrower and emulated paths are testable on one machine `[S7]` | MUST |
-| R14.37 | EGCL MUST provide `SB-SIMD`, `SB-SIMD-SSE2`, `SB-SIMD-AVX`, `SB-SIMD-AVX2` and `SB-SIMD-FMA` compatibility packages re-exporting the EGCL equivalents, per R9.02's pattern `[S7]` | MUST |
+| R14.37 | EGCL MUST expose SIMD operations through `EGCL-SIMD` and its instruction-set packages, without `SB-SIMD*` aliases or re-exports `[S7]` | MUST |
 
 ### 14.3.5  Portable layer
 
@@ -244,7 +244,6 @@ EGCL-SIMD-AVX           |
 EGCL-SIMD-AVX2          |
 EGCL-SIMD-FMA          /
 EGCL-SIMD-NEON         aarch64 (P5)
-SB-SIMD, SB-SIMD-*      compatibility re-exports (R14.37)
 ```
 
 A program picks its layer by choosing a package, which is the whole point of
@@ -343,8 +342,8 @@ callee-saved discipline in §4.7 extends to XMM/YMM; nothing in the lock order
    test asserts element-wise equality against `Y` applications of `X-OP`. This
    is the cheapest correctness net and it needs no reference hardware.
 2. **Differential against SBCL.** Where `sb-simd` provides the same operation,
-   run the same kernel under both and compare; the compatibility packages
-   (R14.37) make the source identical.
+   run equivalent kernels under both and compare, selecting each
+   implementation's package names explicitly.
 3. **Width matrix.** Every portable-layer test runs at each available width and
    emulated, driven by `EGCL_SIMD_MAX`/`EGCL_SIMD_EMULATE` (R14.36, R14.44) —
    otherwise the emulation path is dead code that happens to compile.
