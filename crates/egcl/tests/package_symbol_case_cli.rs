@@ -147,3 +147,34 @@ fn exactly_cased_shadow_allows_export_without_changing_the_shadow() {
         "(T T :EXTERNAL)",
     );
 }
+
+#[test]
+fn shadowing_import_accepts_fresh_symbols_with_mixed_case_names() {
+    check(
+        r#"(let* ((target (make-package "SHADOW-FRESH" :use nil))
+                    (symbol (make-symbol "MiXeD")))
+               (list (shadowing-import symbol target)
+                     (eq symbol (find-symbol "MiXeD" target))
+                     (nth-value 1 (find-symbol "MiXeD" target))
+                     (equal (package-shadowing-symbols target) (list symbol))
+                     (symbol-package symbol)
+                     (symbol-name symbol)))"#,
+        "(T T :INTERNAL T NIL \"MiXeD\")",
+    );
+}
+
+#[test]
+fn shadowing_import_accepts_a_previously_uninterned_symbol() {
+    check(
+        r#"(let* ((source (make-package "SHADOW-SOURCE" :use nil))
+                    (target (make-package "SHADOW-TARGET" :use nil))
+                    (symbol (intern "FORMER" source)))
+               (unintern symbol source)
+               (list (shadowing-import symbol target)
+                     (eq symbol (find-symbol "FORMER" target))
+                     (nth-value 1 (find-symbol "FORMER" target))
+                     (equal (package-shadowing-symbols target) (list symbol))
+                     (symbol-package symbol)))"#,
+        "(T T :INTERNAL T NIL)",
+    );
+}

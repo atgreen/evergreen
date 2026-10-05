@@ -4,6 +4,11 @@
 
 ### Correctness and reliability
 
+- `SHADOWING-IMPORT` now accepts fresh and previously uninterned symbols,
+  preserving their names and identities, and propagates failures instead of
+  silently reporting success
+  ([#14](https://github.com/atgreen/evergreen/pull/14)).
+
 - Package export and import operations now preserve symbol-name case, and
   export conflict checks distinguish differently cased and shadowed names
   ([#13](https://github.com/atgreen/evergreen/pull/13)).

@@ -23896,13 +23896,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // used packages inherit it; IMPORT/SHADOWING-IMPORT → internal).
                 // SHADOWING-IMPORT additionally records each name as a shadowing
                 // symbol and displaces any conflicting present symbol, so
-                // PACKAGE-SHADOWING-SYMBOLS reports it (egcl packages chapter).
+                // PACKAGE-SHADOWING-SYMBOLS reports it.
                 if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
                     if shadowing_mode {
                         let syms: Vec<EgclVal> = resolved.iter().map(|(_, s)| *s).collect();
-                        // Ensure each imported symbol is present somewhere so the
-                        // stdlib name-lookup succeeds; then shadowing-import it.
-                        let _ = egcl_stdlib::shadowing_import(&syms, pkg);
+                        egcl_stdlib::shadowing_import(&syms, pkg)?;
                     } else {
                         // Name-conflict check (CLHS IMPORT; ansi
                         // IMPORT.ERROR.3): importing a symbol DISTINCT from a

@@ -194,6 +194,37 @@ fn shadowing_import_resolves_conflict() {
 }
 
 #[test]
+fn shadowing_import_accepts_an_uninterned_literal_name() {
+    let mut reg = fresh_registry();
+    let target = reg.make_package("SHADOW-FRESH", &[], &[]).unwrap();
+    let symbol = egcl_rt::symbols::make_uninterned("MiXeD:A::B");
+    shadowing_import(&[symbol], target).unwrap();
+    assert_eq!(
+        find_symbol("MiXeD:A::B", target).unwrap().unwrap().0,
+        symbol
+    );
+    assert_eq!(package_shadowing_symbols(target), vec![symbol]);
+    assert!(
+        egcl_rt::symbols::symbol_package(symbol.as_symbol_index())
+            .unwrap()
+            .is_nil()
+    );
+}
+
+#[test]
+fn shadowing_import_accepts_a_symbol_removed_from_all_packages() {
+    let mut reg = fresh_registry();
+    let source = reg.make_package("SHADOW-SOURCE", &[], &[]).unwrap();
+    let target = reg.make_package("SHADOW-TARGET", &[], &[]).unwrap();
+    let (symbol, _) = intern("MiXeD", source).unwrap();
+    assert!(unintern(symbol, source).unwrap());
+    assert!(find_symbol("MiXeD", source).unwrap().is_none());
+    shadowing_import(&[symbol], target).unwrap();
+    assert_eq!(find_symbol("MiXeD", target).unwrap().unwrap().0, symbol);
+    assert_eq!(package_shadowing_symbols(target), vec![symbol]);
+}
+
+#[test]
 fn shadow_creates_if_absent() {
     let mut reg = fresh_registry();
     let pkg = reg.make_package("SH", &[], &[]).unwrap();
