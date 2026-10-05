@@ -352,7 +352,7 @@ work-stealing deque and scheduler state (§13.5).
 
 ## 9.6  Sequence Extensions
 
-**R9.13** Extensible sequences via `SB-SEQUENCE:DEFINE-SEQUENCE-CLASS`.
+**R9.13** An EGCL-owned extensible sequence interface is deferred to v2.
 
 **Status:** Out-of-scope for v1. **Rationale:** The SBCL extensible sequence
 protocol requires deep integration with every standard sequence function
@@ -360,9 +360,9 @@ protocol requires deep integration with every standard sequence function
 few Quicklisp libraries depend on it). The implementation cost is disproportionate
 to adoption benefit for v1. Will be revisited for v2 based on user demand.
 
-**R9.40** When user code calls `sb-sequence:define-sequence-class` in EGCL v1,
-the macro MUST signal a `EGCL-EXT:NOT-YET-IMPLEMENTED` error with a descriptive
-message referencing v2.
+**R9.40** EGCL v1 documentation MUST identify user-defined sequence classes
+as deferred, not advertise an implemented placeholder macro. EGCL MUST NOT
+create an `SB-SEQUENCE` package to expose this deferred interface.
 
 ---
 

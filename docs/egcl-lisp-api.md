@@ -35,7 +35,7 @@ below have been refreshed for the current implementation.
 | `EGCL-THREAD` | OS-backed native threads and synchronization objects | Native thread and mutex operations available; see the manual for the implemented subset | Use the EGCL public names |
 | `EGCL-THREADS` | Nickname for `EGCL-THREAD` | Available | Prefer the canonical name |
 | `EGCL-FIBER` | Lightweight M:N fibers and scheduler groups | Specified | Deliberately distinct from native threads |
-| `EGCL-MOP` | Metaobject protocol | Partial; the full inventory below is not an availability guarantee | Use the EGCL public names |
+| `EGCL-MOP` | Metaobject protocol | Specified public package; not installed by the bootstrap | Planned EGCL namespace |
 | `EGCL-CLTL2` | Compile-time environment inspection | Package available; see the manual for the implemented subset | Use the EGCL public names |
 | `EGCL-GRAY-STREAMS` | Gray stream classes and generic functions | Public classes and elemental protocol available; bulk protocol incomplete | Import from this package |
 | `EGCL-FFI` | Typed foreign calls and callbacks | Partial Rust runtime; Lisp package not yet installed | CFFI/SB-ALIEN migration surface |
@@ -681,9 +681,10 @@ compile-time environment.
 
 ## Metaobject protocol
 
-The full `EGCL-MOP` surface below is **Specified**; this inventory is not a
-claim that every operation is implemented. Use EGCL's own package rather
-than an alias in another implementation's package.
+The `EGCL-MOP` surface below is **Specified**. The bootstrap has CLOS
+internals but does not install this public package. When exposed, the public
+protocol belongs in EGCL's own package, not an alias in another
+implementation's package. This inventory is not an availability guarantee.
 
 ### Class introspection and metaclasses
 
@@ -1112,9 +1113,8 @@ would not be one.
 
 ## Deferred extensible sequences
 
-User-defined sequence classes are **Deferred** to v2. In v1 the specified
-macro signals `EGCL-EXT:NOT-YET-IMPLEMENTED` with a message identifying that
-deferral.
+User-defined sequence classes are **Deferred** to v2. No public class-definition
+macro or placeholder protocol is installed for this extension in v1.
 
 ## Configuration used by the extension APIs
 
