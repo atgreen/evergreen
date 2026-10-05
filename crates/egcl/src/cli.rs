@@ -12622,11 +12622,12 @@ fn find_symbol_in_package_cased(
     // table so one hop covers the visible set).
     // Case-exact lookups probe with the VERBATIM query: a symbol with an
     // escaped lowercase name (`:|f|`, a (:shadow "foo") entry) is keyed by
-    // that exact spelling in the keyword registry / package tables, so the
-    // upcased probe can never find it — and an upcased hit would be filtered
-    // out below anyway (bliss-961p).
+    // that exact spelling in the keyword registry / package tables, so an
+    // upcased probe would miss it or find a distinct symbol (bliss-961p).
     let probe: &str = if exact_case { bare_name } else { &bare_upper };
-    let found = present_symbol_with_status(root, keyword, probe).or_else(|| {
+    // The table/index lookup already matches the exact key. Re-parsing the
+    // returned symbol's name would mistake literal colons for package markers.
+    present_symbol_with_status(root, keyword, probe).or_else(|| {
         egcl_stdlib::package_use_list(root)
             .into_iter()
             .find_map(
@@ -12635,32 +12636,7 @@ fn find_symbol_in_package_cased(
                     _ => None,
                 },
             )
-    });
-    // FIND-SYMBOL is case-SENSITIVE (CLHS): the lookup folds to :upcase like the
-    // reader, but with `exact_case` the found symbol's NAME must equal the query
-    // VERBATIM — so (find-symbol "car") is NIL though CAR exists, while
-    // (find-symbol "CAR") finds it (bliss-961p). Every egcl symbol is interned
-    // upcased, so when the query is ALREADY all-uppercase the folded lookup that
-    // succeeded already matched the exact name — skip the (allocating) name
-    // re-derivation on that hot path (UIOP's ensure-package calls FIND-SYMBOL
-    // once per inherited symbol with uppercase names). Only a query carrying
-    // lowercase can spuriously match an upcased symbol and needs the filter.
-    if exact_case && !already_upper {
-        if let Some((sym, _)) = found {
-            // Compare CASE-PRESERVED bare names: `symbol_bare_name` upcases,
-            // which would wrongly reject a verbatim match on an escaped
-            // lowercase name (`:|f|`, "foo").
-            let raw = sym_name(sym);
-            let without_kw = raw.strip_prefix("KEYWORD:").unwrap_or(&raw);
-            let bare = egcl_rt::symbols::split_registry_key(without_kw)
-                .map(|(_, tail)| tail)
-                .unwrap_or(without_kw);
-            if bare != bare_name {
-                return None;
-            }
-        }
-    }
-    found
+    })
 }
 
 /// The symbol `bare_upper` names in `pkg` itself — present in its tables, or a

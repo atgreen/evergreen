@@ -178,3 +178,63 @@ fn shadowing_import_accepts_a_previously_uninterned_symbol() {
         "(T T :INTERNAL T NIL)",
     );
 }
+
+#[test]
+fn find_symbol_preserves_literal_colons_in_imported_names() {
+    check(
+        r#"(let ((target (make-package "COLON-TARGET" :use nil)))
+               (mapcar (lambda (name)
+                         (let ((symbol (make-symbol name)))
+                           (import symbol target)
+                           (list (eq symbol (find-symbol name target))
+                                 (nth-value 1 (find-symbol name target))
+                                 (null (find-symbol (string-upcase name) target)))))
+                       '("MiXeD:A::B" ":MiXeD" "KEYWORD:MiXeD" "λ:a")))"#,
+        "((T :INTERNAL T) (T :INTERNAL T) (T :INTERNAL T) (T :INTERNAL T))",
+    );
+}
+
+#[test]
+fn shadowing_imported_literal_name_is_findable() {
+    check(
+        r#"(let* ((target (make-package "COLON-TARGET" :use nil))
+                    (symbol (make-symbol "MiXeD:A::B")))
+               (shadowing-import symbol target)
+               (list (eq symbol (find-symbol "MiXeD:A::B" target))
+                     (nth-value 1 (find-symbol "MiXeD:A::B" target))
+                     (equal (package-shadowing-symbols target) (list symbol))
+                     (symbol-package symbol)))"#,
+        "(T :INTERNAL T NIL)",
+    );
+}
+
+#[test]
+fn literal_name_identity_survives_export_inheritance_reading_and_reexport() {
+    check(
+        r#"(let* ((source (make-package "COLON-SOURCE" :use nil))
+                    (target (make-package "COLON-TARGET" :use nil))
+                    (symbol (make-symbol "MiXeD:A::B")))
+               (import symbol source)
+               (export symbol source)
+               (use-package source target)
+               (list (eq symbol (find-symbol "MiXeD:A::B" target))
+                     (nth-value 1 (find-symbol "MiXeD:A::B" target))
+                     (eq symbol (read-from-string "COLON-SOURCE:|MiXeD:A::B|"))
+                     (let ((*package* target))
+                       (eq symbol (read-from-string "|MiXeD:A::B|")))
+                     (export symbol target)
+                     (nth-value 1 (find-symbol "MiXeD:A::B" target))))"#,
+        "(T :INHERITED T T T :EXTERNAL)",
+    );
+}
+
+#[test]
+fn find_symbol_preserves_literal_colons_in_keyword_names() {
+    check(
+        r#"(let ((symbol (read-from-string ":|MiXeD:A::B|")))
+               (list (eq symbol (find-symbol "MiXeD:A::B" :keyword))
+                     (nth-value 1 (find-symbol "MiXeD:A::B" :keyword))
+                     (null (find-symbol "mixed:a::b" :keyword))))"#,
+        "(T :EXTERNAL T)",
+    );
+}
