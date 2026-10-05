@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Reader symbol lookup now preserves escaped names and readtable case modes
+  even when an uppercase symbol with the same spelling already exists
+  ([#12](https://github.com/atgreen/evergreen/pull/12)).
+
 - Compiled direct recursion now preserves errors and nonlocal exits raised
   by its stack-limit fallback instead of continuing through native callers
   ([#11](https://github.com/atgreen/evergreen/pull/11)).
