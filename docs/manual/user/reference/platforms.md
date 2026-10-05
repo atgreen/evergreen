@@ -8,10 +8,10 @@ Tiers are defined in [How Lisp runs](../explanation/execution.md).
 | --- | --- | --- |
 | Linux x86-64 | T1 and T2, OSR and deoptimization | Static musl build or dynamic glibc RPM; host tests |
 | Linux s390x | T1 and T2, OSR and deoptimization | Fedora target RPM; QEMU JIT, image, and GC stress checks |
-| Linux AArch64 | T1 for supported opcode shapes; no AArch64 T2 backend | Fedora target RPM; baseline backend is under development |
+| Linux AArch64 | T1 and T2 for supported shapes, OSR and deoptimization | Fedora target RPM; QEMU JIT, image, and GC stress checks |
 | Linux ppc64le | T1 and T2 for supported shapes | Fedora target RPM; QEMU image and GC stress checks |
 | Windows x86-64 | T1 and T2 for supported shapes | Target RPM runs via Wine; native OS validation remains distinct |
-| Android ARM64 CLI | Static runtime; current source includes partial AArch64 T1 | `egcl-android`; QEMU image checks |
+| Android ARM64 CLI | T1 and T2 for supported shapes; AArch64 backend | `egcl-android`; QEMU image checks |
 | Android ARM64 APK | Dynamic NativeActivity runtime | EGL demo checked on an ARM64 phone |
 | Android x86-64 APK | Dynamic NativeActivity runtime | APK and native-library checks; emulator execution not yet verified |
 
@@ -21,6 +21,10 @@ Stackful fibers support Unix x86-64 and AArch64 (including Android), Linux
 ppc64le and s390x, and Windows x86-64. This is not full architecture parity.
 
 ## Fedora package commands
+
+Published release packages currently target Fedora 44 x86-64. The
+`egcl-target-*` packages below run on that host through QEMU or Wine; the
+runtime target list is not a list of available native-host RPM repositories.
 
 | Package | Command | Host execution |
 | --- | --- | --- |
