@@ -23396,14 +23396,18 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // startup. Other SBCL keyword options (:compression,
                 // :save-runtime-options, …) are accepted and ignored.
                 let (path_form, rest) = cp(cdr);
+                // The path and option values can allocate. Keep the unread
+                // option tail visible to the moving collector, and advance it
+                // before each value evaluation so traversal resumes from the
+                // relocated tail.
+                egcl_rt::rooted!(key = rest);
                 let path_val = eval_form(path_form, env)?;
                 let path = path_designator_to_string(path_val)?;
                 let mut executable = false;
                 let mut toplevel_set = false;
                 let mut application = false;
-                let mut key = rest;
                 while key.is_cons() {
-                    let (k, kr) = cp(key);
+                    let (k, kr) = cp(*key);
                     let kname = if k.is_symbol() {
                         sym_bare_name_rc(k).to_string()
                     } else {
@@ -23423,45 +23427,53 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         "EXECUTABLE" => {
                             if value_is_missing {
                                 executable = true;
-                                key = kr;
+                                *key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 executable = eval_form(vform, env)? != NIL;
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                         "APPLICATION" => {
                             if value_is_missing {
                                 application = true;
-                                key = kr;
+                                *key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 application = eval_form(vform, env)? != NIL;
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                         "TOPLEVEL" => {
                             if value_is_missing {
-                                key = kr; // malformed: no entry point given
+                                *key = kr; // malformed: no entry point given
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 if let Some(sym) = toplevel_symbol(vform, env)? {
                                     let idx = egcl_rt::symbols::intern(IMAGE_TOPLEVEL_VAR);
                                     egcl_rt::symbols::set_symbol_value(idx, sym);
                                     toplevel_set = true;
                                 }
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                         // Unknown option: evaluate its value for effect (unless the
                         // value is missing) and skip it.
                         _ => {
                             if value_is_missing {
-                                key = kr;
+                                *key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 eval_form(vform, env)?;
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                     }
@@ -23481,12 +23493,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // registries (via the HostRegistries hook). Restored by `--image`
                 // detecting the EGCLIMG magic and loading into a fresh runtime.
                 let (path_form, rest) = cp(cdr);
+                // Keep the unread option tail rooted across the allocating path
+                // and value evaluations, advancing it before each evaluation.
+                egcl_rt::rooted!(key = rest);
                 let path_val = eval_form(path_form, env)?;
                 let path = path_designator_to_string(path_val)?;
                 let mut executable = false;
-                let mut key = rest;
                 while key.is_cons() {
-                    let (k, kr) = cp(key);
+                    let (k, kr) = cp(*key);
                     let kname = if k.is_symbol() {
                         sym_bare_name_rc(k).to_string()
                     } else {
@@ -23500,20 +23514,24 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         "EXECUTABLE" => {
                             if value_is_missing {
                                 executable = true;
-                                key = kr;
+                                *key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 executable = eval_form(vform, env)? != NIL;
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                         _ => {
                             if value_is_missing {
-                                key = kr;
+                                *key = kr;
                             } else {
                                 let (vform, kr2) = cp(kr);
+                                *key = kr2;
+                                let cursor_before = key.to_raw();
                                 eval_form(vform, env)?;
-                                key = kr2;
+                                log_save_option_cursor_relocation(cursor_before, *key);
                             }
                         }
                     }
@@ -38139,6 +38157,16 @@ const IMAGE_TOPLEVEL_VAR: &str = "EGCL-INTERNAL::*IMAGE-TOPLEVEL*";
 const EXE_IMAGE_MAGIC: &[u8; 8] = b"EGCLEXE\0";
 // Application arguments bypass the runtime CLI before the heap is restored.
 const APP_IMAGE_MAGIC: &[u8; 8] = b"EGCLAPP\0";
+
+fn log_save_option_cursor_relocation(before: u64, after: EgclVal) {
+    if std::env::var_os("EGCL_SAVE_OPTION_CURSOR_LOG").is_some() {
+        eprintln!(
+            "[save-option-cursor] before={:#x} after={:#x}",
+            before,
+            after.to_raw()
+        );
+    }
+}
 
 /// The bytes of the currently running runtime binary. On Linux, read the magic
 /// `/proc/self/exe` symlink directly rather than resolving it to a path: the
