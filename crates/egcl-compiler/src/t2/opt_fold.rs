@@ -1,55 +1,78 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P4f — Constant folding + strength reduction (spec §4.5 R4.36).
+//! Constant folding and strength reduction over fixnum arithmetic.
 //!
-//! **Parcel P4f. Owner: (sub-agent).** Fold instructions with constant operands
-//! (`FixnumAdd(ConstFixnum a, ConstFixnum b)` → `ConstFixnum a+b`, comparisons,
-//! logic; respect fixnum overflow — a fold that would overflow becomes the
-//! generic/guarded form or is left alone), and strength-reduce known-expensive
-//! patterns (`FixnumMul` by a power of two → `FixnumShl`; `x*1`→`x`; `x+0`→`x`;
-//! division by constant; etc.). Update uses (instruction operands, block-call
-//! args, FrameState value sources) when replacing a value (spec §4.10 R4.60).
+//! # Purpose
 //!
-//! ## Approach
+//! [`ConstFold`] evaluates fixnum arithmetic, logic and comparison
+//! instructions whose operands are all constant, and rewrites the
+//! one-constant-operand shapes that have a cheaper form (`x*2^n` → `x<<n`,
+//! `x*-1` → `-x`, `x*0` → `0`) or no form at all (`x+0`, `x-0`, `x*1`, `x/1`,
+//! `x|0`, `x^0`, `x&-1` → `x`). It is the first pass of the production
+//! mid-end (fold, GVN, guard elimination, DCE).
 //!
-//! A single reverse-postorder scan visits every instruction in program order.
-//! Two disjoint rewrite mechanisms are used, chosen so that value *identity* is
-//! preserved wherever possible and use-rewriting is avoided:
+//! # Contract
 //!
-//! 1. **In-place opcode mutation.** When an instruction's result becomes a fresh
-//!    constant (full constant fold; a comparison collapsing to `T`/`NIL`;
-//!    `x*0`→`0`) or a cheaper single-instruction form (`FixnumMul` by `2^n` →
-//!    `FixnumShl`), the instruction is rewritten in place — its opcode/args/aux
-//!    change but its result `Value` stays the same. Every existing use therefore
-//!    continues to refer to the correct (now cheaper) definition with no
-//!    use-list scan at all.
+//! **Input:** a well-formed `Function`. Only the `Fixnum*`, `Log*` and
+//! `FixnumCmp*` opcodes are considered; generic (numeric-tower) and float
+//! arithmetic are never folded. An instruction flagged `effectful` or `call`
+//! is skipped. The `guard` flag on its own does not exclude an instruction,
+//! but note that speculated typed ops are flagged both `guard` and
+//! `effectful`, so sites produced by `speculate` are not folded here.
 //!
-//! 2. **Value substitution.** When a result should become an *existing* operand
-//!    value (`x*1`→`x`, `x+0`→`x`, `x-0`→`x`, `x/1`→`x`, `x|0`→`x`, `x&-1`→`x`,
-//!    `x^0`→`x`), there is no in-place form (the IR has no copy op), so the
-//!    result is entered into a replacement map. A final pass rewrites every use —
-//!    instruction `args`, terminator `BlockCall.args`, and every `FrameState`
-//!    `ValueSource::Value` (including remat-recipe inputs) — to the
-//!    representative, exactly as GVN does (spec §4.10 R4.60). The frozen IR has
-//!    no use-list, so this pass *is* the value→uses map.
+//! **Output:** rewritten instructions and rerouted uses; nothing is unlinked.
+//! Instructions that were value-substituted away, and constant operands no
+//! longer referenced, remain as dead definitions for DCE.
+//! `Analyses::invalidate` is called if anything changed.
 //!
-//! **Overflow (spec §4.5.9 / R4.36).** Fixnums are 61-bit signed
-//! (`[-2^60, 2^60-1]`). A fold whose result leaves that range is *not* performed
-//! — the instruction is left untouched for the generic/guarded path rather than
-//! silently wrapping. Division/remainder/mod by zero is likewise never folded
-//! (§4.5.9.2: an error form must be raised at runtime, not at compile time).
+//! # Algorithm
 //!
-//! **Overflow guards on reductions.** A `FixnumMul` may carry a deopt
-//! `frame_state` (overflow guard). `x*2^n` and `x<<n` share the *same* overflow
-//! condition, so the `FixnumShl` inherits the original flags and frame_state
-//! unchanged. Identity/`*0` reductions are exact (they cannot overflow), so any
-//! guard is safely dropped. A proven in-range constant fold likewise drops it.
+//! A single reverse-postorder scan in program order. A `consts` map
+//! (`Value → i64`) is seeded from existing `ConstFixnum` definitions and
+//! extended as folds produce new constants, so folds compose transitively in
+//! one scan. Two disjoint rewrite mechanisms are used:
 //!
-//! **Removed defs.** Instructions rewritten in place stay live (their result is
-//! still used); the constant operands they no longer reference, and any
-//! instruction whose result was value-substituted away, are left as dead defs
-//! for the DCE parcel to reap — this pass never unlinks instructions.
+//! 1. **In-place opcode mutation**, when the result becomes a fresh constant
+//!    (full fold; comparison collapsing to `T`/`NIL`; `x*0`) or a cheaper
+//!    single instruction (`FixnumShl`, `FixnumNeg`). The instruction's
+//!    opcode/args/aux change but its result `Value` is unchanged, so every
+//!    existing use stays correct with no use scan. `make_const_fixnum` also
+//!    refines the result type to the singleton range `[k, k]`;
+//!    `make_const_bool` fixes the representation to `Tagged`. The shift count
+//!    for `x*2^n` is materialised as a new `ConstFixnum` inserted immediately
+//!    before the instruction so it dominates its use.
+//! 2. **Value substitution**, when the result should become an existing
+//!    operand (`x+0` → `x` and friends). The IR has no copy instruction, so
+//!    the result is entered in a replacement map and a final pass rewrites
+//!    every instruction operand, terminator edge argument, and FrameState
+//!    value source (including remat-recipe inputs) to the representative. The
+//!    IR has no use lists; this scan is the value-to-uses map.
+//!
+//! # Overflow and errors
+//!
+//! Fixnums are 61-bit signed, `[-2^60, 2^60-1]`. Arithmetic is evaluated in
+//! `i128` and a result outside that range is **not** folded; the instruction
+//! is left for the generic or guarded path rather than wrapping. Division,
+//! remainder and modulus by a constant zero are never folded: the runtime
+//! must signal. `FixnumShl` folds only for shift counts in `0..63`,
+//! `FixnumShr` in `0..64`. `cl_mod` implements CL `MOD` (remainder with the
+//! divisor's sign) for the constant path.
+//!
+//! # Guards on reduced instructions
+//!
+//! A `FixnumMul` may carry an overflow guard (`frame_state`). `x*2^n` and
+//! `x<<n` have the same overflow condition, so the rewritten `FixnumShl`
+//! inherits flags and `frame_state` unchanged. Identity and `*0` reductions
+//! are exact, and a fold proven in range is exact, so in those cases the
+//! guard is vacuous and `make_const_fixnum` clears flags and `frame_state`.
+//!
+//! # Limits
+//!
+//! * No algebraic reassociation or folding through block parameters.
+//! * `0-x`, `x/-1`, and shifts by constants other than in `x*2^n` are not
+//!   reduced.
+//! * Only fixnum constants are tracked; a `ConstFloat` operand never folds.
 
 use std::collections::HashMap;
 
@@ -386,8 +409,7 @@ trait Pipe: Sized {
 }
 impl Pipe for i128 {}
 
-/// CL `mod`: remainder with the sign of the divisor (spec §4.5.8.1 uses this for
-/// `(mod x 2^n)`; we implement it generally for the constant-fold path).
+/// CL `mod`: remainder with the sign of the divisor, for the constant-fold path.
 fn cl_mod(x: i64, y: i64) -> i128 {
     let mut r = x as i128 % y as i128;
     if r != 0 && (r < 0) != ((y as i128) < 0) {

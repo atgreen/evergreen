@@ -1,100 +1,184 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P6 — Register allocation via regalloc2 (spec §4.7 R4.45, §4.10 R4.65).
+//! T2 register allocation: the `regalloc2` adapter and post-allocation
+//! stack-map construction.
 //!
-//! **Parcel P6. Owner: (sub-agent).** Adapt `MachFunc` (mach.rs, frozen) to the
-//! `regalloc2` crate: implement its `Function` trait over our MachInsts (two
-//! register classes: Gpr→Int, Xmm→Float), run the allocator, and write the
-//! results back: fill `MachFunc::allocation` (VReg → Location) and
-//! `MachFunc::stack_maps` (one per safepoint, with live GC refs and the resolved
-//! FrameState id — spec §4.10 A4.14/R4.65).
+//! # Purpose
 //!
-//! ## Mapping MachFunc → regalloc2
+//! Lowering (lower.rs) emits a [`MachFunc`] over virtual registers, one per SSA
+//! value. This module assigns every VReg a physical register or spill slot for
+//! each point in its live range, records the spill/reload/shuffle moves that
+//! assignment implies, and produces the per-safepoint GC stack maps that the
+//! deopt and transfer-site machinery key on. It is the only place T2 runs an
+//! allocator; every backend emitter consumes its output tables and never
+//! re-derives locations.
 //!
-//! The allocation environment and call-clobber set are selected together by
-//! the backend entry point. [`allocate`] and [`allocate_framed`] use x86's
-//! abstract register numbering; [`allocate_framed_s390x`] uses System Z hardware
-//! numbers. The CFG, operand liveness, spill edits, and stack-map pipeline are
-//! shared across both targets.
+//! The allocator itself is `regalloc2` (Ion algorithm: backtracking with
+//! live-range splitting and spill-slot coalescing). T2 needs an SSA allocator
+//! with live-range splitting, two register classes, fixed-register constraints
+//! for the ABI and the c2i convention, and a location for every deopt-live
+//! value at every safepoint; regalloc2 provides all of that, so we adopted it
+//! rather than write a linear-scan allocator. What this file owns is the adapter:
+//! expressing a `MachFunc` through regalloc2's `Function` trait, choosing the
+//! `MachineEnv` per target, and translating the `Output` back into
+//! `MachFunc` fields.
 //!
-//! * **Register classes.** Our [`RegClass::Gpr`] maps to `regalloc2::RegClass::Int`
-//!   (tagged values / unboxed integers / pointers) and [`RegClass::Xmm`] to
-//!   `Float` (unboxed floats). The `Vector` class is unused.
-//! * **VRegs.** A `MachFunc` VReg is `(class, num)`; regalloc2 vregs live in a
-//!   single 0-based, dense index space. We **intern** every distinct VReg we see
-//!   into a dense id (in first-encounter order) and keep the reverse map for
-//!   write-back, so two VRegs that happen to share `num` across classes never
-//!   collide.
-//! * **Operands.** Each `MachInst`'s `defs` become register-constrained
-//!   late-defs (`Operand::reg_def`) and its `uses` become register-constrained
-//!   early-uses (`Operand::reg_use`), which is the ordinary machine-instruction
-//!   model. We emit defs first, then uses, and rely on that order to line the
-//!   result `Allocation`s back up (`Output::inst_allocs` is operand-parallel).
+//! # Contract
 //!
-//! ## Block CFG (P6b) — the real multi-block model
+//! **Input:** `mf.insts` (defs / uses / `deopt_uses` per instruction, each a
+//! `VReg` of class Gpr or Xmm), `mf.blocks` (the machine CFG with block params
+//! and edge args), and the per-instruction `safepoint` / `frame_state` marks.
+//! Lowering guarantees SSA form (one def per VReg, block params at merges) and
+//! no critical edges.
 //!
-//! `MachFunc` now carries a machine-block CFG in `mf.blocks` (mach.rs): a
-//! `Vec<MachBlock>` where `blocks[0]` is the entry, each block is an
-//! `[start, end)` half-open range into `mf.insts`, and edges are `MachSucc`
-//! records (target block + the VReg args bound to that target's params). We map
-//! it onto regalloc2's `Function` CFG directly:
+//! **Output**, written in place:
 //!
-//! * **`num_blocks` / `block_insns`.** One regalloc2 block per `MachBlock`;
-//!   `block_insns(b)` is `[MachBlock.start, MachBlock.end)`.
-//! * **`block_params`.** `MachBlock.params` (VRegs) become regalloc2 block
-//!   params — its SSA-φ replacement. A value that arrives on an incoming edge is
-//!   *defined* by being a block param, so it is live-in **by construction**, not
-//!   a use-before-def. This is what makes branching and looping code (back-edges
-//!   into a loop-header block param) allocate correctly.
-//! * **`block_succs` / `block_preds`.** Successors come from `MachSucc.target`;
-//!   predecessors are the inverted edge set, computed once at build time.
-//! * **`branch_blockparams`.** The outgoing edge args (`MachSucc.args`) for the
-//!   `succ_idx`-th successor, interned to regalloc2 vregs. Their count matches
-//!   the successor's `block_params` count (φ operand parallelism).
-//! * **`is_branch` / `is_ret`.** The terminator of each block is its last
-//!   instruction (`end - 1`). A block **with** successors ends in a branch; a
-//!   block **without** successors ends in a return.
+//! * `inst_allocations[i]` — a `Location` per operand of instruction `i`, in
+//!   the order defs, uses, deopt_uses. This is what emitters index.
+//! * `allocation_edits` — regalloc2's inserted moves (spill, reload, split
+//!   resolution, edge reconciliation), each tagged with the instruction and
+//!   `Before`/`After` position. Emitters must materialise these; the operand
+//!   table alone is incomplete for any split value.
+//! * `value_locations` — per-VReg `[start, end)` location ranges in regalloc2's
+//!   program-point encoding, obtained via its debug-label facility. The framed
+//!   emitters use these to decide which values keep a single home
+//!   (`select_frame_homes`, x64_frame.rs) and to resolve deopt metadata.
+//! * `num_spill_slots` — slots the prologue must reserve.
+//! * `allocation` — one `(VReg, Location)` per VReg, preferring the def site.
+//!   A summary for diagnostics and tests only; it is wrong for split values.
+//! * `stack_maps` — one per `safepoint` instruction; see below.
 //!
-//! ### Critical edges
+//! Failure is a `RegAllocError`, which aborts the T2 compile and leaves the
+//! function at its current tier. Nothing partial is installed.
 //!
-//! regalloc2 rejects unsplit critical edges (a block with >1 successor feeding a
-//! block with >1 predecessor) with `RegAllocError::CritEdge`. This adapter
-//! **asserts none remain**: splitting is the lowering (P5) contract, and a
-//! debug build `debug_assert!`s if a critical edge is detected before we run
-//! (regalloc2 independently rejects any that slip past in release). A plain
-//! diamond (entry→{L,R}→merge) has no critical edges, so it allocates directly.
-//! Relatedly, when a successor has multiple predecessors the branch feeding it
-//! must carry *no* register operands of its own (only blockparam args); our
-//! terminators are pure branches, satisfying regalloc2's `DisallowedBranchArg`
-//! rule.
+//! # Pipeline
 //!
-//! ### Empty-blocks fallback (older flat lowering)
+//! 1. **Target environment.** Each backend entry point ([`allocate`],
+//!    [`allocate_framed`], [`allocate_framed_a64`], [`allocate_framed_ppc64le`],
+//!    [`allocate_framed_s390x`]) builds a `MachineEnv` (allocatable set per
+//!    class plus one reserved edit-scratch per class) and a call-clobber
+//!    `PRegSet`. x86 uses abstract encodings that emit.rs maps to hardware
+//!    registers; the other targets use architectural numbers directly. The
+//!    rationale for each pool (ABI reservations, emitter temporaries, the x86
+//!    reduced-pool-first retry) is on the respective function.
+//! 2. **Adapter construction** (`Adapter::build`): intern VRegs densely, build
+//!    operand lists, CFG tables, terminator flags, and per-instruction clobber
+//!    sets. The adapter owns its tables so the `MachFunc` is not borrowed
+//!    during the run.
+//! 3. **Pre-check for impossible demand.** If one instruction requires more
+//!    `Reg`-constrained operands of a class in one phase than the pool holds,
+//!    return `TooManyLiveRegs` ourselves. regalloc2 0.15.2 underflows
+//!    `ProgPoint::prev` while diagnosing this at instruction zero; reporting
+//!    it first lets `allocate_framed` retry with its full pool normally.
+//! 4. **Run** `regalloc2::run` with `Algorithm::Ion` and `validate_ssa: false`
+//!    (lowering already guarantees SSA; the validator rejects some
+//!    hand-built test functions).
+//! 5. **Write-back** of the tables above, converting `Allocation` to
+//!    [`Location`] (`PReg` hw_enc → `PhysReg`, `SpillSlot` index → `StackSlot`).
+//! 6. **Stack maps**, computed from the output rather than by regalloc2.
 //!
-//! If `mf.blocks` is **empty** (a lowering that has not yet block-structured its
-//! output), we fall back to the original single-basic-block model: one block
-//! spanning all of `mf.insts`, no params/succs/preds, and the last instruction
-//! reported as the return. Straight-line SSA input allocates exactly as before,
-//! so nothing regresses.
+//! # Mapping MachFunc → regalloc2
 //!
-//! ## Stack maps (documented contract gap)
+//! * **Register classes.** [`RegClass::Gpr`] → `Int` (tagged values, unboxed
+//!   integers, pointers); [`RegClass::Xmm`] → `Float` (unboxed floats).
+//!   `Vector` is unused.
+//! * **VRegs.** `MachFunc` VRegs are `(class, num)` and may share `num` across
+//!   classes; regalloc2 wants one dense 0-based index space. Every distinct
+//!   VReg is interned in first-encounter order and the reverse map is kept
+//!   for write-back.
+//! * **Operands.** `defs` → `Operand::reg_def` (late, register-constrained);
+//!   `uses` → `Operand::reg_use` (early, register-constrained). Defs are
+//!   emitted before uses so `Output::inst_allocs`, which is operand-parallel,
+//!   lines up with `inst_allocations`.
+//! * **`Any`-constrained operands.** Three cases relax `Reg` to `Any` so the
+//!   allocator may leave the value in a spill slot: the uses of `INVOKE`, and
+//!   of `CALL` on targets with `stack_call_operands`, because those emitters
+//!   copy arguments from their homes into a scanned slice one at a time and a
+//!   simultaneous register requirement would make any call wider than the
+//!   bank unallocatable; the multiple defs of `CALL_RUNTIME` on those same
+//!   targets, for the symmetric reason; and every `deopt_uses` entry.
+//! * **`deopt_uses` as liveness extension** (bliss-ad1e). A deoptimising
+//!   instruction's `FrameState` names values the interpreter frame is rebuilt
+//!   from; some have no ordinary use after their def and would otherwise be
+//!   dead at the guard. Each is added as an `Any` use at the `Late` position:
+//!   late so it survives the instruction's own writes (in-place result reuse
+//!   followed by a deopting `jo` must still find the original), `Any` so it
+//!   adds no register pressure. This is how "every FrameState value has a
+//!   Location at its deopt point" is enforced by construction rather than
+//!   checked after.
+//! * **Clobbers.** `CALL`, `INVOKE`, `CALL_RUNTIME`, `ALLOC`, `TAILCALL`,
+//!   `THROW`, and `NLX_TRANSFER` report the target's caller-saved set via
+//!   `inst_clobbers`, so values live across them land in callee-saved
+//!   registers or are spilled around the call.
 //!
-//! regalloc2 **0.15.2 has no public safepoint / reftype support** — the trait
-//! methods that once let the allocator track GC references across safepoints
-//! (`requires_refs_for_safepoint`, `reftype_vregs`, `is_safepoint`) exist only
-//! inside its private `fuzzing` module in this version, not on the public
-//! `Function` trait. So we compute stack maps **ourselves** after allocation:
-//! for each `MachInst` with `safepoint == true`, we emit a [`StackMap`] whose
-//! `live_refs` are the resolved [`Location`]s of that instruction's **Gpr-class
-//! uses** (tagged references live into the safepoint live in GPRs) and whose
-//! `frame_state` is the instruction's `FrameStateId`. `code_offset` is set to
-//! the instruction index as a placeholder — real native code offsets are only
-//! known after machine-code emission (a later parcel), which would revisit these
-//! maps. A precise implementation additionally wants per-VReg reftype flags on
-//! `MachInst` and cross-instruction liveness (a value can be a live reference at
-//! a safepoint without being an operand of the safepoint instruction); the
-//! single-block operand-based approximation here covers the values named at the
-//! safepoint itself.
+//! ## Block CFG
+//!
+//! `mf.blocks` is a `Vec<MachBlock>`: `blocks[0]` is the entry, each block is
+//! an `[start, end)` range into `mf.insts`, and edges are `MachSucc` records
+//! (target + the VReg args bound to that target's params). The mapping is
+//! direct:
+//!
+//! * `block_insns(b)` = `[start, end)`.
+//! * `block_params` = `MachBlock.params`, regalloc2's φ replacement. An edge
+//!   value is *defined* by being a block param, so it is live-in by
+//!   construction; this is what makes loop back-edges into header params
+//!   allocate correctly.
+//! * `block_succs` from `MachSucc.target`; `block_preds` is the inverted edge
+//!   set, computed once.
+//! * `branch_blockparams(b, _, succ_idx)` = the interned `MachSucc.args` of
+//!   that successor; their count matches the successor's param count.
+//! * The terminator is `end - 1`: `is_branch` if the block has successors,
+//!   `is_ret` otherwise.
+//!
+//! regalloc2 rejects unsplit critical edges (`CritEdge`) because it has
+//! nowhere to place the reconciling moves; splitting them is lowering's
+//! contract and nothing here re-checks it. A branch into a multi-predecessor
+//! block must also carry no register operands of its own (`DisallowedBranchArg`);
+//! our terminators are pure branches, with edge args travelling only via
+//! `MachSucc.args`.
+//!
+//! If `mf.blocks` is empty (hand-built straight-line functions, several unit
+//! tests), the adapter treats all of `mf.insts` as one block with the last
+//! instruction as the return.
+//!
+//! # Stack maps
+//!
+//! regalloc2 0.15.2 exposes no safepoint or reftype support on the public
+//! `Function` trait (`requires_refs_for_safepoint`, `reftype_vregs`,
+//! `is_safepoint` exist only in its private `fuzzing` module), so the maps are
+//! built after allocation: for each instruction with `safepoint == true`, a
+//! [`StackMap`] whose `live_refs` are the `Location`s of that instruction's
+//! Gpr-class uses (ordinary and `deopt_uses` alike) and whose `frame_state` is
+//! the instruction's `FrameStateId`. `code_offset` carries the **instruction
+//! index**, not a byte offset; transfer_map.rs and deopt.rs match maps to
+//! instructions by that index, and native offsets only exist after emission.
+//!
+//! Two known approximations:
+//!
+//! * Only operands of the safepoint instruction itself are recorded; a value
+//!   live across the safepoint but not named by it is absent.
+//! * There are no per-VReg reftype flags on `MachInst`, so every Gpr-class
+//!   use is reported, unboxed integers included.
+//!
+//! Both are acceptable because no backend hands `live_refs` to the collector.
+//! All framed emitters take the boundary-synchronisation route instead: before
+//! each runtime call the exact live tagged set is synchronised into shadow
+//! slots on the `EgclStack` activation, which the GC scans, and reloaded
+//! afterwards. The maps here serve as the deopt anchor (deopt.rs lowers each
+//! `FrameState` by walking them) and as a cross-check (transfer_map.rs refuses
+//! a transfer site whose FrameState roots are not all in `live_refs`). A
+//! backend that wants to publish register roots directly needs reftype flags
+//! and cross-instruction liveness here first.
+//!
+//! # Debugging
+//!
+//! * `EGCL_RA_DBG=1` — on allocation failure, dump every instruction (op,
+//!   defs, uses, deopt uses, frame state, safepoint) and every block to
+//!   stderr alongside the `RegAllocError`.
+//! * `EGCL_T2_FRAME_ENV=full|reduced` — pin the x86 framed allocator to one
+//!   pool instead of reduced-first with a full-pool retry on
+//!   `TooManyLiveRegs` (see [`allocate_framed`]).
 
 use std::collections::HashMap;
 
@@ -489,12 +573,11 @@ impl Ra2Function for Adapter {
     }
 }
 
-/// Allocate registers for `mf` in place (spec §4.7 R4.45).
+/// Allocate registers for `mf` in place using the abstract x86 register pool.
 ///
 /// Fills `mf.allocation` with a `VReg → Location` binding for every virtual
-/// register and pushes one [`StackMap`] per safepoint instruction (spec §4.7
-/// R4.46, §4.10 R4.65). See the module docs for the single-block and
-/// stack-map limitations.
+/// register and pushes one [`StackMap`] per safepoint instruction. See the
+/// module docs for the empty-blocks fallback and the stack-map limitations.
 pub fn allocate(mf: &mut MachFunc) -> Result<(), RegAllocError> {
     allocate_with_env(mf, machine_env(), x86_call_clobbers())
 }

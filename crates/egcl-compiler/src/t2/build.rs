@@ -1,31 +1,108 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P1 — Bytecode → block-based SSA builder (spec §4.3.5).
+//! Bytecode → block-based SSA builder.
 //!
-//! **Parcel P1.** `build_from_bytecode` abstractly interprets a
-//! `BytecodeFunction`, producing SSA directly in block-parameter form via the
-//! Braun et al. algorithm ("Simple and Efficient Construction of SSA Form").
+//! # Purpose
 //!
-//! Two kinds of interpreter state become SSA `Value`s:
+//! [`build_from_bytecode`] abstractly interprets a `BytecodeFunction` and
+//! produces an [`ir::Function`](crate::t2::ir::Function) directly in SSA form
+//! using Braun et al.'s on-the-fly construction: no dominance frontiers and no
+//! φ placement pass. φs are block parameters created on demand by `read_var`
+//! and completed when the block is sealed, which happens once every
+//! predecessor edge has been recorded. The builder also attaches the deopt
+//! metadata nothing downstream can reconstruct, namely a `FrameState` at every
+//! deoptimising site and an OSR entry state at every empty-stack loop header,
+//! expands intrinsics, inlines saved callee bodies, and in transfer mode builds
+//! the exceptional control-flow edges native non-local transfer needs.
 //!
-//! - **Operand-stack slots** — the stack machine's push/pop are modelled as a
-//!   compile-time `Vec<Value>` per block. A block's live incoming stack entries
-//!   become its leading parameters (materialised lazily via `read_var`).
-//! - **Local slots** — `LoadLocal`/`StoreLocal` read/write the current SSA
-//!   definition of a lexical slot through `read_var`/`write_var`.
+//! # Contract
 //!
-//! Basic-block leaders are bytecode index 0, every branch/`Go` target, and the
-//! fall-through index after every conditional branch. Loops are built with an
-//! **unsealed** header: `read_var` in an unsealed block creates an *incomplete
-//! phi* (a header parameter); when the last predecessor (the back-edge) is
-//! processed the header is **sealed**, filling each phi's operand on every
-//! predecessor edge. `Call`s carry a `FrameState` snapshot of the abstract
-//! interpreter state at their `bcp` (spec §4.10).
+//! **Input:** a `BytecodeFunction`: stack-machine code, constants, local-slot
+//! and parameter layout, and the control-scope tables (`control_scope.rs`
+//! derives the ordered scope map from it).
 //!
-//! Unmodelled opcodes (handlers, restarts, closures, multiple values, non-local
-//! exits) return `Err(BuildError::Unsupported(..))`; the caller keeps such a
-//! function at T1 (spec R4.28). Correctness over coverage.
+//! **Output:** a `Function` that verify.rs accepts, or a [`BuildError`]:
+//! `Unsupported(&str)` for a shape the builder does not model,
+//! `UnsupportedInstr(name)` naming the exact `Instr` discriminant so a silent
+//! tier loss is diagnosable without a disassembly, and `InvalidScopes` from
+//! control-scope analysis. The caller keeps such a function at T1. Coverage is
+//! grown by adding cases; nothing is approximated.
+//!
+//! **Entry points.** [`build_from_bytecode`] uses the default inlining
+//! options; [`build_from_bytecode_with_inline_options`] takes per-site
+//! INLINE/NOTINLINE policy, saved callee bodies, and hotness;
+//! [`build_from_bytecode_for_transfers`] additionally converts every remaining
+//! `Call` into an `Invoke` whose exceptional edge lands on an `NlxTransfer`
+//! cold block carrying the pre-call control scopes;
+//! [`build_from_bytecode_for_native_cleanups`] also admits cleanup, catch, and
+//! handler predecessors before sealing. The last two are not installable yet;
+//! the emitters decline their IR until native landing support is complete.
+//!
+//! # Algorithm (`Builder::run`)
+//!
+//! 1. An empty body becomes a function returning NIL.
+//! 2. `find_leaders`: bcp 0, every branch and `Go` target, the fall-through
+//!    after every conditional branch, and in transfer modes the scope
+//!    transition points, cleanup and catch resume points, and handler clause
+//!    bodies.
+//! 3. `compute_depths`: the operand-stack depth on entry to each leader; it
+//!    must agree on every incoming edge.
+//! 4. `create_blocks`, `compute_reachable`, `compute_total_preds`: one `Block`
+//!    per leader, reachability from the entry, and the structural
+//!    predecessor-edge count of each block, counting edges out of reachable
+//!    blocks only. That count is what drives sealing.
+//! 5. `seed_entry`: entry-block parameters for the positional parameters (for
+//!    a variadic function, the pre-collected &optional/&rest/&key slots the
+//!    shared binding path fills before the body runs, bliss-32l), with
+//!    declared parameter types recorded as checked entry params. The
+//!    function-entry `FrameState` (bcp 0, empty stack) is built by hand:
+//!    non-parameter locals are `Unbound` because at bcp 0 they are
+//!    uninitialised, and `read_var` would otherwise conjure definitions that
+//!    appear later. If bcp 0 is itself a branch target, the entry gets a
+//!    one-shot block jumping to the bytecode header so the header's φs can
+//!    merge initial values with loop-carried ones.
+//! 6. `process_blocks` / `interpret_block`: blocks in leader order. An
+//!    unreachable block is sealed and given a `Trap` terminator. Otherwise the
+//!    incoming operand stack is materialised through `read_var(Var::Stack(k))`
+//!    and each instruction is interpreted: constants, locals via
+//!    `read_var`/`write_var`, arithmetic and comparisons to typed or generic
+//!    opcodes, calls to `Call` with a `FrameState` from `build_frame_state`
+//!    (every local and stack entry as a `Tagged` value source at that bcp),
+//!    BLOCK/RETURN-FROM as a branch to the recorded resume point after
+//!    resetting the stack (bliss-8tlo), and intrinsics via `expand_intrinsic`
+//!    (CAR/CDR become a `Guard(CONS)` plus a load, sharing one proof identity
+//!    so guard elimination can reuse either for the other; an unsupported
+//!    shape keeps the ordinary call). `finish_block` and `record_edges` set
+//!    the terminator and count the edge on each successor; a successor whose
+//!    last edge has arrived is sealed, filling every incomplete φ's operand
+//!    on every predecessor edge.
+//! 7. `capture_osr_entries`: every backward branch target with an empty
+//!    operand stack gets an `OsrEntry` whose `FrameState` covers the locals.
+//!    The empty-stack condition belongs to the target, not the jumping
+//!    instruction, so plain `Br`/`BrIfFalse` back-edges (DO, DOTIMES, DOLIST)
+//!    qualify, not only tagbody `Go` (bliss-izt.4).
+//! 8. `simplify_trivial_phis`: Braun's trivial-φ removal iterated to a
+//!    fixpoint, rewriting uses and frame states.
+//!
+//! `build_with_saved_bodies` then walks every `Call` with a saved body and
+//! decides inlining per site using `inlining.rs`: policy, arity match, depth
+//! limit, recursion (the active-symbol set), body cost against the remaining
+//! node budget, and the small-threshold/hotness rule. An accepted callee is
+//! built recursively and spliced in with `Function::inline_call`, with the
+//! caller's scopes advanced past the call (bcp + 1, arguments popped) so a
+//! deopt inside the callee reconstructs both activations.
+//!
+//! # Design notes
+//!
+//! * Both local slots and operand-stack positions are Braun variables
+//!   (`Var::Local`, `Var::Stack`). Treating the stack this way is what lets a
+//!   block's live incoming stack entries become its leading parameters with
+//!   no separate stack-model pass.
+//! * Every `FrameState` records `Tagged` sources. Representation changes are
+//!   the optimiser's job; the builder records the interpreter's view.
+//! * Loops rely on sealing: a header is read while unsealed, so its reads
+//!   create incomplete φs that the back-edge later completes.
 
 use crate::control_scope::{is_never_returning_call, ScopeError, ScopeKind, ScopeMap};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -42,7 +119,7 @@ use crate::t2::ir::{
 use egcl_rt::bytecode::{typep_class, BytecodeFunction, DeclaredType, Instr, VarLoc};
 
 /// Why the builder could not produce IR for a function (e.g. an opcode not yet
-/// modelled). The caller keeps such a function at T1 (spec R4.28).
+/// modelled). The caller keeps such a function at T1.
 #[derive(Clone, Debug)]
 pub enum BuildError {
     InvalidScopes(ScopeError),
@@ -73,7 +150,7 @@ enum Var {
     Stack(u16),
 }
 
-/// Build a block-based SSA `Function` from `bf` (spec §4.3.5, R4.19).
+/// Build a block-based SSA `Function` from `bf`.
 pub fn build_from_bytecode(bf: &BytecodeFunction) -> Result<Function, BuildError> {
     build_from_bytecode_with_inline_options(bf, InlineOptions::default())
 }
@@ -2014,7 +2091,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    // ── Braun SSA construction primitives (spec §4.3.5.1) ───────────
+    // ── Braun SSA construction primitives ───────────
 
     fn write_var(&mut self, var: Var, block: Block, v: Value) {
         self.current_def.insert((var, block), v);
@@ -2074,7 +2151,7 @@ impl<'a> Builder<'a> {
         self.sealed[block.index()] = true;
     }
 
-    // ── Trivial-phi elimination (Braun `tryRemoveTrivialPhi`, spec §4.3.5.1) ──
+    // ── Trivial-phi elimination (Braun `tryRemoveTrivialPhi`) ──
 
     /// Collapse trivial block parameters as a fixpoint post-pass. A parameter
     /// whose incoming arguments (across every predecessor edge) are all either

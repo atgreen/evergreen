@@ -1,10 +1,51 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Owned saved words for a transfer whose physical frame is still available.
-//! Reserve storage before native entry, capture without collecting, then root
-//! saved tagged words while rebuilding logical frames. Physical save recipes,
-//! retained code definitions and the unwind dispatcher are separate contracts.
+//! Execution-owned snapshot of a throwing call's live values, taken while its
+//! physical frame still exists and rooted while logical frames are rebuilt.
+//!
+//! # Place in the transfer pipeline
+//!
+//! transfer_map.rs decides, per `Invoke`, which locations hold the values a
+//! transfer needs and which of those are tagged roots. transfer_sites.rs binds
+//! that map to an emitted return PC and physical access recipes. This file is
+//! the storage those two hand off to at run time: a [`TransferSnapshot`] is
+//! allocated from a [`TransferCaptureMap`] *before* native entry, filled by a
+//! non-allocating `capture` after the helper has exited through the veneer,
+//! and then used both to `reconstruct` interpreter-visible frames and to
+//! `write_back` updated words to the native homes. It does not know physical
+//! save recipes, retained code definitions, or the unwind dispatcher.
+//!
+//! # Contract
+//!
+//! `new` reserves one `SavedLocation` per distinct location named by the
+//! map's slot descriptors, recursing into remat recipe inputs. A location
+//! named with `Rebox::None` is a tagged word and is stored in a `Cell<EgclVal>`
+//! that `trace_host_roots` visits; any other rebox is a raw word the collector
+//! must not see. The map is cross-checked both ways at construction: every
+//! tagged location must appear in `map.roots` (`MissingRoot`), every root must
+//! correspond to a tagged location (`UnexpectedRoot`), one location may not be
+//! both tagged and raw (`ConflictingLocation`), and a `MaterializeConst` naming
+//! a movable heap object is refused (`MovingConstant`) because its bits cannot
+//! be baked into the snapshot.
+//!
+//! `capture` copies each word through a caller-supplied reader with no
+//! allocation, no GC and no yield, and marks the snapshot captured. After that
+//! the buffer must be rooted (`rooted_ref!`) across any allocating work.
+//! `reconstruct` roots the snapshot internally and runs `deopt::reconstruct`
+//! over a `MachineState` that reads from the saved words, producing
+//! [`ReconstructedFrame`]s whose PCs are unwind origins, never instructions to
+//! re-execute; the caller roots the result before its next allocation.
+//! `write_back` copies every saved word back in its native representation,
+//! so a relocated tagged reference reaches its home but an unboxed float slot
+//! never receives a reboxed Lisp value. Any use before capture is
+//! `NotCaptured`.
+//!
+//! # Limits
+//!
+//! The snapshot is per execution and must not be shared between active
+//! invocations. Output-allocation failure during reconstruction is not yet
+//! handled here; the emergency OOM path belongs to preparation.
 
 use crate::t2::deopt::{
     self, LoweredDeopt, MachineState, Rebox, ReconstructedFrame, SlotDescriptor,

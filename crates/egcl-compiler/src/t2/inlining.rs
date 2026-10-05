@@ -1,13 +1,74 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! T2 call-site inlining policy and compiler-known function metadata.
+//! Call-site inlining policy and compiler-known function metadata.
 //!
-//! This is deliberately separate from the SSA builder.  The builder asks this
-//! module what a function *is* and whether a particular call site may expand;
-//! it does not grow a second list of magic CL names.  `IntrinsicId` is the
-//! leaf expansion representation; saved bytecode bodies are built to SSA and
-//! cloned as CFGs through the same legality, depth, and growth policy.
+//! # Purpose
+//!
+//! This module decides, for one call site, whether the SSA builder may expand
+//! the callee inline, and what it knows about the callee. It is deliberately
+//! separate from the builder: the builder asks this module what a function
+//! *is* and whether a site may expand, and does not keep its own list of
+//! magic CL names. Two expansion kinds share one policy:
+//!
+//! * **Intrinsics.** A fixed table ([`InlineMetadata`] entries in `KNOWN`)
+//!   of functions with a hand-written IR template, identified by
+//!   [`IntrinsicId`]: `EQ`, `NULL`, `CAR`, `CDR`, `SYMBOLP`, `INTEGERP`,
+//!   `TYPEP` with a constant type specifier, `STRINGP`, and
+//!   `UIOP/UTILITY:FIRST-CHAR`. The builder owns the templates.
+//! * **Saved bytecode bodies.** A callee whose bytecode was registered with
+//!   [`InlineOptions::with_body`] can be built to SSA and cloned as a CFG at
+//!   the call site. `body_cost` decides eligibility and estimates growth.
+//!
+//! # Contract
+//!
+//! * [`metadata_for_symbol`] resolves an interned symbol to its `KNOWN` entry.
+//!   An unqualified name denotes an inherited `COMMON-LISP` symbol; explicit
+//!   `CL:`/`COMMON-LISP:` qualification is accepted; a non-CL helper must
+//!   match its owning package exactly. A same-spelling symbol in another
+//!   package is a normal call.
+//! * [`InlineOptions`] carries per-compilation state: lexical
+//!   `INLINE`/`NOTINLINE` declarations keyed by bytecode call-site PC
+//!   ([`InlinePolicy`]), registered bodies, per-site [`CallSiteProfile`]
+//!   counters, and the root symbol of the function being compiled (for
+//!   recursion detection and the outermost deopt scope). The production
+//!   driver populates bodies and profiles from the tiering runtime.
+//! * [`InlineConfig`] holds the limits: `small_threshold` (30 estimated IR
+//!   nodes, always profitable), `max_depth` (6), `node_budget` (500 nodes of
+//!   post-inline growth per compilation), and `hot_frequency_percent` (80:
+//!   calls per 100 caller invocations needed to count a site as hot).
+//! * [`decide`] returns [`InlineDecision`]: `Expand(IntrinsicId)` or
+//!   `Decline(DeclineReason)`.
+//!
+//! # Decision order
+//!
+//! Hard constraints are checked before preference, so an explicit `INLINE`
+//! never overrides them: `NOTINLINE`; wrong arity; an impure, allocating, or
+//! possibly-signalling expansion ([`EffectSummary`] describes the expansion,
+//! not a generic call to the surface function); depth at the limit; cost
+//! above the remaining budget. A site that survives expands when its cost is
+//! at or below `small_threshold`, or the site is hot, or `INLINE` was
+//! declared; otherwise it is declined as not profitable.
+//!
+//! # Body eligibility (`body_cost`)
+//!
+//! Body inlining starts with the safe subset. A body is cloned only if it has
+//! fixed positional arity, no captured environment, and no declared parameter
+//! types (cloning would bypass the callee-entry validator), and its bytecode
+//! uses only constants, local loads/stores, stack ops, branches, returns, and
+//! calls that resolve either to a pure/total/non-allocating intrinsic with
+//! matching arity (`TYPEP` excluded) or to another eligible registered body.
+//! Cost is the instruction count plus callee costs. An `active` set turns
+//! direct and mutual recursion into `DeclineReason::Recursive`.
+//!
+//! # Limits
+//!
+//! * The 500-node budget is the current post-inline cap; a larger budget
+//!   needs a separate decision before arbitrary body cloning lands.
+//! * Lexical declaration policies are not yet populated from source lowering;
+//!   the map exists so tests and clients can exercise the exact contract.
+//! * No interprocedural effect analysis: a body that calls anything outside
+//!   the allow-list is declined wholesale.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -205,9 +266,9 @@ pub enum InlinePolicy {
     NotInline,
 }
 
-/// Profitability limits.  Depth follows spec 04-05.  The 500-node budget is
-/// the current T2 post-inline cap from spec 04-04; the larger 04-05 value needs
-/// a separate spec reconciliation before arbitrary body cloning lands.
+/// Profitability limits. The 500-node budget is the current T2 post-inline
+/// cap; a larger budget needs a separate decision before arbitrary body
+/// cloning lands.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InlineConfig {
     pub small_threshold: u32,
@@ -295,7 +356,7 @@ impl InlineOptions {
     }
 
     /// Make a saved bytecode body available to the body inliner.  Merely being
-    /// registered is not enough: [`body_cost`] still applies the conservative
+    /// registered is not enough: `body_cost` still applies the conservative
     /// fixed-arity/purity/effect filter before the body may be cloned.
     pub fn with_body(mut self, symbol: u32, body: Arc<BytecodeFunction>) -> Self {
         self.bodies.insert(symbol, body);

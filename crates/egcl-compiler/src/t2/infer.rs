@@ -1,29 +1,96 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! P3 — Type / range / representation inference (spec §4.5 R4.31, §4.10 §4.5).
+//! Type, integer-range and representation inference over the T2 SSA IR.
 //!
-//! **Parcel P3.** A sparse-conditional (SCCP-family) *forward* propagation over
-//! the block-based SSA. For every `Value` it infers a narrowed [`IRType`] (tag
-//! bits + an integer [`Range`]) and a provable/profitable [`ValueRepresentation`].
+//! # Purpose
 //!
-//! The lattice (spec D4.08) is `IRType` ordered by `meet` (intersection of tag
-//! bits, intersection of integer ranges). Facts start at `⊥` and grow by `join`
-//! up an ascending chain to a fixpoint over reverse-postorder; a widening step
-//! guarantees termination on loops whose bound is not a compile-time constant.
+//! [`infer`] is a forward, flow-sensitive dataflow analysis in the sparse
+//! conditional constant propagation family. For every reachable `Value` it
+//! computes a narrowed [`IRType`] (tag bits, an optional integer [`Range`],
+//! an optional class id) and from that a [`ValueRepresentation`] saying
+//! whether the value can be carried unboxed. Results go in an
+//! [`InferenceResult`] side table; the IR is never mutated.
 //!
-//! Flow sensitivity comes from two sources, both keyed to the dominator tree:
-//!   * `TypeCheck`/`Guard` — the checked value is narrowed to the met type on
-//!     the dominated region (spec R4.63: speculative facts are discharged by a
-//!     guard, so inference may assume the narrowed type downstream).
-//!   * `Brif` on a comparison — on an edge whose target is entered *only* through
-//!     that edge, the compared operands are range-narrowed (`i < n` ⇒ the body
-//!     sees `i ∈ [lo, n-1]`), which is what lets a counted loop's index be proved
-//!     `FIXNUM[0, n]` so its overflow guard can later be dropped (spec §4.10 T2-c).
+//! Consumers call `infer` directly: guard elimination uses it to delete
+//! guards whose check is already implied, and the x86 framed emitter uses it
+//! to drop values proven to be non-pointer immediates from safepoint root
+//! synchronisation. [`TypeInference`] exists so the analysis can sit in a
+//! `PassManager` pipeline, but as a pass it only logs a summary under
+//! `EGCL_IR_DUMP`; `Analyses` has no slot for inference results.
 //!
-//! Results live in [`InferenceResult`], a side table owned by the pass: `IRType`
-//! is immutable on `ValueData` (the frozen `ir` contract exposes no setter), so
-//! inferred facts are kept in maps rather than written back onto the arena.
+//! # Lattice
+//!
+//! Facts are `IRType`s. `⊥` (`IRType::BOTTOM`) means "not yet reached";
+//! `⊤` means "any value". `ty_join` moves up (union of tag bits, hull of
+//! ranges, class id kept only if equal; `⊥` is the identity) and is used at
+//! block parameters, where a fact must hold on every incoming edge, and when
+//! accumulating a result across iterations. `ty_meet` moves down
+//! (intersection of bits and ranges, class id from either side) and is used
+//! for guard and branch narrowing, where both facts hold. `ty_widen` saturates
+//! a bound that is still growing to `i64::MIN`/`i64::MAX` so loops with
+//! non-constant trip counts terminate.
+//!
+//! # Algorithm
+//!
+//! 1. Seed the parameters of predecessor-less blocks (the entry; an OSR entry
+//!    region) from their declared types.
+//! 2. Iterate up to `MAX_PASSES` times over reverse postorder; widening is
+//!    switched on after `WIDEN_AFTER` passes. Each pass:
+//!    1. Recompute the refinement tables against current facts.
+//!       `edge_refine[T]` holds facts true on entry to block `T` because the
+//!       only edge into `T` is a `Brif` on a fixnum comparison (`narrow_cmp`
+//!       derives bounds for both operands from the relation and the branch
+//!       taken; `!=` yields nothing). `check_refine[B]` holds the narrowings
+//!       of every `TypeCheck`/`Guard` with a `TypeTag` in block `B`.
+//!    2. For each block: join its parameters over predecessor edge
+//!       arguments; build a local environment by walking the dominator chain
+//!       and meeting in every edge refinement on the chain (including the
+//!       block's own) and every check refinement of a **strict** dominator;
+//!       then evaluate instructions in program order with `eval`, joining
+//!       each result into the global fact and inserting it into the local
+//!       environment. A `TypeCheck`/`Guard` met in program order narrows its
+//!       operand for the rest of the block.
+//!    3. Stop early when no fact changed.
+//! 3. Derive representations: a fact confined to fixnum, single-float or
+//!    double-float bits becomes the corresponding unboxed representation,
+//!    anything else `Tagged`.
+//!
+//! `eval` returns `⊥` whenever any operand is `⊥`, so an unreached operand
+//! never widens a result prematurely. Constants seed singleton ranges;
+//! fixnum add/sub/mul/neg propagate ranges with saturating arithmetic; other
+//! fixnum ops yield the full fixnum range; float ops propagate float tags;
+//! generic arithmetic applies numeric contagion and adds `BIGNUM` whenever
+//! `FIXNUM` is possible; comparisons yield `SYMBOL|NULL`; `TypeCheck`/`Guard`
+//! results are the operand met with the tag; everything else is `⊤`.
+//!
+//! # Rationale
+//!
+//! Flow sensitivity is scoped by dominance rather than by per-edge
+//! environments: a refinement attached to a block is valid throughout the
+//! region that block dominates, which is cheap to compute and exactly what a
+//! counted loop needs (`i < n` on the sole entry to the body proves
+//! `i ∈ [lo, n-1]`, letting the index's overflow guard be eliminated later).
+//! Edge refinements are only recorded when the target's sole predecessor is
+//! the branching block, which keeps them sound without edge splitting.
+//! Results are a side table so the analysis is non-destructive and any
+//! consumer can rerun it on whatever IR it currently holds.
+//!
+//! # Limits
+//!
+//! * Each value gets one fact from its definition onward; a guard narrows the
+//!   operand only in the dominated region's local environment, not globally.
+//!   Speculation reifies guards as fresh SSA values for that reason.
+//! * Range tracking covers add, sub, mul and neg only.
+//! * Class ids are propagated but never derived here.
+//! * Fixed iteration budget (`WIDEN_AFTER` = 400, then 8 widened passes);
+//!   a function that has not converged by then keeps its last facts, which
+//!   are still sound over-approximations.
+//!
+//! # Debugging
+//!
+//! * `EGCL_IR_DUMP` (any value) makes the `TypeInference` pass print the
+//!   number of values with a non-`⊥` fact to stderr.
 
 use std::collections::HashMap;
 

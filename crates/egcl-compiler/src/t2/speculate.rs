@@ -1,19 +1,99 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! T2 speculative type lowering — profile-guided, single-type (spec §4.5, §4.10).
+//! Profile-guided, single-type speculative lowering of generic arithmetic.
 //!
-//! Given static operand proofs (declarations/inference) or the operand-type
-//! profile gathered by the interpreter, rewrite a generic arithmetic `Call`
-//! into a typed op — `FixnumMul` for fixnums, `FloatMul` for single-floats, and
-//! so on. Static proof takes precedence over profile. The typed op is
-//! **guard-flagged** and keeps the `Call`'s
-//! `FrameState`, so a wrong-type operand (or a fixnum overflow) deopts to the
-//! interpreter at the site's `bcp`. Crucially it emits **one** path — no fallback
-//! for the other type. A site that is polymorphic or cold (profile `None`) is
-//! left as the generic `Call`. If the speculation proves wrong at runtime it
-//! deopts, the profiler observes the new type, and a later recompile commits to
-//! *that* type instead — never both at once.
+//! # Purpose
+//!
+//! [`speculate`] rewrites generic `Call`s to arithmetic, comparison and
+//! bitwise functions into guarded typed IR ops, committing each site to
+//! exactly **one** operand type: the type the SSA already proves, or else the
+//! type the interpreter's profile observed there. The typed op keeps the
+//! call's `FrameState`, so a wrong-type operand or a fixnum overflow deopts to
+//! the interpreter at the site's `bcp`. There is no fallback path for the
+//! other type. A polymorphic site is left generic; a mis-speculated site
+//! deopts, the profiler observes the new type, and a later recompile commits
+//! to that one instead.
+//!
+//! This is not a `Pass`. The production driver calls it on the freshly built
+//! SSA, before the mid-end (fold, GVN, guard elimination, DCE), and treats a
+//! zero count as fine: the mid-end still improves unspeculated code.
+//!
+//! # Contract
+//!
+//! **Input:** a `Function` straight from the builder; `profile(bcp)` returns
+//! the one [`SpecType`] to speculate at a call site, or `None` to leave it
+//! generic. The site's `bcp` is read from the innermost scope of the call's
+//! `FrameState`, where the builder anchors it; a call without a FrameState is
+//! never speculated (except the profile-free `NOT`/`NULL` rewrite).
+//!
+//! **Output:** the number of sites rewritten. Rewritten instructions keep
+//! their `Inst` and result `Value`s, so no use rewriting is needed; results
+//! are type-refined via `Function::refine_type`. Additional `Guard`
+//! instructions and constants may be inserted (below).
+//!
+//! # Site selection
+//!
+//! The callee symbol decides the family; `statically_proven_spec_type`
+//! (operand SSA types, with fixnum-into-single-float contagion) takes
+//! precedence over the profile:
+//!
+//! * `+ - *` with two arguments → `Fixnum{Add,Sub,Mul}` / `Float{Add,Sub,Mul}`;
+//!   unary `-` → `FixnumNeg` (fixnum only); other arities stay generic.
+//! * `1+` / `1-` (fixnum) → binary op with a materialised `ConstFixnum 1`.
+//! * `< > <= >= =` → typed compare. Fixnum has all five; single-float has
+//!   only `Lt` and `Eq` encoders, so the rest stay generic.
+//! * `LOGAND LOGIOR LOGXOR LOGNOT` (fixnum) → `Log*`; exact on the tagged
+//!   representation, so no overflow and no untag/retag.
+//! * `MOD` by a constant positive power of two (fixnum) → `LogAnd` with the
+//!   divisor operand **replaced** by the mask. Only this shape: the floored
+//!   remainder of a positive power-of-two divisor is the low bits, sign
+//!   included; `REM` is not routed here, and a general `FixnumMod` would be
+//!   declined by every emitter and cost the function its T2 code.
+//! * `ASH` with two arguments (fixnum) → `FixnumShl`; the emitter checks the
+//!   constant shift amount and handles right shifts.
+//! * `NOT` / `NULL` → pure `GenericEq(x, NIL)`, no profile, no guard, no
+//!   safepoint; correct for every argument type.
+//!
+//! # Mutation
+//!
+//! Each selected call is rewritten in place: opcode replaced, any extra
+//! constant operand materialised as a const instruction immediately before
+//! the site, flags set to `guard + effectful` (a deopt point, ordered; no
+//! longer a call or safepoint) with `aux` and `frame_state` retained. The
+//! `GenericEq` rewrite instead clears flags and `frame_state` entirely.
+//!
+//! Three guard-materialisation steps then run (bliss-x5y.25). Inference
+//! assigns each SSA value one fact from its definition onward, so a raw
+//! parameter stays `⊤` everywhere even though the emitter checks it before a
+//! typed op; these steps reify the discharged proof as an explicit `Guard`
+//! value and rewrite the uses it dominates, so the original dies at the guard
+//! and what stays live across later safepoints is provably immediate. The
+//! emitter's root filter then drops it from GC shadow synchronisation, and a
+//! function whose roots all vanish unlocks the direct self-call fast path.
+//!
+//! 1. `materialize_entry_param_preguards`: a parameter used by at least one
+//!    speculated fixnum site, and otherwise only neutrally (self-call
+//!    argument, return, branch, edge argument, guard, `(eq x nil)`), is
+//!    guarded as a fixnum at function entry using the builder's entry
+//!    FrameState. Any other use would make a non-fixnum argument legitimate
+//!    and the pre-guard a deopt storm.
+//! 2. `materialize_self_call_result_guards`: when every return value is
+//!    provably a fixnum or another self-call result, each self-call's result
+//!    is guarded as a fixnum at the next FrameState-carrying instruction.
+//! 3. `materialize_fixnum_operand_guards`: each speculated fixnum site's
+//!    variable operands get a `Guard` reusing the site's FrameState. The
+//!    site's own FrameState is not rewritten: at a deopt of the guard or the
+//!    site, the guard's result does not exist yet.
+//!
+//! # Limits
+//!
+//! * Two speculation types, fixnum and single-float; no double-float, no
+//!   bignum fallback.
+//! * Variadic arithmetic (`(+ a b c)`) and unary `+`/`*` stay generic.
+//! * `FloatNeg` and float `Gt`/`Le`/`Ge` have no opcode or encoder yet.
+//! * Constant operands are recognised from `ConstFixnum` definitions only;
+//!   this runs before folding, so `(mod x (* 2 4))` is not a mask.
 
 use crate::t2::frame_state::FrameStateId;
 use crate::t2::ir::{AuxData, Function, IRType, Inst, InstFlags, Opcode, TypeBits, Value};

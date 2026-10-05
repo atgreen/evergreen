@@ -1,10 +1,74 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Bind final frame maps to exact emitted return PCs. These tables do not own
-//! executable memory or bytecode definitions: the installed-code owner must
-//! retain both, check architecture/ABI compatibility, and publish complete site
-//! coverage before execution. No nearest-PC or function-name lookup is allowed.
+//! Transfer-site tables: capture maps bound to exact emitted return PCs, with
+//! checked physical recipes and the native landing pads each site may enter.
+//!
+//! # Place in the transfer pipeline
+//!
+//! transfer_map.rs produces location-keyed maps per `Invoke`; the x86 framed
+//! emitter turns each into a [`SysvTransferSite`] once it knows the byte
+//! offset immediately after the CALL, the frame's slot count, any temporary
+//! stack adjustment live at that CALL, and which native roots it synchronised
+//! into activation shadow slots. This file validates those sites into a
+//! [`SysvTransferTable`], binds the emitter's cleanup, catch and handler
+//! landing pads to them, and serves the run-time side: exact-PC lookup,
+//! same-frame landing packets, and rooted per-site snapshots. The runtime's
+//! native_transfer_entry module is the consumer. The table owns neither
+//! executable memory nor bytecode definitions; the installed-code owner must
+//! retain both, check architecture and ABI compatibility, and publish complete
+//! site coverage before execution. There is no nearest-PC or function-name
+//! lookup anywhere here.
+//!
+//! # Construction (`SysvTransferTable::new`)
+//!
+//! For each site: the return offset must be inside the code; the map must
+//! carry exactly one logical frame whose `resume_pc` is the origin and whose
+//! slot and bitmap counts agree (inline composition is not supported, so an
+//! uncomposed frame is refused rather than accepted silently); the stack
+//! adjustment must be 8-byte aligned; a [`TransferSnapshot`] must be
+//! constructible from the map, which performs the root/descriptor
+//! cross-checks; each shadow root must be a map root, within the activation,
+//! and unique in both location and slot. Every snapshot location is then given
+//! a `CaptureRecipe`: a [`SysvCaptureLocation`] for its native home (a
+//! callee-saved GPR or a frame slot, built via `x64_frame::ValueHome`), plus
+//! the shadow slot if one was synchronised. Sites are sorted by return offset
+//! and duplicates rejected. Construction may allocate; it runs before the
+//! first native entry.
+//!
+//! # Landing pads
+//!
+//! `with_cleanup_landings`, `with_catch_landings` and `with_handler_landings`
+//! bind compiler-verified cold edges to the exact bytes being installed. A
+//! landing is accepted only if its site exists, the code length matches, the
+//! entry begins with `ENDBR64`, the stack adjustment is 16-byte aligned, the
+//! named scope is `Ownership::Local` with the expected kind and identity
+//! (`cleanup_bcp`, `push_bcp`/`resume_bcp`, or `push_bcp`/`table_index` with a
+//! real clause), no inner scope is inherited or an `Unwind`, and the site has
+//! no prior binding for that destination. Failure consumes the table so a
+//! partially bound set can never be published. A cleanup landing is a
+//! source-specific edge that performs the phi moves into the cleanup, not the
+//! cleanup body itself. Sites without a landing keep the explicit bytecode
+//! fallback. Nothing is inferred from the bytes; the emitter supplies edges
+//! the IR verifier already checked.
+//!
+//! # Run time
+//!
+//! `lookup(code_base, return_pc)` is integer arithmetic plus a binary search.
+//! `CheckedSysvSite::native_*_landing` build a [`SysvNativeLanding`] packet
+//! (`caller_sp + call_stack_adjust`, `code_base + entry_offset`) after checking
+//! the capture's return PC, alignment and `Transfer` exit, without
+//! dereferencing memory; they cannot prove that the frame is still live in the
+//! current segment or that the cursor is rooted, which remain the caller's
+//! obligations. `reserve_snapshot` borrows the checked site into a
+//! [`SysvSiteSnapshot`] before native entry, so a later redefinition cannot
+//! pair the snapshot with another site's recipes. `capture_from_activation`
+//! reads each root from its activation shadow slot when one exists and other
+//! words through the native recipe: a helper that collected has updated the
+//! shadows but not yet restored native homes, so reading a root's native home
+//! here could resurrect a stale pointer. `write_back` returns updated words
+//! through the native recipes. Both are `unsafe`: the frame must be live and
+//! no GC or yield may intervene during the raw copies.
 
 use crate::t2::deopt::ReconstructedFrame;
 use crate::t2::mach::{Location, RegClass};

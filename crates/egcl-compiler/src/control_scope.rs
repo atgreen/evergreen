@@ -1,14 +1,73 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Ordered bytecode control scopes, shared by native-transfer compiler tiers.
+//! Static control-scope analysis of bytecode: at every instruction, the
+//! ordered stack of dynamic scopes (bindings, environments, BLOCK/TAGBODY/
+//! CATCH targets, handler and restart clusters, UNWIND-PROTECT cleanups) that
+//! is logically active there.
 //!
-//! This describes logical handler ownership, not native landing addresses. A
-//! scope inherited at OSR entry still belongs to the interpreter activation;
-//! seeing its POP or a lexical exit does not authorize erasing runtime state.
-//! Logical scopes include running cleanup continuations, not only installed
-//! handlers. Full-function analysis reads handler/restart side tables; the
-//! instruction-only API refuses those scopes. Unknown state never becomes empty.
+//! # Purpose
+//!
+//! Native code that throws, or that is unwound through, must know which
+//! runtime records the exit crosses so it can retire each one, run cleanups
+//! in order, and restore bindings at their defined points. This module
+//! computes that knowledge once from bytecode and shares it between the T2
+//! builder (which attaches scopes to every exceptional edge via
+//! `AuxData::TransferSite`), the IR verifier, transfer-map lowering,
+//! transfer-site landing validation, and `native_unwind::next_unwind_step`.
+//! It describes logical ownership of scopes, not native landing addresses, and
+//! it never guesses: a state it cannot prove is an error, never an empty
+//! scope list.
+//!
+//! # Model
+//!
+//! A [`ControlScope`] records the establishing `push_bcp`, an [`Ownership`],
+//! the operand-stack height to restore, and a [`ScopeKind`]. Ownership is
+//! `Local` for scopes pushed inside the analysed region and `Inherited` for
+//! those already active at an OSR entry: an inherited scope belongs to the
+//! interpreter activation, so seeing its POP or a lexical exit in native code
+//! does not authorise erasing runtime state. UNWIND-PROTECT has three kinds:
+//! `Unwind` (handler installed), `PendingCleanup` (popped on the normal path,
+//! awaiting `EnterCleanupNormal`, still owning the record), and `Cleanup`
+//! (the cleanup body executing with a saved normal value or pending transfer,
+//! which an exit crossing it supersedes). `HandlerBind` has no unwind target:
+//! SIGNAL may return with handlers and restarts still live, so callback
+//! invocation is modelled by the eventual exceptional call edges, not as
+//! clause entry.
+//!
+//! # Algorithm (`ScopeMap::from_entry`)
+//!
+//! A worklist dataflow over bytecode positions with the scope stack as the
+//! state. The state before each reachable instruction is recorded in
+//! `before`; a join whose incoming stacks differ is `InconsistentJoin`, and
+//! duplicate BLOCK/TAGBODY identities are rejected up front. Pushes extend the
+//! stack; pops must match the top (`WrongPop`, `EmptyPop`), except that
+//! `UnbindSpecial`/`PopEnvChild` may retire the matching record beneath
+//! interleaved bindings and environments (LET* interleaves the two runtime
+//! stacks) but never across a handler or cleanup boundary. Each push with a
+//! cold destination (BLOCK and CATCH resume points, HANDLER-CASE clause
+//! bodies, RESTART-CASE resumes, UNWIND-PROTECT cleanup entry) seeds that
+//! destination with the appropriate outer stack, since an escaping call may
+//! select it even when no local exit is visible. `ReturnFrom` and `Go` record
+//! a [`ScopeExit`] (ultimate target, stack height, removed scopes innermost
+//! first; GO retains its TAGBODY) and continue at the target with the stack
+//! truncated. `EnterCleanupNormal`/`CleanupReturn` track each cleanup's normal
+//! resume set in `normal_resumes`, revisiting returns when a new resume is
+//! discovered. `Return`, `Throw`, named exits and a `CallNamed` of `ERROR`
+//! end fall-through.
+//!
+//! `analyze` runs over raw instructions and refuses scopes that need the
+//! function's handler/restart side tables (`MissingScopeTables`);
+//! `analyze_function` reads them. `analyze_osr*` first analyse the normal
+//! entry, then re-run from the OSR entry seeded with the normal-entry state
+//! marked `Inherited`, re-seeding the inherited scopes' cold destinations and
+//! carrying the normal resume sets, so a cleanup already running at entry can
+//! still return to a destination registered before it.
+//!
+//! # Output
+//!
+//! `before(bcp)`, `exit_at(bcp)`, and `cleanup_resumes(cleanup_bcp)`. An
+//! unwind continuation is chosen dynamically and is never in a resume list.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use egcl_rt::bytecode::{BytecodeFunction, Instr};
