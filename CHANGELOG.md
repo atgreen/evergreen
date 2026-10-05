@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Debugging and observability
+
+- Interactive debugger backtraces now preserve the failing Lisp call chain and
+  available original arguments after activations unwind. Historical frames are
+  labeled explicitly, and frame evaluation and locals are reported unavailable
+  instead of being applied to unrelated live frames.
+
 ## 0.0.1 - 2026-10-04
 
 This release establishes the first versioned baseline of Evergreen Common Lisp
