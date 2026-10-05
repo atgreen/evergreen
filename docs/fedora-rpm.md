@@ -239,7 +239,17 @@ collector validates package identity without a hardcoded Fedora version. An
 existing release is never overwritten; a failed upload can leave a draft for
 inspection before retrying.
 
-Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`, build provenance,
+Release notes come from the matching `## VERSION - YYYY-MM-DD` section in
+`CHANGELOG.md` (for example, `## 0.0.2 - 2026-10-06` for tag `v0.0.2`; the date
+is optional). Before tagging, move the intended `Unreleased` entries under that
+version heading and leave a fresh `## Unreleased` section for future changes.
+Planning fails before builds start if the version section is missing, duplicated,
+or empty. Test prereleases and build-only runs select `Unreleased` instead; an
+empty section produces an explicit “No unreleased changes recorded” note.
+The full changelog remains a downloadable asset, but is not the release body.
+
+Published assets include all ten binary RPMs, the shared SRPM, `CHANGELOG.md`,
+the selected `RELEASE_NOTES.md`, build provenance,
 release metadata, the `RPM-GPG-KEY-egcl` public key, a CycloneDX SBOM, and
 `SHA256SUMS` with its detached signature `SHA256SUMS.asc`.
 Publication runs only after package identity, payload, and runtime checks pass.

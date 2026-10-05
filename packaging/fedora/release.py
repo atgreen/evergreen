@@ -142,7 +142,42 @@ def merge_provenance(records, srpm_sha256):
     return merged
 
 
+def release_notes(changelog, plan):
+    """Select one level-two changelog section, ignoring headings in fenced examples."""
+    wanted = 'Unreleased' if plan['prerelease'] else plan['version']
+    lines = changelog.splitlines(keepends=True)
+    headings = []
+    fence = None
+    for index, line in enumerate(lines):
+        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
+        if fence:
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                    and not marker[2].strip()):
+                fence = None
+            continue
+        if marker:
+            fence = marker[1]
+            continue
+        if heading := re.fullmatch(r'##[ \t]+(.+?)\s*', line):
+            headings.append((index, heading[1]))
+    matches = []
+    for offset, (start, title) in enumerate(headings):
+        if re.fullmatch(re.escape(wanted) + r'(?: - \d{4}-\d{2}-\d{2})?', title):
+            end = headings[offset + 1][0] if offset + 1 < len(headings) else len(lines)
+            matches.append((lines[start].rstrip(), ''.join(lines[start + 1:end]).strip()))
+    if len(matches) != 1:
+        raise ValueError(f'CHANGELOG.md must contain exactly one ## {wanted} section '
+                         f'(found {len(matches)})')
+    heading, body = matches[0]
+    if not body:
+        if not plan['prerelease']:
+            raise ValueError(f'CHANGELOG.md section {wanted} must not be empty')
+        body = 'No unreleased changes recorded.'
+    return f'{heading}\n\n{body}\n'
+
+
 def collect(rpm_dirs, destination, plan, source_rpm, provenance_dir, sbom=None):
+    notes = release_notes((ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'), plan)
     with source_rpm.open('rb') as stream:
         source_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     # Merge first: the builders' agreed %dist is what package identity is
@@ -175,6 +210,7 @@ def collect(rpm_dirs, destination, plan, source_rpm, provenance_dir, sbom=None):
         shutil.copy2(rpm, destination / rpm.name)
     shutil.copy2(source_rpm, destination / source_rpm.name)
     shutil.copy2(ROOT / 'CHANGELOG.md', destination / 'CHANGELOG.md')
+    (destination / 'RELEASE_NOTES.md').write_text(notes, encoding='utf-8')
     shutil.copy2(PUBLIC_KEY, destination / PUBLIC_KEY.name)
     if sbom:
         shutil.copy2(sbom, destination / sbom.name)
@@ -297,6 +333,7 @@ def main():
         plan = make_plan(version, os.environ['GITHUB_EVENT_NAME'], os.environ['GITHUB_REF'],
                          os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'],
                          os.environ.get('RELEASE_MODE', ''))
+        release_notes((ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'), plan)
         args.plan.parent.mkdir(parents=True, exist_ok=True)
         args.plan.write_text(json.dumps(plan, indent=2) + '\n')
         if output := os.environ.get('GITHUB_OUTPUT'):

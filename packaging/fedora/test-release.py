@@ -17,6 +17,75 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 
 
+class ReleaseNotesTests(unittest.TestCase):
+    changelog = ('# Changelog\n\n## Unreleased\n\n- Future change.\n\n'
+                 '## 0.0.2 - 2026-10-06\n\n### Fixed\n\n'
+                 '- This release ([#24](https://github.com/atgreen/evergreen/pull/24)).\n\n'
+                 '## 0.0.1 - 2026-10-04\n\n- Old release.\n')
+    stable = {'version': '0.0.2', 'prerelease': False}
+
+    def test_stable_notes_include_only_exact_version_section(self):
+        notes = release.release_notes(self.changelog, self.stable)
+        self.assertEqual(notes, '## 0.0.2 - 2026-10-06\n\n### Fixed\n\n'
+                         '- This release ([#24](https://github.com/atgreen/evergreen/pull/24)).\n')
+        self.assertIn('[#24](https://github.com/atgreen/evergreen/pull/24)', notes)
+        self.assertNotIn('Future change', notes)
+        self.assertNotIn('Old release', notes)
+
+    def test_version_matching_is_exact_and_missing_notes_fail(self):
+        for text in ('## Unreleased\n\n- Pending.\n',
+                     '## 0.0.20 - 2026-10-06\n\n- Wrong version.\n'):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, '0.0.2'):
+                release.release_notes(text, self.stable)
+
+    def test_empty_and_duplicate_stable_sections_fail(self):
+        for text in ('## 0.0.2\n\n## 0.0.1\n\n- Old.\n',
+                     '## 0.0.2\n\n- One.\n\n## 0.0.2 - 2026-10-06\n\n- Two.\n'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                release.release_notes(text, self.stable)
+
+    def test_test_and_build_plans_use_only_unreleased(self):
+        for mode in ('test', 'build'):
+            plan = release.make_plan('0.0.1', 'workflow_dispatch',
+                                     'refs/heads/main', '123', '1', mode)
+            self.assertEqual(release.release_notes(self.changelog, plan),
+                             '## Unreleased\n\n- Future change.\n')
+            self.assertEqual(release.release_notes('## Unreleased\n', plan),
+                             '## Unreleased\n\nNo unreleased changes recorded.\n')
+            with self.assertRaisesRegex(ValueError, 'Unreleased'):
+                release.release_notes('## 0.0.1\n- Old.\n', plan)
+
+    def test_fenced_examples_do_not_start_or_end_sections(self):
+        for fence in ('```', '~~~~'):
+            body = f'- Example:\n\n{fence}markdown\n## 0.0.1\n## 0.0.2\n{fence}\n'
+            text = f'## 0.0.2\n\n{body}\n## 0.0.1\n\n- Old.\n'
+            self.assertEqual(release.release_notes(text, self.stable),
+                             f'## 0.0.2\n\n{body}')
+
+    def test_plan_rejects_missing_notes_before_writing_outputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            version = release.RPM_RELEASE[0]
+            (root / 'Cargo.toml').write_text(f'[workspace.package]\nversion = "{version}"\n')
+            (root / 'CHANGELOG.md').write_text('## Unreleased\n\n- Pending.\n')
+            plan = root / 'plan.json'
+            output = root / 'github-output'
+            environment = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': f'refs/tags/v{version}',
+                           'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '1',
+                           'GITHUB_OUTPUT': str(output)}
+            with patch.object(release, 'ROOT', root), patch.dict('os.environ', environment), \
+                    patch('sys.argv', ['release.py', 'plan', '--plan', str(plan)]):
+                with self.assertRaisesRegex(ValueError, version):
+                    release.main()
+            self.assertFalse(plan.exists())
+            self.assertFalse(output.exists())
+
+    def test_workflow_publishes_selected_notes_not_entire_changelog(self):
+        workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
+        self.assertIn('--notes-file RELEASE_NOTES.md', workflow)
+        self.assertNotIn('--notes-file CHANGELOG.md', workflow)
+
+
 def complete_records(version='0.0.1', rpm_release='0.test.123.1', dist='.fc44'):
     """Every published package: exactly what a release must carry."""
     return [(name, version, f'{rpm_release}{dist}', arch)
@@ -133,7 +202,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rpms = write_rpm_tree(root)
-            (root / 'CHANGELOG.md').write_text('Release notes\n')
+            changelog = '## Unreleased\n\n- Pending.\n\n## 0.0.1\n\n- Old.\n'
+            (root / 'CHANGELOG.md').write_text(changelog)
             provenance = root / 'metadata/all.json'
             provenance.parent.mkdir(parents=True)
             source_rpm = root / 'egcl.src.rpm'
@@ -151,10 +221,13 @@ class ReleaseTests(unittest.TestCase):
                 destination = root / 'assets'
                 release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 self.assertEqual(json.loads((destination / 'release.json').read_text()), plan)
+                self.assertEqual((destination / 'CHANGELOG.md').read_text(), changelog)
+                self.assertEqual((destination / 'RELEASE_NOTES.md').read_text(),
+                                 '## Unreleased\n\n- Pending.\n')
                 entries = (destination / 'SHA256SUMS').read_text().splitlines()
-                # Every binary RPM, the SRPM, CHANGELOG, the public key,
+                # Every binary RPM, the SRPM, CHANGELOG, release notes, the public key,
                 # build.json and release.json.
-                self.assertEqual(len(entries), release.PACKAGE_COUNT + 5)
+                self.assertEqual(len(entries), release.PACKAGE_COUNT + 6)
                 self.assertIn(release.PUBLIC_KEY.name,
                               [entry.split('  ')[1] for entry in entries])
                 for entry in entries:
@@ -173,7 +246,7 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rpms = write_rpm_tree(root)
-            (root / 'CHANGELOG.md').write_text('notes\n')
+            (root / 'CHANGELOG.md').write_text('## Unreleased\n\n- Notes.\n')
             source_rpm = root / 'egcl.src.rpm'
             source_rpm.write_bytes(b'source archive')
             sbom = root / 'egcl-sbom.cdx.json'
@@ -197,7 +270,7 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(manifest[sbom.name],
                              hashlib.sha256(sbom.read_bytes()).hexdigest())
             # As the no-SBOM case, plus the SBOM itself.
-            self.assertEqual(len(manifest), release.PACKAGE_COUNT + 6)
+            self.assertEqual(len(manifest), release.PACKAGE_COUNT + 7)
 
     def test_stable_release_is_paired_with_its_version(self):
         version, number = release.RPM_RELEASE
