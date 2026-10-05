@@ -351,7 +351,7 @@ jobs:
             flags=(--target "$COMMIT" --prerelease --latest=false)
           fi
           gh release create "$RELEASE_TAG" --draft "${flags[@]}" \
-            --title "EGCL $RELEASE_TAG" --notes-file CHANGELOG.md ./*
+            --title "EGCL $RELEASE_TAG" --notes-file RELEASE_NOTES.md ./*
           gh release edit "$RELEASE_TAG" --draft=false
           # Test mode publishes a real prerelease so the publish path itself is
           # exercised, but nothing ever read the older ones -- they just
