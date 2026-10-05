@@ -238,3 +238,106 @@ fn find_symbol_preserves_literal_colons_in_keyword_names() {
         "(T :EXTERNAL T)",
     );
 }
+
+#[test]
+fn unintern_removes_only_the_exact_case_and_identity() {
+    check(
+        r#"(let* ((target (make-package "UNINTERN-TARGET" :use nil))
+                    (lower (intern "low" target))
+                    (upper (intern "LOW" target)))
+               (list (unintern (make-symbol "LOW") target)
+                     (eq upper (find-symbol "LOW" target))
+                     (unintern lower target)
+                     (null (find-symbol "low" target))
+                     (eq upper (find-symbol "LOW" target))
+                     (symbol-package lower)))"#,
+        "(NIL T T T T NIL)",
+    );
+}
+
+#[test]
+fn unintern_rejects_revealing_distinct_exact_name_exports() {
+    check(
+        r#"(let* ((first (make-package "UNINTERN-FIRST" :use nil))
+                    (second (make-package "UNINTERN-SECOND" :use nil))
+                    (target (make-package "UNINTERN-TARGET" :use nil)))
+               (export (intern "low" first) first)
+               (export (intern "low" second) second)
+               (shadow "low" target)
+               (use-package (list first second) target)
+               (let ((symbol (find-symbol "low" target)))
+                 (list (handler-case (unintern symbol target)
+                         (package-error () :conflict))
+                       (eq symbol (find-symbol "low" target))
+                       (equal (package-shadowing-symbols target) (list symbol))
+                       (eq target (symbol-package symbol)))))"#,
+        "(:CONFLICT T T T)",
+    );
+}
+
+#[test]
+fn unintern_absent_identity_does_not_check_another_symbols_conflicts() {
+    check(
+        r#"(let* ((first (make-package "UNINTERN-FIRST" :use nil))
+                    (second (make-package "UNINTERN-SECOND" :use nil))
+                    (target (make-package "UNINTERN-TARGET" :use nil)))
+               (export (intern "LOW" first) first)
+               (export (intern "LOW" second) second)
+               (shadow "LOW" target)
+               (use-package (list first second) target)
+               (let ((symbol (find-symbol "LOW" target)))
+                 (list (unintern (make-symbol "LOW") target)
+                       (eq symbol (find-symbol "LOW" target))
+                       (equal (package-shadowing-symbols target) (list symbol)))))"#,
+        "(NIL T T)",
+    );
+}
+
+#[test]
+fn unintern_allows_multiple_inheritance_of_one_identity() {
+    check(
+        r#"(let* ((first (make-package "UNINTERN-FIRST" :use nil))
+                    (second (make-package "UNINTERN-SECOND" :use nil))
+                    (target (make-package "UNINTERN-TARGET" :use nil))
+                    (inherited (intern "low" first)))
+               (export inherited first)
+               (import inherited second)
+               (export inherited second)
+               (shadow "low" target)
+               (use-package (list first second) target)
+               (let ((symbol (find-symbol "low" target)))
+                 (list (unintern inherited target)
+                       (unintern symbol target)
+                       (eq inherited (find-symbol "low" target))
+                       (nth-value 1 (find-symbol "low" target))
+                       (package-shadowing-symbols target)
+                       (symbol-package symbol))))"#,
+        "(NIL T T :INHERITED NIL NIL)",
+    );
+}
+
+#[test]
+fn unintern_preserves_literal_colons_in_names() {
+    check(
+        r#"(let* ((target (make-package "UNINTERN-TARGET" :use nil))
+                    (symbol (make-symbol "MiXeD:A::B")))
+               (shadowing-import symbol target)
+               (list (unintern symbol target)
+                     (null (find-symbol "MiXeD:A::B" target))
+                     (package-shadowing-symbols target)
+                     (symbol-name symbol)))"#,
+        "(T T NIL \"MiXeD:A::B\")",
+    );
+}
+
+#[test]
+fn unintern_reports_invalid_symbols_and_missing_packages() {
+    check(
+        r#"(let ((target (make-package "UNINTERN-TARGET" :use nil)))
+               (list (handler-case (unintern 42 target)
+                       (type-error () :type))
+                     (handler-case (unintern (make-symbol "X") "UNINTERN-MISSING")
+                       (package-error () :package))))"#,
+        "(:TYPE :PACKAGE)",
+    );
+}

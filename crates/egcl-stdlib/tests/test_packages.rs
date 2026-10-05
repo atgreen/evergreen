@@ -147,6 +147,67 @@ fn unintern_removes_and_absent_false() {
 }
 
 #[test]
+fn unintern_conflict_preserves_the_present_symbol_and_shadow() {
+    let mut reg = fresh_registry();
+    let first = reg.make_package("UNINTERN-FIRST", &[], &[]).unwrap();
+    let second = reg.make_package("UNINTERN-SECOND", &[], &[]).unwrap();
+    let target = reg.make_package("UNINTERN-TARGET", &[], &[]).unwrap();
+    let (a, _) = intern("low", first).unwrap();
+    let (b, _) = intern("low", second).unwrap();
+    export(&[a], first).unwrap();
+    export(&[b], second).unwrap();
+    shadow(&["low"], target).unwrap();
+    use_package(&[first, second], target).unwrap();
+    let symbol = find_symbol("low", target).unwrap().unwrap().0;
+    let other = egcl_rt::symbols::make_uninterned("low");
+    assert!(!unintern(other, target).unwrap());
+    assert!(matches!(
+        unintern(symbol, target),
+        Err(egcl_rt::error::EgclError::PackageError(_))
+    ));
+    assert_eq!(find_symbol("low", target).unwrap().unwrap().0, symbol);
+    assert_eq!(package_shadowing_symbols(target), vec![symbol]);
+}
+
+#[test]
+fn unintern_allows_revealing_one_symbol_exported_from_multiple_packages() {
+    let mut reg = fresh_registry();
+    let first = reg.make_package("UNINTERN-SHARED-FIRST", &[], &[]).unwrap();
+    let second = reg
+        .make_package("UNINTERN-SHARED-SECOND", &[], &[])
+        .unwrap();
+    let target = reg
+        .make_package("UNINTERN-SHARED-TARGET", &[], &[])
+        .unwrap();
+    let (symbol, _) = intern("low", first).unwrap();
+    export(&[symbol], first).unwrap();
+    import(&[symbol], second).unwrap();
+    export(&[symbol], second).unwrap();
+    shadow(&["low"], target).unwrap();
+    use_package(&[first, second], target).unwrap();
+    let shadowing = find_symbol("low", target).unwrap().unwrap().0;
+    assert!(!unintern(symbol, target).unwrap());
+    assert!(unintern(shadowing, target).unwrap());
+    assert_eq!(find_symbol("low", target).unwrap().unwrap().0, symbol);
+    assert!(package_shadowing_symbols(target).is_empty());
+}
+
+#[test]
+fn unintern_does_not_count_the_removed_export_as_an_inherited_conflict() {
+    let mut reg = fresh_registry();
+    let source = reg.make_package("UNINTERN-SELF-SOURCE", &[], &[]).unwrap();
+    let target = reg.make_package("UNINTERN-SELF-TARGET", &[], &[]).unwrap();
+    let (inherited, _) = intern("low", source).unwrap();
+    export(&[inherited], source).unwrap();
+    shadow(&["low"], target).unwrap();
+    let symbol = find_symbol("low", target).unwrap().unwrap().0;
+    export(&[symbol], target).unwrap();
+    use_package(&[target, source], target).unwrap();
+    assert!(unintern(symbol, target).unwrap());
+    assert_eq!(find_symbol("low", target).unwrap().unwrap().0, inherited);
+}
+
+#[test]
 fn use_package_inherits() {
     let mut reg = fresh_registry();
     let prov = reg.make_package("PROV", &[], &[]).unwrap();

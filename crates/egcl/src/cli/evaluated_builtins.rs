@@ -4197,60 +4197,21 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 effective_package_name(env)
             };
-            let name = symbol_bare_name(&val_as_str(symbol));
-            let Some(pkg) = egcl_stdlib::find_package(&pkg_name) else {
-                return Ok(NIL);
-            };
-            // Shadowing-reveal conflict (CLHS UNINTERN; ansi UNINTERN.8/9):
-            // uninterning a SHADOWING symbol uncovers the inherited
-            // same-named externals of the use list. If those are TWO OR
-            // MORE distinct symbols, the reveal creates a name conflict —
-            // a PACKAGE-ERROR; a single symbol (even via several used
-            // packages) is fine.
-            if egcl_stdlib::package_shadowing_symbols(pkg)
-                .iter()
-                .any(|s| string_designator_name(*s).eq_ignore_ascii_case(&name))
-            {
-                let mut revealed: Vec<EgclVal> = Vec::new();
-                for used in egcl_stdlib::package_use_list(pkg) {
-                    if let Some(ext) = egcl_stdlib::find_present_symbol(used, &name) {
-                        if egcl_stdlib::is_external_symbol(used, &name) && !revealed.contains(&ext)
-                        {
-                            revealed.push(ext);
-                        }
-                    }
-                }
-                if revealed.len() > 1 {
-                    return Err(EgclError::PackageError(format!(
-                        "uninterning shadowing symbol {name} from {pkg_name} would \
-                             reveal {} conflicting inherited symbols",
-                        revealed.len()
-                    )));
+            let pkg = egcl_stdlib::find_package(&pkg_name).ok_or_else(|| {
+                EgclError::PackageError(format!("Package {pkg_name:?} does not exist"))
+            })?;
+            // Read the home before removal: the legacy home lookup may need
+            // the present-symbol entry that UNINTERN is about to remove.
+            let home_is_this = symbol.is_symbol()
+                && symbol != NIL
+                && symbol != T
+                && normalize_package_name(&symbol_home_package_name(symbol)) == pkg_name;
+            let removed = egcl_stdlib::unintern(symbol, pkg)?;
+            if removed && home_is_this {
+                if let Some(idx) = symbol.symbol_index() {
+                    mark_symbol_homeless(idx);
                 }
             }
-            let removed = match egcl_stdlib::find_present_symbol(pkg, &name) {
-                Some(sym) => {
-                    // Read the home BEFORE removing the symbol: once it is
-                    // gone from the package, the name→home scan can no longer
-                    // see it.
-                    let home_is_this = sym.is_symbol()
-                        && sym != NIL
-                        && sym != T
-                        && normalize_package_name(&symbol_home_package_name(sym)) == pkg_name;
-                    let ok = egcl_stdlib::unintern(sym, pkg).unwrap_or(false);
-                    // CLHS: if this package was the symbol's home package,
-                    // uninterning makes the symbol homeless (SYMBOL-PACKAGE
-                    // becomes NIL). Record it — egcl's name-prefix home model
-                    // has no other way to represent "no home package".
-                    if ok && home_is_this {
-                        if let Some(idx) = sym.symbol_index() {
-                            mark_symbol_homeless(idx);
-                        }
-                    }
-                    ok
-                }
-                None => false,
-            };
             Ok(if removed { T } else { NIL })
         }),
         _ => None,

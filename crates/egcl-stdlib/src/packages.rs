@@ -906,41 +906,72 @@ pub fn unexport(symbols: &[EgclVal], package: EgclVal) -> Result<(), EgclError> 
 
 /// Unintern a symbol from a package.
 pub fn unintern(symbol: EgclVal, package: EgclVal) -> Result<bool, EgclError> {
+    if !symbol.is_symbol() {
+        return Err(EgclError::TypeError {
+            datum: symbol,
+            expected: "SYMBOL".to_string(),
+        });
+    }
     let store = current_store()?;
+    // Keep conflict validation and removal atomic while taking only one
+    // package lock at a time, regardless of the use-list's package order.
     let registry = store
         .state
-        .read()
-        .map_err(|_| lock_poisoned_error("unintern"))?;
-    let package = lookup_package_arc(&registry, package)?;
-    let mut package = package
         .write()
         .map_err(|_| lock_poisoned_error("unintern"))?;
+    let target = lookup_package_arc(&registry, package)?;
+    let (name, package_name, used_packages) = {
+        let target = target
+            .read()
+            .map_err(|_| lock_poisoned_error("unintern"))?;
+        let present = target
+            .internal_symbols
+            .entries()
+            .into_iter()
+            .chain(target.external_symbols.entries())
+            .find(|(_, value)| *value == symbol);
+        let Some((name, _)) = present else {
+            return Ok(false);
+        };
+        let used = if target.shadowing_symbols.contains(&name) {
+            target.use_list.clone()
+        } else {
+            Vec::new()
+        };
+        (name, target.name.clone(), used)
+    };
 
-    let removed_internal = package
-        .internal_symbols
-        .entries()
-        .into_iter()
-        .find(|(_, value)| *value == symbol)
-        .map(|(name, _)| name);
-    if let Some(name) = removed_internal {
-        package.internal_symbols.remove(&name);
-        package.shadowing_symbols.remove(&name);
-        return Ok(true);
+    let mut revealed = Vec::new();
+    for used in used_packages {
+        if used == package {
+            continue;
+        }
+        let used = lookup_package_arc(&registry, used)?;
+        let used = used
+            .read()
+            .map_err(|_| lock_poisoned_error("unintern conflict check"))?;
+        if let Some(exported) = used.external_symbols.get(&name) {
+            if !revealed.contains(&exported) {
+                revealed.push(exported);
+            }
+        }
+    }
+    if revealed.len() > 1 {
+        return Err(EgclError::PackageError(format!(
+            "uninterning shadowing symbol {name} from {package_name} would \
+             reveal {} conflicting inherited symbols",
+            revealed.len()
+        )));
     }
 
-    let removed_external = package
-        .external_symbols
-        .entries()
-        .into_iter()
-        .find(|(_, value)| *value == symbol)
-        .map(|(name, _)| name);
-    if let Some(name) = removed_external {
-        package.external_symbols.remove(&name);
-        package.shadowing_symbols.remove(&name);
-        return Ok(true);
-    }
+    let mut target = target
+        .write()
+        .map_err(|_| lock_poisoned_error("unintern"))?;
+    target.internal_symbols.remove(&name);
+    target.external_symbols.remove(&name);
+    target.shadowing_symbols.remove(&name);
 
-    Ok(false)
+    Ok(true)
 }
 
 /// Use a package (add to use-list).
