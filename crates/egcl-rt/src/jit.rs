@@ -249,7 +249,18 @@ impl JitBuffer {
 ///
 /// # Safety
 /// `ptr..ptr + len` must be a mapped range in this process.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
+    unsafe extern "C" {
+        fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+    }
+    if len != 0 {
+        // SAFETY: the code buffer is mapped for the entire range.
+        unsafe { sys_icache_invalidate(ptr.cast_mut().cast(), len) };
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
     if len == 0 {
         return;

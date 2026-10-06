@@ -28,6 +28,12 @@ fn main() {
     if unix_fibers || (arch == "x86_64" && target.contains("windows")) {
         println!("cargo:rustc-cfg=egcl_fibers");
     }
+    if target == "aarch64-apple-darwin" {
+        println!("cargo:rerun-if-changed=src/syscall/macos_context.c");
+        cc::Build::new()
+            .file("src/syscall/macos_context.c")
+            .compile("egcl_macos_context");
+    }
     if matches!(
         target.as_str(),
         "powerpc64le-unknown-linux-gnu" | "powerpc64le-unknown-linux-musl"

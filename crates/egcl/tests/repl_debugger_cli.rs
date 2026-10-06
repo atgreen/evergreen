@@ -17,8 +17,8 @@ fn run_in_pty(input: &[u8]) -> String {
             &mut master_fd,
             &mut slave_fd,
             std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     };
     assert_eq!(result, 0, "openpty: {}", std::io::Error::last_os_error());

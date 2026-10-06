@@ -16908,6 +16908,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
     c2i_eval_form_with_frame(EgclVal(form), true)
 }
 
+#[cfg(target_arch = "x86_64")]
 extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture: u64) -> u64 {
     match guard_c2i(|| {
         let env = NATIVE_ENV.with(|slot| slot.get());
@@ -24011,6 +24012,7 @@ mod jtc4_stack_map_tests {
         assert!(matches!(error, EgclError::StackOverflow(_)));
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn c2i_helper_calls_disable_native_sigsegv_recovery_around_rust_frame() {
         let mut asm = Asm::new();

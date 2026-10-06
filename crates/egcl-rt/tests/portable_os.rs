@@ -57,10 +57,17 @@ fn image_tag_identifies_the_target() {
     // The OS half is not always Linux: Android runs the same kernel with a
     // different libc, and an image saved under bionic must not load in a glibc or
     // musl EGCL, so it carries its own tag (Os::Android = 4; bliss-w2vp).
-    let os = if cfg!(target_os = "android") { 5 } else { 1 };
+    let os = if cfg!(target_os = "android") {
+        5
+    } else if cfg!(target_os = "macos") {
+        2
+    } else {
+        1
+    };
     assert_eq!(egcl_rt::current_platform_tag(), (arch << 32) | os);
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn epoll_preserves_a_full_width_cookie() {
     use std::io::Write;

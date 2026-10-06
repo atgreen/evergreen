@@ -114,14 +114,25 @@ library compatibility. The Fedora `egcl` package uses glibc and the system
 dynamic loader. For an installed standalone command, a dynamic FFI build, or profile-guided
 optimization, follow the [build guide](docs/manual/user/how-to/build.md).
 
+On Apple Silicon macOS, select the native target explicitly (the checkout's
+default target is Linux):
+
+```sh
+nix-shell --run 'cargo build --locked -p egcl --bin egcl --target aarch64-apple-darwin'
+target/aarch64-apple-darwin/debug/egcl --no-init --eval '(+ 1 2)'
+```
+
+This produces a Mach-O arm64 command. See the [build guide](docs/manual/user/how-to/build.md)
+for a release build and validation notes.
+
 ## Platform support
 
-Runtime targets include Linux x86-64, AArch64, ppc64le, and s390x; Windows
-x86-64; and Android ARM64 and x86-64 application runtimes. Native compiler
+Runtime targets include Linux x86-64, AArch64, ppc64le, and s390x; macOS
+arm64; Windows x86-64; and Android ARM64 and x86-64 application runtimes. Native compiler
 coverage and foreign-call support vary by target. Linux's four architectures
 have T1 and T2 backends, OSR, and deoptimization for supported code shapes;
-unsupported shapes remain at a lower tier. macOS is not a supported runtime
-target in the current port set.
+unsupported shapes remain at a lower tier. The macOS arm64 CLI is built from
+source and has a narrower validation baseline than Linux.
 
 The Fedora x86-64 repository also offers `egcl-static` and `egcl-target-*`
 packages. Target tools run foreign-architecture runtimes through QEMU or Wine

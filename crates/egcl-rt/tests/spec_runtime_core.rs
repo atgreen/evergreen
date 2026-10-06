@@ -1033,14 +1033,7 @@ extern "C" fn null_guard_recovery_exit() -> ! {
 
 extern "C" fn null_guard_type_error_exit() -> ! {
     if egcl_rt::runtime::check_sigsegv_null_guard() {
-        unsafe {
-            egcl_rt::syscall::syscall3(
-                egcl_rt::syscall::nr::WRITE,
-                1,
-                b"TYPE_ERROR\n".as_ptr() as usize,
-                b"TYPE_ERROR\n".len(),
-            );
-        }
+        unsafe { libc::write(1, b"TYPE_ERROR\n".as_ptr().cast(), b"TYPE_ERROR\n".len()) };
         egcl_rt::syscall::exit_group(0);
     }
     egcl_rt::syscall::dbg_write(b"NULL_GUARD_FLAG_MISSING\n");

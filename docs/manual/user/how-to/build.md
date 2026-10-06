@@ -19,6 +19,21 @@ The expression prints `3`. The repository defaults to the x86-64 musl target.
 The memory-limit wrapper requires a working systemd user session; it is used for
 local runtime checks in this project, not installed as part of EGCL.
 
+## Build a native macOS arm64 binary
+
+On Apple Silicon, enter the repository's Nix shell and select the Darwin
+target explicitly. The checkout defaults to Linux/musl.
+
+```sh
+nix-shell --run 'cargo build --locked --release -p egcl --bin egcl --target aarch64-apple-darwin'
+target/aarch64-apple-darwin/release/egcl --no-init --eval '(+ 1 2)'
+```
+
+The executable is a native Mach-O arm64 file and the expression prints `3`.
+For a faster development build, omit `--release` and run the binary under
+`target/aarch64-apple-darwin/debug/`. The standalone image and install targets
+below are Linux build procedures; on macOS, run the Cargo-built CLI directly.
+
 ## Build and install the standalone command
 
 ```sh

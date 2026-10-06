@@ -10,6 +10,7 @@ Tiers are defined in [How Lisp runs](../explanation/execution.md).
 | Linux s390x | T1 and T2, OSR and deoptimization | Fedora target RPM; QEMU JIT, image, and GC stress checks |
 | Linux AArch64 | T1 and T2 for supported shapes, OSR and deoptimization | Fedora target RPM; QEMU JIT, image, and GC stress checks |
 | Linux ppc64le | T1 and T2 for supported shapes | Fedora target RPM; QEMU image and GC stress checks |
+| macOS arm64 | AArch64 native backend for supported shapes | Source-built Mach-O CLI; host runtime and signal tests |
 | Windows x86-64 | T1 and T2 for supported shapes | Target RPM runs via Wine; native OS validation remains distinct |
 | Android ARM64 CLI | T1 and T2 for supported shapes; AArch64 backend | `egcl-android`; QEMU image checks |
 | Android ARM64 APK | Dynamic NativeActivity runtime | EGL demo checked on an ARM64 phone |

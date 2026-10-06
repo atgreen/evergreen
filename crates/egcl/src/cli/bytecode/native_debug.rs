@@ -54,6 +54,7 @@ pub(super) fn arguments(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_arch = "x86_64", unix))]
     use super::super::*;
 
     #[cfg(all(target_arch = "x86_64", unix))]
