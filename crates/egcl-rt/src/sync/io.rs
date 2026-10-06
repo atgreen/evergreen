@@ -553,7 +553,7 @@ mod kqueue {
                     poller.queue_fd,
                     fd,
                     filter,
-                    (libc::EV_ADD | libc::EV_ONESHOT) as u16,
+                    libc::EV_ADD | libc::EV_ONESHOT,
                     id,
                 )
             } != 0
@@ -561,7 +561,7 @@ mod kqueue {
                 let error = std::io::Error::last_os_error();
                 for &filter in filters(interest) {
                     unsafe {
-                        change(poller.queue_fd, fd, filter, libc::EV_DELETE as u16, id);
+                        change(poller.queue_fd, fd, filter, libc::EV_DELETE, id);
                     }
                 }
                 return Err(EgclError::StreamError(format!(
@@ -593,7 +593,7 @@ mod kqueue {
                         poller.queue_fd,
                         registration.fd,
                         filter,
-                        libc::EV_DELETE as u16,
+                        libc::EV_DELETE,
                         id,
                     );
                 }
@@ -641,7 +641,7 @@ mod kqueue {
                             queue_fd,
                             registration.fd,
                             filter,
-                            libc::EV_DELETE as u16,
+                            libc::EV_DELETE,
                             id,
                         );
                     }

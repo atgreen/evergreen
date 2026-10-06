@@ -1242,6 +1242,13 @@ fn install_process_signal_handlers() -> Result<(), EgclError> {
             syscall::SA_RESTART | syscall::SA_ONSTACK | syscall::SA_SIGINFO,
         )
         .map_err(|_| EgclError::SignalError(syscall::SIGSEGV))?;
+        #[cfg(target_os = "macos")]
+        install(
+            syscall::SIGBUS,
+            sigsegv_handler as *const () as usize,
+            syscall::SA_RESTART | syscall::SA_ONSTACK | syscall::SA_SIGINFO,
+        )
+        .map_err(|_| EgclError::SignalError(syscall::SIGBUS))?;
         install(
             syscall::SIGINT,
             sigint_handler as *const () as usize,
@@ -1328,7 +1335,7 @@ extern "C" fn sigpipe_handler(_sig: i32) {
 
 #[cfg(unix)]
 extern "C" fn sigsegv_handler(
-    _sig: i32,
+    sig: i32,
     _info: *mut core::ffi::c_void,
     _context: *mut core::ffi::c_void,
 ) {
@@ -1359,107 +1366,110 @@ extern "C" fn sigsegv_handler(
             crate::syscall::dbg_write(b"egcl: stack guard SIGSEGV\n")
         }
         SigsegvFaultKind::Ordinary => {
-            crate::syscall::dbg_write(b"egcl: unhandled SIGSEGV\n");
-            // Allocation-free diagnostics: fault address and RIP in hex.
-            let mut buf = [0u8; 64];
-            let mut n = 0;
-            let mut put = |bytes: &[u8], n: &mut usize| {
-                for &b in bytes {
-                    if *n < buf.len() {
-                        buf[*n] = b;
-                        *n += 1;
+            crate::syscall::dbg_write(b"egcl: unhandled memory fault\n");
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            {
+                // Allocation-free diagnostics: fault address and RIP in hex.
+                let mut buf = [0u8; 64];
+                let mut n = 0;
+                let mut put = |bytes: &[u8], n: &mut usize| {
+                    for &b in bytes {
+                        if *n < buf.len() {
+                            buf[*n] = b;
+                            *n += 1;
+                        }
                     }
-                }
-            };
-            let hex = |mut v: usize, out: &mut [u8; 16]| {
-                for i in (0..16).rev() {
-                    let d = (v & 0xF) as u8;
-                    out[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
-                    v >>= 4;
-                }
-            };
-            let mut h = [0u8; 16];
-            put(b"addr=0x", &mut n);
-            hex(addr, &mut h);
-            put(&h, &mut n);
-            const UCONTEXT_RIP_OFFSET: usize = 168;
-            let rip = if _context.is_null() {
-                0
-            } else {
-                unsafe {
-                    core::ptr::read_unaligned(
-                        (_context as *const u8).add(UCONTEXT_RIP_OFFSET) as *const usize
-                    )
-                }
-            };
-            put(b" rip=0x", &mut n);
-            hex(rip, &mut h);
-            put(&h, &mut n);
-            put(b"\n", &mut n);
-            crate::syscall::dbg_write(&buf[..n]);
-            // Registers and the stack top, for wild-jump forensics.
-            let greg = |idx: usize| -> usize {
-                if _context.is_null() {
+                };
+                let hex = |mut v: usize, out: &mut [u8; 16]| {
+                    for i in (0..16).rev() {
+                        let d = (v & 0xF) as u8;
+                        out[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                        v >>= 4;
+                    }
+                };
+                let mut h = [0u8; 16];
+                put(b"addr=0x", &mut n);
+                hex(addr, &mut h);
+                put(&h, &mut n);
+                const UCONTEXT_RIP_OFFSET: usize = 168;
+                let rip = if _context.is_null() {
                     0
                 } else {
                     unsafe {
                         core::ptr::read_unaligned(
-                            (_context as *const u8).add(40 + idx * 8) as *const usize
+                            (_context as *const u8).add(UCONTEXT_RIP_OFFSET) as *const usize
                         )
                     }
-                }
-            };
-            // Linux x86_64 gregs order: R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI
-            // RBP RBX RDX RAX RCX RSP RIP.
-            let names: [&[u8]; 16] = [
-                b"r8 ", b"r9 ", b"r10", b"r11", b"r12", b"r13", b"r14", b"r15", b"rdi", b"rsi",
-                b"rbp", b"rbx", b"rdx", b"rax", b"rcx", b"rsp",
-            ];
-            for (i, name) in names.iter().enumerate() {
-                let mut n2 = 0;
-                let mut b2 = [0u8; 32];
-                for &c in name.iter() {
-                    b2[n2] = c;
+                };
+                put(b" rip=0x", &mut n);
+                hex(rip, &mut h);
+                put(&h, &mut n);
+                put(b"\n", &mut n);
+                crate::syscall::dbg_write(&buf[..n]);
+                // Registers and the stack top, for wild-jump forensics.
+                let greg = |idx: usize| -> usize {
+                    if _context.is_null() {
+                        0
+                    } else {
+                        unsafe {
+                            core::ptr::read_unaligned(
+                                (_context as *const u8).add(40 + idx * 8) as *const usize
+                            )
+                        }
+                    }
+                };
+                // Linux x86_64 gregs order: R8 R9 R10 R11 R12 R13 R14 R15 RDI RSI
+                // RBP RBX RDX RAX RCX RSP RIP.
+                let names: [&[u8]; 16] = [
+                    b"r8 ", b"r9 ", b"r10", b"r11", b"r12", b"r13", b"r14", b"r15", b"rdi", b"rsi",
+                    b"rbp", b"rbx", b"rdx", b"rax", b"rcx", b"rsp",
+                ];
+                for (i, name) in names.iter().enumerate() {
+                    let mut n2 = 0;
+                    let mut b2 = [0u8; 32];
+                    for &c in name.iter() {
+                        b2[n2] = c;
+                        n2 += 1;
+                    }
+                    b2[n2] = b'=';
                     n2 += 1;
-                }
-                b2[n2] = b'=';
-                n2 += 1;
-                let mut h2 = [0u8; 16];
-                hex(greg(i), &mut h2);
-                for &c in h2.iter() {
-                    b2[n2] = c;
+                    let mut h2 = [0u8; 16];
+                    hex(greg(i), &mut h2);
+                    for &c in h2.iter() {
+                        b2[n2] = c;
+                        n2 += 1;
+                    }
+                    b2[n2] = b'\n';
                     n2 += 1;
+                    crate::syscall::dbg_write(&b2[..n2]);
                 }
-                b2[n2] = b'\n';
-                n2 += 1;
-                crate::syscall::dbg_write(&b2[..n2]);
-            }
-            let rsp = greg(15);
-            for k in 0..8usize {
-                let v = unsafe { core::ptr::read_unaligned((rsp + k * 8) as *const usize) };
-                let mut n2 = 0;
-                let mut b2 = [0u8; 40];
-                for &c in b"stk".iter() {
-                    b2[n2] = c;
+                let rsp = greg(15);
+                for k in 0..8usize {
+                    let v = unsafe { core::ptr::read_unaligned((rsp + k * 8) as *const usize) };
+                    let mut n2 = 0;
+                    let mut b2 = [0u8; 40];
+                    for &c in b"stk".iter() {
+                        b2[n2] = c;
+                        n2 += 1;
+                    }
+                    b2[n2] = b'0' + k as u8;
                     n2 += 1;
-                }
-                b2[n2] = b'0' + k as u8;
-                n2 += 1;
-                b2[n2] = b'=';
-                n2 += 1;
-                let mut h2 = [0u8; 16];
-                hex(v, &mut h2);
-                for &c in h2.iter() {
-                    b2[n2] = c;
+                    b2[n2] = b'=';
                     n2 += 1;
+                    let mut h2 = [0u8; 16];
+                    hex(v, &mut h2);
+                    for &c in h2.iter() {
+                        b2[n2] = c;
+                        n2 += 1;
+                    }
+                    b2[n2] = b'\n';
+                    n2 += 1;
+                    crate::syscall::dbg_write(&b2[..n2]);
                 }
-                b2[n2] = b'\n';
-                n2 += 1;
-                crate::syscall::dbg_write(&b2[..n2]);
             }
         }
     }
-    crate::syscall::exit_group(128 + crate::syscall::SIGSEGV);
+    crate::syscall::exit_group(128 + sig);
 }
 
 /// Releases this thread's SIGSEGV-recovery slot when the thread exits.
@@ -1628,7 +1638,15 @@ fn sigsegv_stack_guard_contains(addr: usize) -> bool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
+fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
+    if info.is_null() {
+        return usize::MAX;
+    }
+    unsafe { (*(info as *const libc::siginfo_t)).si_addr as usize }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn siginfo_fault_addr(info: *mut core::ffi::c_void) -> usize {
     if info.is_null() {
         return usize::MAX;
@@ -1656,7 +1674,15 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     true
 }
 
-#[cfg(all(unix, not(target_arch = "x86_64")))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
+    unsafe extern "C" {
+        fn egcl_macos_rewrite_ucontext_pc(context: *mut core::ffi::c_void, pc: usize) -> bool;
+    }
+    unsafe { egcl_macos_rewrite_ucontext_pc(context, ip) }
+}
+
+#[cfg(all(unix, not(target_arch = "x86_64"), not(target_os = "macos")))]
 fn rewrite_ucontext_ip(_context: *mut core::ffi::c_void, _ip: usize) -> bool {
     false
 }

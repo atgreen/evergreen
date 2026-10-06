@@ -239,7 +239,7 @@ pub fn call(args: &[EgclVal]) -> Result<[EgclVal; 3], EgclError> {
             let (result, error) = crate::process::process_operation("OPEN", move || {
                 // SAFETY: the owned path is null-terminated; mode is supplied
                 // even when flags do not require the variadic third argument.
-                let result = unsafe { libc::open(path.as_ptr(), flags, mode) };
+                let result = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
                 let error = if result == -1 {
                     std::io::Error::last_os_error().raw_os_error()
                 } else {

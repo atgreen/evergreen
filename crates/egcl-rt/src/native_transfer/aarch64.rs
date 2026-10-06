@@ -33,6 +33,10 @@ pub(super) unsafe fn enter(
 
 /// Cold transfer exit. The fixed entry frame remains live until its landing
 /// path has written the explicit outcome and restored the caller's state.
+///
+/// # Safety
+/// The caller must supply a live native segment and enter through its
+/// generated transfer path with the expected AArch64 register convention.
 #[unsafe(naked)]
 pub unsafe extern "C" fn leave_native_segment(
     _anchor: *mut NativeSegment,

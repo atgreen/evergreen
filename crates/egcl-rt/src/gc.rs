@@ -6665,7 +6665,10 @@ pub unsafe fn restore_heap_regions(
     for region in &image.regions {
         let count = region.used.div_ceil(config.region_size);
         let destination = state.regions[index].base;
+        #[cfg(target_os = "linux")]
         let mut mapped = false;
+        #[cfg(not(target_os = "linux"))]
+        let mapped = false;
         #[cfg(target_os = "linux")]
         if let Some((file, section_offset)) = backing {
             use std::os::fd::AsRawFd;

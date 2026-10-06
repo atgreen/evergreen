@@ -31,6 +31,10 @@ pub mod packages;
 pub mod symbols;
 /// Runtime OS services: Linux syscall wrappers or the Windows backend.
 #[cfg_attr(windows, path = "syscall/windows.rs")]
+#[cfg(target_os = "macos")]
+#[path = "syscall/macos.rs"]
+pub mod syscall;
+#[cfg(not(target_os = "macos"))]
 pub mod syscall;
 pub mod types;
 pub mod value;
