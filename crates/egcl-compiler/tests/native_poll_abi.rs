@@ -185,3 +185,110 @@ fn call_free_poll_loop_emits_an_aligned_call_frame() {
     // omitted it because the bytecode itself contained no call.
     assert_eq!(&framed.code[..4], &[0x48, 0x83, 0xec, 0x08]);
 }
+
+#[test]
+fn native_poll_preserves_immediate_live_values() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn clear_mv() -> u64 {
+        NIL.0
+    }
+    extern "C" fn poll(_frame: *mut u64) -> u64 {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        // A runtime call may overwrite every SysV caller-saved register.
+        unsafe {
+            core::arch::asm!(
+                "xor rdi, rdi", "xor rsi, rsi", "xor rdx, rdx",
+                "xor rcx, rcx", "xor r8, r8", "xor r9, r9",
+                "xor r10, r10", "xor r11, r11",
+                out("rdi") _, out("rsi") _, out("rdx") _, out("rcx") _,
+                out("r8") _, out("r9") _, out("r10") _, out("r11") _,
+                options(nomem, nostack)
+            );
+        }
+        NIL.0
+    }
+    let loop_code = vec![
+        Instr::Br(1),
+        Instr::Const(0),
+        Instr::BrIfFalse(4),
+        Instr::Br(1),
+        Instr::LoadLocal(0),
+        Instr::Return,
+    ];
+    let loop_phi_code = vec![
+        Instr::Br(1),
+        Instr::Const(0),
+        Instr::BrIfFalse(6),
+        Instr::Const(0),
+        Instr::StoreLocal(0),
+        Instr::Br(1),
+        Instr::LoadLocal(0),
+        Instr::Return,
+    ];
+    let mut straight_code = Vec::new();
+    for _ in 0..65 {
+        straight_code.extend([
+            Instr::LoadLocal(0),
+            Instr::TypeP(egcl_rt::bytecode::typep_class::BOOLEAN),
+            Instr::Pop,
+        ]);
+    }
+    straight_code.extend([Instr::LoadLocal(0), Instr::Return]);
+    for (shape, code) in [
+        ("loop live-in", loop_code),
+        ("loop phi", loop_phi_code),
+        ("straight-line", straight_code),
+    ] {
+        let mut bytecode = call_free_loop_fn();
+        bytecode.code = code;
+        bytecode.constants = vec![NIL];
+        bytecode.n_locals = 1;
+        bytecode.arity = 1;
+        bytecode.min_args = 1;
+        bytecode.max_args = Some(1);
+        let mut function = build_from_bytecode_for_transfers(&bytecode).expect("build poll probe");
+        // Test the emitter with pure checks: the bytecode builder also adds
+        // ClearMv calls for Lisp TYPEP semantics, which would make allocation
+        // account for ordinary calls and hide the inserted-poll clobber.
+        for block in function.block_order().to_vec() {
+            let pure_instructions = function.block(block).insts.iter().copied()
+                .filter(|&inst| {
+                    function.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::ClearMv
+                })
+                .collect();
+            function.block_mut(block).insts = pure_instructions;
+        }
+        for param in function.block(function.entry()).params.clone() {
+            function.refine_type(
+                param,
+                egcl_compiler::t2::ir::IRType::of(egcl_compiler::t2::ir::TypeBits::FIXNUM),
+            );
+        }
+        egcl_compiler::t2::verify::verify(&function).expect("verify poll probe");
+        let helper = poll as *const () as usize as u64;
+        let (framed, _) = emit_framed_native_handlers_with_poll(
+            &function,
+            helper,
+            bytecode.num_slots(),
+            helper,
+            helper,
+            clear_mv as *const () as usize as u64,
+            helper,
+            helper,
+            helper,
+        )
+        .expect("emit poll probe");
+        let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).expect("executable memory");
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let expected = EgclVal::from_fixnum(42);
+        let mut frame = vec![NIL.0; usize::from(bytecode.num_slots() + framed.shadow_root_slots)];
+        frame[0] = expected.0;
+        POLLS.store(0, Ordering::Relaxed);
+        assert_eq!(run(frame.as_mut_ptr()), expected.0, "{shape}");
+        assert!(
+            POLLS.load(Ordering::Relaxed) > 0,
+            "{shape} probe must execute a poll"
+        );
+    }
+}
