@@ -33366,6 +33366,27 @@ fn define_condition_portable(
 }
 
 // ── DEFSTRUCT ────────────────────────────────────────────────────
+// Keep effective slot types on the structure name: symbol properties are GC
+// roots and survive saved images, including a later DEFSTRUCT :INCLUDE.
+const STRUCT_SLOT_TYPES_PROPERTY: &str = "EGCL::%STRUCT-SLOT-TYPES";
+
+#[cfg(test)]
+mod struct_slot_type_tests;
+
+fn checked_struct_slot_form(form: EgclVal, slot_type: EgclVal) -> EgclVal {
+    if slot_type == T {
+        return form;
+    }
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(slot_type = slot_type);
+    let value = gensym_symbol("STRUCT-SLOT");
+    let sym = |name: &str| resolve_sym(name).unwrap_or(NIL);
+    egcl_rt::rooted!(binding = vec_to_list(&[value, *form]));
+    egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+    egcl_rt::rooted!(check = vec_to_list(&[sym("CHECK-TYPE"), value, *slot_type]));
+    vec_to_list(&[sym("LET"), *bindings, *check, value])
+}
+
 // Convert the existing positional structure constructor into a sequence
 // constructor when :TYPE requests a list or vector representation.
 fn typed_struct_constructor(call: EgclVal, representation: EgclVal) -> EgclVal {
@@ -33559,6 +33580,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     struct StructSlot {
         slot_sym: EgclVal,
         default: EgclVal,
+        slot_type: EgclVal,
         accessor: EgclVal,
         initarg: EgclVal,
         /// A `:read-only t` slot gets only a reader (no `(setf accessor)` writer).
@@ -33567,11 +33589,14 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     impl egcl_rt::gc::TraceHostRoots for StructSlot {
         fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
             visit(&mut self.default);
+            visit(&mut self.slot_type);
         }
     }
     let mut slots: Vec<StructSlot> = Vec::new();
     egcl_rt::rooted_ref!(_slots_root = &mut slots);
-    for slot_form in list_to_vec(slots_form) {
+    egcl_rt::rooted!(slot_forms = list_to_vec(slots_form));
+    for slot_index in 0..slot_forms.len() {
+        let slot_form = slot_forms[slot_index];
         let (slot_sym, default, options) = if slot_form.is_cons() {
             let (sn, rest) = cp(slot_form);
             if rest.is_cons() {
@@ -33589,6 +33614,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // Slot options are a plist tail; `:read-only <non-nil>` makes the slot
         // read-only (any non-NIL value counts) (ansi-test struct-test-27/28/29/21).
         let mut read_only = false;
+        let mut slot_type = T;
         let opt_vec = list_to_vec(options);
         let mut k = 0;
         while k + 1 < opt_vec.len() {
@@ -33598,19 +33624,26 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             {
                 read_only = true;
             }
+            if opt_vec[k].is_symbol() && sym_bare_name_rc(opt_vec[k]).as_ref() == "TYPE" {
+                slot_type = opt_vec[k + 1];
+            }
             k += 2;
         }
         let slot_str = sym_bare_name_rc(slot_sym);
+        egcl_rt::rooted!(default = default);
+        egcl_rt::rooted!(slot_type = slot_type);
         let accessor = if conc_name.is_empty() {
             slot_sym
         } else {
             resolve_sym(&format!("{definition_package}::{conc_name}{slot_str}")).unwrap_or(NIL)
         };
+        let initarg = resolve_sym(&format!(":{slot_str}")).unwrap_or(NIL);
         slots.push(StructSlot {
             slot_sym,
-            default,
+            default: *default,
+            slot_type: *slot_type,
             accessor,
-            initarg: resolve_sym(&format!(":{}", slot_str)).unwrap_or(NIL),
+            initarg,
             read_only,
         });
     }
@@ -33626,6 +33659,10 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // allocating (env.classes borrow held only over the copy); the initforms are
     // movable, so they ride in a rooted Vec across the accessor-symbol interning.
     if let Some(parent_sym) = include_parent {
+        let type_property = resolve_sym(STRUCT_SLOT_TYPES_PROPERTY).unwrap_or(NIL);
+        egcl_rt::rooted!(
+            parent_types = plist_lookup(symbol_plist_of(parent_sym), type_property).unwrap_or(NIL)
+        );
         let mut inh_names: Vec<String> = Vec::new();
         egcl_rt::rooted!(inh_forms = Vec::<EgclVal>::new());
         {
@@ -33659,26 +33696,28 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         egcl_rt::rooted_ref!(_inherited_root = &mut inherited);
         for i in 0..inh_names.len() {
             let sname = &inh_names[i];
-            if own.contains(sname) {
+            let bare_sname = sname.rsplit("::").next().unwrap_or(sname.as_str());
+            if own.contains(bare_sname) {
                 continue;
             }
             // Apply an override's new default (its cadr) if one is given for this
             // slot; otherwise keep the inherited initform.
-            let mut default = inh_forms[i];
+            egcl_rt::rooted!(default = inh_forms[i]);
             for j in 0..include_overrides.len() {
                 let ov = include_overrides[j];
                 if !ov.is_cons() {
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == sname {
+                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == bare_sname {
                     if orest.is_cons() {
-                        default = cp(orest).0;
+                        *default = cp(orest).0;
                     }
                     break;
                 }
             }
             let slot_sym = resolve_sym(sname).unwrap_or(NIL);
+            egcl_rt::rooted!(slot_type = plist_lookup(*parent_types, slot_sym).unwrap_or(T));
             // An INHERITED slot's name arrives from the class metadata fully
             // QUALIFIED ("COMMON-LISP-USER::SOCKET"), while a direct slot's is
             // bare. The qualified spelling is what `resolve_sym` needs to find
@@ -33694,7 +33733,6 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // silently takes its default instead — which, for slynk's
             // `(socket (missing-arg))`, means an error the moment a client
             // connects.
-            let bare_sname = sname.rsplit("::").next().unwrap_or(sname.as_str());
             let accessor = if conc_name.is_empty() {
                 slot_sym
             } else {
@@ -33709,8 +33747,8 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     continue;
                 }
                 let (ohead, orest) = cp(ov);
-                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == sname {
-                    let ovec = list_to_vec(orest);
+                if ohead.is_symbol() && sym_bare_name_rc(ohead).as_ref() == bare_sname {
+                    egcl_rt::rooted!(ovec = list_to_vec(orest));
                     let mut k = 1; // skip the new-default form at index 0
                     while k + 1 < ovec.len() {
                         if ovec[k].is_symbol()
@@ -33719,16 +33757,28 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         {
                             read_only = true;
                         }
+                        if ovec[k].is_symbol() && sym_bare_name_rc(ovec[k]).as_ref() == "TYPE" {
+                            // An included declaration cannot remove the parent's
+                            // constraint; a child may only narrow the slot type.
+                            *slot_type = if *slot_type == T {
+                                ovec[k + 1]
+                            } else {
+                                let and = resolve_sym("AND").unwrap_or(NIL);
+                                vec_to_list(&[and, *slot_type, ovec[k + 1]])
+                            };
+                        }
                         k += 2;
                     }
                     break;
                 }
             }
+            let initarg = resolve_sym(&format!(":{bare_sname}")).unwrap_or(NIL);
             inherited.push(StructSlot {
                 slot_sym,
-                default,
+                default: *default,
+                slot_type: *slot_type,
                 accessor,
-                initarg: resolve_sym(&format!(":{bare_sname}")).unwrap_or(NIL),
+                initarg,
                 read_only,
             });
         }
@@ -33742,6 +33792,15 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let obj = sym("%STRUCT-OBJECT%");
 
     egcl_rt::rooted!(name_sym_r = name_sym);
+    egcl_rt::rooted!(slot_types = Vec::<EgclVal>::new());
+    for slot in &slots {
+        slot_types.push(slot.slot_sym);
+        slot_types.push(slot.slot_type);
+    }
+    egcl_rt::rooted!(slot_types = vec_to_list(&slot_types));
+    let type_property = sym(STRUCT_SLOT_TYPES_PROPERTY);
+    symbol_plist_put(*name_sym_r, type_property, *slot_types);
+
     if representation.is_some() {
         // Typed structures are sequences, not CLOS classes. ELT and its SETF
         // function handle both supported representations through stdlib.
@@ -33838,7 +33897,7 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     egcl_rt::rooted!(dflt = slot.default);
                     egcl_rt::rooted!(keyform = vec_to_list(&[slot.initarg, slot.slot_sym]));
                     params.push(vec_to_list(&[*keyform, *dflt]));
-                    call.push(slot.slot_sym);
+                    call.push(checked_struct_slot_form(slot.slot_sym, slot.slot_type));
                 }
                 egcl_rt::rooted!(kw_lambda = vec_to_list(&params));
                 egcl_rt::rooted!(kw_body = vec_to_list(&call));
@@ -33993,13 +34052,8 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         }
                         i += 2;
                     }
-                    match supplied {
-                        Some(var) => positional.push(var),
-                        None => {
-                            egcl_rt::rooted!(dflt = slot_spec.default);
-                            positional.push(*dflt);
-                        }
-                    }
+                    let value_form = supplied.unwrap_or(slot_spec.default);
+                    positional.push(checked_struct_slot_form(value_form, slot_spec.slot_type));
                 }
                 egcl_rt::rooted!(boa_lambda = vec_to_list(&new_params));
                 egcl_rt::rooted!(boa_body = vec_to_list(&positional));
