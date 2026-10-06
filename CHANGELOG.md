@@ -8,6 +8,11 @@
   fence instructions, including after compiled-file loading
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
 
+### Platform support
+
+- The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
+  ([#51](https://github.com/atgreen/evergreen/pull/51)).
+
 ### Correctness and reliability
 
 - `EQ` comparisons between constant operands now compile at T2, including
