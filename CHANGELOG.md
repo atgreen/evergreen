@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Performance
+
+- Constant-kind memory barriers now use dedicated bytecode and x86 native
+  fence instructions, including after compiled-file loading
+  ([#30](https://github.com/atgreen/evergreen/pull/30)).
+
 ### Correctness and reliability
 
 - Native code now preserves live immediate values across inserted loop and
