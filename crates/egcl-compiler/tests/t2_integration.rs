@@ -508,9 +508,16 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn bytecode_typep_boolean_executes_without_a_call_or_deopt() {
+fn bytecode_typep_boolean_executes_and_clears_multiple_values() {
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::ir::{AuxData, Opcode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CLEARS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn clear_values(_primary: u64, _dst: *mut EgclVal, count: u64) {
+        assert_eq!(count, 0);
+        CLEARS.fetch_add(1, Ordering::Relaxed);
+    }
 
     let bf = bytecode_fn(
         "boolean-typep-opcode",
@@ -540,7 +547,12 @@ fn bytecode_typep_boolean_executes_without_a_call_or_deopt() {
     assert!(!check.flags.guard);
     assert!(check.frame_state.is_none());
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit TypeP BOOLEAN");
+    let framed = emit_framed(
+        &f, 0, 0, 0, 0, 0, 0, 0,
+        clear_values as *const () as usize as u64,
+        None,
+    )
+    .expect("emit TypeP BOOLEAN");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: EgclVal| {
@@ -557,6 +569,7 @@ fn bytecode_typep_boolean_executes_without_a_call_or_deopt() {
         ))),
         NIL
     );
+    assert_eq!(CLEARS.load(Ordering::Relaxed), 4);
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]

@@ -1711,6 +1711,10 @@ impl<'a> Builder<'a> {
                     ) {
                         return Err(BuildError::Unsupported("unknown TypeP class"));
                     }
+                    // The check is pure, but TYPEP's single-value return must
+                    // survive folding or elimination of that check.
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
                     let value = stack
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (TypeP)"))?;
@@ -3202,7 +3206,7 @@ mod tests {
     }
 
     #[test]
-    fn bytecode_typep_boolean_builds_as_a_pure_type_check() {
+    fn bytecode_typep_boolean_keeps_its_single_value_effect() {
         let input = bf(
             "boolean-typep-opcode",
             vec![
@@ -3227,6 +3231,15 @@ mod tests {
         assert!(!check.flags.effectful);
         assert!(!check.flags.guard);
         assert!(check.frame_state.is_none());
+        let clear = f
+            .block(f.entry())
+            .insts
+            .iter()
+            .map(|&i| f.inst(i))
+            .find(|d| d.opcode == Opcode::ClearMv)
+            .expect("TypeP must clear stale multiple values even if its check is optimized away");
+        assert!(clear.flags.effectful);
+        assert!(clear.frame_state.is_some());
     }
 
     #[test]
