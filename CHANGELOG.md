@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- `DEFSTRUCT` constructors now enforce declared slot types, including defaults,
+  inherited constraints, BOA constructors, and list/vector-backed structures
+  ([#31](https://github.com/atgreen/evergreen/pull/31)).
+
 - Circular reader labels now preserve identity in vectors, mixed object graphs,
   arrays, and structure literals, including source-free compiled files
   ([#33](https://github.com/atgreen/evergreen/pull/33)).
