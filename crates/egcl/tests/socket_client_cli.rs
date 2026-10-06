@@ -7,10 +7,10 @@ use std::net::TcpListener;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-// Stress + verification scans the heap at every bootstrap allocation. Startup
-// alone takes about 155s on the development host; allow it to finish before
-// testing the socket exchange, whose peer I/O deadlines remain 10s.
-const STRESS_TIMEOUT_SECONDS: u64 = 240;
+// Stress + verification scans the heap at every bootstrap allocation. A
+// startup-only probe took 355s on the development host, before any socket I/O.
+// Allow bootstrap headroom while retaining the peer's separate 10s deadlines.
+const STRESS_TIMEOUT_SECONDS: u64 = 600;
 
 fn run(form: &str, extra: &[&str], stress: bool) -> Output {
     let mut command = Command::new("timeout");
@@ -74,6 +74,8 @@ fn native_client_reads_incrementally_and_writes_before_eof() {
         let output = run(
             &format!(
                 r#"
+          (format *error-output* "NATIVE-TCP-BOOTSTRAP-COMPLETE~%")
+          (finish-output *error-output*)
           (let ((s (egcl::%socket-connect "127.0.0.1" {port} 2000)))
             (unwind-protect
                 (progn
