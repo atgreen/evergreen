@@ -289,16 +289,15 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
         "run image round-trip regression",
     );
 
-    run(
+    let output = run(
         {
             let mut cmd = Command::new("cargo");
             cmd.current_dir(repo_root()).args([
                 "test",
                 "-p",
                 "egcl-compiler",
-                "--test",
-                "spec_tiered_osr_ic_profiling",
-                "deopt_at_safepoint_restores_equivalent_interpreter_frame",
+                "--lib",
+                "t2::deopt::tests::lowers_and_reconstructs_every_inlined_scope_in_order",
                 "--",
                 "--exact",
                 "--nocapture",
@@ -306,5 +305,10 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
             cmd
         },
         "run deoptimisation regression",
+    );
+    assert_has(
+        &String::from_utf8_lossy(&output.stdout),
+        "test result: ok. 1 passed; 0 failed; 0 ignored;",
+        "the exact deoptimisation regression must execute, not merely match zero tests",
     );
 }
