@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Compile-time traversal now preserves remaining definitions when garbage
+  collection relocates the forms being processed
+  ([#35](https://github.com/atgreen/evergreen/pull/35)).
+
 - `COMPILE-FILE` now leaves ordinary `DEFPARAMETER` initialization until load
   time, preserving existing values and avoiding duplicate initializer effects
   while retaining compile-time special declarations

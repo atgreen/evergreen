@@ -11607,6 +11607,9 @@ fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Option<EgclVal> {
     }
 }
 
+#[cfg(test)]
+mod compile_traversal_rooting_tests;
+
 fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
     if !form.is_cons() {
         return;
@@ -11683,11 +11686,12 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
             _ => {}
         }
     }
-    let mut cursor = form;
+    egcl_rt::rooted!(cursor = form);
     while cursor.is_cons() {
-        let (item, rest) = cp(cursor);
+        let item = cp(*cursor).0;
         seed_compile_time_definitions(item, env);
-        cursor = rest;
+        // Recursive evaluation may relocate the entire list, including its tail.
+        *cursor = cp(*cursor).1;
     }
 }
 
@@ -12186,9 +12190,9 @@ fn process_compile_toplevel_form_at(
                     let mut rest = cdr;
                     egcl_rt::rooted_ref!(_rest_root = &mut rest);
                     while rest.is_cons() {
-                        let (sub, tail) = cp(rest);
+                        let sub = cp(rest).0;
                         process_compile_toplevel_form_at(sub, env, depth + 1)?;
-                        rest = tail;
+                        rest = cp(rest).1;
                     }
                     return Ok(());
                 }
