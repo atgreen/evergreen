@@ -198,11 +198,44 @@ def parse_citations(repo: Path) -> set[str]:
     return cited
 
 
+def load_debt(path: Path, reqs: dict[str, Req], cited: set[str],
+              manifest_stage: int | None) -> dict[str, dict[str, str]]:
+    data = json.loads(path.read_text())
+    if (not isinstance(data, dict) or set(data) != {"version", "entries"}
+            or type(data["version"]) is not int or data["version"] != 1
+            or not isinstance(data["entries"], list)):
+        raise ValueError("expected version 1 and an entries array")
+    debt = {}
+    fields = {"requirement", "bead", "kind", "reason"}
+    for entry in data["entries"]:
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or any(not isinstance(v, str) or not v.strip() for v in entry.values())):
+            raise ValueError("each entry needs requirement, bead, kind and nonempty reason")
+        rid = entry["requirement"]
+        if rid in debt:
+            raise ValueError(f"duplicate debt entry: {rid}")
+        if not re.fullmatch(r"[a-z][a-z0-9]*-[a-z0-9]+(?:\.\d+)*", entry["bead"]):
+            raise ValueError(f"invalid Bead identifier for {rid}")
+        if entry["kind"] not in {"implementation", "validation"}:
+            raise ValueError(f"invalid debt kind for {rid}")
+        req = reqs.get(rid)
+        if req is None or not req.level.startswith("MUST"):
+            raise ValueError(f"debt must name an existing MUST requirement: {rid}")
+        if manifest_stage is not None and (req.stage is None or req.stage > manifest_stage):
+            raise ValueError(f"debt is outside the declared current stage: {rid}")
+        if rid in cited:
+            raise ValueError(f"stale debt entry now has a citing test; remove it: {rid}")
+        debt[rid] = entry
+    return debt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--repo", default=".", help="repo root (default: cwd)")
     ap.add_argument("--gate", action="store_true",
                     help="exit non-zero if an in-scope MUST requirement is uncovered")
+    ap.add_argument("--debt-baseline", metavar="PATH",
+                    help="explicit approved debt file, relative to --repo; reject new gaps")
     ap.add_argument("--stage", type=int, default=None,
                     help="override current stage (default: spec/stages.json or $EGCL_STAGE)")
     ap.add_argument("--all", action="store_true",
@@ -244,6 +277,15 @@ def main() -> int:
     in_scope_must = {r: q for r, q in must.items() if in_scope(q)}
     uncovered_scope = sorted(r for r in in_scope_must if r not in cited)
     covered_scope = len(in_scope_must) - len(uncovered_scope)
+    debt = {}
+    if args.debt_baseline:
+        try:
+            debt = load_debt(repo / args.debt_baseline, reqs, cited, manifest_stage)
+        except (OSError, ValueError) as error:
+            print(f"spec-coverage: invalid debt baseline: {error}", file=sys.stderr)
+            return 2
+    known_debt = sorted(set(uncovered_scope) & debt.keys())
+    new_gaps = sorted(set(uncovered_scope) - debt.keys())
 
     deferred = [q for r, q in must.items()
                 if not in_scope(q) and q.stage is not None]
@@ -266,6 +308,9 @@ def main() -> int:
     print(f"  in-scope covered   : {covered_scope}/{len(in_scope_must)} "
           f"({100 * covered_scope // max(len(in_scope_must), 1)}%)")
     print(f"  in-scope UNCOVERED : {len(uncovered_scope)}")
+    if args.debt_baseline:
+        print(f"  known debt         : {len(known_debt)} (not covered)")
+        print(f"  unapproved gaps    : {len(new_gaps)}")
     if current_stage is not None:
         print(f"  deferred (> stage) : {len(deferred)}")
         print(f"  unstaged (no stage): {len(unstaged)}")
@@ -280,6 +325,12 @@ def main() -> int:
             shown = ", ".join(ids[:10]) + (" …" if len(ids) > 10 else "")
             print(f"    {fname:32} {len(ids):3}  {shown}")
 
+    if known_debt:
+        print("\n  Approved debt (still uncovered):")
+        for rid in known_debt:
+            entry = debt[rid]
+            print(f"    {rid} [{entry['kind']}] {entry['bead']}: {entry['reason']}")
+
     if unstaged and current_stage is not None:
         by_file = defaultdict(list)
         for q in unstaged:
@@ -291,12 +342,18 @@ def main() -> int:
             shown = ", ".join(ids[:10]) + (" …" if len(ids) > 10 else "")
             print(f"    {fname:32} {len(ids):3}  {shown}")
 
-    if args.gate and uncovered_scope:
+    if args.gate and new_gaps:
         scope = "spec" if current_stage is None else f"stage <= {current_stage}"
-        print(f"\nspec-coverage: GATE FAILED — {len(uncovered_scope)} in-scope "
-              f"({scope}) MUST requirement(s) have no citing test.",
+        print(f"\nspec-coverage: GATE FAILED — {len(new_gaps)} in-scope "
+              f"({scope}) MUST requirement(s) have no citing test or approved debt: "
+              + ", ".join(new_gaps),
               file=sys.stderr)
         return 1
+
+    if args.gate and known_debt:
+        print(f"\nspec-coverage: PASS WITH DEBT — {len(known_debt)} remain uncovered; "
+              "no new gaps. This is not implementation or stage completion.")
+        return 0
 
     print("\nspec-coverage: OK" if not uncovered_scope
           else "\nspec-coverage: report only (no --gate)")
