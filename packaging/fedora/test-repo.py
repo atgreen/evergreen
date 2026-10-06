@@ -205,6 +205,21 @@ class WorkflowAgreementTests(unittest.TestCase):
     # %check, where it raised FileNotFoundError and failed every binaries job.
     # Skip there rather than pass silently; the release workflow's own plan job
     # runs this file on a full checkout, which is where the invariant is real.
+    @unittest.skipUnless(WORKFLOW.is_file(), 'workflows are not shipped in the source RPM')
+    def test_pages_publishers_preserve_pending_and_running_work(self):
+        for path in (REPOSITORY_WORKFLOW, WORKFLOW.with_name('docs.yml')):
+            with self.subTest(workflow=path.name):
+                policy = re.search(r'^concurrency:\n((?:[ \t]+[^\n]*\n|\n)+)',
+                                   path.read_text(), re.MULTILINE)
+                self.assertIsNotNone(policy, 'a workflow-level publication lock is required')
+                settings = dict(re.findall(r'^  ([a-z-]+):[ \t]+([^\n]+)$',
+                                           policy.group(1), re.MULTILINE))
+                self.assertEqual(settings, {
+                    'group': 'pages',
+                    'cancel-in-progress': 'false',
+                    'queue': 'max',
+                })
+
     @unittest.skipUnless(WORKFLOW.is_file(), 'release.yml is not shipped in the source RPM')
     def test_the_test_channel_cap_matches_the_prerelease_prune(self):
         """Cross-file invariant: a channel referencing a pruned release 404s.
