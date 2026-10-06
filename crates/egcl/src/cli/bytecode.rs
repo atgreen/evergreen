@@ -3901,18 +3901,13 @@ impl<'e> Lowerer<'e> {
 
     // ── Non-local control flow lowering (nmq.4) ────────────────────
 
-    /// `(block name body...)` — establish a lexical exit, run the body.
-    /// Whether an instruction could let a `return-from` reach a block from OUTSIDE
-    /// the function that established it.
-    ///
-    /// Only two things can: creating a closure (which may contain a named return to
-    /// an enclosing block), or a named return itself. Everything else transfers
-    /// control within this function, where `ReturnFrom { block_id }` already
-    /// handles it without consulting `env.block_stack`.
+    /// Whether an instruction could capture or use a control scope from outside
+    /// the function that established it. Local transfers already carry scope IDs
+    /// and do not need named registrations on the shared control-token stack.
     ///
     /// Deliberately conservative — it answers "could", not "does" — and it is
     /// applied to EMITTED code, so a closure a macro produced is included.
-    fn instr_may_escape_block(instr: &Instr) -> bool {
+    fn instr_may_capture_control(instr: &Instr) -> bool {
         matches!(
             instr,
             // Closure construction, in each of the three shapes the lowerer emits:
@@ -3961,7 +3956,7 @@ impl<'e> Lowerer<'e> {
         // the instruction stream is post-expansion and therefore complete.
         let register = self.code[push_at + 1..]
             .iter()
-            .any(Self::instr_may_escape_block);
+            .any(Self::instr_may_capture_control);
         if let Instr::PushBlock {
             resume_bcp,
             register: reg,
@@ -4116,25 +4111,20 @@ impl<'e> Lowerer<'e> {
             });
         }
 
-        // If this tagbody's body can create a capturing closure, register each
-        // tag on the shared control-token stack via NamedTag so a non-local
-        // `GO` from that closure (GoNamed) can unwind here (bliss-x8t). Emitted
-        // right after PushTag (runs once at tagbody entry); tag_bcp is patched
-        // below once tag PCs are known, like pending_gos. A LOOP-FINISH target
-        // must also be registered when a macro hides the closure from this
-        // source scan. Registration is once at entry, not on each back-edge.
+        // Provision every tag before lowering: a macro can introduce a closure
+        // targeting any of them. After expansion, keep these registrations only
+        // if the emitted body can capture control. Registration runs at entry,
+        // not on each back-edge.
         let mut named_tag_idxs: Vec<(usize, String)> = Vec::new();
-        let may_capture = body_may_capture_closure(&items);
         for name in &tag_order {
-            if may_capture || self.loop_finish_tag.as_ref() == Some(name) {
-                let name_idx = self.intern_name(name);
-                self.emit(Instr::NamedTag {
-                    name_idx,
-                    tag_bcp: 0,
-                });
-                named_tag_idxs.push((self.code.len() - 1, name.clone()));
-            }
+            let name_idx = self.intern_name(name);
+            self.emit(Instr::NamedTag {
+                name_idx,
+                tag_bcp: 0,
+            });
+            named_tag_idxs.push((self.code.len() - 1, name.clone()));
         }
+        let body_start = self.code.len();
 
         self.tag_scope.push(TagScope {
             id: tagbody_id,
@@ -4155,6 +4145,9 @@ impl<'e> Lowerer<'e> {
         }
 
         let scope = self.tag_scope.pop().unwrap();
+        let may_capture = self.code[body_start..]
+            .iter()
+            .any(Self::instr_may_capture_control);
         if scoped {
             self.emit(Instr::PopHandler);
         }
@@ -4177,13 +4170,16 @@ impl<'e> Lowerer<'e> {
             }
         }
 
-        // Patch NamedTag resume PCs now that tag positions are known (bliss-x8t).
+        // A fallthrough branch removes unused registration without moving any
+        // instruction: all branch, resume, and deoptimisation PCs stay valid.
         for (idx, name) in &named_tag_idxs {
             let target = *scope.tags.get(name).ok_or(Bail)?;
             if target == usize::MAX {
                 return Err(Bail);
             }
-            if let Instr::NamedTag { tag_bcp, .. } = &mut self.code[*idx] {
+            if !may_capture {
+                self.code[*idx] = Instr::Br(*idx as u32 + 1);
+            } else if let Instr::NamedTag { tag_bcp, .. } = &mut self.code[*idx] {
                 *tag_bcp = target as u32;
             }
         }
@@ -12230,14 +12226,13 @@ fn body_contains_loop(body: EgclVal) -> bool {
 }
 
 /// True if `body` lexically contains a closure-creating form (`LAMBDA`,
-/// `FUNCTION`, `FLET`, `LABELS`, `NAMED-LAMBDA`). Used to gate the tagbody
-/// `NamedTag` side-channel (bliss-x8t): only such a body can produce a capturing
-/// closure whose non-local `GO` must resolve through `env.tag_stack`. Loops with
-/// no closure emit no `NamedTag`, leaving the hot LOOP/DO/DOTIMES path untouched.
+/// `FUNCTION`, `FLET`, `LABELS`, `NAMED-LAMBDA`). Used to decide whether
+/// capture analysis needs pre-expansion. Named control registration is decided
+/// separately from the emitted instructions, after macros have expanded.
 fn body_may_capture_closure(items: &[EgclVal]) -> bool {
     fn walk(v: EgclVal, depth: u32) -> bool {
         if depth > 400 {
-            return true; // deep/odd form — err toward registering (safe, additive)
+            return true; // deep/odd form — conservatively request capture analysis
         }
         if v.is_cons() {
             let (car, cdr) = cp(v);
