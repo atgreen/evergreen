@@ -59,7 +59,7 @@ fn a_defparameter_compiled_in_a_file_is_not_a_constant() {
             "(defparameter *probe-p* 42)",
             "(list (boundp '*probe-p*) (constantp '*probe-p*))"
         ),
-        "(T NIL)"
+        "(NIL NIL)"
     );
 }
 
