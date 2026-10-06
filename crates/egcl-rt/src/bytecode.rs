@@ -33,6 +33,33 @@ pub mod typep_class {
     pub const HASH_TABLE: u16 = 8;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum MemoryFenceKind {
+    Read = 1,
+    Write = 2,
+    Full = 3,
+}
+
+impl MemoryFenceKind {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Read),
+            2 => Some(Self::Write),
+            3 => Some(Self::Full),
+            _ => None,
+        }
+    }
+
+    pub fn ordering(self) -> std::sync::atomic::Ordering {
+        match self {
+            Self::Read => std::sync::atomic::Ordering::Acquire,
+            Self::Write => std::sync::atomic::Ordering::Release,
+            Self::Full => std::sync::atomic::Ordering::SeqCst,
+        }
+    }
+}
+
 /// A single bytecode instruction. Operand-stack based; the frame's value-slot
 /// area holds `n_locals` lexical slots followed by `max_stack` operand slots
 /// (spec D2.03).
@@ -115,6 +142,8 @@ pub enum Instr {
     /// of tag-checkable types to avoid a c2i `CallNamed` to TYPEP on the hot
     /// package-machinery path (bliss-gq5).
     TypeP(u16),
+    /// Execute a native memory-ordering fence and push NIL.
+    MemoryFence(MemoryFenceKind),
     /// Return the top of the operand stack to the caller.
     Return,
 

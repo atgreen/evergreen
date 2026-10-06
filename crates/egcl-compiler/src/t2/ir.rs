@@ -285,6 +285,7 @@ pub enum Opcode {
     VecSet,
     SetSymbolValue,
     WriteBarrier,
+    MemoryFence,
     Alloc,
     AllocCons,
     /// Reset the thread's multiple-values state (interpreter `ClearMv`, emitted
@@ -435,6 +436,7 @@ pub enum AuxData {
     /// `TypeTag`, classes such as BOOLEAN and LIST are not equivalent to their
     /// broad type-lattice union.
     TypepClass(u16),
+    MemoryFence(egcl_rt::bytecode::MemoryFenceKind),
     ValuesLocals {
         nvars: u16,
         slot_base: u16,

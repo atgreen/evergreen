@@ -187,7 +187,7 @@ pub fn backend_is_bytecode() -> bool {
 // interpreter, and the T1 native emitter that operate on these types.
 use egcl_rt::bytecode::{
     BytecodeFunction, ClauseInfo, DeclaredType, HandlerBindInfo, HandlerCaseInfo, Instr,
-    RestartCaseInfo, RestartClauseInfo, VarLoc, typep_class,
+    MemoryFenceKind, RestartCaseInfo, RestartClauseInfo, VarLoc, typep_class,
 };
 
 // ── Per-thread registry of compiled functions ─────────────────────
@@ -847,6 +847,23 @@ fn typep_inline_class(rest: EgclVal) -> Option<u16> {
         return Some(typep_class::BOOLEAN);
     }
     None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn literal_memory_fence(rest: EgclVal) -> Option<MemoryFenceKind> {
+    if !rest.is_cons() {
+        return None;
+    }
+    let (kind, tail) = cp(rest);
+    if !tail.is_nil() || !kind.is_symbol() {
+        return None;
+    }
+    match egcl_rt::symbols::registry_key(kind.as_symbol_index()).as_deref() {
+        Some("KEYWORD:READ" | "KEYWORD:DATA-DEPENDENCY") => Some(MemoryFenceKind::Read),
+        Some("KEYWORD:WRITE") => Some(MemoryFenceKind::Write),
+        Some("KEYWORD:FULL") => Some(MemoryFenceKind::Full),
+        _ => None,
+    }
 }
 
 /// Execute an inline [`Instr::TypeP`] check of `v` against `class`, using the
@@ -3336,6 +3353,17 @@ impl<'e> Lowerer<'e> {
             .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
         if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv) {
             return self.lower_expr(expanded);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if name == "EGCL::%MEMORY-FENCE"
+                && let Some(kind) = literal_memory_fence(rest)
+            {
+                self.emit(Instr::ClearMv);
+                self.emit(Instr::MemoryFence(kind));
+                self.push_n(1);
+                return Ok(());
+            }
         }
         // Inline `(typep x 'SIMPLE-TYPE)` as a direct tag check instead of a c2i
         // CallNamed to TYPEP — this is the hottest builtin on the package-
@@ -8812,7 +8840,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x010c: preserve load-time IN-PACKAGE (SetPackage, action 12).
 // 0x010d: source-independent multidimensional-array constants (tag 19).
 // 0x010e: forward and cyclic references in aggregate constants.
-const BBU_BYTECODE_VERSION: u16 = 0x010e;
+// 0x010f: native memory-fence bytecode (opcode 0x44).
+const BBU_BYTECODE_VERSION: u16 = 0x010f;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -9305,6 +9334,7 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::MakeClosure { .. } => 7,
         Instr::AllocCons => 1,
         Instr::TypeP(_) => 3, // opcode byte + u16 type-class
+        Instr::MemoryFence(_) => 2,
         Instr::Pop | Instr::Dup => 1,
         Instr::Br(_) | Instr::BrIfFalse(_) | Instr::BrIfTrue(_) => 5,
         Instr::CallNamed { .. } => 7,
@@ -9471,6 +9501,10 @@ fn serialize_bbu_function(
             Instr::TypeP(class) => {
                 put_u8(&mut code, 0x42);
                 put_u16(&mut code, *class);
+            }
+            Instr::MemoryFence(kind) => {
+                put_u8(&mut code, 0x44);
+                put_u8(&mut code, *kind as u8);
             }
             Instr::Pop => put_u8(&mut code, 0x11),
             Instr::Dup => put_u8(&mut code, 0x12),
@@ -11801,6 +11835,10 @@ fn decode_bbu_function(
             0x27 => Instr::PopHandler,
             0x30 => Instr::AllocCons,
             0x42 => Instr::TypeP(cursor.u16()?),
+            0x44 => Instr::MemoryFence(
+                MemoryFenceKind::from_u8(cursor.u8()?)
+                    .ok_or_else(|| bbu_error("invalid memory-fence kind"))?,
+            ),
             0x28 => Instr::PushHandlerCase {
                 hc: cursor.u32()?,
                 sp_restore: cursor.u16()?,
@@ -12952,6 +12990,7 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
             Instr::ClearMv => (0, 0),
             Instr::Dup => (1, 2),
             Instr::TypeP(_) => (1, 1),
+            Instr::MemoryFence(_) => (0, 1),
             Instr::AllocCons => (2, 1),
             Instr::SetValues(nvals) => (*nvals as u32, 1),
             Instr::ValuesToList => (1, 1),
@@ -13152,6 +13191,7 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclEr
             | Instr::PopRestartCase => Some((0, 0)),
             Instr::ValuesToList => Some((1, 1)),
             Instr::TypeP(_) => Some((1, 1)),
+            Instr::MemoryFence(_) => Some((0, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
             Instr::Dup => Some((1, 2)),
@@ -15161,6 +15201,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 } else {
                     NIL
                 });
+            }
+            Instr::MemoryFence(kind) => {
+                env.clear_mv();
+                std::sync::atomic::fence(kind.ordering());
+                acts[top_idx].push_op(NIL);
             }
             Instr::Pop => {
                 acts[top_idx].pop_op();
@@ -20759,7 +20804,8 @@ fn emit_native(
                 // 16-aligned for calls (same contract as CallNamed).
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
                 c.extend_from_slice(&clear_mv_addr.to_le_bytes());
-                emit_c2i_helper_call(&mut c);
+                // This leaf helper cannot allocate or signal.
+                c.extend_from_slice(&[0xff, 0xd0]); // call rax
             }
             // Name indexes belong to this exact code version, not the current
             // symbol definition. NativeCode/OsrCode retain this body even after
@@ -20998,6 +21044,16 @@ fn emit_native(
                 c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
                 c.extend_from_slice(&typep_class_addr.to_le_bytes());
                 emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::MemoryFence(kind) => {
+                match kind {
+                    MemoryFenceKind::Read => c.extend_from_slice(&[0x0f, 0xae, 0xe8]),
+                    MemoryFenceKind::Write => c.extend_from_slice(&[0x0f, 0xae, 0xf8]),
+                    MemoryFenceKind::Full => c.extend_from_slice(&[0x0f, 0xae, 0xf0]),
+                }
+                c.extend_from_slice(&[0x48, 0xb8]);
+                c.extend_from_slice(&NIL.0.to_le_bytes());
                 push_rax(&mut c);
             }
             unsupported => {
