@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Functions returned by `MACRO-FUNCTION` now retain their macro definition
+  after redefinition, and copied macro expanders survive saved-image restoration
+  ([#32](https://github.com/atgreen/evergreen/pull/32)).
+
 - Compiled `TYPEP` now returns exactly one value at every execution tier,
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).

@@ -1093,9 +1093,7 @@ fn resolve(name: &str) -> Option<Handler> {
         "MACRO-FUNCTION" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (macro-function symbol &optional environment) → an expander or
-            // NIL. egcl macros are not first-class functions; return T for a
-            // macro (callers here use it as a boolean) and NIL otherwise.
+            // Return a first-class expander that owns the selected definition.
 
             let s = args.first().copied().unwrap_or(NIL);
             if s.is_symbol() {
@@ -1108,17 +1106,17 @@ fn resolve(name: &str) -> Option<Handler> {
                     if let Some(f) = mdef.function {
                         return Ok(f);
                     }
+                    return Ok(snapshot_macro_expander(env, mdef));
                 }
-                // A registered source/bytecode macro, OR a standard CL macro
-                // that egcl implements as a special-form arm (AND/OR/WHEN/COND/
-                // MULTIPLE-VALUE-BIND/DEFUN/…). Either way MACRO-FUNCTION must
+                // A standard CL macro implemented as a special-form arm still
+                // needs a two-argument callable wrapper. MACRO-FUNCTION must
                 // return a genuine two-argument (form environment) expander per
                 // CLHS 3.1.2.1.2.2, so `(funcall (macro-function 'NAME) …)`
-                // enforces the arity — a wrong count trips the lambda binder's
+                // enforce the arity — a wrong count trips the lambda binder's
                 // PROGRAM-ERROR (ansi AND/OR/WHEN/COND/RETURN/DEFUN/MULTIPLE-
                 // VALUE-*/…-ERROR.1/2). Standard special OPERATORS that are not
                 // macros (IF, PROGN, LET, QUOTE, …) are excluded and return NIL.
-                if mdef.is_some() || is_ansi_standard_macro(&bare) {
+                if is_ansi_standard_macro(&bare) {
                     return synthesize_macro_expander(env, s);
                 }
             }
