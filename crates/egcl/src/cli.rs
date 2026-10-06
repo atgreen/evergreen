@@ -19770,17 +19770,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                         format_val(sym)
                                     )));
                                 }
+                                let name = sym_name(sym);
                                 let fnval = coerce_installed_function(env, *val);
-                                global_macro_insert(
-                                    sym_name(sym),
-                                    MacroDef {
-                                        params_form: NIL,
-                                        body: NIL,
-                                        captured_frame: Arc::clone(&env.frame),
-                                        bytecode: None,
-                                        function: Some(fnval),
-                                    },
-                                );
+                                let definition = macro_definition_for_function(env, fnval);
+                                global_macro_insert(name, definition);
                             }
                             "COMPILER-MACRO-FUNCTION" => {
                                 // (setf (compiler-macro-function name) fn) — how
@@ -28345,6 +28338,59 @@ fn synthesize_macro_expander(env: &mut Env, name: EgclVal) -> Result<EgclVal, Eg
     eval_form(*lambda_form, env)
 }
 
+#[cfg(test)]
+mod macro_function_rooting_tests;
+
+fn macro_definition_for_function(env: &Env, function: EgclVal) -> MacroDef {
+    egcl_rt::rooted!(function = function);
+    egcl_rt::rooted!(whole = gensym_symbol("WHOLE"));
+    egcl_rt::rooted!(environment = gensym_symbol("ENVIRONMENT"));
+    egcl_rt::rooted!(operands = gensym_symbol("OPERANDS"));
+    let whole_keyword = resolve_sym("&WHOLE").unwrap();
+    let environment_keyword = resolve_sym("&ENVIRONMENT").unwrap();
+    let rest_keyword = resolve_sym("&REST").unwrap();
+    let funcall = resolve_sym("FUNCALL").unwrap();
+    let quote = quote_sym();
+    egcl_rt::rooted!(params = vec_to_list(&[
+        whole_keyword, *whole, environment_keyword, *environment,
+        rest_keyword, *operands,
+    ]));
+    egcl_rt::rooted!(quoted_function = vec_to_list(&[quote, *function]));
+    egcl_rt::rooted!(call = vec_to_list(&[
+        funcall, *quoted_function, *whole, *environment,
+    ]));
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    // Images retain macro lambda lists and bodies. Keep a callable source
+    // representation alongside the direct function fast path.
+    MacroDef {
+        params_form: *params,
+        body: *body,
+        captured_frame: Arc::clone(&env.frame),
+        bytecode: None,
+        function: Some(*function),
+    }
+}
+
+fn snapshot_macro_expander(env: &Env, definition: &MacroDef) -> EgclVal {
+    egcl_rt::rooted!(definition = definition.clone());
+    egcl_rt::rooted!(descriptor = if let Some(function) = &definition.bytecode {
+        // Release the registered body's lock before closure construction can GC.
+        let function = function.lock().unwrap().clone();
+        bytecode::make_bytecode_closure(&function, Some(Arc::clone(&definition.captured_frame)))
+    } else {
+        register_tree_closure(Closure {
+            params_form: definition.params_form,
+            body: definition.body,
+            captured_frame: Arc::clone(&definition.captured_frame),
+            captured_specials: env.locally_specials.clone(),
+            captured_blocks: env.block_stack.clone(),
+            captured_tags: env.tag_stack.clone(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+        })
+    });
+    make_expander_function(*descriptor, NIL, None)
+}
+
 fn symbol_plist_of(sym: EgclVal) -> EgclVal {
     // symbol_index (not as_symbol_index): is_symbol reports NIL/T as symbols
     // but they carry no symbol-table index, so `(get nil …)` — legal CL,
@@ -31796,6 +31842,16 @@ fn make_compiler_macro_function(
     symbol_macros: EgclVal,
     package: &str,
 ) -> EgclVal {
+    make_expander_function(descriptor, symbol_macros, Some(package))
+}
+
+// Ordinary macro functions use the invocation's dynamic package. Compiler
+// macros retain their existing definition-package behavior.
+fn make_expander_function(
+    descriptor: EgclVal,
+    symbol_macros: EgclVal,
+    package: Option<&str>,
+) -> EgclVal {
     egcl_rt::rooted!(descriptor = descriptor);
     egcl_rt::rooted!(symbol_macros = symbol_macros);
     egcl_rt::rooted!(whole = egcl_rt::symbols::make_uninterned("WHOLE"));
@@ -31803,7 +31859,8 @@ fn make_compiler_macro_function(
     let invoke = resolve_sym("EGCL::%INVOKE-COMPILER-MACRO").unwrap();
     let quote = quote_sym();
     egcl_rt::rooted!(params = vec_to_list(&[*whole, *environment]));
-    egcl_rt::rooted!(package = arena_str(package));
+    let label = if package.is_some() { "COMPILER-MACRO" } else { "MACRO" };
+    egcl_rt::rooted!(package = package.map(arena_str).unwrap_or(NIL));
     egcl_rt::rooted!(quoted_descriptor = vec_to_list(&[quote, *descriptor]));
     egcl_rt::rooted!(quoted_macros = vec_to_list(&[quote, *symbol_macros]));
     egcl_rt::rooted!(
@@ -31817,7 +31874,7 @@ fn make_compiler_macro_function(
         ])
     );
     egcl_rt::rooted!(body = arena_cons(*call, NIL));
-    let name = egcl_rt::symbols::make_uninterned("COMPILER-MACRO");
+    let name = egcl_rt::symbols::make_uninterned(label);
     egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
 }
 
@@ -31837,8 +31894,14 @@ fn invoke_compiler_macro_function(
             "invalid compiler macro environment".into(),
         ));
     }
-    let package = string_designator(args[3]);
     let package_symbol = resolve_sym("*PACKAGE*").unwrap();
+    let package = if args[3].is_nil() {
+        global_value_cell(package_symbol.as_symbol_index())
+            .and_then(package_object_name)
+            .unwrap_or_else(|| caller.current_package.clone())
+    } else {
+        string_designator(args[3])
+    };
     egcl_rt::rooted!(package_value = package_object(&package));
     egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, *package_value));
     let mut env = Env::new_for_macro_expansion(caller.sandbox);
