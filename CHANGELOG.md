@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Generated `DEFSTRUCT` setters now enforce slot types before mutation,
+  including inherited constraints and list/vector-backed structures
+  ([#37](https://github.com/atgreen/evergreen/pull/37)).
+
 - `COMPILE-FILE` no longer runs ordinary `DEFVAR` initializers early, and
   explicit compile-time initialization follows source order while existing
   bindings remain unchanged
