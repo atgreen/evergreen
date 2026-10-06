@@ -11650,7 +11650,10 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 }
                 return;
             }
-            "DEFPARAMETER" | "DEFCONSTANT" => {
+            // Top-level processing proclaims parameters special in order.
+            // Their initializers run only when the form is actually evaluated.
+            "DEFPARAMETER" => return,
+            "DEFCONSTANT" => {
                 // CLHS 3.2.2.3: a DEFCONSTANT compiled in a file is recognised as
                 // a constant for the rest of that compilation, so seeding its
                 // value is not enough — the name must be MARKED. Seeding it as an
@@ -11659,26 +11662,19 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 // re-evaluating, then reported "already bound non-constant
                 // variable" when the fasl loaded. That is what stopped iolib
                 // loading (bliss-vhr6e).
-                let constant = symbol_leaf_name(&op_name) == "DEFCONSTANT";
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() {
                     if rest.is_cons() {
                         // As for DEFVAR above: an init form that cannot be
-                        // evaluated yet seeds nothing. DEFPARAMETER would at least
-                        // be re-assigned later, but a seeded NIL is still visible
-                        // to every compile-time form in between, and DEFCONSTANT
-                        // makes it permanent (bliss-2pmq).
+                        // evaluated yet seeds nothing. A seeded NIL would become
+                        // a permanent constant (bliss-2pmq).
                         if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
                             seed_compile_time_binding(env, symbol, value);
-                            if constant {
-                                mark_constant_name(symbol);
-                            }
+                            mark_constant_name(symbol);
                         }
                     } else {
                         seed_compile_time_binding(env, symbol, NIL);
-                        if constant {
-                            mark_constant_name(symbol);
-                        }
+                        mark_constant_name(symbol);
                     }
                 }
                 return;
@@ -12170,6 +12166,17 @@ fn process_compile_toplevel_form_at(
         if op.is_symbol() {
             let name = sym_name(op);
             match symbol_leaf_name(&name) {
+                "DEFPARAMETER"
+                    if egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
+                        egcl_stdlib::find_present_symbol(package, "DEFPARAMETER") == Some(op)
+                    }) =>
+                {
+                    // This declaration is needed by subsequent forms, including
+                    // parameters introduced by a top-level macro expansion.
+                    // Proclaiming a symbol does not allocate Lisp objects.
+                    proclaim_special(cp(cdr).0);
+                    return Ok(());
+                }
                 "DEFINE-PACKAGE" => {
                     eval_defpackage(cdr, env)?;
                     return Ok(());
