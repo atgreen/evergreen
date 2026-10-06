@@ -11618,44 +11618,9 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
     if op.is_symbol() {
         let op_name = sym_name(op);
         match symbol_leaf_name(&op_name) {
-            "DEFVAR" => {
-                let (symbol, rest) = cp(cdr);
-                if symbol.is_symbol() {
-                    if rest.is_cons() {
-                        // (defvar name value): seed the binding if unbound — but
-                        // ONLY if the init form actually evaluates. This scan runs
-                        // BEFORE the form's own compile-time processing, so a
-                        // DEFVAR nested in an `(eval-when (:compile-toplevel …) …)`
-                        // is reached before the helpers defined ahead of it in that
-                        // same body exist. Seeding NIL on failure is far worse than
-                        // seeding nothing: DEFVAR assigns only when the name is
-                        // UNBOUND, so the NIL sticks for the whole process and
-                        // neither the eval-when body nor the later fasl load can
-                        // replace it. dexador defines
-                        //   (defvar +crlf+ (ascii-string-to-octets (format nil "~C~C" …)))
-                        // that way, so +crlf+ became NIL, every
-                        // `(fast-write-sequence +crlf+ …)` wrote ZERO bytes, and
-                        // EGCL sent HTTP requests with no CRLF anywhere — one
-                        // unparseable line that servers reject (bliss-2pmq).
-                        if env.lookup_var_symbol(symbol).is_none() {
-                            if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
-                                seed_compile_time_binding(env, symbol, value);
-                            }
-                        }
-                    } else {
-                        // (defvar name) with no value only proclaims NAME special;
-                        // it must NOT bind a value (NAME stays unbound, CLHS).
-                        // Seeding NIL here made a compiled `(defvar x)` spuriously
-                        // BOUNDP — e.g. bordeaux-threads v2's CURRENT-THREAD asserts
-                        // on `(boundp '*current-thread*)` (bliss-66ny).
-                        proclaim_special(symbol);
-                    }
-                }
-                return;
-            }
-            // Top-level processing proclaims parameters special in order.
+            // Top-level processing proclaims variables special in order.
             // Their initializers run only when the form is actually evaluated.
-            "DEFPARAMETER" => return,
+            "DEFVAR" | "DEFPARAMETER" => return,
             "DEFCONSTANT" => {
                 // CLHS 3.2.2.3: a DEFCONSTANT compiled in a file is recognised as
                 // a constant for the rest of that compilation, so seeding its
@@ -11668,8 +11633,8 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 let (symbol, rest) = cp(cdr);
                 if symbol.is_symbol() {
                     if rest.is_cons() {
-                        // As for DEFVAR above: an init form that cannot be
-                        // evaluated yet seeds nothing. A seeded NIL would become
+                        // An init form that cannot be evaluated yet seeds
+                        // nothing. A seeded NIL would become
                         // a permanent constant (bliss-2pmq).
                         if let Some(value) = probe_compile_time_value(cp(rest).0, env) {
                             seed_compile_time_binding(env, symbol, value);
@@ -12170,13 +12135,14 @@ fn process_compile_toplevel_form_at(
         if op.is_symbol() {
             let name = sym_name(op);
             match symbol_leaf_name(&name) {
-                "DEFPARAMETER"
+                "DEFVAR" | "DEFPARAMETER"
                     if egcl_stdlib::find_package("COMMON-LISP").is_some_and(|package| {
-                        egcl_stdlib::find_present_symbol(package, "DEFPARAMETER") == Some(op)
+                        egcl_stdlib::find_present_symbol(package, symbol_leaf_name(&name))
+                            == Some(op)
                     }) =>
                 {
                     // This declaration is needed by subsequent forms, including
-                    // parameters introduced by a top-level macro expansion.
+                    // definitions introduced by a top-level macro expansion.
                     // Proclaiming a symbol does not allocate Lisp objects.
                     proclaim_special(cp(cdr).0);
                     return Ok(());

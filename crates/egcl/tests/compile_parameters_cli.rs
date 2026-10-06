@@ -107,3 +107,83 @@ fn unrelated_same_named_macros_keep_their_compile_time_effects() {
         "(assert (= *foreign-macro-count* 1))",
     );
 }
+
+#[test]
+fn defvar_initialization_waits_until_loading() {
+    compile_and_load(
+        "(defparameter *initializations* 0)",
+        "(defvar *compiled-variable* (progn (incf *initializations*) (list 73)))",
+        "(assert (zerop *initializations*)) (assert (not (boundp '*compiled-variable*)))",
+        "(assert (= *initializations* 1)) (assert (equal *compiled-variable* '(73)))",
+    );
+}
+
+#[test]
+fn defvar_never_reinitializes_an_existing_binding() {
+    compile_and_load(
+        "(defparameter *initializations* 0) (defvar *compiled-variable* :original)",
+        "(defvar *compiled-variable* (progn (incf *initializations*) (error \"reinitialized\")))",
+        "(assert (zerop *initializations*)) (assert (eq *compiled-variable* :original))",
+        "(assert (zerop *initializations*)) (assert (eq *compiled-variable* :original))",
+    );
+}
+
+#[test]
+fn direct_and_macro_generated_defvars_proclaim_special_at_compile_time() {
+    compile_and_load(
+        "",
+        "(progn
+           (defvar direct-variable :loaded)
+           (defvar uninitialized-variable)
+           (defmacro define-variable () '(defvar expanded-variable :expanded))
+           (define-variable)
+           (eval-when (:compile-toplevel)
+             (assert (eq (let ((direct-variable :dynamic)) (symbol-value 'direct-variable)) :dynamic))
+             (assert (eq (let ((expanded-variable :dynamic)) (symbol-value 'expanded-variable)) :dynamic))
+             (assert (eq (let ((uninitialized-variable :dynamic)) (symbol-value 'uninitialized-variable)) :dynamic))))",
+        "(assert (not (boundp 'direct-variable)))
+         (assert (not (boundp 'expanded-variable)))
+         (assert (not (boundp 'uninitialized-variable)))",
+        "(assert (eq direct-variable :loaded))
+         (assert (eq expanded-variable :expanded))
+         (assert (not (boundp 'uninitialized-variable)))",
+    );
+}
+
+#[test]
+fn compile_time_defvar_uses_the_preceding_helper_definition() {
+    compile_and_load(
+        "(defun variable-helper () :old)",
+        "(eval-when (:compile-toplevel :load-toplevel :execute)
+           (defun variable-helper () :new)
+           (defvar *compiled-variable* (variable-helper)))",
+        "(assert (eq *compiled-variable* :new))",
+        "(assert (eq *compiled-variable* :new))",
+    );
+}
+
+#[test]
+fn a_nested_defvar_waits_until_its_function_is_called() {
+    compile_and_load(
+        "(defparameter *initializations* 0)",
+        "(defun initialize-variable () (defvar *compiled-variable* (incf *initializations*)))",
+        "(assert (zerop *initializations*)) (assert (not (boundp '*compiled-variable*)))",
+        "(assert (zerop *initializations*)) (assert (not (boundp '*compiled-variable*)))
+         (initialize-variable) (initialize-variable)
+         (assert (= *initializations* 1)) (assert (= *compiled-variable* 1))",
+    );
+}
+
+#[test]
+fn an_unrelated_defvar_macro_keeps_its_compile_time_effect() {
+    compile_and_load(
+        "(defparameter *foreign-macro-count* 0)
+         (defpackage :variable-macros (:use :cl) (:shadow :defvar))
+         (defmacro variable-macros::defvar (name)
+           (declare (ignore name))
+           '(eval-when (:compile-toplevel) (incf *foreign-macro-count*)))",
+        "(variable-macros::defvar ordinary-name)",
+        "(assert (= *foreign-macro-count* 1))",
+        "(assert (= *foreign-macro-count* 1))",
+    );
+}
