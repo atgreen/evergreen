@@ -33794,7 +33794,8 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             if !slot.read_only {
                 egcl_rt::rooted!(writer_name = vec_to_list(&[sym("SETF"), slot.accessor]));
                 egcl_rt::rooted!(writer_params = vec_to_list(&[value, obj]));
-                egcl_rt::rooted!(body = vec_to_list(&[sym("SETF"), *place, value]));
+                egcl_rt::rooted!(checked = checked_struct_slot_form(value, slot.slot_type));
+                egcl_rt::rooted!(body = vec_to_list(&[sym("SETF"), *place, *checked]));
                 let writer = vec_to_list(&[sym("DEFUN"), *writer_name, *writer_params, *body]);
                 eval_form(writer, env)?;
             }
@@ -34503,8 +34504,16 @@ fn install_slot_accessor_method(
         let val = reader::make_uninterned_symbol("V");
         // (v (o CLASS)) — value unspecialized, object specialized on CLASS
         egcl_rt::rooted!(ll = vec_to_list(&[val, *obj_spec]));
+        // Structure metadata is installed before its DEFCLASS accessors. Keep
+        // the generic method, checking against the actual object's slot type.
+        let type_property = resolve_sym(STRUCT_SLOT_TYPES_PROPERTY).unwrap_or(NIL);
+        egcl_rt::rooted!(checked = val);
+        if plist_lookup(symbol_plist_of(*class_form), type_property).is_some() {
+            let check = resolve_sym("EGCL::%CHECKED-STRUCTURE-SLOT-VALUE").unwrap_or(NIL);
+            *checked = vec_to_list(&[check, val, obj, *quoted_slot]);
+        }
         // (setf (slot-value o 'SLOT) v)
-        let setf = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *slot_place, val]);
+        let setf = vec_to_list(&[resolve_sym("SETF").unwrap_or(NIL), *slot_place, *checked]);
         (*ll, setf)
     } else {
         // ((o CLASS)) — a one-argument reader specialized on CLASS
