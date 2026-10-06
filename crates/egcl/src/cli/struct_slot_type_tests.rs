@@ -72,5 +72,30 @@ fn constructor_check_forms_follow_relocated_inputs() {
         assert_eq!(binding[0], check[1]);
         assert_eq!(binding[0], parts[3]);
     }
+    egcl_rt::rooted!(env = Env::new(false));
+    let class = resolve_sym("WRITER-ROOT-CLASS").unwrap();
+    let slot = resolve_sym("WRITER-ROOT-SLOT").unwrap();
+    let accessor = resolve_sym("WRITER-ROOT-ACCESSOR").unwrap();
+    let property = resolve_sym(STRUCT_SLOT_TYPES_PROPERTY).unwrap();
+    egcl_rt::rooted!(types = vec_to_list(&[slot, integer]));
+    symbol_plist_put(class, property, *types);
+    let setf = resolve_sym("SETF").unwrap();
+    let check = resolve_sym("EGCL::%CHECKED-STRUCTURE-SLOT-VALUE").unwrap();
+    egcl_rt::rooted!(method_name = vec_to_list(&[setf, accessor]));
+    let before = *method_name;
+    install_slot_accessor_method(&mut env, *method_name, class, slot, true).unwrap();
+    assert_ne!(*method_name, before, "the checked writer name must move");
+    let key = function_name_key(*method_name);
+    let methods = env.methods.borrow();
+    let method = methods.get(&key).unwrap().last().unwrap();
+    fn contains(form: EgclVal, symbol: EgclVal) -> bool {
+        if form.is_cons() {
+            let (car, cdr) = cp(form);
+            contains(car, symbol) || contains(cdr, symbol)
+        } else {
+            form == symbol
+        }
+    }
+    assert!(contains(method.body, check), "the checked writer body must survive GC");
     println!("STRUCT-INPUTS-RELOCATED");
 }

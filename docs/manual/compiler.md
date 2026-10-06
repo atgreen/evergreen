@@ -83,6 +83,14 @@ not a guarantee of a particular machine-code transformation. In particular,
 declaring fixnum types is not a promise that every operation is unboxed or that
 all runtime checks disappear.
 
+`defstruct` slot `:type` declarations are checked by generated constructors
+and setters. A failed setter check signals `type-error` before changing the
+slot. For ordinary structures, inherited setters use the actual object's
+effective slot type, including a child's narrower `:include` declaration.
+List/vector-backed setters check the type declared for that accessor; their
+sequence representation does not identify a more specific structure type.
+This does not add slot-type enforcement to `defclass`.
+
 T2 uses speculative guards and can reconstruct lower-tier state when a guard
 fails. Deoptimization must preserve both completed side effects and the next
 Lisp operation to execute. Raising compilation thresholds changes when work is

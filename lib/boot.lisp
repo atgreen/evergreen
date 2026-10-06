@@ -434,6 +434,15 @@
        (setf ,place (%check-type-fail ,place ',typespec)))
      nil))
 
+(defun egcl::%checked-structure-slot-value (value object slot)
+  ;; An inherited writer must honor the actual structure's narrowed type.
+  (let ((typespec (getf (get (class-name (class-of object))
+                            'egcl::%struct-slot-types)
+                       slot t)))
+    (if (typep value typespec)
+        value
+        (%check-type-fail value typespec))))
+
 (defmacro assert (test-form &rest more)
   ;; (assert test [(place*) [datum arg*]]) — CLHS 9.2. Signal a correctable
   ;; error with a CONTINUE restart; when CONTINUE is invoked, re-evaluate
