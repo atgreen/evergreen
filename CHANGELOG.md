@@ -4,6 +4,11 @@
 
 ### Correctness and reliability
 
+- `COMPILE-FILE` no longer runs ordinary `DEFVAR` initializers early, and
+  explicit compile-time initialization follows source order while existing
+  bindings remain unchanged
+  ([#36](https://github.com/atgreen/evergreen/pull/36)).
+
 - Compile-time traversal now preserves remaining definitions when garbage
   collection relocates the forms being processed
   ([#35](https://github.com/atgreen/evergreen/pull/35)).
