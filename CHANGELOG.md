@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Bit-vector results from `COPY-SEQ`, `SUBSEQ`, and `REVERSE` now preserve
+  zero bits when garbage collection recycles storage
+  ([#41](https://github.com/atgreen/evergreen/pull/41)).
+
 - Generated `DEFSTRUCT` setters now enforce slot types before mutation,
   including inherited constraints and list/vector-backed structures
   ([#37](https://github.com/atgreen/evergreen/pull/37)).
