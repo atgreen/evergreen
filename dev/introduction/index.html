@@ -1963,9 +1963,9 @@ and does not claim complete conformance. Exporting a standard symbol or acceptin
 a declaration is not evidence that every associated behavior is implemented.
 The test suites and the behavior described in this manual are more useful than
 a blanket “supported” label.</p>
-<p>Selected SBCL-compatible interfaces help existing libraries run on EGCL.
-Compatibility does not make every <code>SB-*</code> package available, and a similar
-function name does not guarantee the same lambda list. Use the actual EGCL
+<p>Selected interfaces have semantics familiar to SBCL users, but EGCL exposes
+them through its own packages, not <code>SB-*</code> aliases or re-exports. A similar
+function name does not guarantee the same lambda list. Use the documented EGCL
 signature, especially for subprocesses and foreign calls.</p>
 <h2 id="public-and-internal-names">Public and internal names<a class="headerlink" href="#public-and-internal-names" title="Permanent link">&para;</a></h2>
 <p><code>COMMON-LISP-USER</code> (nickname <code>CL-USER</code>) is the initial application package.

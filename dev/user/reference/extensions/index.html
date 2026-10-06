@@ -1135,6 +1135,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#atomic-updates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atomic updates
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#memory-ordering" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2085,6 +2096,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#atomic-updates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atomic updates
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#memory-ordering" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2190,6 +2212,85 @@ does not treat zero as a terminator, so pass the position of the first zero as
 <code>:default</code> means UTF-8. ASCII encoding rejects non-ASCII characters. Both
 decoders replace malformed input with U+FFFD, rather than signalling as SBCL's
 default decoder does. Other external formats are not supported.</p>
+<h2 id="atomic-updates">Atomic updates<a class="headerlink" href="#atomic-updates" title="Permanent link">&para;</a></h2>
+<p><strong>Macro</strong> <code>(egcl-ext:cas place old new)</code> → previous value</p>
+<p><strong>Macro</strong> <code>(egcl-ext:atomic-incf place &amp;optional (delta 1))</code> → previous value</p>
+<p><strong>Macro</strong> <code>(egcl-ext:atomic-decf place &amp;optional (delta 1))</code> → previous value</p>
+<p><code>CAS</code> compares the current value of <code>place</code> with <code>old</code> using <code>EQ</code>. On a
+match it stores <code>new</code>; otherwise it leaves the place unchanged. It returns
+the value it observed in either case, not a success flag. Compare that result
+with the expected value using <code>EQ</code> to determine whether the exchange succeeded.</p>
+<table>
+<thead>
+<tr>
+<th>Place</th>
+<th><code>CAS</code></th>
+<th><code>ATOMIC-INCF</code> / <code>ATOMIC-DECF</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Special variable, written as a bare symbol</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Structure-slot accessor, such as <code>(counter-value counter)</code></td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>(svref simple-vector index)</code></td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>(car cons)</code> or <code>(cdr cons)</code></td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>(symbol-value symbol)</code> or <code>(symbol-plist symbol)</code></td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>(slot-value instance slot-name)</code> for an instance-allocated slot</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p>These are not general replacements for <code>SETF</code> or <code>INCF</code>: arbitrary SETF
+places and ordinary lexical variables are not supported. Symbol value cells
+refer to the current dynamic binding when one exists, otherwise to the global
+binding. Updating a thread-local dynamic binding does not update another
+thread's binding. Place subforms and value/delta forms are evaluated once,
+with place subforms evaluated before the values.</p>
+<p><code>ATOMIC-INCF</code> adds <code>delta</code>; <code>ATOMIC-DECF</code> subtracts it. Both the stored value
+and <code>delta</code> must be fixnums or a <code>TYPE-ERROR</code> is signalled. Overflow signals
+<code>ARITHMETIC-ERROR</code> rather than wrapping or promoting to a bignum. A failed
+type or overflow check does not store a replacement value. Unlike <code>INCF</code>
+and <code>DECF</code>, these macros return the value <strong>before</strong> the update.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">cell</span><span class="w"> </span><span class="p">(</span><span class="nb">cons</span><span class="w"> </span><span class="ss">:empty</span><span class="w"> </span><span class="no">nil</span><span class="p">)))</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="p">(</span><span class="nb">list</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ext:cas</span><span class="w"> </span><span class="p">(</span><span class="nb">car</span><span class="w"> </span><span class="nv">cell</span><span class="p">)</span><span class="w"> </span><span class="ss">:empty</span><span class="w"> </span><span class="ss">:ready</span><span class="p">)</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">        </span><span class="p">(</span><span class="nv">egcl-ext:cas</span><span class="w"> </span><span class="p">(</span><span class="nb">car</span><span class="w"> </span><span class="nv">cell</span><span class="p">)</span><span class="w"> </span><span class="ss">:empty</span><span class="w"> </span><span class="ss">:other</span><span class="p">)</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">        </span><span class="p">(</span><span class="nb">car</span><span class="w"> </span><span class="nv">cell</span><span class="p">)))</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="c1">;; =&gt; (:EMPTY :READY :READY)</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">counter</span><span class="w"> </span><span class="p">(</span><span class="nb">vector</span><span class="w"> </span><span class="mi">10</span><span class="p">)))</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">  </span><span class="p">(</span><span class="nb">list</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ext:atomic-incf</span><span class="w"> </span><span class="p">(</span><span class="nb">svref</span><span class="w"> </span><span class="nv">counter</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">        </span><span class="p">(</span><span class="nv">egcl-ext:atomic-decf</span><span class="w"> </span><span class="p">(</span><span class="nb">svref</span><span class="w"> </span><span class="nv">counter</span><span class="w"> </span><span class="mi">0</span><span class="p">))</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">        </span><span class="p">(</span><span class="nb">svref</span><span class="w"> </span><span class="nv">counter</span><span class="w"> </span><span class="mi">0</span><span class="p">)))</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="c1">;; =&gt; (10 13 12)</span>
+</code></pre></div>
+<p>Shared-cell updates use lock-free compare-and-exchange operations: success
+has acquire/release ordering and a failed comparison has acquire ordering.
+Arithmetic updates retry if another updater wins the comparison. This is not
+a transaction across several places and does not make an arbitrary object
+thread-safe. All concurrent writers of the same cell must follow an atomic
+protocol; do not mix these operations with unsynchronized <code>SETF</code>, <code>INCF</code>, or
+<code>DECF</code>, or assume an ordinary read supplies the required synchronization.</p>
 <h2 id="memory-ordering">Memory ordering<a class="headerlink" href="#memory-ordering" title="Permanent link">&para;</a></h2>
 <p><strong>Function</strong> <code>(egcl-ext:memory-barrier &amp;optional (kind :full))</code> → <code>nil</code></p>
 <p><strong>Function</strong> <code>(egcl-ext:load-barrier)</code> → <code>nil</code></p>
@@ -2203,6 +2304,10 @@ word and before consuming its payload; release after producing the payload and
 before publishing its word. The publication word also needs an appropriate
 atomic access protocol. A fence does not make an arbitrary memory access atomic
 or wait for another thread to arrive.</p>
+<p>The public functions are available now. The current implementation calls a
+runtime fence helper; dedicated x86 T1/T2 intrinsic lowering is still pending.
+The interface promises memory ordering, not a particular instruction sequence
+or call latency.</p>
 
 
 
