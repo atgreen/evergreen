@@ -15153,6 +15153,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // Inline `(typep x '<simple-type>)`: a pure tag check, no
                 // allocation, so the popped value needs no rooting (bliss-gq5).
                 let v = acts[top_idx].pop_op();
+                env.clear_mv();
                 acts[top_idx].push_op(if typep_class_matches(class, v) {
                     T
                 } else {
@@ -16944,13 +16945,14 @@ extern "C" fn c2i_t2_mv(primary: u64, dst: *mut EgclVal, n: u64) {
 /// stack map covers the native operand slots, and `primary` (a caller-saved
 /// register argument, invisible to the scan) is rooted here in the helper frame.
 /// c2i helper for the `TypeP` opcode on the native (T1) path: a leaf type check
-/// with no allocation and no env access — far cheaper than a full CallNamed to
+/// with no allocation — far cheaper than a full CallNamed to
 /// TYPEP (no registry lookup / catch_unwind / apply_function name dispatch), and
 /// it lets typep-using functions still promote to T1 instead of being pinned to
 /// T0. Returns the raw bits of T or NIL. `class` is a `typep_class::*` code.
 /// Because it never allocates, no minor GC can fire inside it, so the caller
 /// needs no operand-stack spill beyond the standard helper-call prologue.
 extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
+    c2i_clear_mv();
     if typep_class_matches(class as u16, EgclVal(v)) {
         T.0
     } else {
