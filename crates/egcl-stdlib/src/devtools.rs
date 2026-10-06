@@ -294,6 +294,34 @@ fn values_to_list(values: &[EgclVal]) -> EgclVal {
 }
 
 #[cfg(test)]
+fn isolated_gc_test(name: &str) -> bool {
+    const CHILD: &str = "EGCL_DEVTOOLS_GC_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            eprintln!("isolated devtools GC test timed out");
+            std::process::exit(124);
+        });
+        return true;
+    }
+    // Replacing the heap leaves other fixtures' symbol roots pointing into
+    // the old mapping. A mutex cannot make those roots valid again.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .output()
+        .expect("run isolated GC test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "isolated test {name}: {}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+#[cfg(test)]
 mod repl_history_gc_tests {
     use super::*;
     use egcl_rt::gc::{GcConfig, init_heap, walk_heap};
@@ -336,6 +364,11 @@ mod repl_history_gc_tests {
 
     #[test]
     fn repl_history_value_list_traces_heap_elements_after_full_gc() {
+        if !isolated_gc_test(
+            "devtools::repl_history_gc_tests::repl_history_value_list_traces_heap_elements_after_full_gc",
+        ) {
+            return;
+        }
         let _guard = crate::test_heap_guard();
         init_heap(&gc_config()).expect("init_heap");
 
@@ -673,6 +706,11 @@ mod backtrace_snapshot_gc_tests {
 
     #[test]
     fn lisp_snapshot_owns_arguments_after_the_call_returns_and_gc_moves_them() {
+        if !isolated_gc_test(
+            "devtools::backtrace_snapshot_gc_tests::lisp_snapshot_owns_arguments_after_the_call_returns_and_gc_moves_them",
+        ) {
+            return;
+        }
         let _serial = crate::test_heap_guard();
         egcl_rt::init_heap(&egcl_rt::GcConfig {
             heap_size: 4 * 1024 * 1024,
