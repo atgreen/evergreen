@@ -188,6 +188,8 @@ pub fn make_bit_vector(bits: &[u8]) -> EgclVal {
         // `body` is the payload start (offset hdr past the object header).
         *body = ElementTypeTag::Bit as u8;
         *(body.add(8) as *mut u64) = bits.len() as u64;
+        // Recycled nursery storage may contain set bits from an older object.
+        std::ptr::write_bytes(body.add(16), 0, data_bytes);
         for (i, &b) in bits.iter().enumerate() {
             if b != 0 {
                 *body.add(16 + i / 8) |= 1 << (i % 8);
