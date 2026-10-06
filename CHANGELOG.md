@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Native code now preserves live immediate values across inserted loop and
+  straight-line polls, preventing runtime calls from clobbering those values
+  ([#40](https://github.com/atgreen/evergreen/pull/40)).
+
 - Native-enabled startup no longer hangs while compiling declaration-scanning
   loops; call results now retain conservative type facts at control-flow merges
   ([#38](https://github.com/atgreen/evergreen/pull/38)).
