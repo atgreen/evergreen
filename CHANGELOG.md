@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Correctness and reliability
+
+- Compiled `TYPEP` now returns exactly one value at every execution tier,
+  without leaking secondary values from an earlier form or its argument
+  ([#29](https://github.com/atgreen/evergreen/pull/29)).
+
 ## 0.0.2 - 2026-10-05
 
 ### Documentation
