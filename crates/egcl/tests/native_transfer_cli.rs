@@ -3,15 +3,70 @@
 
 //! A pending native-to-Lisp transfer must stop subsequent native side effects.
 
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+fn bounded_native_probe(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(args)
+        .env("EGCL_NATIVE_TRANSFER", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run EGCL");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut timed_out = false;
+    while child.try_wait().expect("poll EGCL").is_none() {
+        if Instant::now() >= deadline {
+            child.kill().expect("stop hung EGCL");
+            timed_out = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().expect("collect EGCL output");
+    assert!(
+        !timed_out,
+        "native probe timed out; stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+#[test]
+fn native_invoke_results_keep_loop_phis_conservative() {
+    let program = r#"
+        (defun scan-native-declarations (forms)
+          (let ((result nil))
+            (tagbody scan
+              (unless (and (consp forms) (consp (car forms))
+                           (eq (car (car forms)) 'declare))
+                (go done))
+              (setq result (cons (car forms) result) forms (cdr forms))
+              (go scan)
+              done)
+            (values (reverse result) forms)))
+        (dotimes (i 20)
+          (assert (equal '(((declare (ignore x)) (declare (ignore y))) ((body)))
+                         (multiple-value-list
+                           (scan-native-declarations
+                             '((declare (ignore x)) (declare (ignore y)) (body)))))))
+        (format t "NATIVE-INVOKE-PHIS-OK~%")
+    "#;
+    let output = bounded_native_probe(&["--no-bootstrap", "--eval", program]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("NATIVE-INVOKE-PHIS-OK"));
+}
 
 #[test]
 fn process_level_native_transfer_waits_until_bootstrap_finishes() {
-    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", "(+ 1 2)"])
-        .env("EGCL_NATIVE_TRANSFER", "1")
-        .output()
-        .expect("run EGCL");
+    let output = bounded_native_probe(&["--no-init", "--eval", "(+ 1 2)"]);
     assert!(
         output.status.success(),
         "stdout: {}\nstderr: {}",

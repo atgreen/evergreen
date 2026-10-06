@@ -706,7 +706,10 @@ pub fn infer(f: &Function) -> InferenceResult {
             };
             for &inst in &f.block(b).insts {
                 let idef = f.inst(inst);
-                if idef.opcode.is_terminator() {
+                // Invoke terminates its block but still defines the call's
+                // normal result. Leaving it at BOTTOM makes successor joins
+                // incorrectly inherit only the other incoming values' types.
+                if idef.opcode.is_terminator() && idef.results.is_empty() {
                     continue;
                 }
                 let ops: Vec<IRType> = idef.args.iter().map(|&a| fact(a, &env, &g)).collect();
@@ -797,6 +800,71 @@ mod tests {
 
     fn ret() -> InstData {
         inst(Opcode::Return)
+    }
+
+    #[test]
+    fn invoke_results_widen_successor_phi_facts() {
+        let mut f = Function::new("invoke-phi");
+        let entry = f.entry();
+        let condition = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let call = f.make_block();
+        let nil_path = f.make_block();
+        let merge = f.make_block();
+        let cold = f.make_block();
+        let merged = f.add_block_param(merge, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                args: vec![condition],
+                targets: vec![
+                    BlockCall { block: call, args: vec![] },
+                    BlockCall { block: nil_path, args: vec![] },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let (invoke, results) = f.push_inst(
+            call,
+            InstData {
+                aux: AuxData::CallTarget(0),
+                flags: InstFlags {
+                    call: true,
+                    effectful: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                ..inst(Opcode::Call)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.inst_mut(invoke).opcode = Opcode::Invoke;
+        f.inst_mut(invoke).flags.terminator = true;
+        f.inst_mut(invoke).targets = vec![
+            BlockCall { block: merge, args: vec![results[0]] },
+            BlockCall { block: cold, args: vec![] },
+        ];
+        let (_, nil) = f.push_inst(
+            nil_path,
+            inst(Opcode::ConstNil),
+            &[(IRType::of(TypeBits::NULL), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            nil_path,
+            InstData {
+                targets: vec![BlockCall { block: merge, args: vec![nil[0]] }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        f.set_terminator(merge, ret());
+        f.set_terminator(cold, inst(Opcode::Trap));
+        let inferred = infer(&f);
+        assert_eq!(inferred.ty(results[0]), IRType::TOP);
+        assert_eq!(
+            inferred.ty(merged),
+            IRType::TOP,
+            "an unknown call result joined with NIL can still be a heap object"
+        );
+        assert_eq!(inferred.repr(merged), Some(ValueRepresentation::Tagged));
     }
 
     #[test]
