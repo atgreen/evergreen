@@ -3755,6 +3755,9 @@ fn emit_framed_inner(
             let pp = u32::try_from(machine.blocks[block_index].start)
                 .map_err(|_| EmitError::UnsupportedOp(0xFE))?
                 * 2;
+            // Polls are inserted after allocation, so its call-clobber model
+            // cannot preserve even immediate values for us. Save all live
+            // tagged homes; the GC safely ignores non-pointer slot contents.
             let mut live = HashSet::new();
             for range in &machine.value_locations {
                 if range.vreg.class != RegClass::Gpr
@@ -3766,7 +3769,6 @@ fn emit_framed_inner(
                 let value = Value(range.vreg.num);
                 if f.value(value).repr == ValueRepresentation::Tagged
                     && homes.contains_key(&value)
-                    && !proven_immediate(value)
                 {
                     live.insert(value);
                 }
@@ -3834,7 +3836,6 @@ fn emit_framed_inner(
                 }
                 if f.value(value).repr == ValueRepresentation::Tagged
                     && homes.contains_key(&value)
-                    && !proven_immediate(value)
                 {
                     live.insert(value);
                 }
