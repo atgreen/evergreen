@@ -12,6 +12,10 @@
   loops; call results now retain conservative type facts at control-flow merges
   ([#38](https://github.com/atgreen/evergreen/pull/38)).
 
+- `SETQ` and variable `SETF` now reject constants defined after the assigning
+  function was compiled, and saved core images retain constant declarations
+  ([#44](https://github.com/atgreen/evergreen/pull/44)).
+
 - Repeated `POSITION`, `POSITION-IF`, and `POSITION-IF-NOT` searches now avoid
   excessive memory growth from compiling a new predicate helper on every call
   ([#42](https://github.com/atgreen/evergreen/pull/42)).
