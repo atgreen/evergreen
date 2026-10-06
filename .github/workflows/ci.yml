@@ -29,6 +29,12 @@ on:
 permissions:
   contents: read
 
+# Only future runs using this policy share a PR group. Non-PR runs have unique
+# groups so neither running nor pending main-branch runs can supersede others.
+concurrency:
+  group: pr-revision-v1-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # Backtraces on panic. Free — printed only when something fails — and it pays
