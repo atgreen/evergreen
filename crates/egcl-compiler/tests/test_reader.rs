@@ -534,6 +534,41 @@ fn read_circular_structure() {
 }
 
 #[test]
+fn read_circular_vectors_preserve_identity() {
+    let (value, _) = read_from_string("#1=#(#1#)").unwrap();
+    // SAFETY: the reader returned a one-element simple vector.
+    let element = unsafe { *(value.as_ptr().add(16) as *const egcl_rt::EgclVal) };
+    assert_eq!(value, element);
+}
+
+#[test]
+fn read_circular_label_aliases_follow_the_completed_object() {
+    for source in ["(#1=(a #2=#1#) #2#)", "(#1=#(#2=#1#) #2#)"] {
+        let (value, _) = read_from_string(source).unwrap();
+        // SAFETY: both forms read as proper two-element lists.
+        unsafe {
+            let first = &*(value.as_ptr() as *const egcl_rt::object::ConsCell);
+            let second = &*(first.cdr.as_ptr() as *const egcl_rt::object::ConsCell);
+            assert_eq!(first.car, second.car);
+        }
+    }
+}
+
+#[test]
+fn read_large_circular_vector_preserves_identity() {
+    let source = format!("#1=#({}#1#)", "0 ".repeat(66000));
+    let (value, _) = read_from_string(&source).unwrap();
+    // SAFETY: this vector requires an extended header, followed by its length
+    // word and 66001 reference slots.
+    unsafe {
+        let header = *(value.as_ptr() as *const egcl_rt::object::ObjectHeader);
+        assert!(header.is_large_object());
+        let last = *(value.as_ptr().add(24 + 66000 * 8) as *const egcl_rt::EgclVal);
+        assert_eq!(value, last);
+    }
+}
+
+#[test]
 fn read_sharpsign_reference_undefined_is_error() {
     // #1# without a preceding #1= should be an error
     assert!(

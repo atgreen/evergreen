@@ -83,7 +83,7 @@
 //! error rather than a stack overflow. `read` over a `ReaderState` accepts
 //! only simple strings; live streams must use `read_from_stream`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{
@@ -2776,23 +2776,13 @@ fn read_sharpsign_with_base(
                     read_circular,
                     depth + 1,
                 )?;
-                // If the result is a cons, copy its car/cdr into the placeholder
-                if val.is_cons() {
-                    unsafe {
-                        // Through the WRITE BARRIER: the placeholder is an
-                        // EXISTING cons and the values copied into it may be
-                        // younger than it, which a raw store would not record
-                        // (bliss-t53a).
-                        let ph_ptr = placeholder.as_ptr() as *mut ConsCell;
-                        let val_ptr = val.as_ptr() as *const ConsCell;
-                        let (vcar, vcdr) = ((*val_ptr).car, (*val_ptr).cdr);
-                        egcl_rt::gc::store_ref(std::ptr::addr_of_mut!((*ph_ptr).car), vcar);
-                        egcl_rt::gc::store_ref(std::ptr::addr_of_mut!((*ph_ptr).cdr), vcdr);
-                    }
-                    return Ok((placeholder, p));
-                }
-                // For non-cons values, just update the label
                 labels.labels.insert(num, val);
+                for labeled in labels.labels.values_mut() {
+                    if *labeled == placeholder {
+                        *labeled = val;
+                    }
+                }
+                patch_circular_label(val, placeholder, labels.labels.values().copied());
                 return Ok((val, p));
             }
             '#' => {
@@ -3236,6 +3226,72 @@ fn read_radix_integer(
             "invalid radix-{} integer",
             radix
         ))),
+    }
+}
+
+#[cfg(test)]
+#[path = "reader_label_tests.rs"]
+mod reader_label_tests;
+
+/// Replace a pending label throughout the completed reader object graph.
+/// Only Rust containers allocate here: no Lisp allocation or safepoint can
+/// invalidate the worklist, visited identities, or temporary slot pointers.
+fn patch_circular_label(
+    value: EgclVal,
+    placeholder: EgclVal,
+    labeled_objects: impl IntoIterator<Item = EgclVal>,
+) {
+    let mut pending = vec![value];
+    pending.extend(labeled_objects);
+    let mut visited = HashSet::new();
+    while let Some(object) = pending.pop() {
+        if !visited.insert(object) {
+            continue;
+        }
+        let mut patch = |slot: *mut EgclVal| {
+            // SAFETY: each caller supplies a reference slot in a live reader
+            // object. Stores use the barrier because reading can promote it.
+            unsafe {
+                if *slot == placeholder {
+                    egcl_rt::gc::store_ref(slot, value);
+                } else {
+                    pending.push(*slot);
+                }
+            }
+        };
+        // SAFETY: cons fields and the selected heap layouts contain tagged
+        // reference slots. Other object kinds, including symbols and numeric
+        // or string payloads, are leaves for reader-label backpatching.
+        unsafe {
+            if object.is_cons() {
+                let cons = object.as_ptr() as *mut ConsCell;
+                patch(std::ptr::addr_of_mut!((*cons).car));
+                patch(std::ptr::addr_of_mut!((*cons).cdr));
+            } else if object.is_heap_object() {
+                let ptr = object.as_ptr();
+                let header = *(ptr as *const ObjectHeader);
+                let offset = if header.is_large_object() { 16 } else { 8 };
+                let body = ptr.add(offset) as *mut EgclVal;
+                match header.type_id() {
+                    type_id::SIMPLE_VECTOR => {
+                        let length = *(body as *const u64) as usize;
+                        for index in 0..length {
+                            patch(body.add(1 + index));
+                        }
+                    }
+                    type_id::MD_ARRAY | type_id::COMPLEX_ARRAY => patch(body),
+                    type_id::STANDARD_OBJECT => {
+                        // The allocator records exact body bytes in the hash
+                        // field. Footprint size includes uninitialized padding.
+                        // The first body word is an untagged class wrapper.
+                        for index in 1..header.hash() as usize / 8 {
+                            patch(body.add(index));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
