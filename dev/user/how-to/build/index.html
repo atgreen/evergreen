@@ -478,6 +478,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#build-a-native-macos-arm64-binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Build a native macOS arm64 binary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#build-and-install-the-standalone-command" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1874,6 +1885,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#build-a-native-macos-arm64-binary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Build a native macOS arm64 binary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#build-and-install-the-standalone-command" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1956,10 +1978,23 @@ target; use that pin rather than choosing a newer compiler independently.</p>
 <p>The expression prints <code>3</code>. The repository defaults to the x86-64 musl target.
 The memory-limit wrapper requires a working systemd user session; it is used for
 local runtime checks in this project, not installed as part of EGCL.</p>
+<h2 id="build-a-native-macos-arm64-binary">Build a native macOS arm64 binary<a class="headerlink" href="#build-a-native-macos-arm64-binary" title="Permanent link">&para;</a></h2>
+<p>On Apple Silicon, enter the repository's Nix shell and select the Darwin
+target explicitly. The checkout defaults to Linux/musl.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>nix-shell<span class="w"> </span>--run<span class="w"> </span><span class="s1">'cargo build --locked --release -p egcl --bin egcl --target aarch64-apple-darwin'</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>target/aarch64-apple-darwin/release/egcl<span class="w"> </span>--no-init<span class="w"> </span>--eval<span class="w"> </span><span class="s1">'(+ 1 2)'</span>
+</code></pre></div>
+<p>The executable is a native Mach-O arm64 file and the expression prints <code>3</code>.
+The Nix-built executable can link to libraries in <code>/nix/store</code> (including
+<code>libiconv</code>); build it on the Mac where you intend to run it, or keep those
+runtime libraries available when copying it.
+For a faster development build, omit <code>--release</code> and run the binary under
+<code>target/aarch64-apple-darwin/debug/</code>. The standalone image and install targets
+below are Linux build procedures; on macOS, run the Cargo-built CLI directly.</p>
 <h2 id="build-and-install-the-standalone-command">Build and install the standalone command<a class="headerlink" href="#build-and-install-the-standalone-command" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>make<span class="w"> </span>image
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>sudo<span class="w"> </span>make<span class="w"> </span>install
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>make<span class="w"> </span>image
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>sudo<span class="w"> </span>make<span class="w"> </span>install
 </code></pre></div>
 <p><code>make image</code> performs profile-guided builds, trains the runtime, and creates
 <code>target/egcl</code> with ASDF preloaded. <code>make install</code> copies that executable into
@@ -1973,8 +2008,8 @@ for installation prefix overrides.</p>
 synthetic training to optimize the Rust runtime. It requires <code>llvm-profdata</code> matching the LLVM
 version printed by <code>rustc -vV</code> (the Rust <code>llvm-tools-preview</code> component is
 preferred; alternatively set <code>LLVM_PROFDATA</code> to a matching executable):</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>make<span class="w"> </span>image
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>make<span class="w"> </span>image
 </code></pre></div>
 <p>This performs two release builds plus training, then saves and restarts the
 ASDF image before atomically replacing <code>target/egcl</code>. It does not install it.
@@ -1996,8 +2031,8 @@ Performance evidence and outstanding validation are in
 <a href="https://github.com/atgreen/evergreen/blob/main/docs/design/load-performance-handoff.md">the load-performance handoff</a>.</p>
 <h2 id="enable-dynamic-foreign-libraries">Enable dynamic foreign libraries<a class="headerlink" href="#enable-dynamic-foreign-libraries" title="Permanent link">&para;</a></h2>
 <p>Choose the glibc target explicitly and enable the FFI feature:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>-p<span class="w"> </span>egcl<span class="w"> </span>--target<span class="w"> </span>x86_64-unknown-linux-gnu<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--features<span class="w"> </span>egcl-rt/c-ffi
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>-p<span class="w"> </span>egcl<span class="w"> </span>--target<span class="w"> </span>x86_64-unknown-linux-gnu<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span>--features<span class="w"> </span>egcl-rt/c-ffi
 </code></pre></div>
 <p>Run <code>target/x86_64-unknown-linux-gnu/release/egcl</code>. This build uses the system
 dynamic loader for foreign libraries. The default static musl binary instead
