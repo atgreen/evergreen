@@ -41,6 +41,43 @@ pub(super) fn call(
 #[egcl_delivery_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        "EGCL::%PPRINT-CIRCLE" => Some(|_operator, args, _env| {
+            if args.len() != 2 || !args[0].is_symbol() {
+                return Err(EgclError::ProgramError(
+                    "%PPRINT-CIRCLE requires an operation and object".into(),
+                ));
+            }
+            use egcl_stdlib::format::{self, CircleMark};
+            match sym_bare_name_rc(args[0]).as_ref() {
+                "ENTER" => {
+                    format::circle_enter(args[1]);
+                    Ok(NIL)
+                }
+                "EXIT" => {
+                    format::circle_exit();
+                    Ok(NIL)
+                }
+                "SHARED" => Ok(if format::circle_is_shared(args[1]) { T } else { NIL }),
+                "MARK" => Ok(EgclVal::from_fixnum(match format::circle_visit(args[1]) {
+                    CircleMark::NotShared => 0,
+                    CircleMark::First(label) => i64::from(label),
+                    CircleMark::Repeat(label) => -i64::from(label),
+                })),
+                _ => Err(EgclError::ProgramError(
+                    "Unknown pretty-printer circle operation".into(),
+                )),
+            }
+        }),
+        "EGCL::%PPRINT-NATIVE-COLUMN" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "%PPRINT-NATIVE-COLUMN requires one stream".into(),
+                ));
+            }
+            Ok(egcl_stdlib::streams::stream_line_column(args[0])
+                .map(|column| EgclVal::from_fixnum(column as i64))
+                .unwrap_or(NIL))
+        }),
         "EGCL::%DEBUG-BACKTRACE" => Some(|_operator, args, env| {
             let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
             let result = egcl_stdlib::devtools::backtrace_call(args);
@@ -121,7 +158,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let args = RootedVals::new(args.to_vec());
 
             // (write object &key stream escape ...): render OBJECT honouring
-            // :escape (default T → prin1-style; NIL → princ-style) to :stream
+            // :escape (default *PRINT-ESCAPE*) to :stream
             // (default *standard-output*). Other keywords are accepted and
             // ignored. Returns the object.
 
@@ -129,7 +166,10 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::ProgramError("WRITE requires an object".into()));
             }
             let mut stream_idx: Option<usize> = None;
-            let mut escape = true;
+            let mut escape = env
+                .lookup_var("*PRINT-ESCAPE*")
+                .map(|value| !value.is_nil())
+                .unwrap_or(true);
             let mut i = 1;
             while i + 1 < args.len() {
                 let key = sym_bare_name_rc(args[i]);
