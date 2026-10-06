@@ -31,7 +31,7 @@
 use crate::error::EgclError;
 use crate::fxhash::FxBuildHasher;
 use crate::lock_order::{LockLevel, OrderedRwLock};
-use crate::object::{ObjectHeader, SymbolData, type_id};
+use crate::object::{ObjectHeader, SymbolData, symbol_flags, type_id};
 use crate::value::{NIL, EgclVal, UNBOUND};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -789,7 +789,60 @@ pub fn symbol_value(idx: u32) -> Option<EgclVal> {
         .or_else(|| read_cell(idx, |s| EgclVal(s.value.load(Ordering::Acquire))))
 }
 
-/// Assign the current binding, falling back to the global cell.
+/// Whether this symbol has been declared constant, independent of its name.
+pub fn symbol_is_constant(idx: u32) -> bool {
+    read_cell(idx, |s| s.flags & symbol_flags::CONSTANT != 0).unwrap_or(false)
+}
+
+/// Mark an already-established compile-time binding as constant.
+pub fn mark_symbol_constant(idx: u32) {
+    write_cell(idx, |s| s.flags |= symbol_flags::CONSTANT);
+}
+
+/// Publish a constant's global value and metadata together. Defining a constant
+/// does not assign an execution-local dynamic binding of the same symbol.
+pub fn define_symbol_constant(idx: u32, value: EgclVal) {
+    write_cell(idx, |s| {
+        s.value.store(value.0, Ordering::Release);
+        s.flags |= symbol_flags::CONSTANT;
+    });
+}
+
+/// Assign the current binding, rejecting constants. Checking the flag and
+/// writing the value share one registry lock, excluding a concurrent definition
+/// or GC scan. No Lisp allocation or safepoint occurs under that lock.
+pub fn set_symbol_value_checked(idx: u32, value: EgclVal) -> Result<(), EgclError> {
+    let assigned = read_cell(idx, |s| {
+        if s.flags & symbol_flags::CONSTANT != 0 {
+            return false;
+        }
+        let local = DYNAMIC_VALUES.with(|values| {
+            let mut values = values.borrow_mut();
+            if let Some(slot) = values.get_mut(&idx) {
+                *slot = value;
+                true
+            } else {
+                false
+            }
+        });
+        if !local {
+            s.value.store(value.0, Ordering::Release);
+        }
+        true
+    });
+    if assigned == Some(false) {
+        // Resolve diagnostic text only after releasing the registry lock.
+        let name = symbol_name(idx).unwrap_or_else(|| format!("symbol #{idx}"));
+        Err(EgclError::ProgramError(format!(
+            "cannot assign to a constant defined by DEFCONSTANT `{name}`: not an assignable variable name"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// Unrestricted internal assignment for binding setup and restoration.
+/// Use `set_symbol_value_checked` when assignment must reject constants.
 pub fn set_symbol_value(idx: u32, value: EgclVal) {
     let local = DYNAMIC_VALUES.with(|values| {
         let mut values = values.borrow_mut();
