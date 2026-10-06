@@ -28,6 +28,28 @@ direct push to `main`. Until the comprehensive CI bead (`bliss-hn1cc`) is
 complete, run and report the relevant checks without making known-unreliable
 jobs required merge gates.
 
+## Coverage debt policy
+
+The user approved an explicit known-debt ratchet on 2026-10-06. CI invokes
+`scripts/spec-coverage.py --gate --debt-baseline spec/coverage-debt.json`.
+The baseline records audited implementation or validation gaps, each with a
+Bead and a concrete explanation. It does **not** make those requirements
+covered or implemented, permit stage advancement, or excuse failing tests.
+Reports must keep actual coverage and accepted debt separate.
+
+New uncovered requirements fail the gate. Baseline entries must name current,
+in-scope MUST requirements; malformed, duplicate, unknown, or already-covered
+entries fail validation. When a requirement obtains legitimate test coverage,
+remove its now-stale debt entry in the same PR. Do not close its implementation
+Bead merely because the ratcheted gate passes.
+
+The baseline is shrink-only without a new explicit user instruction: do not
+add entries to make a regression pass, change requirement staging to hide a
+gap, or manufacture citations. The command without `--debt-baseline` remains
+the strict completeness check. Run `python3 scripts/test_spec_coverage.py`
+when changing this policy or its checker. Keep new requirement-to-test
+references out of source comments; use reviewed, functional tracking data.
+
 ## Changelog policy
 
 `CHANGELOG.md` records user-facing changes, not the project's development
