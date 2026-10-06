@@ -2093,10 +2093,9 @@ fn is_fixnum_guarding_op(op: crate::t2::ir::Opcode) -> bool {
 /// `cmp` plus a select of the two immediate results.
 /// Resolve `GenericEq`'s two operands to registers (a live value reg, or a
 /// tagged constant loaded into SCRATCH) and emit `cmp r0, r1`, setting ZF iff the
-/// two tagged reps are equal (Lisp `EQ`). At most one operand may be constant
-/// (both-constant is folded by the mid-end); declines otherwise so the single
-/// scratch is never contended. Shared by the value-producing `emit_generic_eq`
-/// and the fused branch path.
+/// two tagged reps are equal (Lisp `EQ`). Two constants set ZF directly from
+/// their known equality, without competing for the single scratch register.
+/// Shared by the value-producing `emit_generic_eq` and the fused branch path.
 fn emit_eq_cmp(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -2108,8 +2107,10 @@ fn emit_eq_cmp(
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
     }
     let (a0, a1) = (data.args[0], data.args[1]);
-    if const_tagged.contains_key(&a0) && const_tagged.contains_key(&a1) {
-        return Err(EmitError::UnsupportedOp(op_tag(Opcode::GenericEq)));
+    if let (Some(left), Some(right)) = (const_tagged.get(&a0), const_tagged.get(&a1)) {
+        mov_imm64(a, SCRATCH, i64::from(left != right));
+        alu_r_imm(a, 7, SCRATCH, 0); // cmp scratch, 0: ZF iff the constants match
+        return Ok(());
     }
     let resolve = |a: &mut Asm, v: crate::t2::ir::Value| -> Result<u8, EmitError> {
         if let Some(&r) = reg.get(&v) {
