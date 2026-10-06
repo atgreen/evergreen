@@ -489,6 +489,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#profile-guided-build-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Profile-guided build details
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#enable-dynamic-foreign-libraries" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1874,6 +1885,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#profile-guided-build-details" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Profile-guided build details
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#enable-dynamic-foreign-libraries" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1944,23 +1966,52 @@ local runtime checks in this project, not installed as part of EGCL.</p>
 <code>/usr/local/bin</code>. Run the build as your ordinary user.</p>
 <p>To build without profile-guided optimization, use <code>make image-no-pgo</code> instead
 of <code>make image</code>. See the repository's
-<a href="https://cave.moxielogic.com/atgreen/bliss/src/branch/main/Makefile">build Makefile</a>
+<a href="https://github.com/atgreen/evergreen/blob/main/Makefile">build Makefile</a>
 for installation prefix overrides.</p>
+<h2 id="profile-guided-build-details">Profile-guided build details<a class="headerlink" href="#profile-guided-build-details" title="Permanent link">&para;</a></h2>
+<p><code>make image</code> uses profile-guided optimization (PGO) by default, with dependency-free
+synthetic training to optimize the Rust runtime. It requires <code>llvm-profdata</code> matching the LLVM
+version printed by <code>rustc -vV</code> (the Rust <code>llvm-tools-preview</code> component is
+preferred; alternatively set <code>LLVM_PROFDATA</code> to a matching executable):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>llvm-tools-preview
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>make<span class="w"> </span>image
+</code></pre></div>
+<p>This performs two release builds plus training, then saves and restarts the
+ASDF image before atomically replacing <code>target/egcl</code>. It does not install it.
+<code>make pgo-image</code> remains an alias. For an ordinary release image without training
+or <code>llvm-profdata</code>, use <code>make image-no-pgo</code>; ordinary Cargo builds are unchanged.
+PGO failures are reported, never silently replaced with a non-PGO build. Build logs, private
+training caches, and profiles are retained under a fresh <code>target/pgo/run.*</code>
+directory; preparation profiles are excluded from optimization training.
+Profiles are local build artifacts, not distributable inputs to unrelated
+source revisions or toolchains. Allow several minutes and extra build storage.</p>
+<p>Overrides: <code>EGCL_PGO_TARGET</code> (default <code>x86_64-unknown-linux-musl</code>, must be
+runnable on the build host), <code>EGCL_PGO_ROOT</code> (artifact directory),
+<code>EGCL_IMAGE_OUT</code> (output executable), and <code>CARGO_BUILD_JOBS</code> (build parallelism).
+Both compiler passes preserve the same <code>CARGO_ENCODED_RUSTFLAGS</code> or <code>RUSTFLAGS</code>.
+Failures leave the previous output executable intact and retain logs; failed
+image stages may also leave a <code>.egcl-pgo.*</code> directory beside the output.
+Run <code>make test-pgo-build</code> for the orchestration tests (Python 3, no Rust build).
+Performance evidence and outstanding validation are in
+<a href="https://github.com/atgreen/evergreen/blob/main/docs/design/load-performance-handoff.md">the load-performance handoff</a>.</p>
 <h2 id="enable-dynamic-foreign-libraries">Enable dynamic foreign libraries<a class="headerlink" href="#enable-dynamic-foreign-libraries" title="Permanent link">&para;</a></h2>
 <p>Choose the glibc target explicitly and enable the FFI feature:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>-p<span class="w"> </span>egcl<span class="w"> </span>--target<span class="w"> </span>x86_64-unknown-linux-gnu<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>--features<span class="w"> </span>egcl-rt/c-ffi
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>-p<span class="w"> </span>egcl<span class="w"> </span>--target<span class="w"> </span>x86_64-unknown-linux-gnu<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--features<span class="w"> </span>egcl-rt/c-ffi
 </code></pre></div>
-<p>Run <code>target/x86_64-unknown-linux-gnu/release/egcl</code>. The default static musl
-binary cannot dynamically load shared libraries. The Fedora native RPM uses a
-dynamic runtime; the Android APK runtime is also a separate dynamic build.</p>
+<p>Run <code>target/x86_64-unknown-linux-gnu/release/egcl</code>. This build uses the system
+dynamic loader for foreign libraries. The default static musl binary instead
+uses a built-in ELF loader with limited library compatibility; it does not
+provide the glibc loader. The Fedora native RPM uses a dynamic runtime; the
+Android APK runtime is also a separate dynamic build.</p>
 <h2 id="install-locally-built-fedora-rpms">Install locally built Fedora RPMs<a class="headerlink" href="#install-locally-built-fedora-rpms" title="Permanent link">&para;</a></h2>
 <p>The project provides a container-free RPM build procedure in
-<a href="https://cave.moxielogic.com/atgreen/bliss/src/branch/main/docs/fedora-rpm.md">the packaging guide</a>.
-It produces local packages; these instructions do not assume a public package
-repository. Install matching versions of <code>egcl</code> and each <code>egcl-target-*</code>
-package you need. Keep the base and installed target packages together when
-upgrading: target packages require the exact base version and release.</p>
+<a href="https://github.com/atgreen/evergreen/blob/main/docs/fedora-rpm.md">the packaging guide</a>.
+For published Fedora 44 x86-64 packages, use the
+<a href="https://github.com/atgreen/evergreen#install-on-fedora-44-x86-64">release repository instructions</a>.
+Install matching versions of <code>egcl</code> and each <code>egcl-target-*</code> package you need.
+Keep the base and installed target packages together when upgrading: target
+packages require the exact base version and release.</p>
 
 
 

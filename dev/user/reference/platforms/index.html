@@ -1901,8 +1901,8 @@ Tiers are defined in <a href="../../explanation/execution/">How Lisp runs</a>.</
 </tr>
 <tr>
 <td>Linux AArch64</td>
-<td>T1 for supported opcode shapes; no AArch64 T2 backend</td>
-<td>Fedora target RPM; baseline backend is under development</td>
+<td>T1 and T2 for supported shapes, OSR and deoptimization</td>
+<td>Fedora target RPM; QEMU JIT, image, and GC stress checks</td>
 </tr>
 <tr>
 <td>Linux ppc64le</td>
@@ -1916,7 +1916,7 @@ Tiers are defined in <a href="../../explanation/execution/">How Lisp runs</a>.</
 </tr>
 <tr>
 <td>Android ARM64 CLI</td>
-<td>Static runtime; current source includes partial AArch64 T1</td>
+<td>T1 and T2 for supported shapes; AArch64 backend</td>
 <td><code>egcl-android</code>; QEMU image checks</td>
 </tr>
 <tr>
@@ -1936,6 +1936,9 @@ Unsupported native compilation shapes remain in a supported lower tier.
 Stackful fibers support Unix x86-64 and AArch64 (including Android), Linux
 ppc64le and s390x, and Windows x86-64. This is not full architecture parity.</p>
 <h2 id="fedora-package-commands">Fedora package commands<a class="headerlink" href="#fedora-package-commands" title="Permanent link">&para;</a></h2>
+<p>Published release packages currently target Fedora 44 x86-64. The
+<code>egcl-target-*</code> packages below run on that host through QEMU or Wine; the
+runtime target list is not a list of available native-host RPM repositories.</p>
 <table>
 <thead>
 <tr>
