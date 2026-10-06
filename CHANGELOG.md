@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Circular reader labels now preserve identity in vectors, mixed object graphs,
+  arrays, and structure literals, including source-free compiled files
+  ([#33](https://github.com/atgreen/evergreen/pull/33)).
+
 - Functions returned by `MACRO-FUNCTION` now retain their macro definition
   after redefinition, and copied macro expanders survive saved-image restoration
   ([#32](https://github.com/atgreen/evergreen/pull/32)).
