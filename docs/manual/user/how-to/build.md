@@ -30,6 +30,9 @@ target/aarch64-apple-darwin/release/egcl --no-init --eval '(+ 1 2)'
 ```
 
 The executable is a native Mach-O arm64 file and the expression prints `3`.
+The Nix-built executable can link to libraries in `/nix/store` (including
+`libiconv`); build it on the Mac where you intend to run it, or keep those
+runtime libraries available when copying it.
 For a faster development build, omit `--release` and run the binary under
 `target/aarch64-apple-darwin/debug/`. The standalone image and install targets
 below are Linux build procedures; on macOS, run the Cargo-built CLI directly.
