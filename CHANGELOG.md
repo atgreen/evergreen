@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Native-enabled startup no longer hangs while compiling declaration-scanning
+  loops; call results now retain conservative type facts at control-flow merges
+  ([#38](https://github.com/atgreen/evergreen/pull/38)).
+
 - Repeated `POSITION`, `POSITION-IF`, and `POSITION-IF-NOT` searches now avoid
   excessive memory growth from compiling a new predicate helper on every call
   ([#42](https://github.com/atgreen/evergreen/pull/42)).
