@@ -68,7 +68,7 @@ fn bbu_counts(bytes: &[u8]) -> (u32, u32, u32) {
     )
 }
 
-fn bbu_action_start(bbu: &[u8]) -> usize {
+fn bbu_layout(bbu: &[u8]) -> (Vec<&[u8]>, usize) {
     let constant_count = u32::from_le_bytes(bbu[12..16].try_into().unwrap()) as usize;
     let function_count = u32::from_le_bytes(bbu[16..20].try_into().unwrap()) as usize;
     let mut pos = 40usize;
@@ -109,10 +109,13 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
             other => panic!("test BBU parser does not know constant tag {other}"),
         }
     }
+    let mut codes = Vec::with_capacity(function_count);
     for _ in 0..function_count {
         pos += 24;
         let code_len = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4 + code_len;
+        pos += 4;
+        codes.push(&bbu[pos..pos + code_len]);
+        pos += code_len;
         let literal_count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4 + literal_count * 4;
         let handler_count = u32::from_le_bytes(bbu[pos..pos + 4].try_into().unwrap());
@@ -122,7 +125,70 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
         assert_eq!(pc_info_count, 0);
         pos += 8;
     }
-    pos
+    (codes, pos)
+}
+
+fn bbu_action_start(bbu: &[u8]) -> usize {
+    bbu_layout(bbu).1
+}
+
+fn bbu_function_codes(bbu: &[u8]) -> Vec<&[u8]> {
+    bbu_layout(bbu).0
+}
+
+#[test]
+fn memory_fence_bytecode_persists_without_source_fallback() {
+    let dir = workdir("memory-fence");
+    let src = dir.join("memory-fence.lisp");
+    let out = dir.join("memory-fence.bfasl");
+    fs::write(
+        &src,
+        "(defun persisted-fence () (egcl-ext:memory-barrier :full))\n(format t \"FENCE-FASL ~S~%\" (persisted-fence))\n",
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {out:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x010f);
+    let codes = bbu_function_codes(bbu);
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "memory fence fell back to EvalSource");
+    }
+    assert!(
+        codes.iter().any(|&code| {
+            // Skip complete implicit BLOCK headers, then match instructions
+            // at their boundary rather than searching inside operands.
+            let mut body = code;
+            while matches!(body.first(), Some(0x1e | 0x43)) {
+                body = body.get(15..).expect("complete BLOCK instruction");
+            }
+            body.starts_with(&[0x14, 0x44, 3]) // ClearMv; MemoryFence(:full)
+        }),
+        "serialized function has no full MemoryFence opcode"
+    );
+    let loaded = Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--load"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(String::from_utf8_lossy(&loaded.stdout).contains("FENCE-FASL NIL"));
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

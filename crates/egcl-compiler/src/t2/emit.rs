@@ -3057,6 +3057,7 @@ fn emit_transfer_function(
                     | Opcode::ConstChar
                     | Opcode::GenericEq
                     | Opcode::TypeCheck
+                    | Opcode::MemoryFence
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
             }
@@ -3958,6 +3959,7 @@ fn emit_framed_inner(
                             | Opcode::SetSymbolValue
                             | Opcode::ClearMv
                             | Opcode::TakeValuesToLocals
+                            | Opcode::MemoryFence
                     )
                 {
                     continue;
@@ -4443,6 +4445,23 @@ fn emit_framed_inner(
                     self_sym,
                     self_entry,
                 )?;
+            } else if d.opcode == Opcode::MemoryFence {
+                match d.aux {
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Read) => {
+                        a.extend_from_slice(&[0x0f, 0xae, 0xe8]);
+                    }
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Write) => {
+                        a.extend_from_slice(&[0x0f, 0xae, 0xf8]);
+                    }
+                    AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Full) => {
+                        a.extend_from_slice(&[0x0f, 0xae, 0xf0]);
+                    }
+                    _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::MemoryFence))),
+                }
+                if let Some(value) = d.results.first() {
+                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+                    store_home(&mut a, homes[value], RAX, 0);
+                }
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
@@ -4530,6 +4549,12 @@ fn emit_framed_inner(
                 mov_imm32(&mut a, 6, 0); // esi = destination (null)
                 mov_imm32(&mut a, 2, 0); // edx = count (clear)
                 mov_imm64(&mut a, 0, c2i_mv_addr as i64);
+                #[cfg(not(windows))]
+                {
+                    // The zero-count path is a leaf that cannot allocate or signal.
+                    a.extend_from_slice(&[0xff, 0xd0]);
+                }
+                #[cfg(windows)]
                 emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
             } else if d.opcode == Opcode::TakeValuesToLocals {
                 let (nvars, slot_base) = match d.aux {
@@ -5326,6 +5351,15 @@ fn emit_inst(
             let dst = def(0)?;
             let src = use_(0)?;
             mov_rr(a, dst, src);
+        }
+        op::MEMORY_FENCE => {
+            match mi.imm.ok_or(EmitError::MissingImm)? {
+                1 => a.extend_from_slice(&[0x0f, 0xae, 0xe8]),
+                2 => a.extend_from_slice(&[0x0f, 0xae, 0xf8]),
+                3 => a.extend_from_slice(&[0x0f, 0xae, 0xf0]),
+                _ => return Err(EmitError::UnsupportedOp(op::MEMORY_FENCE)),
+            }
+            mov_imm64(a, def(0)?, egcl_rt::value::NIL.0 as i64);
         }
         op::ADD | op::SUB => {
             // def = uses[0] (op) uses[1]. x86 ALU is 2-operand, so realise as

@@ -873,6 +873,9 @@ impl<'a> Builder<'a> {
                 Instr::TypeP(_) => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
+                Instr::MemoryFence(_) => {
+                    push(i + 1, d + 1, &mut depth_at, &mut work);
+                }
                 Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
@@ -1729,6 +1732,23 @@ impl<'a> Builder<'a> {
                             IRType::TOP,
                         )
                         .ok_or(BuildError::Unsupported("TypeP has a result"))?;
+                    stack.push(result);
+                }
+                Instr::MemoryFence(kind) => {
+                    let result = self
+                        .emit(
+                            block,
+                            Opcode::MemoryFence,
+                            vec![],
+                            AuxData::MemoryFence(*kind),
+                            InstFlags {
+                                effectful: true,
+                                ..InstFlags::default()
+                            },
+                            None,
+                            IRType::of(TypeBits::NULL),
+                        )
+                        .ok_or(BuildError::Unsupported("MemoryFence has a result"))?;
                     stack.push(result);
                 }
                 Instr::Br(t) => {

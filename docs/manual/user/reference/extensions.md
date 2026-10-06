@@ -181,7 +181,10 @@ before publishing its word. The publication word also needs an appropriate
 atomic access protocol. A fence does not make an arbitrary memory access atomic
 or wait for another thread to arrive.
 
-The public functions are available now. The current implementation calls a
-runtime fence helper; dedicated x86 T1/T2 intrinsic lowering is still pending.
+On x86-64, calls with a literal kind compile to a dedicated bytecode operation
+and native T1/T2 fences: `lfence` for `:read` and `:data-dependency`, `sfence`
+for `:write`, and `mfence` for `:full`. `load-barrier`, `store-barrier`, and
+`memory-barrier` with its default kind use this path too. Dynamic kinds retain
+the checked runtime helper; other architectures retain the runtime path.
 The interface promises memory ordering, not a particular instruction sequence
-or call latency.
+or call latency. Compiled files preserve the intrinsic without source fallback.

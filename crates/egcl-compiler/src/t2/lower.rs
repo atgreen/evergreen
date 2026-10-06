@@ -194,6 +194,7 @@ pub mod op {
     pub const ALLOC: u32 = 0x0062;
     /// GC write barrier.
     pub const WRITE_BARRIER: u32 = 0x0063;
+    pub const MEMORY_FENCE: u32 = 0x0064;
 
     // ── 0x70 calls / guards ──────────────────────────────────────────
     /// Direct/indirect call (clobbers caller-saved; safepoint).
@@ -535,6 +536,15 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
     let defs = lo.vregs(&data.results);
     let uses = lo.vregs(&data.args);
 
+    if data.opcode == MemoryFence {
+        if let (Some(&def), crate::t2::ir::AuxData::MemoryFence(kind)) = (defs.first(), &data.aux) {
+            lo.emit_imm(inst, op::MEMORY_FENCE, def, *kind as i64);
+        } else {
+            lo.emit_for(inst, op::PSEUDO_UNSUPPORTED, defs, uses);
+        }
+        return;
+    }
+
     // Non-moving constants materialise a tagged immediate the emitter can move
     // directly. Heap literals instead define an allocated value and
     // are loaded from their rooted pool slot by the rich emitter.
@@ -669,6 +679,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
             lo.emit_annotated(inst, op::STORE, defs, uses);
         }
         WriteBarrier => lo.emit_annotated(inst, op::WRITE_BARRIER, defs, uses),
+        MemoryFence => unreachable!(),
 
         // ── multiple-values reset → runtime helper (no defs/uses) ──
         ClearMv | TakeValuesToLocals => lo.emit_annotated(inst, op::CALL_RUNTIME, defs, uses),

@@ -453,8 +453,10 @@ The three barrier functions return `NIL`. Kinds are `:READ` (acquire),
 `PROGRAM-ERROR`. `LOAD-BARRIER` and `STORE-BARRIER` select `:READ` and
 `:WRITE`. These fences are not rendezvous barriers and do not make ordinary
 accesses atomic. See [memory ordering](manual/user/reference/extensions.md#memory-ordering).
-Dedicated x86 T1/T2 intrinsic lowering remains pending; the public functions
-currently call the runtime fence helper.
+On x86-64, literal kinds and the default/load/store wrappers lower to dedicated
+T0 bytecode and native T1/T2 fences, also preserved in compiled files. Dynamic
+kinds retain the checked runtime helper; other architectures keep the runtime
+path. The API guarantees ordering, not a particular instruction sequence.
 
 `WITH-ATOMIC` is not part of the implemented public API; do not rely on the
 older planned scheduler-preemption interface.
