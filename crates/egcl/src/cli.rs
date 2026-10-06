@@ -1914,7 +1914,7 @@ fn reject_assignment_to_constant(target: EgclVal) -> Result<(), EgclError> {
         "a keyword"
     } else if !target.is_symbol() {
         "a non-symbol"
-    } else if with_constant_vars(|c| c.borrow().contains(&sym_name(target))) {
+    } else if egcl_rt::symbols::symbol_is_constant(target.as_symbol_index()) {
         "a constant defined by DEFCONSTANT"
     } else {
         return Ok(());
@@ -2743,15 +2743,9 @@ thread_local! {
 /// Global SETF writers are shared by every execution and scanned once per GC.
 static GLOBAL_SETF_FNS: LazyLock<SharedCell<HashMap<String, FunDef>>> =
     LazyLock::new(|| SharedCell::new(HashMap::new()));
-/// DEFCONSTANT metadata is process-wide, like the symbol value cells.
-static CONSTANT_VARS: LazyLock<SharedCell<std::collections::HashSet<String>>> =
-    LazyLock::new(|| SharedCell::new(std::collections::HashSet::new()));
 
 fn with_global_setf_fns<R>(f: impl FnOnce(&SharedCell<HashMap<String, FunDef>>) -> R) -> R {
     f(&GLOBAL_SETF_FNS)
-}
-fn with_constant_vars<R>(f: impl FnOnce(&SharedCell<std::collections::HashSet<String>>) -> R) -> R {
-    f(&CONSTANT_VARS)
 }
 
 /// Cached `(generation, env)` where `env` holds every global macro in its
@@ -8881,17 +8875,25 @@ impl Env {
         }
     }
 
-    fn set_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) {
+    fn set_frame_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) -> bool {
         if Self::set_symbol_frame_var(&self.frame, symbol.as_symbol_index(), val) {
-            return;
+            return true;
         }
         let name = sym_name(symbol);
-        if Self::set_frame_var(&self.frame, &name, val) {
-            return;
+        Self::set_frame_var(&self.frame, &name, val)
+    }
+
+    fn set_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) {
+        if !self.set_frame_var_symbol(symbol, val) {
+            egcl_rt::symbols::set_symbol_value(symbol.as_symbol_index(), val);
         }
-        // Not bound on the frame stack → global assignment into the symbol's
-        // value cell (bliss-jtc.6 Stage C2).
-        egcl_rt::symbols::set_symbol_value(symbol.as_symbol_index(), val);
+    }
+
+    fn assign_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) -> Result<(), EgclError> {
+        if self.set_frame_var_symbol(symbol, val) {
+            return Ok(());
+        }
+        egcl_rt::symbols::set_symbol_value_checked(symbol.as_symbol_index(), val)
     }
 
     fn lookup_symbol_macro(&self, symbol: EgclVal) -> Option<EgclVal> {
@@ -11663,7 +11665,9 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
 /// Record SYMBOL as a DEFCONSTANT name, so CONSTANTP answers for it. The same
 /// registry the `%DEFCONSTANT` primitive writes.
 fn mark_constant_name(symbol: EgclVal) {
-    with_constant_vars(|c| c.borrow_mut().insert(sym_name(symbol)));
+    if let Some(idx) = symbol.symbol_index() {
+        egcl_rt::symbols::mark_symbol_constant(idx);
+    }
 }
 
 fn seed_compile_time_binding(env: &mut Env, symbol: EgclVal, value: EgclVal) {
@@ -18298,7 +18302,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     let (h, _) = cp(v);
                     h.is_symbol() && sym_bare_name_rc(h).as_ref() == "QUOTE"
                 } else if v.is_symbol() {
-                    is_keyword_arg(v) || with_constant_vars(|c| c.borrow().contains(&sym_name(v)))
+                    is_keyword_arg(v) || egcl_rt::symbols::symbol_is_constant(v.as_symbol_index())
                 } else {
                     // Numbers, characters, strings, and other self-evaluating
                     // heap atoms are constant.
@@ -18351,10 +18355,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // allocate; `name` is a symbol handle (an immediate) and needs
                 // no root.
                 egcl_rt::rooted!(val = eval_form(val_form, env)?);
-                if name.is_symbol() {
-                    env.set_var_symbol(name, *val);
-                    let n = sym_name(name);
-                    with_constant_vars(|c| c.borrow_mut().insert(n));
+                if let Some(idx) = name.symbol_index() {
+                    egcl_rt::symbols::define_symbol_constant(idx, *val);
                     home_defined_symbol(env, name);
                 }
                 return Ok(*val);
@@ -18366,8 +18368,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // CONSTANTP recognises it. Called by the DEFCONSTANT macro.
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                if v.is_symbol() {
-                    with_constant_vars(|c| c.borrow_mut().insert(sym_name(v)));
+                if v.symbol_index().is_some() {
+                    mark_constant_name(v);
                     // DEFCONSTANT routes its name here; home it present INTERNAL
                     // in CL-USER so FIND-SYMBOL reports :INTERNAL (bliss-v15i).
                     home_defined_symbol(env, v);
@@ -19041,7 +19043,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     reject_assignment_to_constant(sym_form)?;
                     let val = eval_form(val_form, env)?;
                     if sym_form.is_symbol() {
-                        env.set_var_symbol(sym_form, val);
+                        env.assign_var_symbol(sym_form, val)?;
                     } else {
                         env.set_var(&sym_name(sym_form), val);
                     }
@@ -19325,7 +19327,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             *c = *r2;
                             continue;
                         }
-                        env.set_var_symbol(*place, *val);
+                        env.assign_var_symbol(*place, *val)?;
                     } else if place.is_cons() {
                         let (accessor, aargs) = cp(*place);
                         let acc = if accessor.is_symbol() {

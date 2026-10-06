@@ -14965,7 +14965,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             Instr::StoreGlobal(sym) => {
                 let s = EgclVal::from_symbol_index(sym);
                 let v = acts[top_idx].pop_op();
-                env.set_var_symbol(s, v);
+                if let Err(error) = env.assign_var_symbol(s, v) {
+                    initiate_unwind(acts, stack, env, Pending::Propagate(error))?;
+                }
             }
             Instr::LoadFunction(sym) => {
                 // `#'foo`: push the actual heap function object when `foo` names an
@@ -16475,7 +16477,9 @@ extern "C" fn c2i_load_function(sym: u64) -> u64 {
 }
 
 extern "C" fn c2i_store_global(sym: u64, val: u64) {
-    egcl_rt::symbols::set_symbol_value(sym as u32, EgclVal(val));
+    if let Err(error) = egcl_rt::symbols::set_symbol_value_checked(sym as u32, EgclVal(val)) {
+        stash_native_error(error);
+    }
 }
 
 extern "C" fn c2i_set_native_sigsegv_recovery(enabled: u64) {
