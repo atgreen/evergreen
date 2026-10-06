@@ -10,6 +10,10 @@
 
 ### Correctness and reliability
 
+- `EQ` comparisons between constant operands now compile at T2, including
+  comparisons used as values or branch conditions
+  ([#50](https://github.com/atgreen/evergreen/pull/50)).
+
 - Macro-generated closures now retain their enclosing `TAGBODY` exits, while
   loops without captured exits can reach T2 compilation
   ([#49](https://github.com/atgreen/evergreen/pull/49)).
