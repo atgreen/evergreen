@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -122,6 +123,22 @@ def rpm_identity(source_rpm, version='0.0.1', rpm_release='0.test.123.1.fc44'):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_metadata_matches_workspace_version(self):
+        root = release.ROOT
+        version = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['package']['version']
+        self.assertEqual(release.RPM_RELEASE[0], version)
+        self.assertIn(f'(defun lisp-implementation-version () "{version}")',
+                      (root / 'lib/boot.lisp').read_text())
+        self.assertRegex((root / 'CITATION.cff').read_text(),
+                         rf'(?m)^version: {re.escape(version)}$')
+        self.assertIn(f':apk-runtime-version "{version}"',
+                      (root / 'examples/android-egl/android-egl.asd').read_text())
+        lock = tomllib.loads((root / 'Cargo.lock').read_text())
+        for package in lock['package']:
+            if 'source' not in package:
+                with self.subTest(package=package['name']):
+                    self.assertEqual(package['version'], version)
+
     def test_published_architectures_match_enabled_workflow_builders(self):
         """Disabling a builder must also change what the collector requires."""
         workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
@@ -139,11 +156,12 @@ class ReleaseTests(unittest.TestCase):
                          set(release.RELEASE_PACKAGES_BY_ARCH))
 
     def test_tag_must_match_workspace_version(self):
-        plan = release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.1', '123', '1', '')
-        self.assertEqual(plan['tag'], 'v0.0.1')
+        version = release.RPM_RELEASE[0]
+        plan = release.make_plan(version, 'push', f'refs/tags/v{version}', '123', '1', '')
+        self.assertEqual(plan['tag'], f'v{version}')
         self.assertFalse(plan['prerelease'])
         with self.assertRaisesRegex(ValueError, 'version'):
-            release.make_plan('0.0.1', 'push', 'refs/tags/v0.0.2', '123', '1', '')
+            release.make_plan(version, 'push', 'refs/tags/v99.0.0', '123', '1', '')
 
     def test_manual_test_has_unique_tag_and_lower_rpm_release(self):
         plan = release.make_plan('0.0.1', 'workflow_dispatch', 'refs/heads/main', '123', '2', 'test')

@@ -25,7 +25,7 @@
   :apk-debuggable t
   :apk-hosts ("aarch64-linux-android")
   :apk-runtime-api 4
-  :apk-runtime-version "0.0.1"
+  :apk-runtime-version "0.0.2"
   ;; These become the APK's assets, in this order. app.lisp is the entry the
   ;; runtime loads; it loads the others itself.
   :pathname "assets/"

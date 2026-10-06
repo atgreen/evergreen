@@ -31,7 +31,7 @@ SPEC_NAME = 'egcl.spec'
 FINDING = re.compile(r'^(?P<subject>\S+?): (?P<level>[EW]): (?P<rest>.*)$')
 
 
-def render_spec(version='0.0.1', release='6'):
+def render_spec(version='0.0.2', release='1'):
     """The spec as rpmbuild would see it, with the release macros resolved.
 
     rpmlint on the checked-in spec would report nothing useful: Version is

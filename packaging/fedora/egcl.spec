@@ -57,7 +57,7 @@ Version: %{egcl_version}
 # Fallback for a local rpmbuild; the release jobs always pass --define. Keep it
 # equal to release.py's RPM_RELEASE, which test-release.py enforces, and reset
 # both to 1 whenever Version changes.
-%{!?egcl_release:%global egcl_release 6}
+%{!?egcl_release:%global egcl_release 1}
 Release: %{egcl_release}%{?dist}
 Summary: Evergreen Common Lisp — a tiered JIT and saved executable images
 License: GPL-3.0-or-later WITH Classpath-exception-2.0
@@ -340,5 +340,8 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %endif
 
 %changelog
+* Mon Oct 05 2026 Anthony Green <green@moxielogic.com> - 0.0.2-1
+- Update to EGCL 0.0.2.
+
 * Thu Oct 01 2026 Anthony Green <green@moxielogic.com> - 0.0.1-6
 - Initial Fedora packaging for native and cross-target EGCL runtimes.

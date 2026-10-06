@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.2 - 2026-10-05
+
 ### Documentation
 
 - Document atomic-update semantics, supported places, memory ordering, and
