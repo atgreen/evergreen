@@ -1,0 +1,2393 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Common Lisp with a tiered JIT, saved applications, and cross-target tooling.">
+      
+      
+      
+        <link rel="canonical" href="https://atgreen.github.io/evergreen/0.0.2/user/how-to/save-executable/">
+      
+      
+        <link rel="prev" href="../../reference/images/">
+      
+      
+        <link rel="next" href="../cross-build/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Save an executable - Evergreen Common Lisp</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+    
+    
+      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#save-an-executable" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Evergreen Common Lisp" class="md-header__button md-logo" aria-label="Evergreen Common Lisp" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Evergreen Common Lisp
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Save an executable
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/atgreen/evergreen" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    atgreen/evergreen
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Evergreen Common Lisp" class="md-nav__button md-logo" aria-label="Evergreen Common Lisp" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Evergreen Common Lisp
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/atgreen/evergreen" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    atgreen/evergreen
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contents
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    1. Introduction
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    1. Introduction
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../introduction/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Introduction
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platform support
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../build/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Build and install
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    2. Starting and stopping
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    2. Starting and stopping
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../starting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Starting and stopping
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command-line options
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    3. Compilation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    3. Compilation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../compiler/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compilation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/execution/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Execution tiers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../asdf/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ASDF systems
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../debugger/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    4. Conditions and debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../memory/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    5. Memory and garbage collection
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../foreign/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    6. Foreign function interface
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../java/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    7. Java integration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_9" id="__nav_9_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    8. Threads and fibers
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    8. Threads and fibers
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Threads and synchronization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../fibers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fibers and scheduler groups
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/extensions/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    9. Operating-system interface
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    10. Profiling and efficiency
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    10. Profiling and efficiency
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../profiling/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Profiling and efficiency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/how-to/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Measurement procedure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_12" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_12" id="__nav_12_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    11. Application delivery
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_12_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_12">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    11. Application delivery
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/images/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Images and applications
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/images/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Image dictionary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Save an executable
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Save an executable
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#save-a-development-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Save a development session
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#save-a-separate-core-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Save a separate core file
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deliver-an-application-from-a-saved-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deliver an application from a saved image
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#specialize-the-native-runtime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Specialize the native runtime
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Specialize the native runtime">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#measured-size-example" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measured size example
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cross-build/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cross-target executables
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../android/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Android applications
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/android/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Android project dictionary
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_13" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_13" id="__nav_13_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_13">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Examples
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/first-program/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    First program
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_14" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../../contributing/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Appendix A. Runtime contributors
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_14" id="__nav_14_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_14_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_14">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Appendix A. Runtime contributors
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/explanation/architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/reference/repository/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Repository map
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/reference/fibers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Runtime fiber API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/how-to/change-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Change the runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../contributing/how-to/gc-safety/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GC safety
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../symbol-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Appendix B. Symbol index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../concept-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Appendix C. Concept index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../meta/documentation-guidelines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Writing the manual
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#save-a-development-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Save a development session
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#save-a-separate-core-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Save a separate core file
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deliver-an-application-from-a-saved-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deliver an application from a saved image
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#specialize-the-native-runtime" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Specialize the native runtime
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Specialize the native runtime">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#measured-size-example" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measured size example
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/atgreen/evergreen/edit/main/docs/manual/user/how-to/save-executable.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="save-an-executable">Save an executable<a class="headerlink" href="#save-an-executable" title="Permanent link">&para;</a></h1>
+<p>Use a saved executable to ship a loaded Lisp application. Start with the EGCL
+runtime for the machine that will run the application. For another target,
+follow <a href="../cross-build/">Build for another platform</a>.</p>
+<p>Create <code>build.lisp</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"Hello from EGCL!~%"</span><span class="p">))</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"hello"</span><span class="w"> </span><span class="ss">:executable</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="ss">:toplevel</span><span class="w"> </span><span class="nf">#'</span><span class="nv">main</span><span class="p">)</span>
+</code></pre></div>
+<p>Run:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>build.lisp
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>./hello
+</code></pre></div>
+<p>Saving terminates the build process. Running <code>hello</code> invokes <code>main</code> and prints
+<code>Hello from EGCL!</code>. Load your own application and its libraries before calling
+<code>save-lisp-and-die</code>.</p>
+<h2 id="save-a-development-session">Save a development session<a class="headerlink" href="#save-a-development-session" title="Permanent link">&para;</a></h2>
+<p>To restart into a REPL with your definitions available, omit <code>:toplevel</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">square</span><span class="w"> </span><span class="p">(</span><span class="nv">x</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nb">*</span><span class="w"> </span><span class="nv">x</span><span class="w"> </span><span class="nv">x</span><span class="p">))</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"session"</span><span class="w"> </span><span class="ss">:executable</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
+</code></pre></div>
+<p>After the saving process exits, run <code>./session</code> and evaluate <code>(square 9)</code>.
+The result is <code>81</code>.</p>
+<h2 id="save-a-separate-core-file">Save a separate core file<a class="headerlink" href="#save-a-separate-core-file" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"session.core"</span><span class="p">)</span>
+</code></pre></div>
+<p>Restart it with a compatible runtime:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>session.core
+</code></pre></div>
+<p>Use <code>--image</code> for a core file, not <code>load</code>. See the
+<a href="../../reference/images/">image reference</a> for format and compatibility limits.</p>
+<h2 id="deliver-an-application-from-a-saved-image">Deliver an application from a saved image<a class="headerlink" href="#deliver-an-application-from-a-saved-image" title="Permanent link">&para;</a></h2>
+<p>Delivery takes a saved core and a separate specification. It restores the core
+in the delivery process, selects an entry point, removes unreachable named
+functions in packages you explicitly select, and writes a standalone executable.
+The input core is unchanged. Its old entry point and your init file are not run.</p>
+<p>For example, save this application as <code>app.core</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nb">defpackage</span><span class="w"> </span><span class="ss">:my-app</span><span class="w"> </span><span class="p">(</span><span class="ss">:use</span><span class="w"> </span><span class="ss">:cl</span><span class="p">))</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="p">(</span><span class="nb">in-package</span><span class="w"> </span><span class="ss">:my-app</span><span class="p">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">greeting</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Hello from a delivered image!"</span><span class="p">)</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">unused-helper</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Development only"</span><span class="p">)</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"~A~%"</span><span class="w"> </span><span class="p">(</span><span class="nv">greeting</span><span class="p">)))</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"app.core"</span><span class="p">)</span>
+</code></pre></div>
+<p>Create <code>app.delivery</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>version = 1
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>entry = MY-APP::MAIN
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>prune-package = MY-APP
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>dynamic = explicit
+</code></pre></div>
+<p>Inspect the retention report, then deliver:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span>--dry-run
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>./hello
+</code></pre></div>
+<p>The dry run writes no output files. Delivery writes <code>hello</code> and a versioned
+text report, <code>hello.manifest</code>, listing retained and removed candidate functions,
+retention reasons, platform, runtime policy, and file sizes. Existing executables
+are replaced only after the new executable has been built. The executable and
+report are separate files, not a transactional pair.</p>
+<p>The specification is a UTF-8, line-oriented format, <strong>not TOML or Lisp</strong>. Write
+unquoted <code>key = value</code> lines; blank lines and lines beginning with <code>#</code> are ignored.
+Names are case-sensitive and normally uppercase. Unknown keys, duplicate
+singleton keys, missing functions, and unknown packages are errors.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>version = 1</code></td>
+<td>Required specification version</td>
+</tr>
+<tr>
+<td><code>entry = PACKAGE::FUNCTION</code></td>
+<td>Required existing entry function, called with no arguments</td>
+</tr>
+<tr>
+<td><code>prune-package = PACKAGE</code></td>
+<td>Package whose named functions may be removed; repeat for multiple packages</td>
+</tr>
+<tr>
+<td><code>prune-package = *</code></td>
+<td>Make all named definitions eligible, including bootstrap helpers without a package</td>
+</tr>
+<tr>
+<td><code>keep = PACKAGE::FUNCTION</code></td>
+<td>Additional root, such as a dynamically selected callback; repeat as needed</td>
+</tr>
+<tr>
+<td><code>dynamic = preserve</code></td>
+<td>Default: retain all candidate functions to preserve unknown dynamic targets</td>
+</tr>
+<tr>
+<td><code>dynamic = explicit</code></td>
+<td>Opt in to pruning; declare every additional dynamic entry with <code>keep</code></td>
+</tr>
+<tr>
+<td><code>runtime = full</code></td>
+<td>Default: reuse the full delivery driver, without invoking Cargo</td>
+</tr>
+<tr>
+<td><code>runtime = specialized</code></td>
+<td>Build a matching release runtime with only the required optional native capabilities</td>
+</tr>
+<tr>
+<td><code>max-tier = t2</code></td>
+<td>Default: include both native compilers; <code>t1</code> omits T2 and <code>t0</code> omits both, requiring <code>runtime = specialized</code></td>
+</tr>
+<tr>
+<td><code>runtime-keep = disassembly</code></td>
+<td>Additional native capability root; supported names are <code>disassembly</code>, <code>dynamic-code</code>, and <code>tree-walker</code></td>
+</tr>
+</tbody>
+</table>
+<p>Use <code>dynamic = explicit</code> only when the root list describes your application.
+For example, <code>(funcall (intern command "MY-APP"))</code> can name functions the analyzer
+cannot infer from the saved data. Add a <code>keep</code> line for each permitted target,
+or leave <code>dynamic = preserve</code>. Reachable arbitrary-code entry points such as
+<code>EVAL</code> and <code>LOAD</code> retain all candidate functions and native capabilities even
+with <code>dynamic = explicit</code>: the retention policy cannot override that dependency.
+Plugins, foreign callbacks, and method redefinition also need explicit roots
+when their targets cannot be inferred. This is a delivery policy, not a security
+boundary.</p>
+<p>The current pass retains all global data, symbol identities, packages,
+classes, and functions outside the selected packages. It follows
+references through saved data and source/bytecode, including nested functions
+and captured environments. Conservatively retained registries can keep extra
+functions alive. Runtime packages such as <code>COMMON-LISP</code> and <code>EGCL-INTERNAL</code>
+can be selected explicitly; <code>KEYWORD</code> cannot. Installed printing, instance
+initialization, and Gray stream protocols remain reachable through the
+runtime's implicit calls, even when application code does not name them.</p>
+<p>For the broadest candidate set, use <code>prune-package = *</code>. The default
+<code>dynamic = preserve</code> still retains possible dynamic targets; combine the wildcard
+with <code>dynamic = explicit</code> after declaring any additional entry points with
+<code>keep</code>. A bootstrap helper that has no home package can be retained by its exact
+reported registry name, such as <code>keep = %GCD2</code>. Definitions with a home package
+still require <code>PACKAGE::NAME</code> in <code>keep</code>.</p>
+<p>Generic functions in selected packages are candidates too. Retaining a generic
+retains its methods, and a reachable saved method handle retains its owning
+generic and method set. Class accessor names also retain their functions.
+Unreachable generic functions and their owned method records are removed from
+both evaluator and CLOS registries before saving. A generic can be an <code>entry</code>
+or an explicit <code>keep</code> root.</p>
+<p>For methods with saved bytecode, delivery discards the redundant source body
+and follows the compiled callable. Macros used only to compile such a method
+do not stay alive through its old source. Uncompiled methods retain their
+source and its dependencies.</p>
+<p>Source and bytecode macros in selected packages also follow reachable names.
+Saved macro expanders retain the definitions they invoke, and <code>keep</code> may name
+a macro needed through a dynamically constructed name. An unreachable macro's
+body does not retain its callees or native capabilities. Macros cannot serve
+as the executable's <code>entry</code>. Compiler registrations and frozen captures with a
+known macro owner follow that macro's reachability. Unreachable registrations
+are released before saving. SETF expanders, compiler macros, and registrations
+without a known owner remain conservative roots.</p>
+<p>User-defined SETF writers in selected packages follow the reachability of their
+accessor names and saved writer functions. Delivery removes an unreachable
+writer's private function cell and source record. Use <code>keep = PACKAGE::ACCESSOR</code>
+to retain a dynamically invoked writer, even if the accessor has no getter.
+New BFASLs preserve the accessor symbol so delivery can identify its owning
+package. Older artifacts with missing or ambiguous ownership remain
+conservatively retained.</p>
+<p>Private compiled closures and source closure handles are traced from reachable
+objects and code, including their captured environments. An unreachable
+closure does not retain its callees or native capabilities just because it
+remains in a runtime registry. Delivery removes its private code and captures
+before saving; <code>private-code-removed</code> reports removed compiled entries and
+<code>source-closures-removed</code> reports removed source closure entries.
+Escaped closures and shared captured environments remain live when reachable.</p>
+<p>Pruning removes function bindings and their owned registry records, then saves
+the remaining reachable objects into a new image. The serializer omits dead
+objects even from pinned regions, rather than leaving holes for their bytes.
+Saved object identities let the loader rebuild pointers with an old-to-new
+address map. Symbol identities and other retained data can therefore survive
+after a function's implementation is removed. The original input file is never
+modified.</p>
+<p>With the default <code>runtime = full</code>, delivery reduces the saved image and keeps
+the full Rust runtime. Re-saving an executable replaces its embedded image
+instead of stacking another copy of the previous core into the runtime prefix.</p>
+<h2 id="specialize-the-native-runtime">Specialize the native runtime<a class="headerlink" href="#specialize-the-native-runtime" title="Permanent link">&para;</a></h2>
+<p>Add this to the same delivery specification:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>runtime = specialized
+</code></pre></div>
+<p>Then run delivery with a matching source checkout:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span>--runtime-source<span class="w"> </span>/path/to/egcl
+</code></pre></div>
+<p>The source checkout defaults to the location recorded when the driver was built.
+You need Cargo, the matching Rust toolchain, its target libraries, and the target
+linker. The new runtime must execute on the delivery machine so its compatibility
+contract can be checked; this command does not cross-deliver images.</p>
+<p>Native capabilities are selected by the reachability graph. A retained
+<code>DISASSEMBLE</code> reference keeps disassembly. A retained <code>EVAL</code>, <code>COMPILE</code>, <code>LOAD</code>,
+<code>COMPILE-FILE</code>, <code>REQUIRE</code>, or reader operation supporting <code>#.</code> keeps
+<code>dynamic-code</code>, which in turn keeps <strong>every</strong> native capability and candidate
+Lisp function. The report names these roots. <code>dynamic = preserve</code> retains all
+capabilities; explicit <code>runtime-keep</code> entries add roots, never remove required
+ones.</p>
+<p>When <code>dynamic-code</code> is unreachable, the specialized runtime omits those public
+source-evaluation entry points and rejects <code>--eval</code>, <code>--load</code>, scripts, and the
+REPL. It also skips init files. Validated saved cores
+remain supported. Saved raw lambda lists, including constant-pool and global
+data, retain <code>tree-walker</code> and the definitions referenced by their bodies.
+A fixed lambda does not by itself retain every function or native capability;
+an <code>EVAL</code> inside its body does. Applications that construct arbitrary lambda
+bodies dynamically must retain <code>dynamic-code</code>.</p>
+<p>The GC and T0 bytecode interpreter remain available. Delivery includes both
+native compilers by default. With <code>runtime = specialized</code>, choose the highest
+included tier using <code>max-tier = t2</code> (default), <code>max-tier = t1</code> (omit the T2
+optimizing compiler), or <code>max-tier = t0</code> (omit both native compilers).
+The omitted compiler entry points are removed at build time so native linking
+can remove their implementation. T0-only applications continue executing saved
+bytecode. Native promotion and OSR cannot exceed the selected tier;
+<code>EGCL_FORCE_TIER</code> requests above it are clamped to the available tier.</p>
+<p>For example, a specification that selects the whole saved world and omits both
+native compilers is:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>version = 1
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>entry = MY-APP::MAIN
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>prune-package = *
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>dynamic = explicit
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>runtime = specialized
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>max-tier = t0
+</code></pre></div>
+<p>Add <code>keep</code> entries for dynamically selected callbacks. Tier selection is
+independent of source evaluation: reachable <code>EVAL</code> still retains its evaluator
+and builtin dependencies even with <code>max-tier = t0</code>.</p>
+<p>Deoptimization resumes T0 bytecode; it does not require public <code>EVAL</code>.
+<code>EvalHost</code> follows the references in its saved constant form rather than rooting
+all capabilities. Many library builtins share an evaluated-argument dispatcher
+between source and compiled calls, avoiding the construction and evaluation of
+temporary Lisp call forms. The separate <code>tree-walker</code> capability is omitted
+when retained functions have restorable bytecode and their reachable operations
+do not require source evaluation. Native linking then removes the tree-walking
+operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
+and any selected native compilation tiers.</p>
+<p>Specialized delivery attempts to compile reachable named source functions that
+have no captured lexical environment. It discards their source only after
+confirming that the bytecode can be saved and restored independently, then
+recomputes reachability. This also runs during <code>--dry-run</code>: compilation may
+invoke macro expanders, but delivery does not call the application entry point.
+The input image is unchanged.</p>
+<p>Unsupported source functions and closures, source handler forms, variadic
+argument binders, uncompiled generic methods, and builtin paths that still
+require the evaluator retain <code>tree-walker</code>. The report identifies these
+dependencies. The initial audited builtin set covers arithmetic, basic list operations, multiple values,
+function application, and <code>WRITE-LINE</code>; other builtin paths conservatively
+retain the walker. BFASL input already provides compiled function bodies;
+supported cold source definitions can now be compiled during delivery too.
+Simply omitting <code>EVAL</code> is insufficient if other reachable operations still
+require source evaluation.</p>
+<p>Bootstrap definitions outside the selected packages are retained. Selecting
+their packages allows unreachable library functions and macros to be removed
+from an ordinary bootstrapped image. Conservative registry dependencies can
+still retain all native capabilities even when its application
+entry point comes from BFASL. The source-free native-removal tests use images
+built with <code>--no-bootstrap</code>.</p>
+<p>When the walker is unnecessary, delivery also selects native builtin dispatch
+arms from the reachable symbols. Unselected arms are removed before Rust code
+generation, allowing LTO and linker garbage collection to discard their helpers
+and library implementations. Aliases sharing an arm retain that implementation
+together. Builtin slot numbers remain stable across runtimes. Images requiring
+the walker currently retain the full builtin dispatcher until its implicit
+calls are represented in the dependency graph. Reachable dynamic-code
+operations always retain every builtin.</p>
+<p>Delivery generates a versioned native contract, builds through Cargo in
+<code>target/delivery/</code> under the source checkout, checks the resulting executable,
+and appends the reduced image. Compile-time selection removes references to the
+instruction decoder; release LTO and linker garbage collection can then remove
+its implementation. The cache separates source versions, targets, capabilities,
+builtin selections, maximum tiers, Cargo features, compiler flags, and toolchain
+identities. Existing output files survive a failed build or compatibility check.
+A dry run reports selection without invoking Cargo or writing an executable;
+source preparation and macro expansion can still run as described above.</p>
+<p><code>--runtime-info</code> prints a runtime's contract. Saved image format 5 includes the
+same compatibility information and is checked before heap restoration. Source
+content identity, target, Rust toolchain, Cargo features, and compiler flags
+must match; the runtime's native capabilities must include the image's required
+capabilities, builtin set, and compiler tiers. Contract schema 3 records builtin
+names as UTF-8 hex strings; <code>builtins=*</code> denotes the complete set. The source
+fingerprint is a compatibility identifier, not a cryptographic signature.
+Full runtimes can still read older images; specialized runtimes require the new
+metadata. A reduced driver cannot be used for
+<code>runtime = full</code> delivery.</p>
+<p>The delivery report separates <code>native-bytes</code> and <code>image-bytes</code>. Compare native
+sizes from the same release profile and stripping settings; a debug driver is
+not a useful size baseline for a specialized release build. Strip an executable
+<strong>before</strong> appending an image: stripping the delivered file may discard its core.</p>
+<h3 id="measured-size-example">Measured size example<a class="headerlink" href="#measured-size-example" title="Permanent link">&para;</a></h3>
+<p>At commit <code>c25f245f</code>, the source-free native delivery regression on x86-64 Linux
+musl produced the following sizes. All three builds used Rust 1.94.1, the same
+release profile (Thin LTO), the same application, and no additional stripping.
+The application exercises arithmetic, loops, output, and condition handlers;
+only <code>+</code>, <code>&lt;</code>, <code>=</code>, <code>FUNCALL</code>, and <code>WRITE-LINE</code> remained in its builtin selection.</p>
+<table>
+<thead>
+<tr>
+<th>Highest included tier</th>
+<th style="text-align: right;">Native runtime bytes</th>
+<th style="text-align: right;">Image bytes</th>
+<th style="text-align: right;">Complete executable bytes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T2 (default)</td>
+<td style="text-align: right;">6,302,160</td>
+<td style="text-align: right;">246,167</td>
+<td style="text-align: right;">6,548,343</td>
+</tr>
+<tr>
+<td>T1</td>
+<td style="text-align: right;">5,128,024</td>
+<td style="text-align: right;">246,167</td>
+<td style="text-align: right;">5,374,207</td>
+</tr>
+<tr>
+<td>T0</td>
+<td style="text-align: right;">4,947,864</td>
+<td style="text-align: right;">246,167</td>
+<td style="text-align: right;">5,194,047</td>
+</tr>
+</tbody>
+</table>
+<p>The executable totals include the 16-byte image trailer. These are a small
+fixture's measurements, not a promised size for other applications. The tests
+check omitted compiler and builtin symbols and execute with automatic tiering,
+forced-tier requests, and low promotion/OSR thresholds. Ordinary bootstrap
+images can retain more code through the conservative dependencies described
+above; all global data and symbol/package identities remain roots.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../../reference/images/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Image dictionary">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Image dictionary
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../cross-build/" class="md-footer__link md-footer__link--next" aria-label="Next: Cross-target executables">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Cross-target executables
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.sections", "navigation.indexes", "navigation.top", "navigation.footer", "toc.follow", "content.code.copy", "content.action.edit", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"alias": true, "provider": "mike"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
