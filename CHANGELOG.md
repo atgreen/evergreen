@@ -4,6 +4,11 @@
 
 ### Correctness and reliability
 
+- `COMPILE-FILE` now leaves ordinary `DEFPARAMETER` initialization until load
+  time, preserving existing values and avoiding duplicate initializer effects
+  while retaining compile-time special declarations
+  ([#34](https://github.com/atgreen/evergreen/pull/34)).
+
 - `DEFSTRUCT` constructors now enforce declared slot types, including defaults,
   inherited constraints, BOA constructors, and list/vector-backed structures
   ([#31](https://github.com/atgreen/evergreen/pull/31)).
