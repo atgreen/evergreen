@@ -10,6 +10,10 @@
 
 ### Correctness and reliability
 
+- Macro-generated closures now retain their enclosing `TAGBODY` exits, while
+  loops without captured exits can reach T2 compilation
+  ([#49](https://github.com/atgreen/evergreen/pull/49)).
+
 - Native code now preserves live immediate values across inserted loop and
   straight-line polls, preventing runtime calls from clobbering those values
   ([#40](https://github.com/atgreen/evergreen/pull/40)).
