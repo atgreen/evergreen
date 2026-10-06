@@ -1176,21 +1176,23 @@
 
 (defun position-if (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))))
-    (flet ((matchp (e) (funcall pred (if key (funcall key e) e))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                when (matchp (elt seq i)) return i)
-          (loop for i from start below stop
-                when (matchp (elt seq i)) return i)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              when (funcall pred (if key (funcall key e) e)) return i)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              when (funcall pred (if key (funcall key e) e)) return i))))
 
 (defun position-if-not (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))))
-    (flet ((matchp (e) (not (funcall pred (if key (funcall key e) e)))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                when (matchp (elt seq i)) return i)
-          (loop for i from start below stop
-                when (matchp (elt seq i)) return i)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              unless (funcall pred (if key (funcall key e) e)) return i)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              unless (funcall pred (if key (funcall key e) e)) return i))))
 
 (defun count-if (pred seq &key key (start 0) end from-end)
   (let ((stop (or end (length seq))) (n 0))
@@ -1273,14 +1275,15 @@
   (let ((testfn (or test test-not #'eql))
         (neg (if test-not t nil))
         (stop (or end (length seq))))
-    (flet ((matchp (e)
-             (let ((r (funcall testfn item (if key (funcall key e) e))))
-               (if neg (not r) r))))
-      (if from-end
-          (loop for i from (1- stop) downto start
-                when (matchp (elt seq i)) return i)
-          (loop for i from start below stop
-                when (matchp (elt seq i)) return i)))))
+    (if from-end
+        (loop for i from (1- stop) downto start
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              when (if neg (not matched) matched) return i)
+        (loop for i from start below stop
+              for e = (elt seq i)
+              for matched = (funcall testfn item (if key (funcall key e) e))
+              when (if neg (not matched) matched) return i))))
 
 ;; COUNT and friends accept :FROM-END. The COUNT itself cannot depend on
 ;; direction, but the ORDER in which :KEY and the test are applied does, and

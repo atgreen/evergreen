@@ -4,6 +4,10 @@
 
 ### Correctness and reliability
 
+- Repeated `POSITION`, `POSITION-IF`, and `POSITION-IF-NOT` searches now avoid
+  excessive memory growth from compiling a new predicate helper on every call
+  ([#42](https://github.com/atgreen/evergreen/pull/42)).
+
 - Bit-vector results from `COPY-SEQ`, `SUBSEQ`, and `REVERSE` now preserve
   zero bits when garbage collection recycles storage
   ([#41](https://github.com/atgreen/evergreen/pull/41)).

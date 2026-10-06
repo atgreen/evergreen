@@ -7,15 +7,20 @@ fn eval(source: &str) -> String {
         .args(["--no-init", "--eval", source])
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}\n{}",
-        String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
 #[test]
 #[cfg(target_os = "linux")]
 fn repeated_short_searches_do_not_accumulate_large_closure_metadata() {
-    let output = eval(r#"
+    let output = eval(
+        r#"
       (defun report-rss ()
         (with-open-file (s "/proc/self/status")
           (loop for line = (read-line s nil nil) while line
@@ -26,8 +31,10 @@ fn repeated_short_searches_do_not_accumulate_large_closure_metadata() {
         (assert (= 16 (position #\Space "0000000000000000 T symbol")))
         (assert (= 16 (position-if #'space-p "0000000000000000 T symbol"))))
       (report-rss)
-    "#);
-    let rss: Vec<u64> = output.lines()
+    "#,
+    );
+    let rss: Vec<u64> = output
+        .lines()
         .filter_map(|line| line.strip_prefix("VmRSS:"))
         .map(|line| line.split_whitespace().next().unwrap().parse().unwrap())
         .collect();
@@ -39,7 +46,8 @@ fn repeated_short_searches_do_not_accumulate_large_closure_metadata() {
 
 #[test]
 fn position_preserves_search_direction_keys_and_test_not() {
-    eval(r#"
+    eval(
+        r#"
       (let ((seen nil))
         (assert (= 1 (position 2 #(1 2 3 2 5) :start 1 :end 4
           :key (lambda (x) (push x seen) x))))
@@ -52,5 +60,32 @@ fn position_preserves_search_direction_keys_and_test_not() {
       (assert (= 3 (position #\a "abca" :from-end t)))
       (assert (null (position-if (lambda (x) (error "empty range called predicate"))
                                 #(1 2) :start 1 :end 1 :from-end t)))
-    "#);
+      (let ((seen nil))
+        (assert (= 2 (position-if-not #'oddp #(1 2 4 3) :start 1 :end 4 :from-end t
+          :key (lambda (x) (push x seen) x))))
+        (assert (equal seen '(4 3))))
+      (assert (null (position-if-not (lambda (x) (error "empty range called predicate"))
+                                    #(1 2) :start 1 :end 1)))
+    "#,
+    );
+}
+
+#[test]
+fn repeated_searches_do_not_compile_fresh_helpers() {
+    eval(
+        r#"
+      (defun space-p (c) (char= c #\Space))
+      (defun non-space-p (c) (not (space-p c)))
+      (defun search-round ()
+        (assert (= 16 (position #\Space "0000000000000000 T symbol")))
+        (assert (= 16 (position-if #'space-p "0000000000000000 T symbol")))
+        (assert (= 16 (position-if-not #'non-space-p "0000000000000000 T symbol"))))
+      (dotimes (i 30) (search-round))
+      (let ((before (egcl::%bc-registry-sizes)))
+        (dotimes (i 200) (search-round))
+        (let ((after (egcl::%bc-registry-sizes)))
+          (assert (< (- (first after) (first before)) 32))
+          (assert (< (- (second after) (second before)) 32))))
+    "#,
+    );
 }
