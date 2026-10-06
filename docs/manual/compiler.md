@@ -50,6 +50,12 @@ use the keyword. An odd or malformed keyword tail signals a program error.
 Acceptance of additional compiler keywords does not establish full support for
 their ANSI-specified effects.
 
+Top-level `defvar` and `defparameter` forms proclaim their names special during
+compilation, but ordinary initializers wait until the compiled file is loaded.
+`defvar` still leaves an existing binding untouched. An explicit compile-time
+`eval-when` evaluates its body in source order, including any initialization
+it requests.
+
 ```lisp
 (multiple-value-bind (output warnings-p failure-p)
     (compile-file "example.lisp" :output-file "example.fasl")
