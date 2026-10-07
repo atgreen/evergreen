@@ -1972,10 +1972,16 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
 pub fn ensure_directories_exist(pathname: EgclVal) -> Result<(EgclVal, bool), EgclError> {
     let path_str = extract_path_string(pathname)?;
     let path = Path::new(&path_str);
-    let parent = path.parent().unwrap_or(path);
-    let already_exists = parent.is_dir();
+    // Path::parent discards a final directory even when a namestring ends in
+    // a separator. Only file namestrings need that final component removed.
+    let directory = if path_str.ends_with(std::path::is_separator) {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let already_exists = directory.is_dir();
     if !already_exists {
-        std::fs::create_dir_all(parent)
+        std::fs::create_dir_all(directory)
             .map_err(|e| EgclError::FileError(format!("{}: {}", path_str, e)))?;
     }
     Ok((pathname, !already_exists))
