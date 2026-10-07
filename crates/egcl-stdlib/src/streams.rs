@@ -95,6 +95,7 @@ pub enum StreamDirection {
     Input,
     Output,
     Io,
+    Probe,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +121,9 @@ pub const IF_EXISTS_ERROR_VAL: EgclVal = EgclVal(1 << 3); // fixnum 1
 pub const IF_EXISTS_SUPERSEDE_VAL: EgclVal = EgclVal(2 << 3); // fixnum 2
 pub const IF_EXISTS_APPEND_VAL: EgclVal = EgclVal(3 << 3); // fixnum 3
 pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
+
+/// Missing-file creation policy; NIL returns NIL and T signals a file error.
+pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
 
 // ── Internal stream state ──────────────────────────────────────────
 
@@ -2042,7 +2046,7 @@ pub fn open(
     let path = std::path::Path::new(&path_str);
 
     match direction {
-        StreamDirection::Input => {
+        StreamDirection::Input | StreamDirection::Probe => {
             if path.is_dir() {
                 return Err(EgclError::FileError(format!(
                     "cannot open directory as a file: {}",
@@ -2052,23 +2056,31 @@ pub fn open(
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // CLHS: `:if-does-not-exist nil` returns NIL rather than
-                    // signalling — the caller decides. Any other value (the
-                    // default `:error`, or `:create` which we don't create for
-                    // input) signals a file-error.
                     if if_does_not_exist == NIL {
                         return Ok(NIL);
                     }
-                    return Err(EgclError::FileError(format!(
-                        "file not found: {}",
-                        path_str
-                    )));
+                    if if_does_not_exist == IF_DOES_NOT_EXIST_CREATE_VAL {
+                        // Do not truncate a file created by another process
+                        // between the failed read-only open and this one.
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(path)
+                            .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                    } else {
+                        return Err(EgclError::FileError(format!(
+                            "file not found: {}",
+                            path_str
+                        )));
+                    }
                 }
                 Err(e) => {
                     return Err(EgclError::FileError(format!("cannot open file: {}", e)));
                 }
             };
-            Ok(alloc_stream(
+            egcl_rt::rooted!(stream = alloc_stream(
                 elt,
                 StreamInner::FileInput {
                     file: StreamHandle::File(file),
@@ -2082,7 +2094,11 @@ pub fn open(
                     element_type: elt,
                 },
                 vec![],
-            ))
+            ));
+            if direction == StreamDirection::Probe {
+                close(*stream, false)?;
+            }
+            Ok(*stream)
         }
         StreamDirection::Output => {
             // Issue #8: Handle if_exists variants including :append.
