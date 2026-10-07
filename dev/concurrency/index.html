@@ -2144,6 +2144,10 @@ use the separate <a href="../fibers/">EGCL-FIBER API</a>. The
 Accepts a callable function or a symbol naming a global function. <code>name</code> is a
 string or <code>nil</code>. Treat the returned handle as opaque; its current representation
 is not a portable application data format.</p>
+<p>The worker shares its creator's package registry, including package nicknames
+and internal and exported symbols. Packages and symbols created by either
+execution are visible to the other; this also applies to a native thread
+created by a fiber.</p>
 <h3 id="join-thread"><code>egcl-thread:join-thread</code><a class="headerlink" href="#join-thread" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-thread:join-thread thread &amp;key timeout)</code> → value, completed-p</p>
 <p>Waits for completion and returns the worker's primary result and <code>t</code>.
