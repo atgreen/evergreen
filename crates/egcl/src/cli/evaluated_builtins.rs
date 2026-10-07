@@ -952,12 +952,33 @@ fn resolve(name: &str) -> Option<Handler> {
             while cell.is_cons() {
                 let (key, rest) = cp(cell);
                 if !rest.is_cons() {
+                    // A dotted tail where the value should be -- `(a . b)`.
+                    // The DEFUN this replaced signalled here through DO's
+                    // ENDP; the rewrite returned the default instead, which
+                    // ansi-test's GETF.ERROR.4 caught on the first native
+                    // s390x conformance run (bliss-ljfjg).
+                    if !rest.is_nil() {
+                        return Err(EgclError::TypeError {
+                            datum: args[0],
+                            expected: "a property list".into(),
+                        });
+                    }
                     break;
                 }
                 if key == indicator {
                     return Ok(cp(rest).0);
                 }
                 cell = cp(rest).1;
+            }
+            // A dotted tail after a complete pair -- `(a 10 . b)` (GETF.ERROR.5).
+            // The scan leaves an odd-length PROPER list's last cons in `cell`
+            // (`(:key)`, which the set functions' keyword parsing hands GETF),
+            // and that is not an error: only a non-NIL atom tail is.
+            if !cell.is_nil() && !cell.is_cons() {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "a property list".into(),
+                });
             }
             Ok(args.get(2).copied().unwrap_or(NIL))
         }),
