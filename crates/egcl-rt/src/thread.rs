@@ -1230,6 +1230,8 @@ pub struct Fiber {
     native_faults: crate::runtime::FiberFaultState,
     stack: EgclStack,
     continuation: FiberContinuation,
+    // Ports without a native context switch neither mount nor resume.
+    #[cfg_attr(not(egcl_fibers), allow(dead_code))]
     execution_context: FiberExecutionContext,
     native_stack_size: usize,
     /// Native return context: a pointer to the carrier's saved-SP cell on Unix,
@@ -1238,6 +1240,7 @@ pub struct Fiber {
     /// — NOT in a thread-local — because a fiber can be preempted on one carrier
     /// and resumed on another, and a compiler-cached thread-local address would
     /// then be stale (reads the wrong/cleared carrier slot). See bliss-bca.5.
+    #[cfg_attr(not(egcl_fibers), allow(dead_code))]
     scheduler_return: AtomicUsize,
     /// Carrier pool chosen by the first scheduler-group submission.  Wakeups
     /// from timers, synchronization primitives, and I/O always return to this

@@ -16911,6 +16911,8 @@ extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture
     }
 }
 
+// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
     match guard_c2i(|| {
         egcl_rt::rooted!(car = EgclVal(car));
@@ -16972,6 +16974,8 @@ extern "C" fn c2i_t2_mv(primary: u64, dst: *mut EgclVal, n: u64) {
 /// T0. Returns the raw bits of T or NIL. `class` is a `typep_class::*` code.
 /// Because it never allocates, no minor GC can fire inside it, so the caller
 /// needs no operand-stack spill beyond the standard helper-call prologue.
+// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
     c2i_clear_mv();
     if typep_class_matches(class as u16, EgclVal(v)) {
@@ -17940,11 +17944,15 @@ const NATIVE_TRANSFER_ARCH: u16 = 0xaa64;
 const NATIVE_TRANSFER_ARCH: u16 = 0x9a64;
 #[cfg(target_arch = "s390x")]
 const NATIVE_TRANSFER_ARCH: u16 = 0xa390;
+// ELF e_machine EM_RISCV (0xf3) followed by the word size, like the others.
+#[cfg(target_arch = "riscv64")]
+const NATIVE_TRANSFER_ARCH: u16 = 0xf364;
 #[cfg(not(any(
     target_arch = "x86_64",
     target_arch = "aarch64",
     target_arch = "powerpc64",
-    target_arch = "s390x"
+    target_arch = "s390x",
+    target_arch = "riscv64"
 )))]
 const NATIVE_TRANSFER_ARCH: u16 = 0;
 
@@ -18385,6 +18393,8 @@ fn call_site_counter(func_ptr: usize, bcp: u32) -> &'static RuntimeCallSiteProfi
 /// Stable pointer embedded in T1 code. The record is intentionally leaked:
 /// installed native code may outlive a registry replacement, and an obsolete
 /// site must remain safe to increment even after its profile is detached.
+// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
+#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 fn call_site_profile_token(func_ptr: usize, bcp: u32) -> u64 {
     call_site_counter(func_ptr, bcp) as *const RuntimeCallSiteProfile as usize as u64
 }

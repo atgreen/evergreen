@@ -56,6 +56,7 @@ pub enum Arch {
     Aarch64 = 2,
     Powerpc64le = 3,
     S390x = 4,
+    Riscv64 = 5,
 }
 
 /// Operating system.
@@ -91,11 +92,14 @@ pub fn current_platform_tag() -> u64 {
     let arch = Arch::Powerpc64le;
     #[cfg(target_arch = "s390x")]
     let arch = Arch::S390x;
+    #[cfg(target_arch = "riscv64")]
+    let arch = Arch::Riscv64;
     #[cfg(not(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
         all(target_arch = "powerpc64", target_endian = "little"),
-        target_arch = "s390x"
+        target_arch = "s390x",
+        target_arch = "riscv64"
     )))]
     let arch = Arch::X86_64; // fallback
 

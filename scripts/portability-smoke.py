@@ -20,6 +20,7 @@ ARCHES = {
     "aarch64": ("ARM64", "ARM64", "LITTLE-ENDIAN"),
     "ppc64le": ("PPC64LE", "PPC64", "LITTLE-ENDIAN"),
     "s390x": ("S390X", "S390X", "BIG-ENDIAN"),
+    "riscv64": ("RISCV64", "RISCV64", "LITTLE-ENDIAN"),
 }
 
 
