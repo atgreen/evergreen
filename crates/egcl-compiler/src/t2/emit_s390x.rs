@@ -78,6 +78,21 @@
 //! runtime call and a nonzero result takes the shared exit (NIL, epilogue).
 //! That is the checked legacy ABI; native transfer dispatch is x86-only.
 //!
+//! # Direct self-calls
+//!
+//! A function whose live values across every runtime call are proven
+//! immediates (so no shadow roots), whose calls all target itself with at most
+//! three arguments, and which needs no activation-backed instruction, also gets
+//! a REGISTER entry after the ordinary one: the same prologue, but the
+//! arguments arrive in r2-r4 instead of activation slots and r13 is left as the
+//! caller's. A self-call then moves its arguments into r2-r4 and `BRASL`s to
+//! that entry, skipping c2i dispatch entirely (bliss-hx5xb; measured 0.78 us
+//! per generic call on a z17 against 77 ns per loop iteration). The site first
+//! compares r15 with the published native stack limit and takes the ordinary
+//! `call_slice` path when the stack runs low, so the depth cap still turns
+//! runaway recursion into a STORAGE-CONDITION instead of a crash. Both paths
+//! share the transfer check. `EGCL_NO_DIRECT_SELF_CALL` disables the fast path.
+//!
 //! Back-edge polls: a block with a successor at or before itself in block
 //! order polls before its edge moves, decrementing a 256-count frame word and
 //! calling `poll` through the same root-synchronising path when it reaches
@@ -136,6 +151,9 @@ pub struct RuntimeCalls {
     pub transfer_pending: u64,
     /// Safepoint callback: nonzero requests immediate native exit.
     pub poll: u64,
+    /// The symbol being compiled, when known: a call to it from inside its own
+    /// body can become a direct self-call (see the module docs).
+    pub self_sym: Option<u32>,
 }
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -178,6 +196,11 @@ struct Emitter<'a> {
     poll_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
+    /// The register entry, when this function qualifies for direct self-calls.
+    reg_entry: Option<Label>,
+    /// Frame offset of the three-word area a self-call's slow path stages its
+    /// arguments in for `call_slice`.
+    self_args_base: i32,
 }
 
 fn unsupported() -> EmitError {
@@ -224,11 +247,87 @@ pub(super) fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, 
 }
 
 impl Emitter<'_> {
+    /// A call to this very function, entered through the register entry. The
+    /// published native stack limit is compared first: once the stack runs low
+    /// the ordinary `call_slice` path is taken instead, whose adapter enforces
+    /// the native depth cap and raises a catchable STORAGE-CONDITION. A zero
+    /// limit (never published) compares false, so the guard is inert.
+    fn direct_self_call(&mut self, data: &InstData) -> Result<(), EmitError> {
+        let reg_entry = self.reg_entry.ok_or_else(unsupported)?;
+        let AuxData::CallTarget(symbol) = data.aux else {
+            return Err(unsupported());
+        };
+        if data.args.len() > 3 {
+            return Err(unsupported());
+        }
+        let slow = self.asm.label();
+        let join = self.asm.label();
+        self.asm.imm64(1, egcl_rt::stack::native_stack_limit_addr());
+        self.asm.load(1, 1, 0);
+        // Signed compare is right: stack addresses are canonical and positive.
+        // CC0 (equal) or CC1 (r15 low) means the stack is at or past the limit.
+        self.asm.compare(15, 1);
+        self.asm.branch(12, slow);
+        // Fast path: arguments in r2-r4 (no overlap with the r6-r12 homes),
+        // then a relative call to the register entry; the result is in r2.
+        for (index, &argument) in data.args.iter().enumerate() {
+            self.load(argument, 2 + index as u8)?;
+        }
+        self.asm.call_label(reg_entry);
+        self.asm.branch(15, join);
+        // Slow path: generic dispatch through the slice adapter, the arguments
+        // staged in this frame. No live tagged heap value exists across the
+        // call (eligibility), so nothing needs a shadow root here.
+        self.asm.bind(slow);
+        for (index, &argument) in data.args.iter().enumerate() {
+            self.load(argument, 2)?;
+            self.asm
+                .store(2, 15, self.self_args_base + index as i32 * 8);
+        }
+        self.asm.imm64(2, u64::from(symbol));
+        self.asm.imm64(3, data.args.len() as u64);
+        self.asm.address(4, 15, self.self_args_base);
+        self.asm.imm64(5, 0);
+        let offset = self.asm.here();
+        self.asm.imm64(1, self.runtime.call_slice);
+        self.asm.call_reg(1);
+        self.asm.bind(join);
+        // Either path can leave a pending transfer (a deopt or an error raised
+        // inside the callee); propagate it exactly as runtime_call does.
+        self.asm.store(2, 15, self.result_offset);
+        if self.runtime.transfer_pending != 0 {
+            self.asm.imm64(1, self.runtime.transfer_pending);
+            self.asm.call_reg(1);
+            self.asm.imm64(3, 0);
+            self.asm.compare(2, 3);
+            let exit = *self.transfer_exit.get_or_insert_with(|| self.asm.label());
+            self.asm.branch(6, exit);
+        }
+        if let Some(&result) = data.results.first() {
+            self.asm.load(2, 15, self.result_offset);
+            self.store(result, 2)?;
+        }
+        self.root_sites.push(RootSyncSite {
+            code_offset: u32::try_from(offset).map_err(|_| unsupported())?,
+            live_roots: 0,
+            register_roots: 0,
+            spill_roots: 0,
+        });
+        Ok(())
+    }
+
     fn runtime_call(
         &mut self,
         instruction: Inst,
         data: Option<&InstData>,
     ) -> Result<(), EmitError> {
+        if let Some(data) = data
+            && data.opcode == Opcode::Call
+            && self.reg_entry.is_some()
+            && matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == self.runtime.self_sym)
+        {
+            return self.direct_self_call(data);
+        }
         let roots = self
             .roots
             .get(&instruction)
@@ -886,6 +985,8 @@ pub fn emit_framed_with_runtime(
         poll_offset: 0,
         polls,
         transfer_exit: None,
+        reg_entry: None,
+        self_args_base: 0,
     };
     for &block in function.block_order() {
         let label = emitter.asm.label();
@@ -943,6 +1044,25 @@ pub fn emit_framed_with_runtime(
         };
         emitter.homes.insert(value, home);
     }
+    // A value whose type is confined to non-pointer immediates (fixnum, single
+    // float, character, symbol, NIL/T) can never be relocated by the moving GC,
+    // so it needs no shadow root. The inference map assigns each SSA value the
+    // type it has from its definition on, so the fact holds wherever the value
+    // is live; BOTTOM (unreached) stays rooted. This mirrors emit.rs, and it is
+    // what lets a fixnum-recursive function reach the direct self-call: its
+    // roots vanish entirely.
+    let inference = super::infer::infer(function);
+    let proven_immediate = |value: Value| -> bool {
+        const IMMEDIATE: TypeBits = TypeBits(
+            TypeBits::FIXNUM.0
+                | TypeBits::SINGLE_FLOAT.0
+                | TypeBits::CHARACTER.0
+                | TypeBits::SYMBOL.0
+                | TypeBits::NULL.0,
+        );
+        let bits = inference.ty(value).bits;
+        !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
+    };
     // The same precise regalloc2 ranges that choose native homes determine
     // roots at each actual runtime call. Include dying early arguments, and
     // exclude results that do not exist until the callback returns.
@@ -965,6 +1085,7 @@ pub fn emit_framed_with_runtime(
             .filter(|v| v.class == RegClass::Gpr && !inst.defs.contains(v))
             .map(|v| Value(v.num))
             .filter(|value| emitter.homes.contains_key(value))
+            .filter(|value| !proven_immediate(*value))
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -1005,6 +1126,7 @@ pub fn emit_framed_with_runtime(
                     .flat_map(|target| target.args.iter().copied()),
             )
             .filter(|value| emitter.homes.contains_key(value))
+            .filter(|value| !proven_immediate(*value))
             .collect();
         roots.sort_by_key(|value| value.0);
         roots.dedup();
@@ -1024,6 +1146,36 @@ pub fn emit_framed_with_runtime(
             .unwrap_or(0),
     )
     .map_err(|_| unsupported())?;
+    // Direct self-call eligibility (module docs). Self-call arguments never go
+    // through the activation, so an eligible function needs no argument shadow
+    // slots at all; nothing in its body then touches r13, which is what makes
+    // the activation-less register entry sound.
+    let entry_params = &function.block(function.entry()).params;
+    let instructions = || {
+        function
+            .block_order()
+            .iter()
+            .flat_map(|&block| &function.block(block).insts)
+            .map(|&inst| function.inst(inst))
+    };
+    let all_calls_are_narrow_self_calls = instructions().all(|data| {
+        data.opcode != Opcode::Call
+            || (data.args.len() <= 3
+                && matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym))
+    });
+    let has_reg_entry = emitter.runtime.self_sym.is_some()
+        && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none()
+        && !function.is_variadic()
+        && entry_params.len() <= 3
+        && !entry_params
+            .iter()
+            .any(|&param| function.is_entry_param_checked(param))
+        && emitter.root_slots == 0
+        && all_calls_are_narrow_self_calls
+        && instructions().all(|data| data.opcode != Opcode::TakeValuesToLocals);
+    if has_reg_entry {
+        emitter.argument_slots = 0;
+    }
     let shadow_root_slots = emitter
         .root_slots
         .checked_add(emitter.argument_slots)
@@ -1055,7 +1207,9 @@ pub fn emit_framed_with_runtime(
         .map(|(_, state)| state.remat.len())
         .max()
         .unwrap_or(0);
-    let frame_words = spill_slots as usize + edge_words + deopt_words + remat_words + 2;
+    let self_args_words = if has_reg_entry { 3 } else { 0 };
+    let frame_words =
+        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 2;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported());
@@ -1064,6 +1218,7 @@ pub fn emit_framed_with_runtime(
     emitter.edge_base = 160 + spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
+    emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
     emitter.result_offset = 160 + (frame_words as i32 - 2) * 8;
     emitter.poll_offset = emitter.result_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
@@ -1075,6 +1230,22 @@ pub fn emit_framed_with_runtime(
         emitter.store(parameter, 2)?;
     }
     emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+    if has_reg_entry {
+        // Register entry: the same frame, but the arguments arrive in r2-r4 and
+        // r13 stays the caller's. Move the arguments home BEFORE the poll word
+        // is initialised, since that initialisation uses r2 as scratch.
+        let label = emitter.asm.label();
+        emitter.asm.bind(label);
+        emitter.reg_entry = Some(label);
+        emitter.asm.prologue();
+        emitter.asm.address(15, 15, -emitter.frame_bytes);
+        for (index, &parameter) in entry_params.iter().enumerate() {
+            emitter.store(parameter, 2 + index as u8)?;
+        }
+        emitter.asm.imm64(2, 256);
+        emitter.asm.store(2, 15, emitter.poll_offset);
+        emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+    }
     let mut bcp_offsets = Vec::new();
     for &block in function.block_order() {
         emitter.asm.bind(emitter.blocks[&block]);
