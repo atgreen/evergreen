@@ -41,6 +41,10 @@
 - The EGCL fork installer now includes the Atomics CAS adapter, supporting
   CAS-dependent initialization in libraries such as `cl-cancel`
   ([#59](https://github.com/atgreen/evergreen/pull/59)).
+- Native TCP listeners can now be shared across threads and fibers, honor
+  backlog and address-reuse options, and use GC-safe cooperative accept and
+  readiness waits on Unix; closing a listener wakes pending waits
+  ([#60](https://github.com/atgreen/evergreen/pull/60)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions

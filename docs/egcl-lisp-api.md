@@ -542,8 +542,32 @@ and wake generations prevent an expired earlier wait from waking a later one.
 Established TCP stream reads, writes/flushes, and `%SOCKET-WAIT-FOR-INPUT`
 also park on socket readiness. They use shared epoll/kqueue services on Unix
 and one shared Winsock poller on Windows, preserving synchronous Lisp stream
-calls and receive timeouts. Connect, accept, DNS, regular file I/O, and terminal
+calls and receive timeouts. On Unix, listener accept and readiness waits also
+park unpinned fibers. Connect, DNS, Windows accept, regular file I/O, and terminal
 I/O are not yet cooperative. See [socket I/O limitations](manual/fibers.md#socket-io).
+
+The native server primitives used by library adapters are:
+
+```lisp
+(egcl::%socket-listen &optional (host "127.0.0.1") (port 0) (backlog 5) reuse-address)
+(egcl::%socket-local-port listener) -> port-or-nil
+(egcl::%socket-listener-ready-p listener timeout-ms) -> boolean
+(egcl::%socket-accept listener) -> bidirectional-octet-stream
+(egcl::%socket-close listener)
+```
+
+Listener IDs are process-wide: another native thread or fiber can query, accept,
+or close a listener. Port zero selects an available local port. Ports must be in
+0–65535 and backlog in 0–2147483647; the OS may cap the requested queue limit.
+Explicit `reuse-address` controls `SO_REUSEADDR` before binding. Omitting it
+preserves the previous platform default (true on Unix, false on Windows).
+These internal interfaces are intended for adapters, not as a portable sockets API.
+
+On Unix, negative readiness timeouts wait indefinitely, zero polls, and positive
+values bound the wait in milliseconds. Closing a listener wakes pending Unix
+accept/readiness waits with an error; it does not close already accepted streams.
+Closed IDs are not reused, and `%SOCKET-LOCAL-PORT` returns `NIL` for a closed ID.
+Windows listener readiness and cancellation do not yet provide these guarantees.
 
 ### Pinning
 

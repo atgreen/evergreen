@@ -2979,48 +2979,148 @@ pub fn install_gc_hooks() {
 
 // ── TCP sockets ────────────────────────────────────────────────────
 // Minimal networking primitives for the slynk backend (and general Lisp use).
-// A *listening* socket is an opaque integer id into a thread-local registry (it
+// A *listening* socket is an opaque integer id into a process-wide registry (it
 // is never read/written as a stream, only accept/close/local-port). An *accepted
-// connection* is returned as an ordinary bidirectional character stream, reusing
+// connection* is returned as an ordinary bidirectional octet stream, reusing
 // the FileIo machinery over its owned TCP transport — so all the Gray-stream
 // I/O (read-char, read-line, write-string, force-output, …) works unchanged.
-use std::cell::{Cell, RefCell};
 use std::net::ToSocketAddrs;
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-thread_local! {
-    static SOCKET_LISTENERS: RefCell<HashMap<u64, TcpListener>> = RefCell::new(HashMap::new());
-    static SOCKET_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+struct SocketListener {
+    socket: TcpListener,
+    closed: AtomicBool,
+}
+
+impl SocketListener {
+    fn check_open(&self) -> Result<(), EgclError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(EgclError::FileError("socket listener is closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait(&self, timeout: Option<std::time::Duration>) -> Result<bool, EgclError> {
+        self.check_open()?;
+        // Each parked operation needs its own poller registration. Duplicates
+        // share the listening socket and its shutdown, but have distinct fds.
+        let waiter = self.socket.try_clone()
+            .map_err(|e| EgclError::FileError(format!("socket listener wait: {e}")))?;
+        let ready = egcl_rt::sync::wait_fd(
+            waiter.as_raw_fd(), egcl_rt::sync::IoInterest::Read, timeout,
+        )?;
+        self.check_open()?;
+        Ok(ready)
+    }
+}
+
+fn socket_listeners() -> &'static OrderedMutex<HashMap<u64, Arc<SocketListener>>> {
+    static LISTENERS: OnceLock<OrderedMutex<HashMap<u64, Arc<SocketListener>>>> = OnceLock::new();
+    LISTENERS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            0,
+            "socket listeners",
+            HashMap::new(),
+        )
+    })
+}
+
+fn socket_listener(id: u64) -> Result<Arc<SocketListener>, EgclError> {
+    socket_listeners()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| EgclError::FileError("unknown or closed socket listener".into()))
 }
 
 /// Create a listening TCP socket bound to `host:port` (port 0 = any free port).
 /// Returns an opaque listener id for `socket_accept`/`socket_local_port`/`socket_close_listener`.
-pub fn socket_listen(host: &str, port: u16, _backlog: i32) -> Result<u64, EgclError> {
-    let listener = TcpListener::bind((host, port))
+pub fn socket_listen(host: &str, port: u16, backlog: i32) -> Result<u64, EgclError> {
+    socket_listen_with_options(host, port, backlog, cfg!(unix))
+}
+
+/// Bind a TCP listener with explicit address reuse and pending-connection limit.
+pub fn socket_listen_with_options(
+    host: &str,
+    port: u16,
+    backlog: i32,
+    reuse_address: bool,
+) -> Result<u64, EgclError> {
+    if backlog < 0 {
+        return Err(EgclError::ProgramError(
+            "socket-listen: negative backlog".into(),
+        ));
+    }
+    let bind = || -> std::io::Result<TcpListener> {
+        let mut last_error = std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "hostname resolved to no addresses",
+        );
+        for address in (host, port).to_socket_addrs()? {
+            let attempt = || -> std::io::Result<TcpListener> {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::for_address(address),
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )?;
+                socket.set_reuse_address(reuse_address)?;
+                socket.bind(&address.into())?;
+                socket.listen(backlog)?;
+                Ok(socket.into())
+            };
+            match attempt() {
+                Ok(listener) => return Ok(listener),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    };
+    let listener = bind()
         .map_err(|e| EgclError::FileError(format!("socket-listen {host}:{port}: {e}")))?;
-    let id = SOCKET_NEXT_ID.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    SOCKET_LISTENERS.with(|m| m.borrow_mut().insert(id, listener));
+    #[cfg(unix)]
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| EgclError::FileError(format!("socket-listen: {e}")))?;
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    socket_listeners().lock().unwrap().insert(
+        id,
+        Arc::new(SocketListener {
+            socket: listener,
+            closed: AtomicBool::new(false),
+        }),
+    );
     Ok(id)
 }
 
 /// The actual local port a listener is bound to (resolves port 0).
 pub fn socket_local_port(id: u64) -> Option<u16> {
-    SOCKET_LISTENERS
-        .with(|m| m.borrow().get(&id).and_then(|l| l.local_addr().ok()))
+    socket_listener(id)
+        .ok()
+        .and_then(|l| l.socket.local_addr().ok())
         .map(|a| a.port())
 }
 
 /// Close and forget a listening socket.
 pub fn socket_close_listener(id: u64) {
-    SOCKET_LISTENERS.with(|m| {
-        m.borrow_mut().remove(&id);
-    });
+    let listener = socket_listeners().lock().unwrap().remove(&id);
+    if let Some(listener) = listener {
+        listener.closed.store(true, Ordering::Release);
+        #[cfg(unix)]
+        // SAFETY: this retained owner keeps the descriptor alive until shutdown
+        // returns. Pending waiters retain it too, preventing descriptor reuse.
+        unsafe {
+            libc::shutdown(listener.socket.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
 }
 
 /// Connect a TCP client and return an owned bidirectional octet stream.
@@ -3065,16 +3165,22 @@ pub fn socket_connect(
 /// Accept a connection on listener `id`, returning a bidirectional octet
 /// stream over the new socket (blocks until a client connects).
 pub fn socket_accept(id: u64) -> Result<EgclVal, EgclError> {
-    let stream = SOCKET_LISTENERS.with(|m| {
-        let map = m.borrow();
-        let listener = map.get(&id).ok_or_else(|| {
-            EgclError::FileError("socket-accept: unknown or closed listener".into())
-        })?;
-        listener
-            .accept()
-            .map(|(s, _)| s)
-            .map_err(|e| EgclError::FileError(format!("socket-accept: {e}")))
-    })?;
+    let listener = socket_listener(id)?;
+    let stream = loop {
+        listener.check_open()?;
+        match listener.socket.accept() {
+            Ok((stream, _)) => {
+                listener.check_open()?;
+                break stream;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            #[cfg(unix)]
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                listener.wait(None)?;
+            }
+            Err(e) => return Err(EgclError::FileError(format!("socket-accept: {e}"))),
+        }
+    };
     socket_stream(stream)
 }
 
@@ -3085,46 +3191,27 @@ pub fn socket_accept(id: u64) -> Result<EgclVal, EgclError> {
 /// its own event loop -- a UI serving slynk between frames, say -- has no way to
 /// offer a REPL without stalling on accept until somebody connects.
 pub fn socket_listener_ready(id: u64, timeout_ms: i32) -> Result<bool, EgclError> {
-    SOCKET_LISTENERS.with(|m| {
-        let map = m.borrow();
-        let listener = map.get(&id).ok_or_else(|| {
-            EgclError::FileError("socket-listener-ready: unknown or closed listener".into())
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            use egcl_rt::syscall::{POLLERR, POLLHUP, POLLIN, POLLNVAL, PollFd};
-            let mut descriptor = PollFd {
-                fd: listener.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            };
-            // SAFETY: the listener is alive for this borrow and owns the fd.
-            let count = unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, timeout_ms) }
-                .map_err(|errno| {
-                    EgclError::FileError(format!("socket-listener-ready: errno {errno}"))
-                })?;
-            if descriptor.revents & POLLNVAL != 0 {
-                return Err(EgclError::FileError(
-                    "socket-listener-ready: invalid descriptor".into(),
-                ));
-            }
-            Ok(count > 0 && descriptor.revents & (POLLIN | POLLHUP | POLLERR) != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            // Fall back to a non-blocking accept probe, restoring the mode.
-            let _ = timeout_ms;
-            listener.set_nonblocking(true).ok();
-            let ready = match listener.accept() {
-                Ok(_) => true,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(_) => true,
-            };
-            listener.set_nonblocking(false).ok();
-            Ok(ready)
-        }
-    })
+    let listener = socket_listener(id)?;
+    listener.check_open()?;
+    #[cfg(unix)]
+    {
+        let timeout =
+            (timeout_ms >= 0).then(|| std::time::Duration::from_millis(timeout_ms as u64));
+        listener.wait(timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        // Fall back to a non-blocking accept probe, restoring the mode.
+        let _ = timeout_ms;
+        listener.socket.set_nonblocking(true).ok();
+        let ready = match listener.socket.accept() {
+            Ok(_) => true,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        };
+        listener.socket.set_nonblocking(false).ok();
+        Ok(ready)
+    }
 }
 
 /// Transfer the owned socket to the common stream/finalizer machinery.
