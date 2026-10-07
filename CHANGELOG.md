@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Initialize `*MACROEXPAND-HOOK*` and honor custom hooks during macroexpansion
+  and compilation, including symbol macros. This enables Quicklisp's
+  compilation-progress wrapper when loading downloaded systems
+  ([#90](https://github.com/atgreen/evergreen/pull/90)).
+
 - `PROBE-FILE` now accepts file streams, including closed streams, allowing
   Quicklisp to finish writing its local-project index
   ([#87](https://github.com/atgreen/evergreen/pull/87)).

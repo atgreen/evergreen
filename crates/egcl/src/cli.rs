@@ -8438,6 +8438,7 @@ impl Env {
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
+        compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = egcl_stdlib::bootstrap_clos();
@@ -17505,7 +17506,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             // Debug introspection (bliss-zz6w): raw body/lambda-list of an
             // interpreted-function object, for inspecting restored cores.
-            "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%INVOKE-REGISTERED-MACRO"
+            | "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
             // ── Custom reader macros (bliss-r4mk) ──────────────────────
             // Registrations key by the (pinned) readtable OBJECT in
             // *READTABLE*; handlers are coerced to pinned interpreted-function
@@ -31885,6 +31887,78 @@ fn make_expander_function(
     egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
 }
 
+/// None denotes the normal FUNCALL hook, including bootstrap before its binding.
+fn custom_macroexpand_hook() -> Option<EgclVal> {
+    let hook = egcl_rt::symbols::find_index("*MACROEXPAND-HOOK*")
+        .and_then(global_value_cell)?;
+    let funcall = egcl_rt::symbols::find_index("FUNCALL")
+        .map(EgclVal::from_symbol_index);
+    if Some(hook) == funcall
+        || builtin_wrapper_cache().borrow().values.get("FUNCALL") == Some(&hook)
+    {
+        None
+    } else {
+        Some(hook)
+    }
+}
+
+fn registered_macro_expander_function(expander: EgclVal, constant: bool) -> EgclVal {
+    egcl_rt::rooted!(expander = expander);
+    egcl_rt::rooted!(whole = gensym_symbol("WHOLE"));
+    egcl_rt::rooted!(environment = gensym_symbol("ENVIRONMENT"));
+    let invoke = resolve_sym("EGCL::%INVOKE-REGISTERED-MACRO").unwrap();
+    let quote = quote_sym();
+    egcl_rt::rooted!(params = vec_to_list(&[*whole, *environment]));
+    egcl_rt::rooted!(quoted = vec_to_list(&[quote, *expander]));
+    egcl_rt::rooted!(call = if constant {
+        *quoted
+    } else {
+        vec_to_list(&[invoke, *quoted, *whole, *environment])
+    });
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    let name = egcl_rt::symbols::make_uninterned("MACRO-EXPANDER");
+    egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
+}
+
+fn invoke_registered_macro(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    if args.len() != 3 {
+        return Err(EgclError::ProgramError("macro invocation requires three arguments".into()));
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    let mut environment = if args[2].is_nil() {
+        MacroexpandEnv::child_of(cli_global_macro_env(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        load_macroexpand_environment(args[2]).ok_or_else(|| {
+            EgclError::ProgramError("invalid macro expansion environment".into())
+        })?
+    };
+    egcl_rt::rooted_ref!(_environment_root = &mut environment);
+    compiler_macroexpand::invoke_macro_expander(args[0], args[1], &environment)
+}
+
+fn invoke_lisp_macroexpand_hook(
+    expander: EgclVal,
+    form: EgclVal,
+    environment: &MacroexpandEnv,
+) -> Result<EgclVal, EgclError> {
+    let Some(hook) = custom_macroexpand_hook() else {
+        return compiler_macroexpand::invoke_macro_expander(expander, form, environment);
+    };
+    egcl_rt::rooted!(hook = hook);
+    egcl_rt::rooted!(expander = expander);
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(environment = environment.clone());
+    let constant = matches!(environment.variable_information(*form), Some(VariableInfo::SymbolMacro(_)));
+    let _scope = MacroexpandEnvScope::new();
+    egcl_rt::rooted!(handle = store_macroexpand_environment(environment.clone()));
+    egcl_rt::rooted!(function = registered_macro_expander_function(*expander, constant));
+    egcl_rt::rooted!(env = Env::new_for_macro_expansion(false));
+    apply_function(*hook, &[*function, *form, *handle], &mut env)
+}
+
+#[cfg(test)]
+mod macroexpand_hook_rooting_tests;
+
 fn invoke_compiler_macro_function(
     args: &[EgclVal],
     caller: &mut Env,
@@ -35949,7 +36023,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "ALLOCATE-INSTANCE" | "SLOT-MAKUNBOUND"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
-            | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
+            | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%INVOKE-REGISTERED-MACRO"
+            | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
     )
 }
 
