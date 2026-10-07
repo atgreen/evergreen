@@ -22645,42 +22645,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
-            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => {
+            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
+            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
-            "CHANGE-CLASS" => {
-                let (instance_form, rest) = cp(cdr);
-                let (class_form, _) = cp(rest);
-                // Root the instance across the class-form eval (moving GC;
-                // bliss-4bp).
-                egcl_rt::rooted!(class_form = class_form);
-                egcl_rt::rooted!(instance_r = eval_form(instance_form, env)?);
-                let old_class_name =
-                    class_name_for_instance_class(egcl_stdlib::class_of(*instance_r));
-                let class_input = eval_form(*class_form, env)?;
-                let class = resolve_class_metaobject(env, class_input)?;
-                let instance = *instance_r;
-                egcl_stdlib::change_class(instance, class)?;
-                let new_class_name = class_name_for_instance_class(class);
-                // Newly-added slots are those in the new class's *effective*
-                // (inherited + direct) slot set that were not effective slots of
-                // the old class. Using effective slots — not just direct slots —
-                // is essential: e.g. change-class to a class that inherits a slot
-                // (parent) which the old class lacked must still apply that slot's
-                // initform (CLOS change-class / update-instance-for-different-class).
-                let old_slot_names: std::collections::HashSet<String> =
-                    effective_slots_for_class(env, &old_class_name)
-                        .into_iter()
-                        .map(|slot| slot.name)
-                        .collect();
-                let added_slots = effective_slots_for_class(env, &new_class_name)
-                    .into_iter()
-                    .filter(|slot| !old_slot_names.contains(&slot.name))
-                    .map(|slot| slot.name)
-                    .collect::<Vec<_>>();
-                apply_class_initforms(instance, &new_class_name, env, Some(&added_slots), &[])?;
-                return Ok(instance);
-            }
+            "CHANGE-CLASS" => return eval_builtin_arguments(&name, cdr, env),
             "CALL-NEXT-METHOD" | "EGCL::%CALL-NEXT-METHOD" => {
                 let mut context = env.method_context.last().cloned().ok_or_else(|| {
                     EgclError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
@@ -35743,6 +35713,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
+            | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
             // The image-control operators. 66b2396d stopped a BARE read of these
             // resolving to CL-USER's identity from inside another package, so that
             // a program could define its own SAVE-IMAGE — swank/backend does
