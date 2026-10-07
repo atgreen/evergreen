@@ -44,6 +44,10 @@
 
 ### Correctness and reliability
 
+- `DIRECTORY` now returns `NIL` for wildcard searches under missing
+  directories, allowing fresh Quicklisp setup without a pre-created
+  `local-init/` directory ([#75](https://github.com/atgreen/evergreen/pull/75)).
+
 - `WRITE` now uses the dynamic `*PRINT-ESCAPE*` value when `:ESCAPE` is omitted
   ([#55](https://github.com/atgreen/evergreen/pull/55)).
 
