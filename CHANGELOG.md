@@ -4,6 +4,13 @@
 
 ### Common Lisp support
 
+- `EGCL-GRAY-STREAMS` now exports `STREAM-READ-SEQUENCE` and
+  `STREAM-WRITE-SEQUENCE`, and `READ-SEQUENCE` / `WRITE-SEQUENCE` on a Gray
+  stream dispatch through them with one bulk call, falling back to the scalar
+  generics by default. Portable libraries that specialize the
+  trivial-gray-streams sequence methods are now reached from the standard
+  entry points ([#81](https://github.com/atgreen/evergreen/pull/81)).
+
 - Add `PPRINT-LOGICAL-BLOCK`, its lexical list-traversal helpers, conditional
   line breaks and indentation, and `PPRINT-FILL` / `PPRINT-LINEAR`. Nested
   blocks honor prefixes, suffixes, print limits, and circular-list labels,
