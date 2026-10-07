@@ -457,6 +457,92 @@ fn truename_resolves_pathname() {
 }
 
 #[test]
+fn directory_traverses_exact_wildcard_levels() {
+    let root = temp_path("directory_wild_levels");
+    let files = [
+        "distinfo.txt",
+        "one/distinfo.txt",
+        "two/distinfo.txt",
+        "one/child/distinfo.txt",
+        "one/child/deep/distinfo.txt",
+    ];
+    for file in files {
+        let path = std::path::Path::new(&root).join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "fixture").unwrap();
+    }
+    for (suffix, expected) in [
+        (
+            "*/distinfo.txt",
+            vec!["one/distinfo.txt", "two/distinfo.txt"],
+        ),
+        ("*/*/distinfo.txt", vec!["one/child/distinfo.txt"]),
+        ("*/child/distinfo.txt", vec!["one/child/distinfo.txt"]),
+        (
+            "*/child/*/distinfo.txt",
+            vec!["one/child/deep/distinfo.txt"],
+        ),
+        ("*/", vec!["one/", "two/"]),
+        ("*/*/", vec!["one/child/"]),
+        ("*/missing/distinfo.txt", vec![]),
+        ("*/distinfo.txt/*.lisp", vec![]),
+        ("**/distinfo.txt", files.to_vec()),
+        ("**/**/distinfo.txt", files.to_vec()),
+    ] {
+        let mut expected: Vec<_> = expected
+            .iter()
+            .map(|path| format!("{root}/{path}"))
+            .collect();
+        expected.sort();
+        for parsed in [false, true] {
+            let designator = make_string_val(&format!("{root}/{suffix}"));
+            let pattern = if parsed {
+                parse_namestring(designator, None, None).unwrap().0
+            } else {
+                designator
+            };
+            let entries = directory(pattern).unwrap();
+            let actual: Vec<_> = entries
+                .iter()
+                .map(|entry| namestring(*entry).unwrap().as_string().to_owned())
+                .collect();
+            assert_eq!(actual, expected, "{suffix}, parsed={parsed}");
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn directory_does_not_enter_unmatched_literal_subtrees() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::path::PathBuf::from(temp_path("directory_literal_pruning"));
+    let matching = root.join("one/child/distinfo.txt");
+    let unrelated = root.join("one/unrelated");
+    std::fs::create_dir_all(matching.parent().unwrap()).unwrap();
+    std::fs::create_dir(&unrelated).unwrap();
+    std::fs::write(&matching, "fixture").unwrap();
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0)).unwrap();
+    let permission_denied = std::fs::read_dir(&unrelated).is_err();
+    let result = directory(make_string_val(&format!(
+        "{}/*/child/distinfo.txt",
+        root.display()
+    )));
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+    if !permission_denied {
+        eprintln!("permission regression requires an unprivileged user; skipping assertion");
+        return;
+    }
+    let entries = result.expect("an unrelated unreadable directory must not affect matches");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        namestring(entries[0]).unwrap().as_string(),
+        matching.to_string_lossy()
+    );
+}
+
+#[test]
 fn directory_wildcards_under_missing_roots_return_no_matches() {
     let root = temp_path("directory_missing_root");
     assert!(!std::path::Path::new(&root).exists());
