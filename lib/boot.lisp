@@ -3599,7 +3599,7 @@
 (defgeneric stream-read-line (stream))
 (defgeneric stream-clear-input (stream))
 (defgeneric stream-read-byte (stream))
-(defgeneric gray-read-sequence (stream sequence start end))
+(defgeneric stream-read-sequence (stream sequence start end))
 
 (defgeneric stream-write-char (stream character))
 (defgeneric stream-line-column (stream))
@@ -3611,6 +3611,7 @@
 (defgeneric stream-force-output (stream))
 (defgeneric stream-clear-output (stream))
 (defgeneric stream-write-byte (stream integer))
+(defgeneric stream-write-sequence (stream sequence start end))
 
 (defgeneric gray-stream-element-type (stream))
 (defgeneric gray-close (stream))
@@ -3668,7 +3669,7 @@
 
 (defmethod stream-clear-input ((stream fundamental-input-stream)) nil)
 
-(defmethod gray-read-sequence ((stream fundamental-input-stream) sequence start end)
+(defmethod stream-read-sequence ((stream fundamental-input-stream) sequence start end)
   (let ((read-element (if (subtypep (stream-element-type stream) 'character)
                           #'stream-read-char
                           #'stream-read-byte)))
@@ -3711,6 +3712,23 @@
       nil
       (progn (stream-terpri stream) t)))
 
+;;; Bulk write default: a string goes through STREAM-WRITE-STRING so a stream
+;;; that specializes it sees one call, not one per character; anything else is
+;;; written element by element, characters via STREAM-WRITE-CHAR and integers
+;;; via STREAM-WRITE-BYTE. Portable libraries (trivial-gray-streams) specialize
+;;; STREAM-WRITE-SEQUENCE itself and fall back here with CALL-NEXT-METHOD.
+(defmethod stream-write-sequence ((stream fundamental-output-stream) sequence start end)
+  (let ((end (or end (length sequence))))
+    (if (stringp sequence)
+        (stream-write-string stream sequence start end)
+        (do ((index start (1+ index)))
+            ((>= index end))
+          (let ((element (elt sequence index)))
+            (if (characterp element)
+                (stream-write-char stream element)
+                (stream-write-byte stream element)))))
+    sequence))
+
 (defmethod stream-finish-output ((stream fundamental-output-stream)) nil)
 (defmethod stream-force-output ((stream fundamental-output-stream)) nil)
 (defmethod stream-clear-output ((stream fundamental-output-stream)) nil)
@@ -3734,7 +3752,8 @@
                   stream-write-char stream-line-column stream-start-line-p
                   stream-write-string stream-terpri stream-fresh-line
                   stream-finish-output stream-force-output stream-clear-output
-                  stream-advance-to-column stream-read-byte stream-write-byte)))
+                  stream-advance-to-column stream-read-byte stream-write-byte
+                  stream-read-sequence stream-write-sequence)))
   ;; Bootstrap symbols were historically available by their unqualified names.
   ;; Keep them present in CL-USER as well as in the public protocol package.
   (import protocol :cl-user)
