@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fix `DIRECTORY` traversal of wildcard directory components, allowing
+  Quicklisp to discover installed distributions. Single `*` components match
+  exactly one level; `**` still searches recursively without duplicate scans
+  ([#86](https://github.com/atgreen/evergreen/pull/86)).
+
 ## 0.0.3 - 2026-10-07
 
 ### Common Lisp support
