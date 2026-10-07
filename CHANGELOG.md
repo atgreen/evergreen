@@ -42,6 +42,12 @@
 
 ### Platform support
 
+- Evergreen now builds and runs natively on riscv64 Linux (RV64GC). The
+  interpreter and bytecode tiers, compiled-file loading, and heap images
+  work; saved images carry a distinct `RISCV64` tag, and `*features*`
+  includes `:riscv` and `:riscv64`. Native compilation and the foreign-call
+  ABI are not yet ported ([#82](https://github.com/atgreen/evergreen/pull/82)).
+
 - Recoverable null-pointer and stack-guard faults on s390x now resume at the
   runtime recovery handler instead of terminating the process
   ([#64](https://github.com/atgreen/evergreen/pull/64)).
