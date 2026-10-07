@@ -882,24 +882,51 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL::%SOCKET-LISTEN" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (%socket-listen host port &optional backlog) → listener-id
+            // (%socket-listen &optional host port backlog reuse-address) → listener-id
+
+            if args.len() > 4 {
+                return Err(EgclError::ProgramError(
+                    "%socket-listen accepts at most four arguments".into(),
+                ));
+            }
+            if let Some(&host) = args.first() {
+                if !is_string_value(host) {
+                    return Err(EgclError::TypeError {
+                        datum: host,
+                        expected: "STRING".into(),
+                    });
+                }
+            }
+            for (index, maximum) in [(1, 65535), (2, i32::MAX as i64)] {
+                if let Some(&value) = args.get(index) {
+                    if !value.is_fixnum() || !(0..=maximum).contains(&value.as_fixnum()) {
+                        return Err(EgclError::TypeError {
+                            datum: value,
+                            expected: format!("(INTEGER 0 {maximum})"),
+                        });
+                    }
+                }
+            }
 
             let host = if args.is_empty() {
                 "127.0.0.1".to_string()
             } else {
                 val_as_str(args[0])
             };
-            let port = if args.len() > 1 && args[1].is_fixnum() {
+            let port = if args.len() > 1 {
                 args[1].as_fixnum() as u16
             } else {
                 0
             };
-            let backlog = if args.len() > 2 && args[2].is_fixnum() {
+            let backlog = if args.len() > 2 {
                 args[2].as_fixnum() as i32
             } else {
                 5
             };
-            let id = egcl_stdlib::socket_listen(&host, port, backlog)?;
+            let reuse_address = args.get(3).map_or(cfg!(unix), |value| !value.is_nil());
+            let id = egcl_stdlib::streams::socket_listen_with_options(
+                &host, port, backlog, reuse_address,
+            )?;
             Ok(EgclVal::from_fixnum(id as i64))
         }),
 
