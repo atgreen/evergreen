@@ -23467,7 +23467,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // generic path, which signals the TYPE-ERROR this cannot.
                 }
                 if is_gray_stream(out) {
-                    // One bulk generic call (spec 5.5.2.3): a stream class that
+                    // One bulk generic call: a stream class that
                     // specializes STREAM-WRITE-SEQUENCE -- trivial-gray-streams'
                     // bridge, Flexi Streams -- sees the whole subsequence; the
                     // default method falls back to the scalar generics.
