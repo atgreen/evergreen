@@ -1367,6 +1367,48 @@ extern "C" fn sigsegv_handler(
         }
         SigsegvFaultKind::Ordinary => {
             crate::syscall::dbg_write(b"egcl: unhandled memory fault\n");
+            #[cfg(all(target_os = "linux", target_arch = "s390x"))]
+            {
+                // Allocation-free diagnostics: fault address and the PSW
+                // address (the s390x program counter, at the same offset
+                // rewrite_ucontext_ip writes) in hex.
+                let mut buf = [0u8; 64];
+                let mut n = 0;
+                let mut put = |bytes: &[u8], n: &mut usize| {
+                    for &b in bytes {
+                        if *n < buf.len() {
+                            buf[*n] = b;
+                            *n += 1;
+                        }
+                    }
+                };
+                let hex = |mut v: usize, out: &mut [u8; 16]| {
+                    for i in (0..16).rev() {
+                        let d = (v & 0xF) as u8;
+                        out[i] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+                        v >>= 4;
+                    }
+                };
+                let mut h = [0u8; 16];
+                put(b"addr=0x", &mut n);
+                hex(addr, &mut h);
+                put(&h, &mut n);
+                const UCONTEXT_PSW_ADDR_OFFSET: usize = 48;
+                let psw_addr = if _context.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        core::ptr::read_unaligned(
+                            (_context as *const u8).add(UCONTEXT_PSW_ADDR_OFFSET) as *const usize,
+                        )
+                    }
+                };
+                put(b" psw=0x", &mut n);
+                hex(psw_addr, &mut h);
+                put(&h, &mut n);
+                put(b"\n", &mut n);
+                crate::syscall::dbg_write(&buf[..n]);
+            }
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             {
                 // Allocation-free diagnostics: fault address and RIP in hex.
@@ -1682,7 +1724,34 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     unsafe { egcl_macos_rewrite_ucontext_pc(context, ip) }
 }
 
-#[cfg(all(unix, not(target_arch = "x86_64"), not(target_os = "macos")))]
+#[cfg(all(target_os = "linux", target_arch = "s390x"))]
+fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // Linux s390x ucontext_t begins with uc_flags:8, uc_link:8, stack_t:24,
+    // then the _sigregs mcontext whose first member is the PSW: mask:8,
+    // addr:8. So the resume address lives at byte offset 40 + 8 = 48 --
+    // measured with offsetof(ucontext_t, uc_mcontext.psw.addr) on real
+    // hardware (cfarm191, Debian 13, glibc 2.41), not read off a header.
+    // Rewriting it is how a null-guard or stack-guard fault resumes at the
+    // thread's published recovery address instead of dying (bliss-mfjwt).
+    const UCONTEXT_PSW_ADDR_OFFSET: usize = 48;
+    unsafe {
+        core::ptr::write_unaligned(
+            (context as *mut u8).add(UCONTEXT_PSW_ADDR_OFFSET) as *mut usize,
+            ip,
+        );
+    }
+    true
+}
+
+#[cfg(all(
+    unix,
+    not(target_arch = "x86_64"),
+    not(target_os = "macos"),
+    not(all(target_os = "linux", target_arch = "s390x"))
+))]
 fn rewrite_ucontext_ip(_context: *mut core::ffi::c_void, _ip: usize) -> bool {
     false
 }
