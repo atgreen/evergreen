@@ -119,7 +119,9 @@
 //! T/NIL (bliss-pig52). Everything
 //! else, including `StringByteLength`, variable shift amounts and any unboxed
 //! representation, returns `UnsupportedOp(0x390)` and the function stays at its
-//! current tier.
+//! current tier, naming the opcode in the T2 log; structural declines (an
+//! unsupported frame-state shape, a cycle with no poll adapter, an unboxed
+//! representation) report the emitter's own `0x390`.
 //!
 //! # Deopt exits
 //!
@@ -416,7 +418,7 @@ impl Emitter<'_> {
                     self.asm.imm64(4, u64::from(nvars));
                     self.runtime.multiple_values
                 }
-                _ => return Err(unsupported()),
+                _ => return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode))),
             }
         } else {
             self.runtime.poll
@@ -838,7 +840,11 @@ impl Emitter<'_> {
                     self.asm.mov(2, 3);
                 }
             }
-            _ => return Err(unsupported()),
+            // Name the opcode: the T2 log then says "refused Opcode #N in
+            // t2/ir.rs" instead of this emitter's anonymous 0x390, so a
+            // histogram of declines over real code ranks the missing arms
+            // (bliss-nlpd4).
+            _ => return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode))),
         }
         // Do not overwrite any allocated home until every guard has passed:
         // a failing instruction must reconstruct its pre-instruction state.

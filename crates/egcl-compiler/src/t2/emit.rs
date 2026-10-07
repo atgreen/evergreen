@@ -5205,7 +5205,10 @@ fn emit_framed_inner(
     })
 }
 
-fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
+/// The `UnsupportedOp` payload that names an opcode: the T2 log decodes the
+/// 0x1000 bit as "refused Opcode #N in t2/ir.rs" (bliss-8b236f61). Shared with
+/// the other emitters so their declines are greppable the same way.
+pub(super) fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
     op as u32 | 0x1000
 }
 
