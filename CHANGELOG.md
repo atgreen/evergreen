@@ -16,6 +16,9 @@
   allowing Ironclad's Keccak implementation to tier instead of remaining
   interpreted, including after compiled-file loading
   ([#56](https://github.com/atgreen/evergreen/pull/56)).
+- Functions using `CAR`, `CDR`, bitwise operations, shifts, or power-of-two
+  `MOD` now reach T2 native code on s390x instead of stopping at T1
+  ([#62](https://github.com/atgreen/evergreen/pull/62)).
 
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
   fence instructions, including after compiled-file loading
