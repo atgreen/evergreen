@@ -2200,8 +2200,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // non-instance argument — and real dispatch has to run. Guessing a
             // slot by name would read the wrong one silently.
             match accessor_slot_symbol_cached(env, instance, accessor) {
-                Some(slot) => read_slot_value(instance, slot, env),
-                None => invoke_generic_function(&sym_name(accessor), &[instance], env),
+                Some(slot) => slot_value_or_signal(args[0], slot, env),
+                None => invoke_generic_function(&sym_name(args[1]), &[args[0]], env),
             }
         }),
 

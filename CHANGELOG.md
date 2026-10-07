@@ -44,6 +44,12 @@
 
 ### Correctness and reliability
 
+- Unbound slot reads now call user-defined `SLOT-UNBOUND` methods through both
+  `SLOT-VALUE` and generated accessors, enabling lazy slot initialization such
+  as Quicklisp's distribution directories. The default method signals
+  `UNBOUND-SLOT` with the offending slot and instance
+  ([#78](https://github.com/atgreen/evergreen/pull/78)).
+
 - Floating-point `FORMAT` directives now accept ratios and bignums, allowing
   Quicklisp download progress to display sizes and rates. Large ratio
   components are scaled safely, out-of-range rational arguments signal an

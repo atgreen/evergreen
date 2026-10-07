@@ -6074,32 +6074,24 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
     egcl_stdlib::slot_value(instance, slot)
 }
 
-/// Read a slot, signalling a catchable `unbound-slot` condition (R5.71) when the
-/// slot is unbound on a genuine instance. The condition carries `:name` (the slot
-/// name) and `:instance`, so handlers can inspect it like any CLOS object.
+/// Read a slot through the user-extensible unbound-slot protocol.
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    match read_slot_value(instance, slot, env) {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    match read_slot_value(*instance, *slot, env) {
         Ok(value) => Ok(value),
-        Err(EgclError::UnboundVariable(_)) if egcl_stdlib::is_instance(instance) => {
-            let condition = build_condition_instance(
-                env,
-                "UNBOUND-SLOT",
-                &[
-                    resolve_sym("NAME").unwrap_or(NIL),
-                    slot,
-                    resolve_sym("INSTANCE").unwrap_or(NIL),
-                    instance,
-                ],
-            )?;
-            Err(signal_and_raise(
-                env,
-                condition,
-                format!("slot {} is unbound", sym_bare_name_rc(slot)),
-            ))
+        Err(EgclError::UnboundVariable(_)) if egcl_stdlib::is_instance(*instance) => {
+            let _call_depth = CallDepthGuard::enter()?;
+            let class = egcl_stdlib::class_of(*instance);
+            let args = RootedVals::new(vec![class, *instance, *slot]);
+            let result = invoke_generic_function("SLOT-UNBOUND", &args, env);
+            // A slot read returns only the primary value of SLOT-UNBOUND.
+            env.clear_mv();
+            result
         }
         Err(error) => Err(error),
     }
@@ -24768,7 +24760,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         .unwrap_or(slot_name);
                     resolve_sym(&n).unwrap_or(NIL)
                 });
-            return read_slot_value(*inst, slot_sym, env);
+            return slot_value_or_signal(*inst, slot_sym, env);
         }
 
         // Check methods
@@ -36031,11 +36023,9 @@ fn apply_builtin_fast(
         // against SBCL's 1.205 MB, and make-plan is 95% of what a no-op
         // (asdf:load-system :babel) conses (bliss-4rgg, bliss-sgis).
         //
-        // All four are leaf readers — no :test/:key can re-enter Lisp — so they
-        // satisfy the leaf rule that makes a direct arm safe without invocation
-        // counting or a depth cap (bliss-edzd). Same kernels as the
-        // operator-position handlers, so results and multiple values stay
-        // bit-identical to the tree-walker (bliss-x5y.9).
+        // SLOT-VALUE can re-enter Lisp through SLOT-UNBOUND; the other readers
+        // are leaves. The shared slot helper handles protocol dispatch in both
+        // evaluated and operator-position calls.
         "SLOT-VALUE" if args.len() == 2 => {
             env.clear_mv();
             Some(slot_value_or_signal(args[0], args[1], env))
