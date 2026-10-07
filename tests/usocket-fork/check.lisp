@@ -12,3 +12,4 @@
 (asdf:load-system :usocket)
 (load (asdf:system-relative-pathname :usocket "tests/egcl-client.lisp"))
 #+egcl (load (asdf:system-relative-pathname :usocket "tests/egcl-server.lisp"))
+#+egcl (load (asdf:system-relative-pathname :usocket "tests/egcl-read-timeout.lisp"))

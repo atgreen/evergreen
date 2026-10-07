@@ -98,7 +98,7 @@ trivial-mimes, ghcr.io/ocicl/trivial-mimes@sha256:a92350000c29520f98e349019917e9
 type-i, ghcr.io/ocicl/type-i@sha256:de5c3e7f7b72409c5ec49885eea8c6fe2e02def2846cf97f70c1c21f21a1567c, type-i-20240503-4407a68/type-i.asd
 type-i.test, ghcr.io/ocicl/type-i@sha256:de5c3e7f7b72409c5ec49885eea8c6fe2e02def2846cf97f70c1c21f21a1567c, type-i-20240503-4407a68/type-i.test.asd
 uffi, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/uffi-compat/uffi.asd
-usocket, git+https://github.com/atgreen/usocket@64c26538564b14068a836f97990bd09a00c2d6a1#ref=64c26538564b14068a836f97990bd09a00c2d6a1, usocket-64c2653/usocket.asd
-usocket-server, git+https://github.com/atgreen/usocket@64c26538564b14068a836f97990bd09a00c2d6a1#ref=64c26538564b14068a836f97990bd09a00c2d6a1, usocket-64c2653/usocket-server.asd
+usocket, git+https://github.com/atgreen/usocket@39c189d2c51317fbdfa6d6023a3369fdb329e61e#ref=39c189d2c51317fbdfa6d6023a3369fdb329e61e, usocket-39c189d/usocket.asd
+usocket-server, git+https://github.com/atgreen/usocket@39c189d2c51317fbdfa6d6023a3369fdb329e61e#ref=39c189d2c51317fbdfa6d6023a3369fdb329e61e, usocket-39c189d/usocket-server.asd
 xsubseq, ghcr.io/ocicl/xsubseq@sha256:7605d14f7cc7fd2f63190ad81fe7bd65daef105d6728ee6bb59baef49da2aa51, xsubseq-20240503-5ce430b/xsubseq.asd
 xsubseq-test, ghcr.io/ocicl/xsubseq@sha256:7605d14f7cc7fd2f63190ad81fe7bd65daef105d6728ee6bb59baef49da2aa51, xsubseq-20240503-5ce430b/xsubseq-test.asd
