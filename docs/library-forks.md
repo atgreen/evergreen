@@ -23,7 +23,7 @@ exercises these forks:
 |---|---|---|
 | trivial-features | https://github.com/atgreen/trivial-features | `651e8ea90db0b143d39b9a414ee382ec62efad2f` |
 | trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `0554d306864d252985c23923ef872a1b177894a6` |
-| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `fa0df448d5582c0d637afe3799cf53b28e1586c9` |
+| usocket (binary TCP client and server subset) | https://github.com/atgreen/usocket | `39c189d2c51317fbdfa6d6023a3369fdb329e61e` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
 | trivial-backtrace | https://github.com/atgreen/trivial-backtrace | `650da10abfe4b44c70b58a431aec6d9fe7330406` |
@@ -39,8 +39,11 @@ exercises these forks:
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
-incremental loopback I/O through cold and cached loads. It requires the new
-EGCL client primitives and is not a claim of HTTPS support.
+incremental loopback I/O through cold and cached loads, cross-thread server
+accept/close, octet element-type aliases, listener options, and read-timeout
+expiry and recovery. It requires the native client primitives, shared listener
+support from PR #60, and typed I/O timeouts from PR #72. This is not
+a claim of HTTPS support or a complete USOCKET backend.
 
 The [Drakma scenario](../tests/drakma/README.md) checks plain HTTP GET and POST
 through USOCKET, Chunga, and Flexi Streams, including response text decoding.

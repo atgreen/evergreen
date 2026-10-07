@@ -68,6 +68,10 @@
 - Native socket byte-read timeouts now signal `EGCL-EXT:IO-TIMEOUT`, retaining
   the affected stream so callers can distinguish expiry from other I/O errors
   ([#72](https://github.com/atgreen/evergreen/pull/72)).
+- The USOCKET fork now supports binary TCP listeners, cross-thread accept and
+  close, listener port queries, explicit address-reuse options, and inherited
+  or independently configured read timeouts with `USOCKET:TIMEOUT-ERROR` mapping
+  ([#61](https://github.com/atgreen/evergreen/pull/61)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
