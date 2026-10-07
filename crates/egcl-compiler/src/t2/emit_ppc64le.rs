@@ -113,10 +113,10 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
-use std::collections::{HashMap, HashSet};
 use egcl_rt::asm::Cc;
 use egcl_rt::asm_ppc64le::{Asm, Label, frame};
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
+use std::collections::{HashMap, HashSet};
 
 /// Primary working register, and the ABI's first argument and return register.
 const W0: u8 = 3;
@@ -942,6 +942,48 @@ pub fn emit_framed_with_runtime(
             .iter()
             .filter(|range| {
                 range.vreg.class == RegClass::Gpr && range.start <= after && after < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .chain(data.args.iter().copied())
+            .chain(
+                data.targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
+    // A sampled back-edge poll is a runtime call too, so it needs a root set; a
+    // loop whose poll had none was declined wholesale (bliss-83icg). Poll before
+    // the edge's parallel transfers: lowering represents those as anonymous
+    // moves ahead of the machine terminator, and their destination phi values do
+    // not exist yet in the emitted code. Mirrors the s390x emitter.
+    for (block_index, &block) in function.block_order().iter().enumerate() {
+        let Some(&source) = function.block(block).insts.last() else {
+            continue;
+        };
+        if !emitter.polls.contains(&source) {
+            continue;
+        }
+        let mb = &machine.blocks[block_index];
+        let mut boundary = mb.end;
+        while boundary > mb.start
+            && machine.insts[boundary - 1]
+                .source_inst
+                .is_none_or(|inst| inst == source)
+        {
+            boundary -= 1;
+        }
+        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let data = function.inst(source);
+        let mut roots: Vec<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
             })
             .map(|range| Value(range.vreg.num))
             .chain(data.args.iter().copied())

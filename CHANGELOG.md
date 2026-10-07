@@ -8,6 +8,11 @@
   fence instructions, including after compiled-file loading
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
 
+- Functions containing loops now reach T2 native code on ppc64le instead of
+  stopping at T1: the back-edge safepoint poll had no GC root set, which made
+  the optimizing tier decline every loop
+  ([#98](https://github.com/atgreen/evergreen/pull/98)).
+
 ### Platform support
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
