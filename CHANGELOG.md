@@ -4,6 +4,11 @@
 
 ### Performance
 
+- `MULTIPLE-VALUE-PROG1` now compiles to bytecode and baseline native code,
+  allowing Ironclad's Keccak implementation to tier instead of remaining
+  interpreted, including after compiled-file loading
+  ([#56](https://github.com/atgreen/evergreen/pull/56)).
+
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
   fence instructions, including after compiled-file loading
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
