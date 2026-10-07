@@ -1892,8 +1892,13 @@ fn collect_candidates(
     recursive: bool,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), EgclError> {
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| EgclError::FileError(format!("{}: {}", root.display(), e)))?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(EgclError::FileError(format!("{}: {}", root.display(), error)));
+        }
+    };
     for entry in entries {
         let entry = entry.map_err(|e| EgclError::FileError(e.to_string()))?;
         let path = entry.path();
