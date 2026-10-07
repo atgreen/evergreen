@@ -34,6 +34,10 @@
 - `TYPE-OF` now preserves the defining package of structure, class, and
   condition names, fixing cross-package digest copying used by TLS key
   derivation ([#57](https://github.com/atgreen/evergreen/pull/57)).
+- Extension macros, including `EGCL-EXT:CAS` and atomic arithmetic, now expand
+  consistently in interpreted and compiled code. Local function shadowing and
+  definition-time macro snapshots are preserved
+  ([#58](https://github.com/atgreen/evergreen/pull/58)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
