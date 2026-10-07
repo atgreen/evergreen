@@ -3262,6 +3262,74 @@ fn resolve(name: &str) -> Option<Handler> {
             )
         }),
 
+        "CHANGE-CLASS" => Some(|_operator, args, env| {
+            egcl_rt::rooted!(args = args.to_vec());
+            if args.len() < 2 || (args.len() - 2) % 2 != 0 {
+                return Err(EgclError::ProgramError(
+                    "CHANGE-CLASS requires an instance, a class, and initarg/value pairs".into(),
+                ));
+            }
+            egcl_rt::rooted!(class = resolve_class_metaobject(env, args[1])?);
+            egcl_rt::rooted!(previous =
+                egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
+            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let new_name = class_name_for_instance_class(*class);
+            let old_shared = effective_slots_for_class(env, &old_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Class))
+                .map(|slot| slot.name).collect::<std::collections::HashSet<_>>();
+            let inherited_shared = effective_slots_for_class(env, &new_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
+                    && old_shared.contains(&slot.name))
+                .map(|slot| slot.name).collect::<Vec<_>>();
+            egcl_rt::rooted!(shared_values = Vec::<(EgclVal, EgclVal)>::new());
+            for name in inherited_shared {
+                let symbol = resolve_sym(&name)
+                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
+                let bare = symbol_bare_name(&name);
+                let value = class_slot_cell(env, &old_name, &bare)
+                    .and_then(|cell| cell.lock().unwrap().get(&bare).copied().flatten());
+                if let Some(value) = value {
+                    shared_values.push((symbol, value));
+                }
+            }
+            egcl_stdlib::change_class(args[0], *class)?;
+            for index in 0..shared_values.len() {
+                let (slot, value) = shared_values[index];
+                egcl_stdlib::set_slot_value(args[0], slot, value)?;
+            }
+            egcl_rt::rooted!(hook_args = vec![*previous, args[0]]);
+            hook_args.extend_from_slice(&args[2..]);
+            let hook = resolve_sym("UPDATE-INSTANCE-FOR-DIFFERENT-CLASS")
+                .ok_or_else(|| EgclError::Internal("class-change hook symbol unavailable".into()))?;
+            apply_function(hook, &hook_args, env)?;
+            Ok(args[0])
+        }),
+
+        "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
+        | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => Some(|_operator, args, env| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "class-change slot comparison requires two instances".into(),
+                ));
+            }
+            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let new_name = class_name_for_instance_class(egcl_stdlib::class_of(args[1]));
+            let old_slots: std::collections::HashSet<String> =
+                effective_slots_for_class(env, &old_name).into_iter()
+                    .map(|slot| slot.name).collect();
+            let added = effective_slots_for_class(env, &new_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
+                    && !old_slots.contains(&slot.name))
+                .map(|slot| slot.name).collect::<Vec<_>>();
+            egcl_rt::rooted!(names = Vec::with_capacity(added.len()));
+            for name in added {
+                let symbol = resolve_sym(&name)
+                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
+                names.push(symbol);
+            }
+            Ok(vec_to_list(&names))
+        }),
+
         "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
         | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => Some(|_operator, args, env| {
             egcl_rt::rooted!(args = args.to_vec());
@@ -3282,7 +3350,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 Some(
                     names.iter()
-                        .map(|name| sym_bare_name_rc(*name).to_string())
+                        .map(|name| sym_name(*name))
                         .collect::<Vec<_>>(),
                 )
             };

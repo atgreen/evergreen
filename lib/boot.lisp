@@ -492,6 +492,12 @@
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
   (apply #'shared-initialize instance nil initargs))
 
+(defmethod update-instance-for-different-class
+    ((previous standard-object) (current standard-object) &rest initargs)
+  (apply #'shared-initialize current
+         (egcl-internal::%class-change-added-slots previous current)
+         initargs))
+
 (defmacro with-slots (slots instance &rest body)
   (let ((obj (gensym)))
     `(let ((,obj ,instance))
