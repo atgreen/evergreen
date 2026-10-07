@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Common Lisp support
+
+- Add `PPRINT-LOGICAL-BLOCK`, its lexical list-traversal helpers, conditional
+  line breaks and indentation, and `PPRINT-FILL` / `PPRINT-LINEAR`. Nested
+  blocks honor prefixes, suffixes, print limits, and circular-list labels,
+  allowing Quicklisp's setup code to compile past its missing-macro failure
+  ([#55](https://github.com/atgreen/evergreen/pull/55)).
+
 ### Performance
 
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
@@ -14,6 +22,9 @@
   ([#51](https://github.com/atgreen/evergreen/pull/51)).
 
 ### Correctness and reliability
+
+- `WRITE` now uses the dynamic `*PRINT-ESCAPE*` value when `:ESCAPE` is omitted
+  ([#55](https://github.com/atgreen/evergreen/pull/55)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions

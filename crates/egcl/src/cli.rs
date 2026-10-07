@@ -17481,7 +17481,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(c = EgclVal::from_fixnum(generations as i64));
                 return Ok(vec_to_list(&[*a, *b, *c]));
             }
-            "EGCL::%DEBUG-BACKTRACE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%DEBUG-BACKTRACE" | "EGCL::%PPRINT-CIRCLE"
+                | "EGCL::%PPRINT-NATIVE-COLUMN" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FN-LAMBDA-LIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NATIVE-MUTEX" => return eval_builtin_arguments(&name, cdr, env),
@@ -35638,7 +35639,8 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "DISASSEMBLE" {
         return !cfg!(egcl_no_disassembly);
     }
-    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER") {
+    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN") {
         return true;
     }
     // EGCL-THREAD is an extension package, not COMMON-LISP. Its names must be
@@ -38917,6 +38919,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     BOOT_COMPLETE.with(|c| c.set(true));
 
     if !ca.no_bootstrap && !core_loaded {
+        read_eval_all_env(include_str!("../../../lib/pprint.lisp"), &mut env)?;
         read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
     }
 
