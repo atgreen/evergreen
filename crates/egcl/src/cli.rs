@@ -8580,6 +8580,13 @@ impl Env {
         }
         #[cfg(target_arch = "s390x")]
         features.push(resolve_sym(":S390X").unwrap_or(NIL));
+        // SBCL pushes :RISCV on RV64; :RISCV64 names the word size the way
+        // :PPC64/:PPC64LE do above, so both spellings dispatch.
+        #[cfg(target_arch = "riscv64")]
+        {
+            features.push(resolve_sym(":RISCV").unwrap_or(NIL));
+            features.push(resolve_sym(":RISCV64").unwrap_or(NIL));
+        }
         #[cfg(target_endian = "little")]
         features.push(resolve_sym(":LITTLE-ENDIAN").unwrap_or(NIL));
         #[cfg(target_endian = "big")]

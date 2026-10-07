@@ -35,6 +35,29 @@ computes overflow explicitly rather than branching on a flag.
 Library loading uses the system dynamic loader. Saved images have distinct
 architecture tags; do not move heap images between architectures.
 
+## RISC-V (native build)
+
+RISC-V is built natively on RV64GC hardware rather than through `cross`; no
+cross-toolchain container image is wired up yet. On a Debian 13 riscv64 host
+with rustup's `riscv64gc-unknown-linux-gnu` toolchain:
+
+```sh
+rustup toolchain install 1.94.1 --profile minimal
+cargo build --locked --release -p egcl --bin egcl \
+  --target riscv64gc-unknown-linux-gnu --features egcl-rt/c-ffi
+scripts/egcl-limited.sh python3 scripts/portability-smoke.py riscv64 -- \
+  target/riscv64gc-unknown-linux-gnu/release/egcl
+```
+
+This is the initial CLI port: the interpreter and bytecode tiers run, saved
+images carry a distinct `RISCV64` architecture tag, `*features*` includes
+`:riscv` and `:riscv64`, and the portability smoke test passes natively. There
+is no RISC-V baseline or optimizing native compiler yet, so `EGCL_FORCE_TIER`
+values above `t0` fall back to bytecode. Foreign calls go through the
+bootstrap dispatcher's fixed call shapes, as on s390x, and the fiber scheduler
+runs without a native context switch. The remaining slices are tracked as
+children of Bead `bliss-miro8`.
+
 ## Setup and build
 
 Install Rust through rustup, Podman (or Docker), and `cross`:
