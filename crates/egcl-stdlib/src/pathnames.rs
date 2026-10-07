@@ -1804,6 +1804,9 @@ pub(crate) fn extract_path_string(val: EgclVal) -> Result<String, EgclError> {
     if val.is_string() {
         return Ok(val.as_string());
     }
+    if egcl_rt::types::streamp(val) {
+        return crate::streams::file_namestring(val);
+    }
     Err(EgclError::FileError(
         "cannot extract path string from value".to_string(),
     ))
