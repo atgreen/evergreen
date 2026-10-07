@@ -137,6 +137,64 @@ fn bbu_function_codes(bbu: &[u8]) -> Vec<&[u8]> {
 }
 
 #[test]
+fn multiple_value_prog1_persists_without_source_fallback() {
+    let dir = workdir("multiple-value-prog1");
+    let src = dir.join("mv-prog1.lisp");
+    let out = dir.join("mv-prog1.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defvar *persisted-mv-effects* nil)
+      (defun persisted-mv-prog1 (x)
+        (multiple-value-prog1 (values x :second)
+          (setq *persisted-mv-effects* (cons x *persisted-mv-effects*))
+          (values :discarded :also-discarded)))
+      (defun persisted-mv-empty ()
+        (multiple-value-prog1 (values)
+          (setq *persisted-mv-effects* (cons :zero *persisted-mv-effects*))
+          (values :discarded)))
+      (format t "PERSISTED-MV ~S ~S ~S~%"
+              (multiple-value-list (persisted-mv-prog1 :first))
+              (multiple-value-list (persisted-mv-empty))
+              *persisted-mv-effects*)
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {out:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "must not embed legacy source"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "MULTIPLE-VALUE-PROG1 fell back to EvalSource");
+    }
+    fs::remove_file(&src).unwrap();
+    let loaded = Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--load"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&loaded.stdout)
+            .contains("PERSISTED-MV (:FIRST :SECOND) NIL (:ZERO :FIRST)")
+    );
+}
+
+#[test]
 fn memory_fence_bytecode_persists_without_source_fallback() {
     let dir = workdir("memory-fence");
     let src = dir.join("memory-fence.lisp");

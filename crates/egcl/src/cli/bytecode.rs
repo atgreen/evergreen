@@ -2626,6 +2626,7 @@ impl<'e> Lowerer<'e> {
                 "MULTIPLE-VALUE-CALL" => self.lower_multiple_value_call(rest),
                 "MULTIPLE-VALUE-BIND" => self.lower_mvb(rest),
                 "MULTIPLE-VALUE-LIST" => self.lower_mvlist(rest),
+                "MULTIPLE-VALUE-PROG1" => self.lower_mvprog1(rest),
                 "NTH-VALUE" => self.lower_nth_value(rest),
                 "LAMBDA" => self.lower_lambda(op, rest),
                 "FUNCTION" => self.lower_function(rest),
@@ -6132,6 +6133,37 @@ impl<'e> Lowerer<'e> {
         Ok(())
     }
 
+    /// Preserve the first form's values while evaluating the trailing forms.
+    fn lower_mvprog1(&mut self, rest: EgclVal) -> LowerResult<()> {
+        if !rest.is_cons() {
+            return Err(Bail);
+        }
+        let (first, mut body) = cp(rest);
+        egcl_rt::rooted_ref!(_body_root = &mut body);
+        self.emit(Instr::ClearMv);
+        let may_produce = self.may_produce_multiple_values(first);
+        self.lower_expr(first)?;
+        if !may_produce {
+            self.emit(Instr::ClearMv);
+        }
+        if body.is_nil() {
+            return Ok(());
+        }
+
+        // The operand stack roots the saved tuple across calls and allocations
+        // in the trailing forms. A list also distinguishes zero values from NIL.
+        self.emit(Instr::ValuesToList);
+        self.emit(Instr::ClearMv);
+        self.lower_progn(body)?;
+        self.emit(Instr::Pop);
+        self.pop_n(1);
+        self.emit(Instr::CallNamed {
+            sym: symbol_index_of("VALUES-LIST").ok_or(Bail)?,
+            nargs: 1,
+        });
+        Ok(())
+    }
+
     /// `(nth-value n form)` — the n-th value (0-based) of `form`'s multiple
     /// values, or NIL if `form` yields fewer. NTH-VALUE is a special operator
     /// (not a macro), so the lowerer must handle it: without this it fell through
@@ -7808,7 +7840,6 @@ fn is_bail_special(name: &str) -> bool {
             | "LOAD-TIME-VALUE"
             | "PROGV"
             | "MULTIPLE-VALUE-CALL"
-            | "MULTIPLE-VALUE-PROG1"
             // Absent, its variable list `(a b)` was lowered as a CallNamed and
             // the form died with "undefined function: A" under every bytecode
             // tier while the tree-walker ran it correctly (bliss-h7e0). The
@@ -22682,6 +22713,9 @@ fn symbol_index_of(name: &str) -> Option<u32> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod multiple_value_prog1_tests;
 
 #[cfg(test)]
 mod direct_call_invalidation_tests {
