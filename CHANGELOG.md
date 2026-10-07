@@ -44,6 +44,9 @@
 
 ### Platform support
 
+- Restore Windows builds and stack-limit checks by selecting the Windows OS
+  backend correctly ([#85](https://github.com/atgreen/evergreen/pull/85)).
+
 - Evergreen now builds and runs natively on riscv64 Linux (RV64GC). The
   interpreter and bytecode tiers, compiled-file loading, and heap images
   work; saved images carry a distinct `RISCV64` tag, and `*features*`
