@@ -50,6 +50,11 @@
   `UNBOUND-SLOT` with the offending slot and instance
   ([#78](https://github.com/atgreen/evergreen/pull/78)).
 
+- `ENSURE-DIRECTORIES-EXIST` now creates the final directory component of a
+  directory-only pathname, allowing fresh Quicklisp distribution installations
+  to create their metadata directories
+  ([#79](https://github.com/atgreen/evergreen/pull/79)).
+
 - Floating-point `FORMAT` directives now accept ratios and bignums, allowing
   Quicklisp download progress to display sizes and rates. Large ratio
   components are scaled safely, out-of-range rational arguments signal an
