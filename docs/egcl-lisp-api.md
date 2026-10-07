@@ -57,6 +57,18 @@ intentionally not a supported API.
 
 ## Currently available API
 
+### Stream I/O timeouts
+
+`EGCL-EXT:IO-TIMEOUT` is a subtype of `STREAM-ERROR` and
+`SIMPLE-CONDITION`. Native socket byte and byte-sequence reads signal it when
+their configured receive timeout expires. `STREAM-ERROR-STREAM` returns the
+affected stream; the simple-condition accessors provide the diagnostic text.
+Other stream failures are not classified as timeouts. The socket remains open
+after a timeout and can be read again or closed by the caller.
+
+This is distinct from `EGCL-EXT:TIMEOUT-CONDITION`, which represents a sandbox
+CPU deadline. It does not impose a total deadline on a multi-operation protocol.
+
 ### Environment and working directory
 
 #### `egcl-ext:getenv`
