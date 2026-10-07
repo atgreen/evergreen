@@ -513,6 +513,58 @@ fn directory_traverses_exact_wildcard_levels() {
 }
 
 #[test]
+fn probe_file_accepts_open_and_closed_file_streams() {
+    use egcl_rt::value::T;
+    use egcl_stdlib::streams::{close, open, ExternalFormat, StreamDirection};
+    let file = temp_path("probe_file_stream");
+    std::fs::write(&file, "fixture").unwrap();
+    for direction in [
+        StreamDirection::Input,
+        StreamDirection::Output,
+        StreamDirection::Io,
+        StreamDirection::Probe,
+    ] {
+        egcl_rt::rooted!(
+            stream = open(
+                make_string_val(&file),
+                direction,
+                NIL,
+                T,
+                T,
+                ExternalFormat::Utf8,
+            )
+            .unwrap()
+        );
+        let expected = std::fs::canonicalize(&file).unwrap();
+        let probed = probe_file(*stream).unwrap().unwrap();
+        assert_eq!(
+            namestring(probed).unwrap().as_string(),
+            expected.to_string_lossy()
+        );
+        close(*stream, false).unwrap();
+        let probed = probe_file(*stream).unwrap().unwrap();
+        assert_eq!(
+            namestring(probed).unwrap().as_string(),
+            expected.to_string_lossy()
+        );
+    }
+    egcl_rt::rooted!(
+        stream = open(
+            make_string_val(&file),
+            StreamDirection::Input,
+            NIL,
+            T,
+            T,
+            ExternalFormat::Utf8,
+        )
+        .unwrap()
+    );
+    close(*stream, false).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    assert!(probe_file(*stream).unwrap().is_none());
+}
+
+#[test]
 #[cfg(unix)]
 fn directory_does_not_enter_unmatched_literal_subtrees() {
     use std::os::unix::fs::PermissionsExt;

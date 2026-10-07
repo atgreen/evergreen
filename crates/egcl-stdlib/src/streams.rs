@@ -136,6 +136,8 @@ pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
 /// when the stream becomes unreachable, releasing the fd (via `File`'s Drop) and
 /// buffers, and warning for an unclosed file stream (R5.121).
 struct StreamAlloc {
+    /// Opening namestring, retained after CLOSE; absent for non-file streams.
+    file_namestring: Option<String>,
     /// Immutable component references of a composite stream (broadcast /
     /// concatenated components, two-way/echo input+output, synonym symbol), or
     /// empty for non-composite streams. Stored OUTSIDE the per-stream mutex so
@@ -1815,6 +1817,7 @@ fn alloc_stream(
     element_type: StreamElementType,
     inner: StreamInner,
     components: Vec<EgclVal>,
+    file_namestring: Option<String>,
 ) -> EgclVal {
     // Composite streams are constructed after their immutable components and
     // acquire the composite lock first. Descending keys therefore put every
@@ -1827,6 +1830,7 @@ fn alloc_stream(
     // the GC can trace it lock-free; the mutable state gets a raw back-pointer
     // to it for the composite op arms.
     let mut boxed = Box::new(StreamAlloc {
+        file_namestring,
         components: components.into_boxed_slice(),
         state: OrderedExecutionMutex::new(
             LockLevel::Stream,
@@ -1945,6 +1949,7 @@ pub fn make_stdin() -> EgclVal {
             col: 0,
         },
         vec![],
+        None,
     )
 }
 
@@ -1954,6 +1959,7 @@ pub fn make_stdout() -> EgclVal {
         StreamElementType::Character,
         StreamInner::Stdout { line: 0, col: 0 },
         vec![],
+        None,
     )
 }
 
@@ -1963,6 +1969,7 @@ pub fn make_stderr() -> EgclVal {
         StreamElementType::Character,
         StreamInner::Stderr { line: 0, col: 0 },
         vec![],
+        None,
     )
 }
 
@@ -1989,6 +1996,17 @@ fn get_stream_alloc(stream: EgclVal) -> Result<&'static StreamAlloc, EgclError> 
         }
         Ok(&*box_ptr)
     }
+}
+
+/// Copy a file stream's immutable opening namestring without taking its I/O lock.
+pub(crate) fn file_namestring(stream: EgclVal) -> Result<String, EgclError> {
+    get_stream_alloc(stream)?
+        .file_namestring
+        .clone()
+        .ok_or_else(|| EgclError::TypeError {
+            datum: stream,
+            expected: "stream associated with a file".into(),
+        })
 }
 
 /// Lock the per-stream mutex and return a guard. R5.120.
@@ -2044,6 +2062,10 @@ pub fn open(
     let path_str = crate::pathnames::extract_path_string(pathname)
         .map_err(|_| EgclError::FileError("pathname must be a string".into()))?;
     let path = std::path::Path::new(&path_str);
+    let absolute_path = std::path::absolute(path)
+        .map_err(|e| EgclError::FileError(format!("{}: {}", path_str, e)))?
+        .to_string_lossy()
+        .into_owned();
 
     match direction {
         StreamDirection::Input | StreamDirection::Probe => {
@@ -2094,6 +2116,7 @@ pub fn open(
                     element_type: elt,
                 },
                 vec![],
+                Some(absolute_path),
             ));
             if direction == StreamDirection::Probe {
                 close(*stream, false)?;
@@ -2145,6 +2168,7 @@ pub fn open(
                     col: 0,
                 },
                 vec![],
+                Some(absolute_path),
             ))
         }
         StreamDirection::Io => {
@@ -2204,6 +2228,7 @@ pub fn open(
                     external_format,
                 },
                 vec![],
+                Some(absolute_path),
             ))
         }
     }
@@ -2265,6 +2290,7 @@ pub fn make_string_input_stream(
             unread: None,
         },
         vec![],
+        None,
     ))
 }
 
@@ -2277,6 +2303,7 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
             col: 0,
         },
         vec![],
+        None,
     ))
 }
 
@@ -2300,6 +2327,7 @@ pub fn make_broadcast_stream(streams: &[EgclVal]) -> Result<EgclVal, EgclError> 
         StreamElementType::Character,
         StreamInner::Broadcast,
         streams.to_vec(),
+        None,
     ))
 }
 
@@ -2308,6 +2336,7 @@ pub fn make_concatenated_stream(streams: &[EgclVal]) -> Result<EgclVal, EgclErro
         StreamElementType::Character,
         StreamInner::Concatenated { cursor: 0 },
         streams.to_vec(),
+        None,
     ))
 }
 
@@ -2316,6 +2345,7 @@ pub fn make_two_way_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, E
         StreamElementType::Character,
         StreamInner::TwoWay,
         vec![input, output],
+        None,
     ))
 }
 
@@ -2324,6 +2354,7 @@ pub fn make_echo_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, Egcl
         StreamElementType::Character,
         StreamInner::Echo,
         vec![input, output],
+        None,
     ))
 }
 
@@ -2332,6 +2363,7 @@ pub fn make_synonym_stream(symbol: EgclVal) -> Result<EgclVal, EgclError> {
         StreamElementType::Character,
         StreamInner::Synonym,
         vec![symbol],
+        None,
     ))
 }
 
@@ -3277,6 +3309,7 @@ fn socket_stream(stream: TcpStream) -> Result<EgclVal, EgclError> {
             external_format: ExternalFormat::Utf8,
         },
         vec![],
+        None,
     ))
 }
 
@@ -3301,6 +3334,7 @@ pub fn process_stdin_stream(
             col: 0,
         },
         vec![],
+        None,
     )
 }
 
@@ -3335,6 +3369,7 @@ fn process_input_stream(pipe: OwnedPipe, element_type: StreamElementType) -> Egc
             element_type,
         },
         vec![],
+        None,
     )
 }
 
