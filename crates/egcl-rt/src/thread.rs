@@ -2269,6 +2269,21 @@ pub fn make_thread_named(
     entry: EgclVal,
     name: Option<String>,
 ) -> Result<NativeThreadId, EgclError> {
+    make_thread_named_with_setup(entry, name, || ())
+}
+
+/// Create a native thread with host state installed before its Lisp entry runs.
+/// The setup result remains alive throughout entry execution and is dropped on
+/// the worker before completion is published, including during unwinding.
+/// Only the setup closure crosses threads; its returned guard need not be Send.
+pub fn make_thread_named_with_setup<F, G>(
+    entry: EgclVal,
+    name: Option<String>,
+    setup: F,
+) -> Result<NativeThreadId, EgclError>
+where
+    F: FnOnce() -> G + Send + 'static,
+{
     let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
     let name = name.unwrap_or_else(|| format!("egcl-thread-{}", id.0));
     let result = Arc::new(ThreadResult::new());
@@ -2294,6 +2309,7 @@ pub fn make_thread_named(
         // the worker boundary; after a panic this worker retires without
         // evaluating any more Lisp or hiding the failure with an interrupt.
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _host_state = setup();
             let mut value = run_entry(running.entry());
             if let Some(interrupt) = running.take_interrupt() {
                 value = Ok(interrupt);

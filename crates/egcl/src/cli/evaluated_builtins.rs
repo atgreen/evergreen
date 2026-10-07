@@ -1538,7 +1538,7 @@ fn resolve(name: &str) -> Option<Handler> {
                         Ok(val_as_str(value))
                     })
                     .transpose()?;
-                let id = egcl_rt::make_thread_named(fnv, name)?;
+                let id = egcl_stdlib::threads::make_thread(fnv, name)?;
                 Ok(EgclVal::from_fixnum(id.0 as i64))
             })
         }
