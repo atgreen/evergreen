@@ -444,6 +444,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#logical-block-printing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Logical-block printing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#scope-of-this-edition" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1896,6 +1907,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#logical-block-printing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Logical-block printing
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#scope-of-this-edition" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1992,6 +2014,25 @@ runtime built with the FFI feature. Architecture ports also differ in native
 compilation, callbacks, and fiber switching. Consult the
 <a href="../user/reference/platforms/">platform reference</a> before selecting a deployment
 runtime.</p>
+<h2 id="logical-block-printing">Logical-block printing<a class="headerlink" href="#logical-block-printing" title="Permanent link">&para;</a></h2>
+<p><code>PPRINT-LOGICAL-BLOCK</code> groups output sent to its bound stream. Use the lexical
+<code>PPRINT-POP</code> and <code>PPRINT-EXIT-IF-LIST-EXHAUSTED</code> macros to traverse the supplied
+list without losing dotted-tail and print-limit handling. A <code>NIL</code> stream
+variable designator rebinds <code>*STANDARD-OUTPUT*</code>; <code>T</code> rebinds <code>*TERMINAL-IO*</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="vg">*print-pretty*</span><span class="w"> </span><span class="no">t</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="vg">*print-right-margin*</span><span class="w"> </span><span class="mi">20</span><span class="p">))</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="p">(</span><span class="nb">pprint-logical-block</span><span class="w"> </span><span class="p">(</span><span class="no">nil</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="nv">alpha</span><span class="w"> </span><span class="nv">beta</span><span class="w"> </span><span class="nv">gamma</span><span class="p">)</span><span class="w"> </span><span class="ss">:prefix</span><span class="w"> </span><span class="s">"("</span><span class="w"> </span><span class="ss">:suffix</span><span class="w"> </span><span class="s">")"</span><span class="p">)</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span><span class="p">(</span><span class="nb">loop</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">      </span><span class="p">(</span><span class="nb">pprint-exit-if-list-exhausted</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">      </span><span class="p">(</span><span class="nb">write</span><span class="w"> </span><span class="p">(</span><span class="nb">pprint-pop</span><span class="p">))</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="w">      </span><span class="p">(</span><span class="nb">pprint-exit-if-list-exhausted</span><span class="p">)</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">      </span><span class="p">(</span><span class="nb">write-char</span><span class="w"> </span><span class="sc">#\Space</span><span class="p">)</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">      </span><span class="p">(</span><span class="nb">pprint-newline</span><span class="w"> </span><span class="ss">:fill</span><span class="p">))))</span>
+</code></pre></div>
+<p>The block supports ordinary and per-line prefixes, a suffix, nested blocks,
+conditional newlines, and <code>PPRINT-INDENT</code>. <code>PPRINT-FILL</code> and <code>PPRINT-LINEAR</code>
+provide the standard list-printing patterns. These interfaces do not imply
+support for user-defined pprint dispatch tables; <code>SET-PPRINT-DISPATCH</code> and
+<code>PPRINT-DISPATCH</code> remain separate implementation work.</p>
 <h2 id="scope-of-this-edition">Scope of this edition<a class="headerlink" href="#scope-of-this-edition" title="Permanent link">&para;</a></h2>
 <p>This edition follows the development checkout, not a frozen release. Older
 installed packages may predate the behavior described here. Planned interfaces
