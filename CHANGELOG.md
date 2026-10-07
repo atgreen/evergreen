@@ -56,6 +56,9 @@
   symbol lookup in workers and threads created by fibers. This fixes Ironclad
   reporting SHA256 as unsupported in TLS server threads
   ([#68](https://github.com/atgreen/evergreen/pull/68)).
+- `ENCODE-UNIVERSAL-TIME` now rejects invalid fields and preserves exact
+  fractional time-zone offsets and large years
+  ([#69](https://github.com/atgreen/evergreen/pull/69)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
