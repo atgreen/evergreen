@@ -1,6 +1,6 @@
 alexandria, ghcr.io/ocicl/alexandria@sha256:407634b0781b2d8fc3e55a30432bcb5d0c042af2feb2d1d72de825940b0fb0df, alexandria-20260812-f283e25/alexandria.asd
-atomics, ghcr.io/ocicl/atomics@sha256:da49f4ab0778982770f155b7896bb6e2b6652c89ff1e3ef81ef31832abf150b8, atomics-20260830-1caed1a/atomics.asd
-atomics-test, ghcr.io/ocicl/atomics@sha256:da49f4ab0778982770f155b7896bb6e2b6652c89ff1e3ef81ef31832abf150b8, atomics-20260830-1caed1a/atomics-test.asd
+atomics, git+https://github.com/atgreen/atomics@738ddccd7a6f3c44e83335ac5e3615e76972dfd2#ref=738ddccd7a6f3c44e83335ac5e3615e76972dfd2, atomics-738ddcc/atomics.asd
+atomics-test, git+https://github.com/atgreen/atomics@738ddccd7a6f3c44e83335ac5e3615e76972dfd2#ref=738ddccd7a6f3c44e83335ac5e3615e76972dfd2, atomics-738ddcc/atomics-test.asd
 babel, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel.asd
 babel-streams, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-streams.asd
 babel-tests, ghcr.io/ocicl/babel@sha256:9d9fcde71acc2b5c39572de4f11756a08c1d8801caa86c581b85dabaa35928b3, babel-20250905-4eaf3f2/babel-tests.asd
