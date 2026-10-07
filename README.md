@@ -132,8 +132,8 @@ macOS arm64; Windows x86-64; and Android ARM64 and x86-64 application
 runtimes. Native compiler coverage and foreign-call support vary by target.
 Linux x86-64, AArch64, ppc64le, and s390x have T1 and T2 backends, OSR, and
 deoptimization for supported code shapes; unsupported shapes remain at a lower
-tier. Linux riscv64 is a native build that currently runs the interpreter and
-bytecode tiers only. The macOS arm64 CLI is built from
+tier. Linux riscv64 is a native build with a T1 baseline compiler and OSR but
+no T2 backend yet. The macOS arm64 CLI is built from
 source and has a narrower validation baseline than Linux.
 
 The Fedora x86-64 repository also offers `egcl-static` and `egcl-target-*`
