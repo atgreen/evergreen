@@ -489,6 +489,10 @@
 (defmethod shared-initialize ((instance standard-object) slot-names &rest initargs)
   (egcl-internal::%standard-shared-initialize instance slot-names initargs))
 
+(defmethod slot-unbound (class instance slot-name)
+  (declare (ignore class))
+  (error 'unbound-slot :name slot-name :instance instance))
+
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
   (apply #'shared-initialize instance nil initargs))
 
