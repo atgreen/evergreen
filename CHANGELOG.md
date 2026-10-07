@@ -6,7 +6,7 @@
   arithmetic, comparisons, live on-stack replacement, and deoptimization, so
   hot functions run as RV64 machine code instead of bytecode. T2 optimizing
   compilation is still x86-64, AArch64, ppc64le and s390x only
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#93](https://github.com/atgreen/evergreen/pull/93)).
 
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
