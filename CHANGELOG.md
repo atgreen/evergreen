@@ -44,6 +44,12 @@
 
 ### Correctness and reliability
 
+- Floating-point `FORMAT` directives now accept ratios and bignums, allowing
+  Quicklisp download progress to display sizes and rates. Large ratio
+  components are scaled safely, out-of-range rational arguments signal an
+  arithmetic error, and negative-zero signs are preserved
+  ([#76](https://github.com/atgreen/evergreen/pull/76)).
+
 - `DIRECTORY` now returns `NIL` for wildcard searches under missing
   directories, allowing fresh Quicklisp setup without a pre-created
   `local-init/` directory ([#75](https://github.com/atgreen/evergreen/pull/75)).

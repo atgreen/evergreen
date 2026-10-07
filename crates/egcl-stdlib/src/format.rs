@@ -1131,6 +1131,58 @@ pub fn double_float_to_string(x: f64) -> String {
     }
 }
 
+fn rational_format_value(rational: &egcl_rt::bignum::BigRat) -> f64 {
+    let numerator = rational.num.to_f64();
+    let denominator = rational.den.to_f64();
+    if numerator.is_finite() && denominator.is_finite() {
+        return numerator / denominator;
+    }
+
+    // Divide leading limbs before restoring their relative scale, so huge
+    // components of a representable ratio do not turn into infinity/infinity.
+    fn leading_limbs(integer: &egcl_rt::bignum::BigInt) -> (f64, usize) {
+        let dropped = integer.mag.len().saturating_sub(2);
+        let leading = egcl_rt::bignum::BigInt::from_parts(
+            integer.sign as i32,
+            &integer.mag[dropped..],
+        );
+        (leading.to_f64(), dropped)
+    }
+    let (numerator, numerator_scale) = leading_limbs(&rational.num);
+    let (denominator, denominator_scale) = leading_limbs(&rational.den);
+    let exponent = ((numerator_scale as i64 - denominator_scale as i64) * 64)
+        .clamp(-4096, 4096) as i32;
+    // Split the exponent to keep the scale itself finite and nonzero, even
+    // when the final quotient is near the overflow or subnormal boundary.
+    let first_scale = exponent.clamp(-1022, 1023);
+    (numerator / denominator * 2.0f64.powi(first_scale))
+        * 2.0f64.powi(exponent - first_scale)
+}
+
+fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
+    if val.is_single_float() {
+        Ok(val.as_single_float() as f64)
+    } else if val.is_double_float() {
+        Ok(val.as_double_float())
+    } else if val.is_fixnum() {
+        Ok(val.as_fixnum() as f64)
+    } else if let Some(rational) = egcl_rt::bignum::as_bigrat(val) {
+        let value = rational_format_value(&rational);
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(EgclError::ArithmeticError(
+                "rational argument exceeds the floating-point FORMAT range".into(),
+            ))
+        }
+    } else {
+        Err(EgclError::TypeError {
+            datum: val,
+            expected: "number".into(),
+        })
+    }
+}
+
 fn egclval_to_print_inner(v: EgclVal, escapep: bool) -> String {
     if v.is_nil() {
         return "NIL".into();
@@ -2442,18 +2494,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let shortest = if val.is_single_float() {
                     format!("{}", val.as_single_float())
                 } else {
@@ -2495,7 +2536,7 @@ fn format_impl(
                     }
                 };
                 // ~@F prints a leading + on a non-negative value (CLHS 22.3.3.1).
-                if at_sign && f >= 0.0 {
+                if at_sign && !f.is_sign_negative() {
                     s.insert(0, '+');
                 }
                 if s.len() < w {
@@ -2536,18 +2577,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let mut s = if d < 0 {
                     // No explicit fraction-digit count: shortest round-trip. Format
                     // a single-float from the f32 itself rather than its widened f64,
@@ -2615,15 +2645,8 @@ fn format_impl(
                 // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
                 let mut s = if val.is_single_float() {
                     format!("{}", val.as_single_float())
-                } else if val.is_double_float() {
-                    format!("{}", val.as_double_float())
-                } else if val.is_fixnum() {
-                    format!("{}", val.as_fixnum() as f64)
                 } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
+                    format!("{}", real_format_value(val)?)
                 };
                 if w > 0 && (s.chars().count() as i64) < w {
                     let pad = char::from_u32(if pad_param >= 0 {
@@ -2665,18 +2688,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let body = format!("{:.*}", d, f.abs());
                 let (int_part, frac_part) = match body.split_once('.') {
                     Some((i, fr)) => (i.to_string(), format!(".{fr}")),
@@ -2687,7 +2699,7 @@ fn format_impl(
                 } else {
                     int_part
                 };
-                let sign = if f < 0.0 {
+                let sign = if f.is_sign_negative() {
                     "-"
                 } else if at_sign {
                     "+"
