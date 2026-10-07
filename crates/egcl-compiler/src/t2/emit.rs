@@ -1352,7 +1352,11 @@ fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Resul
 /// resolver from (symbol, argument count) to a table slot, and a reader for the
 /// invalidation generation the call site bakes.
 pub struct DirectBuiltinHooks {
+    /// The register-argument adapter (x86-64's convention).
     pub addr: u64,
+    /// The slice-argument adapter, for emitters that pass arguments through
+    /// the activation's contiguous argument area (s390x).
+    pub slice_addr: u64,
     pub resolve: fn(u32, usize) -> Option<u32>,
     pub generation: fn() -> u64,
 }
@@ -1371,6 +1375,17 @@ fn direct_builtin_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
     let hooks = DIRECT_BUILTIN.get()?;
     let slot = (hooks.resolve)(sym, nargs)?;
     Some((hooks.addr, slot, (hooks.generation)()))
+}
+
+/// [`direct_builtin_for`] for an emitter that passes the arguments as a slice:
+/// `(slice adapter address, table slot, generation to bake)`.
+pub(super) fn direct_builtin_slice_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
+    let hooks = DIRECT_BUILTIN.get()?;
+    if hooks.slice_addr == 0 {
+        return None;
+    }
+    let slot = (hooks.resolve)(sym, nargs)?;
+    Some((hooks.slice_addr, slot, (hooks.generation)()))
 }
 
 /// Emit a `Call` through the interpreter adapter. Up to three arguments use the

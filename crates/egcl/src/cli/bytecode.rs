@@ -17040,6 +17040,8 @@ pub(super) fn install_direct_builtin_hooks() {
         egcl_compiler::t2::emit::DirectBuiltinHooks {
             addr: c2i_call_builtin_regs as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64
                 as usize as u64,
+            slice_addr: c2i_call_builtin as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64
+                as usize as u64,
             resolve: |sym, nargs| super::direct_builtin_slot(sym, nargs),
             generation: || DIRECT_CALL_GEN.load(std::sync::atomic::Ordering::Relaxed),
         },

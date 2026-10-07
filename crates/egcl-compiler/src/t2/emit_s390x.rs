@@ -62,7 +62,10 @@
 //! # Runtime calls and GC roots
 //!
 //! `Call`, `SymbolValue`, `SymbolFunction`, `SetSymbolValue`, `ClearMv` and
-//! `TakeValuesToLocals` go through the C-ABI adapters in [`RuntimeCalls`]. The
+//! `TakeValuesToLocals` go through the C-ABI adapters in [`RuntimeCalls`]. A
+//! `Call` whose callee resolves to a leaf builtin at compile time uses the
+//! direct slice adapter from the runtime's direct-builtin hooks instead, with
+//! the table slot and invalidation generation baked in (bliss-flzmi). The
 //! collector moves objects and cannot see a home register or native spill
 //! slot, so `runtime_call` clears every shadow slot to NIL, writes each live
 //! tagged value into the shadow area that follows `activation_slots` (roots
@@ -355,11 +358,27 @@ impl Emitter<'_> {
                         self.load(arg, 2)?;
                         self.asm.store(2, 13, argument_base + index as i32 * 8);
                     }
-                    self.asm.imm64(2, u64::from(symbol));
-                    self.asm.imm64(3, data.args.len() as u64);
-                    self.asm.address(4, 13, argument_base);
-                    self.asm.imm64(5, 0);
-                    self.runtime.call_slice
+                    // A leaf builtin resolved at compile time goes through the
+                    // direct slice adapter with its table slot baked into r2
+                    // and the invalidation generation in r5, as emit.rs does
+                    // with its register adapter (bliss-x5y.27, bliss-flzmi).
+                    match super::emit::direct_builtin_slice_for(symbol, data.args.len()) {
+                        Some((adapter, slot, generation)) => {
+                            self.asm
+                                .imm64(2, (u64::from(slot) << 32) | u64::from(symbol));
+                            self.asm.imm64(3, data.args.len() as u64);
+                            self.asm.address(4, 13, argument_base);
+                            self.asm.imm64(5, generation);
+                            adapter
+                        }
+                        None => {
+                            self.asm.imm64(2, u64::from(symbol));
+                            self.asm.imm64(3, data.args.len() as u64);
+                            self.asm.address(4, 13, argument_base);
+                            self.asm.imm64(5, 0);
+                            self.runtime.call_slice
+                        }
+                    }
                 }
                 Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
                     let AuxData::SymbolRef(symbol) = data.aux else {
