@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `PROBE-FILE` now accepts file streams, including closed streams, allowing
+  Quicklisp to finish writing its local-project index
+  ([#87](https://github.com/atgreen/evergreen/pull/87)).
+
 - Fix `DIRECTORY` traversal of wildcard directory components, allowing
   Quicklisp to discover installed distributions. Single `*` components match
   exactly one level; `**` still searches recursively without duplicate scans
