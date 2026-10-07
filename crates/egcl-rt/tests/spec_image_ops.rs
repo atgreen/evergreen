@@ -269,8 +269,8 @@ fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
     let heapobj_ref = (target_body - header_size) | TAG_HEAP_OBJECT; // points at header
 
     let mut holder = vec![0u8; 16];
-    holder[..8].copy_from_slice(&cons_ref.to_le_bytes());
-    holder[8..].copy_from_slice(&heapobj_ref.to_le_bytes());
+    holder[..8].copy_from_slice(&cons_ref.to_ne_bytes());
+    holder[8..].copy_from_slice(&heapobj_ref.to_ne_bytes());
     record_object(egcl_rt::object::type_id::CONS, holder);
     set_entry_continuation(EgclVal::from_fixnum(1));
 
@@ -289,8 +289,8 @@ fn spec_image_loader_relocates_tagged_lisp_pointers_when_base_changes() {
         .find(|(_, t, _)| *t == egcl_rt::object::type_id::CONS)
         .map(|(_, _, data)| data.clone())
         .expect("restored holder");
-    let restored_cons = u64::from_le_bytes(holder_data[..8].try_into().unwrap());
-    let restored_heapobj = u64::from_le_bytes(holder_data[8..16].try_into().unwrap());
+    let restored_cons = u64::from_ne_bytes(holder_data[..8].try_into().unwrap());
+    let restored_heapobj = u64::from_ne_bytes(holder_data[8..16].try_into().unwrap());
     assert_eq!(
         restored_cons,
         new_body | TAG_CONS,
@@ -320,8 +320,8 @@ fn spec_image_loader_preserves_unboxed_pointer_shaped_data() {
         .expect("target object");
 
     let mut holder = vec![0u8; 16];
-    holder[..8].copy_from_slice(&(target_ptr as u64).to_le_bytes());
-    holder[8..].copy_from_slice(&0xDEADBEEFu64.to_le_bytes());
+    holder[..8].copy_from_slice(&(target_ptr as u64).to_ne_bytes());
+    holder[8..].copy_from_slice(&0xDEADBEEFu64.to_ne_bytes());
     record_object(0x72, holder);
     let entry = EgclVal::from_fixnum(77);
     set_entry_continuation(entry);
@@ -345,7 +345,7 @@ fn spec_image_loader_preserves_unboxed_pointer_shaped_data() {
     let holder_field = restored
         .iter()
         .find(|(_, type_id, _)| *type_id == 0x72)
-        .map(|(_, _, data)| u64::from_le_bytes(data[..8].try_into().unwrap()))
+        .map(|(_, _, data)| u64::from_ne_bytes(data[..8].try_into().unwrap()))
         .expect("restored holder");
     assert_eq!(holder_field, target_ptr as u64, "unboxed words are not pointer slots");
 }
@@ -363,7 +363,7 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
 
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
-        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
         6,
         "mapped heap regions require image format version 6"
     );

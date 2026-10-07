@@ -7787,8 +7787,8 @@ mod restore_target_tests {
             bytes.extend_from_slice(&old_body.to_le_bytes());
             bytes.push(crate::object::type_id::CONS);
             bytes.extend_from_slice(&16u32.to_le_bytes());
-            bytes.extend_from_slice(&EgclVal::from_fixnum(i as i64).0.to_le_bytes());
-            bytes.extend_from_slice(&tail.to_le_bytes());
+            bytes.extend_from_slice(&EgclVal::from_fixnum(i as i64).0.to_ne_bytes());
+            bytes.extend_from_slice(&tail.to_ne_bytes());
             tail = old_body | crate::value::TAG_CONS;
         }
         // A second restore must not retain a cursor into the previous heap.
@@ -7820,7 +7820,7 @@ mod restore_target_tests {
         let mut objects = Vec::new();
         for size in [4000, 5000, 4000, 1000, 6000, 4000, 3032, 128] {
             let mut body = vec![b'x'; size];
-            body[..8].copy_from_slice(&((size - 8) as u64).to_le_bytes());
+            body[..8].copy_from_slice(&((size - 8) as u64).to_ne_bytes());
             let addr = append_serialized_object(
                 state,
                 crate::object::type_id::SIMPLE_BASE_STRING,
