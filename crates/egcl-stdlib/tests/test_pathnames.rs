@@ -491,6 +491,30 @@ fn directory_lists_contents() {
 }
 
 #[test]
+fn ensure_directories_exist_includes_directory_only_leaf() {
+    for (label, parsed) in [("directory_string", false), ("directory_pathname", true)] {
+        let root = temp_path(label);
+        let leaf = format!("{root}/dists/example/");
+        let designator = make_string_val(&leaf);
+        let path = if parsed {
+            parse_namestring(designator, None, None).unwrap().0
+        } else {
+            designator
+        };
+        let (returned, created) = ensure_directories_exist(path).unwrap();
+        assert_eq!(returned, path);
+        assert!(created);
+        assert!(
+            std::path::Path::new(&leaf).is_dir(),
+            "missing directory-only leaf: {leaf}"
+        );
+        assert!(!ensure_directories_exist(path).unwrap().1);
+        std::fs::write(format!("{leaf}distinfo.txt"), "test").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn ensure_directories_exist_creates_dirs() {
     let dir_path = temp_path("ensure_dirs");
     let full_path = format!("{}/a/b/c/file.txt", dir_path);
