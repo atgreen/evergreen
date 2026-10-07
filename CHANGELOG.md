@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
+  filesystem adapters, pinned setup instructions, and verified fresh
+  distribution installation, dependent-system loading, and offline reload
+  ([#92](https://github.com/atgreen/evergreen/pull/92)).
+
 - Initialize `*MACROEXPAND-HOOK*` and honor custom hooks during macroexpansion
   and compilation, including symbol macros. This enables Quicklisp's
   compilation-progress wrapper when loading downloaded systems

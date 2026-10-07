@@ -37,6 +37,16 @@ exercises these forks:
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `69afcb088f6463850c532a2f573d9ec5d875fdb9` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
+| Quicklisp client (native TCP and directory enumeration) | https://github.com/atgreen/quicklisp-client | `2115f1d96963bf48d6a4c5c7111189bd326bfbed` |
+
+The [Quicklisp client scenario](../tests/quicklisp-client/README.md) fetches this
+exact client through ocicl, checks its native connection and filesystem
+interfaces, installs a fresh local distribution with two dependent releases,
+and reloads them in a new process after the HTTP server stops. An optional
+public smoke test downloads Alexandria from the dated official distribution
+and verifies its source comes from the fresh Quicklisp home, not an inherited
+ASDF project. See the [Quicklisp setup instructions](manual/user/how-to/asdf.md#quicklisp).
+This needs the runtime fixes through PR #90; v0.0.3 alone is insufficient.
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
 incremental loopback I/O through cold and cached loads, cross-thread server
@@ -82,7 +92,7 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-USOCKET (`egcl-support`), Atomics, closer-mop, SLIME and SLY (`egcl`), where their ports
+USOCKET (`egcl-support`), Atomics, closer-mop, SLIME, SLY and the Quicklisp client (`egcl`), where their ports
 live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
