@@ -66,6 +66,14 @@ impl Asm {
         self.rre(0xb980, dst, src);
     }
 
+    pub fn or(&mut self, dst: u8, src: u8) {
+        self.rre(0xb981, dst, src);
+    }
+
+    pub fn xor(&mut self, dst: u8, src: u8) {
+        self.rre(0xb982, dst, src);
+    }
+
     /// Multiply the unsigned low half (even + 1) by src into an even/odd pair.
     pub fn multiply_unsigned_wide(&mut self, even: u8, src: u8) {
         assert!(even < 15 && even % 2 == 0);
@@ -96,6 +104,14 @@ impl Asm {
         assert!(dst < 16 && src < 16 && bits < 64);
         self.code
             .extend_from_slice(&[0xeb, dst << 4 | src, 0, bits, 0, 0x0a]);
+    }
+
+    /// SLLG: a 64-bit logical left shift by a constant, like
+    /// [`Self::shift_right_signed`] with the SRAG opcode byte swapped for SLLG's.
+    pub fn shift_left(&mut self, dst: u8, src: u8, bits: u8) {
+        assert!(dst < 16 && src < 16 && bits < 64);
+        self.code
+            .extend_from_slice(&[0xeb, dst << 4 | src, 0, bits, 0, 0x0d]);
     }
 
     pub fn address(&mut self, dst: u8, base: u8, disp: i32) {
@@ -265,6 +281,24 @@ mod tests {
                 0xb9, 0x20, 0, 0x23, 0xb9, 0x08, 0, 0x23, 0xb9, 0x09, 0, 0x23, 0xb9, 0x80, 0, 0x40,
                 0xeb, 0x33, 0, 3, 0, 0x0a, 0xe3, 0x90, 0x8f, 0xf8, 0x7f, 0x71, 0xe3, 0x20, 0x10, 0,
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
+            ]
+        );
+    }
+
+    #[test]
+    fn logical_and_left_shift_encodings_match_llvm_systemz() {
+        // llvm-mc -triple=s390x-linux-gnu --show-encoding:
+        //   ogr %r2,%r3        b9 81 00 23
+        //   xgr %r2,%r3        b9 82 00 23
+        //   sllg %r3,%r2,5     eb 32 00 05 00 0d
+        let mut a = Asm::new();
+        a.or(2, 3);
+        a.xor(2, 3);
+        a.shift_left(3, 2, 5);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xb9, 0x81, 0, 0x23, 0xb9, 0x82, 0, 0x23, 0xeb, 0x32, 0, 5, 0, 0x0d
             ]
         );
     }

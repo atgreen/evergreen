@@ -87,13 +87,19 @@
 //!
 //! Constants (`Const*` are folded; heap literals are loaded through their
 //! rooted constant-pool slot, never baked in), `Return`, `Jump`, two-way
-//! `Brif`, `Guard` for the FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on
-//! tagged single-floats, and `FixnumAdd/Sub/Mul/Neg` plus the five fixnum
+//! `Brif`, `Guard` for the FIXNUM, SINGLE_FLOAT and CONS tags, `FloatAdd/Sub/Mul`
+//! on tagged single-floats, and `FixnumAdd/Sub/Mul/Neg` plus the five fixnum
 //! comparisons, all tag-guarded and deopting on overflow. Multiply uses the
 //! unsigned 128-bit `MLGR` product with a sign correction and requires the
-//! high half to equal the low half's sign extension. Everything else, including
-//! `Car`/`Cdr`, logical ops, shifts and any unboxed representation, returns
-//! `UnsupportedOp(0x390)` and the function stays at its current tier.
+//! high half to equal the low half's sign extension. Unguarded, effect-free
+//! `Car`/`Cdr` load through the masked headerless cons pointer; `LogAnd`,
+//! `LogOr`, `LogXor` operate directly on tagged bits; `LogNot` re-clears the
+//! tag; and `FixnumShl`/`FixnumShr` by a constant amount shift the tagged
+//! value, where a negative `Shl` constant is a right shift and a left shift
+//! deopts if the value does not survive the round trip (bliss-2yews). Everything
+//! else, including `StringByteLength`, variable shift amounts and any unboxed
+//! representation, returns `UnsupportedOp(0x390)` and the function stays at its
+//! current tier.
 //!
 //! # Deopt exits
 //!
@@ -112,9 +118,9 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
-use std::collections::{HashMap, HashSet};
 use egcl_rt::asm_s390x::{Asm, Label};
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
+use std::collections::{HashMap, HashSet};
 
 /// C-ABI runtime adapters used by optimized code. `transfer_pending` is a
 /// nonallocating leaf; the primary result is temporarily unrooted during it.
@@ -405,6 +411,15 @@ impl Emitter<'_> {
         self.asm.branch(6, deopt);
     }
 
+    fn guard_cons(&mut self, register: u8, deopt: Label) {
+        self.asm.mov(4, register);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, egcl_rt::value::TAG_CONS);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, deopt);
+    }
+
     fn float_operand(&mut self, value: Value, register: u8, deopt: Label) -> Result<(), EmitError> {
         if let Some(&bits) = self.constants.get(&value) {
             let constant = EgclVal(bits);
@@ -517,13 +532,19 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, 2)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
             {
+                // CONS matters as much as the numeric tags: build.rs emits a
+                // separate Guard(TypeTag(CONS)) ahead of every Car/Cdr, so
+                // refusing it cost the whole function its T2 code for any use of
+                // CAR or CDR -- which is most Lisp code (bliss-2yews).
                 let deopt = self.deopt_label(data)?;
-                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM) {
-                    self.guard_fixnum(2, deopt);
-                } else {
-                    self.guard_single_float(2, deopt);
+                match &data.aux {
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM => {
+                        self.guard_fixnum(2, deopt)
+                    }
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(2, deopt),
+                    _ => self.guard_single_float(2, deopt),
                 }
             }
             FloatAdd | FloatSub | FloatMul => {
@@ -584,6 +605,99 @@ impl Emitter<'_> {
                     }
                 }
                 self.asm.branch(1, deopt); // signed arithmetic overflow (CC3)
+            }
+            Car | Cdr => {
+                // A cons cell is HEADERLESS and its tagged pointer differs from
+                // the cell address only in the low three bits, so masking them
+                // off gives the base and the two slots sit at +0 and +8. Mirrors
+                // emit.rs and emit_a64.rs, including the refusal of the guarded
+                // form: this is the fast path for a cons whose type the IR has
+                // already proven, and a Car still carrying a guard, an effect or
+                // a FrameState needs the general path instead.
+                if data.flags.guard || data.flags.effectful || data.frame_state.is_some() {
+                    return Err(unsupported());
+                }
+                self.asm.imm64(3, !7u64);
+                self.asm.and(2, 3);
+                let offset = if data.opcode == Car { 0 } else { 8 };
+                self.asm.load(2, 2, offset);
+            }
+            LogAnd | LogOr | LogXor => {
+                // Exact on the tagged representation, exactly as the x86 and
+                // AArch64 emitters do it: both operands carry the same zero tag,
+                // so tagged(a) OP tagged(b) = (a OP b)<<3 = tagged(a OP b). No
+                // untag, no retag, no overflow.
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(2, deopt);
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, 3)?;
+                self.guard_fixnum(3, deopt);
+                match data.opcode {
+                    LogAnd => self.asm.and(2, 3),
+                    LogOr => self.asm.or(2, 3),
+                    _ => self.asm.xor(2, 3),
+                }
+            }
+            LogNot => {
+                // NOT leaves the tag bits set, so they must be cleared again:
+                // ~(x<<3) has its low three bits all 1, and masking them off
+                // yields ~(x<<3) - 7 = (~x)<<3, which is tagged(~x). System Z
+                // has no register NOT, so XOR with all ones.
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(2, deopt);
+                self.asm.imm64(3, u64::MAX);
+                self.asm.xor(2, 3);
+                self.asm.imm64(3, !7u64);
+                self.asm.and(2, 3);
+            }
+            FixnumShl | FixnumShr => {
+                // (ash x n) for a CONSTANT n; a variable amount declines. The
+                // constants map holds TAGGED bits, so the shift count is
+                // recovered by untagging it.
+                let deopt = self.deopt_label(data)?;
+                let amount = *data.args.get(1).ok_or_else(unsupported)?;
+                let tagged = *self.constants.get(&amount).ok_or_else(unsupported)?;
+                let n = (tagged as i64) >> 3;
+                self.guard_fixnum(2, deopt);
+                // DIRECTION, mirroring emit.rs and easy to get backwards: on
+                // FixnumShl a NEGATIVE constant is a RIGHT shift, because that is
+                // how `(ash x -2)` lowers -- ASH becomes FixnumShl whatever the
+                // sign, and the emitter reads the constant to choose. FixnumShr is
+                // always a right shift. Inverting this is not a crash, it is a
+                // wrong number: on AArch64 it made `(ash -17 -2)` answer -68
+                // instead of -5, and only differential testing against x86-64
+                // showed it (bliss-ys4ha).
+                let shift_right = if data.opcode == FixnumShr {
+                    Some(n.max(0))
+                } else if n < 0 {
+                    Some(-n)
+                } else {
+                    None
+                };
+                if let Some(right) = shift_right {
+                    // Right shift: untag, shift arithmetically, retag. Cannot
+                    // overflow. Saturated at 60 because shifting a 61-bit payload
+                    // further only ever yields 0 or -1, which the shift already
+                    // gives, and SRAG takes a 6-bit amount.
+                    let k = right.min(60) as u8;
+                    self.asm.shift_right_signed(2, 2, 3 + k);
+                    self.asm.shift_left(2, 2, 3);
+                } else {
+                    // Left shift by n: tagged(x)<<n = tagged(x<<n), but it can
+                    // leave fixnum range, and unlike add/sub no condition code
+                    // reports that. Shift back and compare: if the value does not
+                    // survive the round trip it overflowed, so deopt and let the
+                    // generic path produce a bignum. r2 is untouched until the
+                    // check passes, so the deopt exit sees the operand.
+                    if n > 60 {
+                        return Err(unsupported());
+                    }
+                    let k = n as u8;
+                    self.asm.shift_left(3, 2, k);
+                    self.asm.shift_right_signed(4, 3, k);
+                    self.asm.compare(4, 2);
+                    self.asm.branch(6, deopt);
+                    self.asm.mov(2, 3);
+                }
             }
             _ => return Err(unsupported()),
         }
