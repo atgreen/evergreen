@@ -44,6 +44,11 @@
 
 ### Correctness and reliability
 
+- `OPEN :DIRECTION :PROBE` now returns a closed stream and honors
+  `:IF-DOES-NOT-EXIST :CREATE`, allowing Quicklisp to enable installed
+  distributions. Input streams also honor explicit file creation without
+  truncating existing content ([#83](https://github.com/atgreen/evergreen/pull/83)).
+
 - Unbound slot reads now call user-defined `SLOT-UNBOUND` methods through both
   `SLOT-VALUE` and generated accessors, enabling lazy slot initialization such
   as Quicklisp's distribution directories. The default method signals
