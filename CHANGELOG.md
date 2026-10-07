@@ -16,9 +16,14 @@
   allowing Ironclad's Keccak implementation to tier instead of remaining
   interpreted, including after compiled-file loading
   ([#56](https://github.com/atgreen/evergreen/pull/56)).
+
 - Functions using `CAR`, `CDR`, bitwise operations, shifts, or power-of-two
   `MOD` now reach T2 native code on s390x instead of stopping at T1
   ([#62](https://github.com/atgreen/evergreen/pull/62)).
+
+- `EQ`, `NULL`, and `NOT` now reach T2 native code on s390x
+  ([#65](https://github.com/atgreen/evergreen/pull/65)).
+
 - `SEARCH` now advances list candidates without restarting each traversal and
   searches vectors without copying the entire target, avoiding long stalls
   while libraries scan large text such as TLS certificate bundles
@@ -29,6 +34,10 @@
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
 
 ### Platform support
+
+- Recoverable null-pointer and stack-guard faults on s390x now resume at the
+  runtime recovery handler instead of terminating the process
+  ([#64](https://github.com/atgreen/evergreen/pull/64)).
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
   ([#51](https://github.com/atgreen/evergreen/pull/51)).
@@ -41,33 +50,42 @@
 - `TYPE-OF` now preserves the defining package of structure, class, and
   condition names, fixing cross-package digest copying used by TLS key
   derivation ([#57](https://github.com/atgreen/evergreen/pull/57)).
+
 - Extension macros, including `EGCL-EXT:CAS` and atomic arithmetic, now expand
   consistently in interpreted and compiled code. Local function shadowing and
   definition-time macro snapshots are preserved
   ([#58](https://github.com/atgreen/evergreen/pull/58)).
+
 - The EGCL fork installer now includes the Atomics CAS adapter, supporting
   CAS-dependent initialization in libraries such as `cl-cancel`
   ([#59](https://github.com/atgreen/evergreen/pull/59)).
+
 - Native TCP listeners can now be shared across threads and fibers, honor
   backlog and address-reuse options, and use GC-safe cooperative accept and
   readiness waits on Unix; closing a listener wakes pending waits
   ([#60](https://github.com/atgreen/evergreen/pull/60)).
+
 - Native threads now share their creator's package registry, preserving library
   symbol lookup in workers and threads created by fibers. This fixes Ironclad
   reporting SHA256 as unsupported in TLS server threads
   ([#68](https://github.com/atgreen/evergreen/pull/68)).
+
 - `ENCODE-UNIVERSAL-TIME` now rejects invalid fields and preserves exact
   fractional time-zone offsets and large years
   ([#69](https://github.com/atgreen/evergreen/pull/69)).
+
 - Compiled `HANDLER-BIND` now preserves lexical handler functions and initializer
   behavior, including native execution and garbage collection
   ([#70](https://github.com/atgreen/evergreen/pull/70)).
+
 - `CHANGE-CLASS` now honors initialization arguments and class-change hooks,
   preserving retained slot values and initializing newly added slots
   ([#71](https://github.com/atgreen/evergreen/pull/71)).
+
 - Native socket byte-read timeouts now signal `EGCL-EXT:IO-TIMEOUT`, retaining
   the affected stream so callers can distinguish expiry from other I/O errors
   ([#72](https://github.com/atgreen/evergreen/pull/72)).
+
 - The USOCKET fork now supports binary TCP listeners, cross-thread accept and
   close, listener port queries, explicit address-reuse options, and inherited
   or independently configured read timeouts with `USOCKET:TIMEOUT-ERROR` mapping
