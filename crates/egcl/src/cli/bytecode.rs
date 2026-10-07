@@ -1599,12 +1599,43 @@ fn format_native_bytes(bytes: &[u8]) -> String {
     out
 }
 
+/// The native section decoded in Lisp by lib/disasm-s390x.lisp, evaluated on
+/// first use so startup pays nothing for it (bliss-ehjj1). The code bytes cross
+/// as a list of fixnums -- immediates, so the Vec needs no rooting -- and only
+/// that list is held across the call. None, so the caller prints raw bytes,
+/// when the decoder cannot be loaded (e.g. under --no-bootstrap) or declines.
+#[cfg(all(target_arch = "s390x", not(egcl_no_disassembly)))]
+fn lisp_native_listing(bytes: &[u8], env: &mut super::Env) -> Option<String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOADED: AtomicBool = AtomicBool::new(false);
+    if !LOADED.load(Ordering::Acquire) {
+        super::load_embedded_lisp(include_str!("../../../../lib/disasm-s390x.lisp"), env).ok()?;
+        LOADED.store(true, Ordering::Release);
+    }
+    let octets: Vec<EgclVal> = bytes
+        .iter()
+        .map(|&b| EgclVal::from_fixnum(i64::from(b)))
+        .collect();
+    egcl_rt::rooted!(list = super::vec_to_list(&octets));
+    // Resolve the formatter AFTER building the list: that allocation can move
+    // the function object, and apply_function roots its callee only from entry.
+    let formatter = super::resolve_sym("EGCL-DISASM::FORMAT-NATIVE-LISTING")
+        .and_then(|s| egcl_rt::symbols::symbol_function(s.as_symbol_index()))?;
+    let text = super::apply_function(formatter, &[*list], env).ok()?;
+    Some(super::val_as_str(text))
+}
+
+#[cfg(not(all(target_arch = "s390x", not(egcl_no_disassembly))))]
+fn lisp_native_listing(_: &[u8], _: &mut super::Env) -> Option<String> {
+    None
+}
+
 /// The native T1/T2 listing for a specific installed `NativeCode`, with its
 /// compilation strategy and OSR entries. Offsets are relative to the code
 /// entry. Reads the R+X mapping, so the owner must remain alive (tier snapshots
 /// are captured at compile time — see [`capture_tier_disasm`]).
 #[cfg(not(egcl_no_disassembly))]
-fn format_native_listing(nc: &NativeCode) -> String {
+fn format_native_listing(nc: &NativeCode, env: Option<&mut super::Env>) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     if nc.is_t2 {
@@ -1629,7 +1660,10 @@ fn format_native_listing(nc: &NativeCode) -> String {
     let len = nc.code_len as u64;
     let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
     if !cfg!(target_arch = "x86_64") {
-        out.push_str(&format_native_bytes(bytes));
+        match env.and_then(|env| lisp_native_listing(bytes, env)) {
+            Some(text) => out.push_str(&text),
+            None => out.push_str(&format_native_bytes(bytes)),
+        }
         return out;
     }
 
@@ -1720,7 +1754,7 @@ fn capture_tier_disasm(sym: u32, nc: &NativeCode) {
     if !super::events::enabled() {
         return;
     }
-    let text = format_native_listing(nc);
+    let text = format_native_listing(nc, None);
     TIER_DISASM.with(|m| {
         let mut b = m.borrow_mut();
         let e = b.entry(sym).or_default();
@@ -1824,23 +1858,23 @@ pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
 /// DISASSEMBLE is a debug path. Allocation-free: no EGCL object is created, so
 /// there is nothing for a GC to relocate mid-scan.
 #[cfg(not(egcl_no_disassembly))]
-pub fn disassemble_by_function(f: EgclVal) -> Option<String> {
+pub fn disassemble_by_function(f: EgclVal, env: Option<&mut super::Env>) -> Option<String> {
     install_bytecode_root_scanner();
     // Collect the keys before probing so the registry borrow is not held across
     // the lookups below.
     let syms: Vec<u32> = REGISTRY.with(|r| r.borrow().keys().copied().collect());
     syms.into_iter()
         .find(|&sym| egcl_rt::symbols::symbol_function(sym) == Some(f))
-        .and_then(disassemble_by_symbol)
+        .and_then(|sym| disassemble_by_symbol(sym, env))
 }
 
 #[cfg(not(egcl_no_disassembly))]
-pub fn disassemble_by_symbol(sym: u32) -> Option<String> {
+pub fn disassemble_by_symbol(sym: u32, env: Option<&mut super::Env>) -> Option<String> {
     let bf = registry_get(sym)?;
     let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
     let mut out = disasm_header(sym, &bf);
     match native {
-        Some(nc) => out.push_str(&format_native_listing(&nc)),
+        Some(nc) => out.push_str(&format_native_listing(&nc, env)),
         None => {
             // Re-emit without the duplicate header (format_bytecode_listing adds
             // its own), keeping DISASSEMBLE's single-listing shape.
@@ -24170,7 +24204,7 @@ mod jtc4_stack_map_tests {
 }
 
 #[cfg(egcl_no_disassembly)]
-fn format_native_listing(_: &NativeCode) -> String {
+fn format_native_listing(_: &NativeCode, _: Option<&mut super::Env>) -> String {
     "; Native disassembly was omitted at delivery.\n".into()
 }
 
