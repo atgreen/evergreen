@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.3 - 2026-10-07
+
 ### Common Lisp support
 
 - `EGCL-GRAY-STREAMS` now exports `STREAM-READ-SEQUENCE` and
