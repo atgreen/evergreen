@@ -15665,7 +15665,13 @@ fn module_designator_name(module: EgclVal) -> String {
 }
 
 fn load_posix_module(env: &mut Env) -> Result<(), EgclError> {
-    // Loading the embedded module has the same package boundary as LOAD.
+    load_embedded_lisp(include_str!("../../../lib/posix.lisp"), env)
+}
+
+/// Evaluate an embedded Lisp source (a lib/*.lisp compiled into the binary)
+/// with the same package boundary as LOAD: the module's IN-PACKAGE must not
+/// leak into the caller. Shared by the POSIX module and the s390x disassembler.
+fn load_embedded_lisp(source: &str, env: &mut Env) -> Result<(), EgclError> {
     // Keep both the reader context and the dynamic value cell intact.
     let saved_package = env.current_package.clone();
     egcl_rt::rooted!(saved_package_value = env.lookup_var("*PACKAGE*").unwrap_or(NIL));
@@ -15674,7 +15680,7 @@ fn load_posix_module(env: &mut Env) -> Result<(), EgclError> {
     let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
         .unwrap_or(egcl_rt::value::UNBOUND);
     egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
-    let mut result = read_eval_all_env(include_str!("../../../lib/posix.lisp"), env);
+    let mut result = read_eval_all_env(source, env);
     egcl_rt::rooted_ref!(_result_root = &mut result);
     env.current_package = saved_package;
     env.define_local("*PACKAGE*", *saved_package_value);
@@ -24823,12 +24829,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // as_symbol_index() aborts on them (recurring NIL/T guard bug). Exclude
         // them: neither names a disassemblable function.
         let listing = if arg.is_symbol() && arg != NIL && arg != T {
-            bytecode::disassemble_by_symbol(arg.as_symbol_index())
+            bytecode::disassemble_by_symbol(arg.as_symbol_index(), Some(env))
         } else if arg != NIL && arg != T {
             // CLHS takes an extended function designator, so a FUNCTION OBJECT
             // is as valid as a symbol: `(disassemble #'f)` must work, and used
             // to report `#'f` as "not a compiled EGCL function" (bliss-3jkz).
-            bytecode::disassemble_by_function(arg)
+            bytecode::disassemble_by_function(arg, Some(env))
         } else {
             None
         };
@@ -36784,7 +36790,7 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         "DISASSEMBLE" => {
             let listing = args.first().and_then(|a| {
                 if a.is_symbol() {
-                    bytecode::disassemble_by_symbol(a.as_symbol_index())
+                    bytecode::disassemble_by_symbol(a.as_symbol_index(), Some(_env))
                 } else {
                     None
                 }
