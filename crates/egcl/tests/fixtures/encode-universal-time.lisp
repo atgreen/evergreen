@@ -1,0 +1,51 @@
+;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+(defun checked-encode (fields)
+  (apply #'encode-universal-time fields))
+
+(defun rejects-time-field (fields index datum)
+  (let ((bad (copy-list fields)))
+    (setf (nth index bad) datum)
+    (handler-case
+        (progn (checked-encode bad) nil)
+      (type-error (condition)
+        (and (eql (type-error-datum condition) datum)
+             (not (typep datum (type-error-expected-type condition))))))))
+
+(dotimes (iteration 30)
+  (let ((fields '(0 0 4 13 5 2026 0)))
+    (assert (= (checked-encode fields) 3987633600))
+    (loop for index from 0 below 5
+          for bounds in '((0 59) (0 59) (0 23) (1 31) (1 12))
+          do (dolist (bad (list (1- (first bounds)) (1+ (second bounds))
+                               1/2 1.0 1.0d0 #c(1 1) nil :bad (expt 2 100)))
+               (assert (rejects-time-field fields index bad))))
+    (dolist (bad '(-1 -100 2026.0 2026.0d0 4053/2 nil :bad))
+      (assert (rejects-time-field fields 5 bad)))
+    (dolist (bad '(-25 25 1.0 1.0d0 :bad))
+      (assert (rejects-time-field fields 6 bad))))
+  (assert (= 0 (encode-universal-time 0 0 0 1 1 1900 0)))
+  (assert (= 3918168000 (encode-universal-time 0 0 4 29 2 2024 0)))
+  (assert (= 3987642600 (encode-universal-time 0 0 4 13 5 2026 5/2)))
+  (assert (= 3987613800 (encode-universal-time 0 0 4 13 5 2026 -11/2)))
+  (assert (= 3987633601 (encode-universal-time 0 0 4 13 5 2026 1/3600)))
+  (assert (= 3987633599 (encode-universal-time 0 0 4 13 5 2026 -1/3600)))
+  (assert (= 3155695199999999940041769600
+             (encode-universal-time 0 0 0 1 1 100000000000000000000 0)))
+  (let* ((current (nth-value 5 (decode-universal-time (get-universal-time) 0)))
+         (base (- current 50)))
+    (dolist (short '(0 26 49 50 99))
+      (assert (= (encode-universal-time 0 0 0 1 1 short 0)
+                 (encode-universal-time 0 0 0 1 1
+                                        (+ base (mod (- short base) 100)) 0)))))
+  (dolist (bad '((0 0 4 13 5)
+                 (0 0 4 13 5 2026 0 :extra)))
+    (assert (handler-case (progn (checked-encode bad) nil)
+              (program-error () t))))
+  (dolist (bad '((0 0 4 13 5 2026 1/7)
+                 (0 0 0 1 1 1900 -1)
+                 (0 0 0 1 1 1899 0)))
+    (assert (handler-case (progn (checked-encode bad) nil)
+              (error () t)))))
+(format t "ENCODE-TIME-PASS~%")

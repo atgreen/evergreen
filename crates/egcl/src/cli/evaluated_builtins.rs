@@ -2493,41 +2493,7 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "ENCODE-UNIVERSAL-TIME" => Some(|_operator, args, _env| {
-            let args = RootedVals::new(args.to_vec());
-
-            // (encode-universal-time second minute hour date month year
-            //  &optional time-zone)
-
-            if args.len() < 6 {
-                return Err(EgclError::ProgramError(
-                    "ENCODE-UNIVERSAL-TIME requires at least 6 arguments".into(),
-                ));
-            }
-            let n = |v: EgclVal| -> Result<i64, EgclError> { Ok(num_val(v)? as i64) };
-            let (second, minute, hour) = (n(args[0])?, n(args[1])?, n(args[2])?);
-            let (date, month, mut year) = (n(args[3])?, n(args[4])?, n(args[5])?);
-            // CLHS 25.1.4: a two-digit year is relative to a 50-year window
-            // around the current year.
-            if (0..=99).contains(&year) {
-                let current = egcl_stdlib::time::decode_universal_time(
-                    egcl_stdlib::time::get_universal_time(),
-                    Some(0),
-                )
-                .5;
-                let base = current - 50;
-                year = base + (year - base).rem_euclid(100);
-            }
-            // Time zone is hours west of GMT; NIL / omitted means local,
-            // which we model as GMT (see time.rs).
-            let time_zone = match args.get(6) {
-                Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
-                _ => None,
-            };
-            Ok(EgclVal::from_fixnum(
-                egcl_stdlib::time::encode_universal_time(
-                    second, minute, hour, date, month, year, time_zone,
-                ),
-            ))
+            egcl_stdlib::time::encode_universal_time_checked(args)
         }),
 
         "DECODE-UNIVERSAL-TIME" => Some(|_operator, args, env| {
