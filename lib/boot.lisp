@@ -2725,15 +2725,10 @@
       (incf k)))
   seq1)
 
-;; Walk LIST from START with CDR. This used to call (nth i list) for EVERY
-;; pattern element, re-traversing the list from its head each time, which made
-;; one SEARCH O(plen * n^2) in cdr steps instead of O(plen * n) — and SEARCH
-;; coerces both arguments to lists, so every SEARCH on a string paid it
-;; (bliss-3o0r: the ansi sequences chapter's SEARCH-STRING tests).
-;; TAIL is the caller's list advanced to START; a pattern longer than the
-;; remaining tail simply fails to match, as before.
-(defun %match-at (pat list start key testfn neg)
-  (let ((ok t) (tail (nthcdr start list)))
+;; SEARCH advances the candidate tail once per position; matching must not
+;; restart traversal from the sequence's head.
+(defun %match-at (pat tail key testfn neg)
+  (let ((ok t))
     (block nil
       (dolist (p pat ok)
         (when (null tail) (setq ok nil) (return))
@@ -2741,21 +2736,41 @@
           (setq ok nil) (return))
         (setq tail (cdr tail))))))
 
+(defun %match-vector-at (pat sequence start key testfn neg)
+  (let ((position start))
+    (dolist (p pat t)
+      (unless (%seq-match (if key (funcall key p) p)
+                          (aref sequence position) key testfn neg)
+        (return nil))
+      (incf position))))
+
 (defun search (seq1 seq2 &key key (test (function eql)) test-not
                               (start1 0) end1 (start2 0) end2 from-end)
-  (let* ((l1 (coerce seq1 'list)) (l2 (coerce seq2 'list))
-         (e1 (or end1 (length l1))) (e2 (or end2 (length l2)))
+  (unless (or (listp seq2) (vectorp seq2))
+    (error 'type-error :datum seq2 :expected-type 'sequence))
+  (let* ((l1 (coerce seq1 'list))
+         (e1 (or end1 (length l1))) (e2 (or end2 (length seq2)))
          (pat (subseq l1 start1 e1)) (plen (length pat))
          (testfn (or test-not test)) (neg (if test-not t nil))
-         (matches nil))
+         (match nil))
     (if (= plen 0)
         (if from-end e2 start2)
-        (progn
-          (loop for i from start2 to (- e2 plen) do
-            (when (%match-at pat l2 i key testfn neg) (push i matches)))
-          (cond ((null matches) nil)
-                (from-end (car matches))          ; largest index (pushed last)
-                (t (car (last matches))))))))      ; smallest index
+        (if (listp seq2)
+            (let ((tail (nthcdr start2 seq2)))
+              (loop for i from start2 to (- e2 plen) do
+                (when (%match-at pat tail key testfn neg)
+                  (if from-end
+                      (setq match i)
+                      (return-from search i)))
+                (setq tail (cdr tail)))
+              match)
+            (progn
+              (loop for i from start2 to (- e2 plen) do
+                (when (%match-vector-at pat seq2 i key testfn neg)
+                  (if from-end
+                      (setq match i)
+                      (return-from search i))))
+              match)))))
 
 (defun mismatch (seq1 seq2 &key key (test (function eql)) test-not
                                 (start1 0) end1 (start2 0) end2 from-end)

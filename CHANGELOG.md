@@ -19,6 +19,10 @@
 - Functions using `CAR`, `CDR`, bitwise operations, shifts, or power-of-two
   `MOD` now reach T2 native code on s390x instead of stopping at T1
   ([#62](https://github.com/atgreen/evergreen/pull/62)).
+- `SEARCH` now advances list candidates without restarting each traversal and
+  searches vectors without copying the entire target, avoiding long stalls
+  while libraries scan large text such as TLS certificate bundles
+  ([#67](https://github.com/atgreen/evergreen/pull/67)).
 
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
   fence instructions, including after compiled-file loading

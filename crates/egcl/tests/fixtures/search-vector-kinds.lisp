@@ -1,0 +1,23 @@
+;;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+(assert (= 0 (search "αβ" "αβλβαβ")))
+(assert (= 4 (search "αβ" "αβλβαβ" :from-end t)))
+(assert (= 4 (search "αβ" "αβλβαβ" :start2 2)))
+(assert (= 2 (search #*10 #*0010010)))
+(assert (= 5 (search '(1 0) #*0010010 :from-end t)))
+(let* ((storage (vector 9 0 1 2 1 2 9))
+       (view (make-array 5 :displaced-to storage :displaced-index-offset 1)))
+  (assert (= 1 (search '(1 2) view)))
+  (assert (= 3 (search #(1 2) view :from-end t)))
+  (assert (null (search '(1 2) view :start2 2 :end2 4))))
+(let ((octets (make-array 5 :element-type '(unsigned-byte 8)
+                           :initial-contents '(1 2 3 1 2)))
+      (active (make-array 5 :fill-pointer 3 :initial-contents '(1 2 3 1 2))))
+  (assert (= 3 (search #(1 2) octets :from-end t)))
+  (assert (= 0 (search '(1 2) active :from-end t)))
+  (assert (= 3 (search nil active :from-end t))))
+(assert (= 1 (search '((2) (3)) #((1) (2) (3) (2) (3)) :key #'car)))
+(assert (= 3 (search '((2) (3)) #((1) (2) (3) (2) (3)) :key #'car :from-end t)))
+(assert (= 0 (search '(1 2) #(9 1 2) :test-not #'eql)))
+(format t "VECTOR-SEARCH-KINDS-PASS~%") (finish-output)
