@@ -59,6 +59,9 @@
 - `ENCODE-UNIVERSAL-TIME` now rejects invalid fields and preserves exact
   fractional time-zone offsets and large years
   ([#69](https://github.com/atgreen/evergreen/pull/69)).
+- Compiled `HANDLER-BIND` now preserves lexical handler functions and initializer
+  behavior, including native execution and garbage collection
+  ([#70](https://github.com/atgreen/evergreen/pull/70)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions

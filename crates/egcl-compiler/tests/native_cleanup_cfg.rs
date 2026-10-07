@@ -62,8 +62,93 @@ fn cleanup_body() -> BytecodeFunction {
 }
 
 #[test]
+fn handler_initializers_use_transfer_invokes_with_live_stack_maps() {
+    use egcl_rt::bytecode::HandlerBindInfo;
+    let mut body = cleanup_body();
+    let symbol = egcl_rt::symbols::intern("HANDLER-INITIALIZER");
+    body.code = vec![
+        Instr::LoadFunction(symbol),
+        Instr::EvalHost(0),
+        Instr::PushHandlerBind { hb: 0 },
+        Instr::Const(0),
+        Instr::PopHandlerBind,
+        Instr::Return,
+    ];
+    body.max_stack = 2;
+    body.handler_binds = vec![HandlerBindInfo {
+        types: vec!["ERROR".into(), "WARNING".into()],
+    }];
+    assert!(build::build_from_bytecode(&body).is_err());
+    assert!(build::build_from_bytecode_for_transfers(&body).is_err());
+    let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&ir).unwrap();
+    let calls: Vec<_> = ir
+        .block_order()
+        .iter()
+        .flat_map(|&block| &ir.block(block).insts)
+        .copied()
+        .filter(|&inst| ir.inst(inst).opcode == Opcode::Invoke)
+        .collect();
+    let lookup = calls
+        .iter()
+        .copied()
+        .find(|&inst| matches!(ir.inst(inst).aux, AuxData::FunctionLookup(s) if s == symbol))
+        .unwrap();
+    let eval = calls
+        .iter()
+        .copied()
+        .find(|&inst| matches!(ir.inst(inst).aux, AuxData::HostEval(0)))
+        .unwrap();
+    let enter = calls
+        .iter()
+        .copied()
+        .find(|&inst| {
+            matches!(
+                ir.inst(inst).aux,
+                AuxData::HandlerBindScope { enter: true, .. }
+            )
+        })
+        .unwrap();
+    assert!(ir.inst(lookup).args.is_empty());
+    assert!(ir.inst(eval).args.is_empty());
+    assert_eq!(ir.inst(enter).args.len(), 2);
+    let frame = ir.frame_states.get(ir.inst(eval).frame_state.unwrap());
+    assert_eq!(
+        frame.scopes.last().unwrap().stack.len(),
+        1,
+        "the first handler must remain live during the second initializer"
+    );
+
+    let mut malformed = ir.clone();
+    malformed.inst_mut(eval).args = ir.inst(enter).args.clone();
+    assert!(verify::verify(&malformed).is_err());
+
+    body.code[1] = Instr::EvalHost(1);
+    assert!(build::build_from_bytecode_for_native_cleanups(&body).is_err());
+    body.code.remove(1);
+    assert!(
+        build::build_from_bytecode_for_native_cleanups(&body).is_err(),
+        "registration must reject a missing handler operand"
+    );
+}
+
+#[test]
 fn throwing_predecessor_preserves_the_local_before_a_later_assignment() {
-    let body = cleanup_body();
+    for initializer in [
+        Instr::CallNamed {
+            sym: egcl_rt::symbols::intern("MAY-THROW"),
+            nargs: 0,
+        },
+        Instr::EvalHost(0),
+        Instr::LoadFunction(egcl_rt::symbols::intern("HANDLER-LOOKUP")),
+    ] {
+        check_throwing_predecessor(initializer);
+    }
+}
+
+fn check_throwing_predecessor(initializer: Instr) {
+    let mut body = cleanup_body();
+    body.code[1] = initializer;
     let f = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
     verify::verify(&f).unwrap();
     let landing = f
@@ -212,7 +297,6 @@ fn emitted_cleanup_edges_have_exact_sites_and_checked_native_destinations() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod execution {
     use super::*;
-    use std::cell::Cell;
     use egcl_compiler::t2::emit::{
         TransferCallRequest, TransferCleanupRequest, emit_framed_native_cleanups,
     };
@@ -224,7 +308,8 @@ mod execution {
     use egcl_rt::jit::JitBuffer;
     use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
     use egcl_rt::value::NIL;
-    use egcl_rt::{Collector, HeapCollector, EgclStack};
+    use egcl_rt::{Collector, EgclStack, HeapCollector};
+    use std::cell::Cell;
 
     #[repr(C)]
     struct Dispatch {

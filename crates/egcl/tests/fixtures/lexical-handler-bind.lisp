@@ -1,0 +1,96 @@
+;; SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
+;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
+
+(defun record-condition (condition)
+  (declare (ignore condition))
+  (error "Called the global function instead of the lexical handler"))
+
+(defun labels-handler (count)
+  (let ((seen 0))
+    (labels ((add-one () (incf seen))
+             (record-condition (condition)
+               (declare (ignore condition))
+               (add-one)))
+      (dotimes (i count)
+        (handler-bind ((simple-condition #'record-condition))
+          (signal 'simple-condition))))
+    seen))
+
+(defun flet-handler (count)
+  (let ((seen 0))
+    (flet ((record-condition (condition)
+             (declare (ignore condition))
+             (incf seen)))
+      (dotimes (i count)
+        (handler-bind ((simple-condition #'record-condition))
+          (signal 'simple-condition))))
+    seen))
+
+(defun handler-expression (count)
+  (let ((seen 0) (created 0))
+    (labels ((record-condition (condition)
+               (declare (ignore condition))
+               (incf seen))
+             (make-handler ()
+               (incf created)
+               #'record-condition))
+      (dotimes (i count)
+        (handler-bind ((simple-condition (make-handler)))
+          (signal 'simple-condition))))
+    (list seen created)))
+
+(defun retry-handler ()
+  (let ((attempts 0))
+    (labels ((retry-it (condition)
+               (let ((restart (find-restart 'retry condition)))
+                 (when (and restart (< attempts 4))
+                   (invoke-restart restart)))))
+      (handler-bind ((simple-condition #'retry-it))
+        (loop
+          (restart-case
+              (progn
+                (incf attempts)
+                (signal 'simple-condition)
+                (return attempts))
+            (retry () nil)))))))
+
+(defun handler-setup-order ()
+  (let ((events nil))
+    (labels ((outer (condition)
+               (declare (ignore condition)) (push :outer events))
+             (first-handler (condition)
+               (declare (ignore condition)) (push :first events))
+             (second-handler (condition)
+               (declare (ignore condition)) (push :second events)))
+      (handler-bind ((simple-condition #'outer))
+        (assert
+         (equal '(:value 17)
+                (multiple-value-list
+                 (handler-bind
+                     ((simple-condition (progn (push :init-first events) #'first-handler))
+                      (simple-condition (progn
+                                          (signal 'simple-condition)
+                                          (push :init-second events)
+                                          #'second-handler)))
+                   (signal 'simple-condition)
+                   (values :value 17)))))))
+    (nreverse events)))
+
+(defun handler-setup-error ()
+  (catch 'setup-error
+    (handler-bind ((error (lambda (condition)
+                           (declare (ignore condition))
+                           (throw 'setup-error :caught))))
+      (handler-bind ((simple-condition (error "Handler initialization failed")))
+        :body-ran))))
+
+(dotimes (i 30)
+  (assert (= 2 (labels-handler 2)))
+  (assert (= 2 (flet-handler 2)))
+  (assert (equal '(2 2) (handler-expression 2)))
+  (assert (= 4 (retry-handler)))
+  (assert (equal '(:init-first :outer :init-second :first :second :outer)
+                 (handler-setup-order)))
+  (assert (eq :caught (handler-setup-error)))
+  (assert (equal '(1 2) (multiple-value-list (handler-bind () (values 1 2))))))
+(format t "LEXICAL-HANDLERS-PASS~%")
