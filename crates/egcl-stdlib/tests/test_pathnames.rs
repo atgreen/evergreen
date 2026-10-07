@@ -457,6 +457,26 @@ fn truename_resolves_pathname() {
 }
 
 #[test]
+fn directory_wildcards_under_missing_roots_return_no_matches() {
+    let root = temp_path("directory_missing_root");
+    assert!(!std::path::Path::new(&root).exists());
+    for suffix in ["*.lisp", "*.cl", "*/*.lisp", "**/*.lisp"] {
+        let pattern = format!("{root}/{suffix}");
+        let entries = directory(make_string_val(&pattern))
+            .unwrap_or_else(|error| panic!("{pattern}: {error:?}"));
+        assert!(entries.is_empty(), "{pattern} matched nonexistent files");
+    }
+}
+
+#[test]
+fn directory_does_not_hide_other_filesystem_errors() {
+    assert!(matches!(
+        directory(make_string_val("/tmp/invalid\0path/*.lisp")),
+        Err(EgclError::FileError(_))
+    ));
+}
+
+#[test]
 fn directory_lists_contents() {
     // /tmp should always have entries on a Unix system
     let entries = directory(make_string_val("/tmp/*")).unwrap();
