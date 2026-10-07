@@ -96,7 +96,9 @@
 //! `LogOr`, `LogXor` operate directly on tagged bits; `LogNot` re-clears the
 //! tag; and `FixnumShl`/`FixnumShr` by a constant amount shift the tagged
 //! value, where a negative `Shl` constant is a right shift and a left shift
-//! deopts if the value does not survive the round trip (bliss-2yews). Everything
+//! deopts if the value does not survive the round trip (bliss-2yews). `GenericEq`
+//! (EQ, and NULL/NOT via EQ against NIL) is a tagged-word compare selecting
+//! T/NIL (bliss-pig52). Everything
 //! else, including `StringByteLength`, variable shift amounts and any unboxed
 //! representation, returns `UnsupportedOp(0x390)` and the function stays at its
 //! current tier.
@@ -605,6 +607,25 @@ impl Emitter<'_> {
                     }
                 }
                 self.asm.branch(1, deopt); // signed arithmetic overflow (CC3)
+            }
+            GenericEq => {
+                // Lisp EQ (and NULL / NOT, which speculate.rs rewrites to
+                // GenericEq(x, NIL)) is bit-equality of the two tagged words, so
+                // it is one CGR and a select of T/NIL, exactly as emit.rs's
+                // emit_generic_eq does it. No guard: the operands may be any
+                // tagged values and the rewrite carries no frame state. Declining
+                // it cost every function containing a NOT, a NULL or an EQ its
+                // T2 code on s390x (bliss-pig52).
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, 3)?;
+                self.asm.compare(2, 3);
+                let yes = self.asm.label();
+                let done = self.asm.label();
+                self.asm.branch(8, yes);
+                self.asm.imm64(2, NIL.0);
+                self.asm.branch(15, done);
+                self.asm.bind(yes);
+                self.asm.imm64(2, T.0);
+                self.asm.bind(done);
             }
             Car | Cdr => {
                 // A cons cell is HEADERLESS and its tagged pointer differs from
