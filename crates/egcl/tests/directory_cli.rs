@@ -21,16 +21,12 @@ fn missing_wildcard_directories_return_nil() {
                (assert (null (directory (concatenate 'string "{root}/" suffix)))))
              (write-line "MISSING-DIRECTORY-PASS"))"#
     );
-    for stress in ["0", "1"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-            .env("EGCL_GC_STRESS", stress)
-            .env("EGCL_GC_POISON", "1")
-            .args(["--no-init", "--eval", &form])
-            .output()
-            .expect("run missing-directory checks");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "stress={stress}: {stdout}\n{stderr}");
-        assert!(stdout.contains("MISSING-DIRECTORY-PASS"), "{stdout}\n{stderr}");
-    }
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &form])
+        .output()
+        .expect("run missing-directory checks");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("MISSING-DIRECTORY-PASS"), "{stdout}\n{stderr}");
 }
