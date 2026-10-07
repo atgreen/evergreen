@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- riscv64 now has a T1 baseline native compiler with guarded fixnum
+  arithmetic, comparisons, live on-stack replacement, and deoptimization, so
+  hot functions run as RV64 machine code instead of bytecode. T2 optimizing
+  compilation is still x86-64, AArch64, ppc64le and s390x only
+  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
