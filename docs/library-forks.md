@@ -28,6 +28,7 @@ exercises these forks:
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
 | trivial-backtrace | https://github.com/atgreen/trivial-backtrace | `650da10abfe4b44c70b58a431aec6d9fe7330406` |
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f` |
+| atomics (CAS operations) | https://github.com/atgreen/atomics | `738ddccd7a6f3c44e83335ac5e3615e76972dfd2` |
 | cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
 | closer-mop (slot inspection and callable instances) | https://github.com/atgreen/closer-mop | `e9f6d94ff7bb91768841339c87a89bf70b52b95f` |
@@ -78,7 +79,7 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-USOCKET (`egcl-support`), closer-mop, SLIME and SLY (`egcl`), where their ports
+USOCKET (`egcl-support`), Atomics, closer-mop, SLIME and SLY (`egcl`), where their ports
 live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
@@ -146,6 +147,13 @@ that workaround into a published compatibility fork as though it were one.
 The [CL-FAD scenario](../tests/cl-fad/README.md) verifies native EGCL environment
 lookup and an optional UIOP fallback on otherwise unsupported implementations.
 Directory listing and recursive deletion still require an EGCL port.
+
+The [Atomics scenario](../tests/atomics-fork/README.md) exercises native CAS and
+`cl-cancel`'s CAS-dependent lazy atomic-state initialization. The adapter
+supports cons cells, simple vectors, symbol values/plists, structure slots, CLOS
+slots, and special variables, with Atomics' Boolean success result. This is a
+CAS port, not a claim that every Atomics operation is supported: its
+`ATOMIC-INCF`/`ATOMIC-DECF`, custom places, and memory references remain unsupported.
 
 The [trivial-backtrace scenario](../tests/trivial-backtrace/README.md) checks
 printed and structured backtraces, live condition capture, and output destinations

@@ -57,6 +57,7 @@ trivial-cltl2
 trivial-garbage
 trivial-backtrace
 bordeaux-threads
+atomics@egcl
 cl-fad
 usocket@egcl-support
 precise-time
