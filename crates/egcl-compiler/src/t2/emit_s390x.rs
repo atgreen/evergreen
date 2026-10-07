@@ -116,7 +116,10 @@
 //! value, where a negative `Shl` constant is a right shift and a left shift
 //! deopts if the value does not survive the round trip (bliss-2yews). `GenericEq`
 //! (EQ, and NULL/NOT via EQ against NIL) is a tagged-word compare selecting
-//! T/NIL (bliss-pig52). Everything
+//! T/NIL (bliss-pig52). `TypeCheck` answers the fixnum, symbol, integer,
+//! simple-string, package, hash-table, NULL and BOOLEAN predicates inline
+//! from the tag and the header's type-id byte, declining exactly the cases
+//! emit.rs declines (bliss-nlpd4). Everything
 //! else, including `StringByteLength`, variable shift amounts and any unboxed
 //! representation, returns `UnsupportedOp(0x390)` and the function stays at its
 //! current tier, naming the opcode in the T2 log; structural declines (an
@@ -533,6 +536,127 @@ impl Emitter<'_> {
         self.asm.branch(6, deopt);
     }
 
+    /// A type predicate on the tagged value in r2, leaving T or NIL in r2.
+    /// Mirrors emit.rs's emit_type_check exactly, including what it DECLINES:
+    /// CONS and LIST (an interpreter closure is a cons that is not of type
+    /// LIST, bliss-74rl) and the STRING class (a complex string is a
+    /// COMPLEX_ARRAY, so the two simple layouts alone would answer NIL where
+    /// the other tiers answer T, bliss-c02n). `bits == STRING` is the layout
+    /// guard's form and keeps the simple-layout test. Declining keeps the tiers
+    /// bit-identical, which is the bliss-x5y.9 rule.
+    ///
+    /// The object header's type id lives in bits 63:56 of the header word, the
+    /// byte at offset 7 on little-endian x86-64 and at offset 0 here (bliss-nlpd4
+    /// was the first measured s390x opcode gap: SYMBOL-NAME and the LOOP
+    /// keyword helper declined on it).
+    fn type_check(&mut self, first: Value, data: &InstData) -> Result<(), EmitError> {
+        use egcl_rt::bytecode::typep_class;
+        use egcl_rt::object::type_id;
+        use egcl_rt::value::{TAG_HEAP_OBJECT, TAG_SYMBOL};
+        let refused = || EmitError::UnsupportedOp(super::emit::op_tag(Opcode::TypeCheck));
+        // A constant operand should have been folded to T/NIL upstream.
+        if self.constants.contains_key(&first) || self.heap_constants.contains_key(&first) {
+            return Err(refused());
+        }
+        let (bits, class) = match &data.aux {
+            AuxData::TypeTag(ty) => (ty.bits, None),
+            AuxData::TypepClass(class) => (TypeBits::BOTTOM, Some(*class)),
+            _ => return Err(refused()),
+        };
+        let found = self.asm.label();
+        let not_found = self.asm.label();
+        let done = self.asm.label();
+        // r2 holds the operand throughout; r3-r5 are scratch.
+        let integer = TypeBits::FIXNUM.join(TypeBits::BIGNUM);
+        if class == Some(typep_class::BOOLEAN) {
+            self.branch_if_equal_imm(NIL.0, found);
+            self.branch_if_equal_imm(T.0, found);
+        } else if class == Some(typep_class::NULL) {
+            self.branch_if_equal_imm(NIL.0, found);
+        } else if bits == TypeBits::FIXNUM {
+            self.branch_if_tag(0, found);
+        } else if bits == TypeBits::SYMBOL || class == Some(typep_class::SYMBOL) {
+            self.branch_if_tag(TAG_SYMBOL, found);
+            self.branch_if_equal_imm(NIL.0, found); // NIL is a symbol
+            self.branch_if_equal_imm(T.0, found); // T is a symbol
+        } else if bits == integer {
+            self.branch_if_tag(0, found);
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            self.branch_if_type_id(type_id::BIGNUM, found);
+        } else if bits == TypeBits::STRING {
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            self.branch_if_type_id(type_id::SIMPLE_BASE_STRING, found);
+            self.branch_if_type_id(type_id::SIMPLE_CHARACTER_STRING, found);
+        } else if matches!(
+            class,
+            Some(typep_class::PACKAGE) | Some(typep_class::HASH_TABLE)
+        ) {
+            self.branch_unless_tag(TAG_HEAP_OBJECT, not_found);
+            self.load_type_id();
+            let id = if class == Some(typep_class::PACKAGE) {
+                type_id::PACKAGE
+            } else {
+                type_id::HASH_TABLE
+            };
+            self.branch_if_type_id(id, found);
+        } else {
+            return Err(refused());
+        }
+        self.asm.bind(not_found);
+        self.asm.imm64(2, NIL.0);
+        self.asm.branch(15, done);
+        self.asm.bind(found);
+        self.asm.imm64(2, T.0);
+        self.asm.bind(done);
+        Ok(())
+    }
+
+    /// Branch to `target` when r2 equals the tagged constant.
+    fn branch_if_equal_imm(&mut self, bits: u64, target: Label) {
+        self.asm.imm64(3, bits);
+        self.asm.compare(2, 3);
+        self.asm.branch(8, target);
+    }
+
+    /// Branch to `target` when r2's low three bits equal `tag`.
+    fn branch_if_tag(&mut self, tag: u64, target: Label) {
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, tag);
+        self.asm.compare(4, 5);
+        self.asm.branch(8, target);
+    }
+
+    /// Branch to `target` unless r2's low three bits equal `tag`.
+    fn branch_unless_tag(&mut self, tag: u64, target: Label) {
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, tag);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, target);
+    }
+
+    /// Load the header type id of the heap object in r2 into r4: clear the tag
+    /// bits to reach the header word and read its most significant byte, which
+    /// is byte 0 on big-endian System Z.
+    fn load_type_id(&mut self) {
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, !7u64);
+        self.asm.and(4, 5);
+        self.asm.load_u8(4, 4, 0);
+    }
+
+    /// Branch to `target` when the type id loaded by [`Self::load_type_id`] is `id`.
+    fn branch_if_type_id(&mut self, id: u8, target: Label) {
+        self.asm.imm64(5, u64::from(id));
+        self.asm.compare(4, 5);
+        self.asm.branch(8, target);
+    }
+
     fn guard_cons(&mut self, register: u8, deopt: Label) {
         self.asm.mov(4, register);
         self.asm.imm64(5, 7);
@@ -796,7 +920,10 @@ impl Emitter<'_> {
                 // recovered by untagging it.
                 let deopt = self.deopt_label(data)?;
                 let amount = *data.args.get(1).ok_or_else(unsupported)?;
-                let tagged = *self.constants.get(&amount).ok_or_else(unsupported)?;
+                let tagged = *self
+                    .constants
+                    .get(&amount)
+                    .ok_or_else(|| EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)))?;
                 let n = (tagged as i64) >> 3;
                 self.guard_fixnum(2, deopt);
                 // DIRECTION, mirroring emit.rs and easy to get backwards: on
@@ -830,7 +957,7 @@ impl Emitter<'_> {
                     // generic path produce a bignum. r2 is untouched until the
                     // check passes, so the deopt exit sees the operand.
                     if n > 60 {
-                        return Err(unsupported());
+                        return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
                     }
                     let k = n as u8;
                     self.asm.shift_left(3, 2, k);
@@ -840,6 +967,7 @@ impl Emitter<'_> {
                     self.asm.mov(2, 3);
                 }
             }
+            TypeCheck => self.type_check(first, data)?,
             // Name the opcode: the T2 log then says "refused Opcode #N in
             // t2/ir.rs" instead of this emitter's anonymous 0x390, so a
             // histogram of declines over real code ranks the missing arms

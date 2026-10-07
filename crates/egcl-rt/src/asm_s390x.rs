@@ -146,6 +146,12 @@ impl Asm {
         self.memory(0xe3, 0x24, src << 4, base, disp);
     }
 
+    /// LLGC: zero-extend one byte into a 64-bit register.
+    pub fn load_u8(&mut self, dst: u8, base: u8, disp: i32) {
+        assert!(dst < 16);
+        self.memory(0xe3, 0x90, dst << 4, base, disp);
+    }
+
     pub fn load_u32(&mut self, dst: u8, base: u8, disp: i32) {
         assert!(dst < 16);
         self.memory(0xe3, 0x16, dst << 4, base, disp);
@@ -290,6 +296,14 @@ mod tests {
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
             ]
         );
+    }
+
+    #[test]
+    fn byte_load_encoding_matches_llvm_systemz() {
+        // llvm-mc: llgc %r3,7(%r4) => e3 30 40 07 00 90
+        let mut a = Asm::new();
+        a.load_u8(3, 4, 7);
+        assert_eq!(a.finish().unwrap(), [0xe3, 0x30, 0x40, 0x07, 0x00, 0x90]);
     }
 
     #[test]
