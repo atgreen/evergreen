@@ -77,6 +77,11 @@
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).
 
+- Single-float arithmetic on ppc64le now returns correct values once a
+  function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
+  returned `2.2578125` there while the interpreter and baseline tier were
+  right ([#95](https://github.com/atgreen/evergreen/pull/95)).
+
 ## 0.0.2 - 2026-10-05
 
 ### Documentation
