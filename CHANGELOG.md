@@ -52,6 +52,10 @@
   backlog and address-reuse options, and use GC-safe cooperative accept and
   readiness waits on Unix; closing a listener wakes pending waits
   ([#60](https://github.com/atgreen/evergreen/pull/60)).
+- Native threads now share their creator's package registry, preserving library
+  symbol lookup in workers and threads created by fibers. This fixes Ironclad
+  reporting SHA256 as unsupported in TLS server threads
+  ([#68](https://github.com/atgreen/evergreen/pull/68)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
