@@ -184,7 +184,18 @@ fn native_client_receive_timeout_is_enforced_and_can_be_disabled() {
               (assert (null (egcl::%socket-read-timeout s)))
               (egcl::%socket-read-timeout s 50)
               (assert (>= (egcl::%socket-read-timeout s) 50))
-              (assert (handler-case (progn (read-byte s) nil) (stream-error () t)))
+              (dotimes (attempt 2)
+                (assert
+                 (handler-case
+                     (progn
+                       (if (zerop attempt)
+                           (read-byte s)
+                           (read-sequence (make-array 1 :element-type '(unsigned-byte 8)) s))
+                       nil)
+                   (stream-error (condition)
+                     (assert (typep condition 'egcl-ext::io-timeout))
+                     (assert (eq s (stream-error-stream condition)))
+                     t))))
               (egcl::%socket-read-timeout s nil)
               (assert (null (egcl::%socket-read-timeout s)))
               (write-byte 42 s)

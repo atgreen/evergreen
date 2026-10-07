@@ -65,6 +65,9 @@
 - `CHANGE-CLASS` now honors initialization arguments and class-change hooks,
   preserving retained slot values and initializing newly added slots
   ([#71](https://github.com/atgreen/evergreen/pull/71)).
+- Native socket byte-read timeouts now signal `EGCL-EXT:IO-TIMEOUT`, retaining
+  the affected stream so callers can distinguish expiry from other I/O errors
+  ([#72](https://github.com/atgreen/evergreen/pull/72)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions

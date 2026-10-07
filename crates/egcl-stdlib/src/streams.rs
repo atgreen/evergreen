@@ -544,6 +544,23 @@ fn file_read_line_buffered(
     }
 }
 
+fn stream_io_error(operation: &str, error: std::io::Error) -> EgclError {
+    let message = format!("{operation}: {error}");
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        EgclError::IoTimeout { stream: NIL, message }
+    } else {
+        EgclError::StreamError(message)
+    }
+}
+
+fn attach_timeout_stream(error: &mut EgclError, stream: EgclVal) {
+    if let EgclError::IoTimeout { stream: origin, .. } = error {
+        if origin.is_nil() {
+            *origin = stream;
+        }
+    }
+}
+
 /// Read a single raw byte from a buffered file input (for binary streams). Issue #10.
 fn file_read_byte_raw(
     file: &mut StreamHandle,
@@ -555,7 +572,7 @@ fn file_read_byte_raw(
         read_buf.resize(FILE_BUF_SIZE, 0);
         let n = file
             .read(&mut read_buf[..])
-            .map_err(|e| EgclError::StreamError(format!("file read error: {}", e)))?;
+            .map_err(|e| stream_io_error("file read error", e))?;
         if n == 0 {
             return Ok(EOF);
         }
@@ -601,7 +618,7 @@ fn bulk_read_octets(
             }
             Ok(n) => out.truncate(base + n),
             Err(e) => {
-                return Err(EgclError::StreamError(format!("file read error: {}", e)));
+                return Err(stream_io_error("file read error", e));
             }
         }
     }
@@ -1987,6 +2004,9 @@ fn with_stream<T: egcl_rt::gc::TraceHostRoots>(
     egcl_rt::rooted!(stream = stream);
     let mut guard = lock_stream(*stream)?;
     let mut result = operation(&mut guard);
+    if let Err(error) = &mut result {
+        attach_timeout_stream(error, *stream);
+    }
     egcl_rt::rooted_ref!(_result_root = &mut result);
     drop(guard);
     drop(_result_root);
@@ -2541,7 +2561,15 @@ pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, Egcl
     // is what an allocation during the read could move.
     egcl_rt::rooted!(stream = stream);
     let mut guard = lock_stream(*stream)?;
-    guard.read_octets(count)
+    let mut result = guard.read_octets(count);
+    if let Err(error) = &mut result {
+        attach_timeout_stream(error, *stream);
+        egcl_rt::rooted_ref!(_error_root = error);
+        drop(guard);
+    } else {
+        drop(guard);
+    }
+    result
 }
 
 /// Write OCTETS to STREAM as bytes, taking the stream lock once.

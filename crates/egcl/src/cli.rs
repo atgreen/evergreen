@@ -4781,6 +4781,17 @@ fn egcl_error_to_condition(
             egcl_rt::rooted!(control = arena_str(msg));
             build_condition_instance(env, "SIMPLE-PACKAGE-ERROR", &[control_kw, *control])?
         }
+        EgclError::IoTimeout { stream, message } => {
+            egcl_rt::rooted!(stream = *stream);
+            egcl_rt::rooted!(control = arena_str(message));
+            let stream_key = resolve_sym("STREAM").unwrap_or(NIL);
+            let control_key = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            build_condition_instance(
+                env,
+                "EGCL-EXT:IO-TIMEOUT",
+                &[stream_key, *stream, control_key, *control],
+            )?
+        }
         EgclError::StreamError(msg) => {
             // The reader funnels both genuine I/O failures and parse failures
             // through StreamError. ANSI distinguishes three condition classes,
@@ -12954,6 +12965,7 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "WARNING" => Some((vec!["CONDITION".into()], vec![])),
         "INTERRUPT-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "TIMEOUT-CONDITION" => Some((vec!["ERROR".into()], vec![])),
+        "IO-TIMEOUT" => Some((vec!["STREAM-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
         "STYLE-WARNING" => Some((vec!["WARNING".into()], vec![])),
         "STORAGE-CONDITION" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "SIMPLE-CONDITION" => Some((

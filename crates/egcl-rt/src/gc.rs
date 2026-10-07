@@ -3358,6 +3358,7 @@ impl TraceHostRoots for EgclError {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         match self {
             EgclError::TypeError { datum, .. }
+            | EgclError::IoTimeout { stream: datum, .. }
             | EgclError::UnboundVariable(datum)
             | EgclError::UndefinedFunction(datum) => datum.trace_host_roots(visit),
             // The already-signalled condition is a live EgclVal and must be

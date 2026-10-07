@@ -4470,6 +4470,8 @@ a hook error aborts startup.")
   '(egcl::%memory-fence :write))
 (export '(egcl-ext::memory-barrier egcl-ext::load-barrier egcl-ext::store-barrier) :egcl-ext)
 
+(export (intern "IO-TIMEOUT" :egcl-ext) :egcl-ext)
+
 (export (mapcar (lambda (name) (intern name :egcl-ext))
                 '("CAS" "ATOMIC-INCF" "ATOMIC-DECF"))
         :egcl-ext)
