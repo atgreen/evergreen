@@ -1,4 +1,4 @@
 split-sequence, ghcr.io/ocicl/split-sequence@sha256:3a37662eedd99c42995587b9d443c4631f25c4c523091bcca31a27b880585b8e, split-sequence-2.0.1/split-sequence.asd
-usocket, git+https://github.com/atgreen/usocket@fa0df448d5582c0d637afe3799cf53b28e1586c9#ref=fa0df448d5582c0d637afe3799cf53b28e1586c9, usocket-fa0df44/usocket.asd
-usocket-server, git+https://github.com/atgreen/usocket@fa0df448d5582c0d637afe3799cf53b28e1586c9#ref=fa0df448d5582c0d637afe3799cf53b28e1586c9, usocket-fa0df44/usocket-server.asd
-usocket-test, git+https://github.com/atgreen/usocket@fa0df448d5582c0d637afe3799cf53b28e1586c9#ref=fa0df448d5582c0d637afe3799cf53b28e1586c9, usocket-fa0df44/usocket-test.asd
+usocket, git+https://github.com/atgreen/usocket@64c26538564b14068a836f97990bd09a00c2d6a1#ref=64c26538564b14068a836f97990bd09a00c2d6a1, usocket-64c2653/usocket.asd
+usocket-server, git+https://github.com/atgreen/usocket@64c26538564b14068a836f97990bd09a00c2d6a1#ref=64c26538564b14068a836f97990bd09a00c2d6a1, usocket-64c2653/usocket-server.asd
+usocket-test, git+https://github.com/atgreen/usocket@64c26538564b14068a836f97990bd09a00c2d6a1#ref=64c26538564b14068a836f97990bd09a00c2d6a1, usocket-64c2653/usocket-test.asd

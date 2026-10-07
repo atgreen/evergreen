@@ -1,7 +1,7 @@
-# Native TCP client through the pinned usocket fork
+# Native TCP client and server through the pinned usocket fork
 
 This scenario installs `atgreen/usocket` at
-`fa0df448d5582c0d637afe3799cf53b28e1586c9` using ocicl's Git source support.
+`64c26538564b14068a836f97990bd09a00c2d6a1` using ocicl's Git source support.
 It uses an isolated source registry and FASL cache, with runtime downloads
 disabled. No installed libraries or user configuration are modified.
 
@@ -14,7 +14,8 @@ SBCL_BIN="$(command -v sbcl)" \
 ```
 
 Use a newly built EGCL providing `%SOCKET-CONNECT`, `%SOCKET-READ-TIMEOUT`,
-and the FASL `IN-PACKAGE` fix; an older installed image is insufficient.
+the FASL `IN-PACKAGE` fix, and shared native listeners (PR #60), including the
+four-argument `%SOCKET-LISTEN`; an older installed image is insufficient.
 The script retains logs in its printed temporary directory and runs:
 
 - Cold and cached loads, with no source recompilation allowed in the latter.
@@ -24,17 +25,23 @@ The script retains logs in its printed temporary directory and runs:
   rejection of unsupported EGCL connection options.
 - Literal octet types and one-hop/two-hop DEFTYPE aliases, each with its own
   full duplex connection; character and non-octet integer widths stay rejected.
+- EGCL server listen/accept/close and local-port queries, including cross-thread
+  ownership, inherited and overridden octet aliases, and wildcard/auto-port defaults.
+- Linux address-reuse checks using active close and TIME_WAIT, including the
+  deprecated `:reuseaddress` spelling and precedence of `:reuse-address`.
 - Optional GC stress at stride 1,000 with poisoning and heap verification.
   Its child timeout is 330 seconds to allow stressed ASDF startup.
-- Optional SBCL control using the same fixture and a separate FASL cache.
+- Optional SBCL client control using the same fixture and a separate FASL cache.
+  The new server regression is EGCL-specific and is not counted as SBCL coverage.
 
 The wrapper applies `EGCL_MEM_MAX` (default 4G) and `EGCL_TIMEOUT` (default
 600 seconds) to each phase. All socket traffic is loopback, without credentials.
 
-This proves the binary TCP client subset, not TLS, a complete usocket port,
-Dexador, or `completions` streaming. Character sockets, UDP, listeners, local
-binding, deadlines, and disabling TCP_NODELAY are unsupported. DNS resolution
-precedes the connection timeout.
+This checks a binary TCP client/server subset, not TLS, a complete usocket port,
+Dexador, or `completions` streaming. Character sockets, UDP, Unix-domain sockets,
+USOCKET readiness/address queries, connected-socket port queries, explicit client
+local binding, deadlines, and disabling TCP_NODELAY remain unsupported. DNS
+resolution precedes the connection timeout.
 
 ## Known GC-stress load failure
 

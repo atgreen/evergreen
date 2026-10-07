@@ -26,6 +26,7 @@ for phase in cold cached; do
     "$repo/scripts/egcl-limited.sh" python3 "$fixture" \
         "$egcl" --no-init --load check.lisp >"$phase.log" 2>&1
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' "$phase.log"
+    grep -Fxq 'USOCKET-NATIVE-SERVER-OK' "$phase.log"
     grep -Fxq 'USOCKET-LOOPBACK-FIXTURE-OK' "$phase.log"
 done
 if grep -qi 'compiling file' cached.log; then
@@ -37,6 +38,7 @@ if [[ ${EGCL_PORT_STRESS:-0} == 1 ]]; then
         "$repo/scripts/egcl-limited.sh" python3 "$fixture" \
         "$egcl" --no-init --load check.lisp >stress.log 2>&1
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' stress.log
+    grep -Fxq 'USOCKET-NATIVE-SERVER-OK' stress.log
     grep -Fxq 'USOCKET-LOOPBACK-FIXTURE-OK' stress.log
 fi
 if [[ -n ${SBCL_BIN:-} ]]; then
@@ -46,4 +48,4 @@ if [[ -n ${SBCL_BIN:-} ]]; then
     grep -Fxq 'USOCKET-NATIVE-CLIENT-OK' sbcl.log
     grep -Fxq 'USOCKET-LOOPBACK-FIXTURE-OK' sbcl.log
 fi
-echo "USOCKET-FORK-PASS: cold and cached native TCP; artifacts in $work"
+echo "USOCKET-FORK-PASS: cold and cached native TCP client and server; artifacts in $work"
