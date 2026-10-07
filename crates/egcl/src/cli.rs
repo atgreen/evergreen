@@ -37795,6 +37795,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
                 "OUTPUT" => direction = egcl_stdlib::StreamDirection::Output,
                 "IO" => direction = egcl_stdlib::StreamDirection::Io,
                 "INPUT" => direction = egcl_stdlib::StreamDirection::Input,
+                "PROBE" => direction = egcl_stdlib::StreamDirection::Probe,
                 _ => {}
             },
             "ELEMENT-TYPE" => element_type = value,
@@ -37820,15 +37821,15 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
         _ => if_exists,
     };
 
-    // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
-    // (and for output with `:if-exists :overwrite`/`:append`), `:create`
-    // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
-    // creates missing files on output regardless — so the only default that
-    // matters here is input, where NIL must NOT be passed (it would suppress the
-    // error and hand the caller a NIL stream). Represent `:error` as T.
+    // Input defaults to an error on a missing file; probe defaults to NIL.
     if !if_dne_supplied && matches!(direction, egcl_stdlib::StreamDirection::Input) {
         if_does_not_exist = T;
     }
+    if_does_not_exist = match sym_bare_name_rc(if_does_not_exist).as_ref() {
+        "CREATE" => egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL,
+        "ERROR" => T,
+        _ => if_does_not_exist,
+    };
 
     // Flexi-streams names its octet type through DEFTYPE. Resolve aliases
     // before translating the Lisp specifier to the stdlib's byte-stream marker.
