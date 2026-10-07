@@ -332,11 +332,6 @@ unsafe fn trace_bytecode_graph(
         visit(form as *mut EgclVal);
     }
     visit(&mut function.params_form as *mut EgclVal);
-    for handler_bind in &mut function.handler_binds {
-        for (_, form) in &mut handler_bind.bindings {
-            visit(form as *mut EgclVal);
-        }
-    }
     for restart_case in &mut function.restart_cases {
         for restart in &mut restart_case.restarts {
             unsafe {
@@ -641,13 +636,6 @@ pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str
             .any(|instruction| matches!(instruction, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
         {
             return Some("bytecode source-evaluation instruction");
-        }
-        if body
-            .handler_binds
-            .iter()
-            .any(|table| !table.bindings.is_empty())
-        {
-            return Some("source handler-binding form");
         }
         body.nested_functions
             .iter()
@@ -2177,8 +2165,8 @@ struct TagScope {
 /// placed in `constants` would be freed or left stale by a relocating GC fired
 /// by a later lowering allocation — the compiled code would then read a stale
 /// constant (observed as `NIL is not of type number`) (bliss-6b2 #2). The same
-/// holds for the raw handler forms in `handler_binds` and the constants of
-/// already-compiled `restart_cases` / `nested_functions` (bliss-wlf).
+/// holds for the constants of already-compiled `restart_cases` /
+/// `nested_functions` (bliss-wlf).
 impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         let mut seen = std::collections::HashSet::new();
@@ -2195,11 +2183,6 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
         }
         for constant in &mut self.constants {
             visit(constant as *mut EgclVal);
-        }
-        for info in &mut self.handler_binds {
-            for (_, form) in info.bindings.iter_mut() {
-                visit(form as *mut EgclVal);
-            }
         }
         for info in &mut self.restart_cases {
             for restart in info.restarts.iter_mut() {
@@ -5629,11 +5612,13 @@ impl<'e> Lowerer<'e> {
     /// `(handler-bind ((type handler-form)...) body...)` — handlers run in the
     /// signalling context (no unwind unless a handler transfers control).
     fn lower_handler_bind(&mut self, rest: EgclVal) -> LowerResult<()> {
-        let (bindings_form, body) = cp(rest);
-        let enclosing_locals: std::collections::HashSet<String> =
-            self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
-        let mut bindings = Vec::new();
-        for binding in list_to_vec(bindings_form) {
+        let (bindings_form, mut body) = cp(rest);
+        egcl_rt::rooted_ref!(_body_root = &mut body);
+        egcl_rt::rooted!(binding_forms = list_to_vec(bindings_form));
+        let count = u16::try_from(binding_forms.len()).map_err(|_| Bail)?;
+        let mut types = Vec::with_capacity(binding_forms.len());
+        for index in 0..binding_forms.len() {
+            let binding = binding_forms[index];
             if !binding.is_cons() {
                 return Err(Bail);
             }
@@ -5646,32 +5631,14 @@ impl<'e> Lowerer<'e> {
             } else {
                 return Err(Bail);
             };
-            // The handler form is evaluated at run time against this activation's
-            // heap env frame (PushHandlerBind), which holds only the *boxed*
-            // locals. `captured_names` is a syntactic pre-scan of the UNEXPANDED
-            // body, so a handler lambda reached through a macro expansion can
-            // capture an enclosing local the scan never saw; that local stays in
-            // a plain frame slot the handler cannot reach, and it would silently
-            // read as unbound/global. Bail so the enclosing form tree-walks —
-            // the same Slot-capture guard `lower_restart_case` applies (bliss-pgu,
-            // sibling of bliss-8lr).
-            let (params, handler_body) = handler_lambda_parts(handler_form);
-            let mut used = std::collections::HashSet::new();
-            collect_symbol_names(handler_body, &mut used);
-            for name in &used {
-                if params.contains(name) || !enclosing_locals.contains(name) {
-                    continue;
-                }
-                if matches!(self.lookup_local(name), Some(VarLoc::Slot(_))) {
-                    return Err(Bail);
-                }
-            }
-            bindings.push((sym_name(type_form), handler_form));
+            types.push(sym_name(type_form));
+            self.lower_expr(handler_form)?;
         }
 
         let hb = self.handler_binds.len() as u32;
-        self.handler_binds.push(HandlerBindInfo { bindings });
+        self.handler_binds.push(HandlerBindInfo { types });
         self.emit(Instr::PushHandlerBind { hb });
+        self.pop_n(count);
         self.lower_progn(body)?; // body value (+1)
         self.emit(Instr::PopHandlerBind);
         Ok(())
@@ -7666,40 +7633,7 @@ fn compile_restart_clause(
     })
 }
 
-/// Collect the names of all symbols appearing in `form` (recursively), except
-/// inside `quote`. Used for a conservative free-variable over-approximation.
-/// Split a HANDLER-BIND handler form into `(bound-param-names, capture-scan-body)`
-/// for the Slot-capture guard (bliss-pgu). For `(lambda (params...) . body)` and
-/// `(function (lambda (params...) . body))` the lambda list's own variables are
-/// returned as `params` (they shadow enclosing locals, so are not captures) and
-/// the body is scanned for free references. Any other handler form (a symbol,
-/// `(function name)`, a call producing a function) has no bound params, so the
-/// whole form is scanned.
-fn handler_lambda_parts(handler_form: EgclVal) -> (std::collections::HashSet<String>, EgclVal) {
-    let mut form = handler_form;
-    // Unwrap `(function <x>)` to reach a bare lambda inside `#'(lambda …)`.
-    if form.is_cons() {
-        let (head, rest) = cp(form);
-        if head.is_symbol() && sym_name(head) == "FUNCTION" && rest.is_cons() {
-            form = cp(rest).0;
-        }
-    }
-    if form.is_cons() {
-        let (head, rest) = cp(form);
-        if head.is_symbol() && sym_name(head) == "LAMBDA" && rest.is_cons() {
-            let (params_form, body) = cp(rest);
-            let params: std::collections::HashSet<String> = list_to_vec(params_form)
-                .iter()
-                .filter(|p| p.is_symbol())
-                .map(|p| sym_name(*p))
-                .filter(|n| !n.starts_with('&'))
-                .collect();
-            return (params, body);
-        }
-    }
-    (std::collections::HashSet::new(), handler_form)
-}
-
+/// Collect symbols outside QUOTE as a conservative free-variable approximation.
 fn collect_symbol_names(form: EgclVal, out: &mut std::collections::HashSet<String>) {
     collect_symbol_names_qq(form, out, 0);
 }
@@ -9421,9 +9355,8 @@ fn serialize_bbu_function(
     // `serialize_bbu_function_tree`, which serializes children before the owner.
     nested_global: &[u32],
 ) -> Option<BbuFunction> {
-    // handler-bind stores raw (unlowered) handler source forms, so it is not yet
-    // source-free; reject it. handler-case clauses are fully structural
-    // (type-name, body PC, var slot) and are serialized below.
+    // Handler-bind tables do not yet have a BBU encoding. Handler-case clauses
+    // are serialized below.
     if !bf.handler_binds.is_empty() {
         return None;
     }
@@ -13226,7 +13159,7 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclEr
                 if *hb as usize >= func.handler_binds.len() {
                     return Err(fail(pcu, "handler-bind index out of range"));
                 }
-                Some((0, 0))
+                Some((func.handler_binds[*hb as usize].types.len() as u32, 0))
             }
             _ => None,
         };
@@ -15936,55 +15869,33 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             }
             Instr::PushHandlerBind { hb } => {
                 let info = acts[top_idx].func.handler_binds[hb as usize].clone();
-                let env_frame = acts[top_idx].env_frame.clone();
                 let cluster_base = env.handlers.len();
-                let mut entries = Vec::with_capacity(info.bindings.len());
-                let mut cluster_values = Vec::with_capacity(info.bindings.len().saturating_mul(2));
-                for (type_name, handler_form) in &info.bindings {
-                    // When this function has boxed (captured) locals, evaluate
-                    // the handler form now into a closure that captures them, so
-                    // a handler run at signal time (in the tree-walker, where
-                    // env.frame is global) still sees the lexical bindings.
-                    // A handler spec is a FORM that must be EVALUATED to produce
-                    // the handler function (CLHS 9.1.4.1). Storing it unevaluated
-                    // when the function had no boxed locals only LOOKED like it
-                    // worked, because applying a raw `(LAMBDA …)` form happens to
-                    // succeed — every other spelling was applied as a literal
-                    // list and died with "Cons is not of type FUNCTION":
-                    // `#'h` applied `(FUNCTION H)`, `'h` applied `(QUOTE H)`,
-                    // and a call form applied the call itself (bliss-ddpl).
-                    // With boxed locals the form is evaluated against this
-                    // activation's heap frame so the handler closes over them;
-                    // without, the current environment is the right one.
-                    let evaluated = if let Some(ef) = &env_frame {
-                        let saved = std::mem::replace(&mut env.frame, ef.clone());
-                        let v = eval_form(*handler_form, env);
-                        env.frame = saved;
-                        v
-                    } else {
-                        eval_form(*handler_form, env)
-                    };
-                    let handler = match evaluated {
-                        Ok(val) => HandlerImpl::Function(val),
-                        Err(_) => HandlerImpl::Function(*handler_form),
-                    };
-                    let handler_value = match &handler {
-                        HandlerImpl::Function(value) => *value,
-                        HandlerImpl::HandlerCase { .. } => NIL,
-                    };
-                    entries.push(HandlerEntry {
-                        type_name: type_name.clone(),
-                        handler,
-                    });
-                    cluster_values.push(resolve_sym(type_name).ok_or_else(|| {
+                let first = acts[top_idx].sp_top - info.types.len() as u16;
+                let mut entries = Vec::with_capacity(info.types.len());
+                let mut cluster_values = Vec::with_capacity(info.types.len().saturating_mul(2));
+                egcl_rt::rooted_ref!(_entries_root = &mut entries);
+                egcl_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
+                for (index, type_name) in info.types.iter().enumerate() {
+                    let type_symbol = resolve_sym(type_name).ok_or_else(|| {
                         EgclError::Internal(format!(
                             "handler-bind condition type {type_name} is not interned"
                         ))
-                    })?);
+                    })?;
+                    // Keep the operands in their scanned activation until the
+                    // complete cluster owns them; interning a type can collect.
+                    let act = &acts[top_idx];
+                    let handler_value = unsafe {
+                        slot_get(act.frame, act.n_locals + first + index as u16)
+                    };
+                    entries.push(HandlerEntry {
+                        type_name: type_name.clone(),
+                        handler: HandlerImpl::Function(handler_value),
+                    });
+                    cluster_values.push(type_symbol);
                     cluster_values.push(handler_value);
                 }
-                egcl_rt::rooted_ref!(_cluster_values_root = &mut cluster_values);
                 let cluster_frame = push_condition_cluster_frame(stack, &cluster_values)?;
+                acts[top_idx].sp_top = first;
                 env.handlers.push(HandlerCluster { entries });
                 acts[top_idx].handlers.push(Handler::HandlerBind {
                     cluster_base,

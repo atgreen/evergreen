@@ -1604,7 +1604,7 @@ fn emit_invoke_call(
             } else {
                 TRANSFER_HANDLER_BIND_LEAVE_REQUEST
             }) | u64::from(push_bcp),
-            0,
+            data.args.len() as u64,
             false,
         ),
         crate::t2::ir::AuxData::RestartCaseScope { push_bcp, enter } => (
@@ -1616,6 +1616,12 @@ fn emit_invoke_call(
             0,
             false,
         ),
+        crate::t2::ir::AuxData::HostEval(index) => {
+            (TRANSFER_HOST_EVAL_REQUEST | u64::from(index), 0, false)
+        }
+        crate::t2::ir::AuxData::FunctionLookup(symbol) => {
+            (TRANSFER_FUNCTION_LOOKUP_REQUEST | u64::from(symbol), 0, false)
+        }
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -2790,6 +2796,8 @@ pub const TRANSFER_HANDLER_BIND_ENTER_REQUEST: u64 = 5_u64 << 32;
 pub const TRANSFER_HANDLER_BIND_LEAVE_REQUEST: u64 = 6_u64 << 32;
 pub const TRANSFER_RESTART_CASE_ENTER_REQUEST: u64 = 7_u64 << 32;
 pub const TRANSFER_RESTART_CASE_LEAVE_REQUEST: u64 = 8_u64 << 32;
+pub const TRANSFER_HOST_EVAL_REQUEST: u64 = 9_u64 << 32;
+pub const TRANSFER_FUNCTION_LOOKUP_REQUEST: u64 = 10_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
@@ -3033,6 +3041,8 @@ fn emit_transfer_function(
                     && matches!(
                         data.aux,
                         AuxData::CleanupContinuation { .. }
+                            | AuxData::HostEval(_)
+                            | AuxData::FunctionLookup(_)
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -4283,6 +4293,8 @@ fn emit_framed_inner(
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     let veneer = match d.aux {
                         AuxData::CallTarget(_)
+                        | AuxData::HostEval(_)
+                        | AuxData::FunctionLookup(_)
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }
