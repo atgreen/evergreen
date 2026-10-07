@@ -24418,17 +24418,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Ok(resolve_sym("EGCL-THREAD::CONDITION-VARIABLE")
                         .expect("condition-variable type symbol"));
                 }
-                // CLOS instances: TYPE-OF returns the direct class name, not the
-                // representation type (previously "FIXNUM"). See bliss-2ke.
+                // Preserve the defining symbol, including its home package.
                 if egcl_stdlib::is_instance(v) {
-                    if let Some(name) = instance_class_hierarchy_names(v)
-                        .as_ref()
-                        .and_then(|n| n.first())
-                    {
-                        return match resolve_sym(name) {
-                            Some(sym) => Ok(sym),
-                            None => Ok(arena_str(name)),
-                        };
+                    let name = egcl_stdlib::class_name(egcl_stdlib::class_of(v));
+                    if !name.is_nil() {
+                        return Ok(name);
                     }
                 }
                 // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)

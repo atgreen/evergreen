@@ -31,6 +31,10 @@
 - `WRITE` now uses the dynamic `*PRINT-ESCAPE*` value when `:ESCAPE` is omitted
   ([#55](https://github.com/atgreen/evergreen/pull/55)).
 
+- `TYPE-OF` now preserves the defining package of structure, class, and
+  condition names, fixing cross-package digest copying used by TLS key
+  derivation ([#57](https://github.com/atgreen/evergreen/pull/57)).
+
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
   ([#50](https://github.com/atgreen/evergreen/pull/50)).
