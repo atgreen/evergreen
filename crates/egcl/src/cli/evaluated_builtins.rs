@@ -1212,6 +1212,9 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(NIL)
         }),
 
+        "EGCL::%INVOKE-REGISTERED-MACRO" => Some(|_operator, args, _env| {
+            super::invoke_registered_macro(args)
+        }),
         "EGCL::%INVOKE-COMPILER-MACRO" => Some(|_operator, args, env| {
             super::invoke_compiler_macro_function(args, env)
         }),

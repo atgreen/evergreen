@@ -928,6 +928,7 @@
 ;;; ---------------------------------------------------------------------------
 
 (defvar *readtable* :standard-readtable)
+(defvar *macroexpand-hook* #'funcall)
 (defvar *print-array* t)
 (defvar *print-base* 10)
 (defvar *print-case* :upcase)

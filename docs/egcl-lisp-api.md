@@ -199,6 +199,26 @@ zero.
       (egcl-ext:deopt-count))
 ```
 
+### Macroexpansion instrumentation
+
+The standard `CL:*MACROEXPAND-HOOK*` defaults to `#'FUNCALL`.
+`MACROEXPAND-1`, `MACROEXPAND`, and compiler expansion through those entry
+points honor its dynamic binding. The hook receives a callable expander,
+the original form (a symbol for a symbol macro), and the lexical environment.
+
+```lisp
+(let ((previous *macroexpand-hook*))
+  (let ((*macroexpand-hook*
+          (lambda (expander form environment)
+            (format *trace-output* "Expanding ~S~%" form)
+            (funcall previous expander form environment))))
+    (macroexpand '(when ready (run)))))
+```
+
+Use the environment only during expansion; do not retain it. Direct
+tree-evaluator expansion is not a guaranteed instrumentation point, so hook
+counts are not a count of every macro evaluated by a program.
+
 ### Bootstrap image writer
 
 #### `save-image` — **Partial**
