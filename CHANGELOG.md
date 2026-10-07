@@ -39,6 +39,10 @@
   runtime recovery handler instead of terminating the process
   ([#64](https://github.com/atgreen/evergreen/pull/64)).
 
+- `DISASSEMBLE` now decodes s390x native code in-process, with mnemonics,
+  operands and branch targets in binutils syntax, instead of listing raw
+  bytes ([#74](https://github.com/atgreen/evergreen/pull/74)).
+
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
   ([#51](https://github.com/atgreen/evergreen/pull/51)).
 
