@@ -11646,6 +11646,8 @@ fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Option<EgclVal> {
 
 #[cfg(test)]
 mod compile_traversal_rooting_tests;
+#[cfg(test)]
+mod search_rooting_tests;
 
 fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
     if !form.is_cons() {
