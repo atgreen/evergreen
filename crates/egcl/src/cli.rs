@@ -4183,6 +4183,9 @@ fn install_loaded_compiler_macro(
 fn global_macro_remove(name: &str) {
     let mut macros = GLOBAL_MACROS.lock().unwrap();
     macros.remove(name);
+    if let Some(alias) = extension_operator_alias(name) {
+        macros.remove(&alias);
+    }
     bump_macro_env_generation();
 }
 
@@ -4192,6 +4195,12 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
     if let Some(def) = env.macros.borrow().get(name).cloned() {
         return Some(def);
     }
+    let alias = extension_operator_alias(name);
+    if let Some(alias) = &alias {
+        if let Some(def) = env.macros.borrow().get(alias).cloned() {
+            return Some(def);
+        }
+    }
     let leaf = symbol_leaf_name(name);
     if leaf != name {
         if let Some(def) = env.macros.borrow().get(leaf).cloned() {
@@ -4200,13 +4209,16 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
     }
     {
         let g = GLOBAL_MACROS.lock().unwrap();
-        g.get(name).cloned().or_else(|| {
-            if leaf != name {
-                g.get(leaf).cloned()
-            } else {
-                None
-            }
-        })
+        g.get(name)
+            .or_else(|| alias.as_ref().and_then(|alias| g.get(alias)))
+            .cloned()
+            .or_else(|| {
+                if leaf != name {
+                    g.get(leaf).cloned()
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -4215,14 +4227,37 @@ fn macro_defined(env: &Env, name: &str) -> bool {
     if env.macros.borrow().contains_key(name) {
         return true;
     }
+    let alias = extension_operator_alias(name);
+    if alias
+        .as_ref()
+        .is_some_and(|alias| env.macros.borrow().contains_key(alias))
+    {
+        return true;
+    }
     let leaf = symbol_leaf_name(name);
     if leaf != name && env.macros.borrow().contains_key(leaf) {
         return true;
     }
     {
         let g = GLOBAL_MACROS.lock().unwrap();
-        g.contains_key(name) || (leaf != name && g.contains_key(leaf))
+        g.contains_key(name)
+            || alias.as_ref().is_some_and(|alias| g.contains_key(alias))
+            || (leaf != name && g.contains_key(leaf))
     }
+}
+
+/// Extension operator dispatch and saved symbols use different colon spellings.
+/// Keep both spellings in the same package when consulting macro maps.
+fn extension_operator_alias(name: &str) -> Option<String> {
+    for package in ["EGCL-EXT:", "EGCL-INTERNAL:"] {
+        if let Some(rest) = name.strip_prefix(package) {
+            return Some(match rest.strip_prefix(':') {
+                Some(external) => format!("{package}{external}"),
+                None => format!("{package}:{rest}"),
+            });
+        }
+    }
+    None
 }
 
 fn next_control_token(prefix: &str) -> String {
@@ -16941,7 +16976,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // instead of resolving to a distinct undefined symbol (bliss-lb6).
         let name = {
             let raw = sym_name(car);
-            if let Some(rest) = raw.strip_prefix("EGCL-EXT::") {
+            if env.funs.borrow().contains_key(&raw) {
+                raw
+            } else if let Some(rest) = raw.strip_prefix("EGCL-EXT::") {
                 format!("EGCL-EXT:{rest}")
             } else if let Some(rest) = raw.strip_prefix("EGCL-INTERNAL::") {
                 format!("EGCL-INTERNAL:{rest}")
@@ -16961,11 +16998,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // A MACROLET macro lives in that same lexical namespace, so it still
         // wins — only a global macro yields to the binding.
         let shadowed_by_lexical_function = {
+            let raw = sym_name_rc(car);
             let bare = sym_bare_name_rc(car);
             let funs = env.funs.borrow();
             let macros = env.macros.borrow();
-            (funs.contains_key(&name) || funs.contains_key(&*bare))
-                && !(macros.contains_key(&name) || macros.contains_key(&*bare))
+            (funs.contains_key(&name) || funs.contains_key(&*raw) || funs.contains_key(&*bare))
+                && !(macros.contains_key(&name)
+                    || macros.contains_key(&*raw)
+                    || macros.contains_key(&*bare))
         };
         if matches!(
             symbol_bare_name(&name).as_str(),
@@ -32025,6 +32065,15 @@ const MACROEXPAND_ALL_MAX_DEPTH: u32 = 400;
 /// spine is walked iteratively so a long body cannot overflow the Rust stack;
 /// only *nesting* recurses (bounded by `MACROEXPAND_ALL_MAX_DEPTH`).
 fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+    mx_each_scoped(list, env, depth, &HashSet::new())
+}
+
+fn mx_each_scoped(
+    list: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut items = Vec::new();
     let mut c = list;
     while c.is_cons() {
@@ -32039,7 +32088,7 @@ fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
     egcl_rt::rooted_ref!(_items_root = &mut items);
     egcl_rt::rooted_ref!(_out_root = &mut out);
     for i in (0..items.len()).rev() {
-        let expanded = macroexpand_all(items[i], env, depth);
+        let expanded = macroexpand_all(items[i], env, depth, local_functions);
         out = arena_cons(expanded, out);
     }
     out
@@ -32054,7 +32103,12 @@ fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
 /// about is returned unchanged and handled by the lazy expansion in `eval_list`
 /// at call time. An expander error also leaves the form verbatim. Thus the pass
 /// can only ever *under*-expand, never miscompile.
-fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn macroexpand_all(
+    form: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() {
         return form;
     }
@@ -32065,14 +32119,22 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
     if car.is_cons() {
         // Root across the allocating recursive expansions (moving GC; bliss-8qf).
         egcl_rt::rooted!(cdr_r = cdr);
-        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d));
-        let tail = mx_each(*cdr_r, env, d);
+        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d, local_functions));
+        let tail = mx_each_scoped(*cdr_r, env, d, local_functions);
         return arena_cons(*new_car, tail);
     }
     if !car.is_symbol() {
         return form;
     }
     let name = sym_name(car);
+    // A local function suppresses macro lookup, but its argument forms still
+    // need definition-time expansion. Symbol indices preserve package identity.
+    if car
+        .symbol_index()
+        .is_some_and(|index| local_functions.contains(&index))
+    {
+        return arena_cons(car, mx_each_scoped(cdr, env, d, local_functions));
+    }
     if matches!(
         symbol_bare_name(&name).as_str(),
         "ATOMIC-INCF" | "ATOMIC-DECF"
@@ -32087,7 +32149,7 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         // returns it verbatim (moving GC; bliss-8qf).
         egcl_rt::rooted!(form_r = form);
         return match expand_macro(&mdef, cdr, env, form) {
-            Ok(expanded) => macroexpand_all(expanded, env, d),
+            Ok(expanded) => macroexpand_all(expanded, env, d, local_functions),
             Err(_) => *form_r,
         };
     }
@@ -32107,23 +32169,42 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         "LET" | "LET*" => {
             let (bindings, body) = cp(cdr);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             arena_cons(car, arena_cons(*new_bindings, new_body))
         }
         "LAMBDA" => {
             // (lambda lambda-list body...) — keep the lambda list, expand body.
             let (ll, body) = cp(cdr);
             egcl_rt::rooted!(ll = ll);
-            let new_body = mx_each(body, env, d);
+            let new_body = mx_each_scoped(body, env, d, local_functions);
             arena_cons(car, arena_cons(*ll, new_body))
         }
         "FLET" | "LABELS" => {
             // (flet ((name lambda-list fbody...) ...) body...)
             let (defs, body) = cp(cdr);
+            let mut inner_functions = local_functions.clone();
+            let mut remaining = defs;
+            while remaining.is_cons() {
+                let (definition, tail) = cp(remaining);
+                if definition.is_cons() {
+                    let local_name = cp(definition).0;
+                    if let Some(index) = local_name.symbol_index() {
+                        inner_functions.insert(index);
+                    }
+                }
+                remaining = tail;
+            }
+            // FLET bindings are visible only in the enclosing body; LABELS
+            // bindings are also visible throughout the local definitions.
+            let definition_scope = if name == "LABELS" {
+                &inner_functions
+            } else {
+                local_functions
+            };
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d, definition_scope));
+            let new_body = mx_each_scoped(*body, env, d, &inner_functions);
             arena_cons(car, arena_cons(*new_defs, new_body))
         }
         "MULTIPLE-VALUE-BIND" => {
@@ -32132,8 +32213,8 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(vars = vars);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             // Build inside out: copying *vars into an outer call's arguments
             // before allocating the inner tail leaves that copy stale if GC
             // relocates the binding list (bliss-ohwle.2).
@@ -32147,8 +32228,8 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(pattern = pattern);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             // As for MVB, re-read the rooted pattern after allocating the tail.
             let tail = arena_cons(*new_value, new_body);
             let tail = arena_cons(*pattern, tail);
@@ -32169,7 +32250,7 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
                 let (clause, rest) = cp(c);
                 c = rest;
                 clauses.push(if clause.is_cons() {
-                    mx_each(clause, env, d)
+                    mx_each_scoped(clause, env, d, local_functions)
                 } else {
                     clause
                 });
@@ -32185,7 +32266,10 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             // (function (lambda ...)) — expand the lambda; (function name) — leave.
             let (target, _) = cp(cdr);
             if target.is_cons() {
-                arena_cons(car, arena_cons(macroexpand_all(target, env, d), NIL))
+                arena_cons(
+                    car,
+                    arena_cons(macroexpand_all(target, env, d, local_functions), NIL),
+                )
             } else {
                 form
             }
@@ -32196,13 +32280,18 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         // RETURN-FROM, UNWIND-PROTECT, EVAL-WHEN, …) and ordinary function
         // calls — expand each argument independently. Symbols in argument
         // position (tags, block names, setq/setf place symbols) pass through.
-        _ => arena_cons(car, mx_each(cdr, env, d)),
+        _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)),
     }
 }
 
 /// Expand the init-forms of a LET/LET* binding list, preserving each binding's
 /// variable name. A binding is `name`, `(name)`, or `(name init)`.
-fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn mx_bindings(
+    bindings: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut out_items = Vec::new();
     let mut c = bindings;
     // Spine cursor, collected bindings, and the per-binding variable name all
@@ -32217,7 +32306,7 @@ fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (var, init) = cp(b);
             egcl_rt::rooted!(var = var);
             // Keep `var`; expand every init-form after it.
-            let new_init = mx_each(init, env, depth);
+            let new_init = mx_each_scoped(init, env, depth, local_functions);
             arena_cons(*var, new_init)
         } else {
             b
@@ -32234,7 +32323,12 @@ fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
 
 /// Expand the bodies of FLET/LABELS local functions, preserving each name and
 /// lambda list: `(name lambda-list fbody...)`.
-fn mx_local_fns(defs: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn mx_local_fns(
+    defs: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut out_items = Vec::new();
     let mut c = defs;
     // Root everything held across the allocating body expansion: the spine
@@ -32252,7 +32346,7 @@ fn mx_local_fns(defs: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
                 let (ll, fbody) = cp(after_name);
                 egcl_rt::rooted!(fname = fname);
                 egcl_rt::rooted!(ll = ll);
-                let new_body = mx_each(fbody, env, depth);
+                let new_body = mx_each_scoped(fbody, env, depth, local_functions);
                 arena_cons(*fname, arena_cons(*ll, new_body))
             } else {
                 def

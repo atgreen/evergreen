@@ -195,6 +195,58 @@ fn multiple_value_prog1_persists_without_source_fallback() {
 }
 
 #[test]
+fn extension_cas_macro_persists_without_bootstrap_or_source() {
+    let dir = workdir("extension-cas-macro");
+    let src = dir.join("cas.lisp");
+    let out = dir.join("cas.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (defun persisted-cas (cell)
+        (list (egcl-ext:cas (car cell) nil :ready)
+              (egcl-ext:cas (car cell) nil :wrong)
+              (car cell)))
+      (format t "PERSISTED-CAS ~S~%" (persisted-cas (cons nil nil)))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {src:?} :output-file {out:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&out).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "legacy source fallback"
+    );
+    let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
+    let start = bbu_action_start(bbu);
+    let (_, _, count) = bbu_counts(&bytes);
+    for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
+        assert_ne!(action[0], 9, "CAS fell back to EvalSource");
+    }
+    fs::remove_file(src).unwrap();
+    let loaded = Command::new(BIN)
+        .args(["--no-init", "--no-bootstrap", "--load"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(
+        loaded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&loaded.stdout).contains("PERSISTED-CAS (NIL :READY :READY)"),
+        "{}",
+        String::from_utf8_lossy(&loaded.stdout)
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn memory_fence_bytecode_persists_without_source_fallback() {
     let dir = workdir("memory-fence");
     let src = dir.join("memory-fence.lisp");
