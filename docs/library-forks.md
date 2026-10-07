@@ -22,7 +22,7 @@ exercises these forks:
 | Library | Fork | Tested revision |
 |---|---|---|
 | trivial-features | https://github.com/atgreen/trivial-features | `651e8ea90db0b143d39b9a414ee382ec62efad2f` |
-| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `0554d306864d252985c23923ef872a1b177894a6` |
+| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e3c675548a9d935fc40860349ed984687c75abe0` |
 | usocket (binary TCP client and server subset) | https://github.com/atgreen/usocket | `39c189d2c51317fbdfa6d6023a3369fdb329e61e` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |

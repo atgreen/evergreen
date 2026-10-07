@@ -23398,7 +23398,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let mut pos = start;
                 if is_gray_stream(inp) {
                     return invoke_generic_function(
-                        "GRAY-READ-SEQUENCE",
+                        "STREAM-READ-SEQUENCE",
                         &[
                             inp,
                             seq,
@@ -23466,25 +23466,29 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // Not a simple vector of octets: fall through to the
                     // generic path, which signals the TYPE-ERROR this cannot.
                 }
+                if is_gray_stream(out) {
+                    // One bulk generic call: a stream class that
+                    // specializes STREAM-WRITE-SEQUENCE -- trivial-gray-streams'
+                    // bridge, Flexi Streams -- sees the whole subsequence; the
+                    // default method falls back to the scalar generics.
+                    invoke_generic_function(
+                        "STREAM-WRITE-SEQUENCE",
+                        &[
+                            out,
+                            seq,
+                            EgclVal::from_fixnum(start as i64),
+                            EgclVal::from_fixnum(end as i64),
+                        ],
+                        env,
+                    )?;
+                    return Ok(seq);
+                }
                 let mut elems = Vec::with_capacity(end - start);
                 egcl_rt::rooted_ref!(_elements_root = &mut elems);
                 for i in start..end {
                     elems.push(egcl_stdlib::elt(seq, i)?);
                 }
-                if is_gray_stream(out) {
-                    // GC can update the rooted vector during a child call; do not
-                    // retain an iterator borrow across that call.
-                    #[allow(clippy::needless_range_loop)]
-                    for index in 0..elems.len() {
-                        let el = elems[index];
-                        let gf = if el.is_character() {
-                            "STREAM-WRITE-CHAR"
-                        } else {
-                            "STREAM-WRITE-BYTE"
-                        };
-                        invoke_generic_function(gf, &[out, el], env)?;
-                    }
-                } else if egcl_stdlib::is_byte_stream(out) {
+                if egcl_stdlib::is_byte_stream(out) {
                     // GC can update the rooted vector during a child call; do not
                     // retain an iterator borrow across that call.
                     #[allow(clippy::needless_range_loop)]
