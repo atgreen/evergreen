@@ -24,6 +24,10 @@
   variadic functions, instead of the bootstrap dispatcher's fixed integer
   shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
 
+- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
+  the runtime recovery handler instead of terminating the process
+  ([#123](https://github.com/atgreen/evergreen/pull/123)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
