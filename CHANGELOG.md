@@ -17,7 +17,7 @@
 - Fibers on riscv64 now switch stacks natively instead of running on the
   scheduler's no-context-switch fallback, so cooperative scheduling, parking,
   and carrier migration behave as on the other Linux ports
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#120](https://github.com/atgreen/evergreen/pull/120)).
 
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
