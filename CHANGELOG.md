@@ -90,6 +90,11 @@
   compile at T1 instead of staying interpreted, including loops that create a
   closure per iteration and factories whose parameters are captured
   ([#126](https://github.com/atgreen/evergreen/pull/126)).
+
+- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
+  check instead of calling the numeric runtime for every `*`, deoptimizing to
+  the interpreter for a bignum product or a non-fixnum operand
+  ([#127](https://github.com/atgreen/evergreen/pull/127)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
