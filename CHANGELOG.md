@@ -30,6 +30,11 @@
   interpreter in place and returns a finished value: div2 327 to 239 ms on a
   z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
 
+- On s390x, a self-recursive T2 function keeps its direct self-call entry
+  when its body also calls other functions, as long as no heap value is live
+  across a call; such functions no longer pay the generic adapter on every
+  recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
