@@ -35,6 +35,11 @@
   across a call; such functions no longer pay the generic adapter on every
   recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
 
+- On s390x, `EGCL-EXT:MEMORY-BARRIER`, `LOAD-BARRIER` and `STORE-BARRIER` now
+  compile to a native serialization instruction at every tier instead of a
+  generic call, and functions using them persist to bfasl as on x86-64
+  ([#118](https://github.com/atgreen/evergreen/pull/118)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
