@@ -569,11 +569,7 @@ fn framed_mat(
         // live value. The scratch is safe because a general two-operand path uses
         // at most one materialised constant (the other operand is a variable, and
         // both-constant cases are folded upstream / rejected below).
-        mov_imm64(
-            a,
-            SCRATCH,
-            egcl_rt::value::EgclVal::from_fixnum(c).0 as i64,
-        );
+        mov_imm64(a, SCRATCH, egcl_rt::value::EgclVal::from_fixnum(c).0 as i64);
         return Ok(SCRATCH);
     }
     Err(EmitError::UnsupportedOp(0xF2))
@@ -1619,9 +1615,11 @@ fn emit_invoke_call(
         crate::t2::ir::AuxData::HostEval(index) => {
             (TRANSFER_HOST_EVAL_REQUEST | u64::from(index), 0, false)
         }
-        crate::t2::ir::AuxData::FunctionLookup(symbol) => {
-            (TRANSFER_FUNCTION_LOOKUP_REQUEST | u64::from(symbol), 0, false)
-        }
+        crate::t2::ir::AuxData::FunctionLookup(symbol) => (
+            TRANSFER_FUNCTION_LOOKUP_REQUEST | u64::from(symbol),
+            0,
+            false,
+        ),
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -3483,6 +3481,25 @@ fn emit_framed_inner(
                     fixnum_valued.insert(r);
                 }
             }
+            // A declared FIXNUM result is a proof by construction (a guard's
+            // narrowed value, a speculated site's result): its def dominates
+            // every use, so no use needs a re-guard.
+            for &r in &d.results {
+                if type_is(r, TypeBits::FIXNUM) {
+                    fixnum_valued.insert(r);
+                }
+            }
+        }
+        // A block parameter is refined to FIXNUM only when every edge into it
+        // carries a fixnum and any OSR entry checks the imported value
+        // (opt_guard loop-entry splitting), so it is proven as well. Entry
+        // parameters stay with `declared_fixnums` and its boundary check.
+        if b != entry {
+            for &p in &f.block(b).params {
+                if type_is(p, TypeBits::FIXNUM) {
+                    fixnum_valued.insert(p);
+                }
+            }
         }
     }
     // Lightweight value ranges, enough to prove some left shifts can't overflow (so
@@ -3772,15 +3789,11 @@ fn emit_framed_inner(
             // tagged homes; the GC safely ignores non-pointer slot contents.
             let mut live = HashSet::new();
             for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr
-                    || range.start > pp
-                    || pp >= range.end
-                {
+                if range.vreg.class != RegClass::Gpr || range.start > pp || pp >= range.end {
                     continue;
                 }
                 let value = Value(range.vreg.num);
-                if f.value(value).repr == ValueRepresentation::Tagged
-                    && homes.contains_key(&value)
+                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
                 {
                     live.insert(value);
                 }
@@ -3801,8 +3814,10 @@ fn emit_framed_inner(
     // values live at that exact machine program point, not a guessed block-wide
     // set; an incomplete map rejects this native artifact before installation.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (straight_poll_sources, straight_poll_roots):
-        (HashSet<Inst>, HashMap<Inst, Vec<Value>>) = if transfers
+    let (straight_poll_sources, straight_poll_roots): (
+        HashSet<Inst>,
+        HashMap<Inst, Vec<Value>>,
+    ) = if transfers
         .as_ref()
         .and_then(|transfer| transfer.poll_veneer)
         .is_some()
@@ -3836,18 +3851,14 @@ fn emit_framed_inner(
             let pp = u32::try_from(mi).map_err(|_| EmitError::UnsupportedOp(0xFE))? * 2;
             let mut live = HashSet::new();
             for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr
-                    || range.start > pp
-                    || pp >= range.end
-                {
+                if range.vreg.class != RegClass::Gpr || range.start > pp || pp >= range.end {
                     continue;
                 }
                 let value = Value(range.vreg.num);
                 if machine_inst.defs.contains(&range.vreg) {
                     continue;
                 }
-                if f.value(value).repr == ValueRepresentation::Tagged
-                    && homes.contains_key(&value)
+                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
                 {
                     live.insert(value);
                 }
@@ -3932,18 +3943,17 @@ fn emit_framed_inner(
     let mut a = Asm::new();
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-    // Variadic and activation-backed functions require the frame entry.
+                                    // Variadic and activation-backed functions require the frame entry.
     let has_reg_entry = !has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()
         && f.block(entry).params.len() <= arg_regs.len();
     // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
     // Every native caller must propagate a transfer raised by that fallback.
-    let transfer_check =
-        (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
-            pending_addr: c2i_transfer_pending_addr,
-            exit: a.label(),
-        });
+    let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
+        pending_addr: c2i_transfer_pending_addr,
+        exit: a.label(),
+    });
     // Precise deopt (bliss-mba): each guarding instruction gets its own deopt stub
     // that reconstructs the interpreter frame at that guard's bytecode position.
     // Every instruction that reaches `emit_arith_inst` (the only guard emitter)
@@ -4119,10 +4129,7 @@ fn emit_framed_inner(
                 .and_then(|transfer| transfer.poll_veneer)
                 .ok_or(EmitError::UnsupportedOp(0xFE))?;
             let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
-            let roots = loop_roots
-                .get(&b)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+            let roots = loop_roots.get(&b).map(Vec::as_slice).unwrap_or(&[]);
             emit_shadow_root_sync(
                 &mut a,
                 roots,
@@ -4900,11 +4907,31 @@ fn emit_framed_inner(
         Imm(u64),
         Remat(crate::t2::frame_state::RematRecipeId),
     }
+    // An OSR entry with type checks deoptimises through its own header state
+    // when an imported value fails; the stub is emitted with the others.
+    let osr_check_labels: Vec<Option<egcl_rt::asm::Label>> = f
+        .osr_entries
+        .iter()
+        .map(|o| (!o.checks.is_empty()).then(|| a.label()))
+        .collect();
+    let mut deopt_stubs: Vec<(
+        crate::t2::frame_state::FrameStateId,
+        egcl_rt::asm::Label,
+        String,
+    )> = Vec::new();
     for (&inst, &label) in &inst_deopt {
         let fsid = f
             .inst(inst)
             .frame_state
             .ok_or(EmitError::UnsupportedOp(0xF4))?;
+        deopt_stubs.push((fsid, label, format!("{inst:?}")));
+    }
+    for (osr, label) in f.osr_entries.iter().zip(&osr_check_labels) {
+        if let Some(label) = label {
+            deopt_stubs.push((osr.frame_state, *label, format!("osr@{}", osr.bcp)));
+        }
+    }
+    for (fsid, label, origin) in deopt_stubs {
         let fs = f.frame_states.get(fsid);
         if fs.scopes.is_empty() {
             return Err(EmitError::UnsupportedOp(0xF4));
@@ -4912,7 +4939,7 @@ fn emit_framed_inner(
         if std::env::var_os("EGCL_FRAMESTATE_DBG").is_some() {
             for (si, scope) in fs.scopes.iter().enumerate() {
                 eprintln!(
-                    "[fs] inst={inst:?} scope#{si} fn={} bcp={} nlocals={} nstack={}",
+                    "[fs] inst={origin} scope#{si} fn={} bcp={} nlocals={} nstack={}",
                     scope.function,
                     scope.bcp,
                     scope.locals.len(),
@@ -5026,7 +5053,7 @@ fn emit_framed_inner(
     // The normal Return epilogue
     // balances this stub's prologue.
     let mut osr_entries = Vec::new();
-    for osr in &f.osr_entries {
+    for (osr_idx, osr) in f.osr_entries.iter().enumerate() {
         let fs = f.frame_states.get(osr.frame_state);
         let Some(scope) = fs.scopes.first() else {
             continue;
@@ -5053,22 +5080,9 @@ fn emit_framed_inner(
         {
             continue;
         }
-        let offset = a.here();
-        emit_prologue(&mut a);
-        if cfg!(windows) {
-            mov_rr(&mut a, 7, 1);
-        }
-        if let Some(home) = frame_base_home {
-            store_home(&mut a, home, 7 /* rdi */, 0);
-        }
-        // Import only slots whose value is LIVE at the OSR target block.
-        // regalloc2 reuses one register for several disjoint-range values, so
-        // a slot map can legitimately name two values sharing a register home
-        // — at most one is live at the target. Loading a dead slot after the
-        // live one clobbered it (bliss-x5y.29: with the reduced register pool,
-        // live-osr's sum and a dead local shared rcx and the OSR result was
-        // the dead value). Liveness is read from regalloc2's precise
-        // per-ProgPoint ranges, the same source the safepoint roots use.
+        // Liveness at the target, read from regalloc2's precise per-ProgPoint
+        // ranges (see the import loop below); needed first to decide whether
+        // every checked value will be imported at all.
         let target_pp = f
             .block_order()
             .iter()
@@ -5083,6 +5097,49 @@ fn emit_framed_inner(
                     && pp < r.end
             })
         };
+        // Every checked value must be a fixnum proof on an imported, homed
+        // value, or the entry cannot establish it: decline (bliss-5yz5h).
+        let checks_emittable = osr.checks.iter().all(|&(v, ty)| {
+            !ty.bits.is_bottom()
+                && ty.bits.meet(TypeBits::FIXNUM) == ty.bits
+                && homes.contains_key(&v)
+                && live_at_target(v)
+        });
+        if !checks_emittable {
+            continue;
+        }
+        let offset = a.here();
+        emit_prologue(&mut a);
+        if cfg!(windows) {
+            mov_rr(&mut a, 7, 1);
+        }
+        if let Some(home) = frame_base_home {
+            store_home(&mut a, home, 7 /* rdi */, 0);
+        }
+        // The header state names values that are not live at the target and
+        // so are never imported — deopt-only loop phis. Give those homes NIL
+        // first, so a later deopt stub (a failed entry check, or any guard in
+        // the loop) serialises a tagged datum rather than whatever the
+        // register or slot held when the entry was taken; a live import below
+        // overwrites any home the two happen to share.
+        for spec in &specs {
+            if let ValueSource::Value { value, .. } = &spec.source {
+                if !live_at_target(*value) {
+                    if let Some(&home) = homes.get(value) {
+                        mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+                        store_home(&mut a, home, RAX, 0);
+                    }
+                }
+            }
+        }
+        // Import only slots whose value is LIVE at the OSR target block.
+        // regalloc2 reuses one register for several disjoint-range values, so
+        // a slot map can legitimately name two values sharing a register home
+        // — at most one is live at the target. Loading a dead slot after the
+        // live one clobbered it (bliss-x5y.29: with the reduced register pool,
+        // live-osr's sum and a dead local shared rcx and the OSR result was
+        // the dead value). Liveness is read from regalloc2's precise
+        // per-ProgPoint ranges, the same source the safepoint roots use.
         for spec in &specs {
             let slot = spec.index as usize;
             if let ValueSource::Value { value, .. } = &spec.source {
@@ -5107,6 +5164,19 @@ fn emit_framed_inner(
                             mov_from_frame(&mut a, RAX, 7 /* rdi */, slot);
                             store_home(&mut a, home, RAX, 0);
                         }
+                    }
+                }
+            }
+        }
+        // Establish the proofs the loop relies on for imported values: a
+        // non-fixnum deoptimises to the header state before any iteration.
+        if let Some(label) = osr_check_labels[osr_idx] {
+            for &(v, _) in &osr.checks {
+                match homes[&v] {
+                    FramedHome::Reg(r) => guard_fixnum(&mut a, r, label),
+                    home @ FramedHome::Stack(_) => {
+                        load_home(&mut a, RAX, home, 0);
+                        guard_fixnum(&mut a, RAX, label);
                     }
                 }
             }
@@ -5498,6 +5568,7 @@ mod tests {
             bcp: 0,
             block: entry,
             frame_state,
+            checks: Vec::new(),
         });
         let framed = emit_framed(&f, deopt as *const () as u64, 0, 0, 0, 0, 0, 0, 0, None)
             .expect("framed Windows multiply");
@@ -5949,8 +6020,7 @@ mod tests {
             egcl_rt::object::type_id::PATHNAME,
             2,
         ));
-        frame[0] =
-            unsafe { EgclVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()).0 };
+        frame[0] = unsafe { EgclVal::from_heap_ptr(Box::into_raw(pathname_header).cast::<u8>()).0 };
         DEOPTED.store(false, Ordering::SeqCst);
         let _ = length(frame.as_mut_ptr());
         assert!(

@@ -1092,6 +1092,12 @@ pub fn emit_framed_with_runtime(
     }
     let mut osr_entries = Vec::new();
     for osr in &function.osr_entries {
+        // Imported values this entry must type-check are only tested by the
+        // x86-64 framed emitter; without the test the loop's proofs would not
+        // hold for an interpreter value, so decline the entry (bliss-5yz5h).
+        if !osr.checks.is_empty() {
+            continue;
+        }
         let state = function.frame_states.get(osr.frame_state);
         let Some(scope) = state.scopes.first() else {
             continue;
@@ -1389,6 +1395,7 @@ mod tests {
             block: header,
             bcp: 12,
             frame_state: state,
+            checks: Vec::new(),
         });
         for (block, args) in [(entry, inputs), (header, carried)] {
             f.set_terminator(
