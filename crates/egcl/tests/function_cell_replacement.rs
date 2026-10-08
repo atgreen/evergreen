@@ -315,3 +315,47 @@ fn native_slot_callee_recompiles_after_numeric_phase_changes() {
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("NATIVE-SLOT-PHASE-OK"));
 }
+
+#[test]
+fn cached_gethash_calls_preserve_values_errors_and_redefinition() {
+    // Calling a saved builtin after restoring its function cell currently
+    // overflows even on the parent revision (bliss-cqtpe). This probe checks
+    // replacement invalidation and restores the cell only for cleanup.
+    let program = r#"
+      (defun cached-get2 (key table) (gethash key table))
+      (defun cached-get3 (key table default) (gethash key table default))
+      (let ((table (make-hash-table :test 'eql)) (key (list :key)))
+        (dotimes (i 40) (cached-get2 key table) (cached-get3 key table :absent))
+        (assert (= EXPECTED-TIER (egcl-ext:function-tier 'cached-get2)))
+        (assert (= EXPECTED-TIER (egcl-ext:function-tier 'cached-get3)))
+        (assert (equal (multiple-value-list (cached-get2 key table)) '(nil nil)))
+        (assert (equal (multiple-value-list (cached-get3 key table :absent)) '(:absent nil)))
+        (setf (gethash key table) nil)
+        (assert (equal (multiple-value-list (cached-get3 key table :absent)) '(nil t)))
+        (setf (gethash key table) (list :stored))
+        (assert (equal (multiple-value-list (cached-get2 key table)) '((:stored) t)))
+        (assert (handler-case (progn (cached-get2 key nil) nil) (type-error () t)))
+        (let ((saved (symbol-function 'gethash)))
+          (unwind-protect
+              (progn
+                (setf (symbol-function 'gethash)
+                      (lambda (key table &optional default)
+                        (declare (ignore key table))
+                        (values default :replacement)))
+                (assert (equal (multiple-value-list (cached-get2 key table)) '(nil :replacement)))
+                (assert (equal (multiple-value-list (cached-get3 key table :changed)) '(:changed :replacement))))
+            (setf (symbol-function 'gethash) saved))))
+      (format t "GETHASH-CACHE-CORRECT~%")
+    "#;
+    for (tier, expected) in [("t0", "0"), ("t1", "1"), ("t2", "2")] {
+        let program = program.replace("EXPECTED-TIER", expected);
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--eval", &program])
+            .env("EGCL_FORCE_TIER", tier)
+            .env("EGCL_LAZY_COMPILE", "0")
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{tier}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("GETHASH-CACHE-CORRECT"), "{tier}: {stdout}");
+    }
+}

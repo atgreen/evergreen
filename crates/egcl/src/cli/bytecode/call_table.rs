@@ -426,6 +426,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gethash_slot_caches_builtin_and_preserves_both_values() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(table = super::super::super::read_eval_all_env(
+            "(make-hash-table :test 'eql)", &mut env,
+        ).unwrap());
+        let symbol = super::super::super::resolve_sym("GETHASH").unwrap().as_symbol_index();
+        let cell = resolve(symbol).unwrap();
+        let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+        struct RestoreEnv(*mut Env);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                NATIVE_ENV.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut env)));
+        egcl_rt::rooted!(args = [EgclVal::from_fixnum(7), *table, EgclVal::from_fixnum(99)]);
+        for nargs in [2, 3] {
+            egcl_stdlib::remhash(args[0], *table).unwrap();
+            let default = if nargs == 2 { NIL } else { args[2] };
+            assert_eq!(cold(state, &args[..nargs]).unwrap(), default);
+            assert_eq!(env.mv, vec![default, NIL]);
+            assert!(env.mv_active);
+            assert!(!cell.is_cold(), "GETHASH must install its builtin target");
+            assert!(matches!(*state.target.borrow(), Some(Target::Builtin { .. })));
+            egcl_stdlib::set_gethash(args[0], *table, NIL).unwrap();
+            TARGET_LOOKUPS.with(|count| count.set(0));
+            for _ in 0..100 {
+                let entry = unsafe { &*cell.entry_address(false) }
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                    unsafe { std::mem::transmute(entry) };
+                assert_eq!(call(Arc::as_ptr(&cell) as u64, nargs as u64,
+                    args[0].0, args[1].0, args[2].0, 0), NIL.0);
+                assert_eq!(env.mv, vec![NIL, T], "a stored NIL is present");
+                assert!(env.mv_active);
+            }
+            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
+                "warmed GETHASH calls must not resolve their target again");
+        }
+        assert!(matches!(warm(state, &args[..1]), Err(EgclError::ProgramError(_))));
+        assert!(matches!(warm(state, &[args[0], NIL]), Err(EgclError::TypeError { .. })));
+    }
+
     fn check_native_slot(name: &str, params: &str, expression: &str, args: &[i64], expected: i64) {
         let _lock = super::super::super::heap_test_lock()
             .lock()
