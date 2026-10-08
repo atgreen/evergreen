@@ -127,6 +127,61 @@ fn make_thread_creates_and_joins_a_native_os_thread() {
     assert_eq!(join_thread(id2).unwrap(), T);
 }
 
+thread_local! {
+    static HOST_SETUP_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn check_host_setup_entry() -> EgclVal {
+    if HOST_SETUP_ACTIVE.with(|active| active.get()) {
+        T
+    } else {
+        NIL
+    }
+}
+
+fn panic_with_host_setup_entry() -> EgclVal {
+    assert!(HOST_SETUP_ACTIVE.with(|active| active.get()));
+    panic!("deliberate worker failure");
+}
+
+#[test]
+fn thread_host_setup_lives_through_entry_and_drops_before_join() {
+    struct Guard(std::sync::Arc<AtomicBool>, std::rc::Rc<()>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            assert!(HOST_SETUP_ACTIVE.with(|active| active.replace(false)));
+            assert_eq!(std::rc::Rc::strong_count(&self.1), 1);
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    for (entry, success) in [
+        (native_entry::entry(check_host_setup_entry), true),
+        (native_entry::entry(panic_with_host_setup_entry), false),
+        (EgclVal::from_fixnum(42), false),
+    ] {
+        let dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let report = dropped.clone();
+        let thread = make_thread_named_with_setup(entry, None, move || {
+            assert!(!HOST_SETUP_ACTIVE.with(|active| active.replace(true)));
+            Guard(report, std::rc::Rc::new(()))
+        })
+        .unwrap();
+        let result = join_thread(thread);
+        if success {
+            assert_eq!(result.unwrap(), T);
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(dropped.load(Ordering::Acquire));
+    }
+}
+
+#[test]
+fn thread_host_setup_panic_publishes_completion() {
+    let thread = make_thread_named_with_setup(T, None, || panic!("setup failed")).unwrap();
+    assert!(join_thread_timeout(thread, Some(std::time::Duration::from_secs(5))).is_err());
+}
+
 #[test]
 fn named_thread_lifecycle_and_bounded_join_are_truthful() {
     NATIVE_LIFECYCLE_CAN_FINISH.store(false, Ordering::Release);

@@ -5,34 +5,15 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("repo root")
-}
-
-fn cargo_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 fn egcl_bin_path() -> &'static Path {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let status = Command::new("cargo")
-            .current_dir(repo_root())
-            .args(["build", "-p", "egcl"])
-            .status()
-            .expect("build egcl");
-        assert!(status.success(), "cargo build -p egcl failed");
-        PathBuf::from(env!("CARGO_BIN_EXE_egcl"))
-    })
-    .as_path()
+    // Cargo builds the `egcl` binary for this test's own target and profile
+    // before running the test and hands its path over in CARGO_BIN_EXE_egcl.
+    // Rebuilding here with a nested `cargo build -p egcl` added nothing and
+    // broke every native non-x86-64 run: the nested build targets the host
+    // default (the musl x86-64 pin in .cargo/config.toml) and fails outright.
+    Path::new(env!("CARGO_BIN_EXE_egcl"))
 }
 
 fn egcl() -> Command {

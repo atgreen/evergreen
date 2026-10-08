@@ -2,7 +2,169 @@
 
 ## Unreleased
 
+- RISC-V now supports the opt-in native segment boundary, preserving callee-
+  saved integer and floating-point registers across native returns and
+  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
+
+- riscv64 now has a T1 baseline native compiler with guarded fixnum
+  arithmetic, comparisons, live on-stack replacement, and deoptimization, so
+  hot functions run as RV64 machine code instead of bytecode. T2 optimizing
+  compilation is still x86-64, AArch64, ppc64le and s390x only
+  ([#93](https://github.com/atgreen/evergreen/pull/93)).
+
+- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
+  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
+  operations and constant shifts, GC-safe runtime calls, polled loops, live
+  T1-to-T2 OSR and precise deoptimization
+  ([#112](https://github.com/atgreen/evergreen/pull/112)).
+
+- Fibers on riscv64 now switch stacks natively instead of running on the
+  scheduler's no-context-switch fallback, so cooperative scheduling, parking,
+  and carrier migration behave as on the other Linux ports
+  ([#120](https://github.com/atgreen/evergreen/pull/120)).
+
+- Foreign calls on riscv64 now use the LP64D calling convention for every
+  scalar signature, including floats, doubles, mixed argument lists and
+  variadic functions, instead of the bootstrap dispatcher's fixed integer
+  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
+
+- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
+  the runtime recovery handler instead of terminating the process
+  ([#123](https://github.com/atgreen/evergreen/pull/123)).
+
+- An inline s390x deoptimization now resumes on its owned Lisp frame when
+  available, preserving original arguments without duplicating the function in
+  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
+
+- s390x T2 functions now save and restore only the callee-saved registers they
+  use, reducing native call overhead
+  ([#115](https://github.com/atgreen/evergreen/pull/115)).
+
+- s390x T2 code uses shorter native instruction sequences for small constants
+  and fixnum tag checks
+  ([#113](https://github.com/atgreen/evergreen/pull/113)).
+
+- s390x T2 compilation diagnostics now report the actual register entry offset
+  used by direct recursive calls
+  ([#101](https://github.com/atgreen/evergreen/pull/101)).
+
+- On s390x, T2 now compiles additional type predicates and names unsupported
+  opcodes in compilation diagnostics
+  ([#91](https://github.com/atgreen/evergreen/pull/91)).
+
+- On s390x, T1 native code now calls other native functions directly, pushing
+  the callee frame inline instead of dispatching through the generic adapter.
+  With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
+  to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
+
+- On s390x, T2 native code calls other native functions directly as well,
+  with the callees resolved when the compile is queued. With T2 on, on a z17:
+  takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
+  ([#97](https://github.com/atgreen/evergreen/pull/97)).
+
+- On s390x, T2 now compiles uncommon traps and the simple-string fast paths
+  (`STRINGP`, `LENGTH`, ASCII `CHAR`), so shapes such as UIOP's `FIRST-CHAR`
+  and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
+  line of every s390x structural decline
+  ([#99](https://github.com/atgreen/evergreen/pull/99)).
+
+- On s390x, a T2 deoptimization now resumes the interpreter in place, so a
+  guard failing deep inside a directly recursive call returns the right value:
+  `(pow2 70)` answers 2^70 instead of signalling TYPE-ERROR. A self-call with
+  the wrong number of arguments now signals PROGRAM-ERROR at T2 on every
+  target instead of binding whatever the argument registers held
+  ([#107](https://github.com/atgreen/evergreen/pull/107)).
+
+- On s390x, native code now calls T2 functions that may deoptimize directly
+  instead of through the generic adapter, since such a callee resumes the
+  interpreter in place and returns a finished value: div2 327 to 239 ms on a
+  z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
+
+- On s390x, a self-recursive T2 function keeps its direct self-call entry
+  when its body also calls other functions, as long as no heap value is live
+  across a call; such functions no longer pay the generic adapter on every
+  recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
+
+- On s390x, `EGCL-EXT:MEMORY-BARRIER`, `LOAD-BARRIER` and `STORE-BARRIER` now
+  compile to a native serialization instruction at every tier instead of a
+  generic call, and functions using them persist to bfasl as on x86-64
+  ([#118](https://github.com/atgreen/evergreen/pull/118)).
+
+- On s390x, functions that create closures (any LAMBDA in the body) now
+  compile at T1 instead of staying interpreted, including loops that create a
+  closure per iteration and factories whose parameters are captured
+  ([#126](https://github.com/atgreen/evergreen/pull/126)).
+
+- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
+  check instead of calling the numeric runtime for every `*`, deoptimizing to
+  the interpreter for a bignum product or a non-fixnum operand
+  ([#127](https://github.com/atgreen/evergreen/pull/127)).
+- On s390x, eligible self-recursive functions now call their T2 native entry
+  directly, reducing recursive-call overhead while retaining stack-limit
+  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
+
+- T2 now propagates fixnum guards through tail-call loop parameters and
+  recursive results, allowing functions such as `TAK` to use direct native
+  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
+
+- On s390x, native code now calls eligible leaf builtins through cached
+  builtin slots instead of resolving each call by name, while retaining
+  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
+
+- Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
+  filesystem adapters, pinned setup instructions, and verified fresh
+  distribution installation, dependent-system loading, and offline reload
+  ([#92](https://github.com/atgreen/evergreen/pull/92)).
+
+- Initialize `*MACROEXPAND-HOOK*` and honor custom hooks during macroexpansion
+  and compilation, including symbol macros. This enables Quicklisp's
+  compilation-progress wrapper when loading downloaded systems
+  ([#90](https://github.com/atgreen/evergreen/pull/90)).
+
+- `PROBE-FILE` now accepts file streams, including closed streams, allowing
+  Quicklisp to finish writing its local-project index
+  ([#87](https://github.com/atgreen/evergreen/pull/87)).
+
+- Fix `DIRECTORY` traversal of wildcard directory components, allowing
+  Quicklisp to discover installed distributions. Single `*` components match
+  exactly one level; `**` still searches recursively without duplicate scans
+  ([#86](https://github.com/atgreen/evergreen/pull/86)).
+
+## 0.0.3 - 2026-10-07
+
+### Common Lisp support
+
+- `EGCL-GRAY-STREAMS` now exports `STREAM-READ-SEQUENCE` and
+  `STREAM-WRITE-SEQUENCE`, and `READ-SEQUENCE` / `WRITE-SEQUENCE` on a Gray
+  stream dispatch through them with one bulk call, falling back to the scalar
+  generics by default. Portable libraries that specialize the
+  trivial-gray-streams sequence methods are now reached from the standard
+  entry points ([#81](https://github.com/atgreen/evergreen/pull/81)).
+
+- Add `PPRINT-LOGICAL-BLOCK`, its lexical list-traversal helpers, conditional
+  line breaks and indentation, and `PPRINT-FILL` / `PPRINT-LINEAR`. Nested
+  blocks honor prefixes, suffixes, print limits, and circular-list labels,
+  allowing Quicklisp's setup code to compile past its missing-macro failure
+  ([#55](https://github.com/atgreen/evergreen/pull/55)).
+
 ### Performance
+
+- `MULTIPLE-VALUE-PROG1` now compiles to bytecode and baseline native code,
+  allowing Ironclad's Keccak implementation to tier instead of remaining
+  interpreted, including after compiled-file loading
+  ([#56](https://github.com/atgreen/evergreen/pull/56)).
+
+- Functions using `CAR`, `CDR`, bitwise operations, shifts, or power-of-two
+  `MOD` now reach T2 native code on s390x instead of stopping at T1
+  ([#62](https://github.com/atgreen/evergreen/pull/62)).
+
+- `EQ`, `NULL`, and `NOT` now reach T2 native code on s390x
+  ([#65](https://github.com/atgreen/evergreen/pull/65)).
+
+- `SEARCH` now advances list candidates without restarting each traversal and
+  searches vectors without copying the entire target, avoiding long stalls
+  while libraries scan large text such as TLS certificate bundles
+  ([#67](https://github.com/atgreen/evergreen/pull/67)).
 
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
   fence instructions, including after compiled-file loading
@@ -22,10 +184,100 @@
 
 ### Platform support
 
+- Restore Windows builds and stack-limit checks by selecting the Windows OS
+  backend correctly ([#85](https://github.com/atgreen/evergreen/pull/85)).
+
+- Evergreen now builds and runs natively on riscv64 Linux (RV64GC). The
+  interpreter and bytecode tiers, compiled-file loading, and heap images
+  work; saved images carry a distinct `RISCV64` tag, and `*features*`
+  includes `:riscv` and `:riscv64`. Native compilation and the foreign-call
+  ABI are not yet ported ([#82](https://github.com/atgreen/evergreen/pull/82)).
+
+- Recoverable null-pointer and stack-guard faults on s390x now resume at the
+  runtime recovery handler instead of terminating the process
+  ([#64](https://github.com/atgreen/evergreen/pull/64)).
+
+- `DISASSEMBLE` now decodes s390x native code in-process, with mnemonics,
+  operands and branch targets in binutils syntax, instead of listing raw
+  bytes ([#74](https://github.com/atgreen/evergreen/pull/74)).
+
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
   ([#51](https://github.com/atgreen/evergreen/pull/51)).
 
 ### Correctness and reliability
+
+- `OPEN :DIRECTION :PROBE` now returns a closed stream and honors
+  `:IF-DOES-NOT-EXIST :CREATE`, allowing Quicklisp to enable installed
+  distributions. Input streams also honor explicit file creation without
+  truncating existing content ([#83](https://github.com/atgreen/evergreen/pull/83)).
+
+- Unbound slot reads now call user-defined `SLOT-UNBOUND` methods through both
+  `SLOT-VALUE` and generated accessors, enabling lazy slot initialization such
+  as Quicklisp's distribution directories. The default method signals
+  `UNBOUND-SLOT` with the offending slot and instance
+  ([#78](https://github.com/atgreen/evergreen/pull/78)).
+
+- `ENSURE-DIRECTORIES-EXIST` now creates the final directory component of a
+  directory-only pathname, allowing fresh Quicklisp distribution installations
+  to create their metadata directories
+  ([#79](https://github.com/atgreen/evergreen/pull/79)).
+
+- Floating-point `FORMAT` directives now accept ratios and bignums, allowing
+  Quicklisp download progress to display sizes and rates. Large ratio
+  components are scaled safely, out-of-range rational arguments signal an
+  arithmetic error, and negative-zero signs are preserved
+  ([#76](https://github.com/atgreen/evergreen/pull/76)).
+
+- `DIRECTORY` now returns `NIL` for wildcard searches under missing
+  directories, allowing fresh Quicklisp setup without a pre-created
+  `local-init/` directory ([#75](https://github.com/atgreen/evergreen/pull/75)).
+
+- `WRITE` now uses the dynamic `*PRINT-ESCAPE*` value when `:ESCAPE` is omitted
+  ([#55](https://github.com/atgreen/evergreen/pull/55)).
+
+- `TYPE-OF` now preserves the defining package of structure, class, and
+  condition names, fixing cross-package digest copying used by TLS key
+  derivation ([#57](https://github.com/atgreen/evergreen/pull/57)).
+
+- Extension macros, including `EGCL-EXT:CAS` and atomic arithmetic, now expand
+  consistently in interpreted and compiled code. Local function shadowing and
+  definition-time macro snapshots are preserved
+  ([#58](https://github.com/atgreen/evergreen/pull/58)).
+
+- The EGCL fork installer now includes the Atomics CAS adapter, supporting
+  CAS-dependent initialization in libraries such as `cl-cancel`
+  ([#59](https://github.com/atgreen/evergreen/pull/59)).
+
+- Native TCP listeners can now be shared across threads and fibers, honor
+  backlog and address-reuse options, and use GC-safe cooperative accept and
+  readiness waits on Unix; closing a listener wakes pending waits
+  ([#60](https://github.com/atgreen/evergreen/pull/60)).
+
+- Native threads now share their creator's package registry, preserving library
+  symbol lookup in workers and threads created by fibers. This fixes Ironclad
+  reporting SHA256 as unsupported in TLS server threads
+  ([#68](https://github.com/atgreen/evergreen/pull/68)).
+
+- `ENCODE-UNIVERSAL-TIME` now rejects invalid fields and preserves exact
+  fractional time-zone offsets and large years
+  ([#69](https://github.com/atgreen/evergreen/pull/69)).
+
+- Compiled `HANDLER-BIND` now preserves lexical handler functions and initializer
+  behavior, including native execution and garbage collection
+  ([#70](https://github.com/atgreen/evergreen/pull/70)).
+
+- `CHANGE-CLASS` now honors initialization arguments and class-change hooks,
+  preserving retained slot values and initializing newly added slots
+  ([#71](https://github.com/atgreen/evergreen/pull/71)).
+
+- Native socket byte-read timeouts now signal `EGCL-EXT:IO-TIMEOUT`, retaining
+  the affected stream so callers can distinguish expiry from other I/O errors
+  ([#72](https://github.com/atgreen/evergreen/pull/72)).
+
+- The USOCKET fork now supports binary TCP listeners, cross-thread accept and
+  close, listener port queries, explicit address-reuse options, and inherited
+  or independently configured read timeouts with `USOCKET:TIMEOUT-ERROR` mapping
+  ([#61](https://github.com/atgreen/evergreen/pull/61)).
 
 - `EQ` comparisons between constant operands now compile at T2, including
   comparisons used as values or branch conditions
@@ -88,6 +340,11 @@
 - Compiled `TYPEP` now returns exactly one value at every execution tier,
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).
+
+- Single-float arithmetic on ppc64le now returns correct values once a
+  function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
+  returned `2.2578125` there while the interpreter and baseline tier were
+  right ([#95](https://github.com/atgreen/evergreen/pull/95)).
 
 ## 0.0.2 - 2026-10-05
 

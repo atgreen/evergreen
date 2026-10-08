@@ -657,6 +657,52 @@ pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
     allocate_with_call_operands(mf, env, clobbers, true)
 }
 
+/// LP64 allocation for the riscv64 framed emitter. `PhysReg.encoding` is the
+/// architectural register number.
+///
+/// The allocatable integer set is s1 and s3–s11: callee-saved, so a value stays
+/// put across a runtime call and the prologue saves them once. s2 is reserved
+/// for the frame-slots pointer for the whole body (System Z uses r13), s0 is
+/// left as the frame pointer, sp/ra/gp/tp are not allocatable, and a0–a3 plus
+/// t0–t3 are the emitter's working registers; t6 belongs to the assembler.
+///
+/// Floats: ft0–ft7 and fa0–fa7, all call-clobbered. The callee-saved fs
+/// registers are not offered; nothing in the framed pipeline keeps an unboxed
+/// float live across a call.
+pub fn allocate_framed_riscv64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+    let mut integers = PRegSet::empty();
+    for reg in std::iter::once(9).chain(19..=27) {
+        integers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    let mut floats = PRegSet::empty();
+    for reg in (0..=7).chain(10..=17) {
+        floats.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    let env = MachineEnv {
+        preferred_regs_by_class: [integers, floats, PRegSet::empty()],
+        non_preferred_regs_by_class: [PRegSet::empty(); 3],
+        scratch_by_class: [
+            Some(PReg::new(29, Ra2RegClass::Int)),
+            Some(PReg::new(31, Ra2RegClass::Float)),
+            None,
+        ],
+        fixed_stack_slots: Vec::new(),
+    };
+    // LP64: ra, t0-t6, a0-a7 and ft0-ft11, fa0-fa7 are caller-saved.
+    let mut clobbers = PRegSet::empty();
+    for reg in std::iter::once(1)
+        .chain(5..=7)
+        .chain(10..=17)
+        .chain(28..=31)
+    {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Int));
+    }
+    for reg in (0..=7).chain(10..=17).chain(28..=31) {
+        clobbers.add(PReg::new(reg, Ra2RegClass::Float));
+    }
+    allocate_with_call_operands(mf, env, clobbers, true)
+}
+
 /// AAPCS64 allocation for the AArch64 framed emitter. Like the System Z pool,
 /// `PhysReg.encoding` is the architectural register number, not an abstract index.
 ///

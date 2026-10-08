@@ -38,6 +38,49 @@
                   #+egcl 'egcl-gray-streams:fundamental-character-input-stream
                   #+sbcl 'sb-gray:fundamental-character-input-stream
                   #-(or egcl sbcl) 'stream))
+;; The bulk sequence bridge (bliss-td6ih). CL:READ-SEQUENCE / WRITE-SEQUENCE on
+;; a trivial-gray-streams class must reach the PORTABLE sequence generics, and a
+;; class that does not specialize them must still fall back to the scalar
+;; methods through OR-FALLBACK. Both halves ran silently wrong before: the
+;; native entry points never called the portable generics at all.
+(defclass bulk-source (trivial-gray-streams:fundamental-binary-input-stream) ())
+(defmethod trivial-gray-streams:stream-read-byte ((s bulk-source))
+  (error "scalar read must not be used when the bulk method exists"))
+(defmethod trivial-gray-streams:stream-read-sequence ((s bulk-source) seq start end &key)
+  (loop for i from start below end do (setf (elt seq i) 42))
+  end)
+(let ((v (make-array 4 :initial-element 0)))
+  (assert (= 3 (read-sequence v (make-instance 'bulk-source) :start 1 :end 3)))
+  (assert (equalp v #(0 42 42 0))))
+(defclass bulk-sink (trivial-gray-streams:fundamental-character-output-stream)
+  ((seen :initform nil :accessor seen)))
+(defmethod trivial-gray-streams:stream-write-char ((s bulk-sink) c)
+  (error "scalar write must not be used when the bulk method exists"))
+(defmethod trivial-gray-streams:stream-write-sequence ((s bulk-sink) seq start end &key)
+  (push (subseq seq start end) (seen s))
+  seq)
+(let ((s (make-instance 'bulk-sink)))
+  (write-sequence "portable" s :start 2 :end 6)
+  (assert (equal '("rtab") (seen s))))
+(defclass scalar-source (trivial-gray-streams:fundamental-binary-input-stream)
+  ((bytes :initform (list 5 6 7) :accessor bytes)))
+(defmethod trivial-gray-streams:stream-read-byte ((s scalar-source))
+  (if (bytes s) (pop (bytes s)) :eof))
+;; SBCL's default bulk methods ask the stream for its element type and supply
+;; no default for user classes; EGCL defaults it from the fundamental class.
+(defmethod stream-element-type ((s scalar-source)) '(unsigned-byte 8))
+(let ((v (make-array 4 :initial-element -1)))
+  (assert (= 3 (read-sequence v (make-instance 'scalar-source))))
+  (assert (equalp v #(5 6 7 -1))))
+(defclass scalar-sink (trivial-gray-streams:fundamental-character-output-stream)
+  ((chars :initform nil :accessor chars)))
+(defmethod trivial-gray-streams:stream-write-char ((s scalar-sink) c)
+  (push c (chars s)) c)
+(defmethod stream-element-type ((s scalar-sink)) 'character)
+(let ((s (make-instance 'scalar-sink)))
+  (write-sequence "xyz" s :start 1)
+  (assert (equal '(#\z #\y) (chars s))))
+
 (with-open-file (binary "sample-ascii.txt" :element-type '(unsigned-byte 8))
   (let ((stream (flexi-streams:make-flexi-stream
                  binary :external-format '(:utf-8 :eol-style :lf))))
