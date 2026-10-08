@@ -89,6 +89,11 @@
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).
 
+- The sampled back-edge poll in ppc64le baseline native loops now fires at
+  the configured threshold instead of after about four billion iterations, so
+  a hot loop in a warm function requests T2 compilation and responds to
+  signals and GC safepoints ([#110](https://github.com/atgreen/evergreen/pull/110)).
+
 ## 0.0.2 - 2026-10-05
 
 ### Documentation
