@@ -1387,8 +1387,8 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
                         None => " ⇒ generic (polymorphic / cold)",
                     };
                     format!(
-                        "[profile fix:{} float:{} other:{}{}]",
-                        p.fixnum, p.single_float, p.other, spec
+                        "[profile fix:{} float:{} bignum:{} other:{}{}]",
+                        p.fixnum, p.single_float, p.bignum, p.other, spec
                     )
                 })
                 .unwrap_or_default(),
@@ -18276,12 +18276,14 @@ pub enum SpecType {
 pub struct TypeProfile {
     pub fixnum: u32,
     pub single_float: u32,
+    /// Fixnum/bignum/single-float operands including a bignum; require generic arithmetic.
+    pub bignum: u32,
     pub other: u32,
 }
 
 impl TypeProfile {
     pub fn total(&self) -> u32 {
-        self.fixnum + self.single_float + self.other
+        self.fixnum + self.single_float + self.bignum + self.other
     }
     /// The dominant speculatable type, if the site is overwhelmingly consistent
     /// (≥90% one type over ≥`MIN` samples). `None` means "not enough data" or
@@ -18291,7 +18293,9 @@ impl TypeProfile {
         // function only warms up in bytecode until it promotes).
         const MIN: u32 = 8;
         let t = self.total();
-        if t < MIN {
+        // A rare bignum can occur on every invocation of a mostly-fixnum
+        // loop. Speculating that site again would repeatedly deopt/recompile.
+        if t < MIN || self.bignum > 0 {
             return None;
         }
         if self.fixnum * 100 >= t * 90 {
@@ -18301,6 +18305,23 @@ impl TypeProfile {
         } else {
             None
         }
+    }
+
+    /// The T2 choice for an observed site, including lightly sampled but
+    /// monomorphic sites. Share it with deopt feedback so generic sites are
+    /// never mistaken for failed guards at another arithmetic operation.
+    fn speculation(&self) -> Option<SpecType> {
+        self.dominant().or({
+            if self.other != 0 || self.bignum != 0 {
+                None
+            } else if self.single_float == 0 && self.fixnum > 0 {
+                Some(SpecType::Fixnum)
+            } else if self.fixnum == 0 && self.single_float > 0 {
+                Some(SpecType::SingleFloat)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -18355,15 +18376,7 @@ fn decay_failed_speculation(
                 failed.push((bcp as u32, forced.unwrap_or(SpecType::Fixnum)));
                 continue;
             };
-            let spec = forced.or({
-                if p.fixnum >= p.single_float && p.fixnum > 0 {
-                    Some(SpecType::Fixnum)
-                } else if p.single_float > 0 {
-                    Some(SpecType::SingleFloat)
-                } else {
-                    None
-                }
-            });
+            let spec = forced.or_else(|| p.speculation());
             if let Some(spec) = spec {
                 match spec {
                     SpecType::Fixnum => p.fixnum = 0,
@@ -18376,9 +18389,9 @@ fn decay_failed_speculation(
     failed
 }
 
-/// True when the failed version is now seeing the *other* supported numeric
-/// phase at one of its guarded sites. This is an invalidation/recompile event,
-/// not evidence that native execution is fundamentally unprofitable.
+/// True when a guarded site changes to another supported numeric phase,
+/// including bignums that require generic arithmetic. This invalidates the old
+/// version; it does not show that native execution is unprofitable.
 fn supported_numeric_phase_change(sym: u32) -> bool {
     let failed = LAST_FAILED_SPECULATION.with(|m| m.borrow().get(&sym).cloned());
     let Some(failed) = failed else { return false };
@@ -18390,8 +18403,8 @@ fn supported_numeric_phase_change(sym: u32) -> bool {
         type_profile_at(func_ptr, bcp).is_some_and(|profile| {
             profile.other == 0
                 && match old {
-                    SpecType::Fixnum => profile.single_float > 0,
-                    SpecType::SingleFloat => profile.fixnum > 0,
+                    SpecType::Fixnum => profile.single_float > 0 || profile.bignum > 0,
+                    SpecType::SingleFloat => profile.fixnum > 0 || profile.bignum > 0,
                 }
         })
     })
@@ -18410,6 +18423,8 @@ fn record_type_profile(func_ptr: usize, bcp: u32, args: &[EgclVal]) {
     // constant, instead of looking polymorphic and staying generic.
     let numeric = args.iter().all(|a| a.is_fixnum() || a.is_single_float());
     let any_float = args.iter().any(|a| a.is_single_float());
+    let bignum_numeric = !numeric
+        && args.iter().all(|&a| a.is_single_float() || egcl_rt::types::integerp(a));
     TYPE_PROFILE.with(|m| {
         let mut b = m.borrow_mut();
         let e = b.entry((func_ptr, bcp)).or_default();
@@ -18417,6 +18432,8 @@ fn record_type_profile(func_ptr: usize, bcp: u32, args: &[EgclVal]) {
             e.fixnum += 1;
         } else if numeric && any_float {
             e.single_float += 1;
+        } else if bignum_numeric {
+            e.bignum += 1;
         } else {
             e.other += 1;
         }
@@ -22103,9 +22120,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if t2_log_target().is_some() {
         for (bcp, p) in &input.type_profiles {
             t2_log!(
-                "{name}: site bcp={bcp} profile fix={} float={} other={} => {:?}",
+                "{name}: site bcp={bcp} profile fix={} float={} bignum={} other={} => {:?}",
                 p.fixnum,
                 p.single_float,
+                p.bignum,
                 p.other,
                 p.dominant()
             );
@@ -22132,19 +22150,10 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let profile = |bcp: u32| -> Option<egcl_compiler::t2::speculate::SpecType> {
         use egcl_compiler::t2::speculate::SpecType as Bc;
         match input.type_profiles.get(&bcp).copied() {
-            Some(p) => match p.dominant() {
-                Some(SpecType::Fixnum) => Some(Bc::Fixnum),
-                Some(SpecType::SingleFloat) => Some(Bc::SingleFloat),
-                // Below the confidence threshold but UNANIMOUS (only one numeric
-                // type ever seen, no mixed): speculate it anyway — the guard makes
-                // a wrong guess safe, and this covers lightly-exercised sites like a
-                // deep-recursion multiply that runs few times before promotion.
-                None if p.other == 0 && p.single_float == 0 && p.fixnum > 0 => Some(Bc::Fixnum),
-                None if p.other == 0 && p.fixnum == 0 && p.single_float > 0 => {
-                    Some(Bc::SingleFloat)
-                }
-                None => None, // genuinely mixed/polymorphic
-            },
+            Some(p) => p.speculation().map(|spec| match spec {
+                SpecType::Fixnum => Bc::Fixnum,
+                SpecType::SingleFloat => Bc::SingleFloat,
+            }),
             None => Some(Bc::Fixnum), // cold: optimistic, guarded fixnum guess
         }
     };
@@ -24288,9 +24297,9 @@ mod jtc4_stack_map_tests {
         let mut function = compile_function("COLD-PROFILE", NIL, *form, &env, false, false)
             .expect("compile constant body");
         let sym = super::super::resolve_sym("+").unwrap().as_symbol_index();
-        // Three arithmetic sites: never observed, previously observed but
-        // decayed to zero, and a site with samples from two numeric phases.
-        function.code = vec![Instr::CallNamed { sym, nargs: 2 }; 3];
+        // Four arithmetic sites: never observed, decayed to zero, changing
+        // numeric phase, and already generic bignum arithmetic.
+        function.code = vec![Instr::CallNamed { sym, nargs: 2 }; 4];
         let body = Arc::new(function);
         let key = Arc::as_ptr(&body) as usize;
         clear_bytecode_profiles(key);
@@ -24300,7 +24309,15 @@ mod jtc4_stack_map_tests {
             profiles.insert((key, 2), TypeProfile {
                 fixnum: 20,
                 single_float: 2,
+                bignum: 0,
                 other: 0,
+            });
+            // This site was already generic; its historical bignum samples
+            // must not turn another site's overflow into a new numeric phase.
+            profiles.insert((key, 3), TypeProfile {
+                fixnum: 1,
+                bignum: 1,
+                ..TypeProfile::default()
             });
         });
         let failed = decay_failed_speculation(&body, None);
