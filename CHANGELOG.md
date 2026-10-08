@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- s390x T2 functions now save and restore only the callee-saved registers they
+  use, reducing native call overhead
+  ([#115](https://github.com/atgreen/evergreen/pull/115)).
+
 - s390x T2 code uses shorter native instruction sequences for small constants
   and fixnum tag checks
   ([#113](https://github.com/atgreen/evergreen/pull/113)).

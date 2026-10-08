@@ -226,12 +226,39 @@ impl Asm {
     /// outgoing save/argument area. Tagged Lisp roots live in EgclStack, never
     /// in this native save area across an allocating call.
     pub fn prologue(&mut self) {
-        self.memory(0xeb, 0x24, 0x6f, 15, 48);
-        self.add_imm(15, -160);
+        self.prologue_from(6);
     }
 
     pub fn epilogue(&mut self) {
-        self.memory(0xeb, 0x04, 0x6f, 15, 208);
+        self.epilogue_from(6);
+    }
+
+    /// STMG `first`,r15 into the caller's register save area (register rN
+    /// lives at 8*(N-6)+48), then the 160-byte linkage area. A function that
+    /// uses only high callee-saved registers saves and restores fewer words
+    /// per call; `first` must be at most 13 so r13, r14 and r15 are kept.
+    pub fn prologue_from(&mut self, first: u8) {
+        assert!((6..=13).contains(&first));
+        self.memory(
+            0xeb,
+            0x24,
+            first << 4 | 0xf,
+            15,
+            48 + 8 * i32::from(first - 6),
+        );
+        self.add_imm(15, -160);
+    }
+
+    /// LMG `first`,r15 from the save area above the linkage area, then return.
+    pub fn epilogue_from(&mut self, first: u8) {
+        assert!((6..=13).contains(&first));
+        self.memory(
+            0xeb,
+            0x04,
+            first << 4 | 0xf,
+            15,
+            208 + 8 * i32::from(first - 6),
+        );
         self.ret();
     }
 
@@ -331,6 +358,21 @@ mod tests {
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
             ]
         );
+    }
+
+    #[test]
+    fn partial_save_area_encodings_match_llvm_systemz() {
+        // llvm-mc: stmg %r11,%r15,88(%r15) => eb bf f0 58 00 24;
+        //          lmg %r11,%r15,248(%r15) => eb bf f0 f8 00 04;
+        //          stmg %r6,%r15,48(%r15) => eb 6f f0 30 00 24 (the full form).
+        let mut a = Asm::new();
+        a.prologue_from(11);
+        a.epilogue_from(11);
+        a.prologue();
+        let code = a.finish().unwrap();
+        assert_eq!(&code[..6], &[0xeb, 0xbf, 0xf0, 0x58, 0x00, 0x24]);
+        assert_eq!(&code[10..16], &[0xeb, 0xbf, 0xf0, 0xf8, 0x00, 0x04]);
+        assert_eq!(&code[18..24], &[0xeb, 0x6f, 0xf0, 0x30, 0x00, 0x24]);
     }
 
     #[test]
