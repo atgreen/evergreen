@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
+  that computes on x86-64 computes there too: `(deep 50000)` no longer signals
+  `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
 - GETF now signals TYPE-ERROR for improper property lists with a non-NIL
   atomic tail instead of returning the default value
   ([#89](https://github.com/atgreen/evergreen/pull/89)).
