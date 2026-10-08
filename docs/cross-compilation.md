@@ -67,9 +67,10 @@ switches stacks natively (ra, s0-s11, fs0-fs11 and fcsr), so cooperative
 fibers behave as on the other Linux ports. Foreign calls use the LP64D
 calling convention for scalars (integers, pointers, floats, doubles,
 variadic calls after the C promotions); aggregate arguments and foreign
-callbacks are not yet ported, and a memory fault inside native code is not
-yet recoverable. The remaining slices are tracked as children of Bead
-`bliss-miro8`.
+callbacks are not yet ported. Null-pointer and stack-guard faults resume at
+the runtime's recovery handler as on s390x; a fault inside JIT-compiled code
+itself is not yet recoverable. The remaining slices are tracked as children
+of Bead `bliss-miro8`.
 
 ```sh
 scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
