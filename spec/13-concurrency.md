@@ -607,7 +607,7 @@ submitted to a second scheduler group.
 | Safepoint spin iterations | 1000 | `EGCL_SAFEPOINT_SPIN` | Spin count before parking at safepoint. |
 | Deadlock watchdog interval | 5 s | `EGCL_DEADLOCK_WATCHDOG_MS` | Debug-build only. 0 = disabled. |
 | SIGUSR1 timeout | 100 ms | `EGCL_SIGUSR1_TIMEOUT_MS` | Delay before sending SIGUSR1 fallback. |
-| Fiber stack size | 512 KiB | `EGCL_STACK_SIZE` | Per-fiber CL stack. |
+| Fiber stack size | 512 KiB (4 MiB on s390x) | `EGCL_STACK_SIZE` | Per-fiber CL stack. |
 | Max fibers | 100 000 | `EGCL_MAX_FIBERS` | Upper limit (legacy `EGCL_MAX_THREADS` accepted; R2.19). |
 | Pinned blocking | `:WARN` | `EGCL_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` fallback policy (R9.43). |
 

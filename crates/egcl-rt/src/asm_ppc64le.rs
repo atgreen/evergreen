@@ -429,6 +429,23 @@ impl Asm {
         self.word((31 << 26) | ((s as u32) << 21) | ((a as u32) << 16) | (51 << 1));
     }
 
+    /// `xscvspdpn frT, frB` — the single-precision bits in the high word of `frB`
+    /// become a double in `frT`.
+    ///
+    /// A POWER floating-point register holds double format even for single-
+    /// precision arithmetic, so a tagged single moved in with `mtvsrd` is not yet a
+    /// usable operand: its f32 bits sit in the high word and would be read as a
+    /// (garbage) double. This is the conversion that makes them a value.
+    pub fn single_to_double(&mut self, t: u8, b: u8) {
+        self.word(0xF000_052C | ((t as u32) << 21) | ((b as u32) << 11));
+    }
+
+    /// `xscvdpspn frT, frB` — the double in `frB` becomes single-precision bits in
+    /// the high word of `frT`, where `mfvsrd` and the tag expect them.
+    pub fn double_to_single(&mut self, t: u8, b: u8) {
+        self.word(0xF000_042C | ((t as u32) << 21) | ((b as u32) << 11));
+    }
+
     // ── floating point ───────────────────────────────────────────
 
     fn fp(&mut self, opcode: u32, d: u8, a: u8, b: u8, extended: u32) {
@@ -759,6 +776,16 @@ mod tests {
             ),
             ("mtvsrd 1, 3", 0x7C230166, one(|a| a.move_to_float(1, 3))),
             ("mfvsrd 3, 1", 0x7C230066, one(|a| a.move_from_float(3, 1))),
+            (
+                "xscvspdpn 3, 4",
+                0xF060252C,
+                one(|a| a.single_to_double(3, 4)),
+            ),
+            (
+                "xscvdpspn 1, 2",
+                0xF020142C,
+                one(|a| a.double_to_single(1, 2)),
+            ),
         ]);
     }
 

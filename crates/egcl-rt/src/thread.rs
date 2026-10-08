@@ -145,8 +145,25 @@ impl FiberContinuation {
 /// Maximum number of TLS slots per fiber.
 pub const MAX_TLS: usize = 4096;
 
-/// Default stack size for fibers (512 KiB).
-const DEFAULT_STACK_SIZE: usize = 512 * 1024;
+/// Default CL stack size (512 KiB; 4 MiB on s390x).
+///
+/// The CL stack bounds recursion depth once the native stack reserve is
+/// spent: a self-recursive function's T2 code recurses natively until the
+/// published native stack limit, then every deeper call goes through c2i and
+/// pushes a CL activation here. On x86-64 a T2 frame is ~64 bytes, so the
+/// 6 MiB reserve holds ~98 000 frames and `(deep 50000)` never touches this
+/// stack; on s390x the ELF ABI's 160-byte register save area plus the
+/// home-based emitter's spill words make the same frame ~430 bytes, the
+/// reserve is spent after ~14 000, and the rest of the recursion lands here
+/// at ~56 bytes per activation. Measured on a z17 (bliss-hfdq2): with 512 KiB
+/// every tier signalled STORAGE-CONDITION at ~9 000-28 000 frames where
+/// x86-64 computes 50 000; 4 MiB gives s390x the same reach. The mapping is
+/// lazy, so untouched stack costs no resident memory.
+pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(target_arch = "s390x") {
+    4 * 1024 * 1024
+} else {
+    512 * 1024
+};
 
 /// Usable `EgclStack` size for a fiber, honouring `EGCL_STACK_SIZE`
 /// (accepts a raw byte count or a `k`/`m`/`g` suffix), defaulting to 512 KiB.
@@ -3354,7 +3371,11 @@ mod chase_lev_tests {
             let values = Arc::clone(&values);
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                // Hang protection only; the test is about exactly-once claims,
+                // not throughput. Eight contending thieves on an in-order
+                // RISC-V core manage roughly 1,900 steals per second, so a
+                // 5 s deadline left the last ~800 tasks unclaimed there.
+                let deadline = Instant::now() + Duration::from_secs(120);
                 while claimed.load(Ordering::Acquire) < TASKS && Instant::now() < deadline {
                     if let Some(task) = deque.steal() {
                         values.lock().unwrap().push(number(&task));

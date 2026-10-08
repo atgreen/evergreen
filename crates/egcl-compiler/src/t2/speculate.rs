@@ -557,12 +557,47 @@ fn materialize_entry_param_preguards(
         if !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits {
             continue; // already proven (a declared parameter)
         }
+        // The parameter's FLOW SET: itself plus every block parameter it
+        // reaches through an edge argument, transitively. After self-tail-call
+        // elimination the body is a loop whose header phis carry the
+        // parameters, so the entry parameter's only use is the edge into that
+        // header and every real use -- the fixnum sites, the self-calls, the
+        // return -- is of the phi. Judging the entry parameter by its own
+        // uses alone found no evidence, left tak's z unguarded, and with it
+        // the self-call results (the base case returns z), which kept both as
+        // GC roots across every self-call and off the direct self-call path
+        // (bliss-legi4).
+        let mut flow: Vec<Value> = vec![p];
+        loop {
+            let mut grew = false;
+            for b in f.block_order().to_vec() {
+                let Some(term) = f.terminator(b) else {
+                    continue;
+                };
+                for target in f.inst(term).targets.clone() {
+                    for (index, arg) in target.args.iter().enumerate() {
+                        if !flow.contains(arg) {
+                            continue;
+                        }
+                        if let Some(&phi) = f.block(target.block).params.get(index)
+                            && !flow.contains(&phi)
+                        {
+                            flow.push(phi);
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         let mut evidence = false;
         let mut disqualified = false;
         for b in f.block_order().to_vec() {
             for &inst in &f.block(b).insts.clone() {
                 let d = f.inst(inst);
-                if d.args.contains(&p) {
+                if d.args.iter().any(|a| flow.contains(a)) {
                     if fixnum_sites.contains(&inst) {
                         evidence = true;
                     } else {
@@ -664,7 +699,64 @@ fn materialize_self_call_result_guards(f: &mut Function, self_sym: Option<u32>) 
                 .copied()
                 .find(|&i| f.inst(i).frame_state.is_some() && !f.inst(i).results.contains(&r))
         };
-        let Some(anchor) = anchor else { continue };
+        let Some(anchor) = anchor else {
+            // No later FrameState carrier in the block: after self-tail-call
+            // elimination the LAST inner call's result feeds the back-edge
+            // Jump directly (tak's third call), and a Jump carries no state.
+            // The resume point is the interpreter's post-call state, which no
+            // instruction describes, so synthesise it from the call's own
+            // pre-call state: same locals, the raw result on the operand stack
+            // in place of the arguments, at the bytecode after the call (the
+            // StoreLocal that pops it). A deopt there re-runs nothing. Without
+            // this guard the raw result stays TOP, so the loop-header phi it
+            // feeds stays TOP, which keeps the parameter and the result as GC
+            // roots across every self-call and off the direct self-call path
+            // (bliss-legi4).
+            let Some(call_fs) = f.inst(call).frame_state else {
+                continue;
+            };
+            let mut state = f.frame_states.get(call_fs).clone();
+            if state.scopes.len() != 1 {
+                continue;
+            }
+            let scope = &mut state.scopes[0];
+            scope.bcp += 1;
+            scope.stack = vec![crate::t2::frame_state::ValueSource::Value {
+                value: r,
+                repr: ValueRepresentation::Tagged,
+            }];
+            let gfs = f.frame_states.add(state);
+            let source_pos = f.inst(call).source_pos;
+            let (guard, results) = f.push_inst(
+                b,
+                InstData {
+                    opcode: Opcode::Guard,
+                    args: vec![r],
+                    results: vec![],
+                    aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                    flags: InstFlags {
+                        guard: true,
+                        effectful: true,
+                        ..InstFlags::default()
+                    },
+                    targets: vec![],
+                    frame_state: Some(gfs),
+                    source_pos,
+                },
+                &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+            );
+            let narrowed = results[0];
+            let insts = &mut f.block_mut(b).insts;
+            let appended = insts.pop();
+            debug_assert_eq!(appended, Some(guard));
+            let call_pos = insts
+                .iter()
+                .position(|&i| i == call)
+                .expect("call is in its block");
+            insts.insert(call_pos + 1, guard);
+            rewrite_dominated_uses(f, &dom, b, call, guard, r, narrowed, false);
+            continue;
+        };
         // A CALL anchor (tak: the next FrameState carrier after the third
         // inner call is the OUTER call) takes the guard BEFORE it: the call's
         // pre-state (result on stack) is cloned for the guard — a failure

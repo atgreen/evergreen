@@ -33,6 +33,9 @@ pub mod callback;
 // hardcoded shapes (spec §4.7.5.2). Everything else non-x86 still falls back.
 #[cfg(all(target_arch = "aarch64", unix))]
 mod aapcs64;
+// riscv64 likewise: one LP64D trampoline covers every scalar signature.
+#[cfg(all(target_arch = "riscv64", unix))]
+mod lp64d;
 /// ELFv2 foreign calls. Compiled on every host — the placement rules are pure
 /// logic, and their tests are what pin the difference from AAPCS64 that would
 /// otherwise be found only by running on POWER. Only the trampolines and the
@@ -48,6 +51,7 @@ mod elfv2;
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 mod legacy;
@@ -57,18 +61,22 @@ pub mod managed_callback;
 mod win64;
 #[cfg(all(target_arch = "aarch64", unix))]
 pub use aapcs64::{ffi_call, ffi_call_variadic};
+#[cfg(all(target_arch = "riscv64", unix))]
+pub use lp64d::{ffi_call, ffi_call_variadic};
 #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 pub use elfv2::{ffi_call, ffi_call_variadic};
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 pub(crate) fn ffi_profile_enabled() -> bool {
     use std::sync::OnceLock;
@@ -80,7 +88,8 @@ pub(crate) fn ffi_profile_enabled() -> bool {
 /// Android is the logcat tag `egcl-err`.
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "aarch64", unix)
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 pub(crate) fn ffi_profile_record(adapter_ns: u64, enter_ns: u64, invoke_ns: u64, leave_ns: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
