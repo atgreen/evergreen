@@ -12,7 +12,7 @@
   guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
   operations and constant shifts, GC-safe runtime calls, polled loops, live
   T1-to-T2 OSR and precise deoptimization
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#112](https://github.com/atgreen/evergreen/pull/112)).
 
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
