@@ -17,7 +17,7 @@
 - Fibers on riscv64 now switch stacks natively instead of running on the
   scheduler's no-context-switch fallback, so cooperative scheduling, parking,
   and carrier migration behave as on the other Linux ports
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#120](https://github.com/atgreen/evergreen/pull/120)).
 
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
