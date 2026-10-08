@@ -17528,16 +17528,16 @@ extern "C" fn c2i_t1_backedge(
     // frame's raw pointer instead of `o` (bliss-kqdr).
     //
     // Other backends decline the OSR entry when the live frame is too small;
-    // s390x grows it in place below. The decline matches the way
+    // s390x and riscv64 grow it in place below. The decline matches the way
     // validate_t2_root_sync refuses to install shadow-root code with a
     // compiled entry, and as the emitter declines an OSR entry it cannot
     // transfer soundly. The loop keeps running at T1 and still promotes on its
     // next full call, so this costs a fast path, never a correct result.
-    #[cfg(not(target_arch = "s390x"))]
+    #[cfg(not(any(target_arch = "s390x", target_arch = "riscv64")))]
     if t2.num_slots > body.num_slots() {
         return 0;
     }
-    #[cfg(target_arch = "s390x")]
+    #[cfg(any(target_arch = "s390x", target_arch = "riscv64"))]
     {
         let stack = egcl_rt::current_stack();
         let frame = stack.fp();
@@ -22583,7 +22583,7 @@ fn maybe_osr(
         }
         return None;
     }
-    #[cfg(target_arch = "s390x")]
+    #[cfg(any(target_arch = "s390x", target_arch = "riscv64"))]
     {
         // GO has not unwound intervening handlers yet. Enter native code only
         // when the destination tagbody is already the innermost live scope;
