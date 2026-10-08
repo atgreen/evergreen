@@ -14,6 +14,11 @@
   T1-to-T2 OSR and precise deoptimization
   ([#112](https://github.com/atgreen/evergreen/pull/112)).
 
+- Fibers on riscv64 now switch stacks natively instead of running on the
+  scheduler's no-context-switch fallback, so cooperative scheduling, parking,
+  and carrier migration behave as on the other Linux ports
+  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
   backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).

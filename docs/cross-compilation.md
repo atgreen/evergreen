@@ -62,11 +62,12 @@ tagged single-float add, subtract and multiply, `EQ`, unguarded `CAR`/`CDR`,
 bitwise operations and constant shifts, runtime calls with GC-synchronized
 roots, sampled back-edge polls, live T1-to-T2 OSR and precise deopt exits;
 the smoke's T2 sections require actual tier-2 installation and compare guard
-exits, calls, OSR and polls with T0 under GC stress. Foreign calls go through
-the bootstrap dispatcher's fixed call shapes, as on s390x, the fiber scheduler
-runs without a native context switch, and a memory fault inside native code is
-not yet recoverable. The remaining slices are tracked as children of Bead
-`bliss-miro8`.
+exits, calls, OSR and polls with T0 under GC stress. The fiber scheduler
+switches stacks natively (ra, s0-s11, fs0-fs11 and fcsr), so cooperative
+fibers behave as on the other Linux ports. Foreign calls go through the
+bootstrap dispatcher's fixed call shapes, as on s390x, and a memory fault
+inside native code is not yet recoverable. The remaining slices are tracked
+as children of Bead `bliss-miro8`.
 
 ```sh
 scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
