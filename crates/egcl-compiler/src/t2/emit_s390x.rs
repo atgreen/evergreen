@@ -735,19 +735,22 @@ impl Emitter<'_> {
         Ok(label)
     }
 
+    /// The fixnum tag is 0, so one TMLL answers "any tag bit set".
     fn guard_fixnum(&mut self, register: u8, deopt: Label) {
+        self.asm.test_mask_low(register, 7);
+        self.asm.branch(7, deopt);
+    }
+
+    /// r4 = the low three bits of `register`, for a tag compare.
+    fn load_tag(&mut self, register: u8) {
         self.asm.mov(4, register);
         self.asm.imm64(5, 7);
         self.asm.and(4, 5);
-        self.asm.branch(6, deopt);
     }
 
     fn guard_single_float(&mut self, register: u8, deopt: Label) {
-        self.asm.mov(4, register);
-        self.asm.imm64(5, 7);
-        self.asm.and(4, 5);
-        self.asm.imm64(5, 4);
-        self.asm.compare(4, 5);
+        self.load_tag(register);
+        self.asm.compare_imm(4, 4);
         self.asm.branch(6, deopt);
     }
 
@@ -830,28 +833,26 @@ impl Emitter<'_> {
 
     /// Branch to `target` when r2 equals the tagged constant.
     fn branch_if_equal_imm(&mut self, bits: u64, target: Label) {
-        self.asm.imm64(3, bits);
-        self.asm.compare(2, 3);
+        if let Ok(half) = i16::try_from(bits as i64) {
+            self.asm.compare_imm(2, half);
+        } else {
+            self.asm.imm64(3, bits);
+            self.asm.compare(2, 3);
+        }
         self.asm.branch(8, target);
     }
 
     /// Branch to `target` when r2's low three bits equal `tag`.
     fn branch_if_tag(&mut self, tag: u64, target: Label) {
-        self.asm.mov(4, 2);
-        self.asm.imm64(5, 7);
-        self.asm.and(4, 5);
-        self.asm.imm64(5, tag);
-        self.asm.compare(4, 5);
+        self.load_tag(2);
+        self.asm.compare_imm(4, tag as i16);
         self.asm.branch(8, target);
     }
 
     /// Branch to `target` unless r2's low three bits equal `tag`.
     fn branch_unless_tag(&mut self, tag: u64, target: Label) {
-        self.asm.mov(4, 2);
-        self.asm.imm64(5, 7);
-        self.asm.and(4, 5);
-        self.asm.imm64(5, tag);
-        self.asm.compare(4, 5);
+        self.load_tag(2);
+        self.asm.compare_imm(4, tag as i16);
         self.asm.branch(6, target);
     }
 
@@ -944,11 +945,8 @@ impl Emitter<'_> {
     }
 
     fn guard_cons(&mut self, register: u8, deopt: Label) {
-        self.asm.mov(4, register);
-        self.asm.imm64(5, 7);
-        self.asm.and(4, 5);
-        self.asm.imm64(5, egcl_rt::value::TAG_CONS);
-        self.asm.compare(4, 5);
+        self.load_tag(register);
+        self.asm.compare_imm(4, egcl_rt::value::TAG_CONS as i16);
         self.asm.branch(6, deopt);
     }
 
@@ -1664,9 +1662,7 @@ pub fn emit_framed_with_runtime(
     };
     // Self-calls pass their arguments in r2-r4; any other call stages them in
     // this frame's call-argument area (see the module docs).
-    let is_self_call = |data: &InstData| {
-        matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym)
-    };
+    let is_self_call = |data: &InstData| matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym);
     let calls_fit_register_entry = instructions().all(|data| {
         data.opcode != Opcode::Call
             || (is_self_call(data) && data.args.len() <= 3)

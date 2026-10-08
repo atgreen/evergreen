@@ -174,14 +174,43 @@ impl Asm {
         self.code.extend_from_slice(&value.to_be_bytes());
     }
 
-    /// IIHF followed by IILF defines all 64 bits without a literal pool.
+    /// Load a 64-bit constant: LGHI when it is a sign-extended halfword, LGFI
+    /// when a sign-extended word, else IIHF followed by IILF, which define all
+    /// 64 bits without a literal pool. The short forms matter: tags, NIL,
+    /// small fixnums and frame words are most of what compiled code loads,
+    /// and the twelve-byte pair cost two instructions for each of them.
     pub fn imm64(&mut self, reg: u8, value: u64) {
         assert!(reg < 16);
-        self.code.extend_from_slice(&[0xc0, reg << 4 | 8]);
-        self.code
-            .extend_from_slice(&((value >> 32) as u32).to_be_bytes());
-        self.code.extend_from_slice(&[0xc0, reg << 4 | 9]);
-        self.code.extend_from_slice(&(value as u32).to_be_bytes());
+        let signed = value as i64;
+        if let Ok(half) = i16::try_from(signed) {
+            self.code.extend_from_slice(&[0xa7, reg << 4 | 0x9]);
+            self.code.extend_from_slice(&half.to_be_bytes());
+        } else if let Ok(word) = i32::try_from(signed) {
+            self.code.extend_from_slice(&[0xc0, reg << 4 | 0x1]);
+            self.code.extend_from_slice(&word.to_be_bytes());
+        } else {
+            self.code.extend_from_slice(&[0xc0, reg << 4 | 8]);
+            self.code
+                .extend_from_slice(&((value >> 32) as u32).to_be_bytes());
+            self.code.extend_from_slice(&[0xc0, reg << 4 | 9]);
+            self.code.extend_from_slice(&(value as u32).to_be_bytes());
+        }
+    }
+
+    /// TMLL: test the low 16 bits of a register under `mask`. CC0 means every
+    /// selected bit is zero, so `branch(7, ..)` afterwards is "some selected
+    /// bit is set": a one-instruction tag test for the fixnum tag 0.
+    pub fn test_mask_low(&mut self, reg: u8, mask: u16) {
+        assert!(reg < 16);
+        self.code.extend_from_slice(&[0xa7, reg << 4 | 0x1]);
+        self.code.extend_from_slice(&mask.to_be_bytes());
+    }
+
+    /// CGHI: signed 64-bit compare against a sign-extended halfword.
+    pub fn compare_imm(&mut self, reg: u8, value: i16) {
+        assert!(reg < 16);
+        self.code.extend_from_slice(&[0xa7, reg << 4 | 0xf]);
+        self.code.extend_from_slice(&value.to_be_bytes());
     }
 
     pub fn call_reg(&mut self, reg: u8) {
@@ -301,6 +330,37 @@ mod tests {
                 0xeb, 0x33, 0, 3, 0, 0x0a, 0xe3, 0x90, 0x8f, 0xf8, 0x7f, 0x71, 0xe3, 0x20, 0x10, 0,
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
             ]
+        );
+    }
+
+    #[test]
+    fn short_immediates_match_llvm_systemz() {
+        // llvm-mc: lghi %r5,7 => a7 59 00 07; lghi %r2,-1 => a7 29 ff ff;
+        //          lgfi %r5,-100000 => c0 51 ff fe 79 60;
+        //          iihf/iilf for the rest, as before.
+        let mut a = Asm::new();
+        a.imm64(5, 7);
+        a.imm64(2, u64::MAX);
+        a.imm64(5, (-100000i64) as u64);
+        a.imm64(3, 0x1_0000_0000);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xa7, 0x59, 0x00, 0x07, 0xa7, 0x29, 0xff, 0xff, 0xc0, 0x51, 0xff, 0xfe, 0x79, 0x60,
+                0xc0, 0x38, 0, 0, 0, 1, 0xc0, 0x39, 0, 0, 0, 0,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_mask_and_compare_immediate_match_llvm_systemz() {
+        // llvm-mc: tmll %r2,7 => a7 21 00 07; cghi %r4,3 => a7 4f 00 03
+        let mut a = Asm::new();
+        a.test_mask_low(2, 7);
+        a.compare_imm(4, 3);
+        assert_eq!(
+            a.finish().unwrap(),
+            [0xa7, 0x21, 0x00, 0x07, 0xa7, 0x4f, 0x00, 0x03]
         );
     }
 

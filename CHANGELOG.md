@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- s390x T2 code uses shorter native instruction sequences for small constants
+  and fixnum tag checks
+  ([#113](https://github.com/atgreen/evergreen/pull/113)).
+
 - s390x T2 compilation diagnostics now report the actual register entry offset
   used by direct recursive calls
   ([#101](https://github.com/atgreen/evergreen/pull/101)).
