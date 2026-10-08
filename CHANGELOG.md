@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep hot arithmetic functions native when their operands change from fixnums
+  or single floats to bignums. Mixed integer loops now recover to generic T2
+  code without repeatedly deoptimizing, reducing full Prechelt phone-encoding
+  time by about 33% in the measured workload
+  ([#144](https://github.com/atgreen/evergreen/pull/144)).
+
 - Reduce x86-64 T2 named-call overhead and speed up runtime-state access for
   native threads and fibers, while preserving function redefinition and GC
   safety. Native callees recover from fixnum/single-float phase changes instead
