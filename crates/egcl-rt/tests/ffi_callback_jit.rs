@@ -3,10 +3,13 @@
 
 //! Generated inbound scalar ABI adapters, independently called by C fixtures.
 //! R2.12/R2.14: this tests the machine-code boundary, not Lisp callback dispatch.
-#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#![cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(target_arch = "s390x", target_os = "linux")
+))]
 
-use std::cell::RefCell;
 use egcl_rt::ffi::{AlienType, callback::CallbackAdapter};
+use std::cell::RefCell;
 
 struct Context {
     count: usize,

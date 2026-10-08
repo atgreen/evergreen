@@ -29,6 +29,12 @@ pub fn native_layout(ty: &AlienType) -> Result<(usize, usize), EgclError> {
 mod call;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 pub mod callback;
+/// The s390x inbound adapter: the same `CallbackAdapter`/`Dispatcher` contract
+/// as the x86-64 module, generated through the z assembler, so
+/// `managed_callback` compiles unchanged on both.
+#[cfg(all(target_arch = "s390x", unix))]
+#[path = "ffi/callback_s390x.rs"]
+pub mod callback;
 // AArch64 gets a real ABI backend rather than the legacy dispatcher's eighteen
 // hardcoded shapes (spec §4.7.5.2). Everything else non-x86 still falls back.
 #[cfg(all(target_arch = "aarch64", unix))]
@@ -67,7 +73,7 @@ mod s390x;
     all(target_arch = "s390x", unix)
 )))]
 mod legacy;
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix)))]
 pub mod managed_callback;
 #[cfg(all(target_arch = "x86_64", windows))]
 mod win64;

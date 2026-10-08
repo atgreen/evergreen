@@ -293,7 +293,7 @@ fn foreign_name(value: EgclVal) -> Result<String, EgclError> {
 /// Explicit callback ownership, independent of the lifetime of its Lisp wrapper.
 /// The caller must retire all foreign pointer uses before FREE; the active check
 /// additionally rejects a callback trying to release its own executable entry.
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix)))]
 pub fn callback_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     use std::sync::{Mutex, OnceLock};
     use egcl_rt::ffi::managed_callback::LispCallback;
@@ -388,7 +388,7 @@ pub fn callback_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     }
 }
 
-#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+#[cfg(not(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix))))]
 pub fn callback_call(_args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     Err(EgclError::FfiError(
         "callbacks are not implemented for this target ABI".into(),

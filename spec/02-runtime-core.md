@@ -796,8 +796,8 @@ mechanisms in §3. Strings are copied rather than shared: Python's Unicode
 representation and EGCL's string representation are not worth reconciling.
 
 Availability follows the FFI. Lisp→Python works wherever the per-ABI scalar path
-does; Python→Lisp requires callbacks (§2.7.5) and is therefore x86-64 only until
-those are ported. Staging the two directions separately is deliberate.
+does; Python→Lisp requires callbacks (§2.7.5) and is therefore limited to the
+targets with a callback trampoline (x86-64 and s390x) until the rest are ported. Staging the two directions separately is deliberate.
 
 **What exists as of 2026-09-27.** The direction above is now partly built, behind
 the `python` Cargo feature (CPython is resolved through the foreign-library loader
@@ -838,7 +838,7 @@ requires a glibc target rather than the default static musl):
   reached through the stable handle table so the collector may move the function and
   its captured environment. Notably this needs NO generated trampoline — every export
   shares one static C entry point and carries its function in a handle rather than in
-  code — so it is not restricted to x86-64 the way `managed_callback` is; the only
+  code — so it is not restricted to x86-64 and s390x the way `managed_callback` is; the only
   architecture-specific dependency is the foreign→managed transition, which all three
   supported targets have. Verified on x86-64.
 - A Python raise as a first-class condition, `PY:EXCEPTION`, carrying the

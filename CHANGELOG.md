@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Foreign callbacks now work on s390x: `egcl-ffi` can hand a Lisp function to
+  C as a function pointer (a `qsort` comparator, an event handler), with
+  arguments and results following the ELF ABI and errors contained at the C
+  boundary exactly as on x86-64
+  ([#141](https://github.com/atgreen/evergreen/pull/141)).
+
 - Foreign calls on s390x now go through a generated System z ABI adapter:
   floating-point arguments and results, narrow integers, more than five
   integer or four floating-point arguments, and variadic tails all follow the
