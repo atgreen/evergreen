@@ -207,11 +207,6 @@ fn arithmetic(
     let Some(op) = inlinable_fixnum_op(sym) else {
         return false;
     };
-    // Multiplication still uses the numeric runtime until its full-width
-    // overflow check is implemented; MSGR alone silently wraps overflow.
-    if matches!(op, FixnumOp::Mul) {
-        return false;
-    }
     let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
     a.load(2, 9, -16);
     a.load(3, 9, -8);
@@ -225,6 +220,36 @@ fn arithmetic(
                 a.sub(2, 3);
             }
             a.branch(1, deopt);
+        }
+        FixnumOp::Mul => {
+            // The full-width check the T2 emitter uses (multiply_fixnums):
+            // MLGR gives the unsigned 128-bit product of the untagged lhs and
+            // the tagged rhs on every z10-compatible CPU, so the low half is
+            // the tagged product. Correct the high half for signed operands,
+            // then require it to equal the low half's sign extension; else
+            // the product overflowed a fixnum and the site deopts with both
+            // operands and the operand pointer untouched. MSGR alone would
+            // wrap silently, which is why T1 called the numeric runtime for
+            // every `*` before (t1_deopt saw no deopt for a bignum product).
+            a.shift_right_signed(5, 2, 3);
+            a.mov(4, 3);
+            a.mov(3, 5);
+            a.multiply_unsigned_wide(2, 4);
+            a.imm64(0, 0);
+            let lhs_nonnegative = a.label();
+            a.compare(5, 0);
+            a.branch(10, lhs_nonnegative);
+            a.sub(2, 4);
+            a.bind(lhs_nonnegative);
+            let rhs_nonnegative = a.label();
+            a.compare(4, 0);
+            a.branch(10, rhs_nonnegative);
+            a.sub(2, 5);
+            a.bind(rhs_nonnegative);
+            a.shift_right_signed(4, 3, 63);
+            a.compare(2, 4);
+            a.branch(6, deopt);
+            a.mov(2, 3);
         }
         _ => {
             a.compare(2, 3);

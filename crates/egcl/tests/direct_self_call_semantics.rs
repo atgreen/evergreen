@@ -70,13 +70,19 @@ fn inner_overflow_inside_direct_recursion_returns_the_bignum() {
             (egcl-ext:function-tier (quote pow2)) \
             (if (> (egcl-ext:deopt-count) before) :deopted :no-deopt))))";
     let expected = "1180591620717411303424";
-    for (tier, expected_tier) in [("t0", "0"), ("t1", "1")] {
-        let line = run(program, tier);
-        assert!(
-            line.starts_with(&format!("RESULT {expected} {expected_tier}")),
-            "tier {tier}: {line:?}"
-        );
-    }
+    let line = run(program, "t0");
+    assert!(
+        line.starts_with(&format!("RESULT {expected} 0")),
+        "tier t0: {line:?}"
+    );
+    // T1 speculates the multiplication where it inlines `*` (x86-64, and
+    // s390x since its multiply template), so the overflow deopts there too
+    // and the tier afterwards is policy; only the answer is the contract.
+    let line = run(program, "t1");
+    assert!(
+        line.starts_with(&format!("RESULT {expected} ")),
+        "tier t1: {line:?}"
+    );
     // Every native level above the overflow deopts in turn as the bignum
     // climbs, so the per-symbol threshold retires the T2 code by the end;
     // the tier afterwards is a policy, not part of this contract.

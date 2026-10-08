@@ -17922,11 +17922,9 @@ extern "C" fn c2i_deopt_t2_inline(
         return NIL.0;
     }
     if std::env::var_os("EGCL_DEOPT_PATH_DBG").is_some() {
-        eprintln!(
-            "[deopt-path] Inlined sym={sym} scopes={} (inline, {})",
-            scopes.len(),
-            if owns_frame { "own frame" } else { "pushed frame" }
-        );
+        // The same line run_native prints, with nothing after the count:
+        // native_definition_version parses the number that follows "scopes=".
+        eprintln!("[deopt-path] Inlined sym={sym} scopes={}", scopes.len());
     }
     // SAFETY: run_native keeps NATIVE_ENV pointing at a live &mut Env for the
     // duration of the native call, and nested native calls save and restore it.
