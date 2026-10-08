@@ -34,17 +34,18 @@
 //! presented before it was found.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
-    c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
-    c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
-    c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
-    c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
-    call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
+    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, UnaryFixnumOp, c2i_alloc_cons,
+    c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_deopt_state, c2i_eval_host,
+    c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_closure, c2i_osr_backedge,
+    c2i_pop_env_child, c2i_push_env_child, c2i_set_native_sigsegv_recovery, c2i_store_env,
+    c2i_store_global, c2i_t1_backedge, c2i_take_values, c2i_transfer_pending, c2i_typep_class,
+    c2i_values_to_list, call_site_profile_token, inlinable_fixnum_op, inlinable_unary_fixnum_op,
+    registry_get, resolve_sym, t2_backedge_threshold,
 };
 use egcl_rt::asm::Cc;
-use egcl_rt::asm_ppc64le::{Asm, frame};
+use egcl_rt::asm_ppc64le::{Asm, Label, frame};
 use egcl_rt::bytecode::Instr;
-use egcl_rt::value::EgclVal;
+use egcl_rt::value::{EgclVal, NIL, T};
 
 /// Frame slots; local `i` lives at `[SLOTS + 8*i]`.
 const SLOTS: u8 = 14;
@@ -68,7 +69,7 @@ const TOC: u8 = 2;
 /// baseline does not handle.
 pub(super) fn emit_native_ppc64le(
     bf: &BytecodeFunction,
-    _allow_speculation: bool,
+    allow_speculation: bool,
     sym: u32,
     backedge_counter: u64,
     _allow_traps: bool,
@@ -106,6 +107,9 @@ pub(super) fn emit_native_ppc64le(
     // leave the loop mid-flight; `has_deopt` must report that.
     let mut can_osr_to_t2 = false;
 
+    // One cold stub per guarded bytecode position: a failed fixnum guard records
+    // (bcp, operand depth) and leaves, and T0 resumes exactly there.
+    let mut deopts: std::collections::BTreeMap<u32, Label> = std::collections::BTreeMap::new();
     let mut block_targets: std::collections::HashMap<u32, (u32, u16)> =
         std::collections::HashMap::new();
     let mut tag_sp: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
@@ -169,8 +173,7 @@ pub(super) fn emit_native_ppc64le(
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
-    let take_values_addr =
-        c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
+    let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let osr_backedge_addr = c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64;
@@ -247,6 +250,14 @@ pub(super) fn emit_native_ppc64le(
                 emit_c2i_call(&mut c, clear_mv_addr, transfer_addr, recovery_toggle_addr)?;
             }
             Instr::CallNamed { sym: callee, nargs } => {
+                if allow_speculation
+                    && encode!(
+                        "fixnum template operand",
+                        emit_fixnum_template(&mut c, *callee, *nargs, bcp, &mut deopts)
+                    )
+                {
+                    continue;
+                }
                 let direct_builtin = super::super::direct_builtin_slot(*callee, *nargs as usize);
                 let arg0 = match direct_builtin {
                     Some(slot) => ((slot as u64) << 32) | u64::from(*callee),
@@ -491,6 +502,24 @@ pub(super) fn emit_native_ppc64le(
     c.li(ACC, 0);
     emit_epilogue(&mut c)?;
 
+    // Cold deopt stubs. The operand stack was not moved before the guard failed, so
+    // the live locals and the untouched operands are still in the frame slots;
+    // report the bytecode position and the operand depth and leave through the
+    // ordinary epilogue. `run_native` sees the recorded state and resumes T0 there.
+    for (&deopt_bcp, &label) in &deopts {
+        c.bind(label);
+        c.subf(4, SLOTS, OPSP);
+        c.sradi(4, 4, 3);
+        emit_add_disp(&mut c, 4, 4, -n_locals)?;
+        c.imm64(3, u64::from(deopt_bcp));
+        emit_leaf_call(
+            &mut c,
+            c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64,
+        )?;
+        c.imm64(ACC, NIL.0);
+        emit_epilogue(&mut c)?;
+    }
+
     // One alternate entry per eligible loop header: the shared prologue, then a
     // branch into the body.
     let mut osr_entries: Vec<(u32, usize)> = Vec::new();
@@ -518,7 +547,7 @@ pub(super) fn emit_native_ppc64le(
         code,
         osr_entries,
         bcp_offsets,
-        has_deopt: can_osr_to_t2,
+        has_deopt: can_osr_to_t2 || !deopts.is_empty(),
         direct_calls: Vec::new(),
     })
 }
@@ -534,6 +563,130 @@ fn emit_push(c: &mut Asm) -> Option<()> {
 fn emit_pop(c: &mut Asm, register: u8) -> Option<()> {
     c.addi(OPSP, OPSP, -8);
     c.load(register, OPSP, 0)
+}
+
+/// Inline guarded fixnum fast path for an arithmetic `CallNamed`, or `Some(false)`
+/// when the callee or arity has no template (`None` only for an unencodable
+/// operand displacement). PEEK-guard-commit, as on x86 and System Z: the operands
+/// are read in place and the operand-stack pointer is not moved until every guard
+/// has passed, so a failed guard leaves the frame exactly as T0 expects at `bcp`.
+///
+/// Multiplication is left to the runtime: its overflow test needs `mulhd` and the
+/// untagging shift, and the baseline tier gains little from it.
+fn emit_fixnum_template(
+    c: &mut Asm,
+    sym: u32,
+    nargs: u16,
+    bcp: u32,
+    deopts: &mut std::collections::BTreeMap<u32, Label>,
+) -> Option<bool> {
+    if nargs == 1 {
+        let Some(op) = inlinable_unary_fixnum_op(sym) else {
+            return Some(false);
+        };
+        let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
+        c.load(ACC, OPSP, -8)?;
+        emit_guard_fixnum(c, ACC, deopt);
+        match op {
+            UnaryFixnumOp::Incr => {
+                c.li(4, 8);
+                emit_add_checked(c, 4, deopt);
+            }
+            UnaryFixnumOp::Decr => {
+                c.li(4, 8);
+                emit_sub_checked(c, 4, deopt);
+            }
+            UnaryFixnumOp::Neg => {
+                c.mov(4, ACC);
+                c.li(ACC, 0);
+                emit_sub_checked(c, 4, deopt);
+            }
+        }
+        c.store(ACC, OPSP, -8)?;
+        return Some(true);
+    }
+    if nargs != 2 {
+        return Some(false);
+    }
+    let Some(op) = inlinable_fixnum_op(sym) else {
+        return Some(false);
+    };
+    if matches!(op, FixnumOp::Mul) {
+        return Some(false);
+    }
+    let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
+    c.load(ACC, OPSP, -16)?;
+    c.load(4, OPSP, -8)?;
+    emit_guard_fixnum(c, ACC, deopt);
+    emit_guard_fixnum(c, 4, deopt);
+    match op {
+        FixnumOp::Add => emit_add_checked(c, 4, deopt),
+        FixnumOp::Sub => emit_sub_checked(c, 4, deopt),
+        comparison => {
+            // Branchless: `isel` picks T or NIL on the compare result.
+            c.compare(0, ACC, 4);
+            c.imm64(5, T.0);
+            c.imm64(6, NIL.0);
+            let cc = match comparison {
+                FixnumOp::Lt => Cc::L,
+                FixnumOp::Gt => Cc::G,
+                FixnumOp::Le => Cc::Le,
+                FixnumOp::Ge => Cc::Ge,
+                FixnumOp::NumEq => Cc::E,
+                FixnumOp::Add | FixnumOp::Sub | FixnumOp::Mul => unreachable!(),
+            };
+            c.isel(ACC, 5, 6, cc, 0);
+        }
+    }
+    c.store(ACC, OPSP, -16)?;
+    c.addi(OPSP, OPSP, -8);
+    Some(true)
+}
+
+/// Deopt unless `register` carries the fixnum tag (low three bits clear).
+fn emit_guard_fixnum(c: &mut Asm, register: u8, deopt: Label) {
+    c.li(SCRATCH, egcl_rt::value::TAG_MASK as i16);
+    c.and(SCRATCH, register, SCRATCH);
+    c.compare_imm(0, SCRATCH, 0);
+    c.branch(Cc::Ne, 0, deopt);
+}
+
+/// `ACC = ACC + rhs`, deopting on signed overflow. Tagged fixnums add directly.
+/// `XER[SO]` is sticky and cannot serve a per-operation guard (see the T2 emitter),
+/// so the sign test is explicit: overflow iff the operands agree in sign and the
+/// result disagrees with them.
+fn emit_add_checked(c: &mut Asm, rhs: u8, deopt: Label) {
+    c.add(5, ACC, rhs);
+    c.xor(6, ACC, 5);
+    c.xor(SCRATCH, rhs, 5);
+    c.and(6, 6, SCRATCH);
+    c.compare_imm(0, 6, 0);
+    c.mov(ACC, 5);
+    c.branch(Cc::L, 0, deopt);
+}
+
+/// `ACC = ACC - rhs`, deopting on signed overflow: overflow iff the operands
+/// differ in sign and the result's sign differs from the minuend's. Subtracting
+/// directly, rather than negating and adding, keeps the most negative fixnum
+/// correct.
+fn emit_sub_checked(c: &mut Asm, rhs: u8, deopt: Label) {
+    c.subf(5, rhs, ACC);
+    c.xor(6, ACC, rhs);
+    c.xor(SCRATCH, ACC, 5);
+    c.and(6, 6, SCRATCH);
+    c.compare_imm(0, 6, 0);
+    c.mov(ACC, 5);
+    c.branch(Cc::L, 0, deopt);
+}
+
+/// Call a Rust leaf that neither allocates nor re-enters Lisp, with the arguments
+/// already in r3 onwards. Only the TOC and the call itself; no transfer check.
+fn emit_leaf_call(c: &mut Asm, target: u64) -> Option<()> {
+    c.store(TOC, 1, frame::TOC_SLOT)?;
+    c.imm64(TARGET, target);
+    c.move_to_count(TARGET);
+    c.call_count();
+    c.load(TOC, 1, frame::TOC_SLOT)
 }
 
 fn emit_epilogue(c: &mut Asm) -> Option<()> {

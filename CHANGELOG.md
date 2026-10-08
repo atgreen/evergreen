@@ -8,6 +8,12 @@
   fence instructions, including after compiled-file loading
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
 
+- Fixnum `+`, `-`, `1+`, `1-`, unary `-` and the numeric comparisons
+  now compile inline with type and overflow guards in ppc64le baseline native
+  code instead of calling the runtime for every operation, taking a counted
+  loop from about 4,800 to 1,500 instructions per iteration at T1
+  ([#96](https://github.com/atgreen/evergreen/pull/96)).
+
 ### Platform support
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
