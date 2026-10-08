@@ -294,7 +294,8 @@ impl PendingBacktrace {
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 pub(crate) struct ForeignFrame {
     stack: &'static crate::stack::EgclStack,
@@ -306,7 +307,8 @@ pub(crate) struct ForeignFrame {
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 impl ForeignFrame {
     pub(crate) fn enter(target: *const ()) -> Result<Self, EgclError> {
@@ -338,7 +340,8 @@ impl ForeignFrame {
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 impl Drop for ForeignFrame {
     fn drop(&mut self) {

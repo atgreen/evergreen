@@ -219,7 +219,8 @@ fn global_safepoint_page() -> &'static SafepointPage {
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 pub(crate) struct ForeignStateScope {
     thread: &'static crate::thread::NativeThread,
@@ -232,7 +233,8 @@ pub(crate) struct ForeignStateScope {
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 impl ForeignStateScope {
     pub(crate) fn native() -> Self {
@@ -322,7 +324,8 @@ pub(crate) fn transition_native_state(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 ))]
 impl Drop for ForeignStateScope {
     fn drop(&mut self) {

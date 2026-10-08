@@ -48,11 +48,23 @@ mod lp64d;
     )
 )]
 mod elfv2;
+/// s390x foreign calls, compiled on every host for the same reason as ELFv2:
+/// the placement tests pin the two independent register counters and the
+/// big-endian stack layout of a single, which otherwise only a z machine checks.
+#[cfg_attr(
+    not(target_arch = "s390x"),
+    allow(
+        dead_code,
+        reason = "placement is exercised by this module's own tests"
+    )
+)]
+mod s390x;
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 )))]
 mod legacy;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
@@ -65,11 +77,14 @@ pub use aapcs64::{ffi_call, ffi_call_variadic};
 pub use lp64d::{ffi_call, ffi_call_variadic};
 #[cfg(all(target_arch = "powerpc64", target_endian = "little", unix))]
 pub use elfv2::{ffi_call, ffi_call_variadic};
+#[cfg(all(target_arch = "s390x", unix))]
+pub use s390x::{ffi_call, ffi_call_variadic};
 #[cfg(not(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "riscv64", unix),
-    all(target_arch = "powerpc64", target_endian = "little", unix)
+    all(target_arch = "powerpc64", target_endian = "little", unix),
+    all(target_arch = "s390x", unix)
 )))]
 pub use legacy::{ffi_call, ffi_call_variadic};
 
