@@ -23,6 +23,10 @@
   scalar signature, including floats, doubles, mixed argument lists and
   variadic functions, instead of the bootstrap dispatcher's fixed integer
   shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
+
+- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
+  the runtime recovery handler instead of terminating the process
+  ([#123](https://github.com/atgreen/evergreen/pull/123)).
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
   backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
