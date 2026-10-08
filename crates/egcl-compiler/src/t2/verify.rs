@@ -160,6 +160,8 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     || !matches!(
                         data.aux,
                         AuxData::CallTarget(_)
+                            | AuxData::HostEval(_)
+                            | AuxData::FunctionLookup(_)
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -177,6 +179,14 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                 errors.push(VerifyError::new(
                     "V11 invoke-shape",
                     "THROW requires an Invoke with tag and primary",
+                ));
+            }
+            if matches!(data.aux, AuxData::HostEval(_) | AuxData::FunctionLookup(_))
+                && (data.opcode != Opcode::Invoke || !data.args.is_empty())
+            {
+                errors.push(VerifyError::new(
+                    "V11 invoke-shape",
+                    "host evaluation and function lookup require argument-free Invoke",
                 ));
             }
             if let AuxData::HandlerScope { push_bcp, enter } = data.aux {
@@ -244,7 +254,10 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                                 && matches!(scope.kind, crate::control_scope::ScopeKind::HandlerBind { .. })))
                     })
                 };
-                if data.opcode != Opcode::Invoke || !data.args.is_empty() || !identity_matches {
+                if data.opcode != Opcode::Invoke
+                    || (!enter && !data.args.is_empty())
+                    || !identity_matches
+                {
                     errors.push(VerifyError::new(
                         "V16 handler-bind",
                         "invalid handler-bind registration identity or shape",

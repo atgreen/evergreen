@@ -9,12 +9,21 @@
 //! Gregorian range — no table lookups, no leap-year special-casing at the call
 //! site.
 //!
-//! Time zones follow the CL convention: an integer number of hours *west* of
-//! GMT (so GMT itself is 0, and e.g. EST is 5). When a caller omits the zone we
+//! Time zones are hours *west* of GMT (so GMT itself is 0, and e.g. EST is 5).
+//! The checked Lisp encoder accepts rational offsets at whole-second precision;
+//! the integer arithmetic helpers and decoder use whole-hour offsets.
+//! When a caller omits the zone we
 //! default to GMT (0) rather than the host's local zone: it keeps results
 //! deterministic and host-independent, and the libraries that care about local
 //! zones (e.g. local-time) carry their own zone machinery and always pass an
 //! explicit offset.
+
+use egcl_rt::bignum::{
+    BigInt, BigRat, as_bigrat, big_add, big_divmod, big_mul, bigint_from_val, bigrat_cmp,
+};
+use egcl_rt::error::EgclError;
+use egcl_rt::value::EgclVal;
+use std::cmp::Ordering;
 
 /// Days between the CL universal-time epoch (1900-01-01) and the Unix epoch
 /// (1970-01-01). 1900 is not a leap year (divisible by 100, not 400).
@@ -49,8 +58,8 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 }
 
 /// `encode-universal-time`: local decoded time (in zone `time_zone`, hours west
-/// of GMT; `None` = GMT) → universal time. Two-digit years are NOT adjusted here
-/// (the interpreter applies the CLHS 1900/2000 rule before calling).
+/// of GMT; `None` = GMT) → universal time. This low-level helper expects validated
+/// fields and a full year; Lisp callers use [`encode_universal_time_checked`].
 pub fn encode_universal_time(
     second: i64,
     minute: i64,
@@ -63,6 +72,87 @@ pub fn encode_universal_time(
     let days = days_from_civil(year, month, date) + DAYS_1900_TO_1970;
     let local = days * SECS_PER_DAY + hour * 3600 + minute * 60 + second;
     local + time_zone.unwrap_or(0) * 3600
+}
+
+/// Validate Lisp decoded-time arguments and encode without floating-point
+/// coercion or host-integer overflow. Omitted/NIL zones retain the GMT default.
+pub fn encode_universal_time_checked(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    if !(6..=7).contains(&args.len()) {
+        return Err(EgclError::ProgramError(
+            "ENCODE-UNIVERSAL-TIME requires six or seven arguments".into(),
+        ));
+    }
+    let bounded = |value: EgclVal, min: i64, max: i64| {
+        if value.is_fixnum() && (min..=max).contains(&value.as_fixnum()) {
+            Ok(value.as_fixnum())
+        } else {
+            Err(EgclError::TypeError {
+                datum: value,
+                expected: format!("(integer {min} {max})"),
+            })
+        }
+    };
+    let second = bounded(args[0], 0, 59)?;
+    let minute = bounded(args[1], 0, 59)?;
+    let hour = bounded(args[2], 0, 23)?;
+    let date = bounded(args[3], 1, 31)?;
+    let month = bounded(args[4], 1, 12)?;
+    let mut year = bigint_from_val(args[5])
+        .filter(|year| year.sign >= 0)
+        .ok_or_else(|| EgclError::TypeError {
+            datum: args[5],
+            expected: "(integer 0 *)".into(),
+        })?;
+    if year.mag.len() <= 1 && year.mag.first().copied().unwrap_or(0) < 100 {
+        let current = decode_universal_time(get_universal_time(), Some(0)).5;
+        let base = current - 50;
+        let short = year.mag.first().copied().unwrap_or(0) as i64;
+        year = BigInt::from_i64(base + (short - base).rem_euclid(100));
+    }
+    let zone_seconds = match args.get(6).copied().filter(|zone| !zone.is_nil()) {
+        None => 0,
+        Some(value) => {
+            let zone = as_bigrat(value)
+                .filter(|zone| {
+                    bigrat_cmp(zone, &BigRat::from_i64(-24)) != Ordering::Less
+                        && bigrat_cmp(zone, &BigRat::from_i64(24)) != Ordering::Greater
+                })
+                .ok_or_else(|| EgclError::TypeError {
+                    datum: value,
+                    expected: "(or null (rational -24 24))".into(),
+                })?;
+            let (seconds, remainder) =
+                big_divmod(&big_mul(&zone.num, &BigInt::from_i64(3600)), &zone.den);
+            if !remainder.is_zero() {
+                return Err(EgclError::ProgramError(
+                    "time zone must represent a whole number of seconds".into(),
+                ));
+            }
+            i64::from(seconds.sign) * seconds.mag.first().copied().unwrap_or(0) as i64
+        }
+    };
+    // Split off complete Gregorian cycles so even bignum years use the same
+    // bounded civil-date arithmetic as ordinary years.
+    let (era, year_in_era) = big_divmod(&year, &BigInt::from_i64(400));
+    let year_in_era = year_in_era.mag.first().copied().unwrap_or(0) as i64;
+    let within_era = days_from_civil(year_in_era, month, date) + DAYS_1900_TO_1970;
+    let days = big_add(
+        &big_mul(&era, &BigInt::from_i64(146097)),
+        &BigInt::from_i64(within_era),
+    );
+    let universal = big_add(
+        &big_mul(&days, &BigInt::from_i64(SECS_PER_DAY)),
+        &BigInt::from_i64(hour * 3600 + minute * 60 + second + zone_seconds),
+    );
+    // All argument reads are complete before constructing a heap result.
+    let value = universal.to_val();
+    if universal.sign < 0 {
+        return Err(EgclError::TypeError {
+            datum: value,
+            expected: "unsigned-byte".into(),
+        });
+    }
+    Ok(value)
 }
 
 /// Decoded universal time. Returns
@@ -163,6 +253,79 @@ pub fn get_internal_run_time() -> Result<i64, egcl_rt::error::EgclError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_encoding_rejects_invalid_field_types_and_ranges() {
+        let good = [0, 0, 4, 13, 5, 2026, 0].map(EgclVal::from_fixnum);
+        for (index, min, max) in [(0, 0, 59), (1, 0, 59), (2, 0, 23), (3, 1, 31), (4, 1, 12)] {
+            for bad in [
+                EgclVal::from_fixnum(min - 1),
+                EgclVal::from_fixnum(max + 1),
+                EgclVal::from_single_float(1.0),
+                egcl_rt::value::NIL,
+            ] {
+                let mut args = good;
+                args[index] = bad;
+                match encode_universal_time_checked(&args) {
+                    Err(EgclError::TypeError { datum, expected }) => {
+                        assert_eq!(datum, bad);
+                        assert_eq!(expected, format!("(integer {min} {max})"));
+                    }
+                    result => panic!("field {index}: expected a type error, got {result:?}"),
+                }
+            }
+        }
+        assert!(matches!(
+            encode_universal_time_checked(&good[..5]),
+            Err(EgclError::ProgramError(_))
+        ));
+        let mut extra = good.to_vec();
+        extra.push(EgclVal::from_fixnum(0));
+        assert!(matches!(
+            encode_universal_time_checked(&extra),
+            Err(EgclError::ProgramError(_))
+        ));
+    }
+
+    #[test]
+    fn checked_encoding_defaults_to_gmt_and_rejects_subsecond_zones() {
+        let mut args = [0, 0, 4, 13, 5, 2026, 0].map(EgclVal::from_fixnum);
+        let expected = EgclVal::from_fixnum(3987633600);
+        assert_eq!(encode_universal_time_checked(&args[..6]).unwrap(), expected);
+        args[6] = egcl_rt::value::NIL;
+        assert_eq!(encode_universal_time_checked(&args).unwrap(), expected);
+        args[6] = BigRat::new(BigInt::from_i64(1), BigInt::from_i64(7)).to_val();
+        assert!(matches!(
+            encode_universal_time_checked(&args),
+            Err(EgclError::ProgramError(_))
+        ));
+    }
+
+    #[test]
+    fn checked_encoding_agrees_across_gregorian_cycles() {
+        for year in [1900, 1901, 1999, 2000, 2024, 2100, 2400, 9999, 10000] {
+            for month in 1..=12 {
+                for date in [1, 28, 31] {
+                    for zone in [-24, 0, 24] {
+                        let args = [59, 59, 23, date, month, year, zone].map(EgclVal::from_fixnum);
+                        let expected =
+                            encode_universal_time(59, 59, 23, date, month, year, Some(zone));
+                        if expected >= 0 {
+                            assert_eq!(
+                                encode_universal_time_checked(&args).unwrap(),
+                                EgclVal::from_fixnum(expected)
+                            );
+                        } else {
+                            assert!(matches!(
+                                encode_universal_time_checked(&args),
+                                Err(EgclError::TypeError { .. })
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn epoch_is_zero() {

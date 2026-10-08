@@ -293,6 +293,7 @@ impl PendingBacktrace {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 pub(crate) struct ForeignFrame {
@@ -304,6 +305,7 @@ pub(crate) struct ForeignFrame {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 impl ForeignFrame {
@@ -335,6 +337,7 @@ impl ForeignFrame {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 impl Drop for ForeignFrame {

@@ -7,6 +7,12 @@ runtime can compile hot functions to T1 baseline native code and then T2
 optimized code. Forms that are not lowered can use the tree-walking evaluator.
 Native backend coverage varies by architecture.
 
+`multiple-value-prog1` is supported in bytecode and baseline native code,
+including compiled files. It preserves all values of its first form (including
+zero values), evaluates the remaining forms for their effects, and then returns
+the saved values. Functions using its multiple-value list operations currently
+remain at T1 because T2 does not yet lower those operations.
+
 Compilation is therefore not a single event. Reading and evaluating a `defun`,
 writing a compiled file, and optimizing a hot loop are distinct operations.
 [Execution tiers](user/explanation/execution.md) describes the shared model;

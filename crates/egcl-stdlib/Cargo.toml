@@ -16,6 +16,7 @@ python = ["egcl-rt/python"]
 egcl-rt.workspace = true
 egcl-compiler.workspace = true
 rustyline = "18.0.1"
+socket2 = "0.6.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

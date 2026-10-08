@@ -46,8 +46,8 @@
 //!   operator has a local macro binding, else a global macro definition, is
 //!   handed to the current `*macroexpand-hook*` as `(expander form env)`.
 //!   The default hook looks the expander up in the registry and calls it;
-//!   for symbol macros the expansion value is passed in both positions so the
-//!   default hook returns it unchanged. `*PACKAGE*` is snapshotted and
+//!   for symbol macros the expander is the expansion value and the form is the
+//!   original symbol. `*PACKAGE*` is snapshotted and
 //!   restored around every expansion because an expander running in another
 //!   package otherwise leaks its package into the caller's reads
 //!   (bliss-cpm9).
@@ -959,11 +959,21 @@ pub type MacroexpandHook = fn(EgclVal, EgclVal, &Environment) -> Result<EgclVal,
 /// The hook looks up the registered Rust-side callable in MACRO_FUNCTION_REGISTRY
 /// and invokes it with (form, env). If no callable is registered, it falls back
 /// to returning the expander value — this supports symbol macros where the
-/// expander IS the expansion value (macroexpand_1 passes (expansion, expansion, env)).
+/// expander IS the expansion value.
 ///
 /// For full funcall semantics with arbitrary Lisp functions, the runtime must
 /// register each macro's expander via `register_macro_function`.
 fn default_hook(
+    expander: EgclVal,
+    form: EgclVal,
+    env: &Environment,
+) -> Result<EgclVal, EgclError> {
+    invoke_macro_expander(expander, form, env)
+}
+
+/// Invoke an expansion function without consulting the expansion hook again.
+/// Hosts use this when a Lisp hook calls the expander it was handed.
+pub fn invoke_macro_expander(
     expander: EgclVal,
     form: EgclVal,
     env: &Environment,
@@ -973,8 +983,7 @@ fn default_hook(
     if let Some(func) = lookup_macro_function(expander) {
         return func(form, env);
     }
-    // Fallback: for symbol macros, macroexpand_1 passes (expansion, expansion, env),
-    // so returning the first argument yields the correct expansion value.
+    // Symbol macros carry their expansion directly rather than a registry key.
     Ok(expander)
 }
 
@@ -1092,14 +1101,9 @@ pub fn macroexpand_1(
         PackageCellGuard { sym, saved }
     };
     egcl_rt::rooted_ref!(_form_root = &mut form);
-    // 1. Check if form is a symbol with a symbol-macro binding. *macroexpand-hook*
-    // applies to symbol-macro expansion too (CLHS macroexpand-1: the hook mediates
-    // the expansion of both macros and symbol macros), so route through it rather
-    // than returning the expansion raw (bliss-ms0). The expansion value is passed
-    // in BOTH the expander and form positions per the default_hook contract: that
-    // way default_hook (returns the expander) and identity_hook (returns the form)
-    // both yield the expansion, while a transforming hook can override it. Root the
-    // expansion across the hook call, which may allocate (mirrors the macro paths).
+    // Symbol macro hooks receive the original symbol, just as ordinary macro
+    // hooks receive the original call. The host reifies the expansion value as
+    // a callable constant expander before handing it to a Lisp hook.
     if let Some(VariableInfo::SymbolMacro(mut expansion)) = env.variable_information(form) {
         egcl_rt::rooted_ref!(_expansion_root = &mut expansion);
         let hook = get_macroexpand_hook();
@@ -1110,13 +1114,12 @@ pub fn macroexpand_1(
         // expansion can alias (bliss-skx), so even routed through default_hook a
         // fixnum expansion would fall through the registry miss to `Ok(expander)`.
         // This is purely an allocation/lock elision. A CUSTOM hook is still
-        // invoked (expansion in both the expander and form positions, per the
-        // default_hook contract) so it can transform symbol-macro expansions
+        // invoked with the original form so it can transform symbol-macro expansions
         // (CLHS: *macroexpand-hook* mediates symbol-macro expansion too; bliss-ms0).
         if hook as usize == (default_hook as MacroexpandHook) as usize {
             return Ok((expansion, true));
         }
-        let result = hook(expansion, expansion, env)?;
+        let result = hook(expansion, form, env)?;
         return Ok((result, true));
     }
 

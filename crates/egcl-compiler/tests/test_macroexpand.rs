@@ -386,8 +386,7 @@ fn macroexpand_hook_is_invoked_during_expansion() {
 }
 
 #[test]
-fn macroexpand_hook_identity_preserves_expansion() {
-    // With the identity hook, expansion should work normally
+fn macroexpand_hook_receives_original_symbol() {
     set_macroexpand_hook(identity_hook);
 
     let env = Environment::null();
@@ -398,8 +397,8 @@ fn macroexpand_hook_identity_preserves_expansion() {
     let (result, expanded_p) = macroexpand_1(sym, &env2).unwrap();
     assert!(expanded_p, "expansion should occur");
     assert_eq!(
-        result, expansion,
-        "identity hook should preserve the expansion value"
+        result, sym,
+        "identity hook should return the original symbol"
     );
 }
 

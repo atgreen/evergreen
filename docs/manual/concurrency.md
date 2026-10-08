@@ -16,6 +16,11 @@ Accepts a callable function or a symbol naming a global function. `name` is a
 string or `nil`. Treat the returned handle as opaque; its current representation
 is not a portable application data format.
 
+The worker shares its creator's package registry, including package nicknames
+and internal and exported symbols. Packages and symbols created by either
+execution are visible to the other; this also applies to a native thread
+created by a fiber.
+
 ### `egcl-thread:join-thread` { #join-thread }
 
 **Function** `(egcl-thread:join-thread thread &key timeout)` → value, completed-p

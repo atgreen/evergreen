@@ -57,6 +57,18 @@ intentionally not a supported API.
 
 ## Currently available API
 
+### Stream I/O timeouts
+
+`EGCL-EXT:IO-TIMEOUT` is a subtype of `STREAM-ERROR` and
+`SIMPLE-CONDITION`. Native socket byte and byte-sequence reads signal it when
+their configured receive timeout expires. `STREAM-ERROR-STREAM` returns the
+affected stream; the simple-condition accessors provide the diagnostic text.
+Other stream failures are not classified as timeouts. The socket remains open
+after a timeout and can be read again or closed by the caller.
+
+This is distinct from `EGCL-EXT:TIMEOUT-CONDITION`, which represents a sandbox
+CPU deadline. It does not impose a total deadline on a multi-operation protocol.
+
 ### Environment and working directory
 
 #### `egcl-ext:getenv`
@@ -186,6 +198,26 @@ zero.
       (egcl-ext:function-back-edge-count 'sum-to)
       (egcl-ext:deopt-count))
 ```
+
+### Macroexpansion instrumentation
+
+The standard `CL:*MACROEXPAND-HOOK*` defaults to `#'FUNCALL`.
+`MACROEXPAND-1`, `MACROEXPAND`, and compiler expansion through those entry
+points honor its dynamic binding. The hook receives a callable expander,
+the original form (a symbol for a symbol macro), and the lexical environment.
+
+```lisp
+(let ((previous *macroexpand-hook*))
+  (let ((*macroexpand-hook*
+          (lambda (expander form environment)
+            (format *trace-output* "Expanding ~S~%" form)
+            (funcall previous expander form environment))))
+    (macroexpand '(when ready (run)))))
+```
+
+Use the environment only during expansion; do not retain it. Direct
+tree-evaluator expansion is not a guaranteed instrumentation point, so hook
+counts are not a count of every macro evaluated by a program.
 
 ### Bootstrap image writer
 
@@ -542,8 +574,32 @@ and wake generations prevent an expired earlier wait from waking a later one.
 Established TCP stream reads, writes/flushes, and `%SOCKET-WAIT-FOR-INPUT`
 also park on socket readiness. They use shared epoll/kqueue services on Unix
 and one shared Winsock poller on Windows, preserving synchronous Lisp stream
-calls and receive timeouts. Connect, accept, DNS, regular file I/O, and terminal
+calls and receive timeouts. On Unix, listener accept and readiness waits also
+park unpinned fibers. Connect, DNS, Windows accept, regular file I/O, and terminal
 I/O are not yet cooperative. See [socket I/O limitations](manual/fibers.md#socket-io).
+
+The native server primitives used by library adapters are:
+
+```lisp
+(egcl::%socket-listen &optional (host "127.0.0.1") (port 0) (backlog 5) reuse-address)
+(egcl::%socket-local-port listener) -> port-or-nil
+(egcl::%socket-listener-ready-p listener timeout-ms) -> boolean
+(egcl::%socket-accept listener) -> bidirectional-octet-stream
+(egcl::%socket-close listener)
+```
+
+Listener IDs are process-wide: another native thread or fiber can query, accept,
+or close a listener. Port zero selects an available local port. Ports must be in
+0–65535 and backlog in 0–2147483647; the OS may cap the requested queue limit.
+Explicit `reuse-address` controls `SO_REUSEADDR` before binding. Omitting it
+preserves the previous platform default (true on Unix, false on Windows).
+These internal interfaces are intended for adapters, not as a portable sockets API.
+
+On Unix, negative readiness timeouts wait indefinitely, zero polls, and positive
+values bound the wait in milliseconds. Closing a listener wakes pending Unix
+accept/readiness waits with an error; it does not close already accepted streams.
+Closed IDs are not reused, and `%SOCKET-LOCAL-PORT` returns `NIL` for a closed ID.
+Windows listener readiness and cancellation do not yet provide these guarantees.
 
 ### Pinning
 
