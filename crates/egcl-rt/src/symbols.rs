@@ -914,6 +914,7 @@ pub fn symbol_function(idx: u32) -> Option<EgclVal> {
 /// Set the global function cell.
 pub fn set_symbol_function(idx: u32, function: EgclVal) {
     read_cell(idx, |s| s.function.store(function.0, Ordering::Release));
+    crate::call_table::invalidate(idx);
 }
 
 /// Diagnostic: the raw address of a symbol's pinned `SymbolData` object, or

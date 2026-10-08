@@ -49,6 +49,9 @@ mod native_transfer_entry_riscv64;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
 mod pending_error;
+mod call_table;
+#[cfg(all(target_arch = "x86_64", unix))]
+mod call_table_native;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use super::control_payload::reserve_control_values;
@@ -218,6 +221,7 @@ pub(super) fn direct_call_gen() -> u64 {
 #[inline]
 pub(super) fn bump_direct_call_gen() {
     DIRECT_CALL_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    egcl_rt::call_table::invalidate_all();
 }
 
 // Captured lexical locations are process-wide, just like function identities.
@@ -394,6 +398,7 @@ fn trace_private_function_roots(
 fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     // SAFETY: the collector stopped every execution, including suspended fibers.
     unsafe {
+        call_table::scan(visit);
         NATIVE_ERROR.scan(|error| {
             use egcl_rt::gc::TraceHostRoots;
             error.visit(|value| value.trace_host_roots(visit));
@@ -905,6 +910,10 @@ fn form_list(items: &[EgclVal]) -> EgclVal {
 // the old body so saved function objects remain callable after replacement.
 fn replacement_function(sym: u32) -> Option<EgclVal> {
     let function = egcl_rt::symbols::symbol_function(sym)?;
+    replacement_function_value(sym, function)
+}
+
+fn replacement_function_value(sym: u32, function: EgclVal) -> Option<EgclVal> {
     if !egcl_rt::function::is_interpreted_function(function) {
         return None;
     }
@@ -913,6 +922,8 @@ fn replacement_function(sym: u32) -> Option<EgclVal> {
 }
 
 fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
+    #[cfg(test)]
+    call_table::record_target_lookup();
     install_bytecode_root_scanner();
     let shared = named_definitions().borrow().get(&sym).cloned();
     if let Some(definition) = shared {
@@ -1808,6 +1819,7 @@ pub fn profile_unpin(sym: u32) {
     // pin-induced decline, so nothing should be recorded — but an unpinned
     // function must be able to tier up, so clear any entry regardless.
     T1_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+    egcl_rt::call_table::invalidate(sym);
 }
 
 fn is_profile_pinned(sym: u32) -> bool {
@@ -17208,7 +17220,13 @@ extern "C" fn c2i_call_builtin(
     }
 }
 
-fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<EgclVal, EgclError> {
+fn c2i_call_result(
+    sym: u64,
+    args: &[EgclVal],
+    profile_site: u64,
+) -> Result<EgclVal, EgclError> {
+    #[cfg(test)]
+    call_table::record_target_lookup();
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         return Ok(NIL);
@@ -17220,13 +17238,17 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
     let n = args.len();
     let sym32 = sym as u32;
     let fn_val = EgclVal::from_symbol_index(sym32);
+    let current_function = || egcl_rt::symbols::symbol_function(sym32);
     // Guard the interpreter reentry so a panic deep in the callee (e.g. a GC
     // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
     // catchable condition rather than aborting across this `extern "C"` frame.
     guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
-        if let Some(function) = replacement_function(sym32) {
-            return apply_function(function, args, env);
+        if let Some(function) = current_function()
+            .and_then(|function| replacement_function_value(sym32, function))
+        {
+            egcl_rt::rooted!(function = function);
+            return apply_function(*function, args, env);
         }
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the EgclStack (bliss-x5y.4). This
@@ -17243,8 +17265,9 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
                 // interpreter's CallNamed arm, so this adapter owns the callee's
                 // invocation bump and tier transition. Without it, a callee reached
                 // only from a native caller would stop warming up permanently.
-                let fn_obj = egcl_rt::symbols::symbol_function(sym32)
-                    .filter(|&cell| egcl_rt::function::is_interpreted_function(cell));
+                egcl_rt::rooted!(function = current_function().unwrap_or(NIL));
+                let fn_obj = egcl_rt::function::is_interpreted_function(*function)
+                    .then_some(*function);
                 if !profiling_disabled()
                     && let Some(cell) = fn_obj
                 {
@@ -17276,7 +17299,11 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
 }
 
 fn c2i_call_args(sym: u64, args: &[EgclVal], profile_site: u64) -> u64 {
-    match c2i_call_result(sym, args, profile_site) {
+    finish_c2i_call(c2i_call_result(sym, args, profile_site))
+}
+
+fn finish_c2i_call(result: Result<EgclVal, EgclError>) -> u64 {
+    match result {
         Ok(v) => v.0,
         // Rust cannot unwind through native code: stash the transfer and return
         // a placeholder. T1 checks immediately after the crossing and returns
@@ -17876,7 +17903,8 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
 /// `resume_inlined_in_t0` does for run_native, and the frames are popped. The
 /// deopt bookkeeping -- counts, profile decay, retirement or blacklisting of
 /// the native code -- happens here too; retiring the code while this
-/// activation is still inside it is safe because `ActiveNativeCode` holds it.
+/// activation is still inside it is safe because the native entry owner
+/// (`ActiveNativeCode` or an active linkage version) retains it.
 /// An error raised by the resumed code is stashed as a pending native
 /// transfer and NIL returned, which the native caller's transfer check turns
 /// into the ordinary exit.
@@ -17884,7 +17912,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
 /// GC safety: the stream's tagged words are copied into the pushed frames,
 /// which the collector scans, before the interpreter can allocate; the scope
 /// list holds Arc bodies and raw frame pointers, never a loose EgclVal.
-#[cfg_attr(not(target_arch = "s390x"), allow(dead_code))]
+#[cfg_attr(not(any(target_arch = "s390x", target_arch = "x86_64")), allow(dead_code))]
 extern "C" fn c2i_deopt_t2_inline(
     n_scopes: u64,
     n_words: u64,
@@ -18086,6 +18114,8 @@ fn materialize_t2_deopt_scopes(
 // Direct-call contract fields remain part of installed metadata on all targets.
 // Only the x86-64 emitter currently consumes them for direct native calls.
 struct NativeCode {
+    /// Stable linkage words embedded in this code; cells do not own code.
+    _call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     /// Retain executable pages while activations and embedded callers own this code.
     _buffer: egcl_rt::jit::JitBuffer,
     /// The exact metadata and constant slots this machine code was built from.
@@ -18123,8 +18153,8 @@ struct NativeCode {
     /// cross the c2i boundary yet); recorded so that wiring is a local change.
     #[allow(dead_code)]
     compiled_entry: usize,
-    /// Nonzero for T2 code on s390x: the key its deopt stubs pass, resolved
-    /// through `CODE_BY_ID`.
+    /// Stable identity passed by x86-64/s390x callee-local deopt stubs and
+    /// resolved through `CODE_BY_ID`, even after a newer definition is installed.
     code_id: u64,
     /// Optimized loop-header entry offsets for T1→T2 on-stack replacement.
     osr_entries: HashMap<u32, usize>,
@@ -18303,27 +18333,43 @@ static LAST_FAILED_SPECULATION: egcl_rt::execution_local::ExecutionLocal<
 /// to out-vote a large stale count). Called once per promotion; the other type's
 /// samples keep accumulating, so the profile never goes fully cold (which would,
 /// with the cold-site fixnum guess, just re-promote the same wrong type).
-fn decay_failed_speculation(func_ptr: usize, forced: Option<SpecType>) -> Vec<(u32, SpecType)> {
+fn decay_failed_speculation(
+    body: &Arc<BytecodeFunction>,
+    forced: Option<SpecType>,
+) -> Vec<(u32, SpecType)> {
     let mut failed = Vec::new();
+    let func_ptr = Arc::as_ptr(body) as usize;
     TYPE_PROFILE.with(|m| {
-        for ((fp, bcp), p) in m.borrow_mut().iter_mut() {
-            if *fp == func_ptr {
-                let spec = forced.or({
-                    if p.fixnum >= p.single_float && p.fixnum > 0 {
-                        Some(SpecType::Fixnum)
-                    } else if p.single_float > 0 {
-                        Some(SpecType::SingleFloat)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(spec) = spec {
-                    match spec {
-                        SpecType::Fixnum => p.fixnum = 0,
-                        SpecType::SingleFloat => p.single_float = 0,
-                    }
-                    failed.push((*bcp, spec));
+        let mut profiles = m.borrow_mut();
+        for (bcp, instruction) in body.code.iter().enumerate() {
+            let Instr::CallNamed { sym, .. } = instruction else {
+                continue;
+            };
+            if !is_arith_speculatable(*sym) {
+                continue;
+            }
+            let Some(p) = profiles.get_mut(&(func_ptr, bcp as u32)) else {
+                // Missing profiles compile with an optimistic Fixnum guess.
+                // Remember its failure without manufacturing observations: an
+                // existing all-zero profile instead compiles without speculation.
+                failed.push((bcp as u32, forced.unwrap_or(SpecType::Fixnum)));
+                continue;
+            };
+            let spec = forced.or({
+                if p.fixnum >= p.single_float && p.fixnum > 0 {
+                    Some(SpecType::Fixnum)
+                } else if p.single_float > 0 {
+                    Some(SpecType::SingleFloat)
+                } else {
+                    None
                 }
+            });
+            if let Some(spec) = spec {
+                match spec {
+                    SpecType::Fixnum => p.fixnum = 0,
+                    SpecType::SingleFloat => p.single_float = 0,
+                }
+                failed.push((bcp as u32, spec));
             }
         }
     });
@@ -18768,6 +18814,7 @@ struct T2BodySnapshot {
 }
 
 struct T2CompileInput {
+    call_cells: Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
     sym: u32,
     generation: u64,
     priority: u64,
@@ -18849,6 +18896,7 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 }
 
 struct T2Artifact {
+    call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     code: Vec<u8>,
     #[cfg(all(target_arch = "x86_64", windows))]
     windows_unwind: Vec<egcl_compiler::t2::emit::WindowsUnwindRange>,
@@ -19172,6 +19220,8 @@ fn dispatch_invoke_count_snapshot(sym: u32, fn_obj: Option<EgclVal>) -> u32 {
 }
 
 fn publish_native(sym: u32, fn_obj: Option<EgclVal>, nc: &NativeCode) {
+    // The next slot call must observe the newly installed tier.
+    egcl_rt::call_table::invalidate(sym);
     // Pinned to T0 for deterministic profiling (bliss-xgr5): never install native
     // code, so the interpreter counts every call. Catches the T2 install path too
     // (both tiers publish here).
@@ -19351,7 +19401,21 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     }
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
     let direct_natives = direct_native_targets(sym, generation, &root, &inline_bodies);
+    let mut call_cells = Vec::new();
+    if cfg!(target_arch = "x86_64") {
+        for body in std::iter::once(&*root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
+            for instruction in &body.code {
+                if let Instr::CallNamed { sym, .. } = instruction
+                    && !call_cells.iter().any(|(symbol, _)| symbol == sym)
+                    && let Some(cell) = call_table::resolve(*sym)
+                {
+                    call_cells.push((*sym, cell));
+                }
+            }
+        }
+    }
     Some(T2CompileInput {
+        call_cells,
         sym,
         generation,
         priority,
@@ -19580,6 +19644,17 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         return None;
     }
     let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
+    // Resume the root activation on its original definition, so T0 samples
+    // after a guard failure update the profile used for recompilation. The
+    // worker's deep snapshot has a different Arc identity; profiling that copy
+    // would hide the new numeric phase and eventually blacklist valid code.
+    // Keep the snapshot rooted too: native constants may address its pool.
+    if let std::collections::hash_map::Entry::Occupied(mut root) =
+        artifact.deopt_bodies.entry(done.sym)
+    {
+        root.insert(Arc::clone(&bf));
+        artifact.rooted_bodies.push(Arc::clone(&bf));
+    }
     let metadata = if artifact.rooted_bodies.is_empty() {
         None
     } else {
@@ -19652,6 +19727,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         }
     }
     let nc = Rc::new(NativeCode {
+        _call_cells: artifact.call_cells,
         _buffer: buf,
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
@@ -19759,6 +19835,8 @@ fn native_for_dispatch(
     fn_obj: Option<EgclVal>,
     invoke_count: u32,
 ) -> Option<Rc<NativeCode>> {
+    #[cfg(test)]
+    call_table::record_target_lookup();
     if profiling_disabled() {
         return None;
     }
@@ -19868,7 +19946,7 @@ fn note_native_deopt(sym: u32, is_t2: bool, bf: Option<&Arc<BytecodeFunction>>) 
                 // T1's optimistic arithmetic templates are always Fixnum. T2
                 // follows the profile that was dominant when it was compiled.
                 let forced = (!is_t2).then_some(SpecType::Fixnum);
-                let failed = decay_failed_speculation(Arc::as_ptr(bf) as usize, forced);
+                let failed = decay_failed_speculation(bf, forced);
                 LAST_FAILED_SPECULATION.with(|m| {
                     m.borrow_mut().insert(sym, failed);
                 });
@@ -19944,6 +20022,8 @@ fn run_native(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    #[cfg(test)]
+    call_table::record_target_lookup();
     // The segment ABI carries exceptional exits out-of-band through its cold
     // landing path, so it does not need the legacy post-call transfer poll.
     // Keep rollout explicit while native Windows and hardening gates are still
@@ -21868,6 +21948,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
+        _call_cells: Vec::new(),
         _buffer: buf,
         body: Some(bf),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
@@ -22125,12 +22206,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
-    // The s390x stub returns the adapter's value as the activation's result
-    // (bliss-w6aki); the x86-64 stub discards it and lets run_native resume.
-    #[cfg(target_arch = "s390x")]
+    // These emitters resume the precise callee locally and return its result,
+    // so a direct native caller need not re-enter run_native to deoptimize.
+    #[cfg(any(target_arch = "s390x", target_arch = "x86_64"))]
     let deopt_t2_addr =
         c2i_deopt_t2_inline as extern "C" fn(u64, u64, *const u64, u64) -> u64 as usize as u64;
-    #[cfg(not(target_arch = "s390x"))]
+    #[cfg(not(any(target_arch = "s390x", target_arch = "x86_64")))]
     let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let call_slice_addr =
@@ -22141,6 +22222,16 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let mv_addr = c2i_t2_mv as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let recovery_toggle_addr =
         c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
+    let named_calls: Vec<_> = input
+        .call_cells
+        .iter()
+        .map(|(symbol, cell)| egcl_compiler::t2::emit::NamedCallTarget {
+            symbol: *symbol,
+            cell_address: Arc::as_ptr(cell) as u64,
+            register_entry: cell.entry_address(false) as u64,
+            slice_entry: cell.entry_address(true) as u64,
+        })
+        .collect();
     let framed = match egcl_compiler::t2::emit::emit_framed_with_direct_natives(
         &f,
         deopt_addr,
@@ -22158,6 +22249,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         Some(sym),
         &input.direct_natives,
         input.code_id,
+        &named_calls,
     ) {
         Ok(fc) => fc,
         Err(e) => {
@@ -22228,6 +22320,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     );
 
     Some(T2Artifact {
+        call_cells: input
+            .call_cells
+            .iter()
+            .map(|(_, cell)| Arc::clone(cell))
+            .collect(),
         code,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: framed.windows_unwind,
@@ -24145,6 +24242,7 @@ mod jtc4_stack_map_tests {
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
+            call_cells: Vec::new(),
             code: vec![0x90; 8],
             #[cfg(all(target_arch = "x86_64", windows))]
             windows_unwind: vec![],
@@ -24177,6 +24275,44 @@ mod jtc4_stack_map_tests {
         missing.root_sync_sites[0].spill_roots = 1;
         missing.root_sync_sites[0].code_offset = missing.code.len() as u32;
         assert_eq!(validate_t2_root_sync(3, &missing), None);
+    }
+
+    #[test]
+    fn failed_cold_speculation_preserves_missing_and_empty_profiles() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let mut function = compile_function("COLD-PROFILE", NIL, *form, &env, false, false)
+            .expect("compile constant body");
+        let sym = super::super::resolve_sym("+").unwrap().as_symbol_index();
+        // Three arithmetic sites: never observed, previously observed but
+        // decayed to zero, and a site with samples from two numeric phases.
+        function.code = vec![Instr::CallNamed { sym, nargs: 2 }; 3];
+        let body = Arc::new(function);
+        let key = Arc::as_ptr(&body) as usize;
+        clear_bytecode_profiles(key);
+        TYPE_PROFILE.with(|profiles| {
+            let mut profiles = profiles.borrow_mut();
+            profiles.insert((key, 1), TypeProfile::default());
+            profiles.insert((key, 2), TypeProfile {
+                fixnum: 20,
+                single_float: 2,
+                other: 0,
+            });
+        });
+        let failed = decay_failed_speculation(&body, None);
+        let cold = type_profile_at(key, 0);
+        let empty = type_profile_at(key, 1).unwrap();
+        let observed = type_profile_at(key, 2).unwrap();
+        clear_bytecode_profiles(key);
+        assert_eq!(failed, vec![(0, SpecType::Fixnum), (2, SpecType::Fixnum)]);
+        assert!(cold.is_none(), "failed cold guesses must not fabricate observations");
+        assert_eq!(empty.total(), 0);
+        assert_eq!(observed.fixnum, 0);
+        assert_eq!(observed.single_float, 2, "retain the new phase's samples");
     }
 
     #[test]
@@ -24321,6 +24457,7 @@ mod jtc4_stack_map_tests {
         let entry = buf.as_ptr();
         let code_info = install_stack_map(1, std::sync::Weak::new()).unwrap();
         let nc = NativeCode {
+            _call_cells: Vec::new(),
             _buffer: buf,
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
@@ -24388,6 +24525,7 @@ mod jtc4_stack_map_tests {
         let entry = buf.as_ptr();
         let code_info = install_stack_map(1, std::sync::Weak::new()).unwrap();
         let nc = NativeCode {
+            _call_cells: Vec::new(),
             _buffer: buf,
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,

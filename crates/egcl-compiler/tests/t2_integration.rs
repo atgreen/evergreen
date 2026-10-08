@@ -61,6 +61,108 @@ fn bytecode_fn(
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
+fn named_calls_reload_fixed_slots_without_resolving_symbols() {
+    use egcl_compiler::t2::emit::{emit_framed_with_direct_natives, NamedCallTarget};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    extern "C" fn first(cell: u64, n: u64, _: u64, _: u64, _: u64, profile: u64) -> u64 {
+        assert_eq!(cell, 0x1234);
+        assert!(n <= 3);
+        assert_eq!(profile, 0);
+        EgclVal::from_fixnum(41).0
+    }
+    extern "C" fn second(cell: u64, n: u64, _: u64, _: u64, _: u64, profile: u64) -> u64 {
+        assert_eq!(cell, 0x1234);
+        assert!(n <= 3);
+        assert_eq!(profile, 0);
+        EgclVal::from_fixnum(99).0
+    }
+    extern "C" fn first_slice(cell: u64, n: u64, args: *const EgclVal, profile: u64) -> u64 {
+        assert_eq!((cell, n, profile), (0x1234, 4, 0));
+        assert_eq!(unsafe { *args.add(3) }, NIL);
+        EgclVal::from_fixnum(41).0
+    }
+    extern "C" fn second_slice(cell: u64, n: u64, args: *const EgclVal, profile: u64) -> u64 {
+        assert_eq!((cell, n, profile), (0x1234, 4, 0));
+        assert_eq!(unsafe { *args.add(3) }, NIL);
+        EgclVal::from_fixnum(99).0
+    }
+    // Deliberately absent from the symbol registry: execution must consume the
+    // provided slot, not look up a symbol or resolve a runtime function value.
+    let symbol = 0x7fff_ffff;
+    for nargs in [0, 1, 3, 4] {
+        let registers = AtomicUsize::new(first as *const () as usize);
+        let slice = AtomicUsize::new(first_slice as *const () as usize);
+        let target = NamedCallTarget {
+            symbol,
+            cell_address: 0x1234,
+            register_entry: &registers as *const AtomicUsize as u64,
+            slice_entry: &slice as *const AtomicUsize as u64,
+        };
+        let mut instructions = vec![Instr::Const(0); nargs as usize];
+        instructions.push(Instr::CallNamed { sym: symbol, nargs });
+        instructions.push(Instr::Return);
+        let body = bytecode_fn("slot-caller", instructions, vec![NIL], 0, nargs.max(1), 0);
+        let ir = build_from_bytecode(&body).unwrap();
+        let framed = emit_framed_with_direct_natives(
+            &ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            body.num_slots(), None, &[], 0, &[target],
+        ).unwrap();
+        let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
+        let mut slots = vec![NIL.0; (body.num_slots() + framed.shadow_root_slots) as usize];
+        assert_eq!(run(slots.as_mut_ptr()), EgclVal::from_fixnum(41).0);
+        registers.store(second as *const () as usize, Ordering::Release);
+        slice.store(second_slice as *const () as usize, Ordering::Release);
+        assert_eq!(run(slots.as_mut_ptr()), EgclVal::from_fixnum(99).0);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
+fn deoptimizing_native_entries_report_their_own_code_and_frame_kind() {
+    use egcl_compiler::t2::emit::emit_framed_with_direct_natives;
+    use egcl_compiler::t2::speculate::{speculate, SpecType};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENTRY: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn resume(scopes: u64, words: u64, values: *const u64, entry: u64) -> u64 {
+        assert_eq!(scopes, 1);
+        assert!(words >= 4);
+        assert!(!values.is_null());
+        ENTRY.store(entry, Ordering::Relaxed);
+        EgclVal::from_fixnum(987).0
+    }
+    extern "C" fn legacy_resume() -> u64 { EgclVal::from_fixnum(-1).0 }
+    let plus = egcl_rt::symbols::intern("+");
+    let body = bytecode_fn("native-deopt-callee", vec![
+        Instr::LoadLocal(0), Instr::Const(0),
+        Instr::CallNamed { sym: plus, nargs: 2 }, Instr::Return,
+    ], vec![EgclVal::from_fixnum(1)], 1, 2, 1);
+    let mut ir = build_from_bytecode(&body).unwrap();
+    assert!(speculate(&mut ir, &|_| Some(SpecType::Fixnum)) > 0);
+    let code_id = 0x1234;
+    let framed = emit_framed_with_direct_natives(
+        &ir, legacy_resume as *const () as u64, resume as *const () as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        body.num_slots(), None, &[], code_id, &[],
+    ).unwrap();
+    let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
+    let mut slots = vec![NIL.0; (body.num_slots() + framed.shadow_root_slots) as usize];
+    assert_eq!(run(slots.as_mut_ptr()), EgclVal::from_fixnum(987).0);
+    assert_eq!(ENTRY.load(Ordering::Relaxed), code_id, "frame entry owns its callee frame");
+    assert_ne!(framed.compiled_entry, 0);
+    let registers: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe {
+        std::mem::transmute(code.as_ptr().add(framed.compiled_entry))
+    };
+    // The existing compiled entry receives its first Lisp argument in RCX.
+    assert_eq!(registers(0, 0, 0, NIL.0), EgclVal::from_fixnum(987).0);
+    assert_eq!(ENTRY.load(Ordering::Relaxed), code_id | (1 << 63),
+        "register entry asks the deoptimizer to materialize its own frame");
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
 fn native_transfer_check_covers_pure_self_recursion_and_mixed_calls() {
     use egcl_compiler::t2::emit::emit_framed_with_activation_slots;
 

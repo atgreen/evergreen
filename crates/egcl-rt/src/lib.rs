@@ -24,6 +24,7 @@ pub mod digest;
 /// NOT `context` above, which is the machine/stack-pointer switch.
 pub mod exec_context;
 pub mod execution_local;
+pub mod call_table;
 pub mod function;
 pub mod fxhash;
 pub mod native_transfer;
