@@ -40,6 +40,11 @@
   generic call, and functions using them persist to bfasl as on x86-64
   ([#118](https://github.com/atgreen/evergreen/pull/118)).
 
+- On s390x, functions that create closures (any LAMBDA in the body) now
+  compile at T1 instead of staying interpreted, including loops that create a
+  closure per iteration and factories whose parameters are captured
+  ([#126](https://github.com/atgreen/evergreen/pull/126)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
