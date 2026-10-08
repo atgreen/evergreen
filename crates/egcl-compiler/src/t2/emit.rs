@@ -3408,7 +3408,10 @@ fn emit_framed_inner(
     // A multi-scope guard calls the reconstruction callback even if the fast
     // path has no ordinary call. Give it the call-capable prologue/register set
     // so the callback is ABI-aligned and every live value survives the call.
-    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls;
+    // Checked OSR entries call the precise reconstruction callback on failure,
+    // even when the ordinary body contains no calls or guards.
+    let has_checked_osr = f.osr_entries.iter().any(|osr| !osr.checks.is_empty());
+    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls || has_checked_osr;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -5323,6 +5326,10 @@ fn emit_framed_inner(
     let has_deopt = a.label_is_referenced(deopt)
         || inst_deopt
             .values()
+            .any(|&label| a.label_is_referenced(label))
+        || osr_check_labels
+            .iter()
+            .flatten()
             .any(|&label| a.label_is_referenced(label));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if !transfer_maps.is_empty() {
@@ -6439,6 +6446,86 @@ mod tests {
             !framed.has_deopt,
             "identity has no guard branch and must be direct-call eligible"
         );
+    }
+
+    /// OSR checks can be the only deoptimising operation in an otherwise total
+    /// function. Preserve their metadata and give their callback a call frame.
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn osr_only_guard_reports_deopt_and_reconstructs_its_frame() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, OsrEntry, TypeBits,
+            ValueRepresentation,
+        };
+        use egcl_rt::value::EgclVal;
+
+        extern "C" fn reconstruct(nscopes: u64, nwords: u64, words: *const u64, _: u64) -> u64 {
+            if nscopes != 1 || nwords != 5 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts(words, nwords as usize) };
+            if words != [0, 0, 1, 0, EgclVal::from_single_float(2.0).0] {
+                return 0;
+            }
+            EgclVal::from_fixnum(99).0
+        }
+
+        let mut f = Function::new("osr-only-guard");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let frame_state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![ValueSource::Value {
+                    value: x,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(OsrEntry {
+            bcp: 0,
+            block: entry,
+            frame_state,
+            checks: vec![(x, IRType::of(TypeBits::FIXNUM))],
+        });
+        crate::t2::verify::verify(&f).expect("OSR identity IR verifies");
+        let framed = emit_framed(
+            &f, 0, reconstruct as *const () as usize as u64, 0, 0, 0, 0, 0, 0, None,
+        )
+        .expect("emit OSR identity");
+        assert_eq!(framed.osr_entries.len(), 1, "checked OSR entry is emitted");
+        assert!(
+            framed.has_deopt,
+            "an OSR guard needs deopt source snapshots even without instruction guards"
+        );
+        let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+        let osr: extern "C" fn(*mut u64) -> u64 = unsafe {
+            std::mem::transmute(buf.as_ptr().add(framed.osr_entries[0].1))
+        };
+        let mut slots = [EgclVal::from_fixnum(7).0];
+        assert_eq!(osr(slots.as_mut_ptr()), slots[0]);
+        slots[0] = EgclVal::from_single_float(2.0).0;
+        assert_eq!(osr(slots.as_mut_ptr()), EgclVal::from_fixnum(99).0);
     }
 
     /// Compiled-caller ABI: a compiled caller places args in registers and calls

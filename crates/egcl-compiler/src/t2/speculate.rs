@@ -720,11 +720,17 @@ fn materialize_self_call_result_guards(f: &mut Function, self_sym: Option<u32>) 
                 continue;
             }
             let scope = &mut state.scopes[0];
+            let Some(pending) = scope.stack.len().checked_sub(f.inst(call).args.len()) else {
+                continue;
+            };
             scope.bcp += 1;
-            scope.stack = vec![crate::t2::frame_state::ValueSource::Value {
-                value: r,
-                repr: ValueRepresentation::Tagged,
-            }];
+            scope.stack.truncate(pending);
+            scope
+                .stack
+                .push(crate::t2::frame_state::ValueSource::Value {
+                    value: r,
+                    repr: ValueRepresentation::Tagged,
+                });
             let gfs = f.frame_states.add(state);
             let source_pos = f.inst(call).source_pos;
             let (guard, results) = f.push_inst(
@@ -1241,6 +1247,50 @@ mod tests {
             },
         );
         (f, call)
+    }
+
+    #[test]
+    fn self_call_result_guard_preserves_pending_operands() {
+        use crate::t2::frame_state::ValueSource;
+
+        let (mut f, call) = build_star();
+        let self_sym = egcl_rt::symbols::intern("*");
+        let call_state = f.inst(call).frame_state.unwrap();
+        let result = f.inst(call).results[0];
+        let args = f.inst(call).args.clone();
+        let pending = ValueSource::Const(egcl_rt::value::EgclVal::from_fixnum(37));
+        f.frame_states.get_mut(call_state).scopes[0].stack = std::iter::once(pending.clone())
+            .chain(args.iter().map(|&value| ValueSource::Value {
+                value,
+                repr: ValueRepresentation::Tagged,
+            }))
+            .collect();
+
+        materialize_self_call_result_guards(&mut f, Some(self_sym));
+
+        let guard = f
+            .block(f.entry())
+            .insts
+            .iter()
+            .copied()
+            .find(|&inst| f.inst(inst).opcode == Opcode::Guard && f.inst(inst).args == [result])
+            .expect("self-call result must be guarded even without a later frame state");
+        let resumed = &f
+            .frame_states
+            .get(f.inst(guard).frame_state.unwrap())
+            .scopes[0];
+        assert_eq!(resumed.bcp, 3);
+        assert_eq!(
+            resumed.stack.len(),
+            2,
+            "pending operands must survive a post-call deopt"
+        );
+        assert!(matches!(resumed.stack[0], ValueSource::Const(value)
+            if value == egcl_rt::value::EgclVal::from_fixnum(37)));
+        assert!(matches!(resumed.stack[1], ValueSource::Value {
+            value,
+            repr: ValueRepresentation::Tagged,
+        } if value == result));
     }
 
     #[test]
