@@ -107,8 +107,13 @@ uses one shared Winsock polling thread. Waiting on a socket does not create a
 thread per fiber. Windows polls active socket sets in slices of up to 10 ms.
 Pinned waits follow `*pinned-blocking-action*` and may occupy the carrier.
 
-Connection setup is not yet cooperative: hostname lookup, connect, and accept
-can block a carrier. Regular file and terminal I/O are also outside this socket
+On Unix, native listener accept and readiness waits also park unpinned fibers;
+closing the listener wakes pending waits with an error. Listener IDs can be
+shared across native threads and fibers, and closing a listener leaves accepted
+streams open. Windows listener waits do not yet have these guarantees.
+
+Hostname lookup and connect can still block a carrier, as can accept on Windows.
+Regular file and terminal I/O are also outside this socket
 support. Stream operations retain exclusive ownership while waiting, so reads
 and writes on the same stream are serialized; closing that stream from another
 fiber does not interrupt an in-progress read. An explicit readiness wait releases

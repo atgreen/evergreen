@@ -226,3 +226,81 @@ fn exported_gray_protocol_symbols_reach_standard_stream_dispatch() {
     assert!(stdout.contains("GRAY #\\Q"), "{stdout}");
     assert!(stdout.contains("SAME T"), "{stdout}");
 }
+
+#[test]
+fn bulk_sequence_generics_dispatch_and_fall_back() {
+    // Per R5.113, READ-SEQUENCE and WRITE-SEQUENCE on a Gray stream dispatch
+    // through the public STREAM-READ-SEQUENCE / STREAM-WRITE-SEQUENCE generics
+    // (spec 5.5.2.2 / 5.5.2.3): a class that specializes them sees one bulk
+    // call with the caller's bounds, and a class that does not still gets the
+    // scalar fallbacks. trivial-gray-streams' EGCL bridge relies on both halves.
+    for backend in ["bytecode", "tree-walker"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .env("EGCL_BACKEND", backend)
+            .args([
+                "--no-init",
+                "--eval",
+                r#"
+              ;; Specialized bulk input: must be called instead of STREAM-READ-BYTE.
+              (defclass bulk-in (egcl-gray-streams:fundamental-binary-input-stream) ())
+              (defmethod egcl-gray-streams:stream-read-byte ((s bulk-in))
+                (error "scalar read must not be used when the bulk method exists"))
+              (defmethod egcl-gray-streams:stream-read-sequence ((s bulk-in) seq start end)
+                (loop for i from start below (min end (+ start 2))
+                      do (setf (elt seq i) 7))
+                (min end (+ start 2)))
+              (let ((v (make-array 5 :initial-element 0)))
+                (assert (= 3 (read-sequence v (make-instance 'bulk-in) :start 1 :end 4)))
+                (assert (equalp v #(0 7 7 0 0))))
+              ;; Specialized bulk output: must be called with the caller's bounds.
+              (defclass bulk-out (egcl-gray-streams:fundamental-character-output-stream)
+                ((calls :initform nil :accessor calls)))
+              (defmethod egcl-gray-streams:stream-write-char ((s bulk-out) c)
+                (error "scalar write must not be used when the bulk method exists"))
+              (defmethod egcl-gray-streams:stream-write-sequence ((s bulk-out) seq start end)
+                (push (list (subseq seq start end) start end) (calls s))
+                seq)
+              (let ((s (make-instance 'bulk-out)))
+                (assert (string= "hello" (write-sequence "hello" s :start 1 :end 3)))
+                (assert (equal '(("el" 1 3)) (calls s))))
+              ;; No specialization: the defaults fall back to the scalar generics.
+              (defclass scalar-in (egcl-gray-streams:fundamental-binary-input-stream)
+                ((bytes :initform (list 1 2 3) :accessor bytes)))
+              (defmethod egcl-gray-streams:stream-read-byte ((s scalar-in))
+                (if (bytes s) (pop (bytes s)) :eof))
+              (let ((v (make-array 4 :initial-element -1)))
+                (assert (= 3 (read-sequence v (make-instance 'scalar-in))))
+                (assert (equalp v #(1 2 3 -1))))
+              (defclass scalar-out (egcl-gray-streams:fundamental-character-output-stream)
+                ((log :initform nil :accessor log-of)))
+              (defmethod egcl-gray-streams:stream-write-char ((s scalar-out) c)
+                (push c (log-of s)) c)
+              (defmethod egcl-gray-streams:stream-write-byte ((s scalar-out) b)
+                (push b (log-of s)) b)
+              (let ((s (make-instance 'scalar-out)))
+                (write-sequence "abc" s :start 1)
+                (write-sequence #(9 8) s)
+                (write-sequence (list #\z) s)
+                (assert (equal '(#\z 8 9 #\c #\b) (log-of s))))
+              ;; A subclass method reaches the default with CALL-NEXT-METHOD, which
+              ;; is exactly what trivial-gray-streams' OR-FALLBACK does.
+              (defclass chained-in (scalar-in) ())
+              (defmethod egcl-gray-streams:stream-read-sequence ((s chained-in) seq start end)
+                (call-next-method))
+              (let ((v (make-array 2 :initial-element -1)))
+                (assert (= 2 (read-sequence v (make-instance 'chained-in))))
+                (assert (equalp v #(1 2))))
+              (format t "GRAY-BULK-OK~%")
+            "#,
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{backend}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains("GRAY-BULK-OK"), "{backend}: {stdout}");
+    }
+}

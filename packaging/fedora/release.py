@@ -26,7 +26,7 @@ GPG_KEY_NAME = 'EGCL RPM Signing Key'
 # Not rpmautospec's %autorelease, and not commit counting: the release jobs use
 # actions/checkout at its default depth of 1, where counting commits since the
 # version last changed cannot work. A pinned pair fails loudly instead.
-RPM_RELEASE = ('0.0.2', '1')
+RPM_RELEASE = ('0.0.3', '1')
 # Architectures the source RPM knows how to build. Keep this capability map in
 # step with egcl.spec's ExclusiveArch and its `%ifarch x86_64` guard.
 PACKAGES_BY_ARCH = {

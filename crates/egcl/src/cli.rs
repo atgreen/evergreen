@@ -4183,6 +4183,9 @@ fn install_loaded_compiler_macro(
 fn global_macro_remove(name: &str) {
     let mut macros = GLOBAL_MACROS.lock().unwrap();
     macros.remove(name);
+    if let Some(alias) = extension_operator_alias(name) {
+        macros.remove(&alias);
+    }
     bump_macro_env_generation();
 }
 
@@ -4192,6 +4195,12 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
     if let Some(def) = env.macros.borrow().get(name).cloned() {
         return Some(def);
     }
+    let alias = extension_operator_alias(name);
+    if let Some(alias) = &alias {
+        if let Some(def) = env.macros.borrow().get(alias).cloned() {
+            return Some(def);
+        }
+    }
     let leaf = symbol_leaf_name(name);
     if leaf != name {
         if let Some(def) = env.macros.borrow().get(leaf).cloned() {
@@ -4200,13 +4209,16 @@ fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
     }
     {
         let g = GLOBAL_MACROS.lock().unwrap();
-        g.get(name).cloned().or_else(|| {
-            if leaf != name {
-                g.get(leaf).cloned()
-            } else {
-                None
-            }
-        })
+        g.get(name)
+            .or_else(|| alias.as_ref().and_then(|alias| g.get(alias)))
+            .cloned()
+            .or_else(|| {
+                if leaf != name {
+                    g.get(leaf).cloned()
+                } else {
+                    None
+                }
+            })
     }
 }
 
@@ -4215,14 +4227,37 @@ fn macro_defined(env: &Env, name: &str) -> bool {
     if env.macros.borrow().contains_key(name) {
         return true;
     }
+    let alias = extension_operator_alias(name);
+    if alias
+        .as_ref()
+        .is_some_and(|alias| env.macros.borrow().contains_key(alias))
+    {
+        return true;
+    }
     let leaf = symbol_leaf_name(name);
     if leaf != name && env.macros.borrow().contains_key(leaf) {
         return true;
     }
     {
         let g = GLOBAL_MACROS.lock().unwrap();
-        g.contains_key(name) || (leaf != name && g.contains_key(leaf))
+        g.contains_key(name)
+            || alias.as_ref().is_some_and(|alias| g.contains_key(alias))
+            || (leaf != name && g.contains_key(leaf))
     }
+}
+
+/// Extension operator dispatch and saved symbols use different colon spellings.
+/// Keep both spellings in the same package when consulting macro maps.
+fn extension_operator_alias(name: &str) -> Option<String> {
+    for package in ["EGCL-EXT:", "EGCL-INTERNAL:"] {
+        if let Some(rest) = name.strip_prefix(package) {
+            return Some(match rest.strip_prefix(':') {
+                Some(external) => format!("{package}{external}"),
+                None => format!("{package}:{rest}"),
+            });
+        }
+    }
+    None
 }
 
 fn next_control_token(prefix: &str) -> String {
@@ -4745,6 +4780,17 @@ fn egcl_error_to_condition(
             let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
             egcl_rt::rooted!(control = arena_str(msg));
             build_condition_instance(env, "SIMPLE-PACKAGE-ERROR", &[control_kw, *control])?
+        }
+        EgclError::IoTimeout { stream, message } => {
+            egcl_rt::rooted!(stream = *stream);
+            egcl_rt::rooted!(control = arena_str(message));
+            let stream_key = resolve_sym("STREAM").unwrap_or(NIL);
+            let control_key = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            build_condition_instance(
+                env,
+                "EGCL-EXT:IO-TIMEOUT",
+                &[stream_key, *stream, control_key, *control],
+            )?
         }
         EgclError::StreamError(msg) => {
             // The reader funnels both genuine I/O failures and parse failures
@@ -6028,32 +6074,24 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
     egcl_stdlib::slot_value(instance, slot)
 }
 
-/// Read a slot, signalling a catchable `unbound-slot` condition (R5.71) when the
-/// slot is unbound on a genuine instance. The condition carries `:name` (the slot
-/// name) and `:instance`, so handlers can inspect it like any CLOS object.
+/// Read a slot through the user-extensible unbound-slot protocol.
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    match read_slot_value(instance, slot, env) {
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slot = slot);
+    match read_slot_value(*instance, *slot, env) {
         Ok(value) => Ok(value),
-        Err(EgclError::UnboundVariable(_)) if egcl_stdlib::is_instance(instance) => {
-            let condition = build_condition_instance(
-                env,
-                "UNBOUND-SLOT",
-                &[
-                    resolve_sym("NAME").unwrap_or(NIL),
-                    slot,
-                    resolve_sym("INSTANCE").unwrap_or(NIL),
-                    instance,
-                ],
-            )?;
-            Err(signal_and_raise(
-                env,
-                condition,
-                format!("slot {} is unbound", sym_bare_name_rc(slot)),
-            ))
+        Err(EgclError::UnboundVariable(_)) if egcl_stdlib::is_instance(*instance) => {
+            let _call_depth = CallDepthGuard::enter()?;
+            let class = egcl_stdlib::class_of(*instance);
+            let args = RootedVals::new(vec![class, *instance, *slot]);
+            let result = invoke_generic_function("SLOT-UNBOUND", &args, env);
+            // A slot read returns only the primary value of SLOT-UNBOUND.
+            env.clear_mv();
+            result
         }
         Err(error) => Err(error),
     }
@@ -8400,6 +8438,7 @@ impl Env {
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
+        compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
         install_evaluator_global_root_scanner();
         if reset_clos {
             let _ = egcl_stdlib::bootstrap_clos();
@@ -8542,6 +8581,13 @@ impl Env {
         }
         #[cfg(target_arch = "s390x")]
         features.push(resolve_sym(":S390X").unwrap_or(NIL));
+        // SBCL pushes :RISCV on RV64; :RISCV64 names the word size the way
+        // :PPC64/:PPC64LE do above, so both spellings dispatch.
+        #[cfg(target_arch = "riscv64")]
+        {
+            features.push(resolve_sym(":RISCV").unwrap_or(NIL));
+            features.push(resolve_sym(":RISCV64").unwrap_or(NIL));
+        }
         #[cfg(target_endian = "little")]
         features.push(resolve_sym(":LITTLE-ENDIAN").unwrap_or(NIL));
         #[cfg(target_endian = "big")]
@@ -11611,6 +11657,8 @@ fn probe_compile_time_value(form: EgclVal, env: &mut Env) -> Option<EgclVal> {
 
 #[cfg(test)]
 mod compile_traversal_rooting_tests;
+#[cfg(test)]
+mod search_rooting_tests;
 
 fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
     if !form.is_cons() {
@@ -12917,6 +12965,7 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         "WARNING" => Some((vec!["CONDITION".into()], vec![])),
         "INTERRUPT-CONDITION" => Some((vec!["CONDITION".into()], vec![])),
         "TIMEOUT-CONDITION" => Some((vec!["ERROR".into()], vec![])),
+        "IO-TIMEOUT" => Some((vec!["STREAM-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
         "STYLE-WARNING" => Some((vec!["WARNING".into()], vec![])),
         "STORAGE-CONDITION" => Some((vec!["SERIOUS-CONDITION".into()], vec![])),
         "SIMPLE-CONDITION" => Some((
@@ -15624,7 +15673,13 @@ fn module_designator_name(module: EgclVal) -> String {
 }
 
 fn load_posix_module(env: &mut Env) -> Result<(), EgclError> {
-    // Loading the embedded module has the same package boundary as LOAD.
+    load_embedded_lisp(include_str!("../../../lib/posix.lisp"), env)
+}
+
+/// Evaluate an embedded Lisp source (a lib/*.lisp compiled into the binary)
+/// with the same package boundary as LOAD: the module's IN-PACKAGE must not
+/// leak into the caller. Shared by the POSIX module and the s390x disassembler.
+fn load_embedded_lisp(source: &str, env: &mut Env) -> Result<(), EgclError> {
     // Keep both the reader context and the dynamic value cell intact.
     let saved_package = env.current_package.clone();
     egcl_rt::rooted!(saved_package_value = env.lookup_var("*PACKAGE*").unwrap_or(NIL));
@@ -15633,7 +15688,7 @@ fn load_posix_module(env: &mut Env) -> Result<(), EgclError> {
     let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
         .unwrap_or(egcl_rt::value::UNBOUND);
     egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
-    let mut result = read_eval_all_env(include_str!("../../../lib/posix.lisp"), env);
+    let mut result = read_eval_all_env(source, env);
     egcl_rt::rooted_ref!(_result_root = &mut result);
     env.current_package = saved_package;
     env.define_local("*PACKAGE*", *saved_package_value);
@@ -16941,7 +16996,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // instead of resolving to a distinct undefined symbol (bliss-lb6).
         let name = {
             let raw = sym_name(car);
-            if let Some(rest) = raw.strip_prefix("EGCL-EXT::") {
+            if env.funs.borrow().contains_key(&raw) {
+                raw
+            } else if let Some(rest) = raw.strip_prefix("EGCL-EXT::") {
                 format!("EGCL-EXT:{rest}")
             } else if let Some(rest) = raw.strip_prefix("EGCL-INTERNAL::") {
                 format!("EGCL-INTERNAL:{rest}")
@@ -16961,11 +17018,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // A MACROLET macro lives in that same lexical namespace, so it still
         // wins — only a global macro yields to the binding.
         let shadowed_by_lexical_function = {
+            let raw = sym_name_rc(car);
             let bare = sym_bare_name_rc(car);
             let funs = env.funs.borrow();
             let macros = env.macros.borrow();
-            (funs.contains_key(&name) || funs.contains_key(&*bare))
-                && !(macros.contains_key(&name) || macros.contains_key(&*bare))
+            (funs.contains_key(&name) || funs.contains_key(&*raw) || funs.contains_key(&*bare))
+                && !(macros.contains_key(&name)
+                    || macros.contains_key(&*raw)
+                    || macros.contains_key(&*bare))
         };
         if matches!(
             symbol_bare_name(&name).as_str(),
@@ -17446,7 +17506,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             // Debug introspection (bliss-zz6w): raw body/lambda-list of an
             // interpreted-function object, for inspecting restored cores.
-            "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%INVOKE-REGISTERED-MACRO"
+            | "EGCL::%FN-BODY" => return eval_builtin_arguments(&name, cdr, env),
             // ── Custom reader macros (bliss-r4mk) ──────────────────────
             // Registrations key by the (pinned) readtable OBJECT in
             // *READTABLE*; handlers are coerced to pinned interpreted-function
@@ -17481,7 +17542,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(c = EgclVal::from_fixnum(generations as i64));
                 return Ok(vec_to_list(&[*a, *b, *c]));
             }
-            "EGCL::%DEBUG-BACKTRACE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%DEBUG-BACKTRACE" | "EGCL::%PPRINT-CIRCLE"
+                | "EGCL::%PPRINT-NATIVE-COLUMN" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SYM-BY-INDEX" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%FN-LAMBDA-LIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%NATIVE-MUTEX" => return eval_builtin_arguments(&name, cdr, env),
@@ -22602,42 +22664,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
-            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => {
+            | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
+            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
-            "CHANGE-CLASS" => {
-                let (instance_form, rest) = cp(cdr);
-                let (class_form, _) = cp(rest);
-                // Root the instance across the class-form eval (moving GC;
-                // bliss-4bp).
-                egcl_rt::rooted!(class_form = class_form);
-                egcl_rt::rooted!(instance_r = eval_form(instance_form, env)?);
-                let old_class_name =
-                    class_name_for_instance_class(egcl_stdlib::class_of(*instance_r));
-                let class_input = eval_form(*class_form, env)?;
-                let class = resolve_class_metaobject(env, class_input)?;
-                let instance = *instance_r;
-                egcl_stdlib::change_class(instance, class)?;
-                let new_class_name = class_name_for_instance_class(class);
-                // Newly-added slots are those in the new class's *effective*
-                // (inherited + direct) slot set that were not effective slots of
-                // the old class. Using effective slots — not just direct slots —
-                // is essential: e.g. change-class to a class that inherits a slot
-                // (parent) which the old class lacked must still apply that slot's
-                // initform (CLOS change-class / update-instance-for-different-class).
-                let old_slot_names: std::collections::HashSet<String> =
-                    effective_slots_for_class(env, &old_class_name)
-                        .into_iter()
-                        .map(|slot| slot.name)
-                        .collect();
-                let added_slots = effective_slots_for_class(env, &new_class_name)
-                    .into_iter()
-                    .filter(|slot| !old_slot_names.contains(&slot.name))
-                    .map(|slot| slot.name)
-                    .collect::<Vec<_>>();
-                apply_class_initforms(instance, &new_class_name, env, Some(&added_slots), &[])?;
-                return Ok(instance);
-            }
+            "CHANGE-CLASS" => return eval_builtin_arguments(&name, cdr, env),
             "CALL-NEXT-METHOD" | "EGCL::%CALL-NEXT-METHOD" => {
                 let mut context = env.method_context.last().cloned().ok_or_else(|| {
                     EgclError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
@@ -23375,7 +23407,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let mut pos = start;
                 if is_gray_stream(inp) {
                     return invoke_generic_function(
-                        "GRAY-READ-SEQUENCE",
+                        "STREAM-READ-SEQUENCE",
                         &[
                             inp,
                             seq,
@@ -23443,25 +23475,29 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     // Not a simple vector of octets: fall through to the
                     // generic path, which signals the TYPE-ERROR this cannot.
                 }
+                if is_gray_stream(out) {
+                    // One bulk generic call: a stream class that
+                    // specializes STREAM-WRITE-SEQUENCE -- trivial-gray-streams'
+                    // bridge, Flexi Streams -- sees the whole subsequence; the
+                    // default method falls back to the scalar generics.
+                    invoke_generic_function(
+                        "STREAM-WRITE-SEQUENCE",
+                        &[
+                            out,
+                            seq,
+                            EgclVal::from_fixnum(start as i64),
+                            EgclVal::from_fixnum(end as i64),
+                        ],
+                        env,
+                    )?;
+                    return Ok(seq);
+                }
                 let mut elems = Vec::with_capacity(end - start);
                 egcl_rt::rooted_ref!(_elements_root = &mut elems);
                 for i in start..end {
                     elems.push(egcl_stdlib::elt(seq, i)?);
                 }
-                if is_gray_stream(out) {
-                    // GC can update the rooted vector during a child call; do not
-                    // retain an iterator borrow across that call.
-                    #[allow(clippy::needless_range_loop)]
-                    for index in 0..elems.len() {
-                        let el = elems[index];
-                        let gf = if el.is_character() {
-                            "STREAM-WRITE-CHAR"
-                        } else {
-                            "STREAM-WRITE-BYTE"
-                        };
-                        invoke_generic_function(gf, &[out, el], env)?;
-                    }
-                } else if egcl_stdlib::is_byte_stream(out) {
+                if egcl_stdlib::is_byte_stream(out) {
                     // GC can update the rooted vector during a child call; do not
                     // retain an iterator borrow across that call.
                     #[allow(clippy::needless_range_loop)]
@@ -24417,17 +24453,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Ok(resolve_sym("EGCL-THREAD::CONDITION-VARIABLE")
                         .expect("condition-variable type symbol"));
                 }
-                // CLOS instances: TYPE-OF returns the direct class name, not the
-                // representation type (previously "FIXNUM"). See bliss-2ke.
+                // Preserve the defining symbol, including its home package.
                 if egcl_stdlib::is_instance(v) {
-                    if let Some(name) = instance_class_hierarchy_names(v)
-                        .as_ref()
-                        .and_then(|n| n.first())
-                    {
-                        return match resolve_sym(name) {
-                            Some(sym) => Ok(sym),
-                            None => Ok(arena_str(name)),
-                        };
+                    let name = egcl_stdlib::class_name(egcl_stdlib::class_of(v));
+                    if !name.is_nil() {
+                        return Ok(name);
                     }
                 }
                 // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)
@@ -24749,7 +24779,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         .unwrap_or(slot_name);
                     resolve_sym(&n).unwrap_or(NIL)
                 });
-            return read_slot_value(*inst, slot_sym, env);
+            return slot_value_or_signal(*inst, slot_sym, env);
         }
 
         // Check methods
@@ -24812,12 +24842,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // as_symbol_index() aborts on them (recurring NIL/T guard bug). Exclude
         // them: neither names a disassemblable function.
         let listing = if arg.is_symbol() && arg != NIL && arg != T {
-            bytecode::disassemble_by_symbol(arg.as_symbol_index())
+            bytecode::disassemble_by_symbol(arg.as_symbol_index(), Some(env))
         } else if arg != NIL && arg != T {
             // CLHS takes an extended function designator, so a FUNCTION OBJECT
             // is as valid as a symbol: `(disassemble #'f)` must work, and used
             // to report `#'f` as "not a compiled EGCL function" (bliss-3jkz).
-            bytecode::disassemble_by_function(arg)
+            bytecode::disassemble_by_function(arg, Some(env))
         } else {
             None
         };
@@ -31857,6 +31887,78 @@ fn make_expander_function(
     egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
 }
 
+/// None denotes the normal FUNCALL hook, including bootstrap before its binding.
+fn custom_macroexpand_hook() -> Option<EgclVal> {
+    let hook = egcl_rt::symbols::find_index("*MACROEXPAND-HOOK*")
+        .and_then(global_value_cell)?;
+    let funcall = egcl_rt::symbols::find_index("FUNCALL")
+        .map(EgclVal::from_symbol_index);
+    if Some(hook) == funcall
+        || builtin_wrapper_cache().borrow().values.get("FUNCALL") == Some(&hook)
+    {
+        None
+    } else {
+        Some(hook)
+    }
+}
+
+fn registered_macro_expander_function(expander: EgclVal, constant: bool) -> EgclVal {
+    egcl_rt::rooted!(expander = expander);
+    egcl_rt::rooted!(whole = gensym_symbol("WHOLE"));
+    egcl_rt::rooted!(environment = gensym_symbol("ENVIRONMENT"));
+    let invoke = resolve_sym("EGCL::%INVOKE-REGISTERED-MACRO").unwrap();
+    let quote = quote_sym();
+    egcl_rt::rooted!(params = vec_to_list(&[*whole, *environment]));
+    egcl_rt::rooted!(quoted = vec_to_list(&[quote, *expander]));
+    egcl_rt::rooted!(call = if constant {
+        *quoted
+    } else {
+        vec_to_list(&[invoke, *quoted, *whole, *environment])
+    });
+    egcl_rt::rooted!(body = arena_cons(*call, NIL));
+    let name = egcl_rt::symbols::make_uninterned("MACRO-EXPANDER");
+    egcl_rt::function::alloc_interpreted(*params, *body, NIL, name)
+}
+
+fn invoke_registered_macro(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    if args.len() != 3 {
+        return Err(EgclError::ProgramError("macro invocation requires three arguments".into()));
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    let mut environment = if args[2].is_nil() {
+        MacroexpandEnv::child_of(cli_global_macro_env(), Vec::new(), Vec::new(), Vec::new())
+    } else {
+        load_macroexpand_environment(args[2]).ok_or_else(|| {
+            EgclError::ProgramError("invalid macro expansion environment".into())
+        })?
+    };
+    egcl_rt::rooted_ref!(_environment_root = &mut environment);
+    compiler_macroexpand::invoke_macro_expander(args[0], args[1], &environment)
+}
+
+fn invoke_lisp_macroexpand_hook(
+    expander: EgclVal,
+    form: EgclVal,
+    environment: &MacroexpandEnv,
+) -> Result<EgclVal, EgclError> {
+    let Some(hook) = custom_macroexpand_hook() else {
+        return compiler_macroexpand::invoke_macro_expander(expander, form, environment);
+    };
+    egcl_rt::rooted!(hook = hook);
+    egcl_rt::rooted!(expander = expander);
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(environment = environment.clone());
+    let constant = matches!(environment.variable_information(*form), Some(VariableInfo::SymbolMacro(_)));
+    let _scope = MacroexpandEnvScope::new();
+    egcl_rt::rooted!(handle = store_macroexpand_environment(environment.clone()));
+    egcl_rt::rooted!(function = registered_macro_expander_function(*expander, constant));
+    egcl_rt::rooted!(env = Env::new_for_macro_expansion(false));
+    apply_function(*hook, &[*function, *form, *handle], &mut env)
+}
+
+#[cfg(test)]
+mod macroexpand_hook_rooting_tests;
+
 fn invoke_compiler_macro_function(
     args: &[EgclVal],
     caller: &mut Env,
@@ -32030,6 +32132,15 @@ const MACROEXPAND_ALL_MAX_DEPTH: u32 = 400;
 /// spine is walked iteratively so a long body cannot overflow the Rust stack;
 /// only *nesting* recurses (bounded by `MACROEXPAND_ALL_MAX_DEPTH`).
 fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+    mx_each_scoped(list, env, depth, &HashSet::new())
+}
+
+fn mx_each_scoped(
+    list: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut items = Vec::new();
     let mut c = list;
     while c.is_cons() {
@@ -32044,7 +32155,7 @@ fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
     egcl_rt::rooted_ref!(_items_root = &mut items);
     egcl_rt::rooted_ref!(_out_root = &mut out);
     for i in (0..items.len()).rev() {
-        let expanded = macroexpand_all(items[i], env, depth);
+        let expanded = macroexpand_all(items[i], env, depth, local_functions);
         out = arena_cons(expanded, out);
     }
     out
@@ -32059,7 +32170,12 @@ fn mx_each(list: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
 /// about is returned unchanged and handled by the lazy expansion in `eval_list`
 /// at call time. An expander error also leaves the form verbatim. Thus the pass
 /// can only ever *under*-expand, never miscompile.
-fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn macroexpand_all(
+    form: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     if depth >= MACROEXPAND_ALL_MAX_DEPTH || !form.is_cons() {
         return form;
     }
@@ -32070,14 +32186,22 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
     if car.is_cons() {
         // Root across the allocating recursive expansions (moving GC; bliss-8qf).
         egcl_rt::rooted!(cdr_r = cdr);
-        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d));
-        let tail = mx_each(*cdr_r, env, d);
+        egcl_rt::rooted!(new_car = macroexpand_all(car, env, d, local_functions));
+        let tail = mx_each_scoped(*cdr_r, env, d, local_functions);
         return arena_cons(*new_car, tail);
     }
     if !car.is_symbol() {
         return form;
     }
     let name = sym_name(car);
+    // A local function suppresses macro lookup, but its argument forms still
+    // need definition-time expansion. Symbol indices preserve package identity.
+    if car
+        .symbol_index()
+        .is_some_and(|index| local_functions.contains(&index))
+    {
+        return arena_cons(car, mx_each_scoped(cdr, env, d, local_functions));
+    }
     if matches!(
         symbol_bare_name(&name).as_str(),
         "ATOMIC-INCF" | "ATOMIC-DECF"
@@ -32092,7 +32216,7 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         // returns it verbatim (moving GC; bliss-8qf).
         egcl_rt::rooted!(form_r = form);
         return match expand_macro(&mdef, cdr, env, form) {
-            Ok(expanded) => macroexpand_all(expanded, env, d),
+            Ok(expanded) => macroexpand_all(expanded, env, d, local_functions),
             Err(_) => *form_r,
         };
     }
@@ -32112,23 +32236,42 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         "LET" | "LET*" => {
             let (bindings, body) = cp(cdr);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_bindings = mx_bindings(bindings, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             arena_cons(car, arena_cons(*new_bindings, new_body))
         }
         "LAMBDA" => {
             // (lambda lambda-list body...) — keep the lambda list, expand body.
             let (ll, body) = cp(cdr);
             egcl_rt::rooted!(ll = ll);
-            let new_body = mx_each(body, env, d);
+            let new_body = mx_each_scoped(body, env, d, local_functions);
             arena_cons(car, arena_cons(*ll, new_body))
         }
         "FLET" | "LABELS" => {
             // (flet ((name lambda-list fbody...) ...) body...)
             let (defs, body) = cp(cdr);
+            let mut inner_functions = local_functions.clone();
+            let mut remaining = defs;
+            while remaining.is_cons() {
+                let (definition, tail) = cp(remaining);
+                if definition.is_cons() {
+                    let local_name = cp(definition).0;
+                    if let Some(index) = local_name.symbol_index() {
+                        inner_functions.insert(index);
+                    }
+                }
+                remaining = tail;
+            }
+            // FLET bindings are visible only in the enclosing body; LABELS
+            // bindings are also visible throughout the local definitions.
+            let definition_scope = if name == "LABELS" {
+                &inner_functions
+            } else {
+                local_functions
+            };
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_defs = mx_local_fns(defs, env, d, definition_scope));
+            let new_body = mx_each_scoped(*body, env, d, &inner_functions);
             arena_cons(car, arena_cons(*new_defs, new_body))
         }
         "MULTIPLE-VALUE-BIND" => {
@@ -32137,8 +32280,8 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(vars = vars);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             // Build inside out: copying *vars into an outer call's arguments
             // before allocating the inner tail leaves that copy stale if GC
             // relocates the binding list (bliss-ohwle.2).
@@ -32152,8 +32295,8 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (value_form, body) = cp(rest);
             egcl_rt::rooted!(pattern = pattern);
             egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d));
-            let new_body = mx_each(*body, env, d);
+            egcl_rt::rooted!(new_value = macroexpand_all(value_form, env, d, local_functions));
+            let new_body = mx_each_scoped(*body, env, d, local_functions);
             // As for MVB, re-read the rooted pattern after allocating the tail.
             let tail = arena_cons(*new_value, new_body);
             let tail = arena_cons(*pattern, tail);
@@ -32174,7 +32317,7 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
                 let (clause, rest) = cp(c);
                 c = rest;
                 clauses.push(if clause.is_cons() {
-                    mx_each(clause, env, d)
+                    mx_each_scoped(clause, env, d, local_functions)
                 } else {
                     clause
                 });
@@ -32190,7 +32333,10 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             // (function (lambda ...)) — expand the lambda; (function name) — leave.
             let (target, _) = cp(cdr);
             if target.is_cons() {
-                arena_cons(car, arena_cons(macroexpand_all(target, env, d), NIL))
+                arena_cons(
+                    car,
+                    arena_cons(macroexpand_all(target, env, d, local_functions), NIL),
+                )
             } else {
                 form
             }
@@ -32201,13 +32347,18 @@ fn macroexpand_all(form: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
         // RETURN-FROM, UNWIND-PROTECT, EVAL-WHEN, …) and ordinary function
         // calls — expand each argument independently. Symbols in argument
         // position (tags, block names, setq/setf place symbols) pass through.
-        _ => arena_cons(car, mx_each(cdr, env, d)),
+        _ => arena_cons(car, mx_each_scoped(cdr, env, d, local_functions)),
     }
 }
 
 /// Expand the init-forms of a LET/LET* binding list, preserving each binding's
 /// variable name. A binding is `name`, `(name)`, or `(name init)`.
-fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn mx_bindings(
+    bindings: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut out_items = Vec::new();
     let mut c = bindings;
     // Spine cursor, collected bindings, and the per-binding variable name all
@@ -32222,7 +32373,7 @@ fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
             let (var, init) = cp(b);
             egcl_rt::rooted!(var = var);
             // Keep `var`; expand every init-form after it.
-            let new_init = mx_each(init, env, depth);
+            let new_init = mx_each_scoped(init, env, depth, local_functions);
             arena_cons(*var, new_init)
         } else {
             b
@@ -32239,7 +32390,12 @@ fn mx_bindings(bindings: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
 
 /// Expand the bodies of FLET/LABELS local functions, preserving each name and
 /// lambda list: `(name lambda-list fbody...)`.
-fn mx_local_fns(defs: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
+fn mx_local_fns(
+    defs: EgclVal,
+    env: &mut Env,
+    depth: u32,
+    local_functions: &HashSet<u32>,
+) -> EgclVal {
     let mut out_items = Vec::new();
     let mut c = defs;
     // Root everything held across the allocating body expansion: the spine
@@ -32257,7 +32413,7 @@ fn mx_local_fns(defs: EgclVal, env: &mut Env, depth: u32) -> EgclVal {
                 let (ll, fbody) = cp(after_name);
                 egcl_rt::rooted!(fname = fname);
                 egcl_rt::rooted!(ll = ll);
-                let new_body = mx_each(fbody, env, depth);
+                let new_body = mx_each_scoped(fbody, env, depth, local_functions);
                 arena_cons(*fname, arena_cons(*ll, new_body))
             } else {
                 def
@@ -35638,7 +35794,8 @@ fn is_builtin_function(name: &str) -> bool {
     if name == "DISASSEMBLE" {
         return !cfg!(egcl_no_disassembly);
     }
-    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER") {
+    if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
+        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN") {
         return true;
     }
     // EGCL-THREAD is an extension package, not COMMON-LISP. Its names must be
@@ -35651,6 +35808,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
+            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
+            | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
             // The image-control operators. 66b2396d stopped a BARE read of these
             // resolving to CL-USER's identity from inside another package, so that
             // a program could define its own SAVE-IMAGE — swank/backend does
@@ -35864,7 +36023,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "ALLOCATE-INSTANCE" | "SLOT-MAKUNBOUND"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
-            | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
+            | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%INVOKE-REGISTERED-MACRO"
+            | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
     )
 }
 
@@ -35955,11 +36115,9 @@ fn apply_builtin_fast(
         // against SBCL's 1.205 MB, and make-plan is 95% of what a no-op
         // (asdf:load-system :babel) conses (bliss-4rgg, bliss-sgis).
         //
-        // All four are leaf readers — no :test/:key can re-enter Lisp — so they
-        // satisfy the leaf rule that makes a direct arm safe without invocation
-        // counting or a depth cap (bliss-edzd). Same kernels as the
-        // operator-position handlers, so results and multiple values stay
-        // bit-identical to the tree-walker (bliss-x5y.9).
+        // SLOT-VALUE can re-enter Lisp through SLOT-UNBOUND; the other readers
+        // are leaves. The shared slot helper handles protocol dispatch in both
+        // evaluated and operator-position calls.
         "SLOT-VALUE" if args.len() == 2 => {
             env.clear_mv();
             Some(slot_value_or_signal(args[0], args[1], env))
@@ -36718,7 +36876,7 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         "DISASSEMBLE" => {
             let listing = args.first().and_then(|a| {
                 if a.is_symbol() {
-                    bytecode::disassemble_by_symbol(a.as_symbol_index())
+                    bytecode::disassemble_by_symbol(a.as_symbol_index(), Some(_env))
                 } else {
                     None
                 }
@@ -37729,6 +37887,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
                 "OUTPUT" => direction = egcl_stdlib::StreamDirection::Output,
                 "IO" => direction = egcl_stdlib::StreamDirection::Io,
                 "INPUT" => direction = egcl_stdlib::StreamDirection::Input,
+                "PROBE" => direction = egcl_stdlib::StreamDirection::Probe,
                 _ => {}
             },
             "ELEMENT-TYPE" => element_type = value,
@@ -37754,15 +37913,15 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
         _ => if_exists,
     };
 
-    // CLHS defaults for `:if-does-not-exist` when unsupplied: `:error` for input
-    // (and for output with `:if-exists :overwrite`/`:append`), `:create`
-    // otherwise. The stdlib `open` treats any non-NIL value as "signal", and
-    // creates missing files on output regardless — so the only default that
-    // matters here is input, where NIL must NOT be passed (it would suppress the
-    // error and hand the caller a NIL stream). Represent `:error` as T.
+    // Input defaults to an error on a missing file; probe defaults to NIL.
     if !if_dne_supplied && matches!(direction, egcl_stdlib::StreamDirection::Input) {
         if_does_not_exist = T;
     }
+    if_does_not_exist = match sym_bare_name_rc(if_does_not_exist).as_ref() {
+        "CREATE" => egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL,
+        "ERROR" => T,
+        _ => if_does_not_exist,
+    };
 
     // Flexi-streams names its octet type through DEFTYPE. Resolve aliases
     // before translating the Lisp specifier to the stdlib's byte-stream marker.
@@ -38917,6 +39076,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     BOOT_COMPLETE.with(|c| c.set(true));
 
     if !ca.no_bootstrap && !core_loaded {
+        read_eval_all_env(include_str!("../../../lib/pprint.lisp"), &mut env)?;
         read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
     }
 

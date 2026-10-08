@@ -5,8 +5,247 @@ use super::*;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_retains_host_forms_between_invocations() {
+    use super::super::native_transfer_entry::TransferCode;
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let (body, index) = {
+        egcl_rt::rooted!(
+            forms = reader::read_from_string(
+                "((handler-bind ((simple-condition (lambda (c) (declare (ignore c)) nil)))
+                (signal 'simple-condition) :ok))"
+            )
+            .unwrap()
+            .0
+        );
+        let body = Arc::new(
+            compile_function("NATIVE-RETAINED-HANDLER", NIL, *forms, &env, false, false).unwrap(),
+        );
+        egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
+        let index = body
+            .code
+            .iter()
+            .find_map(|op| match op {
+                Instr::EvalHost(index) => Some(*index as usize),
+                _ => None,
+            })
+            .unwrap();
+        // This fresh form has no source-tree owner after this scope ends.
+        let replacement = reader::read_from_string("(lambda (c) (declare (ignore c)) nil)")
+            .unwrap()
+            .0;
+        let mut copy = (*body).clone();
+        copy.constants[index] = replacement;
+        (Arc::new(copy), index)
+    };
+    let code = TransferCode::compile(Arc::clone(&body)).expect("native retained handler");
+    let before = body.constants[index].to_raw();
+    HeapCollector::new().minor_gc().unwrap();
+    assert_ne!(
+        body.constants[index].to_raw(),
+        before,
+        "native code's private constant pool must be rewritten by moving GC"
+    );
+    for _ in 0..2 {
+        egcl_rt::rooted!(result = code.run(&[], &mut env));
+        egcl_rt::rooted!(ok = reader::read_from_string(":ok").unwrap().0);
+        assert_eq!(*result.as_ref().unwrap(), *ok);
+        HeapCollector::new().minor_gc().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_initializers_keep_captures_live() {
+    use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun native-capturing-handler (cell)
+           (lambda (condition)
+             (declare (ignore condition))
+             (setf (car cell) (+ 1 (car cell)))))",
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-bind
+             ((simple-condition (native-capturing-handler x))
+              (simple-condition (lambda (condition) (declare (ignore condition)) nil)))
+           (signal 'simple-condition)
+           :ok))"
+        )
+        .unwrap()
+        .0
+    );
+    egcl_rt::rooted!(
+        replacement = reader::read_from_string(
+            "(progn (%force-minor-gc-for-test)
+           (lambda (condition) (declare (ignore condition)) nil))"
+        )
+        .unwrap()
+        .0
+    );
+    let mut body = compile_function(
+        "NATIVE-HANDLER-CAPTURES",
+        *params,
+        *forms,
+        &env,
+        false,
+        false,
+    )
+    .unwrap();
+    let index = body
+        .code
+        .iter()
+        .find_map(|op| match op {
+            Instr::EvalHost(index) => Some(*index as usize),
+            _ => None,
+        })
+        .expect("inline handler uses host evaluation");
+    // Force collection inside the second initializer, while the first closure
+    // is live only in the native operand stack and captures the argument cons.
+    body.constants[index] = *replacement;
+    let code = TransferCode::compile(Arc::new(body)).expect("native captured handler initializer");
+    egcl_rt::rooted!(
+        args = vec![super::super::super::arena_cons(
+            EgclVal::from_fixnum(0),
+            NIL
+        )]
+    );
+    let before = args[0].to_raw();
+    take_native_fallback_count();
+    egcl_rt::rooted!(result = code.run(&args, &mut env));
+    egcl_rt::rooted!(ok = reader::read_from_string(":ok").unwrap().0);
+    assert_eq!(*result.as_ref().unwrap(), *ok);
+    assert_ne!(args[0].to_raw(), before, "captured cons must actually move");
+    assert_eq!(cp(args[0]).0, EgclVal::from_fixnum(1));
+    assert_eq!(take_native_fallback_count(), 0);
+    assert!(env.handlers.is_empty());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_host_initializer_error_does_not_install_cluster() {
+    use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("()").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-case
+             (handler-bind ((error (lambda (condition) (declare (ignore condition)) nil)))
+               :body-ran)
+           (error () :caught)))"
+        )
+        .unwrap()
+        .0
+    );
+    egcl_rt::rooted!(
+        replacement = reader::read_from_string("(error \"handler initialization failed\")")
+            .unwrap()
+            .0
+    );
+    let mut body = compile_function(
+        "NATIVE-HANDLER-INIT-ERROR",
+        *params,
+        *forms,
+        &env,
+        false,
+        false,
+    )
+    .unwrap();
+    let index = body
+        .code
+        .iter()
+        .find_map(|op| match op {
+            Instr::EvalHost(index) => Some(*index as usize),
+            _ => None,
+        })
+        .expect("inline handler uses host evaluation");
+    body.constants[index] = *replacement;
+    let handler_bcp = body
+        .code
+        .iter()
+        .position(|op| matches!(op, Instr::PushHandlerCase { .. }))
+        .unwrap() as u32;
+    let code = TransferCode::compile(Arc::new(body)).expect("native handler initializer error");
+    take_native_fallback_count();
+    egcl_rt::rooted!(result = code.run(&[], &mut env));
+    egcl_rt::rooted!(caught = reader::read_from_string(":caught").unwrap().0);
+    assert_eq!(*result.as_ref().unwrap(), *caught);
+    assert_eq!(take_native_fallback_count(), 0);
+    assert!(env.handlers.is_empty());
+    assert!(env.restarts.is_empty());
+    let fallback = code.without_handler_destination(handler_bcp, 0);
+    egcl_rt::rooted!(result = fallback.run(&[], &mut env));
+    assert_eq!(*result.as_ref().unwrap(), *caught);
+    assert_eq!(take_native_fallback_count(), 1);
+    assert!(env.handlers.is_empty());
+    assert!(env.restarts.is_empty());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_handler_bind_named_function_preserves_fallback_context() {
+    use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun native-named-handler (condition)
+           (declare (ignore condition)) (invoke-restart 'k))",
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(
+        forms = reader::read_from_string(
+            "((handler-bind ((type-error #'native-named-handler))
+            (restart-case (symbol-value x) (k () :ok))))"
+        )
+        .unwrap()
+        .0
+    );
+    let body = Arc::new(
+        compile_function(
+            "NATIVE-NAMED-HANDLER-BIND",
+            *params,
+            *forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    let code = TransferCode::compile(body).expect("native named handler-bind caller");
+    egcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
+    take_native_fallback_count();
+    egcl_rt::rooted!(result = code.run(&args, &mut env));
+    egcl_rt::rooted!(ok = reader::read_from_string(":ok").unwrap().0);
+    assert_eq!(*result.as_ref().unwrap(), *ok);
+    assert_eq!(take_native_fallback_count(), 1);
+    assert!(env.handlers.is_empty());
+    assert!(env.restarts.is_empty());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_handler_bind_and_restart_case_preserve_fallback_context() {
-    use super::super::native_transfer_entry::{take_native_fallback_count, TransferCode};
+    use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -39,8 +278,8 @@ fn native_v2_handler_bind_and_restart_case_preserve_fallback_context() {
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_handler_case_enters_selected_clause_without_fallback() {
     use super::super::native_transfer_entry::{
-        take_native_cleanup_count, take_native_fallback_count, take_native_handler_count,
-        TransferCode,
+        TransferCode, take_native_cleanup_count, take_native_fallback_count,
+        take_native_handler_count,
     };
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -245,8 +484,8 @@ fn native_v2_handler_case_ir_tracks_clause_destinations() {
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_unavailable_handler_clause_preserves_fallback_and_cleanup() {
     use super::super::native_transfer_entry::{
-        take_native_cleanup_count, take_native_fallback_count, take_native_handler_count,
-        TransferCode,
+        TransferCode, take_native_cleanup_count, take_native_fallback_count,
+        take_native_handler_count,
     };
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -339,7 +578,7 @@ static NEXT_HANDLER_FIBER: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 
 fn handler_fiber() -> EgclVal {
     use super::super::native_transfer_entry::{
-        take_native_fallback_count, take_native_handler_count, TransferCode,
+        TransferCode, take_native_fallback_count, take_native_handler_count,
     };
     let case = NEXT_HANDLER_FIBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut env = Env::new_impl(false, false, false);
@@ -429,8 +668,7 @@ fn native_v2_handler_conditions_survive_suspended_fiber_cleanups() {
                 matches!(
                     egcl_rt::thread::fiber_state(id),
                     Some(
-                        egcl_rt::thread::FiberState::Waiting
-                            | egcl_rt::thread::FiberState::Blocked
+                        egcl_rt::thread::FiberState::Waiting | egcl_rt::thread::FiberState::Blocked
                     )
                 )
             })

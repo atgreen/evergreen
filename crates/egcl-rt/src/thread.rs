@@ -1230,6 +1230,8 @@ pub struct Fiber {
     native_faults: crate::runtime::FiberFaultState,
     stack: EgclStack,
     continuation: FiberContinuation,
+    // Ports without a native context switch neither mount nor resume.
+    #[cfg_attr(not(egcl_fibers), allow(dead_code))]
     execution_context: FiberExecutionContext,
     native_stack_size: usize,
     /// Native return context: a pointer to the carrier's saved-SP cell on Unix,
@@ -1238,6 +1240,7 @@ pub struct Fiber {
     /// — NOT in a thread-local — because a fiber can be preempted on one carrier
     /// and resumed on another, and a compiler-cached thread-local address would
     /// then be stale (reads the wrong/cleared carrier slot). See bliss-bca.5.
+    #[cfg_attr(not(egcl_fibers), allow(dead_code))]
     scheduler_return: AtomicUsize,
     /// Carrier pool chosen by the first scheduler-group submission.  Wakeups
     /// from timers, synchronization primitives, and I/O always return to this
@@ -2269,6 +2272,21 @@ pub fn make_thread_named(
     entry: EgclVal,
     name: Option<String>,
 ) -> Result<NativeThreadId, EgclError> {
+    make_thread_named_with_setup(entry, name, || ())
+}
+
+/// Create a native thread with host state installed before its Lisp entry runs.
+/// The setup result remains alive throughout entry execution and is dropped on
+/// the worker before completion is published, including during unwinding.
+/// Only the setup closure crosses threads; its returned guard need not be Send.
+pub fn make_thread_named_with_setup<F, G>(
+    entry: EgclVal,
+    name: Option<String>,
+    setup: F,
+) -> Result<NativeThreadId, EgclError>
+where
+    F: FnOnce() -> G + Send + 'static,
+{
     let id = NativeThreadId(NEXT_NATIVE_THREAD_ID.fetch_add(1, Ordering::Relaxed));
     let name = name.unwrap_or_else(|| format!("egcl-thread-{}", id.0));
     let result = Arc::new(ThreadResult::new());
@@ -2294,6 +2312,7 @@ pub fn make_thread_named(
         // the worker boundary; after a panic this worker retires without
         // evaluating any more Lisp or hiding the failure with an interrupt.
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _host_state = setup();
             let mut value = run_entry(running.entry());
             if let Some(interrupt) = running.take_interrupt() {
                 value = Ok(interrupt);
@@ -3335,7 +3354,11 @@ mod chase_lev_tests {
             let values = Arc::clone(&values);
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                // Hang protection only; the test is about exactly-once claims,
+                // not throughput. Eight contending thieves on an in-order
+                // RISC-V core manage roughly 1,900 steals per second, so a
+                // 5 s deadline left the last ~800 tasks unclaimed there.
+                let deadline = Instant::now() + Duration::from_secs(120);
                 while claimed.load(Ordering::Acquire) < TASKS && Instant::now() < deadline {
                     if let Some(task) = deque.steal() {
                         values.lock().unwrap().push(number(&task));

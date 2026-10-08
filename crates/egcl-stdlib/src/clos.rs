@@ -2925,6 +2925,35 @@ pub fn change_class(instance: EgclVal, new_class: EgclVal) -> Result<(), EgclErr
     }
     Ok(())
 }
+
+/// Capture the original instance's local slot state for a class-change hook.
+/// Unbound slots remain unbound; copying does not run initialization methods.
+pub fn copy_instance_for_class_change(instance: EgclVal) -> Result<EgclVal, EgclError> {
+    if !is_instance(instance) {
+        return Err(EgclError::TypeError {
+            datum: instance,
+            expected: "standard-object".into(),
+        });
+    }
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(slots = effective_slots(class_of(*instance)));
+    egcl_rt::rooted!(values = Vec::<EgclVal>::with_capacity(slots.len()));
+    for index in 0..slots.len() {
+        let value = if slot_boundp(*instance, slots[index])? {
+            slot_value(*instance, slots[index])?
+        } else {
+            UNBOUND
+        };
+        values.push(value);
+    }
+    egcl_rt::rooted!(copy = allocate_instance(class_of(*instance))?);
+    for index in 0..slots.len() {
+        if values[index] != UNBOUND {
+            set_slot_value(*copy, slots[index], values[index])?;
+        }
+    }
+    Ok(*copy)
+}
 type EffectiveMethodParts = (Vec<EgclVal>, Vec<EgclVal>, Vec<EgclVal>, Vec<EgclVal>);
 
 #[cfg(test)]

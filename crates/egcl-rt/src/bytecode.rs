@@ -215,7 +215,8 @@ pub enum Instr {
     /// Normal completion of `HANDLER-CASE`: disestablish the cluster.
     PopHandlerCase,
     /// Establish a `HANDLER-BIND` cluster (`hb` indexes the static binding
-    /// table). Handlers run in the signalling context via the shared machinery.
+    /// table), consuming one function value per binding from the operand stack.
+    /// Handlers run in the signalling context via the shared machinery.
     PushHandlerBind { hb: u32 },
     /// Normal completion of `HANDLER-BIND`: disestablish the cluster.
     PopHandlerBind,
@@ -321,12 +322,11 @@ pub struct ClauseInfo {
     pub var_slot: Option<u16>,
 }
 
-/// Static description of one `handler-bind` form: `(type . handler-form)` pairs.
-/// The handler form is stored raw (unevaluated) exactly as the tree-walker does,
-/// so the shared signal machinery invokes it identically.
+/// Condition types for one handler cluster, in source order. Handler expressions
+/// are compiled normally and leave their function values on the operand stack.
 #[derive(Debug, Clone)]
 pub struct HandlerBindInfo {
-    pub bindings: Vec<(String, EgclVal)>,
+    pub types: Vec<String>,
 }
 
 /// Where a lexical variable lives: a fast frame slot, or boxed in the shared

@@ -35,6 +35,8 @@ fn generated_structure_functions_stay_in_the_defining_package() {
               (r (reader::make-section :name "reader" :offset 21)))
           (assert (= 42 (writer::section-name-offset w)))
           (assert (= 21 (reader::section-offset r)))
+          (assert (eq (type-of w) 'writer::section))
+          (assert (eq (type-of r) 'reader::section))
           (assert (writer::section-p w))
           (assert (not (writer::section-p r)))
           (assert (typep w 'writer::section-alias))
