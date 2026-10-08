@@ -17959,7 +17959,10 @@ const NATIVE_TRANSFER_ARCH: u16 = 0xf364;
 const NATIVE_TRANSFER_ARCH: u16 = 0;
 
 #[inline]
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", target_os = "linux")
+))]
 fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
     code.transfer_abi_version == NATIVE_TRANSFER_ABI_VERSION
         && code.transfer_abi_arch == NATIVE_TRANSFER_ARCH
@@ -18814,7 +18817,10 @@ pub(super) fn profiling_disabled() -> bool {
 /// Direct native→native calls (bliss-zhvn) — ON by default now that the fast
 /// path is hardened (stability + bounds guards, non-deopting callees only, c2i
 /// fallback). Set EGCL_NN_DIRECT=0 to disable (e.g. to A/B the win).
-#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", target_os = "linux")
+))]
 fn nn_direct_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();

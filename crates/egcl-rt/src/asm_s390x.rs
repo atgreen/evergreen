@@ -157,6 +157,12 @@ impl Asm {
         self.memory(0xe3, 0x16, dst << 4, base, disp);
     }
 
+    /// STHY: store the low 16 bits of a register.
+    pub fn store_u16(&mut self, src: u8, base: u8, disp: i32) {
+        assert!(src < 16);
+        self.memory(0xe3, 0x70, src << 4, base, disp);
+    }
+
     pub fn store_u32(&mut self, src: u8, base: u8, disp: i32) {
         assert!(src < 16);
         self.memory(0xe3, 0x50, src << 4, base, disp);
@@ -296,6 +302,14 @@ mod tests {
                 0, 0x16, 0xe3, 0x20, 0x10, 0, 0, 0x50,
             ]
         );
+    }
+
+    #[test]
+    fn halfword_store_encoding_matches_llvm_systemz() {
+        // llvm-mc: sthy %r1,-2(%r2) => e3 10 2f fe ff 70
+        let mut a = Asm::new();
+        a.store_u16(1, 2, -2);
+        assert_eq!(a.finish().unwrap(), [0xe3, 0x10, 0x2f, 0xfe, 0xff, 0x70]);
     }
 
     #[test]
