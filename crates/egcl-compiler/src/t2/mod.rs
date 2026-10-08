@@ -92,6 +92,7 @@ pub mod speculate; // profile-guided single-type speculative lowering
 pub mod emit; // MachFunc → executable x86-64 bytes
 pub mod emit_a64;
 pub mod emit_ppc64le;
+pub mod emit_riscv64;
 pub mod emit_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;

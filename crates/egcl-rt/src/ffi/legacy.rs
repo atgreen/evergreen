@@ -8,20 +8,38 @@ use super::AlienType;
 use crate::error::EgclError;
 use crate::thread::{FiberState, NativeThreadState, current_fiber, current_stack, current_thread};
 
-/// Variadic calls require the target's generated adapter implementation.
+/// Variadic calls require the target's generated adapter implementation,
+/// except on s390x, where the ELF ABI passes a variadic argument exactly as
+/// a fixed one -- integers in r2-r6, floating point in f0/f2/f4/f6, the rest
+/// on the stack; GCC leaves a double bound for printf in f0 -- so the
+/// fixed-arity call applies unchanged, with the same integer-only limits.
 ///
 /// # Safety
 /// The foreign function and values must match the supplied C signature.
 pub unsafe fn ffi_call_variadic(
-    _fn_ptr: *const (),
-    _ret_type: &AlienType,
-    _arg_types: &[AlienType],
-    _args: &[u64],
-    _fixed_count: usize,
+    fn_ptr: *const (),
+    ret_type: &AlienType,
+    arg_types: &[AlienType],
+    args: &[u64],
+    fixed_count: usize,
 ) -> Result<u64, EgclError> {
-    Err(EgclError::FfiError(
-        "variadic calls are not implemented for this target ABI".into(),
-    ))
+    if fixed_count > args.len() || arg_types.len() != args.len() {
+        return Err(EgclError::FfiError(
+            "invalid variadic argument counts".into(),
+        ));
+    }
+    #[cfg(target_arch = "s390x")]
+    {
+        // SAFETY: the caller's contract is the fixed call's contract.
+        unsafe { ffi_call(fn_ptr, ret_type, arg_types, args) }
+    }
+    #[cfg(not(target_arch = "s390x"))]
+    {
+        let _ = (fn_ptr, ret_type, arg_types, args);
+        Err(EgclError::FfiError(
+            "variadic calls are not implemented for this target ABI".into(),
+        ))
+    }
 }
 
 /// Call a foreign function via pointer.

@@ -7,6 +7,7 @@ EGCL's CLI can be built on x86-64 for these Linux targets:
 | AArch64 | `aarch64-unknown-linux-gnu` | `target/aarch64-unknown-linux-gnu/release/egcl` |
 | POWER little-endian | `powerpc64le-unknown-linux-gnu` | `target/powerpc64le-unknown-linux-gnu/release/egcl` |
 | IBM Z big-endian | `s390x-unknown-linux-gnu` | `target/s390x-unknown-linux-gnu/release/egcl` |
+| RISC-V RV64GC | `riscv64gc-unknown-linux-gnu` | `target/riscv64gc-unknown-linux-gnu/release/egcl` |
 | Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/egcl` |
 
 These are dynamically linked glibc executables, suitable for Fedora. All three
@@ -37,9 +38,10 @@ architecture tags; do not move heap images between architectures.
 
 ## RISC-V (native build)
 
-RISC-V is built natively on RV64GC hardware rather than through `cross`; no
-cross-toolchain container image is wired up yet. On a Debian 13 riscv64 host
-with rustup's `riscv64gc-unknown-linux-gnu` toolchain:
+RISC-V is developed and validated natively on RV64GC hardware; the `cross`
+image above gives x86-64 developers and CI the same cross-build and QEMU smoke
+the other three architectures have. On a Debian 13 riscv64 host with rustup's
+`riscv64gc-unknown-linux-gnu` toolchain:
 
 ```sh
 rustup toolchain install 1.94.1 --profile minimal
@@ -49,14 +51,35 @@ scripts/egcl-limited.sh python3 scripts/portability-smoke.py riscv64 -- \
   target/riscv64gc-unknown-linux-gnu/release/egcl
 ```
 
-This is the initial CLI port: the interpreter and bytecode tiers run, saved
-images carry a distinct `RISCV64` architecture tag, `*features*` includes
-`:riscv` and `:riscv64`, and the portability smoke test passes natively. There
-is no RISC-V baseline or optimizing native compiler yet, so `EGCL_FORCE_TIER`
-values above `t0` fall back to bytecode. Foreign calls go through the
-bootstrap dispatcher's fixed call shapes, as on s390x, and the fiber scheduler
-runs without a native context switch. The remaining slices are tracked as
-children of Bead `bliss-miro8`.
+The interpreter and bytecode tiers run, saved images carry a distinct
+`RISCV64` architecture tag, `*features*` includes `:riscv` and `:riscv64`, and
+the portability smoke test passes natively. The T1 baseline compiler emits
+RV64I code with guarded fixnum add, subtract, increment, decrement, negation
+and comparisons, live T0-to-T1 OSR, and overflow and uncommon-trap
+deoptimization; `scripts/riscv64-jit-smoke.py` requires observable T1
+promotion and compares native, OSR and GC-stressed output with the
+interpreter. The T2 optimizing emitter covers the same opcode set as the
+s390x one: guarded fixnum add, subtract, multiply, negate and comparisons,
+tagged single-float add, subtract and multiply, `EQ`, unguarded `CAR`/`CDR`,
+bitwise operations and constant shifts, runtime calls with GC-synchronized
+roots, sampled back-edge polls, live T1-to-T2 OSR and precise deopt exits;
+the smoke's T2 sections require actual tier-2 installation and compare guard
+exits, calls, OSR and polls with T0 under GC stress. The fiber scheduler
+switches stacks natively (ra, s0-s11, fs0-fs11 and fcsr), so cooperative
+fibers behave as on the other Linux ports. Foreign calls use the LP64D
+calling convention for scalars (integers, pointers, floats, doubles,
+variadic calls after the C promotions); aggregate arguments and foreign
+callbacks are not yet ported. Null-pointer and stack-guard faults resume at
+the runtime's recovery handler as on s390x; a fault inside JIT-compiled code
+itself is not yet recoverable. With `EGCL_NATIVE_TRANSFER=1`, the CLI admits
+allocation-free, scope-free, deopt-free T2 bodies through the LP64D native
+segment entry, exactly the slice the AArch64 and s390x adapters admit. The
+remaining slices are tracked as children of Bead `bliss-miro8`.
+
+```sh
+scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
+  target/riscv64gc-unknown-linux-gnu/release/egcl
+```
 
 ## Setup and build
 
@@ -65,7 +88,7 @@ Install Rust through rustup, Podman (or Docker), and `cross`:
 ```sh
 cargo install cross --version 0.2.5 --locked
 rustup toolchain install 1.94.1 --profile minimal
-rustup target add --toolchain 1.94.1 aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu s390x-unknown-linux-gnu
+rustup target add --toolchain 1.94.1 aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu
 scripts/cross-port.sh build all
 ```
 
@@ -75,7 +98,8 @@ x86-64; no emulated compiler or full Fedora guest is needed. The script selects
 default x86-64 musl target. The default x86-64 build keeps its direct syscalls
 and static ELF loader.
 
-Use `aarch64`, `ppc64le`, or `s390x` instead of `all` to build one architecture.
+Use `aarch64`, `ppc64le`, `s390x`, or `riscv64` instead of `all` to build one
+architecture.
 Set `CROSS=/path/to/cross`, `CROSS_CONTAINER_ENGINE=docker`, `CARGO_BUILD_JOBS`,
 or `CARGO_TARGET_DIR` as needed. The script defaults to Rust 1.94.1 to match the
 tested baseline and prevent `cross` from updating the rolling stable toolchain.
@@ -84,8 +108,8 @@ container images.
 
 ## QEMU validation
 
-Install `qemu-aarch64`, `qemu-ppc64le`, and `qemu-s390x` (Fedora's `qemu-user`
-package), and use a session with the user systemd bus available:
+Install `qemu-aarch64`, `qemu-ppc64le`, `qemu-s390x`, and `qemu-riscv64`
+(Fedora's `qemu-user` package), and use a session with the user systemd bus available:
 
 ```sh
 scripts/cross-port.sh test all
