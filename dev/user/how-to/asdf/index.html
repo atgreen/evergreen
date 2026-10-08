@@ -688,6 +688,24 @@
         
       
       
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ASDF systems
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
       <a href="./" class="md-nav__link md-nav__link--active">
         
   
@@ -704,6 +722,36 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#quicklisp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quicklisp
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
       
     </li>
   
@@ -1764,6 +1812,25 @@
     
   
   
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#quicklisp" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quicklisp
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
 </nav>
                   </div>
                 </div>
@@ -1821,6 +1888,43 @@ works unchanged. When a library rejects the implementation or uses an
 unsupported extension, identify that interface before changing its feature
 conditionals. Contributor guidance for maintained compatibility forks is in
 <a href="../../../contributing/reference/repository/">the repository map</a>.</p>
+<h2 id="quicklisp">Quicklisp<a class="headerlink" href="#quicklisp" title="Permanent link">&para;</a></h2>
+<p>On x86-64 Linux, use the EGCL client fork. This requires an EGCL build containing
+the runtime fixes through <a href="https://github.com/atgreen/evergreen/pull/90">PR #90</a>;
+the v0.0.3 release does not contain them.</p>
+<p>Fetch the tested client into a <strong>new project directory</strong> using an ocicl version
+with Git-source support:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>mkdir<span class="w"> </span>egcl-quicklisp
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="nb">cd</span><span class="w"> </span>egcl-quicklisp
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>touch<span class="w"> </span>ocicl.csv
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>ocicl<span class="w"> </span>install<span class="w"> </span>git+https://github.com/atgreen/quicklisp-client@2115f1d96963bf48d6a4c5c7111189bd326bfbed
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>mkdir<span class="w"> </span>quicklisp
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>cp<span class="w"> </span>ocicl/quicklisp-client-2115f1d/setup.lisp<span class="w"> </span>ocicl/quicklisp-client-2115f1d/asdf.lisp<span class="w"> </span>quicklisp/
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>cp<span class="w"> </span>-R<span class="w"> </span>ocicl/quicklisp-client-2115f1d/quicklisp<span class="w"> </span>quicklisp/
+</code></pre></div>
+<p>Keep <code>ocicl.csv</code> for reproducibility. The separate <code>quicklisp/</code> directory is the
+installation: caches, distribution metadata, and downloaded libraries belong
+there, not in the fetched client source tree. This does not change your existing
+Quicklisp installation or Lisp initialization files.</p>
+<p>Create <code>run.lisp</code> in that project directory:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nb">load</span><span class="w"> </span><span class="s">"quicklisp/setup.lisp"</span><span class="p">)</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="p">(</span><span class="nv">ql:quickload</span><span class="w"> </span><span class="s">"alexandria"</span><span class="w"> </span><span class="ss">:prompt</span><span class="w"> </span><span class="no">nil</span><span class="p">)</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="p">(</span><span class="nb">assert</span><span class="w"> </span><span class="p">(</span><span class="nb">equal</span><span class="w"> </span><span class="p">(</span><span class="nv">alexandria:iota</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="ss">:start</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="mi">3</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="mi">6</span><span class="w"> </span><span class="mi">7</span><span class="p">)))</span>
+</code></pre></div>
+<p>Then run:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>egcl<span class="w"> </span>--no-init<span class="w"> </span>--load<span class="w"> </span>run.lisp
+</code></pre></div>
+<p>The first setup loads ASDF and installs Quicklisp's distribution metadata;
+<code>QUICKLOAD</code> downloads and compiles missing releases. Later processes load the
+same <code>setup.lisp</code> and reuse the installation. The project's <code>install-egcl-forks</code>
+command also fetches the client (<code>egcl</code> branch), but only downloads/registers
+its sources: copy them into a separate installation as above before setup.</p>
+<p>The client uses native EGCL TCP streams; the tested distribution transport is
+plain HTTP, <strong>not TLS</strong>. Do not use <code>QL:UPDATE-CLIENT</code> to replace this client with
+the upstream version, which lacks the EGCL adapter. Library distributions are
+separate from the client: a library needing implementation-specific support may
+still need an EGCL compatibility fork. Successful Quicklisp installation is not
+a claim that every distributed library runs unchanged.</p>
 
 
 

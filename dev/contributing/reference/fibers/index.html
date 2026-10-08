@@ -2288,7 +2288,8 @@ the carrier association; it is not a stable affinity guarantee.</p>
 <code>Blocked</code>, <code>Native</code>, <code>Waiting</code>, and <code>Dead</code>. Polling state is useful for diagnostics
 but does not replace synchronization. Joining removes the fiber's registry entry.</p>
 <p><code>EGCL_STACK_SIZE</code> selects stack bytes (also accepting <code>k</code>, <code>m</code>, or <code>g</code> suffixes);
-the default is 512 KiB. <code>EGCL_TIME_SLICE_US</code> controls cooperative preemption:
+the default is 512 KiB (4 MiB on s390x, whose larger native frames spend the
+native stack reserve sooner). <code>EGCL_TIME_SLICE_US</code> controls cooperative preemption:
 carriers observe yield requests at runtime polls, not at arbitrary instructions.
 The explicit group API uses <code>SchedulerConfig::num_workers</code> for its carrier count.</p>
 <p>Sources: <a href="https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl-rt/src/scheduler.rs">group lifecycle</a>,
