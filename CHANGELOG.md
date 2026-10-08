@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- T2 checks a loop-carried fixnum once on loop entry (and once when a loop
+  is entered through OSR) instead of re-testing its tag on every iteration
+  ([#106](https://github.com/atgreen/evergreen/pull/106)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
