@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- T2 keeps nullable numeric paths native: testing an argument for NIL or
+  another sentinel no longer triggers a premature numeric guard and repeated
+  fallback to the interpreter. This also keeps the phone-encoding benchmark's
+  filtering helper at T2
+  ([#135](https://github.com/atgreen/evergreen/pull/135)).
+
 - Memory barriers return NIL correctly from x86-64 T2 code when their results
   spill to the stack, preventing corrupted values and crashes while printing
   a returned list ([#132](https://github.com/atgreen/evergreen/pull/132)).
