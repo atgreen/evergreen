@@ -25,6 +25,11 @@
   target instead of binding whatever the argument registers held
   ([#107](https://github.com/atgreen/evergreen/pull/107)).
 
+- On s390x, native code now calls T2 functions that may deoptimize directly
+  instead of through the generic adapter, since such a callee resumes the
+  interpreter in place and returns a finished value: div2 327 to 239 ms on a
+  z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
