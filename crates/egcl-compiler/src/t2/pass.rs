@@ -32,7 +32,8 @@
 //!
 //! # Pass order
 //!
-//! The promotion path registers `ConstFold` → `Gvn` → `GuardElim` → `Dce`
+//! The promotion path registers `ConstFold` → `Gvn` → `GuardElim` →
+//! `ClearMvElim` → `Dce`
 //! after speculation; drive.rs registers `ConstFold` → `Gvn` → `Dce`. Folding
 //! first exposes equal values to GVN; guard elimination runs after GVN and
 //! after the builder's inlining so proofs cloned from separate callees collapse
