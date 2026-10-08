@@ -1380,6 +1380,63 @@ fn t2_regalloc_spills_high_pressure_loop() {
     );
 }
 
+/// Deopt frame states name only the locals the interpreter can still read
+/// (bliss-dfilp, bliss-enisp). A `LET*` chain inside a loop therefore keeps
+/// nothing but the loop-carried values alive, and a guard that fails
+/// mid-chain reconstructs a frame whose dead slots are UNBOUND. The resumed
+/// interpreter must still finish the call with the exact (bignum) result.
+#[test]
+fn t2_dead_let_locals_are_not_reconstructed_on_deopt() {
+    let program = "\
+        (defun chain5 (a n) \
+          (let ((x a)) \
+            (dotimes (i n x) \
+              (let* ((y (- (+ x 7919) 7918)) \
+                     (y (- (+ y 7932) 7931)) \
+                     (y (- (+ y 7945) 7944)) \
+                     (y (- (+ y 7958) 7957)) \
+                     (y (- (+ y 7971) 7970))) \
+                (setq x y))))) \
+        (dotimes (warm 80) (chain5 1 10)) \
+        (dotimes (warm 2000) (egcl-ext:function-tier (quote chain5))) \
+        (format t \"~a~%\" (egcl-ext:function-tier (quote chain5))) \
+        (format t \"~a~%\" (chain5 1 10)) \
+        (let ((before (egcl-ext:deopt-count))) \
+          (format t \"~a~%\" (chain5 1152921504606839975 3)) \
+          (format t \"~a~%\" (if (> (egcl-ext:deopt-count) before) :deopted :no-deopt)))";
+    let out = run_output(
+        program,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("EGCL_T2_THREADS", "1"),
+            ("EGCL_T2_LOG", "-"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "chain5 run failed:\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("2"),
+        "chain5 did not reach T2:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(lines.get(1).copied(), Some("51"), "{stdout}");
+    // 2^60 - 7001 + 3 iterations x 5 net increments: the first add overflows
+    // the fixnum range, so T2 deopts inside the chain and T0 finishes.
+    assert_eq!(
+        lines.get(2).copied(),
+        Some("1152921504606839990"),
+        "overflow deopt with dead LET* locals produced a wrong result:\n{stdout}"
+    );
+    assert_eq!(
+        lines.get(3).copied(),
+        Some("DEOPTED"),
+        "the bignum call was expected to deoptimise:\n{stdout}\n{stderr}"
+    );
+}
+
 /// regalloc2 may coalesce a binary result with either input. The framed x86
 /// templates must preserve the RHS when it is also the destination, including
 /// non-commutative subtraction and multiplication's destructive untag step.
@@ -2138,10 +2195,7 @@ fn structural_t1_decline_is_attempted_only_once() {
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
     let out = run_output(
         program,
-        &[
-            ("EGCL_T0_T1_THRESHOLD", "2"),
-            ("EGCL_LOG", "compile=trace"),
-        ],
+        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_LOG", "compile=trace")],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2178,10 +2232,7 @@ fn redefining_a_declined_function_allows_promotion_again() {
           (if (> (egcl-ext:function-tier (quote redef-target)) 0) :promoted :t0))";
     let out = run_output(
         program,
-        &[
-            ("EGCL_T0_T1_THRESHOLD", "2"),
-            ("EGCL_LOG", "compile=trace"),
-        ],
+        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_LOG", "compile=trace")],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
