@@ -21566,7 +21566,8 @@ static FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "s390x", unix),
-    all(target_arch = "riscv64", unix)
+    all(target_arch = "riscv64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 static UNARY_FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
     RefCell<Vec<Option<Option<UnaryFixnumOp>>>>,
@@ -21606,7 +21607,8 @@ fn inlinable_fixnum_op_uncached(sym: u32) -> Option<FixnumOp> {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "s390x", unix),
-    all(target_arch = "riscv64", unix)
+    all(target_arch = "riscv64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 enum UnaryFixnumOp {
     Incr, // 1+
@@ -21617,7 +21619,8 @@ enum UnaryFixnumOp {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "s390x", unix),
-    all(target_arch = "riscv64", unix)
+    all(target_arch = "riscv64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
     memoized_by_sym(
@@ -21630,7 +21633,8 @@ fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "s390x", unix),
-    all(target_arch = "riscv64", unix)
+    all(target_arch = "riscv64", unix),
+    all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 fn inlinable_unary_fixnum_op_uncached(sym: u32) -> Option<UnaryFixnumOp> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
