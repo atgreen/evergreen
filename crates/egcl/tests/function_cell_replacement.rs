@@ -300,7 +300,7 @@ fn native_slot_callee_recompiles_after_numeric_phase_changes() {
           (format t "INITIAL ~D ~D~%" (egcl-ext:function-tier 'phase-slot-leaf) (egcl-ext:function-tier 'phase-slot-caller))
           (assert (= 2 (egcl-ext:function-tier 'phase-slot-caller)))
           (assert (= 2 (egcl-ext:function-tier 'phase-slot-leaf)))
-          (dolist (value '(2.5 7))
+          (dolist (value '(2.5 2305843009213693952 7))
             (dotimes (i 30)
               (assert (= (phase-slot-caller value) (* value 5))))
             (format t "PHASE ~S ~D ~D~%" value (egcl-ext:function-tier 'phase-slot-leaf) (egcl-ext:function-tier 'phase-slot-caller))

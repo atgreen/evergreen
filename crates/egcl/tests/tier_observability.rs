@@ -530,6 +530,65 @@ fn numeric_phase_changes_recompile_t2_instead_of_blacklisting() {
     );
 }
 
+/// Bignum operands need generic arithmetic, but must not blacklist the native
+/// function after its initial fixnum specialization stops matching.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn bignum_phase_recompiles_t2_instead_of_blacklisting() {
+    let program = r#"
+        (defun integer-phase (x) (+ x 1))
+        (dotimes (i 30) (assert (= (integer-phase i) (+ i 1))))
+        (format t "initial=~a~%" (egcl-ext:function-tier 'integer-phase))
+        (let ((large (expt 2 61)))
+          (dotimes (i 30) (assert (= (integer-phase large) (+ large 1)))))
+        (format t "bignum=~a~%" (egcl-ext:function-tier 'integer-phase))
+        (dotimes (i 30) (assert (= (integer-phase i) (+ i 1))))
+        (format t "returned=~a~%" (egcl-ext:function-tier 'integer-phase))
+    "#;
+    let (out, ok) = run(program, &[("EGCL_FORCE_TIER", "t2")]);
+    assert!(ok, "bignum phase produced incorrect results: {out}");
+    for expected in ["initial=2", "bignum=2", "returned=2"] {
+        assert!(out.lines().any(|line| line == expected), "missing {expected}: {out}");
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn mixed_bignum_loop_stops_deoptimizing_after_recovery() {
+    let program = r#"
+        (defun mixed-integers (big)
+          (let ((result 0))
+            (dotimes (i 200 result)
+              (setq result (+ (if (= i 0) big i) 1)))))
+        (dotimes (i 30) (assert (= 200 (mixed-integers 0))))
+        (dotimes (i 80)
+          (assert (= 200 (mixed-integers 2305843009213693952))))
+        (let ((before (egcl-ext:deopt-count)))
+          (dotimes (i 40)
+            (assert (= 200 (mixed-integers 2305843009213693952))))
+          (format t "steady=~D tier=~D~%" (- (egcl-ext:deopt-count) before)
+                  (egcl-ext:function-tier 'mixed-integers)))
+    "#;
+    let (out, ok) = run(program, &[("EGCL_FORCE_TIER", "t2")]);
+    assert!(ok, "mixed integer loop returned incorrect results: {out}");
+    assert!(out.lines().any(|line| line == "steady=0 tier=2"), "{out}");
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn bignum_with_single_float_recovers_to_generic_t2() {
+    let program = r#"
+        (defun float-with-big (x) (+ x 1.0))
+        (dotimes (i 30) (float-with-big 2.0))
+        (dotimes (i 30)
+          (assert (= (float-with-big 2305843009213693952) 2305843009213693952.0)))
+        (format t "float-bignum=~D~%" (egcl-ext:function-tier 'float-with-big))
+    "#;
+    let (out, ok) = run(program, &[("EGCL_FORCE_TIER", "t2")]);
+    assert!(ok, "mixed bignum/float result was incorrect: {out}");
+    assert!(out.lines().any(|line| line == "float-bignum=2"), "{out}");
+}
+
 /// The shipping dispatcher has two real transitions. With T2 enabled by
 /// default, the function is first observable at T1 and only later crosses the
 /// independent T1→T2 invocation threshold; no `EGCL_T2=1` opt-in is used.
