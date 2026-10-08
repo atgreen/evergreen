@@ -4612,8 +4612,8 @@ fn emit_framed_inner(
                     _ => return Err(EmitError::UnsupportedOp(op_tag(Opcode::MemoryFence))),
                 }
                 if let Some(value) = d.results.first() {
-                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
-                    store_home(&mut a, homes[value], RAX, 0);
+                    let dst = *inst_reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
                 }
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
