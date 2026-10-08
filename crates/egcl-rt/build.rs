@@ -14,7 +14,7 @@ fn main() {
     let pointers_64 = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
     let unix_fibers = unix
         && pointers_64
-        && (matches!(arch.as_str(), "x86_64" | "aarch64")
+        && (matches!(arch.as_str(), "x86_64" | "aarch64" | "riscv64")
             || matches!(
                 target.as_str(),
                 "powerpc64le-unknown-linux-gnu"
