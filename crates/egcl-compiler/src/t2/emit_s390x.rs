@@ -107,7 +107,12 @@
 //!
 //! Constants (`Const*` are folded; heap literals are loaded through their
 //! rooted constant-pool slot, never baked in), `Return`, `Jump`, two-way
-//! `Brif`, `Guard` for the FIXNUM, SINGLE_FLOAT and CONS tags, `FloatAdd/Sub/Mul`
+//! `Brif`, `Trap` (an unconditional deopt), `Guard` for the FIXNUM,
+//! SINGLE_FLOAT and CONS tags and for the simple-string layout, with the
+//! `StringByteLength` and ASCII `StringAsciiCharAt` loads that layout proof
+//! refines (the string's byte length is its second word and its bytes follow
+//! at offset 16 on every target; only the header's type-id byte moves with
+//! the byte order), `FloatAdd/Sub/Mul`
 //! on tagged single-floats, and `FixnumAdd/Sub/Mul/Neg` plus the five fixnum
 //! comparisons, all tag-guarded and deopting on overflow. Multiply uses the
 //! unsigned 128-bit `MLGR` product with a sign correction and requires the
@@ -153,6 +158,10 @@ use std::collections::{HashMap, HashSet};
 /// nonallocating leaf; the primary result is temporarily unrooted during it.
 #[derive(Clone, Default)]
 pub struct RuntimeCalls {
+    /// The generic deopt (`c2i_deopt`): flags a deoptimization with no resume
+    /// point, so `run_native` re-runs the function at T0 from the top. Only
+    /// `Trap` uses it (see there); zero declines `Trap`.
+    pub deopt: u64,
     pub call_slice: u64,
     pub load_global: u64,
     pub load_function: u64,
@@ -223,8 +232,17 @@ struct Emitter<'a> {
     self_args_base: i32,
 }
 
-fn unsupported() -> EmitError {
-    EmitError::UnsupportedOp(0x390)
+/// High bits of a structural decline code; the low 16 bits carry the line.
+pub const S390X_DECLINE_TAG: u32 = 0x5390_0000;
+
+/// A structural decline (a shape this emitter does not handle, as opposed to
+/// an opcode it refuses, which carries the opcode tag): names the line that
+/// declined, so the T2 log can say where. The runtime decodes it as
+/// `[s390x emitter declined at emit_s390x.rs:LINE]`.
+macro_rules! unsupported {
+    () => {
+        EmitError::UnsupportedOp(S390X_DECLINE_TAG | line!())
+    };
 }
 
 /// Order shared recipes before their users without recursive host calls or
@@ -244,7 +262,7 @@ pub(super) fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, 
     for root in roots {
         let mut pending = vec![(root, false)];
         while let Some((index, finish)) = pending.pop() {
-            let mark = marks.get_mut(index).ok_or_else(unsupported)?;
+            let mark = marks.get_mut(index).ok_or(unsupported!())?;
             if finish {
                 *mark = 2;
                 order.push(index);
@@ -252,7 +270,7 @@ pub(super) fn rematerialization_order(state: &FrameState) -> Result<Vec<usize>, 
             }
             match *mark {
                 2 => continue,
-                1 => return Err(unsupported()),
+                1 => return Err(unsupported!()),
                 _ => *mark = 1,
             }
             pending.push((index, true));
@@ -273,12 +291,12 @@ impl Emitter<'_> {
     /// the native depth cap and raises a catchable STORAGE-CONDITION. A zero
     /// limit (never published) compares false, so the guard is inert.
     fn direct_self_call(&mut self, data: &InstData) -> Result<(), EmitError> {
-        let reg_entry = self.reg_entry.ok_or_else(unsupported)?;
+        let reg_entry = self.reg_entry.ok_or(unsupported!())?;
         let AuxData::CallTarget(symbol) = data.aux else {
-            return Err(unsupported());
+            return Err(unsupported!());
         };
         if data.args.len() > 3 {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         let slow = self.asm.label();
         let join = self.asm.label();
@@ -328,7 +346,7 @@ impl Emitter<'_> {
             self.store(result, 2)?;
         }
         self.root_sites.push(RootSyncSite {
-            code_offset: u32::try_from(offset).map_err(|_| unsupported())?,
+            code_offset: u32::try_from(offset).map_err(|_| unsupported!())?,
             live_roots: 0,
             register_roots: 0,
             spill_roots: 0,
@@ -348,11 +366,7 @@ impl Emitter<'_> {
         {
             return self.direct_self_call(data);
         }
-        let roots = self
-            .roots
-            .get(&instruction)
-            .ok_or_else(unsupported)?
-            .clone();
+        let roots = self.roots.get(&instruction).ok_or(unsupported!())?.clone();
         let root_base = i32::from(self.activation_slots) * 8;
         let argument_base = root_base + i32::from(self.root_slots) * 8;
         // Clear unused shadows too: an earlier call may have had more live
@@ -372,7 +386,7 @@ impl Emitter<'_> {
             match data.opcode {
                 Opcode::Call => {
                     let AuxData::CallTarget(symbol) = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     for (index, &arg) in data.args.iter().enumerate() {
                         self.load(arg, 2)?;
@@ -413,10 +427,10 @@ impl Emitter<'_> {
                 }
                 Opcode::SymbolValue | Opcode::SymbolFunction | Opcode::SetSymbolValue => {
                     let AuxData::SymbolRef(symbol) = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     if data.opcode == Opcode::SetSymbolValue {
-                        self.load(*data.args.first().ok_or_else(unsupported)?, 3)?;
+                        self.load(*data.args.first().ok_or(unsupported!())?, 3)?;
                     }
                     self.asm.imm64(2, u64::from(symbol));
                     match data.opcode {
@@ -433,16 +447,16 @@ impl Emitter<'_> {
                 }
                 Opcode::TakeValuesToLocals => {
                     let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     };
                     if usize::from(nvars) != data.results.len()
                         || slot_base
                             .checked_add(nvars)
                             .is_none_or(|end| end > self.activation_slots)
                     {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
-                    self.load(*data.args.first().ok_or_else(unsupported)?, 2)?;
+                    self.load(*data.args.first().ok_or(unsupported!())?, 2)?;
                     self.asm.address(3, 13, i32::from(slot_base) * 8);
                     self.asm.imm64(4, u64::from(nvars));
                     self.runtime.multiple_values
@@ -453,7 +467,7 @@ impl Emitter<'_> {
             self.runtime.poll
         };
         if helper == 0 {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         let offset = self.asm.here();
         self.asm.imm64(1, helper);
@@ -495,7 +509,7 @@ impl Emitter<'_> {
             .filter(|value| matches!(self.homes.get(value), Some(Home::Register(_))))
             .count();
         self.root_sites.push(RootSyncSite {
-            code_offset: u32::try_from(offset).map_err(|_| unsupported())?,
+            code_offset: u32::try_from(offset).map_err(|_| unsupported!())?,
             live_roots: roots.len() as u16,
             register_roots: register_roots as u16,
             spill_roots: (roots.len() - register_roots) as u16,
@@ -510,7 +524,7 @@ impl Emitter<'_> {
             self.asm.imm64(1, *slot as u64);
             self.asm.load(register, 1, 0);
         } else {
-            match self.homes.get(&value).ok_or_else(unsupported)? {
+            match self.homes.get(&value).ok_or(unsupported!())? {
                 Home::Register(source) => self.asm.mov(register, *source),
                 Home::Stack(slot) => self.asm.load(register, 15, 160 + (*slot as i32) * 8),
             }
@@ -519,7 +533,7 @@ impl Emitter<'_> {
     }
 
     fn store(&mut self, value: Value, register: u8) -> Result<(), EmitError> {
-        match self.homes.get(&value).ok_or_else(unsupported)? {
+        match self.homes.get(&value).ok_or(unsupported!())? {
             Home::Register(destination) => self.asm.mov(*destination, register),
             Home::Stack(slot) => self.asm.store(register, 15, 160 + (*slot as i32) * 8),
         }
@@ -659,9 +673,9 @@ impl Emitter<'_> {
     }
 
     fn deopt_label(&mut self, data: &InstData) -> Result<Label, EmitError> {
-        let state = data.frame_state.ok_or_else(unsupported)?;
+        let state = data.frame_state.ok_or(unsupported!())?;
         if self.function.frame_states.get(state).scopes.is_empty() {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         let label = self.asm.label();
         self.deopts.push((state, label));
@@ -805,6 +819,77 @@ impl Emitter<'_> {
         self.asm.branch(8, target);
     }
 
+    /// The simple-string layout guard on the value in r2 (emit.rs's
+    /// guard_simple_string): a heap object whose header type id is one of the
+    /// two simple string layouts, else deopt. r2 is left as it was, since the
+    /// guard's result is its operand under a refined identity.
+    fn guard_simple_string(&mut self, deopt: Label) {
+        use egcl_rt::object::type_id;
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, 7);
+        self.asm.and(4, 5);
+        self.asm.imm64(5, egcl_rt::value::TAG_HEAP_OBJECT);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, deopt);
+        let layout_ok = self.asm.label();
+        self.load_type_id();
+        self.branch_if_type_id(type_id::SIMPLE_BASE_STRING, layout_ok);
+        self.branch_if_type_id(type_id::SIMPLE_CHARACTER_STRING, layout_ok);
+        self.asm.branch(15, deopt);
+        self.asm.bind(layout_ok);
+    }
+
+    /// `(CHAR string index)` for an ASCII character, emit.rs's
+    /// emit_string_ascii_char_at: the string in r2 is layout-proven; the index
+    /// must be a non-negative fixnum below the byte length, and every byte
+    /// through the selected one must be ASCII, since a byte index is a
+    /// character index only then (byte 2 of "éa" is not character 2). Anything
+    /// else deopts to the stdlib's UTF-8-aware CL:CHAR. Leaves the tagged
+    /// character in r2. r1 carries the transient byte, as RAX does on x86-64.
+    fn string_ascii_char_at(&mut self, index: Value, deopt: Label) -> Result<(), EmitError> {
+        // r4 = the untagged string, r3 = the tagged index.
+        self.asm.mov(4, 2);
+        self.asm.imm64(5, !7u64);
+        self.asm.and(4, 5);
+        self.load(index, 3)?;
+        // A fixnum (NGR sets the condition code: nonzero low bits deopt)...
+        self.asm.mov(5, 3);
+        self.asm.imm64(2, 7);
+        self.asm.and(5, 2);
+        self.asm.branch(6, deopt);
+        // ...that is non-negative and below the byte length; both compare as
+        // tagged fixnums, which keeps the order of all representable sizes.
+        self.asm.imm64(2, 0);
+        self.asm.compare(3, 2);
+        self.asm.branch(4, deopt);
+        self.asm.load(2, 4, 8);
+        self.asm.shift_left(2, 2, 3);
+        self.asm.compare(3, 2);
+        self.asm.branch(10, deopt);
+        // r5 = &data[0], the cursor; r2 = &data[index], the bound.
+        self.asm.shift_right_signed(3, 3, 3);
+        self.asm.address(5, 4, 16);
+        self.asm.mov(2, 5);
+        self.asm.add(2, 3);
+        let scan = self.asm.label();
+        let selected = self.asm.label();
+        self.asm.bind(scan);
+        self.asm.load_u8(1, 5, 0);
+        self.asm.imm64(3, 128);
+        self.asm.compare(1, 3);
+        self.asm.branch(10, deopt);
+        self.asm.compare(5, 2);
+        self.asm.branch(8, selected);
+        self.asm.add_imm(5, 1);
+        self.asm.branch(15, scan);
+        self.asm.bind(selected);
+        // The tagged character: (byte << 3) | TAG_CHARACTER.
+        self.asm.shift_left(2, 1, 3);
+        self.asm.imm64(3, egcl_rt::value::TAG_CHARACTER);
+        self.asm.or(2, 3);
+        Ok(())
+    }
+
     fn guard_cons(&mut self, register: u8, deopt: Label) {
         self.asm.mov(4, register);
         self.asm.imm64(5, 7);
@@ -860,7 +945,7 @@ impl Emitter<'_> {
     fn edge(&mut self, edge: &BlockCall) -> Result<(), EmitError> {
         let parameters = self.function.block(edge.block).params.clone();
         if parameters.len() != edge.args.len() {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         // A parallel copy through private native slots handles cycles and
         // overlapping register/spill homes without clobbering an edge input.
@@ -920,10 +1005,34 @@ impl Emitter<'_> {
                 self.asm.bind(otherwise);
                 return self.edge(&data.targets[1]);
             }
+            Trap => {
+                // A Trap ends a path that must not continue (bliss-wukf): the
+                // code after a call that never returns normally. As in
+                // emit.rs, the GENERIC deopt suffices even though it re-runs
+                // the function: this is only reachable once a c2i helper has
+                // stashed an error, and run_native takes NATIVE_ERROR before
+                // it looks at NATIVE_DEOPT, so no committed side effect is
+                // repeated and no FrameState is needed (REDUCE's :from-end
+                // path was the first measured s390x function refused here).
+                if self.runtime.deopt == 0 {
+                    return Err(unsupported!());
+                }
+                self.asm.imm64(1, self.runtime.deopt);
+                self.asm.call_reg(1);
+                self.asm.imm64(2, NIL.0);
+                self.epilogue();
+                return Ok(());
+            }
             _ => {}
         }
-        let result = *data.results.first().ok_or_else(unsupported)?;
-        let first = *data.args.first().ok_or_else(unsupported)?;
+        // Everything below produces a value from a first operand; an opcode
+        // that does neither is refused by name, so the T2 log says which.
+        let Some(&result) = data.results.first() else {
+            return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+        };
+        let Some(&first) = data.args.first() else {
+            return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+        };
         self.load(first, 2)?;
         match data.opcode {
             Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
@@ -944,7 +1053,7 @@ impl Emitter<'_> {
             FloatAdd | FloatSub | FloatMul => {
                 let deopt = self.deopt_label(data)?;
                 self.float_operand(first, 2, deopt)?;
-                self.float_operand(*data.args.get(1).ok_or_else(unsupported)?, 3, deopt)?;
+                self.float_operand(*data.args.get(1).ok_or(unsupported!())?, 3, deopt)?;
                 self.asm.load_float_bits(0, 2);
                 self.asm.load_float_bits(2, 3);
                 match data.opcode {
@@ -962,7 +1071,7 @@ impl Emitter<'_> {
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(2, deopt);
                 if data.opcode != FixnumNeg {
-                    self.load(*data.args.get(1).ok_or_else(unsupported)?, 3)?;
+                    self.load(*data.args.get(1).ok_or(unsupported!())?, 3)?;
                     self.guard_fixnum(3, deopt);
                 }
                 match data.opcode {
@@ -1008,7 +1117,7 @@ impl Emitter<'_> {
                 // tagged values and the rewrite carries no frame state. Declining
                 // it cost every function containing a NOT, a NULL or an EQ its
                 // T2 code on s390x (bliss-pig52).
-                self.load(*data.args.get(1).ok_or_else(unsupported)?, 3)?;
+                self.load(*data.args.get(1).ok_or(unsupported!())?, 3)?;
                 self.asm.compare(2, 3);
                 let yes = self.asm.label();
                 let done = self.asm.label();
@@ -1028,7 +1137,7 @@ impl Emitter<'_> {
                 // already proven, and a Car still carrying a guard, an effect or
                 // a FrameState needs the general path instead.
                 if data.flags.guard || data.flags.effectful || data.frame_state.is_some() {
-                    return Err(unsupported());
+                    return Err(unsupported!());
                 }
                 self.asm.imm64(3, !7u64);
                 self.asm.and(2, 3);
@@ -1042,7 +1151,7 @@ impl Emitter<'_> {
                 // untag, no retag, no overflow.
                 let deopt = self.deopt_label(data)?;
                 self.guard_fixnum(2, deopt);
-                self.load(*data.args.get(1).ok_or_else(unsupported)?, 3)?;
+                self.load(*data.args.get(1).ok_or(unsupported!())?, 3)?;
                 self.guard_fixnum(3, deopt);
                 match data.opcode {
                     LogAnd => self.asm.and(2, 3),
@@ -1067,7 +1176,7 @@ impl Emitter<'_> {
                 // constants map holds TAGGED bits, so the shift count is
                 // recovered by untagging it.
                 let deopt = self.deopt_label(data)?;
-                let amount = *data.args.get(1).ok_or_else(unsupported)?;
+                let amount = *data.args.get(1).ok_or(unsupported!())?;
                 let tagged = *self
                     .constants
                     .get(&amount)
@@ -1116,6 +1225,40 @@ impl Emitter<'_> {
                 }
             }
             TypeCheck => self.type_check(first, data)?,
+            Guard if matches!(&data.aux, AuxData::StringLayout) => {
+                if data.args.len() != 1 || !data.flags.guard || !data.flags.effectful {
+                    return Err(EmitError::UnsupportedOp(super::emit::op_tag(Opcode::Guard)));
+                }
+                let deopt = self.deopt_label(data)?;
+                self.guard_simple_string(deopt);
+            }
+            StringByteLength => {
+                if data.args.len() != 1
+                    || data.flags.guard
+                    || data.flags.effectful
+                    || data.frame_state.is_some()
+                {
+                    return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+                }
+                // The operand is layout-proven. r4 = the untagged object; its
+                // byte length is the second word, returned as a fixnum.
+                self.asm.mov(4, 2);
+                self.asm.imm64(5, !7u64);
+                self.asm.and(4, 5);
+                self.asm.load(2, 4, 8);
+                self.asm.shift_left(2, 2, 3);
+            }
+            StringAsciiCharAt => {
+                if data.args.len() != 2
+                    || !data.flags.guard
+                    || !data.flags.effectful
+                    || data.frame_state.is_none()
+                {
+                    return Err(EmitError::UnsupportedOp(super::emit::op_tag(data.opcode)));
+                }
+                let deopt = self.deopt_label(data)?;
+                self.string_ascii_char_at(data.args[1], deopt)?;
+            }
             // Name the opcode: the T2 log then says "refused Opcode #N in
             // t2/ir.rs" instead of this emitter's anonymous 0x390, so a
             // histogram of declines over real code ranks the missing arms
@@ -1147,7 +1290,7 @@ impl Emitter<'_> {
                 self.asm.load(2, 15, self.remat_base + id.0 as i32 * 8);
                 Ok(())
             }
-            _ => Err(unsupported()),
+            _ => Err(unsupported!()),
         }
     }
 
@@ -1155,7 +1298,7 @@ impl Emitter<'_> {
         for index in rematerialization_order(state)? {
             let recipe = &state.remat[index];
             if recipe.result_repr != ValueRepresentation::Tagged {
-                return Err(unsupported());
+                return Err(unsupported!());
             }
             match recipe.op {
                 RematOp::Const
@@ -1164,13 +1307,13 @@ impl Emitter<'_> {
                 | RematOp::BoxFloat
                 | RematOp::UnboxFloat => {
                     if recipe.inputs.len() != 1 {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
                     self.deopt_source(&recipe.inputs[0], state)?;
                 }
                 RematOp::FixnumAdd | RematOp::FixnumSub => {
                     if recipe.inputs.len() != 2 {
-                        return Err(unsupported());
+                        return Err(unsupported!());
                     }
                     self.deopt_source(&recipe.inputs[0], state)?;
                     self.asm.mov(3, 2);
@@ -1256,9 +1399,9 @@ pub fn emit_framed_with_runtime(
             .any(|target| positions.get(target).is_none_or(|&target| target <= index))
         {
             if runtime.poll == 0 {
-                return Err(unsupported());
+                return Err(unsupported!());
             }
-            polls.insert(*function.block(block).insts.last().ok_or_else(unsupported)?);
+            polls.insert(*function.block(block).insts.last().ok_or(unsupported!())?);
         }
     }
     let mut machine = super::lower::lower(function);
@@ -1324,7 +1467,7 @@ pub fn emit_framed_with_runtime(
     for index in 0..function.num_values() {
         let value = Value(index as u32);
         if function.value(value).repr != ValueRepresentation::Tagged {
-            return Err(unsupported());
+            return Err(unsupported!());
         }
         if emitter.constants.contains_key(&value) || emitter.heap_constants.contains_key(&value) {
             continue;
@@ -1377,7 +1520,7 @@ pub fn emit_framed_with_runtime(
         if !calls_runtime(function.inst(source).opcode) {
             continue;
         }
-        let after = u32::try_from(index).map_err(|_| unsupported())? * 2 + 1;
+        let after = u32::try_from(index).map_err(|_| unsupported!())? * 2 + 1;
         let mut roots: Vec<Value> = machine
             .value_locations
             .iter()
@@ -1414,7 +1557,7 @@ pub fn emit_framed_with_runtime(
         {
             boundary -= 1;
         }
-        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let point = u32::try_from(boundary).map_err(|_| unsupported!())? * 2;
         let data = function.inst(source);
         let mut roots: Vec<_> = machine
             .value_locations
@@ -1437,7 +1580,7 @@ pub fn emit_framed_with_runtime(
         emitter.roots.insert(source, roots);
     }
     emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
-        .map_err(|_| unsupported())?;
+        .map_err(|_| unsupported!())?;
     emitter.argument_slots = u16::try_from(
         function
             .block_order()
@@ -1449,7 +1592,7 @@ pub fn emit_framed_with_runtime(
             .max()
             .unwrap_or(0),
     )
-    .map_err(|_| unsupported())?;
+    .map_err(|_| unsupported!())?;
     // Direct self-call eligibility (module docs). Self-call arguments never go
     // through the activation, so an eligible function needs no argument shadow
     // slots at all; nothing in its body then touches r13, which is what makes
@@ -1483,10 +1626,10 @@ pub fn emit_framed_with_runtime(
     let shadow_root_slots = emitter
         .root_slots
         .checked_add(emitter.argument_slots)
-        .ok_or_else(unsupported)?;
+        .ok_or(unsupported!())?;
     activation_slots
         .checked_add(shadow_root_slots)
-        .ok_or_else(unsupported)?;
+        .ok_or(unsupported!())?;
     let edge_words = function
         .block_order()
         .iter()
@@ -1516,7 +1659,7 @@ pub fn emit_framed_with_runtime(
         spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
-        return Err(unsupported());
+        return Err(unsupported!());
     }
     emitter.frame_bytes = (frame_words * 8) as i32;
     emitter.edge_base = 160 + spill_slots as i32 * 8;
@@ -1529,7 +1672,7 @@ pub fn emit_framed_with_runtime(
     emitter.saved_fp_offset = emitter.stack_offset + 8;
     emitter.saved_sp_offset = emitter.saved_fp_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
-        return Err(unsupported());
+        return Err(unsupported!());
     }
     emitter.prologue();
     for (index, &parameter) in function.block(function.entry()).params.iter().enumerate() {

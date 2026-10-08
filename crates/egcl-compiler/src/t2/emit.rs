@@ -2793,6 +2793,7 @@ pub fn emit_framed_with_direct_natives(
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_a64::RuntimeCalls {
+                deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
@@ -2811,6 +2812,7 @@ pub fn emit_framed_with_direct_natives(
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_ppc64le::RuntimeCalls {
+                deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
@@ -2829,6 +2831,7 @@ pub fn emit_framed_with_direct_natives(
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_s390x::RuntimeCalls {
+                deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,

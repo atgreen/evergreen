@@ -18522,6 +18522,16 @@ static T1_DECLINED: egcl_rt::execution_local::ExecutionLocal<
         || RefCell::new(std::collections::HashSet::new()),
     )
 };
+/// The native code of the direct callees a queued T2 job was resolved
+/// against, keyed by the caller and its registry generation (bliss-6j6pk).
+/// Retained from the moment the targets are baked: a callee promoted to T2
+/// while the job compiles replaces its registry entry WITHOUT bumping the
+/// direct-call generation, so the caller's code will keep jumping to the old
+/// entry, and that buffer must not be freed under it. Drained into the
+/// installed code's `_direct_calls`, or dropped when the job is dropped.
+type PendingDirectCalls = HashMap<(u32, u64), Vec<Rc<NativeCode>>, egcl_rt::fxhash::FxBuildHasher>;
+static PENDING_DIRECT_CALLS: egcl_rt::execution_local::ExecutionLocal<RefCell<PendingDirectCalls>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 /// Symbols with one outstanding background T2 request.  Coalescing here
 /// prevents a hot dispatch/back-edge from flooding the global queue.
 static T2_QUEUED: egcl_rt::execution_local::ExecutionLocal<
@@ -19113,7 +19123,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         );
     }
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
-    let direct_natives = direct_native_targets(sym, &root, &inline_bodies);
+    let direct_natives = direct_native_targets(sym, generation, &root, &inline_bodies);
     Some(T2CompileInput {
         sym,
         generation,
@@ -19136,6 +19146,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
 #[cfg(all(target_arch = "s390x", target_os = "linux"))]
 fn direct_native_targets(
     caller: u32,
+    caller_generation: u64,
     root: &BytecodeFunction,
     inline_bodies: &[T2BodySnapshot],
 ) -> Vec<egcl_compiler::t2::emit::DirectNativeTarget> {
@@ -19161,6 +19172,7 @@ fn direct_native_targets(
     let baked_gen = direct_call_gen();
     let generation_addr = std::ptr::addr_of!(DIRECT_CALL_GEN) as u64;
     let mut targets = Vec::new();
+    let mut retained = Vec::new();
     for (callee, nargs) in sites {
         let (Some(cbf), Some(cnc)) = (
             registry_get(callee),
@@ -19203,7 +19215,13 @@ fn direct_native_targets(
                 generation_addr,
                 frame_flags: FLAG_CALL,
             });
+            retained.push(cnc);
         }
+    }
+    if !retained.is_empty() {
+        PENDING_DIRECT_CALLS.with(|m| {
+            m.borrow_mut().insert((caller, caller_generation), retained);
+        });
     }
     targets
 }
@@ -19211,29 +19229,11 @@ fn direct_native_targets(
 #[cfg(not(all(target_arch = "s390x", target_os = "linux")))]
 fn direct_native_targets(
     _caller: u32,
+    _caller_generation: u64,
     _root: &BytecodeFunction,
     _inline_bodies: &[T2BodySnapshot],
 ) -> Vec<egcl_compiler::t2::emit::DirectNativeTarget> {
     Vec::new()
-}
-
-/// The native code of the direct callees an installed T2 function was emitted
-/// against, so their code outlives a registry replacement while this caller
-/// still jumps into it. A callee replaced since the targets were resolved is
-/// not retained: its baked generation guard already fails.
-fn retained_direct_calls(targets: &[(u32, u64)]) -> Vec<Rc<NativeCode>> {
-    NATIVE_REGISTRY.with(|r| {
-        let registry = r.borrow();
-        targets
-            .iter()
-            .filter_map(|&(symbol, entry)| {
-                registry
-                    .get(&symbol)
-                    .filter(|code| code.entry as u64 == entry)
-                    .cloned()
-            })
-            .collect()
-    })
 }
 
 fn request_t2_compilation(sym: u32, priority: u64) -> bool {
@@ -19264,6 +19264,7 @@ fn request_t2_compilation(sym: u32, priority: u64) -> bool {
         completion: t2_completion_sender(),
     };
     if !t2_compile_queue().submit(job) {
+        PENDING_DIRECT_CALLS.with(|m| m.borrow_mut().remove(&(sym, generation)));
         t2_log_write(format_args!(
             "{}: background compilation queue full; retaining T1",
             sym_label(sym)
@@ -19314,6 +19315,10 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     // Bridge rooting from the worker through construction of the smaller
     // installed-code root below. The completion owns this handle until return.
     let _compilation_root = &done.input;
+    // Whatever happens below, the retained callees belong to this job.
+    let direct_calls = PENDING_DIRECT_CALLS
+        .with(|m| m.borrow_mut().remove(&(done.sym, done.generation)))
+        .unwrap_or_default();
     // Refresh the canonical definition before validating the local generation.
     // Otherwise a worker can accept a job predating another thread's DEFUN,
     // or record its decline against the replacement definition.
@@ -21666,6 +21671,11 @@ fn t2_log_target() -> Option<&'static T2LogTarget> {
 fn describe_emit_error(e: &egcl_compiler::t2::emit::EmitError) -> String {
     use egcl_compiler::t2::emit::EmitError;
     match e {
+        EmitError::UnsupportedOp(tag)
+            if tag & 0xFFFF_0000 == egcl_compiler::t2::emit_s390x::S390X_DECLINE_TAG =>
+        {
+            format!(" [s390x emitter declined at emit_s390x.rs:{}]", tag & 0xFFFF)
+        }
         EmitError::UnsupportedOp(tag) if tag & 0x1000 != 0 => {
             format!(" [refused Opcode #{} in t2/ir.rs]", tag & 0xFFF)
         }
