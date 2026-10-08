@@ -29,6 +29,9 @@ pub const NULL: Context = core::ptr::null_mut();
 #[cfg(all(egcl_unix_fibers, target_arch = "aarch64"))]
 #[path = "context/aarch64.rs"]
 mod backend;
+#[cfg(all(egcl_unix_fibers, target_arch = "riscv64"))]
+#[path = "context/riscv64.rs"]
+mod backend;
 #[cfg(all(
     egcl_unix_fibers,
     any(target_arch = "powerpc64", target_arch = "s390x")

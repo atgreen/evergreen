@@ -268,7 +268,10 @@ carrier thread (the "shadow stack") is separate.
  Low address
 ```
 
-Default usable size: 512 KiB (configurable via `EGCL_STACK_SIZE`).
+Default usable size: 512 KiB (configurable via `EGCL_STACK_SIZE`); 4 MiB on
+s390x, where a T2 native frame is ~7x the x86-64 size, so a deep recursion
+spends the native stack reserve ~7x sooner and the remainder of it lands on
+this stack (bliss-hfdq2).
 
 ### 2.4.2 Frame Format
 
@@ -872,7 +875,7 @@ No JVM integration is implied or planned.
 | `EGCL_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
 | `EGCL_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
 | `EGCL_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
-| `EGCL_STACK_SIZE` | `512k` | CL stack size per fiber |
+| `EGCL_STACK_SIZE` | `512k` (`4m` on s390x) | CL stack size per fiber |
 | `EGCL_WORKERS` | `nproc` | Default scheduler-group carrier count (legacy name) |
 | `EGCL_IMAGE` | `egcl.bimg` | Path to boot image |
 | `EGCL_GC_LOG` | (none) | Path to GC log file (enables GC logging) |
