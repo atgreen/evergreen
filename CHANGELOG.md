@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- T2 deopt frame states name only the locals the interpreter can still read.
+  A `LET*` chain inside a loop no longer keeps every binding alive to the end
+  of the function, so its arithmetic stays in registers and the loop
+  back-edge carries only the loop variables
+  ([#103](https://github.com/atgreen/evergreen/pull/103)).
 - T2 no longer emits a runtime call for every `SETQ` in a loop. Multiple-value
   resets that cannot be observed before the next reset are removed, so a
   call-free loop of assignments runs as straight-line native code; a ten-SETQ
