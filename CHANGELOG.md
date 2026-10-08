@@ -19,6 +19,11 @@
   and carrier migration behave as on the other Linux ports
   ([#120](https://github.com/atgreen/evergreen/pull/120)).
 
+- Foreign calls on riscv64 now use the LP64D calling convention for every
+  scalar signature, including floats, doubles, mixed argument lists and
+  variadic functions, instead of the bootstrap dispatcher's fixed integer
+  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
+
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
   backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
