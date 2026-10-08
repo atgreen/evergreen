@@ -197,6 +197,13 @@ impl Asm {
         }
     }
 
+    /// BCR 14,0: the serialization instruction, a full memory fence on
+    /// z/Architecture (what compilers emit for a sequentially consistent
+    /// fence; the architecture already orders loads and stores otherwise).
+    pub fn serialize(&mut self) {
+        self.code.extend_from_slice(&[0x07, 0xe0]);
+    }
+
     /// TMLL: test the low 16 bits of a register under `mask`. CC0 means every
     /// selected bit is zero, so `branch(7, ..)` afterwards is "some selected
     /// bit is set": a one-instruction tag test for the fixnum tag 0.
@@ -392,6 +399,14 @@ mod tests {
                 0xc0, 0x38, 0, 0, 0, 1, 0xc0, 0x39, 0, 0, 0, 0,
             ]
         );
+    }
+
+    #[test]
+    fn serialization_encoding_matches_llvm_systemz() {
+        // llvm-mc: bcr 14,0 => 07 e0
+        let mut a = Asm::new();
+        a.serialize();
+        assert_eq!(a.finish().unwrap(), [0x07, 0xe0]);
     }
 
     #[test]

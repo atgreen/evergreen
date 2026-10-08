@@ -837,7 +837,7 @@ fn typep_inline_class(rest: EgclVal) -> Option<u16> {
     None
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
 fn literal_memory_fence(rest: EgclVal) -> Option<MemoryFenceKind> {
     if !rest.is_cons() {
         return None;
@@ -3372,7 +3372,10 @@ impl<'e> Lowerer<'e> {
         if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv) {
             return self.lower_expr(expanded);
         }
-        #[cfg(target_arch = "x86_64")]
+        // Only on targets whose T1 and T2 emitters compile the opcode; the
+        // others keep the generic %MEMORY-FENCE call, since an unsupported
+        // bytecode would cost a function its native tiers.
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
         {
             if name == "EGCL::%MEMORY-FENCE"
                 && let Some(kind) = literal_memory_fence(rest)
