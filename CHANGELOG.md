@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- An inline s390x deoptimization now resumes on its owned Lisp frame when
+  available, preserving original arguments without duplicating the function in
+  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
+
 - s390x T2 functions now save and restore only the callee-saved registers they
   use, reducing native call overhead
   ([#115](https://github.com/atgreen/evergreen/pull/115)).
