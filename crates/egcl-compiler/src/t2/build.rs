@@ -727,7 +727,11 @@ impl<'a> Builder<'a> {
                 Instr::PushUnwind { cleanup_bcp, .. } if self.native_cleanups => {
                     set.insert(*cleanup_bcp as usize);
                 }
-                Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::Throw
+                Instr::CallNamed { .. }
+                | Instr::SetValues(_)
+                | Instr::Throw
+                | Instr::EvalHost(_)
+                | Instr::LoadFunction(_)
                     if self.native_cleanups =>
                 {
                     if i + 1 < code.len() {
@@ -814,6 +818,8 @@ impl<'a> Builder<'a> {
                     || matches!(
                         code[i],
                         Instr::CallNamed { .. }
+                            | Instr::EvalHost(_)
+                            | Instr::LoadFunction(_)
                             | Instr::SetValues(_)
                             | Instr::CleanupReturn
                             | Instr::Throw
@@ -840,9 +846,22 @@ impl<'a> Builder<'a> {
                 }
             }
             match &code[i] {
+                Instr::EvalHost(_) if self.native_cleanups => {
+                    push(i + 1, d + 1, &mut depth_at, &mut work);
+                }
+                Instr::PushHandlerBind { hb } if self.native_cleanups => {
+                    let count = self.bf.handler_binds
+                        .get(*hb as usize)
+                        .ok_or(BuildError::Unsupported("invalid handler-bind table"))?
+                        .types
+                        .len() as i32;
+                    if d < count {
+                        return Err(BuildError::Unsupported("handler-bind without handlers"));
+                    }
+                    push(i + 1, d - count, &mut depth_at, &mut work);
+                }
                 Instr::PushHandlerCase { .. }
                 | Instr::PopHandlerCase
-                | Instr::PushHandlerBind { .. }
                 | Instr::PopHandlerBind
                 | Instr::PushRestartCase { .. }
                 | Instr::PopRestartCase
@@ -1059,6 +1078,8 @@ impl<'a> Builder<'a> {
         for (offset, instr) in code[start..end].iter().enumerate() {
             if self.catch_transition(start + offset).is_some()
                 || self.handler_transition(start + offset).is_some()
+                || self.handler_bind_transition(start + offset).is_some()
+                || self.restart_case_transition(start + offset).is_some()
             {
                 let mut successors = vec![blk(end)?];
                 for target in self.exceptional_handlers((start + offset) as u32) {
@@ -1073,7 +1094,11 @@ impl<'a> Builder<'a> {
                 return Ok(successors);
             }
             match instr {
-                Instr::CallNamed { .. } | Instr::SetValues(_) | Instr::Throw
+                Instr::CallNamed { .. }
+                | Instr::SetValues(_)
+                | Instr::Throw
+                | Instr::EvalHost(_)
+                | Instr::LoadFunction(_)
                     if self.native_cleanups =>
                 {
                     let mut successors = Vec::new();
@@ -1289,6 +1314,37 @@ impl<'a> Builder<'a> {
         let code = &self.bf.code;
         for (offset, instruction) in code[start..end].iter().enumerate() {
             let i = start + offset;
+            if self.native_cleanups
+                && matches!(instruction, Instr::EvalHost(_) | Instr::LoadFunction(_))
+            {
+                let aux = match instruction {
+                    Instr::EvalHost(index) => {
+                        if self.bf.constants.get(*index as usize).is_none() {
+                            return Err(BuildError::Unsupported("invalid host form constant"));
+                        }
+                        AuxData::HostEval(*index)
+                    }
+                    Instr::LoadFunction(symbol) => AuxData::FunctionLookup(*symbol),
+                    _ => unreachable!(),
+                };
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let (inst, results) = self.f.push_inst(
+                    block,
+                    InstData {
+                        opcode: Opcode::Call,
+                        args: vec![],
+                        results: vec![],
+                        aux,
+                        flags: runtime_call_flags(),
+                        targets: vec![],
+                        frame_state: Some(fs),
+                        source_pos: 0,
+                    },
+                    &[(IRType::TOP, ValueRepresentation::Tagged)],
+                );
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
             if let Some((push_bcp, enter)) = self.handler_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
                 let (inst, results) = self.f.push_inst(
@@ -1310,11 +1366,27 @@ impl<'a> Builder<'a> {
             }
             if let Some((push_bcp, enter)) = self.handler_bind_transition(i) {
                 let fs = self.build_frame_state(block, &stack, i as u32);
+                let args = if enter {
+                    let Instr::PushHandlerBind { hb } = instruction else {
+                        unreachable!();
+                    };
+                    let count = self.bf.handler_binds
+                        .get(*hb as usize)
+                        .ok_or(BuildError::Unsupported("invalid handler-bind table"))?
+                        .types
+                        .len();
+                    let first = stack.len()
+                        .checked_sub(count)
+                        .ok_or(BuildError::Unsupported("handler-bind without handlers"))?;
+                    stack.split_off(first)
+                } else {
+                    vec![]
+                };
                 let (inst, results) = self.f.push_inst(
                     block,
                     InstData {
                         opcode: Opcode::Call,
-                        args: vec![],
+                        args,
                         results: vec![],
                         aux: AuxData::HandlerBindScope { push_bcp, enter },
                         flags: runtime_call_flags(),

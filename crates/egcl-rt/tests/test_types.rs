@@ -359,9 +359,15 @@ fn bit_vector_p_true_for_simple_bit_array() {
         let mut storage = [0u64; 4];
         let header = ObjectHeader::new(type_id::SIMPLE_ARRAY, 3);
         storage[0] = header.0;
-        // Place ElementTypeTag::Bit (1) as the first byte of the second word,
-        // which is where the array element-type tag is expected.
-        storage[1] = ElementTypeTag::Bit as u64;
+        // Place ElementTypeTag::Bit (1) as the first BYTE of the second word,
+        // which is where the array element-type tag is expected: the reader's
+        // alloc_bit_vector writes `*ptr.add(8) = Bit as u8` and bit_vector_p
+        // reads that byte back. Storing the tag as a whole little-endian word
+        // only lands it in that byte on little-endian hosts; on s390x the low
+        // byte of a word is its LAST byte, so build the word from bytes.
+        let mut tag_word = [0u8; 8];
+        tag_word[0] = ElementTypeTag::Bit as u8;
+        storage[1] = u64::from_ne_bytes(tag_word);
         let v = EgclVal::from_heap_ptr(storage.as_mut_ptr() as *mut u8);
         assert!(
             bit_vector_p(v),

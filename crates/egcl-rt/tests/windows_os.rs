@@ -308,5 +308,9 @@ fn windows_stack_budget_fits_current_thread() {
     unsafe {
         windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut low, &mut high);
     }
+    assert_eq!(os::thread_stack_limits(), (low, high));
+    let probe = std::hint::black_box(&low) as *const usize as usize;
+    assert!(low < high);
+    assert!((low..high).contains(&probe));
     assert!(egcl_rt::eval_stack_budget() < high - low);
 }

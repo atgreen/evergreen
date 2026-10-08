@@ -190,9 +190,6 @@ fn bytecode_references_with_params(
             refs.push(EgclVal::from_symbol_index(*sym));
         }
     }
-    for handler in &function.handler_binds {
-        refs.extend(handler.bindings.iter().map(|(_, form)| *form));
-    }
     for restart in &function.restart_cases {
         for entry in &restart.restarts {
             refs.extend(bytecode_references_with_params(

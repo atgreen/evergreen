@@ -10,6 +10,7 @@
 use super::*;
 use super::super::CONTROL_COUNTER;
 use std::cell::Cell;
+use std::sync::OnceLock;
 use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
@@ -72,11 +73,39 @@ impl egcl_rt::gc::TraceHostRoots for RestartFunctionTemplates {
     }
 }
 
+fn native_body_roots() -> &'static SharedCell<Vec<std::sync::Weak<ActiveBytecodeRoot>>> {
+    static ROOTS: OnceLock<SharedCell<Vec<std::sync::Weak<ActiveBytecodeRoot>>>> = OnceLock::new();
+    ROOTS.get_or_init(|| SharedCell::new(Vec::new()))
+}
+
+fn scan_native_body_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    native_body_roots().borrow_mut().retain(|weak| {
+        let Some(root) = weak.upgrade() else {
+            return false;
+        };
+        // The collector stops mutators before rewriting the owning pool.
+        unsafe {
+            trace_bytecode_function(Arc::as_ptr(&root._function) as *mut BytecodeFunction, visit);
+        }
+        true
+    });
+}
+
+fn retain_native_body(body: &Arc<BytecodeFunction>) -> Arc<ActiveBytecodeRoot> {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| egcl_rt::gc::register_root_scanner(scan_native_body_roots));
+    let root = Arc::new(ActiveBytecodeRoot::new(body));
+    // The root token, not the body, is weakly indexed: dropping the native
+    // owner must stop rooting even if a private dispatch cache retains an Arc.
+    native_body_roots().borrow_mut().push(Arc::downgrade(&root));
+    root
+}
+
 /// Only constructible through the host-specific emitter. Retaining this value
 /// retains every embedded code address and the original bytecode definition.
 pub(super) struct TransferCode {
     body: Arc<BytecodeFunction>,
-    _body_roots: ActiveBytecodeRoot,
+    _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
     _veneer: JitBuffer,
     _capture: JitBuffer,
@@ -187,7 +216,7 @@ impl TransferCode {
         }) {
             return None;
         }
-        let roots = ActiveBytecodeRoot::new(&body);
+        let roots = retain_native_body(&body);
         let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
@@ -530,6 +559,8 @@ impl TransferCode {
                                 self.body.code.get(saved.resume_pc as usize),
                                 Some(
                                     Instr::CallNamed { .. }
+                                        | Instr::EvalHost(_)
+                                        | Instr::LoadFunction(_)
                                         | Instr::CleanupReturn
                                         | Instr::SetValues(_)
                                         | Instr::Throw
@@ -992,7 +1023,46 @@ unsafe extern "C" fn call_or_throw(
         TRANSFER_HANDLER_BIND_ENTER_REQUEST, TRANSFER_HANDLER_BIND_LEAVE_REQUEST,
         TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
         TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
+        TRANSFER_HOST_EVAL_REQUEST, TRANSFER_FUNCTION_LOOKUP_REQUEST,
     };
+    if matches!(
+        request_kind,
+        TRANSFER_HOST_EVAL_REQUEST | TRANSFER_FUNCTION_LOOKUP_REQUEST
+    ) {
+        let mut value = NIL;
+        if !native_error_pending() {
+            let result = guard_c2i(|| {
+                assert_eq!(call.nargs, 0);
+                let context = unsafe { &*CAPTURE.with(Cell::get) };
+                let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+                if request_kind == TRANSFER_HOST_EVAL_REQUEST {
+                    let body = unsafe { &*context.body };
+                    let form = *body.constants
+                        .get(call.symbol as u32 as usize)
+                        .ok_or_else(invalid_capture)?;
+                    eval_form(form, env)
+                } else {
+                    let symbol = EgclVal::from_symbol_index(call.symbol as u32);
+                    Ok(super::super::symbol_function_object(env, symbol).unwrap_or(symbol))
+                }
+            });
+            match result {
+                Ok(result) => value = result,
+                Err(error) => NATIVE_ERROR.with(|slot| slot.set_first(error)),
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
     if matches!(
         request_kind,
         TRANSFER_HANDLER_BIND_ENTER_REQUEST
@@ -1002,7 +1072,9 @@ unsafe extern "C" fn call_or_throw(
     ) {
         if !native_error_pending() {
             let result = guard_c2i(|| {
-                assert_eq!(call.nargs, 0);
+                if request_kind != TRANSFER_HANDLER_BIND_ENTER_REQUEST {
+                    assert_eq!(call.nargs, 0);
+                }
                 let context = unsafe { &mut *CAPTURE.with(Cell::get) };
                 let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
                 let push_bcp = call.symbol as u32;
@@ -1021,30 +1093,28 @@ unsafe extern "C" fn call_or_throw(
                     if request_kind == TRANSFER_HANDLER_BIND_ENTER_REQUEST {
                         assert!(binds.len() < binds.capacity());
                         let info = &body.handler_binds[*hb as usize];
+                        assert_eq!(call.nargs, info.types.len());
                         let cluster_base = env.handlers.len();
                         let mut entries = Vec::new();
                         entries
-                            .try_reserve(info.bindings.len())
+                            .try_reserve(info.types.len())
                             .map_err(|_| EgclError::Oom)?;
                         let mut values = Vec::new();
                         values
-                            .try_reserve(info.bindings.len().saturating_mul(2))
+                            .try_reserve(info.types.len().saturating_mul(2))
                             .map_err(|_| EgclError::Oom)?;
                         egcl_rt::rooted_ref!(_entries = &mut entries);
                         egcl_rt::rooted_ref!(_values = &mut values);
-                        for (type_name, form) in &info.bindings {
-                            let handler = eval_form(*form, env)
-                                .map(HandlerImpl::Function)
-                                .unwrap_or(HandlerImpl::Function(*form));
-                            let handler_value = match &handler {
-                                HandlerImpl::Function(value) => *value,
-                                HandlerImpl::HandlerCase { .. } => NIL,
-                            };
+                        for (index, type_name) in info.types.iter().enumerate() {
+                            let type_symbol = resolve_sym(type_name).ok_or_else(invalid_capture)?;
+                            // The native call's argument area remains rooted;
+                            // reread after interning, which can relocate values.
+                            let handler_value = unsafe { *call.args.add(index) };
                             entries.push(HandlerEntry {
                                 type_name: try_clone_string(type_name)?,
-                                handler,
+                                handler: HandlerImpl::Function(handler_value),
                             });
-                            values.push(resolve_sym(type_name).ok_or_else(invalid_capture)?);
+                            values.push(type_symbol);
                             values.push(handler_value);
                         }
                         let cluster_frame =

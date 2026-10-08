@@ -1,0 +1,9 @@
+alexandria, ghcr.io/ocicl/alexandria@sha256:407634b0781b2d8fc3e55a30432bcb5d0c042af2feb2d1d72de825940b0fb0df, alexandria-20260812-f283e25/alexandria.asd
+atomics, git+https://github.com/atgreen/atomics@738ddccd7a6f3c44e83335ac5e3615e76972dfd2#ref=738ddccd7a6f3c44e83335ac5e3615e76972dfd2, atomics-738ddcc/atomics.asd
+bordeaux-threads, git+https://github.com/atgreen/bordeaux-threads@2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f#ref=2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f, bordeaux-threads-2f736ed/bordeaux-threads.asd
+cl-cancel, ghcr.io/ocicl/cl-cancel@sha256:b6e6387eed5027d5becb5fa18b370c1c3a755daf26bca037007018a611bcd353, cl-cancel-20260206-bec34fb/cl-cancel.asd
+documentation-utils, ghcr.io/ocicl/documentation-utils@sha256:b2a1b3f3bcd1a738af85ae2b0168d408c177661eab6d6bbebb254e394d983f54, documentation-utils-20230511-98630dd/documentation-utils.asd
+global-vars, ghcr.io/ocicl/global-vars@sha256:d197e871c9c9abc4bf31b1186f5fd28f0ca848ebe2e9dddf2d82ecee01dbdc65, global-vars-20240503-c749f32/global-vars.asd
+precise-time, git+https://github.com/atgreen/precise-time@045df7c4cddc84d775610cbecf47b462aaea29d6#ref=045df7c4cddc84d775610cbecf47b462aaea29d6, precise-time-045df7c/precise-time.asd
+trivial-features, git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f#ref=651e8ea90db0b143d39b9a414ee382ec62efad2f, trivial-features-651e8ea/trivial-features.asd
+trivial-indent, ghcr.io/ocicl/trivial-indent@sha256:d6fbd17596902035519516d5a1dfb96e535cb8f1098dc1ba0753b975bdf5c21f, trivial-indent-20260912-7281fb0/trivial-indent.asd

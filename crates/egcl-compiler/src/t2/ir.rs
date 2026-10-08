@@ -381,6 +381,10 @@ pub enum AuxData {
     },
     FieldOffset(u32),
     CallTarget(u32),
+    /// Evaluate an owned constant form through the native-transfer bridge.
+    HostEval(u16),
+    /// Read a function designator through the native-transfer bridge.
+    FunctionLookup(u32),
     /// Invoke a THROW with rooted tag and primary arguments; no normal result.
     TransferThrow,
     /// Establish/retire a dynamic CATCH binding in the owning activation.

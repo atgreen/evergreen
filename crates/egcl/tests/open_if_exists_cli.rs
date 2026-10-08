@@ -4,6 +4,67 @@
 use std::process::Command;
 
 #[test]
+fn probe_creates_missing_files_and_returns_closed_streams() {
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let root =
+            std::env::temp_dir().join(format!("egcl-open-probe-{}-{tier}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let program = r#"
+          (defun probe-mode (path mode)
+            (open path :direction :probe :if-does-not-exist mode))
+          (let ((path "enabled.txt"))
+            (let ((stream (probe-mode path :create)))
+              (assert (streamp stream))
+              (assert (not (open-stream-p stream))))
+            (assert (probe-file path))
+            (with-open-file (stream path :direction :output :if-exists :supersede)
+              (write-string "keep" stream))
+            (dolist (mode '(:create :error nil))
+              (let ((stream (probe-mode path mode)))
+                (assert (streamp stream))
+                (assert (not (open-stream-p stream)))))
+            (with-open-file (stream path :direction :probe)
+              (assert (streamp stream))
+              (assert (not (open-stream-p stream))))
+            (let ((stream (funcall #'open path :direction :probe)))
+              (assert (not (open-stream-p stream))))
+            (with-open-file (stream path)
+              (assert (string= (read-line stream) "keep"))))
+          (assert (null (open "missing.txt" :direction :probe)))
+          (assert (null (probe-mode "missing.txt" nil)))
+          (assert (handler-case (progn (probe-mode "missing.txt" :error) nil)
+                    (file-error () t)))
+          (assert (not (probe-file "missing.txt")))
+          (assert (handler-case (progn (probe-mode "no-parent/leaf.txt" :create) nil)
+                    (file-error () t)))
+          (with-open-file (stream "input.txt" :direction :input :if-does-not-exist :create)
+            (assert (open-stream-p stream))
+            (assert (eq :eof (read-char stream nil :eof))))
+          (assert (probe-file "input.txt"))
+          (assert (null (open "missing.txt" :if-does-not-exist nil)))
+          (assert (handler-case (progn (open "missing.txt") nil) (file-error () t)))
+          (write-line "PROBE-CREATE-PASS")
+        "#;
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .current_dir(&root)
+            .args(["--no-init", "--eval", program])
+            .env("EGCL_FORCE_TIER", tier)
+            .env_remove("EGCL_BACKEND")
+            .env_remove("EGCL_DISABLE_T2")
+            .output()
+            .expect("run OPEN probe checks");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
+        assert!(
+            stdout.contains("PROBE-CREATE-PASS"),
+            "{tier}: {stdout}\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn evaluated_if_exists_modes_preserve_file_contents_across_tiers() {
     for tier in ["interp", "t0", "t1", "t2"] {
         let path =

@@ -3,6 +3,76 @@
 
 use std::process::Command;
 
+fn check_type_names(tier: &str) {
+    let program = r#"
+      (defpackage :type-home-a (:use :cl))
+      (defpackage :type-home-b (:use :cl))
+      (in-package :type-home-a)
+      (defstruct digest state)
+      (defclass widget () ())
+      (define-condition trouble (error) ())
+      (in-package :type-home-b)
+      (defstruct digest state)
+      (defclass widget () ())
+      (define-condition trouble (error) ())
+      (in-package :cl-user)
+      (defun object-type-name (object) (type-of object))
+      (let ((objects (list (type-home-a::make-digest)
+                           (type-home-b::make-digest)
+                           (make-instance 'type-home-a::widget)
+                           (make-instance 'type-home-b::widget)
+                           (make-condition 'type-home-a::trouble)
+                           (make-condition 'type-home-b::trouble)))
+            (names '(type-home-a::digest type-home-b::digest
+                     type-home-a::widget type-home-b::widget
+                     type-home-a::trouble type-home-b::trouble)))
+        (loop for object in objects for name in names do
+          (assert (eq (object-type-name object) name))
+          (assert (eq (funcall #'type-of object) name))
+          (assert (eq (eval (list 'type-of (list 'quote object))) name))
+          (assert (eq (class-name (class-of object)) name))))
+      (disassemble #'object-type-name)
+      (format t "TYPE-NAME-PACKAGES-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env("EGCL_FORCE_TIER", tier)
+        .args(["--no-init", "--eval", program])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
+    assert!(stdout.contains("TYPE-NAME-PACKAGES-OK"), "{stdout}");
+    if tier != "interp" {
+        assert!(
+            stdout.contains(&format!("; {}", tier.to_uppercase())),
+            "requested {tier} was not installed: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn type_of_preserves_defining_symbols_interpreted() {
+    check_type_names("interp");
+}
+
+#[test]
+fn type_of_preserves_defining_symbols_t0() {
+    check_type_names("t0");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn type_of_preserves_defining_symbols_t1() {
+    check_type_names("t1");
+}
+
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn type_of_preserves_defining_symbols_t2() {
+    check_type_names("t2");
+}
+
 #[test]
 fn class_names_do_not_make_strings_or_symbols_instances() {
     let program = r#"
