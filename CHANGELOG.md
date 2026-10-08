@@ -13,6 +13,84 @@
   operations and constant shifts, GC-safe runtime calls, polled loops, live
   T1-to-T2 OSR and precise deoptimization
   ([#112](https://github.com/atgreen/evergreen/pull/112)).
+- An inline s390x deoptimization now resumes on its owned Lisp frame when
+  available, preserving original arguments without duplicating the function in
+  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
+
+- s390x T2 functions now save and restore only the callee-saved registers they
+  use, reducing native call overhead
+  ([#115](https://github.com/atgreen/evergreen/pull/115)).
+
+- s390x T2 code uses shorter native instruction sequences for small constants
+  and fixnum tag checks
+  ([#113](https://github.com/atgreen/evergreen/pull/113)).
+
+- s390x T2 compilation diagnostics now report the actual register entry offset
+  used by direct recursive calls
+  ([#101](https://github.com/atgreen/evergreen/pull/101)).
+
+- On s390x, T2 now compiles additional type predicates and names unsupported
+  opcodes in compilation diagnostics
+  ([#91](https://github.com/atgreen/evergreen/pull/91)).
+
+- On s390x, T1 native code now calls other native functions directly, pushing
+  the callee frame inline instead of dispatching through the generic adapter.
+  With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
+  to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
+
+- On s390x, T2 native code calls other native functions directly as well,
+  with the callees resolved when the compile is queued. With T2 on, on a z17:
+  takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
+  ([#97](https://github.com/atgreen/evergreen/pull/97)).
+
+- On s390x, T2 now compiles uncommon traps and the simple-string fast paths
+  (`STRINGP`, `LENGTH`, ASCII `CHAR`), so shapes such as UIOP's `FIRST-CHAR`
+  and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
+  line of every s390x structural decline
+  ([#99](https://github.com/atgreen/evergreen/pull/99)).
+
+- On s390x, a T2 deoptimization now resumes the interpreter in place, so a
+  guard failing deep inside a directly recursive call returns the right value:
+  `(pow2 70)` answers 2^70 instead of signalling TYPE-ERROR. A self-call with
+  the wrong number of arguments now signals PROGRAM-ERROR at T2 on every
+  target instead of binding whatever the argument registers held
+  ([#107](https://github.com/atgreen/evergreen/pull/107)).
+
+- On s390x, native code now calls T2 functions that may deoptimize directly
+  instead of through the generic adapter, since such a callee resumes the
+  interpreter in place and returns a finished value: div2 327 to 239 ms on a
+  z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
+
+- On s390x, a self-recursive T2 function keeps its direct self-call entry
+  when its body also calls other functions, as long as no heap value is live
+  across a call; such functions no longer pay the generic adapter on every
+  recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
+
+- On s390x, `EGCL-EXT:MEMORY-BARRIER`, `LOAD-BARRIER` and `STORE-BARRIER` now
+  compile to a native serialization instruction at every tier instead of a
+  generic call, and functions using them persist to bfasl as on x86-64
+  ([#118](https://github.com/atgreen/evergreen/pull/118)).
+
+- On s390x, functions that create closures (any LAMBDA in the body) now
+  compile at T1 instead of staying interpreted, including loops that create a
+  closure per iteration and factories whose parameters are captured
+  ([#126](https://github.com/atgreen/evergreen/pull/126)).
+
+- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
+  check instead of calling the numeric runtime for every `*`, deoptimizing to
+  the interpreter for a bignum product or a non-fixnum operand
+  ([#127](https://github.com/atgreen/evergreen/pull/127)).
+- On s390x, eligible self-recursive functions now call their T2 native entry
+  directly, reducing recursive-call overhead while retaining stack-limit
+  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
+
+- T2 now propagates fixnum guards through tail-call loop parameters and
+  recursive results, allowing functions such as `TAK` to use direct native
+  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
+
+- On s390x, native code now calls eligible leaf builtins through cached
+  builtin slots instead of resolving each call by name, while retaining
+  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
 
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh

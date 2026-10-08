@@ -574,7 +574,7 @@ fn directory_does_not_enter_unmatched_literal_subtrees() {
     std::fs::create_dir_all(matching.parent().unwrap()).unwrap();
     std::fs::create_dir(&unrelated).unwrap();
     std::fs::write(&matching, "fixture").unwrap();
-    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o0)).unwrap();
     let permission_denied = std::fs::read_dir(&unrelated).is_err();
     let result = directory(make_string_val(&format!(
         "{}/*/child/distinfo.txt",
