@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Managed callback roots, runtime transitions, and errors contained inside C.
-#![cfg(all(target_arch = "x86_64", any(unix, windows)))]
+#![cfg(any(
+    all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix)
+))]
 use egcl_rt::ffi::{
     AlienType, ffi_call,
     managed_callback::{LispCallback, set_callback_runner},
@@ -344,12 +347,67 @@ fn first_callback_trace_survives_a_later_callback_collection() {
     callback_trace_survives_collection(false);
 }
 
+// Buffered (aggregate-capable) calls exist only on x86-64; the scalar half above
+// runs on every target with callbacks.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 #[test]
 fn buffered_callback_trace_survives_a_later_callback_collection() {
     if run_isolated("buffered_callback_trace_survives_a_later_callback_collection") {
         return;
     }
     callback_trace_survives_collection(true);
+}
+
+/// `target(callback)` through the scalar path, or through the buffered path
+/// where it exists.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+unsafe fn invoke_through_c(
+    buffered: bool,
+    target: *const (),
+    pointer: *const (),
+) -> Result<u64, EgclError> {
+    let pointer_type = AlienType::Pointer(Box::new(AlienType::Void));
+    if buffered {
+        let mut result = 0.0_f64;
+        unsafe {
+            egcl_rt::ffi::ffi_call_buffered(
+                target,
+                &AlienType::Double,
+                &[pointer_type],
+                &[(&pointer as *const *const ()).cast()],
+                (&mut result as *mut f64).cast(),
+                None,
+            )
+        }
+        .map(|()| result.to_bits())
+    } else {
+        unsafe {
+            ffi_call(
+                target,
+                &AlienType::Double,
+                &[pointer_type],
+                &[pointer as usize as u64],
+            )
+        }
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", any(unix, windows))))]
+unsafe fn invoke_through_c(
+    buffered: bool,
+    target: *const (),
+    pointer: *const (),
+) -> Result<u64, EgclError> {
+    assert!(!buffered, "buffered calls are x86-64 only");
+    let pointer_type = AlienType::Pointer(Box::new(AlienType::Void));
+    unsafe {
+        ffi_call(
+            target,
+            &AlienType::Double,
+            &[pointer_type],
+            &[pointer as usize as u64],
+        )
+    }
 }
 
 fn callback_trace_survives_collection(buffered: bool) {
@@ -385,29 +443,9 @@ fn callback_trace_survives_collection(buffered: bool) {
     )
     .unwrap();
     egcl_rt::rooted!(
-        error = unsafe {
-            if buffered {
-                let pointer = callback.as_fn_ptr();
-                let mut result = 0.0_f64;
-                egcl_rt::ffi::ffi_call_buffered(
-                    invoke_twice as *const (),
-                    &AlienType::Double,
-                    &[AlienType::Pointer(Box::new(AlienType::Void))],
-                    &[(&pointer as *const *const ()).cast()],
-                    (&mut result as *mut f64).cast(),
-                    None,
-                )
-                .map(|()| result.to_bits())
-            } else {
-                ffi_call(
-                    invoke_twice as *const (),
-                    &AlienType::Double,
-                    &[AlienType::Pointer(Box::new(AlienType::Void))],
-                    &[callback.as_fn_ptr() as usize as u64],
-                )
-            }
-        }
-        .unwrap_err()
+        error =
+            unsafe { invoke_through_c(buffered, invoke_twice as *const (), callback.as_fn_ptr()) }
+                .unwrap_err()
     );
     assert_eq!(
         RETURNED.load(Ordering::SeqCst),

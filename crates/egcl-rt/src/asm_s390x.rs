@@ -106,6 +106,35 @@ impl Asm {
             .extend_from_slice(&[0xeb, dst << 4 | src, 0, bits, 0, 0x0a]);
     }
 
+    /// SRLG: a 64-bit logical right shift by a constant.
+    pub fn shift_right_logical(&mut self, dst: u8, src: u8, bits: u8) {
+        assert!(dst < 16 && src < 16 && bits < 64);
+        self.code
+            .extend_from_slice(&[0xeb, dst << 4 | src, 0, bits, 0, 0x0c]);
+    }
+
+    /// LLGCR, LLGHR or LLGFR: zero-extend the low `bits` of `src` into `dst`.
+    pub fn zero_extend(&mut self, dst: u8, src: u8, bits: u8) {
+        let opcode = match bits {
+            8 => 0xb984,
+            16 => 0xb985,
+            32 => 0xb916,
+            _ => panic!("no zero extension from {bits} bits"),
+        };
+        self.rre(opcode, dst, src);
+    }
+
+    /// LGBR, LGHR or LGFR: sign-extend the low `bits` of `src` into `dst`.
+    pub fn sign_extend(&mut self, dst: u8, src: u8, bits: u8) {
+        let opcode = match bits {
+            8 => 0xb906,
+            16 => 0xb907,
+            32 => 0xb914,
+            _ => panic!("no sign extension from {bits} bits"),
+        };
+        self.rre(opcode, dst, src);
+    }
+
     /// SLLG: a 64-bit logical left shift by a constant, like
     /// [`Self::shift_right_signed`] with the SRAG opcode byte swapped for SLLG's.
     pub fn shift_left(&mut self, dst: u8, src: u8, bits: u8) {
@@ -451,6 +480,30 @@ mod tests {
         let mut a = Asm::new();
         a.store_u16(1, 2, -2);
         assert_eq!(a.finish().unwrap(), [0xe3, 0x10, 0x2f, 0xfe, 0xff, 0x70]);
+    }
+
+    #[test]
+    fn extension_and_logical_shift_encodings_match_llvm_systemz() {
+        // llvm-mc: llgcr %r1,%r1 => b9 84 00 11; llghr => b9 85 00 11;
+        //          llgfr => b9 16 00 11; lgbr %r2,%r2 => b9 06 00 22;
+        //          lghr => b9 07 00 22; lgfr => b9 14 00 22;
+        //          srlg %r1,%r1,32 => eb 11 00 20 00 0c
+        let mut a = Asm::new();
+        a.zero_extend(1, 1, 8);
+        a.zero_extend(1, 1, 16);
+        a.zero_extend(1, 1, 32);
+        a.sign_extend(2, 2, 8);
+        a.sign_extend(2, 2, 16);
+        a.sign_extend(2, 2, 32);
+        a.shift_right_logical(1, 1, 32);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xb9, 0x84, 0x00, 0x11, 0xb9, 0x85, 0x00, 0x11, 0xb9, 0x16, 0x00, 0x11, 0xb9, 0x06,
+                0x00, 0x22, 0xb9, 0x07, 0x00, 0x22, 0xb9, 0x14, 0x00, 0x22, 0xeb, 0x11, 0x00, 0x20,
+                0x00, 0x0c
+            ]
+        );
     }
 
     #[test]

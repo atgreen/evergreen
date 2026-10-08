@@ -3,7 +3,10 @@
 
 //! Per R2.12, Lisp closures are callable through generated C entries, with
 //! contained exits and native-thread admission. Per R8.01, sandbox denies entry.
-#![cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#![cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(target_arch = "s390x", target_os = "linux")
+))]
 use std::process::Command;
 
 #[test]
@@ -336,8 +339,7 @@ fn callbacks_preserve_dynamic_bindings_and_contain_lexical_exits() {
 #[cfg(unix)]
 #[test]
 fn foreign_created_thread_can_invoke_a_retained_lisp_closure() {
-    let dir =
-        std::env::temp_dir().join(format!("egcl-callback-thread-cli-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("egcl-callback-thread-cli-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("callback.c");
     let library = dir.join("callback.so");

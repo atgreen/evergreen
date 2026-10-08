@@ -188,7 +188,7 @@ signal an FFI error. `callback-error` consumes saved diagnostic text, including
 errors recorded on a foreign thread. Callback support must be checked for the
 target architecture separately from scalar foreign calls.
 
-On an x86-64 runtime with callback support, a callback can be exercised through
+On a runtime with callback support (x86-64 and s390x), a callback can be exercised through
 the same call interface before giving it to a C library:
 
 ```lisp
