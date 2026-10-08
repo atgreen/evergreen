@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- T2 deopt frame states name only the locals the interpreter can still read.
+  A `LET*` chain inside a loop no longer keeps every binding alive to the end
+  of the function, so its arithmetic stays in registers and the loop
+  back-edge carries only the loop variables
+  ([#103](https://github.com/atgreen/evergreen/pull/103)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
