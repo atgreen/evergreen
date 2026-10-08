@@ -804,6 +804,30 @@ pub struct RootSyncSite {
     pub spill_roots: u16,
 }
 
+/// A native callee a T2 `Call` site may enter directly, resolved by the
+/// runtime on the execution thread before the compile job is queued
+/// (bliss-6j6pk). Plain data: the compile runs on a worker that cannot see
+/// the thread-local native registry, so everything the emitted code needs is
+/// baked here, and `generation` is the direct-call generation captured before
+/// the lookup so a concurrent redefinition can only make the baked guard
+/// fail, never pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectNativeTarget {
+    pub symbol: u32,
+    pub nargs: u16,
+    /// The callee's native entry, `fn(slots, egcl_stack)`.
+    pub entry: u64,
+    /// The callee's `CodeInfo` pointer, stored in the pushed frame header.
+    pub code_info: u64,
+    /// The callee's activation size in tagged words.
+    pub num_slots: u16,
+    pub generation: u64,
+    /// Address of the runtime's direct-call generation word.
+    pub generation_addr: u64,
+    /// The frame-header flag word for an ordinary call frame.
+    pub frame_flags: u32,
+}
+
 /// The branch condition a fixnum comparison opcode is true under. `None` for
 /// non-fixnum-comparison opcodes (float comparisons aren't fused yet).
 fn fixnum_cmp_cc(op: crate::t2::ir::Opcode) -> Option<Cc> {
@@ -1352,7 +1376,11 @@ fn emit_call_arg_moves(a: &mut Asm, mut pending: Vec<(u8, ArgMoveSrc)>) -> Resul
 /// resolver from (symbol, argument count) to a table slot, and a reader for the
 /// invalidation generation the call site bakes.
 pub struct DirectBuiltinHooks {
+    /// The register-argument adapter (x86-64's convention).
     pub addr: u64,
+    /// The slice-argument adapter, for emitters that pass arguments through
+    /// the activation's contiguous argument area (s390x).
+    pub slice_addr: u64,
     pub resolve: fn(u32, usize) -> Option<u32>,
     pub generation: fn() -> u64,
 }
@@ -1360,6 +1388,18 @@ pub struct DirectBuiltinHooks {
 static DIRECT_BUILTIN: std::sync::OnceLock<DirectBuiltinHooks> = std::sync::OnceLock::new();
 
 /// Install the direct-builtin hooks. Idempotent; later calls are ignored.
+/// The rooting variant of the slice call adapter (see
+/// `emit_s390x::RuntimeCalls::call_slice_rooted`), installed by the runtime.
+static CALL_SLICE_ROOTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn install_call_slice_rooted(addr: u64) {
+    let _ = CALL_SLICE_ROOTED.set(addr);
+}
+
+fn call_slice_rooted_addr() -> u64 {
+    CALL_SLICE_ROOTED.get().copied().unwrap_or(0)
+}
+
 pub fn install_direct_builtin_hooks(hooks: DirectBuiltinHooks) {
     let _ = DIRECT_BUILTIN.set(hooks);
 }
@@ -1371,6 +1411,17 @@ fn direct_builtin_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
     let hooks = DIRECT_BUILTIN.get()?;
     let slot = (hooks.resolve)(sym, nargs)?;
     Some((hooks.addr, slot, (hooks.generation)()))
+}
+
+/// [`direct_builtin_for`] for an emitter that passes the arguments as a slice:
+/// `(slice adapter address, table slot, generation to bake)`.
+pub(super) fn direct_builtin_slice_for(sym: u32, nargs: usize) -> Option<(u64, u32, u64)> {
+    let hooks = DIRECT_BUILTIN.get()?;
+    if hooks.slice_addr == 0 {
+        return None;
+    }
+    let slot = (hooks.resolve)(sym, nargs)?;
+    Some((hooks.slice_addr, slot, (hooks.generation)()))
 }
 
 /// Emit a `Call` through the interpreter adapter. Up to three arguments use the
@@ -1394,6 +1445,7 @@ fn emit_call(
     call_arg_base: u16,
     self_sym: Option<u32>,
     self_entry: Option<egcl_rt::asm::Label>,
+    self_arity: usize,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1425,7 +1477,11 @@ fn emit_call(
         // Wider calls need an activation-backed argument slice, including on
         // the stack-limit path; they cannot use this register-only entry.
         const C2I_ARGS_SELF: [u8; 3] = [2, 1, 8];
-        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() {
+        // A self-call with the wrong argument count must reach c2i, which
+        // raises PROGRAM-ERROR; the register entry would bind whatever is in
+        // the argument registers (bliss-w6aki).
+        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() && nargs == self_arity
+        {
             // Stack guard. The direct call below takes a REAL C frame and does
             // not reach c2i_call_args, so it never sees native_depth_cap() —
             // and the T2 prologue has no guard of its own. Unbounded, a deeply
@@ -2708,19 +2764,66 @@ pub fn emit_framed_with_activation_slots(
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    emit_framed_with_direct_natives(
+        f,
+        c2i_deopt_addr,
+        c2i_deopt_t2_addr,
+        c2i_call_addr,
+        c2i_call_slice_addr,
+        c2i_load_global_addr,
+        c2i_load_function_addr,
+        c2i_store_global_addr,
+        c2i_mv_addr,
+        c2i_recovery_toggle_addr,
+        c2i_transfer_pending_addr,
+        c2i_poll_addr,
+        activation_slots,
+        self_sym,
+        &[],
+        0,
+    )
+}
+
+/// [`emit_framed_with_activation_slots`] plus the native callees the runtime
+/// resolved for this function's call sites. The s390x emitter enters a listed
+/// callee directly (bliss-6j6pk); the other emitters ignore the list.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_with_direct_natives(
+    f: &Function,
+    c2i_deopt_addr: u64,
+    c2i_deopt_t2_addr: u64,
+    c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
+    c2i_load_global_addr: u64,
+    c2i_load_function_addr: u64,
+    c2i_store_global_addr: u64,
+    c2i_mv_addr: u64,
+    c2i_recovery_toggle_addr: u64,
+    c2i_transfer_pending_addr: u64,
+    c2i_poll_addr: u64,
+    activation_slots: u16,
+    self_sym: Option<u32>,
+    direct_natives: &[DirectNativeTarget],
+    code_id: u64,
+) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
             f,
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_a64::RuntimeCalls {
+                deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
+                call_slice_rooted: 0,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
+                self_sym: None,
+                direct_natives: Vec::new(),
+                code_id: 0,
             },
         );
     }
@@ -2730,6 +2833,27 @@ pub fn emit_framed_with_activation_slots(
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_ppc64le::RuntimeCalls {
+                deopt: c2i_deopt_addr,
+                call_slice: c2i_call_slice_addr,
+                call_slice_rooted: 0,
+                load_global: c2i_load_global_addr,
+                load_function: c2i_load_function_addr,
+                store_global: c2i_store_global_addr,
+                multiple_values: c2i_mv_addr,
+                transfer_pending: c2i_transfer_pending_addr,
+                poll: c2i_poll_addr,
+                self_sym: None,
+                direct_natives: Vec::new(),
+                code_id: 0,
+            },
+        );
+    }
+    if cfg!(target_arch = "riscv64") {
+        return super::emit_riscv64::emit_framed_with_runtime(
+            f,
+            c2i_deopt_t2_addr,
+            activation_slots,
+            super::emit_riscv64::RuntimeCalls {
                 call_slice: c2i_call_slice_addr,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
@@ -2746,13 +2870,18 @@ pub fn emit_framed_with_activation_slots(
             c2i_deopt_t2_addr,
             activation_slots,
             super::emit_s390x::RuntimeCalls {
+                deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
+                call_slice_rooted: call_slice_rooted_addr(),
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
+                self_sym,
+                direct_natives: direct_natives.to_vec(),
+                code_id,
             },
         );
     }
@@ -4457,6 +4586,7 @@ fn emit_framed_inner(
                     root_shadow_slots,
                     self_sym,
                     self_entry,
+                    f.block(entry).params.len(),
                 )?;
             } else if d.opcode == Opcode::MemoryFence {
                 match d.aux {
@@ -5187,7 +5317,10 @@ fn emit_framed_inner(
     })
 }
 
-fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
+/// The `UnsupportedOp` payload that names an opcode: the T2 log decodes the
+/// 0x1000 bit as "refused Opcode #N in t2/ir.rs" (bliss-8b236f61). Shared with
+/// the other emitters so their declines are greppable the same way.
+pub(super) fn op_tag(op: crate::t2::ir::Opcode) -> u32 {
     op as u32 | 0x1000
 }
 

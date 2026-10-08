@@ -67,4 +67,5 @@ cffi
 iolib
 slime@egcl
 sly@egcl
+quicklisp-client@egcl
 EOF

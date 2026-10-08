@@ -5,3 +5,5 @@ repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
     grep -Fx 'ocicl install git+https://github.com/atgreen/usocket@egcl-support'
 "$repo/scripts/install-egcl-forks" --dry-run |
     grep -Fx 'ocicl install git+https://github.com/atgreen/atomics@egcl'
+"$repo/scripts/install-egcl-forks" --dry-run |
+    grep -Fx 'ocicl install git+https://github.com/atgreen/quicklisp-client@egcl'
