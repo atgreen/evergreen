@@ -218,6 +218,7 @@ fn global_safepoint_page() -> &'static SafepointPage {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 pub(crate) struct ForeignStateScope {
@@ -230,6 +231,7 @@ pub(crate) struct ForeignStateScope {
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 impl ForeignStateScope {
@@ -319,6 +321,7 @@ pub(crate) fn transition_native_state(
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 ))]
 impl Drop for ForeignStateScope {
