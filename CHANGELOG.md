@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
+  that computes on x86-64 computes there too: `(deep 50000)` no longer signals
+  `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
