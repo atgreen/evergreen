@@ -12,7 +12,7 @@
   guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
   operations and constant shifts, GC-safe runtime calls, polled loops, live
   T1-to-T2 OSR and precise deoptimization
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#112](https://github.com/atgreen/evergreen/pull/112)).
 
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
