@@ -2848,6 +2848,22 @@ pub fn emit_framed_with_direct_natives(
             },
         );
     }
+    if cfg!(target_arch = "riscv64") {
+        return super::emit_riscv64::emit_framed_with_runtime(
+            f,
+            c2i_deopt_t2_addr,
+            activation_slots,
+            super::emit_riscv64::RuntimeCalls {
+                call_slice: c2i_call_slice_addr,
+                load_global: c2i_load_global_addr,
+                load_function: c2i_load_function_addr,
+                store_global: c2i_store_global_addr,
+                multiple_values: c2i_mv_addr,
+                transfer_pending: c2i_transfer_pending_addr,
+                poll: c2i_poll_addr,
+            },
+        );
+    }
     if cfg!(target_arch = "s390x") {
         return super::emit_s390x::emit_framed_with_runtime(
             f,

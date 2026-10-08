@@ -6,10 +6,12 @@
 
 Run natively on RV64 hardware (or under qemu-riscv64), passing the binary or
 QEMU command after --. The tier assertions are essential: correct bytecode
-fallback is not a JIT pass. The T2 sections of scripts/s390x-jit-smoke.py are
-deliberately absent: riscv64 has no optimizing emitter yet (bliss-miro8.3).
+fallback is not a JIT pass. The T2 sections mirror scripts/s390x-jit-smoke.py: they require actual
+tier-2 installation and compare guard exits, calls, OSR and polls with T0.
 """
 import os
+import selectors
+import time
 from pathlib import Path
 import struct
 import subprocess
@@ -148,6 +150,226 @@ def main():
             at += size
         assert found, "no code-load record for JIT-DIAGNOSTICS"
     print("riscv64: native listings and perf jitdump identify RISC-V", flush=True)
+
+    optimized = r"""
+      (defun jit-t2-add (x) (+ x 1))
+      (defun jit-t2-branch (x) (if (< x 0) (- x 1) (+ x 1)))
+      (defun jit-t2-neg (x) (- x))
+      (defun jit-t2-literal (x) (if (< x 0) '(constant negative) '(constant positive)))
+      (jit-t2-add 10) (jit-t2-add 11)
+      (jit-t2-branch -2) (jit-t2-branch 2)
+      (jit-t2-neg 1) (jit-t2-literal 1)
+      (format t "~S~%" (list (jit-t2-add 41) (jit-t2-branch -5) (jit-t2-branch 5)
+                             (jit-t2-neg -4) (jit-t2-literal -1) (jit-t2-literal 1)))
+    """
+    tiers = r"""
+      (if (= (egcl-ext:function-tier 'jit-t2-add) 2) nil (error "ADD missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-branch) 2) nil (error "BRANCH missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-neg) 2) nil (error "NEG missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-literal) 2) nil (error "LITERAL missed T2"))
+    """
+    traps = r"""
+      (format t "~S~%" (jit-t2-add 1152921504606846975))
+      (format t "~S~%" (jit-t2-branch 1.5))
+      (format t "~S~%" (jit-t2-neg -1152921504606846976))
+    """
+    reference = run(optimized + traps, EGCL_FORCE_TIER="t0")
+    native = run(optimized + tiers + traps, EGCL_FORCE_TIER="t2")
+    stressed = run(optimized + tiers + traps, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("riscv64: optimized T2 arithmetic, branches and guard exits match T0", flush=True)
+
+    numeric = r"""
+      (defun jit-t2-mul (a b) (* a b))
+      (defun jit-t2-fadd (a b) (+ a b))
+      (defun jit-t2-fsub (a b) (- a b))
+      (defun jit-t2-fmul (a b) (* a b))
+      (defun jit-t2-fscale (a) (* a 2))
+      (jit-t2-mul 3 7) (jit-t2-mul 4 -8)
+      (jit-t2-fadd 1.5 2.25) (jit-t2-fadd 2.5 -1.25)
+      (jit-t2-fsub 1.5 2.25) (jit-t2-fsub 2.5 -1.25)
+      (jit-t2-fmul 1.5 2.25) (jit-t2-fmul 2.5 -1.25)
+      (jit-t2-fscale 1.5) (jit-t2-fscale 2.5)
+      (format t "~S~%" (list (jit-t2-mul -123456789 123456789)
+                             (jit-t2-mul -1152921504606846976 1)
+                             (jit-t2-fadd 1.5 2.25) (jit-t2-fsub 1.5 2.25)
+                             (jit-t2-fmul -0.0 2.5) (jit-t2-fscale 3.25)))
+    """
+    numeric_tiers = "\n".join(
+        f"(if (= (egcl-ext:function-tier '{name}) 2) nil (error \"{name} missed T2\"))"
+        for name in ["jit-t2-mul", "jit-t2-fadd", "jit-t2-fsub", "jit-t2-fmul", "jit-t2-fscale"]
+    )
+    numeric_traps = r"""
+      (format t "~S~%" (list (jit-t2-mul 1152921504606846975 2)
+                             (jit-t2-mul -1152921504606846976 -1)
+                             (jit-t2-mul 1.5 2.0)
+                             (jit-t2-fadd 1.0d0 2.0d0)
+                             (jit-t2-fsub 9 3) (jit-t2-fmul 4 5)))
+    """
+    reference = run(numeric + numeric_traps, EGCL_FORCE_TIER="t0")
+    native = run(numeric + numeric_tiers + numeric_traps, EGCL_FORCE_TIER="t2")
+    stressed = run(numeric + numeric_tiers + numeric_traps, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("riscv64: T2 multiplication and single-float arithmetic match T0 through guard exits", flush=True)
+
+    calls = r"""
+      (defun jit-t2-roots (x)
+        (let ((a (list x x)))
+          (list a (list x) a x)))
+      (defun jit-t2-wide (a b c d e f g h i j k l)
+        (list l k j i h g f e d c b a))
+      (defun jit-t2-spill-roots (x)
+        (let ((a (list x 1)) (b (list x 2)) (c (list x 3)) (d (list x 4))
+              (e (list x 5)) (f (list x 6)) (g (list x 7)) (h (list x 8))
+              (i (list x 9)) (j (list x 10)) (k (list x 11)) (l (list x 12)))
+          (list a b c d e f g h i j k l (list x) a b c d e f g h i j k l)))
+      (setq *jit-t2-effects* 0)
+      (defun jit-t2-effect (x)
+        (setq *jit-t2-effects* (1+ *jit-t2-effects*))
+        (+ x 1))
+      (defun jit-t2-error (x)
+        (length x)
+        (setq *jit-t2-effects* 999))
+      (defun jit-t2-values (x)
+        (multiple-value-bind (a b) (values (list x) (list x x))
+          (list a b x)))
+      (defun jit-t2-many-values (x)
+        (multiple-value-bind (a b c d e f g h i j k l) (values x 2 3 4 5 6 7 8 9 10 11 12)
+          (list a b c d e f g h i j k l)))
+      (defun jit-t2-target (x) (+ x 1))
+      (defun jit-t2-resolve (x) (funcall #'jit-t2-target x))
+      (defun jit-t2-nlx-helper (x) (if x (throw 'out (list x)) nil))
+      (defun jit-t2-nlx (fn x) (funcall fn x) (setq *jit-t2-effects* 999))
+      (jit-t2-roots '(warm root))
+      (jit-t2-wide 1 2 3 4 5 6 7 8 9 10 11 12)
+      (jit-t2-spill-roots '(warm root))
+      (jit-t2-values '(warm root))
+      (jit-t2-many-values '(warm root))
+      (format t "~S~%" (jit-t2-roots '(input root)))
+      (format t "~S~%" (jit-t2-wide 1 2 3 4 5 6 7 8 9 10 11 12))
+      (format t "~S~%" (jit-t2-spill-roots '(input root)))
+      (format t "~S~%" (jit-t2-values '(input root)))
+      (format t "~S~%" (jit-t2-many-values '(input root)))
+      (jit-t2-effect 1) (jit-t2-effect 2)
+      (jit-t2-error '(valid input)) (jit-t2-error '(valid input))
+      (jit-t2-resolve 1) (jit-t2-resolve 2)
+      (jit-t2-nlx #'jit-t2-nlx-helper nil) (jit-t2-nlx #'jit-t2-nlx-helper nil)
+      (setq *jit-t2-effects* 0)
+    """
+    call_tiers = r"""
+      (if (= (egcl-ext:function-tier 'jit-t2-roots) 2) nil (error "ROOTS missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-wide) 2) nil (error "WIDE missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-spill-roots) 2) nil (error "SPILL-ROOTS missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-values) 2) nil (error "VALUES missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-many-values) 2) nil (error "MANY-VALUES missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-effect) 2) nil (error "EFFECT missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-error) 2) nil (error "ERROR missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-resolve) 2) nil (error "RESOLVE missed T2"))
+      (if (= (egcl-ext:function-tier 'jit-t2-nlx) 2) nil (error "NLX missed T2"))
+    """
+    effects = r"""
+      (format t "~S~%" (jit-t2-effect 1152921504606846975))
+      (format t "~S~%" *jit-t2-effects*)
+      (handler-case (jit-t2-error 17) (type-error () (format t "T2-ERROR-CAUGHT~%")))
+      (format t "~S~%" *jit-t2-effects*)
+      (format t "~S~%" (catch 'out (jit-t2-nlx #'jit-t2-nlx-helper 23)))
+      (format t "~S~%" *jit-t2-effects*)
+      (defun jit-t2-target (x) (+ x 10))
+      (format t "~S~%" (jit-t2-resolve 5))
+    """
+    reference = run(calls + effects, EGCL_FORCE_TIER="t0")
+    native = run(calls + call_tiers + effects, EGCL_FORCE_TIER="t2")
+    stressed = run(calls + call_tiers + effects, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("riscv64: T2 calls, live roots, multiple values and committed effects match T0", flush=True)
+
+    loops = r"""
+      (setq *jit-loop-effects* 0)
+      (defun jit-t2-loop (n initial x)
+        (setq *jit-loop-effects* (1+ *jit-loop-effects*))
+        (let ((i 0) (sum initial))
+          (block done (tagbody top
+            (if (>= i n) (return-from done (list sum x)))
+            (if (= i 100000) (setq x (list x)))
+            (setq sum (1+ sum)) (setq i (1+ i)) (go top)))))
+      (jit-t2-loop 0 0 '(live root))
+      (format t "~S~%" (jit-t2-loop 200000 1152921504606646985 '(live root)))
+      (format t "~S~%" *jit-loop-effects*)
+    """
+    loop_tiers = r"""
+      (if (= (egcl-ext:function-tier 'jit-t2-loop) 2) nil (error "LOOP missed T2"))
+      (if (> (egcl-ext:function-osr-count 'jit-t2-loop) 0) nil (error "LOOP missed live T2 OSR"))
+      (if (> (egcl-ext:deopt-count) 0) nil (error "LOOP missed overflow deopt"))
+    """
+    # Only loop heat can promote this activation. The overflowing increment
+    # occurs near its end, after the compiler has time to publish an OSR entry.
+    # One allocation halfway through also exercises GC in the grown frame.
+    settings = dict(EGCL_T0_T1_THRESHOLD="1", EGCL_T1_T2_INVOKE_THRESHOLD="1000000",
+                    EGCL_OSR_THRESHOLD="1000000")
+    reference = run(loops, EGCL_FORCE_TIER="t0")
+    native = run(loops + loop_tiers, **settings)
+    stressed = run(loops + loop_tiers, EGCL_GC_STRESS="1", EGCL_GC_POISON="1", **settings)
+    assert reference == native == stressed, (reference, native, stressed)
+    print("riscv64: live T1-to-T2 OSR, polling and late overflow preserve roots and effects", flush=True)
+
+    allocating_loop = r"""
+      (defun jit-t2-alloc-loop (n x)
+        (let ((i 0) (r x))
+          (block done (tagbody top
+            (if (>= i n) (return-from done (list i r x)))
+            (setq r (list x i)) (setq i (1+ i)) (go top)))))
+      (jit-t2-alloc-loop 0 '(root)) (jit-t2-alloc-loop 0 '(root))
+      (format t "~S~%" (jit-t2-alloc-loop 100 '(root)))
+    """
+    allocation_tier = "(if (= (egcl-ext:function-tier 'jit-t2-alloc-loop) 2) nil (error \"allocating loop missed T2\"))"
+    reference = run(allocating_loop, EGCL_FORCE_TIER="t0")
+    native = run(allocating_loop + allocation_tier, EGCL_FORCE_TIER="t2")
+    stressed = run(allocating_loop + allocation_tier, EGCL_FORCE_TIER="t2",
+                   EGCL_GC_STRESS="1", EGCL_GC_POISON="1")
+    assert reference == native == stressed, (reference, native, stressed)
+    print("riscv64: optimized allocating loops preserve moving-GC roots", flush=True)
+
+    spin = r"""
+      (defun jit-t2-spin (n)
+        (let ((i 0)) (block done (tagbody top
+          (if (= i n) (return-from done i))
+          (setq i (1+ i)) (go top)))))
+      (jit-t2-spin 0) (jit-t2-spin 0)
+      (if (= (egcl-ext:function-tier 'jit-t2-spin) 2) nil (error "SPIN missed T2"))
+      (format t "READY~%") (force-output)
+      (jit-t2-spin -1)
+      (format t "FELL-THROUGH~%")
+    """
+    # Slow allocating iterations can put sampled back-edge polls farther apart
+    # than the shutdown deadline. Runtime-call boundaries must poll too.
+    allocating_spin = spin.replace("(setq i (1+ i))", "(list i i) (setq i (1+ i))")
+    for name, source, stress in [
+        ("call-free", spin, {}),
+        ("allocating stress", allocating_spin, {"EGCL_GC_STRESS": "1", "EGCL_GC_POISON": "1"}),
+    ]:
+        env = dict(base, EGCL_FORCE_TIER="t2", EGCL_LAZY_COMPILE="0", **stress)
+        child = subprocess.Popen(command + ["--no-init", "--no-bootstrap", "--eval", source],
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            with selectors.DefaultSelector() as ready:
+                ready.register(child.stdout, selectors.EVENT_READ)
+                assert ready.select(timeout=30), "optimized spin did not become ready"
+                assert child.stdout.readline().strip() == "READY", "optimized spin failed before ready"
+            # Let it enter the native loop; shutdown must beat the runtime's 5s
+            # hard SIGTERM deadline, which alone would not prove cooperative polls.
+            time.sleep(0.1)
+            child.terminate()
+            output, errors = child.communicate(timeout=2)
+            assert child.returncode >= 0 and "FELL-THROUGH" not in output, (child.returncode, output, errors)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate()
+        print(f"riscv64: {name} T2 loop responds promptly to SIGTERM", flush=True)
+
 
 
 if __name__ == "__main__":
