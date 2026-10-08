@@ -962,6 +962,48 @@ pub fn emit_framed_with_runtime(
         roots.dedup();
         emitter.roots.insert(source, roots);
     }
+    // A sampled back-edge poll is a runtime call too, so it needs a root set; a
+    // loop whose poll had none was declined wholesale (bliss-83icg). Poll before
+    // the edge's parallel transfers: lowering represents those as anonymous
+    // moves ahead of the machine terminator, and their destination phi values do
+    // not exist yet in the emitted code. Mirrors the s390x emitter.
+    for (block_index, &block) in function.block_order().iter().enumerate() {
+        let Some(&source) = function.block(block).insts.last() else {
+            continue;
+        };
+        if !emitter.polls.contains(&source) {
+            continue;
+        }
+        let mb = &machine.blocks[block_index];
+        let mut boundary = mb.end;
+        while boundary > mb.start
+            && machine.insts[boundary - 1]
+                .source_inst
+                .is_none_or(|inst| inst == source)
+        {
+            boundary -= 1;
+        }
+        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let data = function.inst(source);
+        let mut roots: Vec<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .chain(data.args.iter().copied())
+            .chain(
+                data.targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
     emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
         .map_err(|_| unsupported())?;
     emitter.argument_slots = u16::try_from(
