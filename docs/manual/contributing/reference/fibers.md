@@ -201,7 +201,8 @@ The current Rust states are `Created`, `Runnable`, `Running`, `Suspended`,
 but does not replace synchronization. Joining removes the fiber's registry entry.
 
 `EGCL_STACK_SIZE` selects stack bytes (also accepting `k`, `m`, or `g` suffixes);
-the default is 512 KiB. `EGCL_TIME_SLICE_US` controls cooperative preemption:
+the default is 512 KiB (4 MiB on s390x, whose larger native frames spend the
+native stack reserve sooner). `EGCL_TIME_SLICE_US` controls cooperative preemption:
 carriers observe yield requests at runtime polls, not at arbitrary instructions.
 The explicit group API uses `SchedulerConfig::num_workers` for its carrier count.
 

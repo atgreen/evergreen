@@ -256,7 +256,7 @@ impl RuntimeConfig {
             .ok()
             .map(|s| parse_size(&s, "EGCL_STACK_SIZE"))
             .transpose()?
-            .unwrap_or(512 * 1024);
+            .unwrap_or(crate::thread::DEFAULT_STACK_SIZE);
         let num_workers = std::env::var("EGCL_WORKERS")
             .ok()
             .map(|s| parse_usize(&s, "EGCL_WORKERS"))
