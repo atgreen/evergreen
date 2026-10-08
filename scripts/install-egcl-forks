@@ -57,6 +57,7 @@ trivial-cltl2
 trivial-garbage
 trivial-backtrace
 bordeaux-threads
+atomics@egcl
 cl-fad
 usocket@egcl-support
 precise-time
@@ -66,4 +67,5 @@ cffi
 iolib
 slime@egcl
 sly@egcl
+quicklisp-client@egcl
 EOF

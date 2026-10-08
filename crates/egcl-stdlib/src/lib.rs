@@ -43,6 +43,7 @@ pub mod process;
 pub mod posix;
 pub mod streams;
 pub mod synchronization;
+pub mod threads;
 pub mod text_codec;
 
 // ── Sequences & hash tables ───────────────────────────────────────

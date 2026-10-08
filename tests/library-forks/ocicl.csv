@@ -28,6 +28,6 @@ named-readtables-test, ghcr.io/ocicl/named-readtables@sha256:9c467a5a6d7b4e928d4
 rt, ghcr.io/ocicl/rt@sha256:e3e71ac89d5dae840a65665b918a9ee40c3863b1efe2761469138bf9c7f4028a, rt-20240503-a6a7503/rt.asd
 trivial-features, git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f#ref=651e8ea90db0b143d39b9a414ee382ec62efad2f, trivial-features-651e8ea/trivial-features.asd
 trivial-features-tests, git+https://github.com/atgreen/trivial-features@651e8ea90db0b143d39b9a414ee382ec62efad2f#ref=651e8ea90db0b143d39b9a414ee382ec62efad2f, trivial-features-651e8ea/trivial-features-tests.asd
-trivial-gray-streams, git+https://github.com/atgreen/trivial-gray-streams@0554d306864d252985c23923ef872a1b177894a6#ref=0554d306864d252985c23923ef872a1b177894a6, trivial-gray-streams-0554d30/trivial-gray-streams.asd
-trivial-gray-streams-test, git+https://github.com/atgreen/trivial-gray-streams@0554d306864d252985c23923ef872a1b177894a6#ref=0554d306864d252985c23923ef872a1b177894a6, trivial-gray-streams-0554d30/trivial-gray-streams-test.asd
+trivial-gray-streams, git+https://github.com/atgreen/trivial-gray-streams@e3c675548a9d935fc40860349ed984687c75abe0#ref=e3c675548a9d935fc40860349ed984687c75abe0, trivial-gray-streams-e3c6755/trivial-gray-streams.asd
+trivial-gray-streams-test, git+https://github.com/atgreen/trivial-gray-streams@e3c675548a9d935fc40860349ed984687c75abe0#ref=e3c675548a9d935fc40860349ed984687c75abe0, trivial-gray-streams-e3c6755/trivial-gray-streams-test.asd
 uffi, ghcr.io/ocicl/cffi-grovel@sha256:7072c620dda3331a746259217bf03aec289e471699d1dce4fd38d94cd673c3c9, cffi-20260821-787d3cd/uffi-compat/uffi.asd

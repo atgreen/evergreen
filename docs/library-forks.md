@@ -22,12 +22,13 @@ exercises these forks:
 | Library | Fork | Tested revision |
 |---|---|---|
 | trivial-features | https://github.com/atgreen/trivial-features | `651e8ea90db0b143d39b9a414ee382ec62efad2f` |
-| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `0554d306864d252985c23923ef872a1b177894a6` |
-| usocket (binary TCP client subset) | https://github.com/atgreen/usocket | `fa0df448d5582c0d637afe3799cf53b28e1586c9` |
+| trivial-gray-streams | https://github.com/atgreen/trivial-gray-streams | `e3c675548a9d935fc40860349ed984687c75abe0` |
+| usocket (binary TCP client and server subset) | https://github.com/atgreen/usocket | `39c189d2c51317fbdfa6d6023a3369fdb329e61e` |
 | trivial-cltl2 | https://github.com/atgreen/trivial-cltl2 | `cf3253050711277e847a9dc445a45fa7170dc9cb` |
 | trivial-garbage | https://github.com/atgreen/trivial-garbage | `3c4f9c86d4d3454dcd4f8d19113b4101c3add032` |
 | trivial-backtrace | https://github.com/atgreen/trivial-backtrace | `650da10abfe4b44c70b58a431aec6d9fe7330406` |
 | bordeaux-threads | https://github.com/atgreen/bordeaux-threads | `2f736ed7ef61d1856f2c6a5aefde9a5ee7b3b66f` |
+| atomics (CAS operations) | https://github.com/atgreen/atomics | `738ddccd7a6f3c44e83335ac5e3615e76972dfd2` |
 | cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
 | closer-mop (slot inspection and callable instances) | https://github.com/atgreen/closer-mop | `e9f6d94ff7bb91768841339c87a89bf70b52b95f` |
@@ -36,10 +37,23 @@ exercises these forks:
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
 | swank (in the slime tree, branch `egcl`) | https://github.com/atgreen/slime | `69afcb088f6463850c532a2f573d9ec5d875fdb9` |
 | slynk (in the sly tree, branch `egcl`) | https://github.com/atgreen/sly | `e81f332eb458e33cd650f8601f655da58be18b98` — the EGCL backend, moved out of `lib/slynk/` |
+| Quicklisp client (native TCP and directory enumeration) | https://github.com/atgreen/quicklisp-client | `2115f1d96963bf48d6a4c5c7111189bd326bfbed` |
+
+The [Quicklisp client scenario](../tests/quicklisp-client/README.md) fetches this
+exact client through ocicl, checks its native connection and filesystem
+interfaces, installs a fresh local distribution with two dependent releases,
+and reloads them in a new process after the HTTP server stops. An optional
+public smoke test downloads Alexandria from the dated official distribution
+and verifies its source comes from the fresh Quicklisp home, not an inherited
+ASDF project. See the [Quicklisp setup instructions](manual/user/how-to/asdf.md#quicklisp).
+This needs the runtime fixes through PR #90; v0.0.3 alone is insufficient.
 
 The separate [native usocket scenario](../tests/usocket-fork/README.md) checks
-incremental loopback I/O through cold and cached loads. It requires the new
-EGCL client primitives and is not a claim of HTTPS support.
+incremental loopback I/O through cold and cached loads, cross-thread server
+accept/close, octet element-type aliases, listener options, and read-timeout
+expiry and recovery. It requires the native client primitives, shared listener
+support from PR #60, and typed I/O timeouts from PR #72. This is not
+a claim of HTTPS support or a complete USOCKET backend.
 
 The [Drakma scenario](../tests/drakma/README.md) checks plain HTTP GET and POST
 through USOCKET, Chunga, and Flexi Streams, including response text decoding.
@@ -78,7 +92,7 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-USOCKET (`egcl-support`), closer-mop, SLIME and SLY (`egcl`), where their ports
+USOCKET (`egcl-support`), Atomics, closer-mop, SLIME, SLY and the Quicklisp client (`egcl`), where their ports
 live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
@@ -146,6 +160,13 @@ that workaround into a published compatibility fork as though it were one.
 The [CL-FAD scenario](../tests/cl-fad/README.md) verifies native EGCL environment
 lookup and an optional UIOP fallback on otherwise unsupported implementations.
 Directory listing and recursive deletion still require an EGCL port.
+
+The [Atomics scenario](../tests/atomics-fork/README.md) exercises native CAS and
+`cl-cancel`'s CAS-dependent lazy atomic-state initialization. The adapter
+supports cons cells, simple vectors, symbol values/plists, structure slots, CLOS
+slots, and special variables, with Atomics' Boolean success result. This is a
+CAS port, not a claim that every Atomics operation is supported: its
+`ATOMIC-INCF`/`ATOMIC-DECF`, custom places, and memory references remain unsupported.
 
 The [trivial-backtrace scenario](../tests/trivial-backtrace/README.md) checks
 printed and structured backtraces, live condition capture, and output destinations
