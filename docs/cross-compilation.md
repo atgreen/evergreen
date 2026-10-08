@@ -7,6 +7,7 @@ EGCL's CLI can be built on x86-64 for these Linux targets:
 | AArch64 | `aarch64-unknown-linux-gnu` | `target/aarch64-unknown-linux-gnu/release/egcl` |
 | POWER little-endian | `powerpc64le-unknown-linux-gnu` | `target/powerpc64le-unknown-linux-gnu/release/egcl` |
 | IBM Z big-endian | `s390x-unknown-linux-gnu` | `target/s390x-unknown-linux-gnu/release/egcl` |
+| RISC-V RV64GC | `riscv64gc-unknown-linux-gnu` | `target/riscv64gc-unknown-linux-gnu/release/egcl` |
 | Android AArch64 | `aarch64-linux-android` | `target-android/aarch64-linux-android/debug/egcl` |
 
 These are dynamically linked glibc executables, suitable for Fedora. All three
@@ -37,9 +38,10 @@ architecture tags; do not move heap images between architectures.
 
 ## RISC-V (native build)
 
-RISC-V is built natively on RV64GC hardware rather than through `cross`; no
-cross-toolchain container image is wired up yet. On a Debian 13 riscv64 host
-with rustup's `riscv64gc-unknown-linux-gnu` toolchain:
+RISC-V is developed and validated natively on RV64GC hardware; the `cross`
+image above gives x86-64 developers and CI the same cross-build and QEMU smoke
+the other three architectures have. On a Debian 13 riscv64 host with rustup's
+`riscv64gc-unknown-linux-gnu` toolchain:
 
 ```sh
 rustup toolchain install 1.94.1 --profile minimal
@@ -84,7 +86,7 @@ Install Rust through rustup, Podman (or Docker), and `cross`:
 ```sh
 cargo install cross --version 0.2.5 --locked
 rustup toolchain install 1.94.1 --profile minimal
-rustup target add --toolchain 1.94.1 aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu s390x-unknown-linux-gnu
+rustup target add --toolchain 1.94.1 aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu s390x-unknown-linux-gnu riscv64gc-unknown-linux-gnu
 scripts/cross-port.sh build all
 ```
 
@@ -94,7 +96,8 @@ x86-64; no emulated compiler or full Fedora guest is needed. The script selects
 default x86-64 musl target. The default x86-64 build keeps its direct syscalls
 and static ELF loader.
 
-Use `aarch64`, `ppc64le`, or `s390x` instead of `all` to build one architecture.
+Use `aarch64`, `ppc64le`, `s390x`, or `riscv64` instead of `all` to build one
+architecture.
 Set `CROSS=/path/to/cross`, `CROSS_CONTAINER_ENGINE=docker`, `CARGO_BUILD_JOBS`,
 or `CARGO_TARGET_DIR` as needed. The script defaults to Rust 1.94.1 to match the
 tested baseline and prevent `cross` from updating the rolling stable toolchain.
@@ -103,8 +106,8 @@ container images.
 
 ## QEMU validation
 
-Install `qemu-aarch64`, `qemu-ppc64le`, and `qemu-s390x` (Fedora's `qemu-user`
-package), and use a session with the user systemd bus available:
+Install `qemu-aarch64`, `qemu-ppc64le`, `qemu-s390x`, and `qemu-riscv64`
+(Fedora's `qemu-user` package), and use a session with the user systemd bus available:
 
 ```sh
 scripts/cross-port.sh test all
