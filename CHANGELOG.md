@@ -45,6 +45,11 @@
   closure per iteration and factories whose parameters are captured
   ([#126](https://github.com/atgreen/evergreen/pull/126)).
 
+- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
+  check instead of calling the numeric runtime for every `*`, deoptimizing to
+  the interpreter for a bignum product or a non-fixnum operand
+  ([#127](https://github.com/atgreen/evergreen/pull/127)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
