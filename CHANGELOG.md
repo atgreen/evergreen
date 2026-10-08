@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- s390x foreign calls now accept variadic calls supported by the existing
+  fixed-arity integer dispatcher
+  ([#119](https://github.com/atgreen/evergreen/pull/119)).
+
 - The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
   that computes on x86-64 computes there too: `(deep 50000)` no longer signals
   `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
