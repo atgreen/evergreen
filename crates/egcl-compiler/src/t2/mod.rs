@@ -24,7 +24,7 @@
 //!    generic operations to typed ones behind guards; [`infer`] supplies the
 //!    type, range, and representation facts passes consult.
 //! 4. Mid-end passes under [`pass::PassManager`]. The promotion path runs
-//!    [`opt_fold`] → [`opt_gvn`] → [`opt_guard`] → [`opt_dce`]; [`opt_licm`]
+//!    [`opt_fold`] → [`opt_gvn`] → [`opt_guard`] → [`opt_clear_mv`] → [`opt_dce`]; [`opt_licm`]
 //!    and [`opt_escape`] are implemented and tested as passes but not yet
 //!    scheduled there.
 //! 5. [`lower`] — instruction selection from SSA to a [`mach::MachFunc`] over
@@ -80,6 +80,7 @@ pub mod verify; // IR verifier
 // ── Mid-end and back end ──────────────────────────────────────────
 pub mod deopt; // FrameState → stack-map lowering + runtime reconstruction
 pub mod lower; // IR → MachFunc instruction selection
+pub mod opt_clear_mv; // dead multiple-value-reset elimination
 pub mod opt_dce; // deopt-aware DCE + rematerialisation
 pub mod opt_guard; // guard elimination + hoisting
 pub mod opt_gvn; // global value numbering / CSE

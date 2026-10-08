@@ -1380,6 +1380,57 @@ fn t2_regalloc_spills_high_pressure_loop() {
     );
 }
 
+/// A `SETQ` in a call-free loop must not cost a runtime call per assignment
+/// (bliss-y7wdk). The bytecode lowering emits `ClearMv` after every `SETQ`;
+/// T2 keeps only the resets that can be observed, which here is the one
+/// before the function returns. The remaining resets must still truncate a
+/// stale multiple-value state left by the caller.
+#[test]
+fn t2_elides_unobservable_multiple_value_resets() {
+    let program = "\
+        (defun mv-loop (x n) (dotimes (i n x) (setq x (+ x 1)))) \
+        (dotimes (warm 80) (mv-loop 1 10)) \
+        (dotimes (warm 2000) (egcl-ext:function-tier (quote mv-loop))) \
+        (format t \"~a~%\" (egcl-ext:function-tier (quote mv-loop))) \
+        (format t \"~a~%\" (multiple-value-list (mv-loop 1 3))) \
+        (format t \"~a~%\" (multiple-value-list (progn (values 1 2 3) (mv-loop 1 3))))";
+    let out = run_output(
+        program,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("EGCL_T2_THREADS", "1"),
+            ("EGCL_T2_LOG", "-"),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "mv-loop run failed:\n{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("2"),
+        "mv-loop did not reach T2:\n{stdout}\n{stderr}"
+    );
+    assert_eq!(lines.get(1).copied(), Some("(4)"), "{stdout}");
+    assert_eq!(
+        lines.get(2).copied(),
+        Some("(4)"),
+        "a stale multiple-value state leaked through the T2 return:\n{stdout}"
+    );
+    let installed = stderr
+        .lines()
+        .find(|l| l.contains("MV-LOOP: T2 INSTALLED"))
+        .unwrap_or_else(|| panic!("no T2 install record for MV-LOOP:\n{stderr}"));
+    // Both loop-body resets (after `(setq x ...)` and after the DOTIMES step)
+    // are dead: every path from them reaches another reset before a reader.
+    // The only safepoint-carrying instructions left are outside the loop.
+    assert!(
+        installed.contains("safepoints=1,"),
+        "expected exactly the pre-return reset to survive, got: {installed}"
+    );
+}
+
 /// regalloc2 may coalesce a binary result with either input. The framed x86
 /// templates must preserve the RHS when it is also the destination, including
 /// non-commutative subtraction and multiplication's destructive untag step.
@@ -2138,10 +2189,7 @@ fn structural_t1_decline_is_attempted_only_once() {
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
     let out = run_output(
         program,
-        &[
-            ("EGCL_T0_T1_THRESHOLD", "2"),
-            ("EGCL_LOG", "compile=trace"),
-        ],
+        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_LOG", "compile=trace")],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2178,10 +2226,7 @@ fn redefining_a_declined_function_allows_promotion_again() {
           (if (> (egcl-ext:function-tier (quote redef-target)) 0) :promoted :t0))";
     let out = run_output(
         program,
-        &[
-            ("EGCL_T0_T1_THRESHOLD", "2"),
-            ("EGCL_LOG", "compile=trace"),
-        ],
+        &[("EGCL_T0_T1_THRESHOLD", "2"), ("EGCL_LOG", "compile=trace")],
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);

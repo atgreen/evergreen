@@ -21707,7 +21707,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 
     // Route the speculated IR through the mid-end: constant folding + strength
     // reduction (P4f), global value numbering (P4a), dominance-based guard
-    // elimination (P4d), then deopt-aware DCE (P4c).  Guard elimination runs
+    // elimination (P4d), dead multiple-value-reset elimination (bliss-y7wdk),
+    // then deopt-aware DCE (P4c).  Guard elimination runs
     // after body inlining in the builder, so equivalent proofs cloned from
     // separate callees collapse to one dominating guard.
     // Each pass preserves well-formedness (spec §4.10 R4.60); re-verify before
@@ -21718,6 +21719,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         pm.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
         pm.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
         pm.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
+        pm.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
         pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
         pm.run(&mut f);
     }
