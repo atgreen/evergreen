@@ -71,8 +71,10 @@ calling convention for scalars (integers, pointers, floats, doubles,
 variadic calls after the C promotions); aggregate arguments and foreign
 callbacks are not yet ported. Null-pointer and stack-guard faults resume at
 the runtime's recovery handler as on s390x; a fault inside JIT-compiled code
-itself is not yet recoverable. The remaining slices are tracked as children
-of Bead `bliss-miro8`.
+itself is not yet recoverable. With `EGCL_NATIVE_TRANSFER=1`, the CLI admits
+allocation-free, scope-free, deopt-free T2 bodies through the LP64D native
+segment entry, exactly the slice the AArch64 and s390x adapters admit. The
+remaining slices are tracked as children of Bead `bliss-miro8`.
 
 ```sh
 scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
