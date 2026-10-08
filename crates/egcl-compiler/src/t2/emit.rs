@@ -6184,6 +6184,8 @@ mod tests {
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
     /// the given inferred range — i.e. what inlining/the caller ABI would supply.
+    // Its callers are the x86-64 range tests below; elsewhere it is unused.
+    #[cfg(all(target_arch = "x86_64", unix))]
     pub(super) fn build_mul_ranged(
         c: i64,
         range: Option<crate::t2::ir::Range>,

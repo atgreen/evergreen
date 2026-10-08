@@ -23810,7 +23810,8 @@ mod direct_call_invalidation_tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    // Used only by the x86-64 direct-call retention test below.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn has_executable_mapping(address: usize) -> bool {
         std::fs::read_to_string("/proc/self/maps")
             .expect("read process mappings")
