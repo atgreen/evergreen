@@ -804,6 +804,30 @@ pub struct RootSyncSite {
     pub spill_roots: u16,
 }
 
+/// A native callee a T2 `Call` site may enter directly, resolved by the
+/// runtime on the execution thread before the compile job is queued
+/// (bliss-6j6pk). Plain data: the compile runs on a worker that cannot see
+/// the thread-local native registry, so everything the emitted code needs is
+/// baked here, and `generation` is the direct-call generation captured before
+/// the lookup so a concurrent redefinition can only make the baked guard
+/// fail, never pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectNativeTarget {
+    pub symbol: u32,
+    pub nargs: u16,
+    /// The callee's native entry, `fn(slots, egcl_stack)`.
+    pub entry: u64,
+    /// The callee's `CodeInfo` pointer, stored in the pushed frame header.
+    pub code_info: u64,
+    /// The callee's activation size in tagged words.
+    pub num_slots: u16,
+    pub generation: u64,
+    /// Address of the runtime's direct-call generation word.
+    pub generation_addr: u64,
+    /// The frame-header flag word for an ordinary call frame.
+    pub frame_flags: u32,
+}
+
 /// The branch condition a fixnum comparison opcode is true under. `None` for
 /// non-fixnum-comparison opcodes (float comparisons aren't fused yet).
 fn fixnum_cmp_cc(op: crate::t2::ir::Opcode) -> Option<Cc> {
@@ -2723,6 +2747,46 @@ pub fn emit_framed_with_activation_slots(
     activation_slots: u16,
     self_sym: Option<u32>,
 ) -> Result<FramedCode, EmitError> {
+    emit_framed_with_direct_natives(
+        f,
+        c2i_deopt_addr,
+        c2i_deopt_t2_addr,
+        c2i_call_addr,
+        c2i_call_slice_addr,
+        c2i_load_global_addr,
+        c2i_load_function_addr,
+        c2i_store_global_addr,
+        c2i_mv_addr,
+        c2i_recovery_toggle_addr,
+        c2i_transfer_pending_addr,
+        c2i_poll_addr,
+        activation_slots,
+        self_sym,
+        &[],
+    )
+}
+
+/// [`emit_framed_with_activation_slots`] plus the native callees the runtime
+/// resolved for this function's call sites. The s390x emitter enters a listed
+/// callee directly (bliss-6j6pk); the other emitters ignore the list.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_with_direct_natives(
+    f: &Function,
+    c2i_deopt_addr: u64,
+    c2i_deopt_t2_addr: u64,
+    c2i_call_addr: u64,
+    c2i_call_slice_addr: u64,
+    c2i_load_global_addr: u64,
+    c2i_load_function_addr: u64,
+    c2i_store_global_addr: u64,
+    c2i_mv_addr: u64,
+    c2i_recovery_toggle_addr: u64,
+    c2i_transfer_pending_addr: u64,
+    c2i_poll_addr: u64,
+    activation_slots: u16,
+    self_sym: Option<u32>,
+    direct_natives: &[DirectNativeTarget],
+) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
             f,
@@ -2737,6 +2801,7 @@ pub fn emit_framed_with_activation_slots(
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
                 self_sym: None,
+                direct_natives: Vec::new(),
             },
         );
     }
@@ -2754,6 +2819,7 @@ pub fn emit_framed_with_activation_slots(
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
                 self_sym: None,
+                direct_natives: Vec::new(),
             },
         );
     }
@@ -2771,6 +2837,7 @@ pub fn emit_framed_with_activation_slots(
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
                 self_sym,
+                direct_natives: direct_natives.to_vec(),
             },
         );
     }
