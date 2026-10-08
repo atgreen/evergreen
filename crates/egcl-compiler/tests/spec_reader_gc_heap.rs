@@ -97,6 +97,13 @@ fn streaming_reader_roots_values_across_character_callbacks() {
     use egcl_compiler::reader::{ReaderMacroKind, ReaderStream, read_from_stream};
     use egcl_rt::{error::EgclError, object::ComplexData};
 
+    // The first thing this test does is collect, from inside the stream
+    // callback, before the reader has allocated anything. The heap comes up
+    // lazily with the first allocation, so run alone (or scheduled first in
+    // the parallel harness) the collection failed with "heap not initialized";
+    // the sibling tests only passed it by allocating first.
+    egcl_rt::gc::ensure_heap_initialized();
+
     struct CollectingInput {
         chars: Vec<char>,
         position: usize,
