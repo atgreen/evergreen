@@ -243,6 +243,10 @@ struct Emitter<'a> {
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
     reg_entry: Option<Label>,
+    /// The lowest callee-saved register the prologue saves: the lowest home
+    /// register in use, or r13 when none is below it. Homes are handed out
+    /// from r12 downward so this range is as short as the function allows.
+    first_saved: u8,
     /// Frame offset of the call-argument area of a register-entry body: a
     /// self-call's slow path stages its arguments there for `call_slice`, and
     /// every other call stages its arguments there too (bliss-of8kz).
@@ -591,7 +595,7 @@ impl Emitter<'_> {
     }
 
     fn prologue(&mut self) {
-        self.asm.prologue();
+        self.asm.prologue_from(self.first_saved);
         self.asm.address(15, 15, -self.frame_bytes);
         self.asm.mov(13, 2);
         // The entry's second argument is the EgclStack; a direct native call
@@ -599,8 +603,16 @@ impl Emitter<'_> {
         // this: its r3 is an argument, and a function with a register entry
         // makes only self-calls, so it never needs the pointer.)
         self.asm.store(3, 15, self.stack_offset);
-        self.asm.imm64(2, 256);
-        self.asm.store(2, 15, self.poll_offset);
+        self.init_poll_word();
+    }
+
+    /// The sampled back-edge poll's countdown; a function without a back
+    /// edge never reads it, so its entry need not write it.
+    fn init_poll_word(&mut self) {
+        if !self.polls.is_empty() {
+            self.asm.imm64(2, 256);
+            self.asm.store(2, 15, self.poll_offset);
+        }
     }
 
     /// The listed native callee for `symbol` at this arity, if any.
@@ -722,7 +734,7 @@ impl Emitter<'_> {
 
     fn epilogue(&mut self) {
         self.asm.address(15, 15, self.frame_bytes);
-        self.asm.epilogue();
+        self.asm.epilogue_from(self.first_saved);
     }
 
     fn deopt_label(&mut self, data: &InstData) -> Result<Label, EmitError> {
@@ -1488,6 +1500,7 @@ pub fn emit_framed_with_runtime(
         polls,
         transfer_exit: None,
         reg_entry: None,
+        first_saved: 6,
         self_args_base: 0,
     };
     for &block in function.block_order() {
@@ -1536,7 +1549,10 @@ pub fn emit_framed_with_runtime(
             .map(|range| range.location)
             .filter(|first| ranges.all(|range| range.location == *first));
         let home = match stable {
-            Some(Location::Register(register)) => Home::Register(register.encoding),
+            // The allocator numbers r6..r12 upward; mirror them onto r12..r6
+            // so the registers in use sit at the top of the callee-saved
+            // range and the prologue saves only from the lowest one.
+            Some(Location::Register(register)) => Home::Register(18 - register.encoding),
             Some(Location::Stack(slot)) => Home::Stack(slot.0),
             None => {
                 let slot = spill_slots;
@@ -1546,6 +1562,16 @@ pub fn emit_framed_with_runtime(
         };
         emitter.homes.insert(value, home);
     }
+    emitter.first_saved = emitter
+        .homes
+        .values()
+        .filter_map(|home| match home {
+            Home::Register(register) => Some(*register),
+            Home::Stack(_) => None,
+        })
+        .min()
+        .unwrap_or(13)
+        .min(13);
     // A value whose type is confined to non-pointer immediates (fixnum, single
     // float, character, symbol, NIL/T) can never be relocated by the moving GC,
     // so it needs no shadow root. The inference map assigns each SSA value the
@@ -1759,13 +1785,12 @@ pub fn emit_framed_with_runtime(
         emitter.asm.bind(label);
         emitter.reg_entry = Some(label);
         compiled_entry = emitter.asm.here();
-        emitter.asm.prologue();
+        emitter.asm.prologue_from(emitter.first_saved);
         emitter.asm.address(15, 15, -emitter.frame_bytes);
         for (index, &parameter) in entry_params.iter().enumerate() {
             emitter.store(parameter, 2 + index as u8)?;
         }
-        emitter.asm.imm64(2, 256);
-        emitter.asm.store(2, 15, emitter.poll_offset);
+        emitter.init_poll_word();
         emitter.asm.branch(15, emitter.blocks[&function.entry()]);
     }
     let mut bcp_offsets = Vec::new();
@@ -1930,7 +1955,19 @@ mod tests {
     #[test]
     fn emits_system_z_with_precise_guard_metadata() {
         let code = emit_framed(&add_one(), 0, 3).unwrap();
-        assert!(code.code.starts_with(&[0xeb, 0x6f, 0xf0, 0x30, 0, 0x24]));
+        // STMG first,r15 into the caller's save area: first is whichever
+        // callee-saved register the function uses lowest (r6 when it uses
+        // them all), so only the shape is fixed, not the register.
+        let first = code.code[1] >> 4;
+        assert!((6..=13).contains(&first), "first saved register: r{first}");
+        assert!(code.code.starts_with(&[
+            0xeb,
+            first << 4 | 0xf,
+            0xf0,
+            0x30 + 8 * (first - 6),
+            0,
+            0x24
+        ]));
         assert!(code.has_deopt);
         assert_ne!(code.bcp_offsets[9], u32::MAX);
         assert_eq!(code.shadow_root_slots, 0);
