@@ -1749,15 +1749,16 @@ mod tests {
     fn osr_only_guard_reports_deopt_and_reconstructs_its_frame() {
         use crate::t2::ir::OsrEntry;
 
-        extern "C" fn reconstruct(nscopes: u64, nwords: u64, words: *const u64, _: u64) -> u64 {
-            if nscopes != 1 || nwords != 5 {
-                return 0;
-            }
+        thread_local! {
+            static RECONSTRUCTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        extern "C" fn reconstruct(nscopes: u64, nwords: u64, words: *const u64, _: u64) {
             let words = unsafe { std::slice::from_raw_parts(words, nwords as usize) };
-            if words != [0, 0, 1, 0, EgclVal::from_single_float(2.0).0] {
-                return 0;
-            }
-            EgclVal::from_fixnum(99).0
+            RECONSTRUCTED.with(|out| {
+                let mut out = out.borrow_mut();
+                out.push(nscopes);
+                out.extend_from_slice(words);
+            });
         }
 
         let mut f = Function::new("rv-osr-only-guard");
@@ -1800,6 +1801,7 @@ mod tests {
         crate::t2::verify::verify(&f).expect("OSR identity IR verifies");
         let framed = emit_framed(&f, reconstruct as *const () as usize as u64, 1)
             .expect("emit OSR identity");
+        let _ = &RECONSTRUCTED;
         assert_eq!(framed.osr_entries.len(), 1, "checked OSR entry is emitted");
         assert!(
             framed.has_deopt,
@@ -1812,8 +1814,18 @@ mod tests {
                 unsafe { std::mem::transmute(buf.as_ptr().add(framed.osr_entries[0].1)) };
             let mut slots = [EgclVal::from_fixnum(7).0];
             assert_eq!(osr(slots.as_mut_ptr()), slots[0]);
+            RECONSTRUCTED.with(|out| assert!(out.borrow().is_empty()));
+            // A non-fixnum import fails the entry guard: the deopt exit hands
+            // the header frame [function 0, bcp 0, 1 local, 0 stack, x] to
+            // the callback and, as on every home-based backend, returns NIL.
             slots[0] = EgclVal::from_single_float(2.0).0;
-            assert_eq!(osr(slots.as_mut_ptr()), EgclVal::from_fixnum(99).0);
+            assert_eq!(osr(slots.as_mut_ptr()), NIL.0);
+            RECONSTRUCTED.with(|out| {
+                assert_eq!(
+                    *out.borrow(),
+                    [1, 0, 0, 1, 0, EgclVal::from_single_float(2.0).0]
+                );
+            });
         }
     }
 
