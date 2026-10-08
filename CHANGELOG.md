@@ -341,6 +341,10 @@
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).
 
+- The sampled back-edge poll in ppc64le baseline native loops now fires at
+  the configured threshold instead of after about four billion iterations, so
+  a hot loop in a warm function requests T2 compilation and responds to
+  signals and GC safepoints ([#110](https://github.com/atgreen/evergreen/pull/110)).
 - Single-float arithmetic on ppc64le now returns correct values once a
   function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
   returned `2.2578125` there while the interpreter and baseline tier were

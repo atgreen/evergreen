@@ -429,13 +429,19 @@ pub(super) fn emit_native_ppc64le(
                     let keep = c.label();
                     c.imm64(SCRATCH, backedge_counter);
                     // The counter is an AtomicU32, so these are 32-bit accesses: a
-                    // 64-bit one would read and write the four bytes past it.
+                    // 64-bit one would read and write the four bytes past it. It
+                    // starts at ZERO and counts UP to the threshold, as on the other
+                    // three targets; counting down from that zero start meant the
+                    // first poll fired only when the u32 wrapped, so installed T1
+                    // loops never escalated to T2 and never polled signals or GC
+                    // safepoints (bliss-fsqh3).
                     encode!("poll counter load", c.load_word(ACC, SCRATCH, 0));
-                    c.addi(ACC, ACC, -1);
+                    c.addi(ACC, ACC, 1);
                     encode!("poll counter store", c.store_word(ACC, SCRATCH, 0));
-                    c.compare_imm(0, ACC, 0);
-                    c.branch(Cc::Ne, 0, keep);
-                    c.imm64(ACC, u64::from(t2_backedge_threshold()));
+                    c.imm64(4, u64::from(t2_backedge_threshold()));
+                    c.compare(0, ACC, 4);
+                    c.branch(Cc::L, 0, keep);
+                    c.li(ACC, 0);
                     encode!("poll reset", c.store_word(ACC, SCRATCH, 0));
                     let helper = if is_osr {
                         // Signal-only: an OSR loop has no T1 tier to promote from,
