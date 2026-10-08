@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- RISC-V now supports the opt-in native segment boundary, preserving callee-
+  saved integer and floating-point registers across native returns and
+  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
+
 - riscv64 now has a T1 baseline native compiler with guarded fixnum
   arithmetic, comparisons, live on-stack replacement, and deoptimization, so
   hot functions run as RV64 machine code instead of bytecode. T2 optimizing
