@@ -325,6 +325,14 @@ pub(super) fn emit_native(
                 a.store(2, 8, 8 * i32::from(i));
             }
             Instr::Pop => a.add_imm(9, -8),
+            // A full fence for every kind: z/Architecture orders loads and
+            // stores already, and BCR 14,0 serializes the rest. Pushes NIL,
+            // the barrier's value, as the x86-64 emitter does.
+            Instr::MemoryFence(_) => {
+                a.serialize();
+                a.imm64(2, NIL.0);
+                push(&mut a);
+            }
             Instr::Dup => {
                 a.load(2, 9, -8);
                 push(&mut a);

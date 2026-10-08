@@ -113,7 +113,8 @@
 //!
 //! Constants (`Const*` are folded; heap literals are loaded through their
 //! rooted constant-pool slot, never baked in), `Return`, `Jump`, two-way
-//! `Brif`, `Trap` (an unconditional deopt), `Guard` for the FIXNUM,
+//! `Brif`, `Trap` (an unconditional deopt), `MemoryFence` (BCR 14,0 for
+//! every kind), `Guard` for the FIXNUM,
 //! SINGLE_FLOAT and CONS tags and for the simple-string layout, with the
 //! `StringByteLength` and ASCII `StringAsciiCharAt` loads that layout proof
 //! refines (the string's byte length is its second word and its bytes follow
@@ -1067,6 +1068,16 @@ impl Emitter<'_> {
                 self.edge(&data.targets[0])?;
                 self.asm.bind(otherwise);
                 return self.edge(&data.targets[1]);
+            }
+            MemoryFence => {
+                // A full fence for every kind (see bytecode_s390x.rs); the
+                // value is NIL.
+                self.asm.serialize();
+                if let Some(&value) = data.results.first() {
+                    self.asm.imm64(2, NIL.0);
+                    self.store(value, 2)?;
+                }
+                return Ok(());
             }
             Trap => {
                 // A Trap ends a path that must not continue (bliss-wukf): the
