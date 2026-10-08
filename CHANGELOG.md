@@ -174,6 +174,11 @@
   stopping at T1: the back-edge safepoint poll had no GC root set, which made
   the optimizing tier decline every loop
   ([#98](https://github.com/atgreen/evergreen/pull/98)).
+
+- Functions using `CAR`, `CDR`, `EQ`, `NULL`, `NOT`, the logical bit
+  operations or `ASH` by a constant now reach T2 native code on ppc64le
+  instead of stopping at T1
+  ([#105](https://github.com/atgreen/evergreen/pull/105)).
 - Fixnum `+`, `-`, `1+`, `1-`, unary `-` and the numeric comparisons
   now compile inline with type and overflow guards in ppc64le baseline native
   code instead of calling the runtime for every operation, taking a counted
