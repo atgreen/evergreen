@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reduce x86-64 T2 named-call overhead and speed up runtime-state access for
+  native threads and fibers, while preserving function redefinition and GC
+  safety. Native callees recover from fixnum/single-float phase changes instead
+  of being incorrectly left in the interpreter
+  ([#142](https://github.com/atgreen/evergreen/pull/142)).
+
 - Foreign callbacks now work on s390x: `egcl-ffi` can hand a Lisp function to
   C as a function pointer (a `qsort` comparator, an event handler), with
   arguments and results following the ELF ABI and errors contained at the C
