@@ -253,7 +253,13 @@ pub(super) fn emit_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
-    if bf.arity > bf.num_slots() {
+    // Parameters live in slots unless the function captures them into a
+    // heap EnvFrame, in which case the bytecode reaches them through
+    // LoadEnvVar and the activation may be narrower than the arity: a closure
+    // factory with five captured parameters has one slot. Only the former
+    // shape can violate the slot count, and then only through an invariant
+    // breach the emitter must not build on.
+    if bf.arity > bf.num_slots() && !bf.has_env {
         return None;
     }
     let values_sym = resolve_sym("VALUES")?.as_symbol_index();
@@ -459,7 +465,16 @@ pub(super) fn emit_native(
                     *labels.get(target as usize)?,
                 );
             }
-            Instr::PushBlock { .. } | Instr::PushTag { .. } | Instr::PopHandler => {}
+            // NamedTag only publishes a tag on the shared control-token stack
+            // so a non-local GO from a nested closure can reach it; local GO
+            // is a jump to the tag's label. The native_would_lose_captured_
+            // control guard keeps any function whose closure captures such a
+            // tag at T0, so a NamedTag reaching this emitter is local-only and
+            // the publish is dead, as emit.rs concludes for x86-64 (bliss-x5y).
+            Instr::PushBlock { .. }
+            | Instr::PushTag { .. }
+            | Instr::NamedTag { .. }
+            | Instr::PopHandler => {}
             Instr::Go {
                 tagbody_id,
                 target_bcp,
@@ -578,6 +593,21 @@ pub(super) fn emit_native(
                 helper(&mut a, c2i_alloc_cons as *const () as u64, exit);
                 push(&mut a);
             }
+            // A LAMBDA in native code: the nested body pointer and the capture
+            // flag go to the adapter, which builds the closure over the current
+            // native environment frame. The executing NativeCode retains its
+            // body, nested functions included, so the pointer stays valid even
+            // if the global name is redefined meanwhile. Without this arm any
+            // function containing a LAMBDA declined T1 on s390x and stayed
+            // interpreted (native_portable_closure's four factory tests).
+            Instr::MakeClosure { func, capture_env } => {
+                let nested =
+                    bf.nested_functions.get(func as usize)?.as_ref() as *const BytecodeFunction;
+                a.imm64(2, nested as u64);
+                a.imm64(3, u64::from(capture_env));
+                helper(&mut a, c2i_make_bytecode_closure as *const () as u64, exit);
+                push(&mut a);
+            }
             Instr::EvalHost(k) | Instr::MakeClosureEnv(k) => {
                 a.imm64(2, bf.constants.get(k as usize)? as *const EgclVal as u64);
                 a.load(2, 2, 0);
@@ -613,7 +643,20 @@ pub(super) fn emit_native(
                 let target = *deopts.entry(bcp).or_insert_with(|| a.label());
                 a.branch(15, target);
             }
-            _ => return None,
+            unsupported => {
+                // Name the refusal: a silent None here cost a function its
+                // T1 tier with no trace at all (bliss-xltiz found a factory
+                // and an OSR loop declining this way on s390x).
+                egcl_rt::blog!(
+                    "compile",
+                    egcl_rt::log::TRACE,
+                    "[T1] {}: s390x emitter declined on {:?} at bcp {}",
+                    display_fn_name(&bf.name),
+                    unsupported,
+                    bcp
+                );
+                return None;
+            }
         }
     }
     a.bind(exit);
