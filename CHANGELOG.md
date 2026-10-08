@@ -8,6 +8,12 @@
   compilation is still x86-64, AArch64, ppc64le and s390x only
   ([#93](https://github.com/atgreen/evergreen/pull/93)).
 
+- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
+  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
+  operations and constant shifts, GC-safe runtime calls, polled loops, live
+  T1-to-T2 OSR and precise deoptimization
+  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload

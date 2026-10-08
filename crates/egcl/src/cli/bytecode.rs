@@ -21597,6 +21597,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if !cfg!(any(
         all(target_arch = "x86_64", any(unix, windows)),
         all(target_arch = "s390x", unix),
+        all(target_arch = "riscv64", unix),
         all(target_arch = "aarch64", unix),
         all(target_arch = "powerpc64", target_endian = "little", unix)
     )) {
