@@ -76,7 +76,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::t2::frame_state::ValueSource;
-use crate::t2::ir::{AuxData, Block, Function, IRType, Inst, Opcode, Value, ValueDef};
+use crate::t2::ir::{AuxData, Block, Function, IRType, Inst, Opcode, TypeBits, Value, ValueDef};
 use crate::t2::pass::{Analyses, Pass};
 
 #[derive(Default)]
@@ -93,6 +93,7 @@ impl Pass for GuardElim {
         let dom = a.dominators(f).clone();
 
         let mut changed = false;
+        changed |= split_loop_entry_guards(f, &dom);
         changed |= remove_inference_proven(f);
         changed |= remove_dominating_duplicates(f, &dom);
         changed |= hoist_loop_invariant(f, &dom);
@@ -380,6 +381,195 @@ fn frame_state_dominates(
     ok
 }
 
+// ── Transform 4: loop-entry guard splitting ─────────────────────────
+
+/// A value whose declared type is already confined to FIXNUM.
+fn declared_fixnum(f: &Function, v: Value) -> bool {
+    let bits = f.value(v).ty.bits;
+    !bits.is_bottom() && bits.meet(TypeBits::FIXNUM) == bits
+}
+
+/// A `TypeTag(FIXNUM)` guard with no range or class refinement.
+fn is_plain_fixnum_guard(d: &crate::t2::ir::InstData) -> bool {
+    d.flags.guard
+        && matches!(&d.aux, AuxData::TypeTag(tau)
+            if tau.bits == TypeBits::FIXNUM && tau.range.is_none() && tau.class_id.is_none())
+}
+
+/// Replace the in-loop fixnum guards on a loop-carried header parameter by a
+/// single guard on its entry value in the preheader, prove the parameter
+/// FIXNUM, and record the proof as an OSR-entry check (bliss-5yz5h).
+///
+/// For a header `H` with preheader `P` and an OSR entry, a parameter `φ` of
+/// `H` qualifies when some plain fixnum guard inside the loop checks `φ`
+/// itself and every latch argument for `φ` is already declared FIXNUM (or is
+/// `φ`). Then every value `φ` can take is a fixnum provided its entry value
+/// is: that value is guarded once in `P` (unless already declared), the
+/// preheader edge is rewired to the guard's narrowed result, `φ` is refined to
+/// FIXNUM, and the loop's guards on `φ` are removed. Values an OSR entry
+/// imports did not come through the preheader, so the entry records
+/// `(φ, FIXNUM)` and tests it before entering the loop (emit.rs); a backend
+/// that cannot test declines the entry.
+///
+/// The preheader guard deoptimises with the OSR entry's own state — the
+/// interpreter frame at the header — rewritten so each header parameter reads
+/// its preheader edge value. That state describes resumption at the header
+/// before the first iteration, which is exactly where a failed entry guard
+/// leaves the program. Every source of the rewritten state must dominate the
+/// preheader, or the parameter is skipped.
+fn split_loop_entry_guards(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
+    use crate::t2::frame_state::ValueSource;
+    use crate::t2::ir::{InstData, InstFlags, ValueRepresentation};
+
+    let inst_block = inst_block_map(f);
+    let mut latches: HashMap<usize, Vec<Block>> = HashMap::new();
+    for &b in f.block_order() {
+        for s in f.succs(b) {
+            if dom.dominates(s, b) {
+                latches.entry(s.index()).or_default().push(b);
+            }
+        }
+    }
+    let fixnum = IRType::of(TypeBits::FIXNUM);
+    let mut changed = false;
+
+    for (&hidx, tails) in &latches {
+        let header = Block(hidx as u32);
+        let body = natural_loop_body(f, header, tails);
+        let Some(ph) = preheader(f, header, &body) else {
+            continue;
+        };
+        let Some(osr_idx) = f.osr_entries.iter().position(|o| o.block == header) else {
+            continue;
+        };
+        let Some(ph_term) = f.terminator(ph) else {
+            continue;
+        };
+        let Some(edge_idx) = f
+            .inst(ph_term)
+            .targets
+            .iter()
+            .position(|t| t.block == header)
+        else {
+            continue;
+        };
+        let params = f.block(header).params.clone();
+        let ph_args = f.inst(ph_term).targets[edge_idx].args.clone();
+        if ph_args.len() != params.len() {
+            continue;
+        }
+
+        for (k, &phi) in params.iter().enumerate() {
+            if declared_fixnum(f, phi) {
+                continue;
+            }
+            // In-loop plain fixnum guards checking φ itself.
+            let guards: Vec<Inst> = body
+                .iter()
+                .flat_map(|&b| f.block(b).insts.iter().copied())
+                .filter(|&i| {
+                    let d = f.inst(i);
+                    is_plain_fixnum_guard(d) && d.args.first() == Some(&phi)
+                })
+                .collect();
+            if guards.is_empty() {
+                continue;
+            }
+            // Every latch must carry a fixnum (or φ itself) back to φ.
+            let latches_ok = tails.iter().all(|&t| {
+                f.terminator(t).is_some_and(|term| {
+                    f.inst(term)
+                        .targets
+                        .iter()
+                        .filter(|c| c.block == header)
+                        .all(|c| {
+                            c.args
+                                .get(k)
+                                .is_some_and(|&a| a == phi || declared_fixnum(f, a))
+                        })
+                })
+            });
+            if !latches_ok {
+                continue;
+            }
+            let entry_arg = ph_args[k];
+
+            // The preheader guard's deopt state: the OSR header state with
+            // every header parameter replaced by its preheader edge value.
+            let osr_fs = f.osr_entries[osr_idx].frame_state;
+            let mut state = f.frame_states.get(osr_fs).clone();
+            let subst = |src: &mut ValueSource| {
+                if let ValueSource::Value { value, .. } = src {
+                    if let Some(m) = params.iter().position(|p| p == value) {
+                        *value = ph_args[m];
+                    }
+                }
+            };
+            for scope in &mut state.scopes {
+                scope.locals.iter_mut().for_each(subst);
+                scope.stack.iter_mut().for_each(subst);
+            }
+            for recipe in &mut state.remat {
+                recipe.inputs.iter_mut().for_each(subst);
+            }
+            let dominates_ph = |src: &ValueSource| match src {
+                ValueSource::Value { value, .. } => {
+                    def_block(f, &inst_block, *value).is_some_and(|db| dom.dominates(db, ph))
+                }
+                _ => true,
+            };
+            let sources_ok = state
+                .scopes
+                .iter()
+                .all(|s| s.locals.iter().chain(s.stack.iter()).all(dominates_ph))
+                && state
+                    .remat
+                    .iter()
+                    .all(|r| r.inputs.iter().all(dominates_ph));
+            if !sources_ok {
+                continue;
+            }
+
+            if !declared_fixnum(f, entry_arg) {
+                let fsid = f.frame_states.add(state);
+                let source_pos = f.inst(guards[0]).source_pos;
+                let (guard, results) = f.push_inst(
+                    ph,
+                    InstData {
+                        opcode: Opcode::Guard,
+                        args: vec![entry_arg],
+                        results: vec![],
+                        aux: AuxData::TypeTag(fixnum),
+                        flags: InstFlags {
+                            guard: true,
+                            effectful: true,
+                            ..InstFlags::default()
+                        },
+                        targets: vec![],
+                        frame_state: Some(fsid),
+                        source_pos,
+                    },
+                    &[(fixnum, ValueRepresentation::Tagged)],
+                );
+                // push_inst appends after the terminator; move it just before.
+                let insts = &mut f.block_mut(ph).insts;
+                let appended = insts.pop();
+                debug_assert_eq!(appended, Some(guard));
+                let pos = insts.len().saturating_sub(1);
+                insts.insert(pos, guard);
+                f.inst_mut(ph_term).targets[edge_idx].args[k] = results[0];
+            }
+            f.osr_entries[osr_idx].checks.push((phi, fixnum));
+            f.refine_type(phi, fixnum);
+            for g in guards {
+                remove_guard(f, g);
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
 // ── Shared mutation helpers ─────────────────────────────────────────
 
 /// Remove a guard instruction, forwarding any result to its checked operand and
@@ -557,6 +747,201 @@ mod tests {
     fn run(f: &mut Function) {
         let mut a = Analyses::new();
         GuardElim.run(f, &mut a);
+    }
+
+    fn brif(cond: Value, then: Block, then_args: Vec<Value>, els: Block) -> InstData {
+        InstData {
+            args: vec![cond],
+            targets: vec![
+                BlockCall {
+                    block: then,
+                    args: then_args,
+                },
+                BlockCall {
+                    block: els,
+                    args: vec![],
+                },
+            ],
+            ..base(Opcode::Brif)
+        }
+    }
+
+    /// entry(a) -> preheader -> header(x, i) [Guard x; x' = x + 1; i' = i + 1]
+    /// -> body -Brif-> header(x', i') | exit. The header has an OSR entry
+    /// whose state names (x, i). Returns (f, entry, preheader, header, a).
+    fn loop_with_guarded_phi() -> (Function, Block, Block, Block, Value) {
+        let mut f = Function::new("split");
+        let entry = f.entry();
+        let a = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, c0) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::FixnumImm(0),
+                ..base(Opcode::ConstFixnum)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (_, c1) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::FixnumImm(1),
+                ..base(Opcode::ConstFixnum)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (_, t) = f.push_inst(
+            entry,
+            base(Opcode::ConstT),
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let ph = f.make_block();
+        let header = f.make_block();
+        let body = f.make_block();
+        let exit = f.make_block();
+        f.set_terminator(entry, jump(ph));
+        let x = f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged);
+        let i = f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            ph,
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![a, c0[0]],
+                }],
+                ..base(Opcode::Jump)
+            },
+        );
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 5,
+                locals: vec![
+                    ValueSource::Value {
+                        value: x,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                    ValueSource::Value {
+                        value: i,
+                        repr: ValueRepresentation::Tagged,
+                    },
+                ],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(crate::t2::ir::OsrEntry {
+            bcp: 5,
+            block: header,
+            frame_state: state,
+            checks: Vec::new(),
+        });
+        let (_, xg) = f.push_inst(
+            header,
+            InstData {
+                frame_state: Some(state),
+                ..guard(x, fixnum())
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let arith = |v: Value| InstData {
+            args: vec![v, c1[0]],
+            flags: InstFlags {
+                guard: true,
+                effectful: true,
+                ..InstFlags::default()
+            },
+            frame_state: Some(state),
+            ..base(Opcode::FixnumAdd)
+        };
+        let (_, xn) = f.push_inst(
+            header,
+            arith(xg[0]),
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (_, inn) = f.push_inst(header, arith(i), &[(fixnum(), ValueRepresentation::Tagged)]);
+        f.set_terminator(header, jump(body));
+        f.set_terminator(body, brif(t[0], header, vec![xn[0], inn[0]], exit));
+        f.set_terminator(exit, ret());
+        (f, entry, ph, header, a)
+    }
+
+    #[test]
+    fn loop_phi_guard_splits_to_preheader_and_osr_check() {
+        let (mut f, _entry, ph, header, a) = loop_with_guarded_phi();
+        assert_eq!(count_guards(&f), 3, "x guard + two checked adds");
+        run(&mut f);
+
+        // The header's guard on x is gone; the preheader now guards a.
+        let header_guards: Vec<Inst> = f
+            .block(header)
+            .insts
+            .iter()
+            .copied()
+            .filter(|&i| f.inst(i).opcode == Opcode::Guard)
+            .collect();
+        assert!(
+            header_guards.is_empty(),
+            "in-loop guard on the phi must be removed"
+        );
+        let ph_guard = f
+            .block(ph)
+            .insts
+            .iter()
+            .copied()
+            .find(|&i| f.inst(i).opcode == Opcode::Guard)
+            .expect("preheader guard on the entry value");
+        assert_eq!(f.inst(ph_guard).args, vec![a]);
+        let narrowed = f.inst(ph_guard).results[0];
+        let ph_term = f.terminator(ph).unwrap();
+        assert_eq!(
+            f.inst(ph_term).targets[0].args[0],
+            narrowed,
+            "preheader edge must carry the narrowed value"
+        );
+        let x = f.block(header).params[0];
+        assert_eq!(
+            f.value(x).ty.bits,
+            TypeBits::FIXNUM,
+            "phi refined to FIXNUM"
+        );
+        assert_eq!(
+            f.osr_entries[0].checks,
+            vec![(x, IRType::of(TypeBits::FIXNUM))],
+            "OSR entry must check the imported phi"
+        );
+        // The preheader guard's state names a (not x) for the first local.
+        let fs = f.frame_states.get(f.inst(ph_guard).frame_state.unwrap());
+        assert!(matches!(fs.scopes[0].locals[0], ValueSource::Value { value, .. } if value == a));
+        assert!(
+            crate::t2::verify::verify(&f).is_ok(),
+            "{:?}",
+            crate::t2::verify::verify(&f)
+        );
+    }
+
+    #[test]
+    fn unchecked_osr_phi_is_not_inferred_from_its_edges() {
+        // Same loop, but without running the split: x's edges are a (TOP)
+        // and a fixnum, i's edges are both fixnums. With an OSR entry and no
+        // check, inference must not claim i is a fixnum.
+        let (f, _entry, _ph, header, _a) = loop_with_guarded_phi();
+        let inf = crate::t2::infer::infer(&f);
+        let i = f.block(header).params[1];
+        assert_eq!(
+            inf.ty(i).bits,
+            TypeBits::TOP,
+            "OSR can import anything into i"
+        );
+        let mut f = f;
+        f.osr_entries[0]
+            .checks
+            .push((i, IRType::of(TypeBits::FIXNUM)));
+        let inf = crate::t2::infer::infer(&f);
+        assert_eq!(
+            inf.ty(i).bits,
+            TypeBits::FIXNUM,
+            "a checked import keeps the edge fact"
+        );
     }
 
     #[test]

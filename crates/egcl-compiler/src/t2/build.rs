@@ -703,6 +703,7 @@ impl<'a> Builder<'a> {
                 bcp,
                 block,
                 frame_state,
+                checks: Vec::new(),
             });
         }
     }

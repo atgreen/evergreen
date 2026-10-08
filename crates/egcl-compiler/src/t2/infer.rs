@@ -588,6 +588,32 @@ pub fn infer(f: &Function) -> InferenceResult {
             }
         }
     }
+    // An OSR entry hands a loop header parameters straight from an interpreter
+    // frame, bypassing every IR edge. A fact joined only over those edges is
+    // not a fact about such a value, so seed each unchecked parameter of an
+    // OSR target from its declared type too. A parameter the entry checks
+    // (`OsrEntry::checks`) is proven on that path as well, so it keeps the
+    // edge-derived fact. So does a parameter nothing on the fast path reads —
+    // one named only by deopt states: the entry never imports it, its home is
+    // NIL-filled there, and the only reader is the deopt stub, so its edge
+    // fact stays an honest description of what can be observed (bliss-5yz5h).
+    let fast_path_use = |p: Value| -> bool {
+        f.block_order().iter().any(|&b| {
+            f.block(b).insts.iter().any(|&i| {
+                let d = f.inst(i);
+                d.args.contains(&p) || d.targets.iter().any(|t| t.args.contains(&p))
+            })
+        })
+    };
+    for osr in &f.osr_entries {
+        for &p in &f.block(osr.block).params {
+            if osr.checks.iter().any(|&(v, _)| v == p) || !fast_path_use(p) {
+                continue;
+            }
+            let seeded = ty_join(g.get(p), f.value(p).ty);
+            g.0.insert(p, seeded);
+        }
+    }
 
     for pass in 0..MAX_PASSES {
         let widen = pass >= WIDEN_AFTER;
@@ -817,8 +843,14 @@ mod tests {
             InstData {
                 args: vec![condition],
                 targets: vec![
-                    BlockCall { block: call, args: vec![] },
-                    BlockCall { block: nil_path, args: vec![] },
+                    BlockCall {
+                        block: call,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: nil_path,
+                        args: vec![],
+                    },
                 ],
                 ..inst(Opcode::Brif)
             },
@@ -840,8 +872,14 @@ mod tests {
         f.inst_mut(invoke).opcode = Opcode::Invoke;
         f.inst_mut(invoke).flags.terminator = true;
         f.inst_mut(invoke).targets = vec![
-            BlockCall { block: merge, args: vec![results[0]] },
-            BlockCall { block: cold, args: vec![] },
+            BlockCall {
+                block: merge,
+                args: vec![results[0]],
+            },
+            BlockCall {
+                block: cold,
+                args: vec![],
+            },
         ];
         let (_, nil) = f.push_inst(
             nil_path,
@@ -851,7 +889,10 @@ mod tests {
         f.set_terminator(
             nil_path,
             InstData {
-                targets: vec![BlockCall { block: merge, args: vec![nil[0]] }],
+                targets: vec![BlockCall {
+                    block: merge,
+                    args: vec![nil[0]],
+                }],
                 ..inst(Opcode::Jump)
             },
         );

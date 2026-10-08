@@ -504,6 +504,14 @@ pub struct OsrEntry {
     pub bcp: u32,
     pub block: Block,
     pub frame_state: crate::t2::frame_state::FrameStateId,
+    /// Type facts the entry must establish on the values it imports before
+    /// jumping into the loop: a proof the optimiser relies on for a header
+    /// parameter (a loop-entry guard split out of the body, bliss-5yz5h) is
+    /// only true of values that arrived through the IR's own edges, so an
+    /// interpreter value entering here is tested and, on failure, deoptimised
+    /// through `frame_state`. A backend that cannot emit the test must decline
+    /// the entry.
+    pub checks: Vec<(Value, IRType)>,
 }
 
 // ── Function ────────────────────────────────────────────────────────

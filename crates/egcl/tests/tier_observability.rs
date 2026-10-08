@@ -2316,3 +2316,52 @@ fn t2_elides_unobservable_multiple_value_resets() {
         "expected exactly the pre-return reset to survive, got: {installed}"
     );
 }
+
+/// A loop-carried fixnum is guarded once on loop entry (and once at the OSR
+/// entry), never per iteration (bliss-5yz5h). The hot path of a counted loop
+/// over a `LET`-bound accumulator must contain no tag checks beyond the two
+/// loop-entry ones; a per-iteration check on `i`, `n` or `x` would add more.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn t2_loop_carried_fixnums_are_checked_on_entry_not_per_iteration() {
+    let program = "\
+        (defun acc-loop (a n) \
+          (let ((x a)) \
+            (dotimes (i n x) \
+              (let* ((y (- (+ x 7919) 7918)) \
+                     (y (- (+ y 7932) 7931))) \
+                (setq x y))))) \
+        (dotimes (warm 80) (acc-loop 1 10)) \
+        (dotimes (warm 2000) (egcl-ext:function-tier (quote acc-loop))) \
+        (format t \"~a~%\" (egcl-ext:function-tier (quote acc-loop))) \
+        (format t \"~a~%\" (acc-loop 1 10)) \
+        (format t \"~a~%\" (acc-loop 1.5 0)) \
+        (format t \"~a~%\" (acc-loop 1.5 2)) \
+        (disassemble (quote acc-loop))";
+    let (out, ok) = run(
+        program,
+        &[
+            ("EGCL_T0_T1_THRESHOLD", "2"),
+            ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
+            ("EGCL_T2_THREADS", "1"),
+        ],
+    );
+    assert!(ok, "acc-loop program failed: {out}");
+    let mut lines = out.lines();
+    assert_eq!(lines.next(), Some("2"), "acc-loop did not reach T2: {out}");
+    assert_eq!(lines.next(), Some("21"), "{out}");
+    // A non-fixnum entry value fails the loop-entry guard and deoptimises:
+    // zero iterations return it unchanged, two iterations use float arithmetic.
+    assert_eq!(lines.next(), Some("1.5"), "{out}");
+    assert_eq!(lines.next(), Some("5.5"), "{out}");
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
+    let hot_path: Vec<&str> = out
+        .lines()
+        .take_while(|l| !l.contains("deoptimization stubs"))
+        .collect();
+    let tag_checks = hot_path.iter().filter(|l| l.contains("tag check")).count();
+    assert!(
+        tag_checks <= 2,
+        "expected at most the two loop-entry tag checks on the hot path, found {tag_checks}:\n{out}"
+    );
+}

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- T2 checks a loop-carried fixnum once on loop entry (and once when a loop
+  is entered through OSR) instead of re-testing its tag on every iteration
+  ([#106](https://github.com/atgreen/evergreen/pull/106)).
 - T2 deopt frame states name only the locals the interpreter can still read.
   A `LET*` chain inside a loop no longer keeps every binding alive to the end
   of the function, so its arithmetic stays in registers and the loop
