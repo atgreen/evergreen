@@ -978,9 +978,14 @@ pub fn emit_framed_with_runtime(
     }
     let mut osr_entries = Vec::new();
     for osr in &function.osr_entries {
-        // Imported values bypass the preheader guards. Until this backend
-        // emits their checks, entering here would invalidate the loop's proofs.
-        if !osr.checks.is_empty() {
+        // Imported values bypass the preheader guards, so the entry must
+        // establish each proof itself: every check has to be a fixnum fact
+        // about a homed value, or the entry is declined (bliss-5yz5h).
+        if !osr.checks.iter().all(|&(value, ty)| {
+            !ty.bits.is_bottom()
+                && ty.bits.meet(TypeBits::FIXNUM) == ty.bits
+                && emitter.homes.contains_key(&value)
+        }) {
             continue;
         }
         let state = function.frame_states.get(osr.frame_state);
@@ -1030,11 +1035,30 @@ pub fn emit_framed_with_runtime(
         {
             continue;
         }
+        // A checked value that is not imported here never reaches the loop
+        // through this entry, so there is nothing to test; decline.
+        if osr
+            .checks
+            .iter()
+            .any(|(value, _)| !imports.iter().any(|(_, imported)| imported == value))
+        {
+            continue;
+        }
         let offset = emitter.asm.here();
         emitter.prologue();
         for (slot, value) in imports {
             emitter.asm.load(A0, SLOTS, slot as i32 * 8);
             emitter.store(value, A0)?;
+        }
+        // Establish the proofs the loop relies on for imported values: a
+        // non-fixnum deoptimises to the header state before any iteration.
+        if !osr.checks.is_empty() {
+            let deopt = emitter.asm.label();
+            emitter.deopts.push((osr.frame_state, deopt));
+            for &(value, _) in &osr.checks {
+                emitter.load(value, A0)?;
+                emitter.guard_fixnum(A0, deopt);
+            }
         }
         emitter.asm.jump(emitter.blocks[&osr.block]);
         osr_entries.push((osr.bcp, offset));
@@ -1353,9 +1377,14 @@ mod tests {
             },
         )
         .expect("the ordinary entry remains compilable");
+        assert_eq!(
+            checked_code.osr_entries.len(),
+            1,
+            "a checked OSR entry is published with its guard emitted"
+        );
         assert!(
-            checked_code.osr_entries.is_empty(),
-            "RISC-V must not publish an OSR entry whose imported-value checks it cannot emit"
+            checked_code.has_deopt,
+            "an OSR guard needs deopt source snapshots even without instruction guards"
         );
         #[cfg(target_arch = "riscv64")]
         {
@@ -1713,6 +1742,78 @@ mod tests {
                 NIL.0,
             ]);
             RECONSTRUCTED.with(|out| assert_eq!(*out.borrow(), expected));
+        }
+    }
+
+    #[test]
+    fn osr_only_guard_reports_deopt_and_reconstructs_its_frame() {
+        use crate::t2::ir::OsrEntry;
+
+        extern "C" fn reconstruct(nscopes: u64, nwords: u64, words: *const u64, _: u64) -> u64 {
+            if nscopes != 1 || nwords != 5 {
+                return 0;
+            }
+            let words = unsafe { std::slice::from_raw_parts(words, nwords as usize) };
+            if words != [0, 0, 1, 0, EgclVal::from_single_float(2.0).0] {
+                return 0;
+            }
+            EgclVal::from_fixnum(99).0
+        }
+
+        let mut f = Function::new("rv-osr-only-guard");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    terminator: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let frame_state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 0,
+                locals: vec![ValueSource::Value {
+                    value: x,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(OsrEntry {
+            bcp: 0,
+            block: entry,
+            frame_state,
+            checks: vec![(x, IRType::of(TypeBits::FIXNUM))],
+        });
+        crate::t2::verify::verify(&f).expect("OSR identity IR verifies");
+        let framed = emit_framed(&f, reconstruct as *const () as usize as u64, 1)
+            .expect("emit OSR identity");
+        assert_eq!(framed.osr_entries.len(), 1, "checked OSR entry is emitted");
+        assert!(
+            framed.has_deopt,
+            "an OSR guard needs deopt source snapshots even without instruction guards"
+        );
+        #[cfg(target_arch = "riscv64")]
+        {
+            let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+            let osr: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buf.as_ptr().add(framed.osr_entries[0].1)) };
+            let mut slots = [EgclVal::from_fixnum(7).0];
+            assert_eq!(osr(slots.as_mut_ptr()), slots[0]);
+            slots[0] = EgclVal::from_single_float(2.0).0;
+            assert_eq!(osr(slots.as_mut_ptr()), EgclVal::from_fixnum(99).0);
         }
     }
 
