@@ -7,6 +7,11 @@
   With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
   to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
 
+- On s390x, T2 native code calls other native functions directly as well,
+  with the callees resolved when the compile is queued. With T2 on, on a z17:
+  takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
+  ([#97](https://github.com/atgreen/evergreen/pull/97)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
