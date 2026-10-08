@@ -44,6 +44,8 @@ mod native_transfer_entry_aarch64;
 mod native_transfer_entry_ppc64le;
 #[cfg(all(target_arch = "s390x", unix))]
 mod native_transfer_entry_s390x;
+#[cfg(all(target_arch = "riscv64", unix))]
+mod native_transfer_entry_riscv64;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
 mod pending_error;
@@ -19957,6 +19959,12 @@ fn run_native(
     #[cfg(all(target_arch = "s390x", unix))]
     if let Some(body) = nc.body.clone() {
         if let Some(result) = native_transfer_entry_s390x::try_run(body, args, env) {
+            return result;
+        }
+    }
+    #[cfg(all(target_arch = "riscv64", unix))]
+    if let Some(body) = nc.body.clone() {
+        if let Some(result) = native_transfer_entry_riscv64::try_run(body, args, env) {
             return result;
         }
     }
