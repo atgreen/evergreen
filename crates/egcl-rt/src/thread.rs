@@ -3354,7 +3354,11 @@ mod chase_lev_tests {
             let values = Arc::clone(&values);
             handles.push(std::thread::spawn(move || {
                 start.wait();
-                let deadline = Instant::now() + Duration::from_secs(5);
+                // Hang protection only; the test is about exactly-once claims,
+                // not throughput. Eight contending thieves on an in-order
+                // RISC-V core manage roughly 1,900 steals per second, so a
+                // 5 s deadline left the last ~800 tasks unclaimed there.
+                let deadline = Instant::now() + Duration::from_secs(120);
                 while claimed.load(Ordering::Acquire) < TASKS && Instant::now() < deadline {
                     if let Some(task) = deque.steal() {
                         values.lock().unwrap().push(number(&task));
