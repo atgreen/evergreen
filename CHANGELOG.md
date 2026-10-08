@@ -19,6 +19,11 @@
   and carrier migration behave as on the other Linux ports
   ([#120](https://github.com/atgreen/evergreen/pull/120)).
 
+- Foreign calls on riscv64 now use the LP64D calling convention for every
+  scalar signature, including floats, doubles, mixed argument lists and
+  variadic functions, instead of the bootstrap dispatcher's fixed integer
+  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
