@@ -64,10 +64,12 @@ roots, sampled back-edge polls, live T1-to-T2 OSR and precise deopt exits;
 the smoke's T2 sections require actual tier-2 installation and compare guard
 exits, calls, OSR and polls with T0 under GC stress. The fiber scheduler
 switches stacks natively (ra, s0-s11, fs0-fs11 and fcsr), so cooperative
-fibers behave as on the other Linux ports. Foreign calls go through the
-bootstrap dispatcher's fixed call shapes, as on s390x, and a memory fault
-inside native code is not yet recoverable. The remaining slices are tracked
-as children of Bead `bliss-miro8`.
+fibers behave as on the other Linux ports. Foreign calls use the LP64D
+calling convention for scalars (integers, pointers, floats, doubles,
+variadic calls after the C promotions); aggregate arguments and foreign
+callbacks are not yet ported, and a memory fault inside native code is not
+yet recoverable. The remaining slices are tracked as children of Bead
+`bliss-miro8`.
 
 ```sh
 scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
