@@ -13,6 +13,11 @@
   the optimizing tier decline every loop
   ([#98](https://github.com/atgreen/evergreen/pull/98)).
 
+- Functions using `CAR`, `CDR`, `EQ`, `NULL`, `NOT`, the logical bit
+  operations or `ASH` by a constant now reach T2 native code on ppc64le
+  instead of stopping at T1
+  ([#105](https://github.com/atgreen/evergreen/pull/105)).
+
 ### Platform support
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
