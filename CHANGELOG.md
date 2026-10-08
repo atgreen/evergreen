@@ -25,6 +25,13 @@
   and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
   line of every s390x structural decline
   ([#99](https://github.com/atgreen/evergreen/pull/99)).
+
+- On s390x, a T2 deoptimization now resumes the interpreter in place, so a
+  guard failing deep inside a directly recursive call returns the right value:
+  `(pow2 70)` answers 2^70 instead of signalling TYPE-ERROR. A self-call with
+  the wrong number of arguments now signals PROGRAM-ERROR at T2 on every
+  target instead of binding whatever the argument registers held
+  ([#107](https://github.com/atgreen/evergreen/pull/107)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
