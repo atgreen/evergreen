@@ -12,6 +12,12 @@
   takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
   ([#97](https://github.com/atgreen/evergreen/pull/97)).
 
+- On s390x, T2 now compiles uncommon traps and the simple-string fast paths
+  (`STRINGP`, `LENGTH`, ASCII `CHAR`), so shapes such as UIOP's `FIRST-CHAR`
+  and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
+  line of every s390x structural decline
+  ([#99](https://github.com/atgreen/evergreen/pull/99)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
