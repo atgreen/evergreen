@@ -17861,8 +17861,16 @@ extern "C" fn c2i_deopt_t2_inline(
     n_scopes: u64,
     n_words: u64,
     buf: *const u64,
-    code_id: u64,
+    entry_kind: u64,
 ) -> u64 {
+    // The stub passes the frame word its entry stamped: the code id, with
+    // bit 63 set when the activation came in through the register entry and
+    // so owns no EgclStack frame. An activation that owns the frame at fp
+    // resumes on it, exactly as run_native would have, and leaves it for its
+    // owner to pop, so the backtrace keeps one frame per logical call with
+    // its recorded arguments; a register-entry level gets a pushed frame.
+    let owns_frame = entry_kind & (1 << 63) == 0;
+    let code_id = entry_kind & !(1 << 63);
     // The stub names its own code. Under a direct native call that is the
     // callee, which ACTIVE_NATIVE_CODE (the outermost run_native's code, the
     // caller) cannot tell us; without the id, fall back to it as before.
@@ -17870,8 +17878,20 @@ extern "C" fn c2i_deopt_t2_inline(
         .then(|| CODE_BY_ID.with(|m| m.borrow().get(&code_id).and_then(std::rc::Weak::upgrade)))
         .flatten();
     let metadata = own.as_ref().and_then(|code| code.t2_metadata.clone());
+    let outer = if owns_frame {
+        let frame = egcl_rt::current_stack().fp() as *mut Frame;
+        if frame.is_null() {
+            stash_native_error(EgclError::Internal(
+                "T2 deopt supplied an empty virtual-frame stream".into(),
+            ));
+            return NIL.0;
+        }
+        Some(frame)
+    } else {
+        None
+    };
     let (scopes, metadata) =
-        match materialize_t2_deopt_scopes(n_scopes, n_words, buf, None, metadata) {
+        match materialize_t2_deopt_scopes(n_scopes, n_words, buf, outer, metadata) {
             Ok(materialized) => materialized,
             Err(message) => {
                 stash_native_error(EgclError::Internal(message.into()));
@@ -17901,10 +17921,29 @@ extern "C" fn c2i_deopt_t2_inline(
         ));
         return NIL.0;
     }
+    if std::env::var_os("EGCL_DEOPT_PATH_DBG").is_some() {
+        eprintln!(
+            "[deopt-path] Inlined sym={sym} scopes={} (inline, {})",
+            scopes.len(),
+            if owns_frame { "own frame" } else { "pushed frame" }
+        );
+    }
     // SAFETY: run_native keeps NATIVE_ENV pointing at a live &mut Env for the
     // duration of the native call, and nested native calls save and restore it.
     let env = unsafe { &mut *env_ptr };
-    match resume_inlined_in_t0(scopes, metadata, env) {
+    let stack = egcl_rt::current_stack();
+    let result = resume_inlined_in_t0(scopes, metadata, env);
+    if let Some(frame) = outer
+        && !std::ptr::eq(stack.fp(), frame)
+    {
+        // The resumed activation popped the frame on its Return, as the
+        // interpreter always does, but the native level that owns it has not
+        // returned yet and its owner pops once more -- run_native with
+        // pop_frame, a direct caller by restoring fp and sp_offset. Leave an
+        // empty frame in its place so that pop finds one.
+        let _ = stack.push_frame(NIL, std::ptr::null(), 0, FLAG_CALL);
+    }
+    match result {
         Ok(value) => value.0,
         Err(error) => {
             stash_native_error(error);

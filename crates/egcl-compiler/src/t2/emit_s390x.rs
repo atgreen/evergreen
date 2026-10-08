@@ -49,10 +49,11 @@
 //! (regalloc2's plus the stable homes added for split values), the edge
 //! parallel-copy buffer (max block-param count), the deopt serialisation buffer
 //! (max over frame states of four header words plus locals plus stack per
-//! scope), the remat buffer (max recipe count), and five words holding the saved
+//! scope), the remat buffer (max recipe count), and six words holding the saved
 //! call result, the poll countdown, the `EgclStack` pointer the entry
-//! received in r3, and the caller's frame pointer and stack offset parked
-//! across a direct native call. Every access must fit a signed 20-bit
+//! received in r3, the caller's frame pointer and stack offset parked
+//! across a direct native call, and the code id stamped by the entry (bit 63
+//! set by the register entry, which owns no frame). Every access must fit a signed 20-bit
 //! displacement, so an oversized frame declines.
 //!
 //! The entry prologue copies the entry block's parameters from activation
@@ -190,9 +191,11 @@ pub struct RuntimeCalls {
     /// a `Call` to one of them with its arity is entered directly
     /// (bliss-6j6pk, see the module docs).
     pub direct_natives: Vec<super::emit::DirectNativeTarget>,
-    /// Passed by every deopt stub as the adapter's fourth argument, so the
-    /// runtime can resolve the code the stub belongs to even when it was
-    /// entered by a direct native call; 0 means "the active code".
+    /// Stamped into a frame word by each entry and passed by every deopt
+    /// stub as the adapter's fourth argument (bit 63 set by the register
+    /// entry), so the runtime can resolve the code the stub belongs to even
+    /// when it was entered by a direct native call, and knows whether the
+    /// activation owns the frame at fp; 0 means "the active code".
     pub code_id: u64,
 }
 
@@ -240,6 +243,10 @@ struct Emitter<'a> {
     /// native call.
     saved_fp_offset: i32,
     saved_sp_offset: i32,
+    /// Frame word holding the code id, with bit 63 set when this activation
+    /// came in through the register entry and so has no EgclStack frame of
+    /// its own; the deopt stubs pass it to the runtime (bliss-w6aki).
+    entry_kind_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
@@ -604,6 +611,10 @@ impl Emitter<'_> {
         // this: its r3 is an argument, and a function with a register entry
         // makes only self-calls, so it never needs the pointer.)
         self.asm.store(3, 15, self.stack_offset);
+        // This activation owns the frame at fp (run_native's, or the one a
+        // direct call published): a deopt may resume on it.
+        self.asm.imm64(2, self.runtime.code_id);
+        self.asm.store(2, 15, self.entry_kind_offset);
         self.init_poll_word();
     }
 
@@ -1423,7 +1434,7 @@ impl Emitter<'_> {
         self.asm.imm64(2, state.scopes.len() as u64);
         self.asm.imm64(3, words as u64);
         self.asm.address(4, 15, self.deopt_base);
-        self.asm.imm64(5, self.runtime.code_id);
+        self.asm.load(5, 15, self.entry_kind_offset);
         self.asm.imm64(1, callback);
         self.asm.call_reg(1);
         // The callback resumes T0 inline and returns the activation's result
@@ -1508,6 +1519,7 @@ pub fn emit_framed_with_runtime(
         stack_offset: 0,
         saved_fp_offset: 0,
         saved_sp_offset: 0,
+        entry_kind_offset: 0,
         polls,
         transfer_exit: None,
         reg_entry: None,
@@ -1761,7 +1773,7 @@ pub fn emit_framed_with_runtime(
         0
     };
     let frame_words =
-        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
+        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 6;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported!());
@@ -1771,11 +1783,12 @@ pub fn emit_framed_with_runtime(
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
-    emitter.result_offset = 160 + (frame_words as i32 - 5) * 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 6) * 8;
     emitter.poll_offset = emitter.result_offset + 8;
     emitter.stack_offset = emitter.poll_offset + 8;
     emitter.saved_fp_offset = emitter.stack_offset + 8;
     emitter.saved_sp_offset = emitter.saved_fp_offset + 8;
+    emitter.entry_kind_offset = emitter.saved_sp_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported!());
     }
@@ -1801,6 +1814,9 @@ pub fn emit_framed_with_runtime(
         for (index, &parameter) in entry_params.iter().enumerate() {
             emitter.store(parameter, 2 + index as u8)?;
         }
+        // No frame of its own (r13 is the caller's): a deopt must push one.
+        emitter.asm.imm64(2, emitter.runtime.code_id | (1 << 63));
+        emitter.asm.store(2, 15, emitter.entry_kind_offset);
         emitter.init_poll_word();
         emitter.asm.branch(15, emitter.blocks[&function.entry()]);
     }
