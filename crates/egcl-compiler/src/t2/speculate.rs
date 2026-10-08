@@ -74,7 +74,7 @@
 //!
 //! 1. `materialize_entry_param_preguards`: a parameter used by at least one
 //!    speculated fixnum site, and otherwise only neutrally (self-call
-//!    argument, return, branch, edge argument, guard, `(eq x nil)`), is
+//!    argument, return, edge argument, guard), is
 //!    guarded as a fixnum at function entry using the builder's entry
 //!    FrameState. Any other use would make a non-fixnum argument legitimate
 //!    and the pre-guard a deopt storm.
@@ -532,9 +532,11 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
 ///
 /// Perma-deopt safety: a parameter is pre-guarded only when at least one use
 /// is a speculated fixnum site (runtime evidence of fixnum-ness) and every
-/// other use is NEUTRAL — a self-call argument, a return, a branch, an edge
-/// argument, a guard, or the pure `(eq x nil)` test. Any other use (a generic
-/// call, a heap accessor) is a path where a non-fixnum argument is legitimate,
+/// other use is NEUTRAL — a self-call argument, a return, an edge argument,
+/// or a guard. Branch conditions and equality tests are not neutral: they can
+/// test a nonnumeric sentinel before entering the numeric path, as in
+/// `(if x (+ x 1) 0)`. Any such use (or a generic call or heap accessor) is a
+/// path where a non-fixnum argument is legitimate,
 /// and an entry pre-guard would turn that call pattern into a deopt storm.
 fn materialize_entry_param_preguards(
     f: &mut Function,
@@ -605,11 +607,7 @@ fn materialize_entry_param_preguards(
                             Opcode::Call => {
                                 matches!(d.aux, AuxData::CallTarget(s) if Some(s) == self_sym)
                             }
-                            Opcode::Return
-                            | Opcode::Brif
-                            | Opcode::Jump
-                            | Opcode::Guard
-                            | Opcode::GenericEq => true,
+                            Opcode::Return | Opcode::Jump | Opcode::Guard => true,
                             _ => false,
                         };
                         if !neutral {
