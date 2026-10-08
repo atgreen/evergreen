@@ -16887,7 +16887,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
     c2i_eval_form_with_frame(EgclVal(form), true)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
 extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture: u64) -> u64 {
     match guard_c2i(|| {
         let env = NATIVE_ENV.with(|slot| slot.get());

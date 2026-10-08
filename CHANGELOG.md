@@ -59,6 +59,11 @@
   compile to a native serialization instruction at every tier instead of a
   generic call, and functions using them persist to bfasl as on x86-64
   ([#118](https://github.com/atgreen/evergreen/pull/118)).
+
+- On s390x, functions that create closures (any LAMBDA in the body) now
+  compile at T1 instead of staying interpreted, including loops that create a
+  closure per iteration and factories whose parameters are captured
+  ([#126](https://github.com/atgreen/evergreen/pull/126)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
