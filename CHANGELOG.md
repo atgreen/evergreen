@@ -20,6 +20,11 @@
   drops from about 1,500 to 1,000 instructions per iteration at T1
   ([#104](https://github.com/atgreen/evergreen/pull/104)).
 
+- A hot loop in a warm function on ppc64le now hands off from baseline
+  native code into its compiled T2 loop mid-flight instead of finishing at
+  the baseline tier; measured at 78 instead of 978 instructions per
+  iteration ([#114](https://github.com/atgreen/evergreen/pull/114)).
+
 ### Platform support
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source

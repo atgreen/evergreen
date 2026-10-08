@@ -17508,11 +17508,25 @@ extern "C" fn c2i_t1_backedge(
     // compiled entry, and as the emitter declines an OSR entry it cannot
     // transfer soundly. The loop keeps running at T1 and still promotes on its
     // next full call, so this costs a fast path, never a correct result.
-    #[cfg(not(target_arch = "s390x"))]
+    // x86-64 T2 keeps its roots in registers under a stack map, so its code
+    // needs no more activation slots than T1 and the frame is reused as is.
+    #[cfg(not(any(
+        target_arch = "s390x",
+        all(target_arch = "powerpc64", target_endian = "little")
+    )))]
     if t2.num_slots > body.num_slots() {
         return 0;
     }
-    #[cfg(target_arch = "s390x")]
+    // System Z and POWER T2 bodies reserve shadow-root slots after the
+    // activation slots for every runtime call, the back-edge poll included, so
+    // their code always needs a larger frame than T1 left. Grow the top frame
+    // in place (the collector scans the new slots through the T2 code_info)
+    // rather than refusing the hand-off, which on ppc64le refused it every
+    // time and left a warm hot loop at T1 for good (bliss-bliss-0li32).
+    #[cfg(any(
+        target_arch = "s390x",
+        all(target_arch = "powerpc64", target_endian = "little")
+    ))]
     {
         let stack = egcl_rt::current_stack();
         let frame = stack.fp();
