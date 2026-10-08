@@ -152,6 +152,12 @@ impl Asm {
         self.memory(0xe3, 0x90, dst << 4, base, disp);
     }
 
+    /// LDY: load a floating-point register with a raw doubleword.
+    pub fn load_float(&mut self, float_dst: u8, base: u8, disp: i32) {
+        assert!(float_dst < 16);
+        self.memory(0xed, 0x65, float_dst << 4, base, disp);
+    }
+
     pub fn load_u32(&mut self, dst: u8, base: u8, disp: i32) {
         assert!(dst < 16);
         self.memory(0xe3, 0x16, dst << 4, base, disp);
@@ -238,6 +244,24 @@ impl Asm {
 
     pub fn epilogue(&mut self) {
         self.epilogue_from(6);
+    }
+
+    /// [`Self::prologue`] with `extra` more bytes of frame above the 160-byte
+    /// save area, for outgoing stack arguments.
+    pub fn prologue_with(&mut self, extra: i32) {
+        assert!(extra >= 0 && extra % 8 == 0);
+        self.memory(0xeb, 0x24, 0x6f, 15, 48);
+        match i16::try_from(-160 - extra) {
+            Ok(delta) => self.add_imm(15, delta),
+            Err(_) => self.address(15, 15, -160 - extra),
+        }
+    }
+
+    /// [`Self::epilogue`] for a frame claimed by [`Self::prologue_with`].
+    pub fn epilogue_with(&mut self, extra: i32) {
+        assert!(extra >= 0 && extra % 8 == 0);
+        self.memory(0xeb, 0x04, 0x6f, 15, 208 + extra);
+        self.ret();
     }
 
     /// STMG `first`,r15 into the caller's register save area (register rN
@@ -427,6 +451,49 @@ mod tests {
         let mut a = Asm::new();
         a.store_u16(1, 2, -2);
         assert_eq!(a.finish().unwrap(), [0xe3, 0x10, 0x2f, 0xfe, 0xff, 0x70]);
+    }
+
+    #[test]
+    fn float_load_encoding_matches_llvm_systemz() {
+        // llvm-mc: ldy %f2,16(%r4) => ed 20 40 10 00 65
+        let mut a = Asm::new();
+        a.load_float(2, 4, 16);
+        a.load_float(6, 4, 24);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xed, 0x20, 0x40, 0x10, 0x00, 0x65, 0xed, 0x60, 0x40, 0x18, 0x00, 0x65
+            ]
+        );
+    }
+
+    #[test]
+    fn sized_frame_encoding_matches_llvm_systemz() {
+        // llvm-mc: stmg %r6,%r15,48(%r15) => eb 6f f0 30 00 24
+        //          aghi %r15,-168         => a7 fb ff 58
+        //          lmg %r6,%r15,216(%r15) => eb 6f f0 d8 00 04
+        //          br %r14                => 07 fe
+        let mut a = Asm::new();
+        a.prologue_with(8);
+        a.epilogue_with(8);
+        assert_eq!(
+            a.finish().unwrap(),
+            [
+                0xeb, 0x6f, 0xf0, 0x30, 0x00, 0x24, 0xa7, 0xfb, 0xff, 0x58, 0xeb, 0x6f, 0xf0, 0xd8,
+                0x00, 0x04, 0x07, 0xfe
+            ]
+        );
+        // The largest frame the FFI adapter claims still fits AGHI; past i16 the
+        // prologue switches to LAY: lay %r15,-40160(%r15) => e3 f0 f3 20 f6 71.
+        let mut a = Asm::new();
+        a.prologue_with(512);
+        assert_eq!(&a.finish().unwrap()[6..], &[0xa7, 0xfb, 0xfd, 0x60]);
+        let mut a = Asm::new();
+        a.prologue_with(40000);
+        assert_eq!(
+            &a.finish().unwrap()[6..],
+            &[0xe3, 0xf0, 0xf3, 0x20, 0xf6, 0x71]
+        );
     }
 
     #[test]

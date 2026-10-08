@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Foreign calls on s390x now go through a generated System z ABI adapter:
+  floating-point arguments and results, narrow integers, more than five
+  integer or four floating-point arguments, and variadic tails all follow the
+  ELF ABI. Previously `(sqrt 16d0)` through the FFI answered 16.0 and `pow`
+  returned a denormal, with no error
+  ([#133](https://github.com/atgreen/evergreen/pull/133)).
+
 - T2 keeps nullable numeric paths native: testing an argument for NIL or
   another sentinel no longer triggers a premature numeric guard and repeated
   fallback to the interpreter. This also keeps the phone-encoding benchmark's
