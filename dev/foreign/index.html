@@ -2339,7 +2339,7 @@ failure and returns a zero result to C; the enclosing foreign call can then
 signal an FFI error. <code>callback-error</code> consumes saved diagnostic text, including
 errors recorded on a foreign thread. Callback support must be checked for the
 target architecture separately from scalar foreign calls.</p>
-<p>On an x86-64 runtime with callback support, a callback can be exercised through
+<p>On a runtime with callback support (x86-64 and s390x), a callback can be exercised through
 the same call interface before giving it to a C library:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="p">(</span><span class="k">let</span><span class="w"> </span><span class="p">((</span><span class="nv">callback</span><span class="w"> </span><span class="p">(</span><span class="nv">egcl-ffi:make-callback</span><span class="w"> </span><span class="p">(</span><span class="k">lambda</span><span class="w"> </span><span class="p">(</span><span class="nv">x</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nb">+</span><span class="w"> </span><span class="nv">x</span><span class="w"> </span><span class="mi">1</span><span class="p">))</span><span class="w"> </span><span class="ss">:int</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="ss">:int</span><span class="p">))))</span>
 <a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">  </span><span class="p">(</span><span class="k">unwind-protect</span>
