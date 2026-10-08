@@ -968,6 +968,11 @@ pub fn emit_framed_with_runtime(
     }
     let mut osr_entries = Vec::new();
     for osr in &function.osr_entries {
+        // Imported values bypass the preheader guards. Until this backend
+        // emits their checks, entering here would invalidate the loop's proofs.
+        if !osr.checks.is_empty() {
+            continue;
+        }
         let state = function.frame_states.get(osr.frame_state);
         let Some(scope) = state.scopes.first() else {
             continue;
@@ -1270,6 +1275,7 @@ mod tests {
             block: header,
             bcp: 12,
             frame_state: state,
+            checks: Vec::new(),
         });
         for (block, args) in [(entry, inputs), (header, carried)] {
             f.set_terminator(
@@ -1321,6 +1327,25 @@ mod tests {
         assert_eq!(compiled.osr_entries.len(), 1);
         assert_eq!(compiled.root_sync_sites.len(), 1);
         assert_eq!(compiled.root_sync_sites[0].live_roots, 20);
+        let mut checked = f.clone();
+        let imported = checked.block(header).params[0];
+        checked.osr_entries[0]
+            .checks
+            .push((imported, IRType::of(super::super::ir::TypeBits::FIXNUM)));
+        let checked_code = emit_framed_with_runtime(
+            &checked,
+            0,
+            20,
+            RuntimeCalls {
+                poll: poll as *const () as usize as u64,
+                ..RuntimeCalls::default()
+            },
+        )
+        .expect("the ordinary entry remains compilable");
+        assert!(
+            checked_code.osr_entries.is_empty(),
+            "RISC-V must not publish an OSR entry whose imported-value checks it cannot emit"
+        );
         #[cfg(target_arch = "riscv64")]
         {
             let buffer = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();

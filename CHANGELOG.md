@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- T2 deoptimization now preserves pending operands after recursive calls and
+  retains frame reconstruction metadata when a guard exists only at an x86-64
+  OSR entry. RISC-V declines checked OSR entries it cannot validate, keeping
+  those loops on their existing tier
+  ([#131](https://github.com/atgreen/evergreen/pull/131)).
+
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
