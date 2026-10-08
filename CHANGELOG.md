@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- s390x T2 compilation diagnostics now report the actual register entry offset
+  used by direct recursive calls
+  ([#101](https://github.com/atgreen/evergreen/pull/101)).
+
 - On s390x, T2 now compiles additional type predicates and names unsupported
   opcodes in compilation diagnostics
   ([#91](https://github.com/atgreen/evergreen/pull/91)).

@@ -18634,9 +18634,6 @@ struct T2Artifact {
     has_deopt: bool,
     rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
-    /// `(symbol, entry)` of each direct native callee the code was emitted
-    /// against; resolved again and retained at install (bliss-6j6pk).
-    direct_natives: Vec<(u32, u64)>,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -19338,7 +19335,6 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     };
-    let direct_calls = retained_direct_calls(&artifact.direct_natives);
     // Diagnostic (bliss-fhci): pay the full T2 COMPILATION cost but install
     // nothing, so execution stays at T1. Moving the T2 threshold cannot separate
     // "compiling cost time" from "the emitted code is slower", because both
@@ -21972,11 +21968,6 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         has_deopt: framed.has_deopt,
         rooted_bodies,
         deopt_bodies,
-        direct_natives: input
-            .direct_natives
-            .iter()
-            .map(|target| (target.symbol, target.entry))
-            .collect(),
     })
 }
 
@@ -23897,7 +23888,6 @@ mod jtc4_stack_map_tests {
             has_deopt: false,
             rooted_bodies: vec![],
             deopt_bodies: HashMap::new(),
-            direct_natives: Vec::new(),
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 

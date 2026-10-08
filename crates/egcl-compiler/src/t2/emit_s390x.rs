@@ -1680,6 +1680,9 @@ pub fn emit_framed_with_runtime(
         emitter.store(parameter, 2)?;
     }
     emitter.asm.branch(15, emitter.blocks[&function.entry()]);
+    // The register entry's offset, published as FramedCode::compiled_entry so
+    // the install log and its tests can see it (0 = no register entry).
+    let mut compiled_entry = 0;
     if has_reg_entry {
         // Register entry: the same frame, but the arguments arrive in r2-r4 and
         // r13 stays the caller's. Move the arguments home BEFORE the poll word
@@ -1687,6 +1690,7 @@ pub fn emit_framed_with_runtime(
         let label = emitter.asm.label();
         emitter.asm.bind(label);
         emitter.reg_entry = Some(label);
+        compiled_entry = emitter.asm.here();
         emitter.asm.prologue();
         emitter.asm.address(15, 15, -emitter.frame_bytes);
         for (index, &parameter) in entry_params.iter().enumerate() {
@@ -1783,7 +1787,7 @@ pub fn emit_framed_with_runtime(
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,
-        compiled_entry: 0,
+        compiled_entry,
         osr_entries,
         bcp_offsets,
         native_spill_slots: frame_words as u32,
