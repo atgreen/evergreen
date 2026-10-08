@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- GETF now signals TYPE-ERROR for improper property lists with a non-NIL
+  atomic tail instead of returning the default value
+  ([#89](https://github.com/atgreen/evergreen/pull/89)).
+
 - RISC-V now supports the opt-in native segment boundary, preserving callee-
   saved integer and floating-point registers across native returns and
   transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
