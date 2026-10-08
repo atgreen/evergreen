@@ -49,14 +49,23 @@ scripts/egcl-limited.sh python3 scripts/portability-smoke.py riscv64 -- \
   target/riscv64gc-unknown-linux-gnu/release/egcl
 ```
 
-This is the initial CLI port: the interpreter and bytecode tiers run, saved
-images carry a distinct `RISCV64` architecture tag, `*features*` includes
-`:riscv` and `:riscv64`, and the portability smoke test passes natively. There
-is no RISC-V baseline or optimizing native compiler yet, so `EGCL_FORCE_TIER`
-values above `t0` fall back to bytecode. Foreign calls go through the
-bootstrap dispatcher's fixed call shapes, as on s390x, and the fiber scheduler
-runs without a native context switch. The remaining slices are tracked as
-children of Bead `bliss-miro8`.
+The interpreter and bytecode tiers run, saved images carry a distinct
+`RISCV64` architecture tag, `*features*` includes `:riscv` and `:riscv64`, and
+the portability smoke test passes natively. The T1 baseline compiler emits
+RV64I code with guarded fixnum add, subtract, increment, decrement, negation
+and comparisons, live T0-to-T1 OSR, and overflow and uncommon-trap
+deoptimization; `scripts/riscv64-jit-smoke.py` requires observable T1
+promotion and compares native, OSR and GC-stressed output with the
+interpreter. There is no RISC-V optimizing (T2) emitter yet, so hot T1 code
+stays at T1. Foreign calls go through the bootstrap dispatcher's fixed call
+shapes, as on s390x, the fiber scheduler runs without a native context
+switch, and a memory fault inside native code is not yet recoverable. The
+remaining slices are tracked as children of Bead `bliss-miro8`.
+
+```sh
+scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
+  target/riscv64gc-unknown-linux-gnu/release/egcl
+```
 
 ## Setup and build
 

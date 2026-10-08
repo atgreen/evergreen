@@ -84,6 +84,12 @@ mod s390x;
 #[cfg(all(target_arch = "s390x", unix))]
 use s390x::emit_native;
 
+#[cfg(all(target_arch = "riscv64", unix))]
+#[path = "bytecode_riscv64.rs"]
+mod riscv64;
+#[cfg(all(target_arch = "riscv64", unix))]
+use riscv64::emit_native;
+
 // ── Backend selection ──────────────────────────────────────────────
 
 /// Process-wide tier pin for differential testing (bliss-19tm).
@@ -1580,14 +1586,17 @@ fn native_insn_annotation(
 
 /// A lossless fallback for targets without an in-process instruction decoder.
 /// Keep halfword offsets so System Z bytecode/OSR positions remain selectable
-/// in the tier viewer without pretending these are decoded instructions.
+/// in the tier viewer without pretending these are decoded instructions. The
+/// riscv64 emitter never uses compressed instructions, so one line per
+/// 4-byte word there keeps each instruction on its own line.
 #[cfg(not(egcl_no_disassembly))]
 fn format_native_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
+    let width = if cfg!(target_arch = "riscv64") { 4 } else { 2 };
     let mut out =
         String::from("; Raw bytes; mnemonic decoding is unavailable for this architecture.\n");
-    for (index, chunk) in bytes.chunks(2).enumerate() {
-        let _ = write!(out, "  +{:04x}:  .byte ", index * 2);
+    for (index, chunk) in bytes.chunks(width).enumerate() {
+        let _ = write!(out, "  +{:04x}:  .byte ", index * width);
         for (byte_index, byte) in chunk.iter().enumerate() {
             if byte_index != 0 {
                 out.push_str(", ");
@@ -16914,8 +16923,6 @@ extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture
     }
 }
 
-// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
-#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 extern "C" fn c2i_alloc_cons(car: u64, cdr: u64) -> u64 {
     match guard_c2i(|| {
         egcl_rt::rooted!(car = EgclVal(car));
@@ -16977,8 +16984,6 @@ extern "C" fn c2i_t2_mv(primary: u64, dst: *mut EgclVal, n: u64) {
 /// T0. Returns the raw bits of T or NIL. `class` is a `typep_class::*` code.
 /// Because it never allocates, no minor GC can fire inside it, so the caller
 /// needs no operand-stack spill beyond the standard helper-call prologue.
-// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
-#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
     c2i_clear_mv();
     if typep_class_matches(class as u16, EgclVal(v)) {
@@ -17669,10 +17674,15 @@ fn elf_machine() -> u32 {
     {
         22
     }
+    #[cfg(target_arch = "riscv64")]
+    {
+        243
+    }
     #[cfg(not(any(
         all(target_arch = "x86_64", unix),
         target_arch = "aarch64",
-        target_arch = "s390x"
+        target_arch = "s390x",
+        target_arch = "riscv64"
     )))]
     {
         0
@@ -18584,8 +18594,6 @@ fn call_site_counter(func_ptr: usize, bcp: u32) -> &'static RuntimeCallSiteProfi
 /// Stable pointer embedded in T1 code. The record is intentionally leaked:
 /// installed native code may outlive a registry replacement, and an obsolete
 /// site must remain safe to increment even after its profile is detached.
-// Only T1 emitters call this; riscv64 has none until bliss-miro8.2 lands.
-#[cfg_attr(target_arch = "riscv64", allow(dead_code))]
 fn call_site_profile_token(func_ptr: usize, bcp: u32) -> u64 {
     call_site_counter(func_ptr, bcp) as *const RuntimeCallSiteProfile as usize as u64
 }
@@ -21549,7 +21557,8 @@ static FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
 };
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 static UNARY_FIXNUM_OP_MEMO: egcl_rt::execution_local::ExecutionLocal<
     RefCell<Vec<Option<Option<UnaryFixnumOp>>>>,
@@ -21588,7 +21597,8 @@ fn inlinable_fixnum_op_uncached(sym: u32) -> Option<FixnumOp> {
 #[derive(Clone, Copy)]
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 enum UnaryFixnumOp {
     Incr, // 1+
@@ -21598,7 +21608,8 @@ enum UnaryFixnumOp {
 
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
     memoized_by_sym(
@@ -21610,7 +21621,8 @@ fn inlinable_unary_fixnum_op(sym: u32) -> Option<UnaryFixnumOp> {
 
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
-    all(target_arch = "s390x", unix)
+    all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix)
 ))]
 fn inlinable_unary_fixnum_op_uncached(sym: u32) -> Option<UnaryFixnumOp> {
     match egcl_rt::symbols::symbol_name(sym).as_deref() {
@@ -21748,6 +21760,7 @@ fn emit_native_t1(
     all(target_arch = "x86_64", any(unix, windows)),
     all(target_arch = "aarch64", unix),
     all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix),
     all(target_arch = "powerpc64", target_endian = "little", unix)
 )))]
 fn emit_native(
