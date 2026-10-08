@@ -39121,6 +39121,12 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     if let Some(ref path) = ca.load_report {
         return run_load_report(path, &mut env);
     }
+    // EGCL_GC_STRESS_AFTER_INIT: the image is up; start the forced collections
+    // at the user's first form instead of paying one per bootstrap allocation
+    // (bliss-v2b6o). Only meaningful with EGCL_GC_STRESS set.
+    if std::env::var_os("EGCL_GC_STRESS_AFTER_INIT").is_some() {
+        egcl_rt::gc::stress_arm_after_init();
+    }
     if !ca.eval_forms.is_empty() {
         // Evaluate every --eval/-e form in order, all in the SAME env, so state
         // created by an earlier form (packages, defvars, loaded systems) is

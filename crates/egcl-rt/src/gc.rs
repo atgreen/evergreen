@@ -4891,6 +4891,40 @@ thread_local! {
     static GC_STRESS_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Whether strided stressing is live. `EGCL_GC_STRESS_AFTER_INIT` starts it
+/// disarmed; the host arms it with [`stress_arm_after_init`] once the image is
+/// up. Process-wide rather than per thread: the host's call and the
+/// allocations it means to cover need not share a thread. The allocation
+/// counter advances regardless, so `EGCL_GC_STRESS_AT` indices are unchanged.
+fn gc_stress_armed() -> &'static std::sync::atomic::AtomicBool {
+    static ARMED: OnceLock<std::sync::atomic::AtomicBool> = OnceLock::new();
+    ARMED.get_or_init(|| {
+        std::sync::atomic::AtomicBool::new(std::env::var_os("EGCL_GC_STRESS_AFTER_INIT").is_none())
+    })
+}
+
+/// Start the strided `EGCL_GC_STRESS` collections here.
+///
+/// Booting the Lisp image allocates about 100,000 objects before any user code
+/// runs, and under `EGCL_GC_STRESS=1` each of those costs a minor collection at
+/// 1.5–2 ms: a stress test that boots pays minutes, on every target, before it
+/// tests anything (bliss-v2b6o measured 281 s for `(print 1)` on a z17 debug
+/// build, and 611 s with poison and verification on; the deopt cleanup tests
+/// overran a 900 s cap). The bootstrap is not what such a test is probing. With
+/// `EGCL_GC_STRESS_AFTER_INIT` set, stressing stays off until the CLI calls
+/// this before its first user form. A numeric `EGCL_GC_STRESS_SKIP` cannot
+/// express the same thing, because the bootstrap's allocation count moves with
+/// every image change.
+pub fn stress_arm_after_init() {
+    gc_stress_armed().store(true, std::sync::atomic::Ordering::SeqCst);
+    // Say where the stress starts, so a clean run is known to have stressed
+    // something (a skip past the program's end proves nothing: bliss-sqpi).
+    if gc_stress_stride() != 0 {
+        let so_far = GC_STRESS_COUNTER.with(std::cell::Cell::get);
+        eprintln!("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation #{so_far}");
+    }
+}
+
 /// Run a minor collection every `EGCL_GC_STRESS` allocations, at a GC-safe
 /// point (before this allocation, mirroring the real TLAB-refill trigger — the
 /// caller is not yet holding a half-built object from this call).
@@ -4920,8 +4954,13 @@ fn maybe_gc_stress() {
         let _ = collect_t0_minor();
         return;
     }
-    // Strided stressing, optionally skipping the first `SKIP` allocations.
-    if stride != 0 && n > gc_stress_skip() && n % stride == 0 {
+    // Strided stressing, optionally skipping the first `SKIP` allocations, and
+    // only once armed (immediately, unless EGCL_GC_STRESS_AFTER_INIT defers it).
+    if stride != 0
+        && n > gc_stress_skip()
+        && n % stride == 0
+        && gc_stress_armed().load(std::sync::atomic::Ordering::Relaxed)
+    {
         let _ = collect_t0_minor();
     }
 }
