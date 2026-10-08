@@ -31,6 +31,11 @@ pub(super) unsafe fn enter(
 }
 
 /// Cold transfer exit. No Rust frame may be crossed by this path.
+///
+/// # Safety
+/// The caller must supply the live native segment's pinned anchor and reach
+/// this through the segment's generated transfer path with the expected
+/// System Z register convention; the call never returns.
 #[unsafe(naked)]
 pub unsafe extern "C" fn leave_native_segment(
     _anchor: *mut NativeSegment,

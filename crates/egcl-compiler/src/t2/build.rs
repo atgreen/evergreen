@@ -371,6 +371,11 @@ struct Builder<'a> {
     /// resetting the operand stack to `sp_restore` and pushing the value
     /// (bliss-8tlo).
     block_exits: HashMap<u32, (u32, u16)>,
+    /// Local slots that may still be read before being written, on entry to
+    /// each bytecode index: one bitset (`u64` words) per instruction. Computed
+    /// by `compute_local_liveness`; `build_frame_state` names only live slots
+    /// and marks the rest `Unbound` (bliss-dfilp, bliss-enisp).
+    local_live_in: Vec<Vec<u64>>,
     control_scopes: Option<ScopeMap>,
     /// Predecessor edges of a block: `(pred_block, target_index_in_pred_terminator)`.
     pred_edges: HashMap<Block, Vec<(Block, usize)>>,
@@ -566,6 +571,7 @@ impl<'a> Builder<'a> {
             block_of: HashMap::new(),
             entry_depth: HashMap::new(),
             block_exits: HashMap::new(),
+            local_live_in: Vec::new(),
             control_scopes: None,
             pred_edges: HashMap::new(),
             total_preds: Vec::new(),
@@ -605,6 +611,7 @@ impl<'a> Builder<'a> {
         }
         self.find_leaders()?;
         self.compute_depths()?;
+        self.compute_local_liveness()?;
         self.create_blocks();
         self.compute_reachable()?;
         self.compute_total_preds()?;
@@ -851,7 +858,9 @@ impl<'a> Builder<'a> {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::PushHandlerBind { hb } if self.native_cleanups => {
-                    let count = self.bf.handler_binds
+                    let count = self
+                        .bf
+                        .handler_binds
                         .get(*hb as usize)
                         .ok_or(BuildError::Unsupported("invalid handler-bind table"))?
                         .types
@@ -958,14 +967,180 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    // ── Pass 2b: local-slot liveness at each bytecode index ─────────
+
+    /// Whether local `slot` may be read before it is next written, starting at
+    /// bytecode index `bcp`. Indices the analysis did not cover (none, once
+    /// `compute_local_liveness` has run) are reported live.
+    fn local_is_live_at(&self, slot: u16, bcp: usize) -> bool {
+        match self.local_live_in.get(bcp) {
+            Some(words) => {
+                let slot = slot as usize;
+                words
+                    .get(slot / 64)
+                    .is_some_and(|w| w & (1u64 << (slot % 64)) != 0)
+            }
+            None => true,
+        }
+    }
+
+    /// Backward "may be read before written" dataflow over the bytecode,
+    /// one bit per local slot, to a fixpoint.
+    ///
+    /// Uses are `LoadLocal`; definitions are `StoreLocal` and the slots a
+    /// `TakeValuesToLocals` fills. Control successors follow the same
+    /// relation as `compute_depths`. Where the interpreter could resume at a
+    /// position this analysis cannot see through — a handler, cleanup, or
+    /// catch landing (`native_cleanups`), a cleanup body entered as bytecode
+    /// fallback (`PushUnwind` in `transfer_mode`), or host evaluation — every
+    /// slot is treated as live at that instruction, so the result is only
+    /// ever conservative.
+    ///
+    /// Only this is sound for frame states: a deopt at `bcp` resumes the
+    /// interpreter at `bcp` and the interpreter reads locals only through
+    /// `LoadLocal`, so a slot dead here is a slot whose reconstructed value
+    /// can never be observed.
+    fn compute_local_liveness(&mut self) -> Result<(), BuildError> {
+        let code = &self.bf.code;
+        let n = code.len();
+        let words = usize::from(self.bf.n_locals).div_ceil(64);
+        let mut live_in: Vec<Vec<u64>> = vec![vec![0u64; words]; n];
+        let all_ones = |w: usize| -> u64 {
+            let used = usize::from(self.bf.n_locals) - w * 64;
+            if used >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << used) - 1
+            }
+        };
+
+        // Per-instruction transfer: (successors, everything-live, uses, defs).
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut opaque: Vec<bool> = vec![false; n];
+        let mut uses: Vec<Option<u16>> = vec![None; n];
+        let mut defs: Vec<(u16, u16)> = vec![(0, 0); n]; // (base, count)
+        for i in 0..n {
+            let push = |t: usize, succs: &mut Vec<Vec<usize>>| {
+                if t < n {
+                    succs[i].push(t);
+                }
+            };
+            if self.native_cleanups
+                && (self.catch_transition(i).is_some()
+                    || self.handler_transition(i).is_some()
+                    || self.handler_bind_transition(i).is_some()
+                    || self.restart_case_transition(i).is_some()
+                    || matches!(
+                        code[i],
+                        Instr::CallNamed { .. }
+                            | Instr::EvalHost(_)
+                            | Instr::LoadFunction(_)
+                            | Instr::SetValues(_)
+                            | Instr::CleanupReturn
+                            | Instr::Throw
+                    ))
+            {
+                opaque[i] = true;
+            }
+            match &code[i] {
+                Instr::LoadLocal(k) => {
+                    uses[i] = Some(*k);
+                    push(i + 1, &mut succs);
+                }
+                Instr::StoreLocal(k) => {
+                    defs[i] = (*k, 1);
+                    push(i + 1, &mut succs);
+                }
+                Instr::TakeValuesToLocals { nvars, slot_base } => {
+                    defs[i] = (*slot_base, *nvars);
+                    push(i + 1, &mut succs);
+                }
+                Instr::Br(t) => push(*t as usize, &mut succs),
+                Instr::Go { target_bcp, .. } => push(*target_bcp as usize, &mut succs),
+                Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => {
+                    push(*t as usize, &mut succs);
+                    push(i + 1, &mut succs);
+                }
+                Instr::ReturnFrom { block_id } => {
+                    let (resume_bcp, _) = *self
+                        .block_exits
+                        .get(block_id)
+                        .ok_or(BuildError::Unsupported("ReturnFrom to an unknown block"))?;
+                    push(resume_bcp as usize, &mut succs);
+                }
+                Instr::Return => {}
+                Instr::Throw => opaque[i] = true,
+                Instr::EvalHost(_) | Instr::PushUnwind { .. } => {
+                    opaque[i] = true;
+                    push(i + 1, &mut succs);
+                }
+                Instr::EnterCleanupNormal { cleanup_bcp, .. } => {
+                    opaque[i] = true;
+                    push(*cleanup_bcp as usize, &mut succs);
+                }
+                Instr::CleanupReturn => {
+                    opaque[i] = true;
+                    if let Ok((_, resume)) = self.normal_cleanup_return(i as u32) {
+                        push(resume as usize, &mut succs);
+                    }
+                }
+                Instr::CallNamed { sym, .. }
+                    if self.transfer_mode && is_never_returning_call(*sym) => {}
+                _ => push(i + 1, &mut succs),
+            }
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in (0..n).rev() {
+                let mut out = vec![0u64; words];
+                if opaque[i] {
+                    for (w, slot) in out.iter_mut().enumerate() {
+                        *slot = all_ones(w);
+                    }
+                } else {
+                    for &s in &succs[i] {
+                        for w in 0..words {
+                            out[w] |= live_in[s][w];
+                        }
+                    }
+                    let (base, count) = defs[i];
+                    for k in base..base.saturating_add(count) {
+                        let k = usize::from(k);
+                        if k / 64 < words {
+                            out[k / 64] &= !(1u64 << (k % 64));
+                        }
+                    }
+                    if let Some(k) = uses[i] {
+                        let k = usize::from(k);
+                        if k / 64 < words {
+                            out[k / 64] |= 1u64 << (k % 64);
+                        }
+                    }
+                }
+                if out != live_in[i] {
+                    live_in[i] = out;
+                    changed = true;
+                }
+            }
+        }
+        self.local_live_in = live_in;
+        Ok(())
+    }
+
     // ── Pass 3: block creation ──────────────────────────────────────
 
     fn create_blocks(&mut self) {
         let leaders = self.leaders.clone();
         let entry_is_loop_header = self.bf.code.iter().any(|instr| {
-            matches!(instr,
-                Instr::Br(0) | Instr::BrIfFalse(0) | Instr::BrIfTrue(0)
-                | Instr::Go { target_bcp: 0, .. })
+            matches!(
+                instr,
+                Instr::Br(0)
+                    | Instr::BrIfFalse(0)
+                    | Instr::BrIfTrue(0)
+                    | Instr::Go { target_bcp: 0, .. }
+            )
         });
         for &l in &leaders {
             let b = if l == 0 && !entry_is_loop_header {
@@ -1371,12 +1546,15 @@ impl<'a> Builder<'a> {
                     let Instr::PushHandlerBind { hb } = instruction else {
                         unreachable!();
                     };
-                    let count = self.bf.handler_binds
+                    let count = self
+                        .bf
+                        .handler_binds
                         .get(*hb as usize)
                         .ok_or(BuildError::Unsupported("invalid handler-bind table"))?
                         .types
                         .len();
-                    let first = stack.len()
+                    let first = stack
+                        .len()
                         .checked_sub(count)
                         .ok_or(BuildError::Unsupported("handler-bind without handlers"))?;
                     stack.split_off(first)
@@ -2358,8 +2536,17 @@ impl<'a> Builder<'a> {
         stack: &[Value],
         bcp: u32,
     ) -> crate::t2::frame_state::FrameStateId {
+        // A slot the interpreter can never read again from `bcp` is not
+        // reconstructed: naming it would keep its value deopt-live (and so
+        // spilled, and carried through every loop header) for nothing. The
+        // interpreter frame receives UNBOUND-MARKER there, as it already does
+        // for not-yet-initialised locals in the entry state.
         let mut locals = Vec::with_capacity(self.bf.n_locals as usize);
         for i in 0..self.bf.n_locals {
+            if !self.local_is_live_at(i, bcp as usize) {
+                locals.push(ValueSource::Unbound);
+                continue;
+            }
             let v = self.read_var(Var::Local(i), block);
             locals.push(ValueSource::Value {
                 value: v,
@@ -2865,8 +3052,8 @@ mod tests {
     use super::*;
     use crate::t2::inlining::{InlineConfig, InlineOptions, InlinePolicy};
     use crate::t2::ir::Opcode;
-    use std::sync::Arc;
     use egcl_rt::value::EgclVal;
+    use std::sync::Arc;
 
     fn bf(
         name: &str,
@@ -3061,6 +3248,79 @@ mod tests {
         assert_eq!(f.inst(call).frame_state, before);
         assert_eq!(f.succs(entry), vec![normal, cleanup]);
         assert_eq!(f.inst(call).targets[1].args, vec![live]);
+        assert!(
+            crate::t2::verify::verify(&f).is_ok(),
+            "{:?}",
+            crate::t2::verify::verify(&f)
+        );
+    }
+
+    #[test]
+    fn frame_states_name_only_locals_the_interpreter_can_still_read() {
+        // Local 0 is the parameter; local 1 is a let-bound temporary that is
+        // written at 3 and read once at 4. Every frame state after that read
+        // must leave slot 1 Unbound, and the last one (nothing is read after
+        // bcp 8) must leave slot 0 Unbound too (bliss-dfilp, bliss-enisp).
+        //  0: LoadLocal 0
+        //  1: Const 0            ; 1
+        //  2: CallNamed + 2      ; state@2: l0 live (read at 7), l1 dead
+        //  3: StoreLocal 1
+        //  4: LoadLocal 1
+        //  5: Const 0
+        //  6: CallNamed + 2      ; state@6: l0 live, l1 dead
+        //  7: LoadLocal 0
+        //  8: CallNamed + 2      ; state@8: both dead
+        //  9: Return
+        let plus = egcl_rt::symbols::intern("+");
+        let f = build_from_bytecode(&bf(
+            "dead-locals",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::Const(0),
+                Instr::CallNamed {
+                    sym: plus,
+                    nargs: 2,
+                },
+                Instr::StoreLocal(1),
+                Instr::LoadLocal(1),
+                Instr::Const(0),
+                Instr::CallNamed {
+                    sym: plus,
+                    nargs: 2,
+                },
+                Instr::LoadLocal(0),
+                Instr::CallNamed {
+                    sym: plus,
+                    nargs: 2,
+                },
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(1)],
+            2,
+            1,
+            3,
+        ))
+        .expect("builds");
+
+        let live_slots = |bcp: u32| -> Vec<bool> {
+            let (_, fs) = f
+                .frame_states
+                .iter()
+                .find(|(_, fs)| fs.scopes.len() == 1 && fs.scopes[0].bcp == bcp)
+                .unwrap_or_else(|| panic!("no frame state at bcp {bcp}"));
+            fs.scopes[0]
+                .locals
+                .iter()
+                .map(|src| matches!(src, ValueSource::Value { .. }))
+                .collect()
+        };
+        assert_eq!(live_slots(2), vec![true, false], "state at the first call");
+        assert_eq!(
+            live_slots(6),
+            vec![true, false],
+            "state after l1's last read"
+        );
+        assert_eq!(live_slots(8), vec![false, false], "state at the last call");
         assert!(
             crate::t2::verify::verify(&f).is_ok(),
             "{:?}",

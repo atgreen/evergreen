@@ -88,9 +88,11 @@
 //! Constants (`Const*` folded; heap literals loaded through their rooted
 //! constant-pool slot), `Return`, `Jump`, two-way `Brif`, `Guard` for the
 //! FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on tagged single-floats
-//! (unboxed through the direct GPR↔FPR move), `FixnumAdd/Sub/Mul/Neg` and the
+//! (moved in with `mtvsrd` and converted to double format), `FixnumAdd/Sub/Mul/Neg` and the
 //! five comparisons (branchless via `isel`), all tag-guarded and deopting on
-//! overflow. Anything else returns `UnsupportedOp(0x9C)`.
+//! overflow; `Guard` for CONS, `Car`/`Cdr` on a proven cons, `GenericEq`,
+//! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant. Anything else returns
+//! `UnsupportedOp(0x9C)`.
 //!
 //! # Deopt exits
 //!
@@ -113,10 +115,10 @@ use super::ir::{
     ValueRepresentation,
 };
 use super::mach::{Location, RegClass};
-use std::collections::{HashMap, HashSet};
 use egcl_rt::asm::Cc;
 use egcl_rt::asm_ppc64le::{Asm, Label, frame};
-use egcl_rt::value::{NIL, T, EgclVal, UNBOUND};
+use egcl_rt::value::{EgclVal, NIL, T, UNBOUND};
+use std::collections::{HashMap, HashSet};
 
 /// Primary working register, and the ABI's first argument and return register.
 const W0: u8 = 3;
@@ -333,6 +335,16 @@ impl Emitter<'_> {
     }
 
     /// A tagged single-float carries tag 4 and its f32 bits in the high half.
+    /// Deopt unless `register` carries the cons tag. build.rs emits a separate
+    /// `Guard(TypeTag(CONS))` ahead of every `Car`/`Cdr`, so refusing it cost the
+    /// whole function its T2 code for any use of CAR or CDR (bliss-ksuwa).
+    fn guard_cons(&mut self, register: u8, deopt: Label) {
+        self.asm.li(T0, 7);
+        self.asm.and(T0, register, T0);
+        self.asm.compare_imm(0, T0, egcl_rt::value::TAG_CONS as i16);
+        self.asm.branch(Cc::Ne, 0, deopt);
+    }
+
     fn guard_single_float(&mut self, register: u8, deopt: Label) {
         self.asm.li(T0, 7);
         self.asm.and(T0, register, T0);
@@ -358,10 +370,14 @@ impl Emitter<'_> {
 
     /// Unbox a tagged single-float from `gpr` into `fpr`, through the direct
     /// register-file move POWER provides.
+    /// A tagged single carries its f32 bits in the high word and the tag in the
+    /// low one. `mtvsrd` lands the whole word in the register, where the bits
+    /// must then be converted to the double format the register file uses; the
+    /// conversion reads only the high word, so the tag needs no masking
+    /// (bliss-pjq99).
     fn unbox_single(&mut self, fpr: u8, gpr: u8) {
-        self.asm.srdi(T1, gpr, 32);
-        self.asm.sldi(T1, T1, 32);
-        self.asm.move_to_float(fpr, T1);
+        self.asm.move_to_float(fpr, gpr);
+        self.asm.single_to_double(fpr, fpr);
     }
 
     /// Multiply the tagged fixnums in `W0` and `W1`, leaving the tagged product in
@@ -625,13 +641,15 @@ impl Emitter<'_> {
         let first = *data.args.first().ok_or_else(unsupported)?;
         self.load(first, W0)?;
         match data.opcode {
-            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT) =>
+            Guard if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM || ty.bits == TypeBits::SINGLE_FLOAT || ty.bits == TypeBits::CONS) =>
             {
                 let deopt = self.deopt_label(data)?;
-                if matches!(&data.aux, AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM) {
-                    self.guard_fixnum(W0, deopt);
-                } else {
-                    self.guard_single_float(W0, deopt);
+                match &data.aux {
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::FIXNUM => {
+                        self.guard_fixnum(W0, deopt)
+                    }
+                    AuxData::TypeTag(ty) if ty.bits == TypeBits::CONS => self.guard_cons(W0, deopt),
+                    _ => self.guard_single_float(W0, deopt),
                 }
             }
             FloatAdd | FloatSub | FloatMul => {
@@ -645,6 +663,8 @@ impl Emitter<'_> {
                     FloatSub => self.asm.sub_single(F0, F0, F1),
                     _ => self.asm.multiply_single(F0, F0, F1),
                 }
+                // Back to single-precision bits in the high word, then tag.
+                self.asm.double_to_single(F0, F0);
                 self.asm.move_from_float(W0, F0);
                 self.asm.srdi(W0, W0, 32);
                 self.asm.sldi(W0, W0, 32);
@@ -689,6 +709,95 @@ impl Emitter<'_> {
                         self.asm.isel(W0, T0, T1, cc, 0);
                         return self.store(result, W0);
                     }
+                }
+            }
+            GenericEq => {
+                // Lisp EQ (and NULL / NOT, which speculate.rs rewrites to
+                // GenericEq(x, NIL)) is bit-equality of the two tagged words: one
+                // compare and an `isel` of T/NIL. No guard: the operands may be any
+                // tagged values and the rewrite carries no frame state.
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.asm.compare(0, W0, W1);
+                self.asm.imm64(T0, T.0);
+                self.asm.imm64(T1, NIL.0);
+                self.asm.isel(W0, T0, T1, Cc::E, 0);
+            }
+            Car | Cdr => {
+                // A cons cell is headerless and its tagged pointer differs from the
+                // cell address only in the low three bits, so masking them off
+                // gives the base and the two slots sit at +0 and +8. Mirrors
+                // emit.rs, including the refusal of the guarded form: this is the
+                // fast path for a cons whose type the IR has already proven.
+                if data.flags.guard || data.flags.effectful || data.frame_state.is_some() {
+                    return Err(unsupported());
+                }
+                self.asm.imm64(T0, !7u64);
+                self.asm.and(W0, W0, T0);
+                let offset = if data.opcode == Car { 0 } else { 8 };
+                self.asm.load(W0, W0, offset).ok_or_else(unsupported)?;
+            }
+            LogAnd | LogOr | LogXor => {
+                // Exact on the tagged representation: both operands carry the same
+                // zero tag, so tagged(a) OP tagged(b) = (a OP b)<<3 = tagged(a OP b).
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.load(*data.args.get(1).ok_or_else(unsupported)?, W1)?;
+                self.guard_fixnum(W1, deopt);
+                match data.opcode {
+                    LogAnd => self.asm.and(W0, W0, W1),
+                    LogOr => self.asm.or(W0, W0, W1),
+                    _ => self.asm.xor(W0, W0, W1),
+                }
+            }
+            LogNot => {
+                // ~(x<<3) has its low three bits set; clearing them again yields
+                // (~x)<<3, which is tagged(~x). `nand` of a value with itself is NOT.
+                let deopt = self.deopt_label(data)?;
+                self.guard_fixnum(W0, deopt);
+                self.asm.nand(W0, W0, W0);
+                self.asm.imm64(T0, !7u64);
+                self.asm.and(W0, W0, T0);
+            }
+            FixnumShl | FixnumShr => {
+                // (ash x n) for a CONSTANT n; a variable amount declines. The
+                // constants map holds tagged bits, so the count is untagged first.
+                // DIRECTION: on FixnumShl a NEGATIVE constant is a RIGHT shift,
+                // because that is how `(ash x -2)` lowers; FixnumShr is always a
+                // right shift. Getting this backwards is a wrong number, not a
+                // crash (bliss-ys4ha on AArch64).
+                let deopt = self.deopt_label(data)?;
+                let amount = *data.args.get(1).ok_or_else(unsupported)?;
+                let tagged = *self.constants.get(&amount).ok_or_else(unsupported)?;
+                let n = (tagged as i64) >> 3;
+                self.guard_fixnum(W0, deopt);
+                let shift_right = if data.opcode == FixnumShr {
+                    Some(n.max(0))
+                } else if n < 0 {
+                    Some(-n)
+                } else {
+                    None
+                };
+                if let Some(right) = shift_right {
+                    // Untag, shift arithmetically, retag; cannot overflow. Saturated
+                    // at 60 because a 61-bit payload shifted further is already 0
+                    // or -1.
+                    let k = right.min(60) as u8;
+                    self.asm.sradi(W0, W0, 3 + k);
+                    self.asm.sldi(W0, W0, 3);
+                } else {
+                    // tagged(x)<<n = tagged(x<<n), but it can leave fixnum range and
+                    // no flag reports that: shift back and compare, deopting if the
+                    // value did not survive the round trip. W0 is untouched until
+                    // the check passes, so the deopt exit sees the operand.
+                    if n > 60 {
+                        return Err(unsupported());
+                    }
+                    let k = n as u8;
+                    self.asm.sldi(T0, W0, k);
+                    self.asm.sradi(T1, T0, k);
+                    self.asm.compare(0, T1, W0);
+                    self.asm.branch(Cc::Ne, 0, deopt);
+                    self.asm.mov(W0, T0);
                 }
             }
             _ => return Err(unsupported()),
@@ -942,6 +1051,48 @@ pub fn emit_framed_with_runtime(
             .iter()
             .filter(|range| {
                 range.vreg.class == RegClass::Gpr && range.start <= after && after < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .chain(data.args.iter().copied())
+            .chain(
+                data.targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
+    // A sampled back-edge poll is a runtime call too, so it needs a root set; a
+    // loop whose poll had none was declined wholesale (bliss-83icg). Poll before
+    // the edge's parallel transfers: lowering represents those as anonymous
+    // moves ahead of the machine terminator, and their destination phi values do
+    // not exist yet in the emitted code. Mirrors the s390x emitter.
+    for (block_index, &block) in function.block_order().iter().enumerate() {
+        let Some(&source) = function.block(block).insts.last() else {
+            continue;
+        };
+        if !emitter.polls.contains(&source) {
+            continue;
+        }
+        let mb = &machine.blocks[block_index];
+        let mut boundary = mb.end;
+        while boundary > mb.start
+            && machine.insts[boundary - 1]
+                .source_inst
+                .is_none_or(|inst| inst == source)
+        {
+            boundary -= 1;
+        }
+        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let data = function.inst(source);
+        let mut roots: Vec<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
             })
             .map(|range| Value(range.vreg.num))
             .chain(data.args.iter().copied())

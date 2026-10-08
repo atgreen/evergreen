@@ -256,7 +256,7 @@ impl RuntimeConfig {
             .ok()
             .map(|s| parse_size(&s, "EGCL_STACK_SIZE"))
             .transpose()?
-            .unwrap_or(512 * 1024);
+            .unwrap_or(crate::thread::DEFAULT_STACK_SIZE);
         let num_workers = std::env::var("EGCL_WORKERS")
             .ok()
             .map(|s| parse_usize(&s, "EGCL_WORKERS"))
@@ -1367,11 +1367,14 @@ extern "C" fn sigsegv_handler(
         }
         SigsegvFaultKind::Ordinary => {
             crate::syscall::dbg_write(b"egcl: unhandled memory fault\n");
-            #[cfg(all(target_os = "linux", target_arch = "s390x"))]
+            #[cfg(all(
+                target_os = "linux",
+                any(target_arch = "s390x", target_arch = "riscv64")
+            ))]
             {
-                // Allocation-free diagnostics: fault address and the PSW
-                // address (the s390x program counter, at the same offset
-                // rewrite_ucontext_ip writes) in hex.
+                // Allocation-free diagnostics: fault address and the program
+                // counter (the s390x PSW address or the riscv64 pc, at the
+                // same offset rewrite_ucontext_ip writes) in hex.
                 let mut buf = [0u8; 64];
                 let mut n = 0;
                 let mut put = |bytes: &[u8], n: &mut usize| {
@@ -1393,7 +1396,11 @@ extern "C" fn sigsegv_handler(
                 put(b"addr=0x", &mut n);
                 hex(addr, &mut h);
                 put(&h, &mut n);
-                const UCONTEXT_PSW_ADDR_OFFSET: usize = 48;
+                const UCONTEXT_PSW_ADDR_OFFSET: usize = if cfg!(target_arch = "riscv64") {
+                    176
+                } else {
+                    48
+                };
                 let psw_addr = if _context.is_null() {
                     0
                 } else {
@@ -1403,7 +1410,14 @@ extern "C" fn sigsegv_handler(
                         )
                     }
                 };
-                put(b" psw=0x", &mut n);
+                put(
+                    if cfg!(target_arch = "riscv64") {
+                        b" pc=0x" as &[u8]
+                    } else {
+                        b" psw=0x"
+                    },
+                    &mut n,
+                );
                 hex(psw_addr, &mut h);
                 put(&h, &mut n);
                 put(b"\n", &mut n);
@@ -1746,11 +1760,34 @@ fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
     true
 }
 
+#[cfg(all(target_os = "linux", target_arch = "riscv64"))]
+fn rewrite_ucontext_ip(context: *mut core::ffi::c_void, ip: usize) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    // Linux riscv64 ucontext_t: uc_flags:8, uc_link:8, stack_t:24,
+    // sigset_t:128, then the 16-byte-aligned mcontext_t whose __gregs[0] is
+    // the pc: byte offset 176. Measured with offsetof(ucontext_t,
+    // uc_mcontext.__gregs[0]) on real hardware (cfarm95, Debian 13, glibc
+    // 2.41), not read off a header.
+    const UCONTEXT_PC_OFFSET: usize = 176;
+    unsafe {
+        core::ptr::write_unaligned(
+            (context as *mut u8).add(UCONTEXT_PC_OFFSET) as *mut usize,
+            ip,
+        );
+    }
+    true
+}
+
 #[cfg(all(
     unix,
     not(target_arch = "x86_64"),
     not(target_os = "macos"),
-    not(all(target_os = "linux", target_arch = "s390x"))
+    not(all(
+        target_os = "linux",
+        any(target_arch = "s390x", target_arch = "riscv64")
+    ))
 ))]
 fn rewrite_ucontext_ip(_context: *mut core::ffi::c_void, _ip: usize) -> bool {
     false
