@@ -226,16 +226,34 @@ pub(super) fn emit_native(
                 {
                     continue;
                 }
-                a.imm64(2, u64::from(callee));
+                // A leaf builtin the call site resolved at compile time is
+                // called through the direct adapter with its table slot baked
+                // in and the invalidation generation in place of a profile
+                // token (builtins do not tier, so there is nothing to profile),
+                // exactly as the x86-64 T1 emitter does (bliss-x5y.27). Same
+                // slice convention, so only r2, r5 and the target differ. Every
+                // call used to be resolved BY NAME in c2i (bliss-flzmi).
+                let direct_builtin = super::super::direct_builtin_slot(callee, usize::from(nargs));
+                match direct_builtin {
+                    Some(slot) => a.imm64(2, (u64::from(slot) << 32) | u64::from(callee)),
+                    None => a.imm64(2, u64::from(callee)),
+                }
                 a.imm64(3, u64::from(nargs));
                 a.address(4, 9, -8 * i32::from(nargs));
-                let profile = if registry_get(callee).is_some() {
+                let profile = if direct_builtin.is_some() {
+                    direct_call_gen()
+                } else if registry_get(callee).is_some() {
                     call_site_profile_token(bf as *const BytecodeFunction as usize, bcp)
                 } else {
                     0
                 };
                 a.imm64(5, profile);
-                helper(&mut a, c2i_call_slice as *const () as u64, exit);
+                let adapter = if direct_builtin.is_some() {
+                    c2i_call_builtin as *const () as u64
+                } else {
+                    c2i_call_slice as *const () as u64
+                };
+                helper(&mut a, adapter, exit);
                 a.address(9, 9, -8 * i32::from(nargs));
                 push(&mut a);
             }
