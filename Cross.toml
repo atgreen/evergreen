@@ -39,6 +39,11 @@ image = "ghcr.io/cross-rs/powerpc64le-unknown-linux-gnu:0.2.5"
 [target.s390x-unknown-linux-gnu]
 image = "ghcr.io/cross-rs/s390x-unknown-linux-gnu:0.2.5"
 
+# riscv64 is developed natively on RV64 hardware; this image gives CI and
+# x86-64 developers the same cross-build and QEMU smoke the other three have.
+[target.riscv64gc-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-gnu:0.2.5"
+
 # Android shares the AArch64 Linux kernel ABI but not its libc: the image ships
 # the NDK, so no local NDK install is needed, and it carries qemu-user so the
 # runtime's own tests can be RUN, not merely built (bliss-w2vp).

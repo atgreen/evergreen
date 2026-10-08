@@ -24,7 +24,7 @@ const TAG_HEAP: u64 = 0b010;
 fn make_object(type_id: u8) -> Vec<u8> {
     let mut buf = vec![0u8; HDR + 16];
     let hdr = ObjectHeader::new(type_id, 3);
-    buf[..HDR].copy_from_slice(&hdr.0.to_le_bytes());
+    buf[..HDR].copy_from_slice(&hdr.0.to_ne_bytes());
     buf
 }
 
@@ -32,10 +32,10 @@ fn make_object(type_id: u8) -> Vec<u8> {
 /// set the FORWARDED gc-bit (preserving type_id/size) and write `new_body` into
 /// the first payload word.
 fn forward(obj: &mut [u8], new_body: usize) {
-    let mut hdr = ObjectHeader(u64::from_le_bytes(obj[..HDR].try_into().unwrap()));
+    let mut hdr = ObjectHeader(u64::from_ne_bytes(obj[..HDR].try_into().unwrap()));
     hdr.set_forwarded();
-    obj[..HDR].copy_from_slice(&hdr.0.to_le_bytes());
-    obj[HDR..HDR + 8].copy_from_slice(&(new_body as u64).to_le_bytes());
+    obj[..HDR].copy_from_slice(&hdr.0.to_ne_bytes());
+    obj[HDR..HDR + 8].copy_from_slice(&(new_body as u64).to_ne_bytes());
 }
 
 /// Chase forwarding for a CL-frame slot — the same logic as
@@ -62,7 +62,7 @@ fn cl_frame_object_relocates_correctly_across_move() {
     // An object with recognizable contents, and its relocated copy.
     let mut old = make_object(0x0E); // STANDARD_OBJECT
     let mut newo = make_object(0x0E);
-    newo[HDR..HDR + 8].copy_from_slice(&0xDEAD_BEEF_u64.to_le_bytes());
+    newo[HDR..HDR + 8].copy_from_slice(&0xDEAD_BEEF_u64.to_ne_bytes());
     let old_body = unsafe { old.as_mut_ptr().add(HDR) } as usize;
     let new_body = unsafe { newo.as_mut_ptr().add(HDR) } as usize;
 
@@ -167,7 +167,7 @@ fn compiled_frame_scanned_precisely_via_gc_stack_map() {
 
     let mut old = make_object(0x0E);
     let mut newo = make_object(0x0E);
-    newo[HDR..HDR + 8].copy_from_slice(&0x00C0_FFEE_u64.to_le_bytes());
+    newo[HDR..HDR + 8].copy_from_slice(&0x00C0_FFEE_u64.to_ne_bytes());
     let old_body = unsafe { old.as_mut_ptr().add(HDR) } as usize;
     let new_body = unsafe { newo.as_mut_ptr().add(HDR) } as usize;
     forward(&mut old, new_body);

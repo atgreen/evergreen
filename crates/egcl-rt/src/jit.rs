@@ -85,7 +85,7 @@ impl JitBuffer {
             }
             // Make the instructions visible to the fetch path (nothing to do on
             // x86-64, which has coherent caches).
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
             flush_instruction_cache(ptr, code.len());
             Some(JitBuffer {
                 ptr,
@@ -306,6 +306,31 @@ unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
     unsafe {
         std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
+}
+
+/// RISC-V instruction fetch is not coherent with stores, and `fence.i` only
+/// orders the executing hart. The kernel's `riscv_flush_icache` syscall with
+/// flags 0 makes the new code visible to every thread of this process.
+///
+/// # Safety
+/// `ptr..ptr + len` must be a mapped range in this process.
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+unsafe fn flush_instruction_cache(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // __NR_arch_specific_syscall (244) + 15; the libc crate does not name it.
+    const SYS_RISCV_FLUSH_ICACHE: libc::c_long = 259;
+    // SAFETY: the range is mapped; the syscall takes (start, end, flags).
+    let rc = unsafe {
+        libc::syscall(
+            SYS_RISCV_FLUSH_ICACHE,
+            ptr as usize,
+            ptr as usize + len,
+            0usize,
+        )
+    };
+    debug_assert_eq!(rc, 0, "riscv_flush_icache failed");
 }
 
 impl Drop for JitBuffer {

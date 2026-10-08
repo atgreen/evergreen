@@ -10,7 +10,7 @@ use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{ObjectHeader, type_id};
 use egcl_rt::value::{NIL, T, TAG_HEAP_OBJECT, EgclVal};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
@@ -1804,6 +1804,9 @@ pub(crate) fn extract_path_string(val: EgclVal) -> Result<String, EgclError> {
     if val.is_string() {
         return Ok(val.as_string());
     }
+    if egcl_rt::types::streamp(val) {
+        return crate::streams::file_namestring(val);
+    }
     Err(EgclError::FileError(
         "cannot extract path string from value".to_string(),
     ))
@@ -1871,38 +1874,132 @@ pub fn truename(pathname: EgclVal) -> Result<EgclVal, EgclError> {
     pathname_from_fs_path(Path::new(&path_str))
 }
 
-fn wildcard_root(parsed: &ParsedPathname) -> PathBuf {
+fn wildcard_root(parsed: &ParsedPathname) -> (PathBuf, Vec<DirPart>) {
     let mut prefix = parsed.clone();
     prefix.name = None;
     prefix.type_field = None;
+    let mut remaining = Vec::new();
     if let Some(dir) = &mut prefix.directory {
-        dir.parts.truncate(
-            dir.parts
-                .iter()
-                .position(|part| matches!(part, DirPart::Wild | DirPart::WildInferiors))
-                .unwrap_or(dir.parts.len()),
-        );
+        let first_wild = dir
+            .parts
+            .iter()
+            .position(|part| matches!(part, DirPart::Wild | DirPart::WildInferiors))
+            .unwrap_or(dir.parts.len());
+        remaining = dir.parts.split_off(first_wild);
     }
     let rendered = render_namestring_from_parsed(&prefix);
-    PathBuf::from(if rendered.is_empty() { "." } else { &rendered })
+    (
+        PathBuf::from(if rendered.is_empty() { "." } else { &rendered }),
+        remaining,
+    )
 }
 
 fn collect_candidates(
     root: &Path,
-    recursive: bool,
+    parts: &[DirPart],
+    directory_only: bool,
+    visited: &mut HashSet<(PathBuf, usize)>,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), EgclError> {
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| EgclError::FileError(format!("{}: {}", root.display(), e)))?;
+    // A suffix length identifies the current position in this one pattern.
+    // Multiple ** expansions must not scan the same path and suffix again.
+    if !visited.insert((root.to_path_buf(), parts.len())) {
+        return Ok(());
+    }
+    match std::fs::metadata(root) {
+        Ok(metadata) if !metadata.is_dir() => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(EgclError::FileError(format!(
+                "{}: {}",
+                root.display(),
+                error
+            )));
+        }
+    }
+    match parts.first() {
+        Some(DirPart::Literal(name)) => {
+            return collect_candidates(&root.join(name), &parts[1..], directory_only, visited, out);
+        }
+        Some(DirPart::Up) => {
+            return collect_candidates(&root.join(".."), &parts[1..], directory_only, visited, out);
+        }
+        Some(DirPart::WildInferiors) => {
+            // ** may consume zero directory levels, or retain itself while
+            // descending. An ordinary * consumes exactly one level below.
+            collect_candidates(root, &parts[1..], directory_only, visited, out)?;
+        }
+        None if directory_only => {
+            out.push(root.to_path_buf());
+            return Ok(());
+        }
+        _ => {}
+    }
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(EgclError::FileError(format!(
+                "{}: {}",
+                root.display(),
+                error
+            )));
+        }
+    };
     for entry in entries {
         let entry = entry.map_err(|e| EgclError::FileError(e.to_string()))?;
         let path = entry.path();
-        out.push(path.clone());
-        if recursive && path.is_dir() {
-            collect_candidates(&path, true, out)?;
+        if parts.is_empty() {
+            out.push(path);
+        } else if path.is_dir() {
+            let remaining = if matches!(parts[0], DirPart::WildInferiors) {
+                parts
+            } else {
+                &parts[1..]
+            };
+            collect_candidates(&path, remaining, directory_only, visited, out)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod directory_traversal_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_wild_inferiors_visit_each_candidate_once() {
+        let root = std::env::temp_dir().join(format!(
+            "egcl-directory-states-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("one/two")).unwrap();
+        std::fs::write(root.join("one/two/distinfo.txt"), "fixture").unwrap();
+        let mut candidates = Vec::new();
+        let result = collect_candidates(
+            &root,
+            &[DirPart::WildInferiors, DirPart::WildInferiors],
+            false,
+            &mut HashSet::new(),
+            &mut candidates,
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        result.unwrap();
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![
+                root.join("one"),
+                root.join("one/two"),
+                root.join("one/two/distinfo.txt")
+            ]
+        );
+    }
 }
 
 pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
@@ -1932,19 +2029,18 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         return Ok(result);
     }
 
-    let recursive = rec
-        .parsed
-        .directory
-        .as_ref()
-        .map(|dir| {
-            dir.parts
-                .iter()
-                .any(|part| matches!(part, DirPart::WildInferiors))
-        })
-        .unwrap_or(false);
-    let root = wildcard_root(&rec.parsed);
+    let (root, parts) = wildcard_root(&rec.parsed);
     let mut candidates = Vec::new();
-    collect_candidates(&root, recursive, &mut candidates)?;
+    let directory_only = rec.parsed.name.is_none() && rec.parsed.type_field.is_none();
+    collect_candidates(
+        &root,
+        &parts,
+        directory_only,
+        &mut HashSet::new(),
+        &mut candidates,
+    )?;
+    candidates.sort();
+    candidates.dedup();
 
     let mut result = Vec::new();
     for candidate in candidates {
@@ -1967,10 +2063,16 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
 pub fn ensure_directories_exist(pathname: EgclVal) -> Result<(EgclVal, bool), EgclError> {
     let path_str = extract_path_string(pathname)?;
     let path = Path::new(&path_str);
-    let parent = path.parent().unwrap_or(path);
-    let already_exists = parent.is_dir();
+    // Path::parent discards a final directory even when a namestring ends in
+    // a separator. Only file namestrings need that final component removed.
+    let directory = if path_str.ends_with(std::path::is_separator) {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let already_exists = directory.is_dir();
     if !already_exists {
-        std::fs::create_dir_all(parent)
+        std::fs::create_dir_all(directory)
             .map_err(|e| EgclError::FileError(format!("{}: {}", path_str, e)))?;
     }
     Ok((pathname, !already_exists))

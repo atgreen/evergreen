@@ -320,6 +320,84 @@ fn format_directive_tilde_g_general_float() {
 
 // ~$ — monetary/dollars float (R5.157)
 #[test]
+fn format_floating_directives_accept_rationals() {
+    for (numerator, denominator, number) in [(5, 4, 1.25), (-5, 4, -1.25), (155, 512, 0.302734375)] {
+        egcl_rt::rooted!(ratio = egcl_rt::bignum::alloc_ratio_cli(
+            EgclVal::from_fixnum(numerator),
+            EgclVal::from_fixnum(denominator),
+        ));
+        egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(number));
+        for control in ["~,3F", "~,2E", "~G", "~$", "~@$", "~v$"] {
+            let (rational_args, float_args) = if control == "~v$" {
+                (vec![EgclVal::from_fixnum(3), *ratio], vec![EgclVal::from_fixnum(3), *float])
+            } else {
+                (vec![*ratio], vec![*float])
+            };
+            egcl_rt::rooted!(rational_args = rational_args);
+            egcl_rt::rooted!(float_args = float_args);
+            assert_eq!(
+                format_nil_string(control, &rational_args),
+                format_nil_string(control, &float_args),
+                "{control} of {numerator}/{denominator}",
+            );
+        }
+    }
+}
+
+#[test]
+fn format_floating_directives_accept_bignums() {
+    egcl_rt::rooted!(integer = egcl_rt::bignum::BigInt::from_mag(1, vec![0, 1]).to_val());
+    egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(18446744073709551616.0));
+    for control in ["~,3F", "~,2E", "~G", "~$"] {
+        let expected = format_nil_string(control, &[*float]);
+        assert_eq!(format_nil_string(control, &[*integer]), expected, "{control}");
+    }
+}
+
+#[test]
+fn format_floating_directives_handle_large_ratio_components() {
+    let mut numerator = vec![0; 33];
+    numerator[0] = 1;
+    numerator[32] = 1;
+    egcl_rt::rooted!(numerator = egcl_rt::bignum::BigInt::from_mag(1, numerator).to_val());
+    egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, vec![u64::MAX; 32]).to_val());
+    egcl_rt::rooted!(ratio = egcl_rt::bignum::alloc_ratio_cli(*numerator, *denominator));
+    assert_eq!(format_nil_string("~,3F", &[*ratio]), "1.000");
+
+    let mut denominator = vec![0; 17];
+    denominator[16] = 1 << 16;
+    egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, denominator).to_val());
+    egcl_rt::rooted!(tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(1), *denominator));
+    egcl_rt::rooted!(float = egcl_rt::gc::alloc_double_float(f64::from_bits(1 << 34)));
+    let expected = format_nil_string("~E", &[*float]);
+    assert_eq!(format_nil_string("~E", &[*tiny]), expected);
+}
+
+#[test]
+fn format_floating_directives_preserve_negative_underflow_sign() {
+    let mut magnitude = vec![0; 33];
+    magnitude[32] = 1;
+    egcl_rt::rooted!(denominator = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
+    egcl_rt::rooted!(tiny = egcl_rt::bignum::alloc_ratio_cli(EgclVal::from_fixnum(-1), *denominator));
+    for (control, expected) in [("~$", "-0.00"), ("~@$", "-0.00"), ("~,3@F", "-0.000")] {
+        assert_eq!(format_nil_string(control, &[*tiny]), expected, "{control}");
+    }
+}
+
+#[test]
+fn format_floating_directives_signal_rational_overflow() {
+    let mut magnitude = vec![0; 33];
+    magnitude[32] = 1;
+    egcl_rt::rooted!(huge = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
+    for control in ["~,3F", "~E", "~G", "~$"] {
+        assert!(matches!(
+            format_nil(control, &[*huge]),
+            Err(egcl_rt::error::EgclError::ArithmeticError(_))
+        ), "{control}");
+    }
+}
+
+#[test]
 fn format_directive_tilde_dollar_monetary_float() {
     let s = format_nil_string("~$", &[EgclVal::from_single_float(std::f32::consts::PI)]);
     // ~$ typically produces at least 2 decimal places, e.g. "3.14"

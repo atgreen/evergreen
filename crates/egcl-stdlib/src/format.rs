@@ -384,7 +384,7 @@ pub enum CircleMark {
 }
 
 struct CircleTable {
-    /// address → times reached during the scan (retained only for count ≥ 2).
+    /// All reachable cons addresses and their multiplicities.
     counts: std::collections::HashMap<usize, u32>,
     /// address → label number, assigned lazily in first-print order.
     labels: std::collections::HashMap<usize, u32>,
@@ -402,8 +402,6 @@ impl CircleTable {
             next_label: 1,
         };
         t.scan(root);
-        // Keep only genuinely shared/circular conses.
-        t.counts.retain(|_, c| *c >= 2);
         if t.counts.is_empty() { None } else { Some(t) }
     }
 
@@ -431,17 +429,16 @@ impl CircleTable {
     }
 
     fn is_shared(&self, v: EgclVal) -> bool {
-        v.is_cons() && self.counts.contains_key(&(unsafe { v.as_ptr() } as usize))
+        v.is_cons()
+            && self.counts.get(&(unsafe { v.as_ptr() } as usize))
+                .is_some_and(|n| *n >= 2)
     }
 
     fn visit(&mut self, v: EgclVal) -> CircleMark {
-        if !v.is_cons() {
+        if !self.is_shared(v) {
             return CircleMark::NotShared;
         }
         let addr = unsafe { v.as_ptr() } as usize;
-        if !self.counts.contains_key(&addr) {
-            return CircleMark::NotShared;
-        }
         if let Some(&n) = self.labels.get(&addr) {
             CircleMark::Repeat(n)
         } else {
@@ -453,17 +450,19 @@ impl CircleTable {
     }
 }
 
-static CIRCLE: egcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<Option<CircleTable>>> = unsafe {
-    egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::RefCell::new(None) })
-};
-/// Re-entrancy depth so the table is built once at the outermost print and
-/// torn down when it returns, even though the printers recurse through the
-/// same entry points.
-static CIRCLE_DEPTH: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<usize>> =
-    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { std::cell::Cell::new(0) }) };
+#[derive(Default)]
+struct CircleContexts {
+    tables: Vec<CircleTable>,
+    pushed: Vec<bool>,
+    next_label: u32,
+}
 
-/// Enter a (possibly nested) print. At the outermost level, build the circle
-/// table from `root` if `*print-circle*` is active. Pair with [`circle_exit`].
+static CIRCLE: egcl_rt::execution_local::ExecutionLocal<std::cell::RefCell<CircleContexts>> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::RefCell::new(CircleContexts::default()))
+};
+
+/// Reuse the current graph's table for recursive printing, but scan an
+/// independent graph written inside a logical block. Pair with [`circle_exit`].
 pub fn circle_enter(root: EgclVal) {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(|| {
@@ -471,7 +470,7 @@ pub fn circle_enter(root: EgclVal) {
             // SAFETY: all mutators are stopped while registered scanners run.
             unsafe {
                 CIRCLE.scan(|slot| {
-                    if let Some(table) = slot.borrow_mut().as_mut() {
+                    for table in &mut slot.borrow_mut().tables {
                         let mut counts = std::collections::HashMap::new();
                         let mut labels = std::collections::HashMap::new();
                         for (address, count) in table.counts.drain() {
@@ -490,44 +489,56 @@ pub fn circle_enter(root: EgclVal) {
             };
         })
     });
-    let d = CIRCLE_DEPTH.with(|c| {
-        let n = c.get() + 1;
-        c.set(n);
-        n
+    let covered = CIRCLE.with(|c| {
+        !root.is_cons() || c.borrow().tables.last().is_some_and(|table| {
+            table.counts.contains_key(&(unsafe { root.as_ptr() } as usize))
+        })
     });
-    if d == 1 {
-        let table = CircleTable::build(root);
-        CIRCLE.with(|c| *c.borrow_mut() = table);
-    }
+    let table = if covered { None } else { CircleTable::build(root) };
+    CIRCLE.with(|c| {
+        let mut contexts = c.borrow_mut();
+        if contexts.pushed.is_empty() {
+            contexts.next_label = 1;
+        }
+        contexts.pushed.push(table.is_some());
+        if let Some(mut table) = table {
+            table.next_label = contexts.tables.last()
+                .map_or(contexts.next_label, |parent| parent.next_label);
+            contexts.tables.push(table);
+        }
+    });
 }
 
-/// Leave a print level; drop the table when the outermost level returns.
+/// Leave a print level, restoring any enclosing graph's circle context.
 pub fn circle_exit() {
-    let d = CIRCLE_DEPTH.with(|c| {
-        let n = c.get().saturating_sub(1);
-        c.set(n);
-        n
+    CIRCLE.with(|c| {
+        let mut contexts = c.borrow_mut();
+        if contexts.pushed.pop() == Some(true) {
+            if let Some(child) = contexts.tables.pop() {
+                contexts.next_label = child.next_label;
+                if let Some(parent) = contexts.tables.last_mut() {
+                    parent.next_label = child.next_label;
+                }
+            }
+        }
     });
-    if d == 0 {
-        CIRCLE.with(|c| *c.borrow_mut() = None);
-    }
 }
 
-/// True when a circle table is active (there is shared/circular structure).
+/// True when a cons graph is being tracked for sharing or circularity.
 pub fn circle_active() -> bool {
-    CIRCLE.with(|c| c.borrow().is_some())
+    CIRCLE.with(|c| !c.borrow().tables.is_empty())
 }
 
 /// True when `v` is a shared/circular cons (used to force a dotted tail).
 pub fn circle_is_shared(v: EgclVal) -> bool {
-    CIRCLE.with(|c| c.borrow().as_ref().is_some_and(|t| t.is_shared(v)))
+    CIRCLE.with(|c| c.borrow().tables.last().is_some_and(|t| t.is_shared(v)))
 }
 
 /// Register a visit to cons `v`, assigning a label on first sight.
 pub fn circle_visit(v: EgclVal) -> CircleMark {
     CIRCLE.with(|c| {
         let mut b = c.borrow_mut();
-        match b.as_mut() {
+        match b.tables.last_mut() {
             Some(t) => t.visit(v),
             None => CircleMark::NotShared,
         }
@@ -1117,6 +1128,58 @@ pub fn double_float_to_string(x: f64) -> String {
         format!("{s}d0")
     } else {
         format!("{s}.0d0")
+    }
+}
+
+fn rational_format_value(rational: &egcl_rt::bignum::BigRat) -> f64 {
+    let numerator = rational.num.to_f64();
+    let denominator = rational.den.to_f64();
+    if numerator.is_finite() && denominator.is_finite() {
+        return numerator / denominator;
+    }
+
+    // Divide leading limbs before restoring their relative scale, so huge
+    // components of a representable ratio do not turn into infinity/infinity.
+    fn leading_limbs(integer: &egcl_rt::bignum::BigInt) -> (f64, usize) {
+        let dropped = integer.mag.len().saturating_sub(2);
+        let leading = egcl_rt::bignum::BigInt::from_parts(
+            integer.sign as i32,
+            &integer.mag[dropped..],
+        );
+        (leading.to_f64(), dropped)
+    }
+    let (numerator, numerator_scale) = leading_limbs(&rational.num);
+    let (denominator, denominator_scale) = leading_limbs(&rational.den);
+    let exponent = ((numerator_scale as i64 - denominator_scale as i64) * 64)
+        .clamp(-4096, 4096) as i32;
+    // Split the exponent to keep the scale itself finite and nonzero, even
+    // when the final quotient is near the overflow or subnormal boundary.
+    let first_scale = exponent.clamp(-1022, 1023);
+    (numerator / denominator * 2.0f64.powi(first_scale))
+        * 2.0f64.powi(exponent - first_scale)
+}
+
+fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
+    if val.is_single_float() {
+        Ok(val.as_single_float() as f64)
+    } else if val.is_double_float() {
+        Ok(val.as_double_float())
+    } else if val.is_fixnum() {
+        Ok(val.as_fixnum() as f64)
+    } else if let Some(rational) = egcl_rt::bignum::as_bigrat(val) {
+        let value = rational_format_value(&rational);
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(EgclError::ArithmeticError(
+                "rational argument exceeds the floating-point FORMAT range".into(),
+            ))
+        }
+    } else {
+        Err(EgclError::TypeError {
+            datum: val,
+            expected: "number".into(),
+        })
     }
 }
 
@@ -2431,18 +2494,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let shortest = if val.is_single_float() {
                     format!("{}", val.as_single_float())
                 } else {
@@ -2484,7 +2536,7 @@ fn format_impl(
                     }
                 };
                 // ~@F prints a leading + on a non-negative value (CLHS 22.3.3.1).
-                if at_sign && f >= 0.0 {
+                if at_sign && !f.is_sign_negative() {
                     s.insert(0, '+');
                 }
                 if s.len() < w {
@@ -2525,18 +2577,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let mut s = if d < 0 {
                     // No explicit fraction-digit count: shortest round-trip. Format
                     // a single-float from the f32 itself rather than its widened f64,
@@ -2604,15 +2645,8 @@ fn format_impl(
                 // Shortest round-trip from the f32 for single-floats (bliss-8zrb).
                 let mut s = if val.is_single_float() {
                     format!("{}", val.as_single_float())
-                } else if val.is_double_float() {
-                    format!("{}", val.as_double_float())
-                } else if val.is_fixnum() {
-                    format!("{}", val.as_fixnum() as f64)
                 } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
+                    format!("{}", real_format_value(val)?)
                 };
                 if w > 0 && (s.chars().count() as i64) < w {
                     let pad = char::from_u32(if pad_param >= 0 {
@@ -2654,18 +2688,7 @@ fn format_impl(
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
-                let f = if val.is_single_float() {
-                    val.as_single_float() as f64
-                } else if val.is_double_float() {
-                    val.as_double_float()
-                } else if val.is_fixnum() {
-                    val.as_fixnum() as f64
-                } else {
-                    return Err(EgclError::TypeError {
-                        datum: val,
-                        expected: "number".into(),
-                    });
-                };
+                let f = real_format_value(val)?;
                 let body = format!("{:.*}", d, f.abs());
                 let (int_part, frac_part) = match body.split_once('.') {
                     Some((i, fr)) => (i.to_string(), format!(".{fr}")),
@@ -2676,7 +2699,7 @@ fn format_impl(
                 } else {
                     int_part
                 };
-                let sign = if f < 0.0 {
+                let sign = if f.is_sign_negative() {
                     "-"
                 } else if at_sign {
                     "+"

@@ -8,8 +8,8 @@ cd "$(dirname "$0")/.."
 
 action=${1:-build}
 architecture=${2:-all}
-if [[ $# -gt 2 || ! $action =~ ^(build|test)$ || ! $architecture =~ ^(all|aarch64|ppc64le|s390x)$ ]]; then
-    echo "usage: $0 [build|test] [all|aarch64|ppc64le|s390x]" >&2
+if [[ $# -gt 2 || ! $action =~ ^(build|test)$ || ! $architecture =~ ^(all|aarch64|ppc64le|s390x|riscv64)$ ]]; then
+    echo "usage: $0 [build|test] [all|aarch64|ppc64le|s390x|riscv64]" >&2
     exit 2
 fi
 cross=${CROSS:-cross}
@@ -26,7 +26,7 @@ command -v "$cross" >/dev/null
 command -v "$CROSS_CONTAINER_ENGINE" >/dev/null
 architectures=($architecture)
 if [[ $architecture == all ]]; then
-    architectures=(aarch64 ppc64le s390x)
+    architectures=(aarch64 ppc64le s390x riscv64)
 fi
 
 for arch in "${architectures[@]}"; do
@@ -34,6 +34,7 @@ for arch in "${architectures[@]}"; do
         aarch64) target=aarch64-unknown-linux-gnu; toolchain=aarch64-linux-gnu ;;
         ppc64le) target=powerpc64le-unknown-linux-gnu; toolchain=powerpc64le-linux-gnu ;;
         s390x) target=s390x-unknown-linux-gnu; toolchain=s390x-linux-gnu ;;
+        riscv64) target=riscv64gc-unknown-linux-gnu; toolchain=riscv64-linux-gnu ;;
     esac
     "$cross" build --locked --release -p egcl --bin egcl --target "$target" --features egcl-rt/c-ffi
     binary="${CARGO_TARGET_DIR:-target}/$target/release/egcl"
@@ -65,6 +66,10 @@ PY
     if [[ $arch == s390x ]]; then
         scripts/egcl-limited.sh python3 scripts/s390x-jit-smoke.py -- \
             qemu-s390x -L "$sysroot" "$binary"
+    fi
+    if [[ $arch == riscv64 ]]; then
+        scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \
+            qemu-riscv64 -L "$sysroot" "$binary"
     fi
     rm -rf -- "$sysroot"
     trap - EXIT

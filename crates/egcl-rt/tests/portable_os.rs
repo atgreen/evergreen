@@ -51,6 +51,8 @@ fn image_tag_identifies_the_target() {
         3
     } else if cfg!(target_arch = "s390x") {
         4
+    } else if cfg!(target_arch = "riscv64") {
+        5
     } else {
         panic!("unlisted test architecture")
     };

@@ -61,6 +61,30 @@ compilation, callbacks, and fiber switching. Consult the
 [platform reference](user/reference/platforms.md) before selecting a deployment
 runtime.
 
+## Logical-block printing
+
+`PPRINT-LOGICAL-BLOCK` groups output sent to its bound stream. Use the lexical
+`PPRINT-POP` and `PPRINT-EXIT-IF-LIST-EXHAUSTED` macros to traverse the supplied
+list without losing dotted-tail and print-limit handling. A `NIL` stream
+variable designator rebinds `*STANDARD-OUTPUT*`; `T` rebinds `*TERMINAL-IO*`.
+
+```lisp
+(let ((*print-pretty* t) (*print-right-margin* 20))
+  (pprint-logical-block (nil '(alpha beta gamma) :prefix "(" :suffix ")")
+    (loop
+      (pprint-exit-if-list-exhausted)
+      (write (pprint-pop))
+      (pprint-exit-if-list-exhausted)
+      (write-char #\Space)
+      (pprint-newline :fill))))
+```
+
+The block supports ordinary and per-line prefixes, a suffix, nested blocks,
+conditional newlines, and `PPRINT-INDENT`. `PPRINT-FILL` and `PPRINT-LINEAR`
+provide the standard list-printing patterns. These interfaces do not imply
+support for user-defined pprint dispatch tables; `SET-PPRINT-DISPATCH` and
+`PPRINT-DISPATCH` remain separate implementation work.
+
 ## Scope of this edition
 
 This edition follows the development checkout, not a frozen release. Older
