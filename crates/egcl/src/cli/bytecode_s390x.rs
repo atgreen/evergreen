@@ -367,7 +367,10 @@ pub(super) fn emit_native(
                             && !closure_controls().borrow().contains_key(&callee);
                         if replacement_function(callee).is_none()
                             && native_transfer_abi_compatible(&cnc)
-                            && !cnc.has_deopt
+                            // A deopting T2 callee resumes T0 inline and
+                            // returns a finished value (bliss-w6aki); a T1
+                            // callee's deopt still waits for run_native.
+                            && (!cnc.has_deopt || cnc.is_t2)
                             && fixed
                             && no_types
                             && not_closure

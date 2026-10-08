@@ -177,6 +177,10 @@ pub struct RuntimeCalls {
     /// a `Call` to one of them with its arity is entered directly
     /// (bliss-6j6pk, see the module docs).
     pub direct_natives: Vec<super::emit::DirectNativeTarget>,
+    /// Passed by every deopt stub as the adapter's fourth argument, so the
+    /// runtime can resolve the code the stub belongs to even when it was
+    /// entered by a direct native call; 0 means "the active code".
+    pub code_id: u64,
 }
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -1358,7 +1362,7 @@ impl Emitter<'_> {
         self.asm.imm64(2, state.scopes.len() as u64);
         self.asm.imm64(3, words as u64);
         self.asm.address(4, 15, self.deopt_base);
-        self.asm.imm64(5, 0);
+        self.asm.imm64(5, self.runtime.code_id);
         self.asm.imm64(1, callback);
         self.asm.call_reg(1);
         // The callback resumes T0 inline and returns the activation's result

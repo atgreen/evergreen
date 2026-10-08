@@ -2768,6 +2768,7 @@ pub fn emit_framed_with_activation_slots(
         activation_slots,
         self_sym,
         &[],
+        0,
     )
 }
 
@@ -2791,6 +2792,7 @@ pub fn emit_framed_with_direct_natives(
     activation_slots: u16,
     self_sym: Option<u32>,
     direct_natives: &[DirectNativeTarget],
+    code_id: u64,
 ) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
@@ -2808,6 +2810,7 @@ pub fn emit_framed_with_direct_natives(
                 poll: c2i_poll_addr,
                 self_sym: None,
                 direct_natives: Vec::new(),
+                code_id: 0,
             },
         );
     }
@@ -2827,6 +2830,7 @@ pub fn emit_framed_with_direct_natives(
                 poll: c2i_poll_addr,
                 self_sym: None,
                 direct_natives: Vec::new(),
+                code_id: 0,
             },
         );
     }
@@ -2846,6 +2850,7 @@ pub fn emit_framed_with_direct_natives(
                 poll: c2i_poll_addr,
                 self_sym,
                 direct_natives: direct_natives.to_vec(),
+                code_id,
             },
         );
     }

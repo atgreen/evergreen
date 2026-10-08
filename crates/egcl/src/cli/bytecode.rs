@@ -17778,7 +17778,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         });
         return;
     }
-    match materialize_t2_deopt_scopes(n_scopes, n_words, buf, Some(outer)) {
+    match materialize_t2_deopt_scopes(n_scopes, n_words, buf, Some(outer), None) {
         Ok((scopes, metadata)) => {
             NATIVE_DEOPT.with(|d| d.set(true));
             NATIVE_DEOPT_RESUME.with(|c| {
@@ -17823,23 +17823,34 @@ extern "C" fn c2i_deopt_t2_inline(
     n_scopes: u64,
     n_words: u64,
     buf: *const u64,
-    _reserved: u64,
+    code_id: u64,
 ) -> u64 {
-    let (scopes, metadata) = match materialize_t2_deopt_scopes(n_scopes, n_words, buf, None) {
-        Ok(materialized) => materialized,
-        Err(message) => {
-            stash_native_error(EgclError::Internal(message.into()));
-            return NIL.0;
-        }
-    };
+    // The stub names its own code. Under a direct native call that is the
+    // callee, which ACTIVE_NATIVE_CODE (the outermost run_native's code, the
+    // caller) cannot tell us; without the id, fall back to it as before.
+    let own = (code_id != 0)
+        .then(|| CODE_BY_ID.with(|m| m.borrow().get(&code_id).and_then(std::rc::Weak::upgrade)))
+        .flatten();
+    let metadata = own.as_ref().and_then(|code| code.t2_metadata.clone());
+    let (scopes, metadata) =
+        match materialize_t2_deopt_scopes(n_scopes, n_words, buf, None, metadata) {
+            Ok(materialized) => materialized,
+            Err(message) => {
+                stash_native_error(EgclError::Internal(message.into()));
+                return NIL.0;
+            }
+        };
     let sym = scopes[0].function;
-    let (is_t2, body) = ACTIVE_NATIVE_CODE.with(|slot| {
-        // SAFETY: ActiveNativeCode retains a reference for the native call and
-        // restores the enclosing owner after nested calls or OSR return.
-        unsafe { slot.get().as_ref() }
-            .map(|code| (code.is_t2, code.body.clone()))
-            .unwrap_or((true, None))
-    });
+    let (is_t2, body) = match own.as_ref() {
+        Some(code) => (code.is_t2, code.body.clone()),
+        None => ACTIVE_NATIVE_CODE.with(|slot| {
+            // SAFETY: ActiveNativeCode retains a reference for the native call
+            // and restores the enclosing owner after nested calls or OSR return.
+            unsafe { slot.get().as_ref() }
+                .map(|code| (code.is_t2, code.body.clone()))
+                .unwrap_or((true, None))
+        }),
+    };
     note_native_deopt(sym, is_t2, body.as_ref());
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
@@ -17867,23 +17878,25 @@ extern "C" fn c2i_deopt_t2_inline(
 /// Rebuild the virtual frames of a T2 deopt stream on the EgclStack: four
 /// header words per scope (function, bcp, locals, stack depth) then the
 /// slots. `outer` is the frame to write scope 0 into; `None` pushes a fresh
-/// frame for it too. Pushed frames are popped again on any error.
+/// frame for it too. `metadata` is the deopting code's; `None` takes the
+/// active code's. Pushed frames are popped again on any error.
 fn materialize_t2_deopt_scopes(
     n_scopes: u64,
     n_words: u64,
     buf: *const u64,
     outer: Option<*mut Frame>,
+    metadata: Option<Arc<T2InstalledMetadata>>,
 ) -> Result<(Vec<InlinedResumeScope>, Arc<T2InstalledMetadata>), &'static str> {
     let stack = egcl_rt::current_stack();
     if buf.is_null() || n_scopes == 0 {
         return Err("T2 deopt supplied an empty virtual-frame stream");
     }
 
-    let metadata = ACTIVE_NATIVE_CODE.with(|slot| {
+    let metadata = metadata.or_else(|| ACTIVE_NATIVE_CODE.with(|slot| {
         // SAFETY: ActiveNativeCode retains a reference for the native call and
         // restores the enclosing owner after nested calls or OSR return.
         unsafe { slot.get().as_ref() }.and_then(|code| code.t2_metadata.clone())
-    });
+    }));
     let Some(metadata) = metadata else {
         return Err("T2 deopt has no active code metadata");
     };
@@ -18007,6 +18020,9 @@ struct NativeCode {
     /// cross the c2i boundary yet); recorded so that wiring is a local change.
     #[allow(dead_code)]
     compiled_entry: usize,
+    /// Nonzero for T2 code on s390x: the key its deopt stubs pass, resolved
+    /// through `CODE_BY_ID`.
+    code_id: u64,
     /// Optimized loop-header entry offsets for T1→T2 on-stack replacement.
     osr_entries: HashMap<u32, usize>,
     /// Bytecode→native position map for the tiered-JIT viewer (bliss-zmmb):
@@ -18661,7 +18677,23 @@ struct T2CompileInput {
     /// Native callees the s390x T2 emitter may enter directly, resolved here
     /// on the execution thread (bliss-6j6pk).
     direct_natives: Vec<egcl_compiler::t2::emit::DirectNativeTarget>,
+    /// Identifies the installed code to its own deopt stubs (see
+    /// `CODE_BY_ID`); never 0.
+    code_id: u64,
 }
+
+/// Source of `T2CompileInput::code_id`.
+static T2_CODE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Installed T2 code by its baked id, so a deopt stub can name the code it
+/// belongs to (the adapter's fourth argument on s390x). `ACTIVE_NATIVE_CODE`
+/// is not enough once native code calls native code directly: it names the
+/// outermost run_native's code, the caller, while the deopting function is
+/// the callee. Weak, so a retired code object drops as before; a stale entry
+/// is one word per T2 install.
+static CODE_BY_ID: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<u64, std::rc::Weak<NativeCode>, egcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
 
 impl egcl_rt::gc::TraceHostRoots for T2CompileInput {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
@@ -18729,6 +18761,8 @@ struct T2Artifact {
     has_deopt: bool,
     rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
+    /// The id baked into the code's deopt stubs (s390x); see `CODE_BY_ID`.
+    code_id: u64,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -19225,6 +19259,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         receiver_profiles,
         inline_bodies,
         direct_natives,
+        code_id: T2_CODE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     })
 }
 
@@ -19284,7 +19319,10 @@ fn direct_native_targets(
             && !closure_controls().borrow().contains_key(&callee);
         if replacement_function(callee).is_none()
             && native_transfer_abi_compatible(&cnc)
-            && !cnc.has_deopt
+            // A deopting T2 callee resumes T0 inline on s390x and returns a
+            // finished value (bliss-w6aki), so only T1 callees, whose deopts
+            // still wait for run_native, keep the gate.
+            && (!cnc.has_deopt || cnc.is_t2)
             && fixed
             && no_types
             && not_closure
@@ -19523,6 +19561,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         is_t2: true,
         num_slots: total_slots,
         compiled_entry: artifact.compiled_entry,
+        code_id: artifact.code_id,
         osr_entries: artifact.osr_entries.into_iter().collect(),
         bcp_offsets: artifact.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
         code_info,
@@ -19531,6 +19570,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         has_deopt: artifact.has_deopt,
         t2_metadata: metadata,
     });
+    CODE_BY_ID.with(|m| m.borrow_mut().insert(nc.code_id, Rc::downgrade(&nc)));
     NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&nc)));
     let fn_obj = egcl_rt::symbols::symbol_function(done.sym)
         .filter(|&v| egcl_rt::function::is_interpreted_function(v));
@@ -21721,7 +21761,8 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         code_len: code.len(),
         is_t2: false,
         num_slots,
-        compiled_entry: 0, // T1 baseline has no distinct register entry yet
+        compiled_entry: 0,
+        code_id: 0, // T1 baseline has no distinct register entry yet
         osr_entries: HashMap::new(),
         bcp_offsets,
         code_info,
@@ -21997,6 +22038,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         bf.num_slots(),
         Some(sym),
         &input.direct_natives,
+        input.code_id,
     ) {
         Ok(fc) => fc,
         Err(e) => {
@@ -22079,6 +22121,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         has_deopt: framed.has_deopt,
         rooted_bodies,
         deopt_bodies,
+        code_id: input.code_id,
     })
 }
 
@@ -23999,6 +24042,7 @@ mod jtc4_stack_map_tests {
             has_deopt: false,
             rooted_bodies: vec![],
             deopt_bodies: HashMap::new(),
+            code_id: 0,
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 
@@ -24167,6 +24211,7 @@ mod jtc4_stack_map_tests {
             is_t2: false,
             num_slots: 1,
             compiled_entry: 0,
+            code_id: 0,
             osr_entries: HashMap::new(),
             bcp_offsets: vec![],
             code_info,
@@ -24233,6 +24278,7 @@ mod jtc4_stack_map_tests {
             is_t2: false,
             num_slots: 1,
             compiled_entry: 0,
+            code_id: 0,
             osr_entries: HashMap::new(),
             bcp_offsets: vec![],
             code_info,

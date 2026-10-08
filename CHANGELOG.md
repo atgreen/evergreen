@@ -32,6 +32,11 @@
   the wrong number of arguments now signals PROGRAM-ERROR at T2 on every
   target instead of binding whatever the argument registers held
   ([#107](https://github.com/atgreen/evergreen/pull/107)).
+
+- On s390x, native code now calls T2 functions that may deoptimize directly
+  instead of through the generic adapter, since such a callee resumes the
+  interpreter in place and returns a finished value: div2 327 to 239 ms on a
+  z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
