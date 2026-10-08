@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- RISC-V now supports the opt-in native segment boundary, preserving callee-
+  saved integer and floating-point registers across native returns and
+  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
+
 - riscv64 now has a T1 baseline native compiler with guarded fixnum
   arithmetic, comparisons, live on-stack replacement, and deoptimization, so
   hot functions run as RV64 machine code instead of bytecode. T2 optimizing
@@ -90,6 +94,11 @@
   compile at T1 instead of staying interpreted, including loops that create a
   closure per iteration and factories whose parameters are captured
   ([#126](https://github.com/atgreen/evergreen/pull/126)).
+
+- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
+  check instead of calling the numeric runtime for every `*`, deoptimizing to
+  the interpreter for a bignum product or a non-fixnum operand
+  ([#127](https://github.com/atgreen/evergreen/pull/127)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
