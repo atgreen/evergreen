@@ -12,7 +12,8 @@
             target_env = "gnu",
             any(
                 all(target_arch = "powerpc64", target_endian = "little"),
-                target_arch = "s390x"
+                target_arch = "s390x",
+                target_arch = "riscv64"
             )
         ),
         all(windows, target_arch = "x86_64")

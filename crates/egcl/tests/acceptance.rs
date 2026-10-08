@@ -13619,14 +13619,8 @@ fn cons_and_unary_arithmetic_match_operator_position() {
     }
 }
 
-/// `%match-at`, SEARCH's inner loop, called `(nth i list)` for EVERY pattern
-/// element, re-traversing the list from its head each time — so one SEARCH cost
-/// O(plen * n^2) cdr steps instead of O(plen * n). SEARCH coerces both
-/// arguments to lists, so every SEARCH on a string or vector paid it
-/// (bliss-3o0r). It now walks with a single NTHCDR plus CDR.
-///
-/// The rewrite has to keep SEARCH's exact answers, including which end wins,
-/// the empty-pattern cases, a pattern longer than what remains, and the
+/// SEARCH's candidate and pattern walks must keep its exact answers, including
+/// which end wins, the empty-pattern cases, a pattern longer than what remains, and the
 /// bounding/`:key`/`:test` keywords.
 #[test]
 fn search_finds_the_same_positions_after_the_walk_rewrite() {

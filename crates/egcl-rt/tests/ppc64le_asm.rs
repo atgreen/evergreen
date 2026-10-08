@@ -254,6 +254,29 @@ fn double_arithmetic_runs_in_the_float_registers() {
 }
 
 #[test]
+fn single_arithmetic_converts_through_double_format() {
+    // A tagged single carries its f32 bits in the high word, but the register
+    // file holds doubles: the bits are converted on the way in and out, not
+    // reinterpreted. Reinterpreting them gave 1.5 + 2.25 = 2.2578125
+    // (bliss-pjq99).
+    let add: extern "C" fn(u64, u64) -> u64 = compile(|a| {
+        a.move_to_float(1, 3);
+        a.move_to_float(2, 4);
+        a.single_to_double(1, 1);
+        a.single_to_double(2, 2);
+        a.add_single(1, 1, 2);
+        a.double_to_single(1, 1);
+        a.move_from_float(3, 1);
+        a.ret();
+    });
+    let high = |x: f32| (u64::from(x.to_bits()) << 32) | 4;
+    let single = |bits: u64| f32::from_bits((bits >> 32) as u32);
+    assert_eq!(single(add(high(1.5), high(2.25))), 3.75);
+    assert_eq!(single(add(high(10.0), high(5.0))), 15.0);
+    assert_eq!(single(add(high(-0.125), high(0.125))), 0.0);
+}
+
+#[test]
 fn logical_operations_mask_as_written() {
     let untag: extern "C" fn(u64) -> u64 = compile(|a| {
         a.imm64(4, 0xffff_ffff_ffff_fff8);

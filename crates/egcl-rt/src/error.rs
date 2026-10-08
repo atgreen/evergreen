@@ -67,6 +67,9 @@ pub enum EgclError {
     /// Stream / I/O error. Maps to CL `STREAM-ERROR`.
     StreamError(String),
 
+    /// A stream I/O deadline expired. Maps to `EGCL-EXT:IO-TIMEOUT`.
+    IoTimeout { stream: EgclVal, message: String },
+
     /// File error. Maps to CL `FILE-ERROR`.
     FileError(String),
 
@@ -203,6 +206,7 @@ impl core::fmt::Display for EgclError {
             EgclError::ArithmeticError(msg) => write!(f, "arithmetic error: {}", msg),
             EgclError::PackageError(msg) => write!(f, "package error: {}", msg),
             EgclError::StreamError(msg) => write!(f, "stream error: {}", msg),
+            EgclError::IoTimeout { message, .. } => write!(f, "I/O timeout: {message}"),
             EgclError::FileError(msg) => write!(f, "file error: {}", msg),
             EgclError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
             EgclError::ControlError(msg) => write!(f, "control error: {}", msg),

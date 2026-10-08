@@ -41,6 +41,43 @@ pub(super) fn call(
 #[egcl_delivery_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        "EGCL::%PPRINT-CIRCLE" => Some(|_operator, args, _env| {
+            if args.len() != 2 || !args[0].is_symbol() {
+                return Err(EgclError::ProgramError(
+                    "%PPRINT-CIRCLE requires an operation and object".into(),
+                ));
+            }
+            use egcl_stdlib::format::{self, CircleMark};
+            match sym_bare_name_rc(args[0]).as_ref() {
+                "ENTER" => {
+                    format::circle_enter(args[1]);
+                    Ok(NIL)
+                }
+                "EXIT" => {
+                    format::circle_exit();
+                    Ok(NIL)
+                }
+                "SHARED" => Ok(if format::circle_is_shared(args[1]) { T } else { NIL }),
+                "MARK" => Ok(EgclVal::from_fixnum(match format::circle_visit(args[1]) {
+                    CircleMark::NotShared => 0,
+                    CircleMark::First(label) => i64::from(label),
+                    CircleMark::Repeat(label) => -i64::from(label),
+                })),
+                _ => Err(EgclError::ProgramError(
+                    "Unknown pretty-printer circle operation".into(),
+                )),
+            }
+        }),
+        "EGCL::%PPRINT-NATIVE-COLUMN" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "%PPRINT-NATIVE-COLUMN requires one stream".into(),
+                ));
+            }
+            Ok(egcl_stdlib::streams::stream_line_column(args[0])
+                .map(|column| EgclVal::from_fixnum(column as i64))
+                .unwrap_or(NIL))
+        }),
         "EGCL::%DEBUG-BACKTRACE" => Some(|_operator, args, env| {
             let prev_env = PRINT_ENV.with(|c| c.replace(env as *mut Env));
             let result = egcl_stdlib::devtools::backtrace_call(args);
@@ -121,7 +158,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let args = RootedVals::new(args.to_vec());
 
             // (write object &key stream escape ...): render OBJECT honouring
-            // :escape (default T → prin1-style; NIL → princ-style) to :stream
+            // :escape (default *PRINT-ESCAPE*) to :stream
             // (default *standard-output*). Other keywords are accepted and
             // ignored. Returns the object.
 
@@ -129,7 +166,10 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::ProgramError("WRITE requires an object".into()));
             }
             let mut stream_idx: Option<usize> = None;
-            let mut escape = true;
+            let mut escape = env
+                .lookup_var("*PRINT-ESCAPE*")
+                .map(|value| !value.is_nil())
+                .unwrap_or(true);
             let mut i = 1;
             while i + 1 < args.len() {
                 let key = sym_bare_name_rc(args[i]);
@@ -842,24 +882,51 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL::%SOCKET-LISTEN" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (%socket-listen host port &optional backlog) → listener-id
+            // (%socket-listen &optional host port backlog reuse-address) → listener-id
+
+            if args.len() > 4 {
+                return Err(EgclError::ProgramError(
+                    "%socket-listen accepts at most four arguments".into(),
+                ));
+            }
+            if let Some(&host) = args.first() {
+                if !is_string_value(host) {
+                    return Err(EgclError::TypeError {
+                        datum: host,
+                        expected: "STRING".into(),
+                    });
+                }
+            }
+            for (index, maximum) in [(1, 65535), (2, i32::MAX as i64)] {
+                if let Some(&value) = args.get(index) {
+                    if !value.is_fixnum() || !(0..=maximum).contains(&value.as_fixnum()) {
+                        return Err(EgclError::TypeError {
+                            datum: value,
+                            expected: format!("(INTEGER 0 {maximum})"),
+                        });
+                    }
+                }
+            }
 
             let host = if args.is_empty() {
                 "127.0.0.1".to_string()
             } else {
                 val_as_str(args[0])
             };
-            let port = if args.len() > 1 && args[1].is_fixnum() {
+            let port = if args.len() > 1 {
                 args[1].as_fixnum() as u16
             } else {
                 0
             };
-            let backlog = if args.len() > 2 && args[2].is_fixnum() {
+            let backlog = if args.len() > 2 {
                 args[2].as_fixnum() as i32
             } else {
                 5
             };
-            let id = egcl_stdlib::socket_listen(&host, port, backlog)?;
+            let reuse_address = args.get(3).map_or(cfg!(unix), |value| !value.is_nil());
+            let id = egcl_stdlib::streams::socket_listen_with_options(
+                &host, port, backlog, reuse_address,
+            )?;
             Ok(EgclVal::from_fixnum(id as i64))
         }),
 
@@ -1145,6 +1212,9 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(NIL)
         }),
 
+        "EGCL::%INVOKE-REGISTERED-MACRO" => Some(|_operator, args, _env| {
+            super::invoke_registered_macro(args)
+        }),
         "EGCL::%INVOKE-COMPILER-MACRO" => Some(|_operator, args, env| {
             super::invoke_compiler_macro_function(args, env)
         }),
@@ -1471,7 +1541,7 @@ fn resolve(name: &str) -> Option<Handler> {
                         Ok(val_as_str(value))
                     })
                     .transpose()?;
-                let id = egcl_rt::make_thread_named(fnv, name)?;
+                let id = egcl_stdlib::threads::make_thread(fnv, name)?;
                 Ok(EgclVal::from_fixnum(id.0 as i64))
             })
         }
@@ -2133,8 +2203,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // non-instance argument — and real dispatch has to run. Guessing a
             // slot by name would read the wrong one silently.
             match accessor_slot_symbol_cached(env, instance, accessor) {
-                Some(slot) => read_slot_value(instance, slot, env),
-                None => invoke_generic_function(&sym_name(accessor), &[instance], env),
+                Some(slot) => slot_value_or_signal(args[0], slot, env),
+                None => invoke_generic_function(&sym_name(args[1]), &[args[0]], env),
             }
         }),
 
@@ -2426,41 +2496,7 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "ENCODE-UNIVERSAL-TIME" => Some(|_operator, args, _env| {
-            let args = RootedVals::new(args.to_vec());
-
-            // (encode-universal-time second minute hour date month year
-            //  &optional time-zone)
-
-            if args.len() < 6 {
-                return Err(EgclError::ProgramError(
-                    "ENCODE-UNIVERSAL-TIME requires at least 6 arguments".into(),
-                ));
-            }
-            let n = |v: EgclVal| -> Result<i64, EgclError> { Ok(num_val(v)? as i64) };
-            let (second, minute, hour) = (n(args[0])?, n(args[1])?, n(args[2])?);
-            let (date, month, mut year) = (n(args[3])?, n(args[4])?, n(args[5])?);
-            // CLHS 25.1.4: a two-digit year is relative to a 50-year window
-            // around the current year.
-            if (0..=99).contains(&year) {
-                let current = egcl_stdlib::time::decode_universal_time(
-                    egcl_stdlib::time::get_universal_time(),
-                    Some(0),
-                )
-                .5;
-                let base = current - 50;
-                year = base + (year - base).rem_euclid(100);
-            }
-            // Time zone is hours west of GMT; NIL / omitted means local,
-            // which we model as GMT (see time.rs).
-            let time_zone = match args.get(6) {
-                Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
-                _ => None,
-            };
-            Ok(EgclVal::from_fixnum(
-                egcl_stdlib::time::encode_universal_time(
-                    second, minute, hour, date, month, year, time_zone,
-                ),
-            ))
+            egcl_stdlib::time::encode_universal_time_checked(args)
         }),
 
         "DECODE-UNIVERSAL-TIME" => Some(|_operator, args, env| {
@@ -3229,6 +3265,74 @@ fn resolve(name: &str) -> Option<Handler> {
             )
         }),
 
+        "CHANGE-CLASS" => Some(|_operator, args, env| {
+            egcl_rt::rooted!(args = args.to_vec());
+            if args.len() < 2 || (args.len() - 2) % 2 != 0 {
+                return Err(EgclError::ProgramError(
+                    "CHANGE-CLASS requires an instance, a class, and initarg/value pairs".into(),
+                ));
+            }
+            egcl_rt::rooted!(class = resolve_class_metaobject(env, args[1])?);
+            egcl_rt::rooted!(previous =
+                egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
+            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let new_name = class_name_for_instance_class(*class);
+            let old_shared = effective_slots_for_class(env, &old_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Class))
+                .map(|slot| slot.name).collect::<std::collections::HashSet<_>>();
+            let inherited_shared = effective_slots_for_class(env, &new_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
+                    && old_shared.contains(&slot.name))
+                .map(|slot| slot.name).collect::<Vec<_>>();
+            egcl_rt::rooted!(shared_values = Vec::<(EgclVal, EgclVal)>::new());
+            for name in inherited_shared {
+                let symbol = resolve_sym(&name)
+                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
+                let bare = symbol_bare_name(&name);
+                let value = class_slot_cell(env, &old_name, &bare)
+                    .and_then(|cell| cell.lock().unwrap().get(&bare).copied().flatten());
+                if let Some(value) = value {
+                    shared_values.push((symbol, value));
+                }
+            }
+            egcl_stdlib::change_class(args[0], *class)?;
+            for index in 0..shared_values.len() {
+                let (slot, value) = shared_values[index];
+                egcl_stdlib::set_slot_value(args[0], slot, value)?;
+            }
+            egcl_rt::rooted!(hook_args = vec![*previous, args[0]]);
+            hook_args.extend_from_slice(&args[2..]);
+            let hook = resolve_sym("UPDATE-INSTANCE-FOR-DIFFERENT-CLASS")
+                .ok_or_else(|| EgclError::Internal("class-change hook symbol unavailable".into()))?;
+            apply_function(hook, &hook_args, env)?;
+            Ok(args[0])
+        }),
+
+        "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
+        | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => Some(|_operator, args, env| {
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "class-change slot comparison requires two instances".into(),
+                ));
+            }
+            let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let new_name = class_name_for_instance_class(egcl_stdlib::class_of(args[1]));
+            let old_slots: std::collections::HashSet<String> =
+                effective_slots_for_class(env, &old_name).into_iter()
+                    .map(|slot| slot.name).collect();
+            let added = effective_slots_for_class(env, &new_name).into_iter()
+                .filter(|slot| matches!(slot.allocation, SlotAllocation::Instance)
+                    && !old_slots.contains(&slot.name))
+                .map(|slot| slot.name).collect::<Vec<_>>();
+            egcl_rt::rooted!(names = Vec::with_capacity(added.len()));
+            for name in added {
+                let symbol = resolve_sym(&name)
+                    .ok_or_else(|| EgclError::Internal("class-change slot symbol unavailable".into()))?;
+                names.push(symbol);
+            }
+            Ok(vec_to_list(&names))
+        }),
+
         "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
         | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE" => Some(|_operator, args, env| {
             egcl_rt::rooted!(args = args.to_vec());
@@ -3249,7 +3353,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 Some(
                     names.iter()
-                        .map(|name| sym_bare_name_rc(*name).to_string())
+                        .map(|name| sym_name(*name))
                         .collect::<Vec<_>>(),
                 )
             };

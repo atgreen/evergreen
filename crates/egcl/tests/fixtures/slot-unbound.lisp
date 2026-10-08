@@ -1,0 +1,53 @@
+(defclass lazy-box () ((value :accessor lazy-value)))
+(defmethod slot-unbound (class (object lazy-box) (slot (eql 'value)))
+  (assert (eq class (class-of object)))
+  (setf (lazy-value object) (list 42)))
+
+(defun check-lazy-slots ()
+  (let ((object (make-instance 'lazy-box)))
+    (assert (not (slot-boundp object 'value)))
+    (assert (equal (lazy-value object) '(42)))
+    (slot-makunbound object 'value)
+    (assert (equal (slot-value object 'value) '(42)))
+    (slot-makunbound object 'value)
+    (assert (equal (funcall #'lazy-value object) '(42)))))
+
+(check-lazy-slots)
+
+(defclass returning-box () ((value :reader returning-value)))
+(defmethod slot-unbound (class (object returning-box) slot)
+  (declare (ignore class object slot))
+  (values 17 18))
+(let ((object (make-instance 'returning-box)))
+  (assert (equal (multiple-value-list (slot-value object 'value)) '(17)))
+  (assert (equal (multiple-value-list (returning-value object)) '(17)))
+  (assert (not (slot-boundp object 'value))))
+
+(defclass shared-box () ((value :allocation :class :accessor shared-value)))
+(defclass shared-child (shared-box) ())
+(defmethod slot-unbound (class (object shared-box) slot)
+  (assert (eq class (class-of object)))
+  (setf (slot-value object slot) (list 23)))
+(let ((object (make-instance 'shared-child)))
+  (assert (equal (shared-value object) '(23)))
+  (assert (eq (shared-value object) (shared-value (make-instance 'shared-box)))))
+
+(defclass ordinary-box () ((value :reader ordinary-value)))
+(defclass next-box (ordinary-box) ())
+(defmethod slot-unbound (class (object next-box) slot)
+  (declare (ignore class object slot))
+  (assert (next-method-p))
+  (call-next-method))
+(dolist (class '(ordinary-box next-box))
+  (let ((object (make-instance class)))
+    (dolist (reader (list #'ordinary-value
+                         (lambda (object) (slot-value object 'value))))
+      (assert
+       (handler-case (progn (funcall reader object) nil)
+         (unbound-slot (condition)
+           (and (eq (cell-error-name condition) 'value)
+                (eq (unbound-slot-instance condition) object))))))))
+
+;; Warm the reader calls so compiled dispatch also sees unbound instances.
+(dotimes (i 100) (check-lazy-slots))
+(write-line "SLOT-UNBOUND-PASS")

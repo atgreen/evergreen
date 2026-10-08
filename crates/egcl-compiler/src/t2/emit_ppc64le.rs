@@ -88,7 +88,7 @@
 //! Constants (`Const*` folded; heap literals loaded through their rooted
 //! constant-pool slot), `Return`, `Jump`, two-way `Brif`, `Guard` for the
 //! FIXNUM and SINGLE_FLOAT tags, `FloatAdd/Sub/Mul` on tagged single-floats
-//! (unboxed through the direct GPR↔FPR move), `FixnumAdd/Sub/Mul/Neg` and the
+//! (moved in with `mtvsrd` and converted to double format), `FixnumAdd/Sub/Mul/Neg` and the
 //! five comparisons (branchless via `isel`), all tag-guarded and deopting on
 //! overflow; `Guard` for CONS, `Car`/`Cdr` on a proven cons, `GenericEq`,
 //! `LogAnd/Or/Xor/Not` and `FixnumShl/Shr` by a constant. Anything else returns
@@ -370,10 +370,14 @@ impl Emitter<'_> {
 
     /// Unbox a tagged single-float from `gpr` into `fpr`, through the direct
     /// register-file move POWER provides.
+    /// A tagged single carries its f32 bits in the high word and the tag in the
+    /// low one. `mtvsrd` lands the whole word in the register, where the bits
+    /// must then be converted to the double format the register file uses; the
+    /// conversion reads only the high word, so the tag needs no masking
+    /// (bliss-pjq99).
     fn unbox_single(&mut self, fpr: u8, gpr: u8) {
-        self.asm.srdi(T1, gpr, 32);
-        self.asm.sldi(T1, T1, 32);
-        self.asm.move_to_float(fpr, T1);
+        self.asm.move_to_float(fpr, gpr);
+        self.asm.single_to_double(fpr, fpr);
     }
 
     /// Multiply the tagged fixnums in `W0` and `W1`, leaving the tagged product in
@@ -659,6 +663,8 @@ impl Emitter<'_> {
                     FloatSub => self.asm.sub_single(F0, F0, F1),
                     _ => self.asm.multiply_single(F0, F0, F1),
                 }
+                // Back to single-precision bits in the high word, then tag.
+                self.asm.double_to_single(F0, F0);
                 self.asm.move_from_float(W0, F0);
                 self.asm.srdi(W0, W0, 32);
                 self.asm.sldi(W0, W0, 32);

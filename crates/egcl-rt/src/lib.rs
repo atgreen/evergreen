@@ -11,6 +11,7 @@
 // ── Object model ──────────────────────────────────────────────────
 pub mod asm;
 pub mod asm_ppc64le;
+pub mod asm_riscv64;
 pub mod asm_s390x;
 pub mod bfasl;
 pub mod bignum;
@@ -29,12 +30,9 @@ pub mod native_transfer;
 pub mod object;
 pub mod packages;
 pub mod symbols;
-/// Runtime OS services: Linux syscall wrappers or the Windows backend.
+/// Runtime OS services for Linux, Windows, and macOS.
 #[cfg_attr(windows, path = "syscall/windows.rs")]
-#[cfg(target_os = "macos")]
-#[path = "syscall/macos.rs"]
-pub mod syscall;
-#[cfg(not(target_os = "macos"))]
+#[cfg_attr(target_os = "macos", path = "syscall/macos.rs")]
 pub mod syscall;
 pub mod types;
 pub mod value;

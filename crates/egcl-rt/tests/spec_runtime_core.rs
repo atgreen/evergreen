@@ -834,7 +834,7 @@ fn subprocess_acceptance_aborts_unclassified_sigsegv_without_success() {
         "ordinary SIGSEGV must not be reported as a successful subprocess"
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unhandled SIGSEGV"),
+        String::from_utf8_lossy(&output.stderr).contains("unhandled memory fault"),
         "ordinary SIGSEGV should emit the minimal handler diagnostic; stderr={:?}",
         String::from_utf8_lossy(&output.stderr)
     );

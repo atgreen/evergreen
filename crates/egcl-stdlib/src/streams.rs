@@ -95,6 +95,7 @@ pub enum StreamDirection {
     Input,
     Output,
     Io,
+    Probe,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +122,9 @@ pub const IF_EXISTS_SUPERSEDE_VAL: EgclVal = EgclVal(2 << 3); // fixnum 2
 pub const IF_EXISTS_APPEND_VAL: EgclVal = EgclVal(3 << 3); // fixnum 3
 pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
 
+/// Missing-file creation policy; NIL returns NIL and T signals a file error.
+pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
+
 // ── Internal stream state ──────────────────────────────────────────
 
 /// Off-heap Rust-owned stream state (egcl-jtc.7a). This is NOT the Lisp-visible
@@ -132,6 +136,8 @@ pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
 /// when the stream becomes unreachable, releasing the fd (via `File`'s Drop) and
 /// buffers, and warning for an unclosed file stream (R5.121).
 struct StreamAlloc {
+    /// Opening namestring, retained after CLOSE; absent for non-file streams.
+    file_namestring: Option<String>,
     /// Immutable component references of a composite stream (broadcast /
     /// concatenated components, two-way/echo input+output, synonym symbol), or
     /// empty for non-composite streams. Stored OUTSIDE the per-stream mutex so
@@ -544,6 +550,23 @@ fn file_read_line_buffered(
     }
 }
 
+fn stream_io_error(operation: &str, error: std::io::Error) -> EgclError {
+    let message = format!("{operation}: {error}");
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        EgclError::IoTimeout { stream: NIL, message }
+    } else {
+        EgclError::StreamError(message)
+    }
+}
+
+fn attach_timeout_stream(error: &mut EgclError, stream: EgclVal) {
+    if let EgclError::IoTimeout { stream: origin, .. } = error {
+        if origin.is_nil() {
+            *origin = stream;
+        }
+    }
+}
+
 /// Read a single raw byte from a buffered file input (for binary streams). Issue #10.
 fn file_read_byte_raw(
     file: &mut StreamHandle,
@@ -555,7 +578,7 @@ fn file_read_byte_raw(
         read_buf.resize(FILE_BUF_SIZE, 0);
         let n = file
             .read(&mut read_buf[..])
-            .map_err(|e| EgclError::StreamError(format!("file read error: {}", e)))?;
+            .map_err(|e| stream_io_error("file read error", e))?;
         if n == 0 {
             return Ok(EOF);
         }
@@ -601,7 +624,7 @@ fn bulk_read_octets(
             }
             Ok(n) => out.truncate(base + n),
             Err(e) => {
-                return Err(EgclError::StreamError(format!("file read error: {}", e)));
+                return Err(stream_io_error("file read error", e));
             }
         }
     }
@@ -1794,6 +1817,7 @@ fn alloc_stream(
     element_type: StreamElementType,
     inner: StreamInner,
     components: Vec<EgclVal>,
+    file_namestring: Option<String>,
 ) -> EgclVal {
     // Composite streams are constructed after their immutable components and
     // acquire the composite lock first. Descending keys therefore put every
@@ -1806,6 +1830,7 @@ fn alloc_stream(
     // the GC can trace it lock-free; the mutable state gets a raw back-pointer
     // to it for the composite op arms.
     let mut boxed = Box::new(StreamAlloc {
+        file_namestring,
         components: components.into_boxed_slice(),
         state: OrderedExecutionMutex::new(
             LockLevel::Stream,
@@ -1924,6 +1949,7 @@ pub fn make_stdin() -> EgclVal {
             col: 0,
         },
         vec![],
+        None,
     )
 }
 
@@ -1933,6 +1959,7 @@ pub fn make_stdout() -> EgclVal {
         StreamElementType::Character,
         StreamInner::Stdout { line: 0, col: 0 },
         vec![],
+        None,
     )
 }
 
@@ -1942,6 +1969,7 @@ pub fn make_stderr() -> EgclVal {
         StreamElementType::Character,
         StreamInner::Stderr { line: 0, col: 0 },
         vec![],
+        None,
     )
 }
 
@@ -1970,6 +1998,17 @@ fn get_stream_alloc(stream: EgclVal) -> Result<&'static StreamAlloc, EgclError> 
     }
 }
 
+/// Copy a file stream's immutable opening namestring without taking its I/O lock.
+pub(crate) fn file_namestring(stream: EgclVal) -> Result<String, EgclError> {
+    get_stream_alloc(stream)?
+        .file_namestring
+        .clone()
+        .ok_or_else(|| EgclError::TypeError {
+            datum: stream,
+            expected: "stream associated with a file".into(),
+        })
+}
+
 /// Lock the per-stream mutex and return a guard. R5.120.
 fn lock_stream(
     stream: EgclVal,
@@ -1987,6 +2026,9 @@ fn with_stream<T: egcl_rt::gc::TraceHostRoots>(
     egcl_rt::rooted!(stream = stream);
     let mut guard = lock_stream(*stream)?;
     let mut result = operation(&mut guard);
+    if let Err(error) = &mut result {
+        attach_timeout_stream(error, *stream);
+    }
     egcl_rt::rooted_ref!(_result_root = &mut result);
     drop(guard);
     drop(_result_root);
@@ -2020,9 +2062,13 @@ pub fn open(
     let path_str = crate::pathnames::extract_path_string(pathname)
         .map_err(|_| EgclError::FileError("pathname must be a string".into()))?;
     let path = std::path::Path::new(&path_str);
+    let absolute_path = std::path::absolute(path)
+        .map_err(|e| EgclError::FileError(format!("{}: {}", path_str, e)))?
+        .to_string_lossy()
+        .into_owned();
 
     match direction {
-        StreamDirection::Input => {
+        StreamDirection::Input | StreamDirection::Probe => {
             if path.is_dir() {
                 return Err(EgclError::FileError(format!(
                     "cannot open directory as a file: {}",
@@ -2032,23 +2078,31 @@ pub fn open(
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // CLHS: `:if-does-not-exist nil` returns NIL rather than
-                    // signalling — the caller decides. Any other value (the
-                    // default `:error`, or `:create` which we don't create for
-                    // input) signals a file-error.
                     if if_does_not_exist == NIL {
                         return Ok(NIL);
                     }
-                    return Err(EgclError::FileError(format!(
-                        "file not found: {}",
-                        path_str
-                    )));
+                    if if_does_not_exist == IF_DOES_NOT_EXIST_CREATE_VAL {
+                        // Do not truncate a file created by another process
+                        // between the failed read-only open and this one.
+                        std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create(true)
+                            .truncate(false)
+                            .open(path)
+                            .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                    } else {
+                        return Err(EgclError::FileError(format!(
+                            "file not found: {}",
+                            path_str
+                        )));
+                    }
                 }
                 Err(e) => {
                     return Err(EgclError::FileError(format!("cannot open file: {}", e)));
                 }
             };
-            Ok(alloc_stream(
+            egcl_rt::rooted!(stream = alloc_stream(
                 elt,
                 StreamInner::FileInput {
                     file: StreamHandle::File(file),
@@ -2062,7 +2116,12 @@ pub fn open(
                     element_type: elt,
                 },
                 vec![],
-            ))
+                Some(absolute_path),
+            ));
+            if direction == StreamDirection::Probe {
+                close(*stream, false)?;
+            }
+            Ok(*stream)
         }
         StreamDirection::Output => {
             // Issue #8: Handle if_exists variants including :append.
@@ -2109,6 +2168,7 @@ pub fn open(
                     col: 0,
                 },
                 vec![],
+                Some(absolute_path),
             ))
         }
         StreamDirection::Io => {
@@ -2168,6 +2228,7 @@ pub fn open(
                     external_format,
                 },
                 vec![],
+                Some(absolute_path),
             ))
         }
     }
@@ -2229,6 +2290,7 @@ pub fn make_string_input_stream(
             unread: None,
         },
         vec![],
+        None,
     ))
 }
 
@@ -2241,6 +2303,7 @@ pub fn make_string_output_stream(_element_type: EgclVal) -> Result<EgclVal, Egcl
             col: 0,
         },
         vec![],
+        None,
     ))
 }
 
@@ -2264,6 +2327,7 @@ pub fn make_broadcast_stream(streams: &[EgclVal]) -> Result<EgclVal, EgclError> 
         StreamElementType::Character,
         StreamInner::Broadcast,
         streams.to_vec(),
+        None,
     ))
 }
 
@@ -2272,6 +2336,7 @@ pub fn make_concatenated_stream(streams: &[EgclVal]) -> Result<EgclVal, EgclErro
         StreamElementType::Character,
         StreamInner::Concatenated { cursor: 0 },
         streams.to_vec(),
+        None,
     ))
 }
 
@@ -2280,6 +2345,7 @@ pub fn make_two_way_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, E
         StreamElementType::Character,
         StreamInner::TwoWay,
         vec![input, output],
+        None,
     ))
 }
 
@@ -2288,6 +2354,7 @@ pub fn make_echo_stream(input: EgclVal, output: EgclVal) -> Result<EgclVal, Egcl
         StreamElementType::Character,
         StreamInner::Echo,
         vec![input, output],
+        None,
     ))
 }
 
@@ -2296,6 +2363,7 @@ pub fn make_synonym_stream(symbol: EgclVal) -> Result<EgclVal, EgclError> {
         StreamElementType::Character,
         StreamInner::Synonym,
         vec![symbol],
+        None,
     ))
 }
 
@@ -2541,7 +2609,15 @@ pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, Egcl
     // is what an allocation during the read could move.
     egcl_rt::rooted!(stream = stream);
     let mut guard = lock_stream(*stream)?;
-    guard.read_octets(count)
+    let mut result = guard.read_octets(count);
+    if let Err(error) = &mut result {
+        attach_timeout_stream(error, *stream);
+        egcl_rt::rooted_ref!(_error_root = error);
+        drop(guard);
+    } else {
+        drop(guard);
+    }
+    result
 }
 
 /// Write OCTETS to STREAM as bytes, taking the stream lock once.
@@ -2979,48 +3055,148 @@ pub fn install_gc_hooks() {
 
 // ── TCP sockets ────────────────────────────────────────────────────
 // Minimal networking primitives for the slynk backend (and general Lisp use).
-// A *listening* socket is an opaque integer id into a thread-local registry (it
+// A *listening* socket is an opaque integer id into a process-wide registry (it
 // is never read/written as a stream, only accept/close/local-port). An *accepted
-// connection* is returned as an ordinary bidirectional character stream, reusing
+// connection* is returned as an ordinary bidirectional octet stream, reusing
 // the FileIo machinery over its owned TCP transport — so all the Gray-stream
 // I/O (read-char, read-line, write-string, force-output, …) works unchanged.
-use std::cell::{Cell, RefCell};
 use std::net::ToSocketAddrs;
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-thread_local! {
-    static SOCKET_LISTENERS: RefCell<HashMap<u64, TcpListener>> = RefCell::new(HashMap::new());
-    static SOCKET_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+struct SocketListener {
+    socket: TcpListener,
+    closed: AtomicBool,
+}
+
+impl SocketListener {
+    fn check_open(&self) -> Result<(), EgclError> {
+        if self.closed.load(Ordering::Acquire) {
+            Err(EgclError::FileError("socket listener is closed".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait(&self, timeout: Option<std::time::Duration>) -> Result<bool, EgclError> {
+        self.check_open()?;
+        // Each parked operation needs its own poller registration. Duplicates
+        // share the listening socket and its shutdown, but have distinct fds.
+        let waiter = self.socket.try_clone()
+            .map_err(|e| EgclError::FileError(format!("socket listener wait: {e}")))?;
+        let ready = egcl_rt::sync::wait_fd(
+            waiter.as_raw_fd(), egcl_rt::sync::IoInterest::Read, timeout,
+        )?;
+        self.check_open()?;
+        Ok(ready)
+    }
+}
+
+fn socket_listeners() -> &'static OrderedMutex<HashMap<u64, Arc<SocketListener>>> {
+    static LISTENERS: OnceLock<OrderedMutex<HashMap<u64, Arc<SocketListener>>>> = OnceLock::new();
+    LISTENERS.get_or_init(|| {
+        OrderedMutex::new(
+            LockLevel::ExecutionRegistry,
+            0,
+            "socket listeners",
+            HashMap::new(),
+        )
+    })
+}
+
+fn socket_listener(id: u64) -> Result<Arc<SocketListener>, EgclError> {
+    socket_listeners()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| EgclError::FileError("unknown or closed socket listener".into()))
 }
 
 /// Create a listening TCP socket bound to `host:port` (port 0 = any free port).
 /// Returns an opaque listener id for `socket_accept`/`socket_local_port`/`socket_close_listener`.
-pub fn socket_listen(host: &str, port: u16, _backlog: i32) -> Result<u64, EgclError> {
-    let listener = TcpListener::bind((host, port))
+pub fn socket_listen(host: &str, port: u16, backlog: i32) -> Result<u64, EgclError> {
+    socket_listen_with_options(host, port, backlog, cfg!(unix))
+}
+
+/// Bind a TCP listener with explicit address reuse and pending-connection limit.
+pub fn socket_listen_with_options(
+    host: &str,
+    port: u16,
+    backlog: i32,
+    reuse_address: bool,
+) -> Result<u64, EgclError> {
+    if backlog < 0 {
+        return Err(EgclError::ProgramError(
+            "socket-listen: negative backlog".into(),
+        ));
+    }
+    let bind = || -> std::io::Result<TcpListener> {
+        let mut last_error = std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "hostname resolved to no addresses",
+        );
+        for address in (host, port).to_socket_addrs()? {
+            let attempt = || -> std::io::Result<TcpListener> {
+                let socket = socket2::Socket::new(
+                    socket2::Domain::for_address(address),
+                    socket2::Type::STREAM,
+                    Some(socket2::Protocol::TCP),
+                )?;
+                socket.set_reuse_address(reuse_address)?;
+                socket.bind(&address.into())?;
+                socket.listen(backlog)?;
+                Ok(socket.into())
+            };
+            match attempt() {
+                Ok(listener) => return Ok(listener),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
+    };
+    let listener = bind()
         .map_err(|e| EgclError::FileError(format!("socket-listen {host}:{port}: {e}")))?;
-    let id = SOCKET_NEXT_ID.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    SOCKET_LISTENERS.with(|m| m.borrow_mut().insert(id, listener));
+    #[cfg(unix)]
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| EgclError::FileError(format!("socket-listen: {e}")))?;
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    socket_listeners().lock().unwrap().insert(
+        id,
+        Arc::new(SocketListener {
+            socket: listener,
+            closed: AtomicBool::new(false),
+        }),
+    );
     Ok(id)
 }
 
 /// The actual local port a listener is bound to (resolves port 0).
 pub fn socket_local_port(id: u64) -> Option<u16> {
-    SOCKET_LISTENERS
-        .with(|m| m.borrow().get(&id).and_then(|l| l.local_addr().ok()))
+    socket_listener(id)
+        .ok()
+        .and_then(|l| l.socket.local_addr().ok())
         .map(|a| a.port())
 }
 
 /// Close and forget a listening socket.
 pub fn socket_close_listener(id: u64) {
-    SOCKET_LISTENERS.with(|m| {
-        m.borrow_mut().remove(&id);
-    });
+    let listener = socket_listeners().lock().unwrap().remove(&id);
+    if let Some(listener) = listener {
+        listener.closed.store(true, Ordering::Release);
+        #[cfg(unix)]
+        // SAFETY: this retained owner keeps the descriptor alive until shutdown
+        // returns. Pending waiters retain it too, preventing descriptor reuse.
+        unsafe {
+            libc::shutdown(listener.socket.as_raw_fd(), libc::SHUT_RDWR);
+        }
+    }
 }
 
 /// Connect a TCP client and return an owned bidirectional octet stream.
@@ -3065,16 +3241,22 @@ pub fn socket_connect(
 /// Accept a connection on listener `id`, returning a bidirectional octet
 /// stream over the new socket (blocks until a client connects).
 pub fn socket_accept(id: u64) -> Result<EgclVal, EgclError> {
-    let stream = SOCKET_LISTENERS.with(|m| {
-        let map = m.borrow();
-        let listener = map.get(&id).ok_or_else(|| {
-            EgclError::FileError("socket-accept: unknown or closed listener".into())
-        })?;
-        listener
-            .accept()
-            .map(|(s, _)| s)
-            .map_err(|e| EgclError::FileError(format!("socket-accept: {e}")))
-    })?;
+    let listener = socket_listener(id)?;
+    let stream = loop {
+        listener.check_open()?;
+        match listener.socket.accept() {
+            Ok((stream, _)) => {
+                listener.check_open()?;
+                break stream;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            #[cfg(unix)]
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                listener.wait(None)?;
+            }
+            Err(e) => return Err(EgclError::FileError(format!("socket-accept: {e}"))),
+        }
+    };
     socket_stream(stream)
 }
 
@@ -3085,46 +3267,27 @@ pub fn socket_accept(id: u64) -> Result<EgclVal, EgclError> {
 /// its own event loop -- a UI serving slynk between frames, say -- has no way to
 /// offer a REPL without stalling on accept until somebody connects.
 pub fn socket_listener_ready(id: u64, timeout_ms: i32) -> Result<bool, EgclError> {
-    SOCKET_LISTENERS.with(|m| {
-        let map = m.borrow();
-        let listener = map.get(&id).ok_or_else(|| {
-            EgclError::FileError("socket-listener-ready: unknown or closed listener".into())
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            use egcl_rt::syscall::{POLLERR, POLLHUP, POLLIN, POLLNVAL, PollFd};
-            let mut descriptor = PollFd {
-                fd: listener.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            };
-            // SAFETY: the listener is alive for this borrow and owns the fd.
-            let count = unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, timeout_ms) }
-                .map_err(|errno| {
-                    EgclError::FileError(format!("socket-listener-ready: errno {errno}"))
-                })?;
-            if descriptor.revents & POLLNVAL != 0 {
-                return Err(EgclError::FileError(
-                    "socket-listener-ready: invalid descriptor".into(),
-                ));
-            }
-            Ok(count > 0 && descriptor.revents & (POLLIN | POLLHUP | POLLERR) != 0)
-        }
-        #[cfg(not(unix))]
-        {
-            // Fall back to a non-blocking accept probe, restoring the mode.
-            let _ = timeout_ms;
-            listener.set_nonblocking(true).ok();
-            let ready = match listener.accept() {
-                Ok(_) => true,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(_) => true,
-            };
-            listener.set_nonblocking(false).ok();
-            Ok(ready)
-        }
-    })
+    let listener = socket_listener(id)?;
+    listener.check_open()?;
+    #[cfg(unix)]
+    {
+        let timeout =
+            (timeout_ms >= 0).then(|| std::time::Duration::from_millis(timeout_ms as u64));
+        listener.wait(timeout)
+    }
+    #[cfg(not(unix))]
+    {
+        // Fall back to a non-blocking accept probe, restoring the mode.
+        let _ = timeout_ms;
+        listener.socket.set_nonblocking(true).ok();
+        let ready = match listener.socket.accept() {
+            Ok(_) => true,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(_) => true,
+        };
+        listener.socket.set_nonblocking(false).ok();
+        Ok(ready)
+    }
 }
 
 /// Transfer the owned socket to the common stream/finalizer machinery.
@@ -3146,6 +3309,7 @@ fn socket_stream(stream: TcpStream) -> Result<EgclVal, EgclError> {
             external_format: ExternalFormat::Utf8,
         },
         vec![],
+        None,
     ))
 }
 
@@ -3170,6 +3334,7 @@ pub fn process_stdin_stream(
             col: 0,
         },
         vec![],
+        None,
     )
 }
 
@@ -3204,6 +3369,7 @@ fn process_input_stream(pipe: OwnedPipe, element_type: StreamElementType) -> Egc
             element_type,
         },
         vec![],
+        None,
     )
 }
 
