@@ -227,6 +227,14 @@ EGCL_GC_STRESS_AT=40120 EGCL_GC_POISON=1 ./…/egcl …
 Prefer `SKIP` to localize (robust: it stresses the whole suffix) and `AT` to
 name the allocation site once the window is tight.
 
+**Booting the image under stress costs minutes before your form runs.** The
+bootstrap allocates ~100k objects, and `EGCL_GC_STRESS=1` forces a collection on
+each (1.5–2 ms apiece, on every target — bliss-v2b6o). When the bootstrap is not
+what you are probing, set `EGCL_GC_STRESS_AFTER_INIT=1` as well: the CLI then
+starts the forced collections at the first `--eval`/`--load`/`--script` form.
+A numeric `SKIP` cannot express this, because the bootstrap's allocation count
+moves with every image change.
+
 **A `SKIP` above the program's allocation count is silently a no-op** — it
 disables stressing entirely and reports a *clean run that proves nothing*
 (bliss-sqpi: an early bracketing of that bug concluded "the fault is in

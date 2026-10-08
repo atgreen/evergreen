@@ -5,10 +5,13 @@
 use std::process::Command;
 
 fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
-    // Per-allocation stress plus heap verification takes about 372 seconds in
-    // the CI release profile (bliss-q2enn). Keep stress, poison, verification,
-    // and every result/path assertion; give that work a bounded budget with
-    // headroom instead of terminating it at the old 240-second deadline.
+    // Per-allocation stress plus heap verification took about 372 seconds in
+    // the CI release profile (bliss-q2enn) and overran this budget on s390x
+    // (bliss-v2b6o): nearly all of it was the ~100,000 bootstrap allocations,
+    // each paying a verified minor collection before the probe even started.
+    // EGCL_GC_STRESS_AFTER_INIT starts the stress at the first user form, which
+    // is what this test is probing; stress, poison, verification and every
+    // result/path assertion are unchanged.
     let timeout_seconds = "900";
     let program = format!(
         r#"
@@ -42,6 +45,7 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
         .env("EGCL_FORCE_TIER", tier)
         .env("EGCL_LAZY_COMPILE", "0")
         .env("EGCL_GC_STRESS", "1")
+        .env("EGCL_GC_STRESS_AFTER_INIT", "1")
         .env("EGCL_GC_POISON", "1")
         .env("EGCL_GC_VERIFY", "1")
         .env("EGCL_DEOPT_PATH_DBG", "1")
