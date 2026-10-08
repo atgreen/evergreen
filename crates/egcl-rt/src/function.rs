@@ -12,10 +12,11 @@
 //! cache ownership, deopt/tracing/debug identity, and precise GC roots — none of
 //! which a name→struct map can provide.
 //!
-//! Function objects are **pinned and identity-stable**: redefinition updates the
-//! existing object's fields in place (resetting tiering) rather than replacing
-//! the object, because inline caches, tracing, and deopt policy key off object
-//! identity.
+//! Function objects are **pinned and identity-stable**. Ordinary DEFUN installs
+//! a fresh object in the symbol's function cell, so saved references retain the
+//! previous definition. Tier changes preserve the object's identity. Explicit
+//! in-place restoration uses `redefine`; callers must also invalidate compiled
+//! dependencies when using that lower-level operation.
 
 use crate::object::{FunctionData, ObjectHeader, type_id};
 use crate::value::EgclVal;

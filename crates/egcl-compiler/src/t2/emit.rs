@@ -1442,6 +1442,7 @@ fn emit_call(
     self_sym: Option<u32>,
     self_entry: Option<egcl_rt::asm::Label>,
     self_arity: usize,
+    named_calls: &[NamedCallTarget],
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1449,6 +1450,14 @@ fn emit_call(
         _ => return Err(EmitError::UnsupportedOp(0xF8)),
     };
     let nargs = data.args.len();
+    let named = named_calls.iter().find(|target| target.symbol == sym);
+    // A named slot speaks the Lisp native ABI. Only its interpreter/legacy
+    // bridge crosses into Rust and changes fault-recovery state.
+    let named_recovery = if named.is_some() && cfg!(all(target_arch = "x86_64", unix)) {
+        0
+    } else {
+        c2i_recovery_toggle_addr
+    };
     // Direct self-call: the target is this very function and it has a register
     // entry — place args in the arg registers and `call` our own entry, skipping
     // c2i dispatch entirely (the register entry saves/restores our callee-saved
@@ -1531,7 +1540,7 @@ fn emit_call(
             emit_call_arg_moves(a, moves)?;
             mov_imm64(a, 7, sym as i64); // rdi = sym
             mov_imm64(a, 6, nargs as i64); // rsi = nargs
-            mov_imm64(a, 9, 0); // r9 = no call-site profile
+            mov_imm64(a, 9, 0); // r9 = no profiling token
             mov_imm64(a, 0, c2i_call_addr as i64);
             // The common join checks both the helper and direct entries.
             emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
@@ -1544,8 +1553,7 @@ fn emit_call(
             return Ok(());
         }
     }
-    // c2i_call(sym, n, a0, a1, a2, profile): rdx=a0, rcx=a1, r8=a2.
-    // T2 does not gather another inlining profile after installation, so r9=0.
+    // T2 call(sym, n, a0, a1, a2, profile_site): rdx=a0, rcx=a1, r8=a2.
     const C2I_ARGS: [u8; 3] = [2, 1, 8];
     if nargs > C2I_ARGS.len() {
         let frame_base = frame_base.ok_or(EmitError::UnsupportedOp(0xF9))?;
@@ -1570,9 +1578,14 @@ fn emit_call(
             2,
             (i32::from(activation_slots) + i32::from(call_arg_base)) * 8,
         );
-        mov_imm32(a, 1, 0); // rcx = profile site (T2 does not gather one)
-        mov_imm64(a, 0, c2i_call_slice_addr as i64);
-        emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+        mov_imm64(a, 1, 0); // rcx = no profiling token
+        if let Some(target) = named {
+            mov_imm64(a, 7, target.cell_address as i64);
+            mov_imm64(a, 0, target.slice_entry as i64);
+        } else {
+            mov_imm64(a, 0, c2i_call_slice_addr as i64);
+        }
+        emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
         if let Some(&result) = data.results.first() {
             let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
             store_home(a, home, RAX, 0);
@@ -1593,21 +1606,28 @@ fn emit_call(
     // convention, so only rdi (which also carries the table slot), r9 (the
     // baked invalidation generation instead of a profile token — builtins do
     // not tier, so there is nothing to profile) and the target differ.
-    match direct_builtin_for(sym, nargs) {
-        Some((addr, slot, generation)) => {
-            mov_imm64(a, 7, (((slot as u64) << 32) | sym as u64) as i64); // rdi
-            mov_imm64(a, 6, nargs as i64); // rsi = nargs
-            mov_imm64(a, 9, generation as i64); // r9 = baked generation
-            mov_imm64(a, 0, addr as i64); // rax = direct builtin adapter
-        }
-        None => {
-            mov_imm64(a, 7, sym as i64); // mov rdi, sym
-            mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
-            mov_imm64(a, 9, 0); // mov r9, no call-site profile
-            mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
+    if let Some(target) = named {
+        mov_imm64(a, 7, target.cell_address as i64);
+        mov_imm64(a, 6, nargs as i64);
+        mov_imm64(a, 9, 0);
+        mov_imm64(a, 0, target.register_entry as i64);
+    } else {
+        match direct_builtin_for(sym, nargs) {
+            Some((addr, slot, generation)) => {
+                mov_imm64(a, 7, (((slot as u64) << 32) | sym as u64) as i64); // rdi
+                mov_imm64(a, 6, nargs as i64); // rsi = nargs
+                mov_imm64(a, 9, generation as i64); // r9 = baked generation
+                mov_imm64(a, 0, addr as i64); // rax = direct builtin adapter
+            }
+            None => {
+                mov_imm64(a, 7, sym as i64); // mov rdi, sym
+                mov_imm64(a, 6, nargs as i64); // mov rsi, nargs
+                mov_imm64(a, 9, 0); // r9 = no profiling token
+                mov_imm64(a, 0, c2i_call_addr as i64); // mov rax, c2i_call
+            }
         }
     }
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+    emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
     if let Some(&r0) = data.results.first() {
         let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_rr(a, dst, 0); // mov result, rax
@@ -1811,11 +1831,35 @@ fn emit_transfer_check(a: &mut Asm, check: Option<NativeTransferCheck>) {
     a.jcc(egcl_rt::asm::Cc::Ne, check.exit);
 }
 
-#[cfg(windows)]
+/// Convert a Lisp register/slice call into a Rust runtime callback. This
+/// boundary belongs to interpreted or legacy targets, not ordinary call sites.
+/// The callback receives the current cell, argument count, and register/slice
+/// payload. It must catch Rust panics and report Lisp transfers out of band.
+#[cfg(all(target_arch = "x86_64", unix))]
+pub fn emit_native_call_bridge(target: u64, recovery_toggle: u64) -> Result<Vec<u8>, EmitError> {
+    let mut a = Asm::new();
+    // At entry RSP is 8 mod 16. The helper emitter expects call-site alignment.
+    a.extend_from_slice(&[0x48, 0x83, 0xec, 8]);
+    mov_imm64(&mut a, RAX, target as i64);
+    emit_runtime_helper_call(&mut a, recovery_toggle, None);
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, 8, 0xc3]);
+    a.finish().ok_or(EmitError::BadBranch)
+}
+
 fn emit_runtime_helper_call(
     a: &mut Asm,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
+) {
+    emit_runtime_target_call(a, c2i_recovery_toggle_addr, transfer_check, false);
+}
+
+#[cfg(windows)]
+fn emit_runtime_target_call(
+    a: &mut Asm,
+    c2i_recovery_toggle_addr: u64,
+    transfer_check: Option<NativeTransferCheck>,
+    indirect: bool,
 ) {
     // Templates arrange up to six word arguments in rdi/rsi/rdx/rcx/r8/r9.
     // At the C boundary translate to Win64's four registers and two stack args.
@@ -1840,7 +1884,7 @@ fn emit_runtime_helper_call(
         store_to_rsp(a, RAX, 32 + i * 8);
     }
     load_from_rsp(a, RAX, 96);
-    a.extend_from_slice(&[0xFF, 0xD0]);
+    a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
     if c2i_recovery_toggle_addr != 0 {
         // Recovery toggles are leaf, nonallocating callbacks: raw operands and
         // the primary result may live here across them, never across a GC.
@@ -1855,13 +1899,14 @@ fn emit_runtime_helper_call(
 }
 
 #[cfg(not(windows))]
-fn emit_runtime_helper_call(
+fn emit_runtime_target_call(
     a: &mut Asm,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
+    indirect: bool,
 ) {
     if c2i_recovery_toggle_addr == 0 {
-        a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
         emit_transfer_check(a, transfer_check);
         return;
     }
@@ -1889,7 +1934,7 @@ fn emit_runtime_helper_call(
     a.extend_from_slice(&[0x48, 0x8B, 0x3C, 0x24]); // mov rdi, [rsp]
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 64
 
-    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
 
     a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
     a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
@@ -2704,6 +2749,9 @@ fn is_moving_gc_reference(value: egcl_rt::value::EgclVal) -> bool {
 /// activation-frame destination otherwise. A function that contains a `Call`
 /// uses callee-saved value registers (so the call cannot clobber live values)
 /// and a small frame.
+/// These generic call adapters receive a zero profiling token. Production
+/// x86-64 callers can supply resolved linkage slots through
+/// `emit_framed_with_direct_natives`; those cells must outlive the code.
 // Public adapter addresses remain explicit to preserve the emitter API.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed(
@@ -2732,6 +2780,8 @@ pub fn emit_framed(
         0,
         None,
         self_sym,
+        &[],
+        0,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
     )
@@ -2779,12 +2829,24 @@ pub fn emit_framed_with_activation_slots(
         self_sym,
         &[],
         0,
+        &[],
     )
+}
+
+/// Execution-owned linkage slots resolved before background compilation.
+/// The runtime must retain these cells for the lifetime of the emitted code.
+#[derive(Clone, Copy, Debug)]
+pub struct NamedCallTarget {
+    pub symbol: u32,
+    pub cell_address: u64,
+    pub register_entry: u64,
+    pub slice_entry: u64,
 }
 
 /// [`emit_framed_with_activation_slots`] plus the native callees the runtime
 /// resolved for this function's call sites. The s390x emitter enters a listed
-/// callee directly (bliss-6j6pk); the other emitters ignore the list.
+/// callee directly (bliss-6j6pk); the other emitters ignore that list.
+/// On x86-64, `named_calls` supplies retained linkage slots for named calls.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_with_direct_natives(
     f: &Function,
@@ -2803,6 +2865,7 @@ pub fn emit_framed_with_direct_natives(
     self_sym: Option<u32>,
     direct_natives: &[DirectNativeTarget],
     code_id: u64,
+    named_calls: &[NamedCallTarget],
 ) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
@@ -2897,6 +2960,8 @@ pub fn emit_framed_with_direct_natives(
         c2i_transfer_pending_addr,
         Some(activation_slots),
         self_sym,
+        named_calls,
+        code_id,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
     )
@@ -3227,6 +3292,8 @@ fn emit_transfer_function(
         0,
         Some(activation_slots),
         None,
+        &[],
+        0,
         Some(&mut transfers),
     )?;
     let mut landings = Vec::new();
@@ -3289,6 +3356,8 @@ fn emit_framed_inner(
     c2i_transfer_pending_addr: u64,
     activation_slots: Option<u16>,
     self_sym: Option<u32>,
+    named_calls: &[NamedCallTarget],
+    code_id: u64,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))] mut transfers: Option<
         &mut TransferEmission,
     >,
@@ -3411,7 +3480,8 @@ fn emit_framed_inner(
     // Checked OSR entries call the precise reconstruction callback on failure,
     // even when the ordinary body contains no calls or guards.
     let has_checked_osr = f.osr_entries.iter().any(|osr| !osr.checks.is_empty());
-    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls || has_checked_osr;
+    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls || has_checked_osr
+        || code_id != 0;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -3550,7 +3620,7 @@ fn emit_framed_inner(
                 if uses.get(&cond) == Some(&1) {
                     if let ValueDef::Result { inst, .. } = f.value(cond).def {
                         let op = f.inst(inst).opcode;
-                        if (fixnum_cmp_cc(op).is_some() || op == Opcode::GenericEq)
+                        if ((code_id == 0 && fixnum_cmp_cc(op).is_some()) || op == Opcode::GenericEq)
                             && f.block(b).insts.contains(&inst)
                         {
                             fused.insert(inst);
@@ -4060,6 +4130,13 @@ fn emit_framed_inner(
         next_stack += 1;
         Some(home)
     };
+    // Native callees resume their own deoptimization, including register-entry
+    // recursion. Record whether this activation owns an EgclStack frame.
+    let entry_kind_home = (code_id != 0).then(|| {
+        let home = FramedHome::Stack(next_stack);
+        next_stack += 1;
+        home
+    });
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
     let allocation_edits = machine.allocation_edits.len();
@@ -4194,6 +4271,10 @@ fn emit_framed_inner(
     // registers and pad; then load entry params from the frame slots into their
     // value registers and fall (or jump) into the entry block.
     let _unwind_info = emit_prologue(&mut a);
+    if let Some(home) = entry_kind_home {
+        mov_imm64(&mut a, RAX, code_id as i64);
+        store_home(&mut a, home, RAX, 0);
+    }
     if cfg!(windows) {
         mov_rr(&mut a, 7, 1); // Win64 entry RCX -> preserved frame base RDI
     }
@@ -4218,6 +4299,10 @@ fn emit_framed_inner(
         // Register entry: same prologue, but args arrive in the arg registers and
         // move into the (callee-saved) value registers; then fall into the body.
         emit_prologue(&mut a);
+        if let Some(home) = entry_kind_home {
+            mov_imm64(&mut a, RAX, (code_id | (1 << 63)) as i64);
+            store_home(&mut a, home, RAX, 0);
+        }
         let entry_moves = f
             .block(entry)
             .params
@@ -4597,6 +4682,7 @@ fn emit_framed_inner(
                     self_sym,
                     self_entry,
                     f.block(entry).params.len(),
+                    named_calls,
                 )?;
             } else if d.opcode == Opcode::MemoryFence {
                 match d.aux {
@@ -4877,7 +4963,13 @@ fn emit_framed_inner(
             // looks at NATIVE_DEOPT, returning the error without re-running. No
             // committed side effect is repeated, and no FrameState is needed.
             Opcode::Trap => {
-                a.jmp(deopt);
+                if code_id != 0 {
+                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+                    emit_epilogue(&mut a);
+                    a.push(0xC3);
+                } else {
+                    a.jmp(deopt);
+                }
             }
             Opcode::Return => {
                 if let Some(&value) = td.args.first() {
@@ -5168,7 +5260,11 @@ fn emit_framed_inner(
         // c2i_deopt_t2(n_scopes=rdi, n_words=rsi, buf=rdx, reserved=rcx)
         mov_imm32(&mut a, 7, fs.scopes.len() as u32);
         mov_imm32(&mut a, 6, n_words as u32);
-        mov_imm32(&mut a, 1, 0);
+        if let Some(home) = entry_kind_home {
+            load_home(&mut a, 1, home, alloc as i32);
+        } else {
+            mov_imm32(&mut a, 1, 0);
+        }
         mov_rr(&mut a, 2, 4); // mov rdx, rsp
         mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
         emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
@@ -5243,6 +5339,10 @@ fn emit_framed_inner(
         }
         let offset = a.here();
         emit_prologue(&mut a);
+        if let Some(home) = entry_kind_home {
+            mov_imm64(&mut a, RAX, code_id as i64);
+            store_home(&mut a, home, RAX, 0);
+        }
         if cfg!(windows) {
             mov_rr(&mut a, 7, 1);
         }
@@ -5323,6 +5423,9 @@ fn emit_framed_inner(
     // Conversely, pure functions use the shared whole-function `deopt` stub and
     // have no entries in `inst_deopt`. Derive the capability from actual label
     // references, not from which kind of stub happened to be allocated.
+    if code_id != 0 && a.label_is_referenced(deopt) {
+        return Err(EmitError::UnsupportedOp(0xF4));
+    }
     let has_deopt = a.label_is_referenced(deopt)
         || inst_deopt
             .values()
