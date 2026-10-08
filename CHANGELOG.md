@@ -37,6 +37,11 @@
   instead of through the generic adapter, since such a callee resumes the
   interpreter in place and returns a finished value: div2 327 to 239 ms on a
   z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
+
+- On s390x, a self-recursive T2 function keeps its direct self-call entry
+  when its body also calls other functions, as long as no heap value is live
+  across a call; such functions no longer pay the generic adapter on every
+  recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
 - On s390x, eligible self-recursive functions now call their T2 native entry
   directly, reducing recursive-call overhead while retaining stack-limit
   checks ([#77](https://github.com/atgreen/evergreen/pull/77)).

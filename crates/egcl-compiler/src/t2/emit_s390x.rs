@@ -86,11 +86,17 @@
 //! # Direct self-calls
 //!
 //! A function whose live values across every runtime call are proven
-//! immediates (so no shadow roots), whose calls all target itself with at most
-//! three arguments, and which needs no activation-backed instruction, also gets
-//! a REGISTER entry after the ordinary one: the same prologue, but the
-//! arguments arrive in r2-r4 instead of activation slots and r13 is left as the
-//! caller's. A self-call then moves its arguments into r2-r4 and `BRASL`s to
+//! immediates (so no shadow roots), whose self-calls pass at most three
+//! arguments and whose other calls at most [`CALL_ARGS_MAX`], and which needs
+//! no activation-backed instruction, also gets a REGISTER entry after the
+//! ordinary one: the same prologue, but the arguments arrive in r2-r4 instead
+//! of activation slots and r13 is left as the caller's. Such a body never
+//! touches r13: a non-self call stages its arguments in this frame's
+//! call-argument area and goes through `call_slice_rooted`, which copies them
+//! into rooted storage before the callee can allocate, or enters a resolved
+//! native callee directly, which copies them into the callee's published
+//! frame first; the direct-builtin shortcut is not taken there, since a
+//! builtin reads the area while it may allocate (bliss-of8kz). A self-call then moves its arguments into r2-r4 and `BRASL`s to
 //! that entry, skipping c2i dispatch entirely (bliss-hx5xb; measured 0.78 us
 //! per generic call on a z17 against 77 ns per loop iteration). The site first
 //! compares r15 with the published native stack limit and takes the ordinary
@@ -163,6 +169,12 @@ pub struct RuntimeCalls {
     /// `Trap` uses it (see there); zero declines `Trap`.
     pub deopt: u64,
     pub call_slice: u64,
+    /// `call_slice` with the arguments copied into rooted storage before the
+    /// callee runs: what a register-entry body uses for its non-self calls,
+    /// whose arguments are staged in the native frame where the collector
+    /// cannot see them (bliss-of8kz). Zero withholds the register entry from
+    /// any body that makes such a call.
+    pub call_slice_rooted: u64,
     pub load_global: u64,
     pub load_function: u64,
     pub store_global: u64,
@@ -231,13 +243,18 @@ struct Emitter<'a> {
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
     reg_entry: Option<Label>,
-    /// Frame offset of the three-word area a self-call's slow path stages its
-    /// arguments in for `call_slice`.
+    /// Frame offset of the call-argument area of a register-entry body: a
+    /// self-call's slow path stages its arguments there for `call_slice`, and
+    /// every other call stages its arguments there too (bliss-of8kz).
     self_args_base: i32,
 }
 
 /// High bits of a structural decline code; the low 16 bits carry the line.
 pub const S390X_DECLINE_TAG: u32 = 0x5390_0000;
+
+/// The most arguments a non-self call may pass from a register-entry body:
+/// the rooting slice adapter copies that many (bliss-of8kz).
+pub const CALL_ARGS_MAX: usize = 8;
 
 /// A structural decline (a shape this emitter does not handle, as opposed to
 /// an opcode it refuses, which carries the opcode tag): names the line that
@@ -401,9 +418,18 @@ impl Emitter<'_> {
                     let AuxData::CallTarget(symbol) = data.aux else {
                         return Err(unsupported!());
                     };
+                    // A register-entry body must not touch r13 (the caller's
+                    // activation when entered that way): it stages the
+                    // arguments in its own frame instead (bliss-of8kz).
+                    let in_frame = self.reg_entry.is_some();
+                    let (args_reg, args_base) = if in_frame {
+                        (15, self.self_args_base)
+                    } else {
+                        (13, argument_base)
+                    };
                     for (index, &arg) in data.args.iter().enumerate() {
                         self.load(arg, 2)?;
-                        self.asm.store(2, 13, argument_base + index as i32 * 8);
+                        self.asm.store(2, args_reg, args_base + index as i32 * 8);
                     }
                     // A native callee the runtime resolved for this site is
                     // entered directly; its guards fall through to the slice
@@ -411,7 +437,7 @@ impl Emitter<'_> {
                     if let Some(target) = self.direct_native_for(symbol, data.args.len()) {
                         let slow = self.asm.label();
                         let join = self.asm.label();
-                        self.direct_native_call(&target, argument_base, slow);
+                        self.direct_native_call(&target, args_reg, args_base, slow);
                         self.asm.branch(15, join);
                         self.asm.bind(slow);
                         direct_join = Some(join);
@@ -420,21 +446,32 @@ impl Emitter<'_> {
                     // direct slice adapter with its table slot baked into r2
                     // and the invalidation generation in r5, as emit.rs does
                     // with its register adapter (bliss-x5y.27, bliss-flzmi).
-                    match super::emit::direct_builtin_slice_for(symbol, data.args.len()) {
+                    // Not from a register-entry body: the builtin reads the
+                    // unrooted frame area while it may allocate.
+                    let builtin = if in_frame {
+                        None
+                    } else {
+                        super::emit::direct_builtin_slice_for(symbol, data.args.len())
+                    };
+                    match builtin {
                         Some((adapter, slot, generation)) => {
                             self.asm
                                 .imm64(2, (u64::from(slot) << 32) | u64::from(symbol));
                             self.asm.imm64(3, data.args.len() as u64);
-                            self.asm.address(4, 13, argument_base);
+                            self.asm.address(4, args_reg, args_base);
                             self.asm.imm64(5, generation);
                             adapter
                         }
                         None => {
                             self.asm.imm64(2, u64::from(symbol));
                             self.asm.imm64(3, data.args.len() as u64);
-                            self.asm.address(4, 13, argument_base);
+                            self.asm.address(4, args_reg, args_base);
                             self.asm.imm64(5, 0);
-                            self.runtime.call_slice
+                            if in_frame {
+                                self.runtime.call_slice_rooted
+                            } else {
+                                self.runtime.call_slice
+                            }
                         }
                     }
                 }
@@ -598,6 +635,7 @@ impl Emitter<'_> {
     fn direct_native_call(
         &mut self,
         target: &super::emit::DirectNativeTarget,
+        args_reg: u8,
         argument_base: i32,
         slow: Label,
     ) {
@@ -654,9 +692,11 @@ impl Emitter<'_> {
         self.asm.store_u32(2, 5, f_flags);
         self.asm.imm64(2, nslots as u64);
         self.asm.store_u16(2, 5, f_nloc);
-        // Bind the arguments from the shadow area; the rest start as NIL.
+        // Bind the arguments from the staging area (the activation's shadow
+        // slots, or the native frame of a register-entry body); the rest
+        // start as NIL.
         for index in 0..nargs {
-            self.asm.load(2, 13, argument_base + 8 * index);
+            self.asm.load(2, args_reg, argument_base + 8 * index);
             self.asm.store(2, 5, hdr + 8 * index);
         }
         if nargs < nslots {
@@ -1622,11 +1662,21 @@ pub fn emit_framed_with_runtime(
             .flat_map(|&block| &function.block(block).insts)
             .map(|&inst| function.inst(inst))
     };
-    let all_calls_are_narrow_self_calls = instructions().all(|data| {
+    // Self-calls pass their arguments in r2-r4; any other call stages them in
+    // this frame's call-argument area (see the module docs).
+    let is_self_call = |data: &InstData| {
+        matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym)
+    };
+    let calls_fit_register_entry = instructions().all(|data| {
         data.opcode != Opcode::Call
-            || (data.args.len() <= 3
-                && matches!(data.aux, AuxData::CallTarget(symbol) if Some(symbol) == emitter.runtime.self_sym))
+            || (is_self_call(data) && data.args.len() <= 3)
+            || (matches!(data.aux, AuxData::CallTarget(_)) && data.args.len() <= CALL_ARGS_MAX)
     });
+    let other_call_words = instructions()
+        .filter(|data| data.opcode == Opcode::Call && !is_self_call(data))
+        .map(|data| data.args.len())
+        .max()
+        .unwrap_or(0);
     let has_reg_entry = emitter.runtime.self_sym.is_some()
         && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none()
         && !function.is_variadic()
@@ -1635,7 +1685,8 @@ pub fn emit_framed_with_runtime(
             .iter()
             .any(|&param| function.is_entry_param_checked(param))
         && emitter.root_slots == 0
-        && all_calls_are_narrow_self_calls
+        && calls_fit_register_entry
+        && (other_call_words == 0 || emitter.runtime.call_slice_rooted != 0)
         && instructions().all(|data| data.opcode != Opcode::TakeValuesToLocals);
     if has_reg_entry {
         emitter.argument_slots = 0;
@@ -1671,7 +1722,11 @@ pub fn emit_framed_with_runtime(
         .map(|(_, state)| state.remat.len())
         .max()
         .unwrap_or(0);
-    let self_args_words = if has_reg_entry { 3 } else { 0 };
+    let self_args_words = if has_reg_entry {
+        3.max(other_call_words)
+    } else {
+        0
+    };
     let frame_words =
         spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
     // Every load/store and frame adjustment must fit a signed 20-bit address.

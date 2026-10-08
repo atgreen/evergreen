@@ -1388,6 +1388,18 @@ pub struct DirectBuiltinHooks {
 static DIRECT_BUILTIN: std::sync::OnceLock<DirectBuiltinHooks> = std::sync::OnceLock::new();
 
 /// Install the direct-builtin hooks. Idempotent; later calls are ignored.
+/// The rooting variant of the slice call adapter (see
+/// `emit_s390x::RuntimeCalls::call_slice_rooted`), installed by the runtime.
+static CALL_SLICE_ROOTED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn install_call_slice_rooted(addr: u64) {
+    let _ = CALL_SLICE_ROOTED.set(addr);
+}
+
+fn call_slice_rooted_addr() -> u64 {
+    CALL_SLICE_ROOTED.get().copied().unwrap_or(0)
+}
+
 pub fn install_direct_builtin_hooks(hooks: DirectBuiltinHooks) {
     let _ = DIRECT_BUILTIN.set(hooks);
 }
@@ -2802,6 +2814,7 @@ pub fn emit_framed_with_direct_natives(
             super::emit_a64::RuntimeCalls {
                 deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
+                call_slice_rooted: 0,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,
@@ -2822,6 +2835,7 @@ pub fn emit_framed_with_direct_natives(
             super::emit_ppc64le::RuntimeCalls {
                 deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
+                call_slice_rooted: 0,
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,
@@ -2842,6 +2856,7 @@ pub fn emit_framed_with_direct_natives(
             super::emit_s390x::RuntimeCalls {
                 deopt: c2i_deopt_addr,
                 call_slice: c2i_call_slice_addr,
+                call_slice_rooted: call_slice_rooted_addr(),
                 load_global: c2i_load_global_addr,
                 load_function: c2i_load_function_addr,
                 store_global: c2i_store_global_addr,

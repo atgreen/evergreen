@@ -17036,6 +17036,11 @@ extern "C" fn c2i_call_builtin_regs(
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
     #[cfg(not(egcl_no_t2))]
+    egcl_compiler::t2::emit::install_call_slice_rooted(
+        c2i_call_slice_rooted as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize
+            as u64,
+    );
+    #[cfg(not(egcl_no_t2))]
     egcl_compiler::t2::emit::install_direct_builtin_hooks(
         egcl_compiler::t2::emit::DirectBuiltinHooks {
             addr: c2i_call_builtin_regs as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64
@@ -17060,6 +17065,36 @@ extern "C" fn c2i_call_slice(sym: u64, n: u64, args: *const EgclVal, profile_sit
     // adapter synchronously. The frame cannot disappear during this call.
     let args = unsafe { std::slice::from_raw_parts(args, n as usize) };
     c2i_call_args(sym, args, profile_site)
+}
+
+/// `c2i_call_slice` for arguments the collector cannot see: a register-entry
+/// body on s390x stages them in its native frame (bliss-of8kz). They are
+/// copied into a rooted array before the callee can allocate, so a callee that
+/// conses while binding (a &rest list, say) cannot leave them stale. Bodies
+/// with wider calls are not given a register entry
+/// (`egcl_compiler::t2::emit_s390x::CALL_ARGS_MAX`).
+extern "C" fn c2i_call_slice_rooted(
+    sym: u64,
+    n: u64,
+    args: *const EgclVal,
+    profile_site: u64,
+) -> u64 {
+    const MAX: usize = egcl_compiler::t2::emit_s390x::CALL_ARGS_MAX;
+    let n = n as usize;
+    if n != 0 && args.is_null() {
+        return NIL.0;
+    }
+    if n > MAX {
+        // Not emitted; keep the generic behaviour rather than truncate.
+        let args = unsafe { std::slice::from_raw_parts(args, n) };
+        return c2i_call_args(sym, args, profile_site);
+    }
+    let mut copy = [NIL; MAX];
+    // SAFETY: the emitter passes a pointer to `n` tagged words in its own
+    // frame, live for the duration of this call.
+    copy[..n].copy_from_slice(unsafe { std::slice::from_raw_parts(args, n) });
+    egcl_rt::rooted_ref!(_copy_root = &mut copy);
+    c2i_call_args(sym, &copy[..n], profile_site)
 }
 
 /// Direct builtin call from compiled code (bliss-x5y.27).
