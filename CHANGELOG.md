@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- On s390x, T1 native code now calls other native functions directly, pushing
+  the callee frame inline instead of dispatching through the generic adapter.
+  With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
+  to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
