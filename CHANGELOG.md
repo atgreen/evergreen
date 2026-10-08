@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- On s390x, eligible self-recursive functions now call their T2 native entry
+  directly, reducing recursive-call overhead while retaining stack-limit
+  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
+
+- T2 now propagates fixnum guards through tail-call loop parameters and
+  recursive results, allowing functions such as `TAK` to use direct native
+  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
+
+- On s390x, native code now calls eligible leaf builtins through cached
+  builtin slots instead of resolving each call by name, while retaining
+  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
