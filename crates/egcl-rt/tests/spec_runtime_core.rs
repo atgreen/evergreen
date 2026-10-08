@@ -126,7 +126,15 @@ fn environment_variables_map_to_runtime_config_and_defaults() {
             assert_eq!(cfg.heap_size, 512 * 1024 * 1024);
             assert_eq!(cfg.nursery_size, 64 * 1024 * 1024);
             assert_eq!(cfg.tlab_size, 2 * 1024 * 1024);
-            assert_eq!(cfg.stack_size, 512 * 1024);
+            // s390x fibers default to 4 MiB (spec §2.3, bliss-hfdq2 / #102):
+            // its frames are larger and the 512 KiB default overflowed in
+            // ordinary nested evaluation.
+            let default_stack = if cfg!(target_arch = "s390x") {
+                4 * 1024 * 1024
+            } else {
+                512 * 1024
+            };
+            assert_eq!(cfg.stack_size, default_stack);
             assert!(cfg.num_workers >= 1);
             assert_eq!(cfg.image_path.as_deref(), Some("egcl.bimg"));
             assert_eq!(cfg.gc_log, None);
