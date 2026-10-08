@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Memory barriers return NIL correctly from x86-64 T2 code when their results
+  spill to the stack, preventing corrupted values and crashes while printing
+  a returned list ([#132](https://github.com/atgreen/evergreen/pull/132)).
+
 - T2 deoptimization now preserves pending operands after recursive calls and
   retains frame reconstruction metadata when a guard exists only at an x86-64
   OSR entry. RISC-V declines checked OSR entries it cannot validate, keeping
