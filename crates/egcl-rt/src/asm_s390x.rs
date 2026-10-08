@@ -194,6 +194,13 @@ impl Asm {
         self.ret();
     }
 
+    /// BRASL %r14,target: a relative call to a label in this same code. The
+    /// displacement is patched by [`Self::finish`] exactly like a branch's.
+    pub fn call_label(&mut self, target: Label) {
+        self.branches.push((self.here(), target));
+        self.code.extend_from_slice(&[0xc0, 0xe5, 0, 0, 0, 0]);
+    }
+
     /// Branch on an architectural condition-code mask (8=equal, 15=always).
     pub fn branch(&mut self, mask: u8, target: Label) {
         assert!(mask < 16);
@@ -338,6 +345,17 @@ mod tests {
                 0xc0, 0x84, 0, 0, 0, 6, 0xc0, 0xf4, 0xff, 0xff, 0xff, 0xfd, 0x07, 0xfe,
             ]
         );
+    }
+
+    #[test]
+    fn relative_call_uses_signed_halfwords_from_instruction_start() {
+        // llvm-mc: brasl %r14,.+6 => c0 e5 00 00 00 03
+        let mut a = Asm::new();
+        let target = a.label();
+        a.call_label(target);
+        a.bind(target);
+        a.ret();
+        assert_eq!(a.finish().unwrap(), [0xc0, 0xe5, 0, 0, 0, 3, 0x07, 0xfe]);
     }
 
     #[test]

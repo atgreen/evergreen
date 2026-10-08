@@ -2721,6 +2721,7 @@ pub fn emit_framed_with_activation_slots(
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
+                self_sym: None,
             },
         );
     }
@@ -2737,6 +2738,7 @@ pub fn emit_framed_with_activation_slots(
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
+                self_sym: None,
             },
         );
     }
@@ -2753,6 +2755,7 @@ pub fn emit_framed_with_activation_slots(
                 multiple_values: c2i_mv_addr,
                 transfer_pending: c2i_transfer_pending_addr,
                 poll: c2i_poll_addr,
+                self_sym,
             },
         );
     }
