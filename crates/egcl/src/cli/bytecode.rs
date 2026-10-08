@@ -17769,16 +17769,114 @@ extern "C" fn c2i_deopt_state(bcp: u64, depth: u64) {
 /// resumes T0 on the reconstructed activation chain, so committed caller side
 /// effects are not repeated.
 extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserved: u64) {
-    let stack = egcl_rt::current_stack();
-    let outer = stack.fp() as *mut Frame;
-    let fail = |message: &'static str| {
+    let outer = egcl_rt::current_stack().fp() as *mut Frame;
+    if outer.is_null() {
         NATIVE_ERROR.with(|c| {
-            c.set_first(EgclError::Internal(message.into()));
+            c.set_first(EgclError::Internal(
+                "T2 deopt supplied an empty virtual-frame stream".into(),
+            ));
         });
-    };
-    if outer.is_null() || buf.is_null() || n_scopes == 0 {
-        fail("T2 deopt supplied an empty virtual-frame stream");
         return;
+    }
+    match materialize_t2_deopt_scopes(n_scopes, n_words, buf, Some(outer)) {
+        Ok((scopes, metadata)) => {
+            NATIVE_DEOPT.with(|d| d.set(true));
+            NATIVE_DEOPT_RESUME.with(|c| {
+                *c.borrow_mut() = Some(NativeDeoptResume::Inlined { scopes, metadata });
+            });
+        }
+        Err(message) => NATIVE_ERROR.with(|c| {
+            c.set_first(EgclError::Internal(message.into()));
+        }),
+    }
+}
+
+/// The s390x T2 deopt adapter (bliss-w6aki): resume T0 HERE, inside the
+/// native activation, and return the completed result to the native code,
+/// which returns it to its caller as if the guarded instruction had finished.
+///
+/// `c2i_deopt_t2` instead records the state for run_native to resume after
+/// the native activation returns -- which is only right when the deopting
+/// native frame IS run_native's callee. A direct self-call (the register
+/// entry) nests native frames with no run_native between them: an inner
+/// level's recorded state would be consumed only after every outer level had
+/// continued with the stub's NIL, so `(pow2 70)` answered TYPE-ERROR at T2
+/// where T1 answered 2^70. Measured natively on s390x and x86-64.
+///
+/// Every scope, the deopting function's own included, gets a fresh EgclStack
+/// frame above the current top (a register-entry level has none of its own;
+/// an ordinary level's frame is left untouched for its native code to finish
+/// popping), the interpreter runs the virtual frames to completion exactly as
+/// `resume_inlined_in_t0` does for run_native, and the frames are popped. The
+/// deopt bookkeeping -- counts, profile decay, retirement or blacklisting of
+/// the native code -- happens here too; retiring the code while this
+/// activation is still inside it is safe because `ActiveNativeCode` holds it.
+/// An error raised by the resumed code is stashed as a pending native
+/// transfer and NIL returned, which the native caller's transfer check turns
+/// into the ordinary exit.
+///
+/// GC safety: the stream's tagged words are copied into the pushed frames,
+/// which the collector scans, before the interpreter can allocate; the scope
+/// list holds Arc bodies and raw frame pointers, never a loose EgclVal.
+#[cfg_attr(not(target_arch = "s390x"), allow(dead_code))]
+extern "C" fn c2i_deopt_t2_inline(
+    n_scopes: u64,
+    n_words: u64,
+    buf: *const u64,
+    _reserved: u64,
+) -> u64 {
+    let (scopes, metadata) = match materialize_t2_deopt_scopes(n_scopes, n_words, buf, None) {
+        Ok(materialized) => materialized,
+        Err(message) => {
+            stash_native_error(EgclError::Internal(message.into()));
+            return NIL.0;
+        }
+    };
+    let sym = scopes[0].function;
+    let (is_t2, body) = ACTIVE_NATIVE_CODE.with(|slot| {
+        // SAFETY: ActiveNativeCode retains a reference for the native call and
+        // restores the enclosing owner after nested calls or OSR return.
+        unsafe { slot.get().as_ref() }
+            .map(|code| (code.is_t2, code.body.clone()))
+            .unwrap_or((true, None))
+    });
+    note_native_deopt(sym, is_t2, body.as_ref());
+    let env_ptr = NATIVE_ENV.with(|e| e.get());
+    if env_ptr.is_null() {
+        let stack = egcl_rt::current_stack();
+        for _ in 0..scopes.len() {
+            stack.pop_frame();
+        }
+        stash_native_error(EgclError::Internal(
+            "T2 deopt resumed with no native environment".into(),
+        ));
+        return NIL.0;
+    }
+    // SAFETY: run_native keeps NATIVE_ENV pointing at a live &mut Env for the
+    // duration of the native call, and nested native calls save and restore it.
+    let env = unsafe { &mut *env_ptr };
+    match resume_inlined_in_t0(scopes, metadata, env) {
+        Ok(value) => value.0,
+        Err(error) => {
+            stash_native_error(error);
+            NIL.0
+        }
+    }
+}
+
+/// Rebuild the virtual frames of a T2 deopt stream on the EgclStack: four
+/// header words per scope (function, bcp, locals, stack depth) then the
+/// slots. `outer` is the frame to write scope 0 into; `None` pushes a fresh
+/// frame for it too. Pushed frames are popped again on any error.
+fn materialize_t2_deopt_scopes(
+    n_scopes: u64,
+    n_words: u64,
+    buf: *const u64,
+    outer: Option<*mut Frame>,
+) -> Result<(Vec<InlinedResumeScope>, Arc<T2InstalledMetadata>), &'static str> {
+    let stack = egcl_rt::current_stack();
+    if buf.is_null() || n_scopes == 0 {
+        return Err("T2 deopt supplied an empty virtual-frame stream");
     }
 
     let metadata = ACTIVE_NATIVE_CODE.with(|slot| {
@@ -17787,17 +17885,17 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         unsafe { slot.get().as_ref() }.and_then(|code| code.t2_metadata.clone())
     });
     let Some(metadata) = metadata else {
-        fail("T2 deopt has no active code metadata");
-        return;
+        return Err("T2 deopt has no active code metadata");
     };
 
     let words = unsafe { std::slice::from_raw_parts(buf, n_words as usize) };
     let mut at = 0usize;
     let mut pushed = 0usize;
     let mut scopes = Vec::with_capacity(n_scopes as usize);
+    let mut error: Option<&'static str> = None;
     for scope_index in 0..n_scopes as usize {
         if at + 4 > words.len() {
-            fail("truncated T2 virtual-frame header");
+            error = Some("truncated T2 virtual-frame header");
             break;
         }
         let function = words[at] as u32;
@@ -17808,14 +17906,14 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
         let n_slots = n_locals.saturating_add(sp_top);
         let entry = metadata.deopt_bodies.get(&function).cloned();
         let Some(entry) = entry else {
-            fail("T2 deopt function is absent from its compiled metadata");
+            error = Some("T2 deopt function is absent from its compiled metadata");
             break;
         };
         if at + n_slots > words.len() || n_slots > entry.num_slots() as usize {
-            fail("invalid T2 virtual-frame slot count");
+            error = Some("invalid T2 virtual-frame slot count");
             break;
         }
-        let frame = if scope_index == 0 {
+        let frame = if let (0, Some(outer)) = (scope_index, outer) {
             outer
         } else {
             let Some(frame) = stack.push_frame(
@@ -17824,7 +17922,7 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
                 entry.num_slots(),
                 FLAG_CALL,
             ) else {
-                fail("EgclStack exhausted while reconstructing inlined frames");
+                error = Some("EgclStack exhausted while reconstructing inlined frames");
                 break;
             };
             pushed += 1;
@@ -17857,16 +17955,13 @@ extern "C" fn c2i_deopt_t2(n_scopes: u64, n_words: u64, buf: *const u64, _reserv
             frame,
         });
     }
-    if scopes.len() != n_scopes as usize || at != words.len() {
+    if error.is_some() || scopes.len() != n_scopes as usize || at != words.len() {
         for _ in 0..pushed {
             stack.pop_frame();
         }
-        return;
+        return Err(error.unwrap_or("truncated T2 virtual-frame stream"));
     }
-    NATIVE_DEOPT.with(|d| d.set(true));
-    NATIVE_DEOPT_RESUME.with(|c| {
-        *c.borrow_mut() = Some(NativeDeoptResume::Inlined { scopes, metadata });
-    });
+    Ok((scopes, metadata))
 }
 
 /// Installed T1 native code for a function. Its CL activation (locals + operand
@@ -19597,6 +19692,111 @@ impl Drop for BlockScopeGuard {
     }
 }
 
+/// The bookkeeping run_native does when a native activation deoptimized:
+/// count it, decay the profile on the first deopt after a promotion, and
+/// retire or blacklist the native code once the per-symbol threshold is hit.
+/// Shared with the inline-resume adapter, which handles the deopt without
+/// returning to run_native (bliss-w6aki). An obsolete activation may still
+/// fail a guard; that counts, but must not retire the replacement's code.
+fn note_native_deopt(sym: u32, is_t2: bool, bf: Option<&Arc<BytecodeFunction>>) {
+    DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    trace("native speculative deopt → interpreter");
+    // An obsolete activation may still fail a guard. Resume its original
+    // body, but do not retire or blacklist the replacement's native code.
+    let current = registry_get(sym);
+    if current
+        .as_ref()
+        .zip(bf)
+        .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
+    {
+        // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
+        // the fast path stays installed. Repeated failures either indicate a
+        // supported numeric phase change (retire this version and recompile) or
+        // a genuinely unsupported domain (permanently blacklist speculation).
+        let n = DEOPT_COUNTS.with(|m| {
+            let mut b = m.borrow_mut();
+            let e = b.entry(sym).or_insert(0);
+            *e += 1;
+            *e
+        });
+        // Decay the profile once per promotion: the first deopt means the
+        // speculation was wrong for the current phase, so zero the type we bet on
+        // and let the new phase's samples take over quickly.
+        if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
+            if let Some(bf) = bf {
+                // T1's optimistic arithmetic templates are always Fixnum. T2
+                // follows the profile that was dominant when it was compiled.
+                let forced = (!is_t2).then_some(SpecType::Fixnum);
+                let failed = decay_failed_speculation(Arc::as_ptr(bf) as usize, forced);
+                LAST_FAILED_SPECULATION.with(|m| {
+                    m.borrow_mut().insert(sym, failed);
+                });
+            }
+        }
+        let threshold_hit = n >= deopt_blacklist_threshold();
+        let phase_change = threshold_hit && supported_numeric_phase_change(sym);
+        // JFR-style event stream (bliss-ai8n): a speculation guard failed.
+        // Record the classified reason + running per-function count.
+        super::events::record(
+            super::events::EventKind::Deopt,
+            sym,
+            if phase_change {
+                super::events::DEOPT_PHASE_CHANGE
+            } else if threshold_hit {
+                super::events::DEOPT_BLACKLIST
+            } else {
+                super::events::DEOPT_GUARD
+            },
+            n as u64,
+        );
+        if t2_log_target().is_some() {
+            let nm = registry_get(sym)
+                .map(|b| b.name.clone())
+                .unwrap_or_default();
+            t2_log_write(format_args!(
+                "{nm}: native guard deopt #{n} => resuming interpreted{}",
+                if phase_change {
+                    " (threshold hit: supported numeric phase change => generic T1 + recompile)"
+                } else if threshold_hit {
+                    " (threshold hit: uninstall + blacklist => T0)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if phase_change {
+            // The current T2 assumptions are stale, but native execution itself
+            // is profitable. Replace it immediately with non-speculating T1 so
+            // subsequent calls stay native while dispatch queues a profile-led
+            // replacement T2 version.
+            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+            T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
+            DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
+            PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
+            LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
+            let fn_obj = egcl_rt::symbols::symbol_function(sym)
+                .filter(|&value| egcl_rt::function::is_interpreted_function(value));
+            if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
+                publish_native(sym, fn_obj, &fallback);
+                trace("stale numeric specialization retired → generic T1");
+            } else if let Some(function) = fn_obj {
+                egcl_rt::function::set_tier(function, 0);
+            }
+        } else if threshold_hit {
+            NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
+            bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
+            DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
+            if let Some(function) = egcl_rt::symbols::symbol_function(sym)
+                .filter(|&value| egcl_rt::function::is_interpreted_function(value))
+            {
+                egcl_rt::function::set_tier(function, 0);
+            }
+            trace("t1 speculation blacklisted → staying T0");
+        }
+    }
+}
+
 fn run_native(
     nc: &NativeCode,
     sym: u32,
@@ -19772,102 +19972,7 @@ fn run_native(
     // kept as a fallback when no resume point was recorded; purity of every call
     // makes re-running from the top observably equivalent.)
     if deopt {
-        DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        trace("native speculative deopt → interpreter");
-        // An obsolete activation may still fail a guard. Resume its original
-        // body, but do not retire or blacklist the replacement's native code.
-        let current = registry_get(sym);
-        if current
-            .as_ref()
-            .zip(bf.as_ref())
-            .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
-        {
-            // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
-            // the fast path stays installed. Repeated failures either indicate a
-            // supported numeric phase change (retire this version and recompile) or
-            // a genuinely unsupported domain (permanently blacklist speculation).
-            let n = DEOPT_COUNTS.with(|m| {
-                let mut b = m.borrow_mut();
-                let e = b.entry(sym).or_insert(0);
-                *e += 1;
-                *e
-            });
-            // Decay the profile once per promotion: the first deopt means the
-            // speculation was wrong for the current phase, so zero the type we bet on
-            // and let the new phase's samples take over quickly.
-            if PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym)) {
-                if let Some(bf) = bf.as_ref() {
-                    // T1's optimistic arithmetic templates are always Fixnum. T2
-                    // follows the profile that was dominant when it was compiled.
-                    let forced = (!nc.is_t2).then_some(SpecType::Fixnum);
-                    let failed = decay_failed_speculation(Arc::as_ptr(bf) as usize, forced);
-                    LAST_FAILED_SPECULATION.with(|m| {
-                        m.borrow_mut().insert(sym, failed);
-                    });
-                }
-            }
-            let threshold_hit = n >= deopt_blacklist_threshold();
-            let phase_change = threshold_hit && supported_numeric_phase_change(sym);
-            // JFR-style event stream (bliss-ai8n): a speculation guard failed.
-            // Record the classified reason + running per-function count.
-            super::events::record(
-                super::events::EventKind::Deopt,
-                sym,
-                if phase_change {
-                    super::events::DEOPT_PHASE_CHANGE
-                } else if threshold_hit {
-                    super::events::DEOPT_BLACKLIST
-                } else {
-                    super::events::DEOPT_GUARD
-                },
-                n as u64,
-            );
-            if t2_log_target().is_some() {
-                let nm = registry_get(sym)
-                    .map(|b| b.name.clone())
-                    .unwrap_or_default();
-                t2_log_write(format_args!(
-                    "{nm}: native guard deopt #{n} => resuming interpreted{}",
-                    if phase_change {
-                        " (threshold hit: supported numeric phase change => generic T1 + recompile)"
-                    } else if threshold_hit {
-                        " (threshold hit: uninstall + blacklist => T0)"
-                    } else {
-                        ""
-                    }
-                ));
-            }
-            if phase_change {
-                // The current T2 assumptions are stale, but native execution itself
-                // is profitable. Replace it immediately with non-speculating T1 so
-                // subsequent calls stay native while dispatch queues a profile-led
-                // replacement T2 version.
-                NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-                bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
-                T2_DECLINED.with(|s| s.borrow_mut().remove(&sym));
-                DEOPT_COUNTS.with(|m| m.borrow_mut().insert(sym, 0));
-                PROMOTED_FRESH.with(|s| s.borrow_mut().remove(&sym));
-                LAST_FAILED_SPECULATION.with(|m| m.borrow_mut().remove(&sym));
-                let fn_obj = egcl_rt::symbols::symbol_function(sym)
-                    .filter(|&value| egcl_rt::function::is_interpreted_function(value));
-                if let Some(fallback) = try_promote_to_t1_with_speculation(sym, false) {
-                    publish_native(sym, fn_obj, &fallback);
-                    trace("stale numeric specialization retired → generic T1");
-                } else if let Some(function) = fn_obj {
-                    egcl_rt::function::set_tier(function, 0);
-                }
-            } else if threshold_hit {
-                NATIVE_REGISTRY.with(|r| r.borrow_mut().remove(&sym));
-                bump_direct_call_gen(); // invalidate baked direct-call targets (bliss-zhvn)
-                DEOPT_BLACKLIST.with(|s| s.borrow_mut().insert(sym));
-                if let Some(function) = egcl_rt::symbols::symbol_function(sym)
-                    .filter(|&value| egcl_rt::function::is_interpreted_function(value))
-                {
-                    egcl_rt::function::set_tier(function, 0);
-                }
-                trace("t1 speculation blacklisted → staying T0");
-            }
-        }
+        note_native_deopt(sym, nc.is_t2, bf.as_ref());
         let entry = bf.ok_or_else(|| {
             EgclError::Internal("deopt: native code has no bytecode body".into())
         })?;
@@ -21860,6 +21965,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
 
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
+    // The s390x stub returns the adapter's value as the activation's result
+    // (bliss-w6aki); the x86-64 stub discards it and lets run_native resume.
+    #[cfg(target_arch = "s390x")]
+    let deopt_t2_addr =
+        c2i_deopt_t2_inline as extern "C" fn(u64, u64, *const u64, u64) -> u64 as usize as u64;
+    #[cfg(not(target_arch = "s390x"))]
     let deopt_t2_addr = c2i_deopt_t2 as extern "C" fn(u64, u64, *const u64, u64) as usize as u64;
     let call_addr = c2i_call as extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 as usize as u64;
     let call_slice_addr =

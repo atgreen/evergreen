@@ -1433,6 +1433,7 @@ fn emit_call(
     call_arg_base: u16,
     self_sym: Option<u32>,
     self_entry: Option<egcl_rt::asm::Label>,
+    self_arity: usize,
 ) -> Result<(), EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
@@ -1464,7 +1465,11 @@ fn emit_call(
         // Wider calls need an activation-backed argument slice, including on
         // the stack-limit path; they cannot use this register-only entry.
         const C2I_ARGS_SELF: [u8; 3] = [2, 1, 8];
-        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() {
+        // A self-call with the wrong argument count must reach c2i, which
+        // raises PROGRAM-ERROR; the register entry would bind whatever is in
+        // the argument registers (bliss-w6aki).
+        if !self_call_disabled && sym == ss && nargs <= C2I_ARGS_SELF.len() && nargs == self_arity
+        {
             // Stack guard. The direct call below takes a REAL C frame and does
             // not reach c2i_call_args, so it never sees native_depth_cap() —
             // and the T2 prologue has no guard of its own. Unbounded, a deeply
@@ -4545,6 +4550,7 @@ fn emit_framed_inner(
                     root_shadow_slots,
                     self_sym,
                     self_entry,
+                    f.block(entry).params.len(),
                 )?;
             } else if d.opcode == Opcode::MemoryFence {
                 match d.aux {

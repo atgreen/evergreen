@@ -300,19 +300,28 @@ impl Emitter<'_> {
         }
         let slow = self.asm.label();
         let join = self.asm.label();
-        self.asm.imm64(1, egcl_rt::stack::native_stack_limit_addr());
-        self.asm.load(1, 1, 0);
-        // Signed compare is right: stack addresses are canonical and positive.
-        // CC0 (equal) or CC1 (r15 low) means the stack is at or past the limit.
-        self.asm.compare(15, 1);
-        self.asm.branch(12, slow);
-        // Fast path: arguments in r2-r4 (no overlap with the r6-r12 homes),
-        // then a relative call to the register entry; the result is in r2.
-        for (index, &argument) in data.args.iter().enumerate() {
-            self.load(argument, 2 + index as u8)?;
+        // A self-call with the wrong argument count must reach the generic
+        // adapter, which raises PROGRAM-ERROR; the register entry binds
+        // whatever is in r2-r4 (bliss-w6aki: `(g 0 0)` in a one-parameter G
+        // answered 0 at T2). Only the slow path is emitted for it.
+        let arity_matches =
+            data.args.len() == self.function.block(self.function.entry()).params.len();
+        if arity_matches {
+            self.asm.imm64(1, egcl_rt::stack::native_stack_limit_addr());
+            self.asm.load(1, 1, 0);
+            // Signed compare is right: stack addresses are canonical and
+            // positive. CC0 (equal) or CC1 (r15 low) means the stack is at or
+            // past the limit.
+            self.asm.compare(15, 1);
+            self.asm.branch(12, slow);
+            // Fast path: arguments in r2-r4 (no overlap with the r6-r12 homes),
+            // then a relative call to the register entry; the result is in r2.
+            for (index, &argument) in data.args.iter().enumerate() {
+                self.load(argument, 2 + index as u8)?;
+            }
+            self.asm.call_label(reg_entry);
+            self.asm.branch(15, join);
         }
-        self.asm.call_label(reg_entry);
-        self.asm.branch(15, join);
         // Slow path: generic dispatch through the slice adapter, the arguments
         // staged in this frame. No live tagged heap value exists across the
         // call (eligibility), so nothing needs a shadow root here.
@@ -1352,7 +1361,11 @@ impl Emitter<'_> {
         self.asm.imm64(5, 0);
         self.asm.imm64(1, callback);
         self.asm.call_reg(1);
-        self.asm.imm64(2, NIL.0);
+        // The callback resumes T0 inline and returns the activation's result
+        // (c2i_deopt_t2_inline, bliss-w6aki), or NIL with a transfer pending;
+        // either way r2 is what this native level returns. Returning here
+        // rather than continuing is what makes a deopt inside a direct
+        // self-call level correct: the level above receives a finished value.
         self.epilogue();
         Ok(())
     }
@@ -2138,7 +2151,9 @@ mod tests {
                 source_pos: 0,
             },
         );
-        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            NIL.0
+        }
         let compiled = emit_framed(&f, deopt as *const () as u64, 20).unwrap();
         assert!(compiled.regalloc_spill_slots > 0);
         assert!(compiled.allocation_edits > 0);
@@ -2212,11 +2227,12 @@ mod tests {
     #[test]
     fn multiplies_fixnums_with_exact_signed_overflow_guards() {
         thread_local! { static SAVED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
-        extern "C" fn deopt(_: u64, words: u64, pointer: *const u64, _: u64) {
+        extern "C" fn deopt(_: u64, words: u64, pointer: *const u64, _: u64) -> u64 {
             SAVED.with(|out| {
                 *out.borrow_mut() =
                     unsafe { std::slice::from_raw_parts(pointer, words as usize) }.to_vec()
             });
+            NIL.0
         }
         let compiled = emit_framed(
             &binary_numeric(Opcode::FixnumMul),
@@ -2261,7 +2277,9 @@ mod tests {
 
     #[test]
     fn executes_tagged_single_float_arithmetic() {
-        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) {}
+        extern "C" fn deopt(_: u64, _: u64, _: *const u64, _: u64) -> u64 {
+            NIL.0
+        }
         for opcode in [Opcode::FloatAdd, Opcode::FloatSub, Opcode::FloatMul] {
             let compiled = emit_framed(
                 &binary_numeric(opcode),
@@ -2393,12 +2411,13 @@ mod tests {
     #[test]
     fn reconstructs_nested_shared_recipes_from_registers_and_spills() {
         thread_local! { static RECONSTRUCTED: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) }; }
-        extern "C" fn deopt(scopes: u64, words: u64, pointer: *const u64, _: u64) {
+        extern "C" fn deopt(scopes: u64, words: u64, pointer: *const u64, _: u64) -> u64 {
             assert_eq!(scopes, 1);
             RECONSTRUCTED.with(|out| {
                 *out.borrow_mut() =
                     unsafe { std::slice::from_raw_parts(pointer, words as usize) }.to_vec()
             });
+            NIL.0
         }
         let (f, _) = rematerialized_guard();
         let compiled = emit_framed(&f, deopt as *const () as usize as u64, 21)
@@ -2446,13 +2465,14 @@ mod tests {
         thread_local! {
             static DEOPT: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        extern "C" fn deopt(scopes: u64, words: u64, pointer: *const u64, _: u64) {
+        extern "C" fn deopt(scopes: u64, words: u64, pointer: *const u64, _: u64) -> u64 {
             let values = unsafe { std::slice::from_raw_parts(pointer, words as usize) };
             DEOPT.with(|out| {
                 let mut out = out.borrow_mut();
                 out.push(scopes);
                 out.extend_from_slice(values);
             });
+            NIL.0
         }
         let compiled = emit_framed(&add_one(), deopt as *const () as u64, 3).unwrap();
         let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
