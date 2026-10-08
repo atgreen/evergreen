@@ -14,6 +14,12 @@
   loop from about 4,800 to 1,500 instructions per iteration at T1
   ([#96](https://github.com/atgreen/evergreen/pull/96)).
 
+- ppc64le baseline native code no longer brackets every runtime helper call
+  with the SIGSEGV-recovery toggle, which cannot resume on that target yet,
+  and resets multiple-values state with a bare leaf call; a counted loop
+  drops from about 1,500 to 1,000 instructions per iteration at T1
+  ([#104](https://github.com/atgreen/evergreen/pull/104)).
+
 ### Platform support
 
 - The EGCL CLI now builds and runs natively on Apple Silicon macOS from source
