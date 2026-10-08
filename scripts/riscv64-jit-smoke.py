@@ -10,6 +10,7 @@ fallback is not a JIT pass. The T2 sections mirror scripts/s390x-jit-smoke.py: t
 tier-2 installation and compare guard exits, calls, OSR and polls with T0.
 """
 import os
+import re
 import selectors
 import time
 from pathlib import Path
@@ -62,11 +63,14 @@ def main():
         raise SystemExit("usage: riscv64-jit-smoke.py -- [qemu-riscv64 -L sysroot] egcl")
     base = {k: v for k, v in os.environ.items() if not k.startswith("EGCL_")}
 
-    def run(source, **settings):
+    def run(source, bootstrap=False, **settings):
         env = dict(base, EGCL_LAZY_COMPILE="0", EGCL_T1_T2_BACKEDGE_THRESHOLD="4", **settings)
         # --eval prints the last form's value. Give every variant the same
-        # final value even when it appends extra tier assertions.
-        result = subprocess.run(command + ["--no-init", "--no-bootstrap", "--eval", source + "\nnil"],
+        # final value even when it appends extra tier assertions. The Lisp
+        # prelude is skipped for speed except where a check needs it: the
+        # riscv64 disassembler (lib/disasm-riscv64.lisp) is Lisp and needs DEFVAR.
+        prelude = [] if bootstrap else ["--no-bootstrap"]
+        result = subprocess.run(command + ["--no-init"] + prelude + ["--eval", source + "\nnil"],
                                 env=env, capture_output=True, text=True, timeout=300)
         if result.returncode:
             raise RuntimeError(f"exit {result.returncode}\n{result.stdout}\n{result.stderr}")
@@ -125,19 +129,21 @@ def main():
           (if (= (egcl-ext:function-tier 'jit-diagnostics) 1) nil
               (error "diagnostic fixture did not compile"))
           (disassemble 'jit-diagnostics)
-        """, EGCL_FORCE_TIER="t1", EGCL_PERF_JITDUMP=str(dump_path))
+        """, EGCL_FORCE_TIER="t1", EGCL_PERF_JITDUMP=str(dump_path), bootstrap=True)
         assert "bytes of riscv64" in listing and "bytes of x86" not in listing, listing
-        # The prologue's first word is `addi sp, sp, -48`.
-        assert "+0000:" in listing and ".byte 0x13, 0x01, 0x01, 0xfd" in listing, listing
+        # Decoded in Lisp by lib/disasm-riscv64.lisp (bliss-miro8.10): a mnemonic,
+        # with the raw bytes still listed so the jitdump comparison below needs
+        # nothing else. The prologue's `addi sp,sp,-48` opens every T1 function.
+        assert "+0000:" in listing and "addi sp,sp,-48" in listing and "13 01 01 fd" in listing, listing
         dump = dump_path.read_bytes()
         magic, version, header_size, machine = struct.unpack_from("<IIII", dump)
         assert (magic, version, header_size, machine) == (0x4A695444, 1, 40, 243)
         listed_bytes = bytearray()
         for line in listing.splitlines():
-            offset, separator, byte_text = line.partition(":  .byte ")
-            if separator:
-                assert int(offset.strip().removeprefix("+"), 16) == len(listed_bytes)
-                listed_bytes.extend(int(value, 16) for value in byte_text.split(", "))
+            match = re.match(r"\s*\+([0-9a-f]+):\s+((?:[0-9a-f]{2} )*[0-9a-f]{2})\s", line)
+            if match:
+                assert int(match.group(1), 16) == len(listed_bytes)
+                listed_bytes.extend(int(value, 16) for value in match.group(2).split(" "))
         at = header_size
         found = False
         while at + 56 <= len(dump):

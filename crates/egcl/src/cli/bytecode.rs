@@ -1604,11 +1604,13 @@ fn native_insn_annotation(
     None
 }
 
-/// A lossless fallback for targets without an in-process instruction decoder.
-/// Keep halfword offsets so System Z bytecode/OSR positions remain selectable
-/// in the tier viewer without pretending these are decoded instructions. The
-/// riscv64 emitter never uses compressed instructions, so one line per
-/// 4-byte word there keeps each instruction on its own line.
+/// A lossless fallback for targets without an in-process instruction decoder,
+/// and for the two that have one when the decoder cannot be loaded (for
+/// instance under --no-bootstrap). Keep halfword offsets so System Z
+/// bytecode/OSR positions remain selectable in the tier viewer without
+/// pretending these are decoded instructions. The riscv64 emitter never uses
+/// compressed instructions, so one line per 4-byte word there keeps each
+/// instruction on its own line.
 #[cfg(not(egcl_no_disassembly))]
 fn format_native_bytes(bytes: &[u8]) -> String {
     use std::fmt::Write;
@@ -1628,17 +1630,29 @@ fn format_native_bytes(bytes: &[u8]) -> String {
     out
 }
 
-/// The native section decoded in Lisp by lib/disasm-s390x.lisp, evaluated on
-/// first use so startup pays nothing for it (bliss-ehjj1). The code bytes cross
+/// The native section decoded in Lisp -- lib/disasm-s390x.lisp on s390x
+/// (bliss-ehjj1), lib/disasm-riscv64.lisp on riscv64 (bliss-miro8.10) --
+/// evaluated on first use so startup pays nothing for it. The code bytes cross
 /// as a list of fixnums -- immediates, so the Vec needs no rooting -- and only
 /// that list is held across the call. None, so the caller prints raw bytes,
 /// when the decoder cannot be loaded (e.g. under --no-bootstrap) or declines.
-#[cfg(all(target_arch = "s390x", not(egcl_no_disassembly)))]
+#[cfg(all(
+    any(target_arch = "s390x", target_arch = "riscv64"),
+    not(egcl_no_disassembly)
+))]
 fn lisp_native_listing(bytes: &[u8], env: &mut super::Env) -> Option<String> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOADED: AtomicBool = AtomicBool::new(false);
+    #[cfg(target_arch = "s390x")]
+    const SOURCE: &str = include_str!("../../../../lib/disasm-s390x.lisp");
+    #[cfg(target_arch = "riscv64")]
+    const SOURCE: &str = include_str!("../../../../lib/disasm-riscv64.lisp");
+    #[cfg(target_arch = "s390x")]
+    const FORMATTER: &str = "EGCL-DISASM::FORMAT-NATIVE-LISTING";
+    #[cfg(target_arch = "riscv64")]
+    const FORMATTER: &str = "EGCL-DISASM-RISCV64::FORMAT-NATIVE-LISTING";
     if !LOADED.load(Ordering::Acquire) {
-        super::load_embedded_lisp(include_str!("../../../../lib/disasm-s390x.lisp"), env).ok()?;
+        super::load_embedded_lisp(SOURCE, env).ok()?;
         LOADED.store(true, Ordering::Release);
     }
     let octets: Vec<EgclVal> = bytes
@@ -1648,13 +1662,16 @@ fn lisp_native_listing(bytes: &[u8], env: &mut super::Env) -> Option<String> {
     egcl_rt::rooted!(list = super::vec_to_list(&octets));
     // Resolve the formatter AFTER building the list: that allocation can move
     // the function object, and apply_function roots its callee only from entry.
-    let formatter = super::resolve_sym("EGCL-DISASM::FORMAT-NATIVE-LISTING")
+    let formatter = super::resolve_sym(FORMATTER)
         .and_then(|s| egcl_rt::symbols::symbol_function(s.as_symbol_index()))?;
     let text = super::apply_function(formatter, &[*list], env).ok()?;
     Some(super::val_as_str(text))
 }
 
-#[cfg(not(all(target_arch = "s390x", not(egcl_no_disassembly))))]
+#[cfg(not(all(
+    any(target_arch = "s390x", target_arch = "riscv64"),
+    not(egcl_no_disassembly)
+)))]
 fn lisp_native_listing(_: &[u8], _: &mut super::Env) -> Option<String> {
     None
 }
