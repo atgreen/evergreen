@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- T2 no longer emits a runtime call for every `SETQ` in a loop. Multiple-value
+  resets that cannot be observed before the next reset are removed, so a
+  call-free loop of assignments runs as straight-line native code; a ten-SETQ
+  loop went from 1.35 s to 0.02 s for two million iterations
+  ([#100](https://github.com/atgreen/evergreen/pull/100)).
+
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
   distribution installation, dependent-system loading, and offline reload
