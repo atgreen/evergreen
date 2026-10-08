@@ -49,7 +49,7 @@ const FLOAT_REGISTERS: usize = 4;
 const OUTGOING_ARGS: i32 = 160;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Scalar {
+pub(super) enum Scalar {
     Void,
     Integer { bits: u8, signed: bool },
     Float,
@@ -57,7 +57,7 @@ enum Scalar {
 }
 
 impl Scalar {
-    fn from_type(ty: &AlienType) -> Result<Self, EgclError> {
+    pub(super) fn from_type(ty: &AlienType) -> Result<Self, EgclError> {
         match ty {
             AlienType::Void => Ok(Self::Void),
             AlienType::Int {
@@ -86,14 +86,14 @@ impl Scalar {
 
 /// Where one argument goes: exactly one of a GPR, an FPR, or a stack doubleword.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Placement {
+pub(super) enum Placement {
     Integer(usize),
     Float(usize),
     Stack(usize),
 }
 
 /// s390x placement: two independent register counters, one shared overflow area.
-fn classify(arguments: &[Scalar]) -> Result<Vec<Placement>, EgclError> {
+pub(super) fn classify(arguments: &[Scalar]) -> Result<Vec<Placement>, EgclError> {
     let mut integers = 0usize;
     let mut floats = 0usize;
     let mut stack = 0usize;
@@ -253,6 +253,9 @@ unsafe fn call(
     // Publish Native state so a collection can proceed while foreign code runs,
     // exactly as the other paths do.
     let foreign_frame = crate::debug_stack::ForeignFrame::enter(fn_ptr)?;
+    // A Lisp callback that fails inside this call records its error here, and
+    // the call reports it once C has returned normally.
+    let errors = super::managed_callback::ForeignCallErrors::enter();
     let state_guard = crate::safepoint::ForeignStateScope::native();
     // SAFETY: the trampoline reads a fixed count from each register buffer and
     // `stack.len()` from the stack buffer, all initialised above. The caller
@@ -284,6 +287,7 @@ unsafe fn call(
     };
     drop(state_guard);
     drop(foreign_frame);
+    errors.finish()?;
     Ok(narrow_result(result, raw))
 }
 

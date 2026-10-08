@@ -8177,7 +8177,7 @@ fn install_evaluator_global_root_scanner() {
         // thread (bliss-q9i1): egcl-rt is the lower layer and cannot call the
         // interpreter directly, so it invokes this host callback.
         egcl_rt::set_thread_entry_runner(thread_entry_runner);
-        #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+        #[cfg(any(all(target_arch = "x86_64", any(unix, windows)), all(target_arch = "s390x", unix)))]
         egcl_rt::ffi::managed_callback::set_callback_runner(foreign_callback_runner);
     });
 }
@@ -8185,7 +8185,7 @@ fn install_evaluator_global_root_scanner() {
 /// Run a Lisp function from FOREIGN code: a fresh control environment, rooted, with
 /// the caller's nonlocal-exit tokens preserved and this callback's discarded.
 ///
-/// Registered with `managed_callback` on x86-64, where its JIT trampoline lives, but
+/// Registered with `managed_callback` on x86-64 and s390x, where its JIT trampoline lives, but
 /// the function itself is architecture-independent and the embedded-Python export
 /// path (bliss-89axw) calls it directly on every target — that path needs no
 /// trampoline, because all its exports share one static C entry point and carry the
@@ -8193,6 +8193,7 @@ fn install_evaluator_global_root_scanner() {
 /// when either the native trampoline or embedded Python needs it.
 #[cfg(any(
     all(target_arch = "x86_64", any(unix, windows)),
+    all(target_arch = "s390x", unix),
     feature = "python"
 ))]
 fn foreign_callback_runner(

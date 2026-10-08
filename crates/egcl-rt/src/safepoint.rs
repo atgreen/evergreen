@@ -244,7 +244,10 @@ impl ForeignStateScope {
         )
     }
 
-    #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+    #[cfg(any(
+        all(target_arch = "x86_64", any(unix, windows)),
+        all(target_arch = "s390x", unix)
+    ))]
     pub(crate) fn lisp() -> Self {
         Self::enter(
             crate::thread::current_thread_for_foreign_entry(),
