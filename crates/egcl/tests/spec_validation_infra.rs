@@ -35,19 +35,30 @@ fn cargo_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// The `--target` this test binary was built for, so a nested cargo run
+/// builds and runs the same target instead of the host default: the triple
+/// is the path segment before the profile directory in CARGO_BIN_EXE_egcl
+/// (`.../<triple>/<profile>/egcl`), which `.cargo/config.toml`'s pinned
+/// target and an explicit `--target` both produce. Absent that segment the
+/// nested run inherits the default, as before.
+fn cargo_target_args() -> Vec<String> {
+    let bin = Path::new(env!("CARGO_BIN_EXE_egcl"));
+    bin.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .filter(|name| name.matches('-').count() >= 2 && *name != "target")
+        .map(|triple| vec!["--target".to_string(), triple.to_string()])
+        .unwrap_or_default()
+}
+
 fn egcl_bin_path() -> &'static Path {
-    static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let status = Command::new("cargo")
-            .current_dir(repo_root())
-            .args(["build", "-p", "egcl"])
-            .status()
-            .expect("build egcl");
-        assert!(status.success(), "cargo build -p egcl failed");
-        PathBuf::from(env!("CARGO_BIN_EXE_egcl"))
-    })
-    .as_path()
+    // Cargo builds the `egcl` binary for this test's own target and profile
+    // before running the test and hands its path over in CARGO_BIN_EXE_egcl.
+    // Rebuilding here with a nested `cargo build -p egcl` added nothing and
+    // broke every native non-x86-64 run: the nested build targets the host
+    // default (the musl x86-64 pin in .cargo/config.toml) and fails outright.
+    Path::new(env!("CARGO_BIN_EXE_egcl"))
 }
 
 fn run(mut command: Command, context: &str) -> Output {
@@ -235,8 +246,10 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     run(
         {
             let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root()).args([
-                "test",
+            cmd.current_dir(repo_root())
+                .arg("test")
+                .args(cargo_target_args())
+                .args([
                 "-p",
                 "egcl-rt",
                 "--test",
@@ -254,8 +267,10 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     run(
         {
             let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root()).args([
-                "test",
+            cmd.current_dir(repo_root())
+                .arg("test")
+                .args(cargo_target_args())
+                .args([
                 "-p",
                 "egcl-stdlib",
                 "--test",
@@ -273,8 +288,10 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     run(
         {
             let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root()).args([
-                "test",
+            cmd.current_dir(repo_root())
+                .arg("test")
+                .args(cargo_target_args())
+                .args([
                 "-p",
                 "egcl-rt",
                 "--test",
@@ -292,8 +309,10 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     let output = run(
         {
             let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root()).args([
-                "test",
+            cmd.current_dir(repo_root())
+                .arg("test")
+                .args(cargo_target_args())
+                .args([
                 "-p",
                 "egcl-compiler",
                 "--lib",
