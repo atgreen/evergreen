@@ -49,8 +49,10 @@
 //! (regalloc2's plus the stable homes added for split values), the edge
 //! parallel-copy buffer (max block-param count), the deopt serialisation buffer
 //! (max over frame states of four header words plus locals plus stack per
-//! scope), the remat buffer (max recipe count), and two words holding the saved
-//! call result and the poll countdown. Every access must fit a signed 20-bit
+//! scope), the remat buffer (max recipe count), and five words holding the saved
+//! call result, the poll countdown, the `EgclStack` pointer the entry
+//! received in r3, and the caller's frame pointer and stack offset parked
+//! across a direct native call. Every access must fit a signed 20-bit
 //! displacement, so an oversized frame declines.
 //!
 //! The entry prologue copies the entry block's parameters from activation
@@ -149,7 +151,7 @@ use std::collections::{HashMap, HashSet};
 
 /// C-ABI runtime adapters used by optimized code. `transfer_pending` is a
 /// nonallocating leaf; the primary result is temporarily unrooted during it.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct RuntimeCalls {
     pub call_slice: u64,
     pub load_global: u64,
@@ -162,6 +164,10 @@ pub struct RuntimeCalls {
     /// The symbol being compiled, when known: a call to it from inside its own
     /// body can become a direct self-call (see the module docs).
     pub self_sym: Option<u32>,
+    /// Native callees resolved by the runtime for this function's call sites;
+    /// a `Call` to one of them with its arity is entered directly
+    /// (bliss-6j6pk, see the module docs).
+    pub direct_natives: Vec<super::emit::DirectNativeTarget>,
 }
 
 fn calls_runtime(opcode: Opcode) -> bool {
@@ -202,6 +208,12 @@ struct Emitter<'a> {
     root_sites: Vec<RootSyncSite>,
     result_offset: i32,
     poll_offset: i32,
+    /// Frame word holding the `EgclStack` pointer the entry received in r3.
+    stack_offset: i32,
+    /// Frame words parking the caller's fp and sp_offset across a direct
+    /// native call.
+    saved_fp_offset: i32,
+    saved_sp_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
     /// The register entry, when this function qualifies for direct self-calls.
@@ -353,6 +365,9 @@ impl Emitter<'_> {
             self.load(value, 2)?;
             self.asm.store(2, 13, root_base + index as i32 * 8);
         }
+        // Bound after the helper call when a direct native fast path precedes
+        // it: both paths leave the result in r2 and share the post-call code.
+        let mut direct_join: Option<Label> = None;
         let helper = if let Some(data) = data {
             match data.opcode {
                 Opcode::Call => {
@@ -362,6 +377,17 @@ impl Emitter<'_> {
                     for (index, &arg) in data.args.iter().enumerate() {
                         self.load(arg, 2)?;
                         self.asm.store(2, 13, argument_base + index as i32 * 8);
+                    }
+                    // A native callee the runtime resolved for this site is
+                    // entered directly; its guards fall through to the slice
+                    // adapter below (bliss-6j6pk).
+                    if let Some(target) = self.direct_native_for(symbol, data.args.len()) {
+                        let slow = self.asm.label();
+                        let join = self.asm.label();
+                        self.direct_native_call(&target, argument_base, slow);
+                        self.asm.branch(15, join);
+                        self.asm.bind(slow);
+                        direct_join = Some(join);
                     }
                     // A leaf builtin resolved at compile time goes through the
                     // direct slice adapter with its table slot baked into r2
@@ -432,6 +458,9 @@ impl Emitter<'_> {
         let offset = self.asm.here();
         self.asm.imm64(1, helper);
         self.asm.call_reg(1);
+        if let Some(join) = direct_join {
+            self.asm.bind(join);
+        }
         self.asm.store(2, 15, self.result_offset);
         if data.is_none() || self.runtime.transfer_pending != 0 {
             if data.is_some() {
@@ -501,8 +530,127 @@ impl Emitter<'_> {
         self.asm.prologue();
         self.asm.address(15, 15, -self.frame_bytes);
         self.asm.mov(13, 2);
+        // The entry's second argument is the EgclStack; a direct native call
+        // pushes the callee's frame on it. (The register entry does not run
+        // this: its r3 is an argument, and a function with a register entry
+        // makes only self-calls, so it never needs the pointer.)
+        self.asm.store(3, 15, self.stack_offset);
         self.asm.imm64(2, 256);
         self.asm.store(2, 15, self.poll_offset);
+    }
+
+    /// The listed native callee for `symbol` at this arity, if any.
+    fn direct_native_for(
+        &self,
+        symbol: u32,
+        nargs: usize,
+    ) -> Option<super::emit::DirectNativeTarget> {
+        if self.runtime.self_sym == Some(symbol) {
+            return None;
+        }
+        self.runtime
+            .direct_natives
+            .iter()
+            .find(|target| target.symbol == symbol && usize::from(target.nargs) == nargs)
+            .cloned()
+    }
+
+    /// Enter `target` directly from a `Call` site whose arguments are already
+    /// staged in the shadow argument area at `argument_base` (bliss-6j6pk; the
+    /// T1 emitter's `direct_native_call`, with the caller's bookkeeping in
+    /// frame words instead of callee-saved registers, since r6-r12 are homes
+    /// here). Falls back to `slow` -- the ordinary `call_slice` sequence --
+    /// when the native stack is near its limit, when the direct-call
+    /// generation has moved since the target was resolved, or when the
+    /// callee's frame would not fit the EgclStack. On the fast path the
+    /// callee's frame is pushed and published (fp, sp_offset) before the
+    /// entry runs, so every argument slot is a scanned root while the callee
+    /// allocates; afterwards the caller's fp and sp_offset are restored and
+    /// the result is in r2, exactly where the slow path leaves it. The
+    /// callee's entry preserves r6-r15, so the homes and r13 survive it.
+    fn direct_native_call(
+        &mut self,
+        target: &super::emit::DirectNativeTarget,
+        argument_base: i32,
+        slow: Label,
+    ) {
+        let bs_base = egcl_rt::EgclStack::OFFSET_BASE as i32;
+        let bs_sp = egcl_rt::EgclStack::OFFSET_SP_OFFSET as i32;
+        let bs_fp = egcl_rt::EgclStack::OFFSET_FP as i32;
+        let bs_cap = egcl_rt::EgclStack::OFFSET_CAPACITY as i32;
+        let f_prev = core::mem::offset_of!(egcl_rt::Frame, prev_fp) as i32;
+        let f_ret = core::mem::offset_of!(egcl_rt::Frame, return_pc) as i32;
+        let f_func = core::mem::offset_of!(egcl_rt::Frame, function) as i32;
+        let f_ci = core::mem::offset_of!(egcl_rt::Frame, code_info) as i32;
+        let f_flags = core::mem::offset_of!(egcl_rt::Frame, flags) as i32;
+        let f_nloc = core::mem::offset_of!(egcl_rt::Frame, num_locals) as i32;
+        let hdr = core::mem::size_of::<egcl_rt::Frame>() as i32;
+        let nslots = i32::from(target.num_slots);
+        let nargs = i32::from(target.nargs);
+        let framebytes = hdr + 8 * nslots;
+        // Native stack headroom, as the direct self-call checks it.
+        self.asm.imm64(1, egcl_rt::stack::native_stack_limit_addr());
+        self.asm.load(1, 1, 0);
+        self.asm.compare(15, 1);
+        self.asm.branch(12, slow);
+        // Guard 1: the direct-call generation still equals the baked one.
+        self.asm.imm64(1, target.generation_addr);
+        self.asm.load(4, 1, 0);
+        self.asm.imm64(5, target.generation);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, slow);
+        // r1 = the EgclStack; r2 = base, r3 = old sp_offset, r4 = new sp_offset.
+        self.asm.load(1, 15, self.stack_offset);
+        self.asm.load(2, 1, bs_base);
+        self.asm.load(3, 1, bs_sp);
+        self.asm.address(4, 3, framebytes);
+        // Guard 2: the callee's frame fits. new sp_offset > capacity => slow.
+        self.asm.load(5, 1, bs_cap);
+        self.asm.compare(4, 5);
+        self.asm.branch(2, slow);
+        // r5 = frame start = base + old sp_offset.
+        self.asm.mov(5, 2);
+        self.asm.add(5, 3);
+        // Park the caller's fp (r2) and sp_offset (r3).
+        self.asm.load(2, 1, bs_fp);
+        self.asm.store(2, 15, self.saved_fp_offset);
+        self.asm.store(3, 15, self.saved_sp_offset);
+        // Frame header.
+        self.asm.store(2, 5, f_prev);
+        self.asm.imm64(2, 0);
+        self.asm.store(2, 5, f_ret);
+        self.asm.imm64(2, NIL.0);
+        self.asm.store(2, 5, f_func);
+        self.asm.imm64(2, target.code_info);
+        self.asm.store(2, 5, f_ci);
+        self.asm.imm64(2, u64::from(target.frame_flags));
+        self.asm.store_u32(2, 5, f_flags);
+        self.asm.imm64(2, nslots as u64);
+        self.asm.store_u16(2, 5, f_nloc);
+        // Bind the arguments from the shadow area; the rest start as NIL.
+        for index in 0..nargs {
+            self.asm.load(2, 13, argument_base + 8 * index);
+            self.asm.store(2, 5, hdr + 8 * index);
+        }
+        if nargs < nslots {
+            self.asm.imm64(2, NIL.0);
+            for index in nargs..nslots {
+                self.asm.store(2, 5, hdr + 8 * index);
+            }
+        }
+        // Publish the frame, then call: r2 = the callee's slots, r3 = the stack.
+        self.asm.store(5, 1, bs_fp);
+        self.asm.store(4, 1, bs_sp);
+        self.asm.address(2, 5, hdr);
+        self.asm.mov(3, 1);
+        self.asm.imm64(1, target.entry);
+        self.asm.call_reg(1);
+        // Pop the callee's frame: restore the parked fp and sp_offset.
+        self.asm.load(1, 15, self.stack_offset);
+        self.asm.load(3, 15, self.saved_fp_offset);
+        self.asm.store(3, 1, bs_fp);
+        self.asm.load(3, 15, self.saved_sp_offset);
+        self.asm.store(3, 1, bs_sp);
     }
 
     fn epilogue(&mut self) {
@@ -1136,6 +1284,9 @@ pub fn emit_framed_with_runtime(
         root_sites: Vec::new(),
         result_offset: 0,
         poll_offset: 0,
+        stack_offset: 0,
+        saved_fp_offset: 0,
+        saved_sp_offset: 0,
         polls,
         transfer_exit: None,
         reg_entry: None,
@@ -1362,7 +1513,7 @@ pub fn emit_framed_with_runtime(
         .unwrap_or(0);
     let self_args_words = if has_reg_entry { 3 } else { 0 };
     let frame_words =
-        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 2;
+        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported());
@@ -1372,8 +1523,11 @@ pub fn emit_framed_with_runtime(
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
-    emitter.result_offset = 160 + (frame_words as i32 - 2) * 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 5) * 8;
     emitter.poll_offset = emitter.result_offset + 8;
+    emitter.stack_offset = emitter.poll_offset + 8;
+    emitter.saved_fp_offset = emitter.stack_offset + 8;
+    emitter.saved_sp_offset = emitter.saved_fp_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported());
     }

@@ -18553,6 +18553,9 @@ struct T2CompileInput {
     type_profiles: HashMap<u32, TypeProfile>,
     receiver_profiles: Vec<(String, Vec<ReceiverTypeProfileEntrySnapshot>)>,
     inline_bodies: Vec<T2BodySnapshot>,
+    /// Native callees the s390x T2 emitter may enter directly, resolved here
+    /// on the execution thread (bliss-6j6pk).
+    direct_natives: Vec<egcl_compiler::t2::emit::DirectNativeTarget>,
 }
 
 impl egcl_rt::gc::TraceHostRoots for T2CompileInput {
@@ -18621,6 +18624,9 @@ struct T2Artifact {
     has_deopt: bool,
     rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
+    /// `(symbol, entry)` of each direct native callee the code was emitted
+    /// against; resolved again and retained at install (bliss-6j6pk).
+    direct_natives: Vec<(u32, u64)>,
 }
 
 /// Validate the emitter's native-root synchronization contract before any T2
@@ -19107,6 +19113,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         );
     }
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+    let direct_natives = direct_native_targets(sym, &root, &inline_bodies);
     Some(T2CompileInput {
         sym,
         generation,
@@ -19115,6 +19122,117 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
         type_profiles,
         receiver_profiles,
         inline_bodies,
+        direct_natives,
+    })
+}
+
+/// The native callees a T2 compile of `caller` may enter directly: every
+/// `CallNamed` target in its body and in the bodies it may inline that has
+/// installed native code of the site's fixed arity, with no declared parameter
+/// types, no closure environment, no replacement function, a compatible
+/// transfer ABI and no deopt point -- the x86-64 T1 emitter's test, verbatim
+/// (bliss-zhvn, bliss-767gn). Only the s390x T2 emitter consumes the list, so
+/// the other targets skip the registry walk. `EGCL_NN_DIRECT=0` empties it.
+#[cfg(all(target_arch = "s390x", target_os = "linux"))]
+fn direct_native_targets(
+    caller: u32,
+    root: &BytecodeFunction,
+    inline_bodies: &[T2BodySnapshot],
+) -> Vec<egcl_compiler::t2::emit::DirectNativeTarget> {
+    if !nn_direct_enabled() {
+        return Vec::new();
+    }
+    let mut sites: Vec<(u32, u16)> = Vec::new();
+    for body in std::iter::once(root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
+        for instruction in &body.code {
+            if let Instr::CallNamed { sym, nargs } = instruction
+                && *sym != caller
+                && !sites.contains(&(*sym, *nargs))
+            {
+                sites.push((*sym, *nargs));
+            }
+        }
+    }
+    if sites.is_empty() {
+        return Vec::new();
+    }
+    // Capture the guard before any lookup: a concurrent replacement must not
+    // stamp an old target with its newer generation.
+    let baked_gen = direct_call_gen();
+    let generation_addr = std::ptr::addr_of!(DIRECT_CALL_GEN) as u64;
+    let mut targets = Vec::new();
+    for (callee, nargs) in sites {
+        let (Some(cbf), Some(cnc)) = (
+            registry_get(callee),
+            NATIVE_REGISTRY.with(|r| r.borrow().get(&callee).cloned()),
+        ) else {
+            continue;
+        };
+        let fixed = !cbf.variadic
+            && cbf.max_args == Some(cbf.min_args)
+            && cbf.min_args == nargs;
+        let no_types = cbf
+            .param_types
+            .iter()
+            .all(|t| matches!(t, DeclaredType::Any));
+        let not_closure = !cbf.has_env
+            && !closure_envs().borrow().contains_key(&callee)
+            && !closure_controls().borrow().contains_key(&callee);
+        if replacement_function(callee).is_none()
+            && native_transfer_abi_compatible(&cnc)
+            && !cnc.has_deopt
+            && fixed
+            && no_types
+            && not_closure
+        {
+            egcl_rt::blog!(
+                "compile",
+                egcl_rt::log::TRACE,
+                "[T2] {}: direct call to {} [T{}]",
+                display_fn_name(&root.name),
+                display_fn_name(&cbf.name),
+                if cnc.is_t2 { 2 } else { 1 }
+            );
+            targets.push(egcl_compiler::t2::emit::DirectNativeTarget {
+                symbol: callee,
+                nargs,
+                entry: cnc.entry as u64,
+                code_info: cnc.code_info as *const CodeInfo as u64,
+                num_slots: cnc.num_slots,
+                generation: baked_gen,
+                generation_addr,
+                frame_flags: FLAG_CALL,
+            });
+        }
+    }
+    targets
+}
+
+#[cfg(not(all(target_arch = "s390x", target_os = "linux")))]
+fn direct_native_targets(
+    _caller: u32,
+    _root: &BytecodeFunction,
+    _inline_bodies: &[T2BodySnapshot],
+) -> Vec<egcl_compiler::t2::emit::DirectNativeTarget> {
+    Vec::new()
+}
+
+/// The native code of the direct callees an installed T2 function was emitted
+/// against, so their code outlives a registry replacement while this caller
+/// still jumps into it. A callee replaced since the targets were resolved is
+/// not retained: its baked generation guard already fails.
+fn retained_direct_calls(targets: &[(u32, u64)]) -> Vec<Rc<NativeCode>> {
+    NATIVE_REGISTRY.with(|r| {
+        let registry = r.borrow();
+        targets
+            .iter()
+            .filter_map(|&(symbol, entry)| {
+                registry
+                    .get(&symbol)
+                    .filter(|code| code.entry as u64 == entry)
+                    .cloned()
+            })
+            .collect()
     })
 }
 
@@ -19215,6 +19333,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     };
+    let direct_calls = retained_direct_calls(&artifact.direct_natives);
     // Diagnostic (bliss-fhci): pay the full T2 COMPILATION cost but install
     // nothing, so execution stays at T1. Moving the T2 threshold cannot separate
     // "compiling cost time" from "the emitted code is slower", because both
@@ -19302,7 +19421,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
-        _direct_calls: Vec::new(),
+        _direct_calls: direct_calls,
         entry,
         code_len: artifact.code.len(),
         is_t2: true,
@@ -21745,7 +21864,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let mv_addr = c2i_t2_mv as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let recovery_toggle_addr =
         c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
-    let framed = match egcl_compiler::t2::emit::emit_framed_with_activation_slots(
+    let framed = match egcl_compiler::t2::emit::emit_framed_with_direct_natives(
         &f,
         deopt_addr,
         deopt_t2_addr,
@@ -21760,6 +21879,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64,
         bf.num_slots(),
         Some(sym),
+        &input.direct_natives,
     ) {
         Ok(fc) => fc,
         Err(e) => {
@@ -21842,6 +21962,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         has_deopt: framed.has_deopt,
         rooted_bodies,
         deopt_bodies,
+        direct_natives: input
+            .direct_natives
+            .iter()
+            .map(|target| (target.symbol, target.entry))
+            .collect(),
     })
 }
 
@@ -23762,6 +23887,7 @@ mod jtc4_stack_map_tests {
             has_deopt: false,
             rooted_bodies: vec![],
             deopt_bodies: HashMap::new(),
+            direct_natives: Vec::new(),
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 
