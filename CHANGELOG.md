@@ -7,6 +7,12 @@
   hot functions run as RV64 machine code instead of bytecode. T2 optimizing
   compilation is still x86-64, AArch64, ppc64le and s390x only
   ([#93](https://github.com/atgreen/evergreen/pull/93)).
+
+- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
+  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
+  operations and constant shifts, GC-safe runtime calls, polled loops, live
+  T1-to-T2 OSR and precise deoptimization
+  ([#112](https://github.com/atgreen/evergreen/pull/112)).
 - An inline s390x deoptimization now resumes on its owned Lisp frame when
   available, preserving original arguments without duplicating the function in
   backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).

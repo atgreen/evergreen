@@ -56,11 +56,17 @@ RV64I code with guarded fixnum add, subtract, increment, decrement, negation
 and comparisons, live T0-to-T1 OSR, and overflow and uncommon-trap
 deoptimization; `scripts/riscv64-jit-smoke.py` requires observable T1
 promotion and compares native, OSR and GC-stressed output with the
-interpreter. There is no RISC-V optimizing (T2) emitter yet, so hot T1 code
-stays at T1. Foreign calls go through the bootstrap dispatcher's fixed call
-shapes, as on s390x, the fiber scheduler runs without a native context
-switch, and a memory fault inside native code is not yet recoverable. The
-remaining slices are tracked as children of Bead `bliss-miro8`.
+interpreter. The T2 optimizing emitter covers the same opcode set as the
+s390x one: guarded fixnum add, subtract, multiply, negate and comparisons,
+tagged single-float add, subtract and multiply, `EQ`, unguarded `CAR`/`CDR`,
+bitwise operations and constant shifts, runtime calls with GC-synchronized
+roots, sampled back-edge polls, live T1-to-T2 OSR and precise deopt exits;
+the smoke's T2 sections require actual tier-2 installation and compare guard
+exits, calls, OSR and polls with T0 under GC stress. Foreign calls go through
+the bootstrap dispatcher's fixed call shapes, as on s390x, the fiber scheduler
+runs without a native context switch, and a memory fault inside native code is
+not yet recoverable. The remaining slices are tracked as children of Bead
+`bliss-miro8`.
 
 ```sh
 scripts/egcl-limited.sh python3 scripts/riscv64-jit-smoke.py -- \

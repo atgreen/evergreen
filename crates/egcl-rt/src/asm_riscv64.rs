@@ -37,6 +37,10 @@ pub mod reg {
     pub const T5: u8 = 30;
     /// Reserved for the assembler's own address arithmetic (wide offsets).
     pub const T6: u8 = 31;
+    /// Floating-point argument registers fa0/fa1 (f10/f11), used as scratch
+    /// by the single-float templates.
+    pub const FA0: u8 = 10;
+    pub const FA1: u8 = 11;
 }
 
 /// Conditions for [`Asm::branch`], evaluated as `lhs cond rhs` on signed
@@ -84,6 +88,7 @@ const OP_IMM32: u32 = 0x1b;
 const OP_STORE: u32 = 0x23;
 const OP_REG: u32 = 0x33;
 const OP_LUI: u32 = 0x37;
+const OP_FP: u32 = 0x53;
 const OP_BRANCH: u32 = 0x63;
 const OP_JALR: u32 = 0x67;
 const OP_JAL: u32 = 0x6f;
@@ -256,6 +261,51 @@ impl Asm {
         self.r_type(OP_REG, 0b010, 0, dst, lhs, rhs);
     }
 
+    /// Low 64 bits of the signed product (M extension).
+    pub fn mul(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.r_type(OP_REG, 0b000, 1, dst, lhs, rhs);
+    }
+
+    /// High 64 bits of the signed 128-bit product (M extension).
+    pub fn mulh(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.r_type(OP_REG, 0b001, 1, dst, lhs, rhs);
+    }
+
+    pub fn or_imm(&mut self, dst: u8, src: u8, imm: i32) {
+        self.i_type(OP_IMM, 0b110, dst, src, imm);
+    }
+
+    pub fn xor_imm(&mut self, dst: u8, src: u8, imm: i32) {
+        self.i_type(OP_IMM, 0b100, dst, src, imm);
+    }
+
+    // ── Single-precision floats (F extension) ──────────────────────────
+
+    /// `fmv.w.x`: move the low 32 bits of an integer register into a float
+    /// register unchanged.
+    pub fn float_from_bits(&mut self, float_dst: u8, general_src: u8) {
+        self.r_type(OP_FP, 0b000, 0x78, float_dst, general_src, 0);
+    }
+
+    /// `fmv.x.w`: move a single's bits to an integer register, sign-extended
+    /// from bit 31.
+    pub fn bits_from_float(&mut self, general_dst: u8, float_src: u8) {
+        self.r_type(OP_FP, 0b000, 0x70, general_dst, float_src, 0);
+    }
+
+    /// `fadd.s` under the dynamic rounding mode.
+    pub fn add_single(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.r_type(OP_FP, 0b111, 0x00, dst, lhs, rhs);
+    }
+
+    pub fn sub_single(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.r_type(OP_FP, 0b111, 0x04, dst, lhs, rhs);
+    }
+
+    pub fn multiply_single(&mut self, dst: u8, lhs: u8, rhs: u8) {
+        self.r_type(OP_FP, 0b111, 0x08, dst, lhs, rhs);
+    }
+
     // ── Memory ─────────────────────────────────────────────────────────
 
     /// Materialize `base + disp` into T6 when `disp` does not fit a 12-bit
@@ -301,7 +351,7 @@ impl Asm {
 
     /// A sign-extended 32-bit constant through LUI+ADDIW, two instructions.
     pub fn imm32(&mut self, dst: u8, value: i32) {
-        let lo = ((value << 20) >> 20) as i32; // sign-extended low 12 bits
+        let lo = (value << 20) >> 20; // sign-extended low 12 bits
         let hi = (value.wrapping_sub(lo) as u32) >> 12;
         if hi == 0 {
             self.add_imm(dst, reg::ZERO, lo);
@@ -503,6 +553,29 @@ mod tests {
             [
                 0x00050913, 0x00b50533, 0x40b50533, 0x006572b3, 0x006562b3, 0x006542b3, 0xff898993,
                 0x00757293, 0x00351513, 0x4035d593, 0x0205d593, 0x00b522b3,
+            ]
+        );
+    }
+
+    #[test]
+    fn multiply_logical_and_float_encodings_match_gnu_as() {
+        let mut a = Asm::new();
+        a.mul(A0, A0, A1); // mul a0, a0, a1
+        a.mulh(T0, A0, A1); // mulh t0, a0, a1
+        a.or_imm(A0, A0, 4); // ori a0, a0, 4
+        a.xor_imm(A0, A0, -1); // xori a0, a0, -1
+        a.shift_right(A0, A0, 32); // srli a0, a0, 32
+        a.float_from_bits(FA0, A0); // fmv.w.x fa0, a0
+        a.float_from_bits(FA1, A1); // fmv.w.x fa1, a1
+        a.add_single(FA0, FA0, FA1); // fadd.s fa0, fa0, fa1
+        a.sub_single(FA0, FA0, FA1); // fsub.s fa0, fa0, fa1
+        a.multiply_single(FA0, FA0, FA1); // fmul.s fa0, fa0, fa1
+        a.bits_from_float(A0, FA0); // fmv.x.w a0, fa0
+        assert_eq!(
+            words(&a.finish().unwrap()),
+            [
+                0x02b50533, 0x02b512b3, 0x00456513, 0xfff54513, 0x02055513, 0xf0050553, 0xf00585d3,
+                0x00b57553, 0x08b57553, 0x10b57553, 0xe0050553,
             ]
         );
     }
