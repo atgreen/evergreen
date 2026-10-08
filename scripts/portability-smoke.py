@@ -173,6 +173,39 @@ def main():
             assert native.stderr.count("[native-transfer/s390x] direct segment:") >= 2, native.stderr
             print(f"{arch}: opt-in native segment entry: OK", flush=True)
 
+        if arch == "riscv64":
+            # The parity loop may use the checked fallback.  This separate
+            # opt-in probe proves that a leaf body reaches the LP64D segment
+            # adapter at the RISC-V/native invocation boundary.
+            native_env = env.copy()
+            native_env["EGCL_FORCE_TIER"] = "t2"
+            native_env["EGCL_NATIVE_TRANSFER"] = "1"
+            native_env["EGCL_NATIVE_TRANSFER_DEBUG"] = "1"
+            native_env["EGCL_NN_DIRECT"] = "0"
+            native = subprocess.run(
+                command + [
+                    "--no-init",
+                    "--eval",
+                    "(progn (defun riscv64-segment-constant () 41) "
+                    "(defun riscv64-segment-identity (x) x) "
+                    "(assert (= (riscv64-segment-constant) 41)) "
+                    "(assert (= (riscv64-segment-identity 42) 42)) "
+                    "(format t \"RISCV64-NATIVE-SEGMENT-OK~%\"))",
+                ],
+                env=native_env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            if native.returncode:
+                raise RuntimeError(
+                    f"riscv64 native segment exit {native.returncode}\n"
+                    f"{native.stdout}\n{native.stderr}"
+                )
+            assert "RISCV64-NATIVE-SEGMENT-OK" in native.stdout, native.stdout
+            assert native.stderr.count("[native-transfer/riscv64] direct segment:") >= 2, native.stderr
+            print(f"{arch}: opt-in native segment entry: OK", flush=True)
+
         if arch == "win64":
             home_env = env.copy()
             home_env.pop("HOME", None)

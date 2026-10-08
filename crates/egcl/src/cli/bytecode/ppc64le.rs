@@ -34,17 +34,18 @@
 //! presented before it was found.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
-    c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
-    c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
-    c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
+    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, UnaryFixnumOp, c2i_alloc_cons,
+    c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_deopt_state, c2i_eval_host,
+    c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_closure, c2i_osr_backedge,
+    c2i_pop_env_child, c2i_push_env_child, c2i_store_env, c2i_store_global, c2i_t1_backedge,
     c2i_take_values, c2i_transfer_pending, c2i_typep_class, c2i_values_to_list,
-    call_site_profile_token, registry_get, resolve_sym, t2_backedge_threshold,
+    call_site_profile_token, inlinable_fixnum_op, inlinable_unary_fixnum_op, registry_get,
+    resolve_sym, t2_backedge_threshold,
 };
 use egcl_rt::asm::Cc;
-use egcl_rt::asm_ppc64le::{Asm, frame};
+use egcl_rt::asm_ppc64le::{Asm, Label, frame};
 use egcl_rt::bytecode::Instr;
-use egcl_rt::value::EgclVal;
+use egcl_rt::value::{EgclVal, NIL, T};
 
 /// Frame slots; local `i` lives at `[SLOTS + 8*i]`.
 const SLOTS: u8 = 14;
@@ -68,7 +69,7 @@ const TOC: u8 = 2;
 /// baseline does not handle.
 pub(super) fn emit_native_ppc64le(
     bf: &BytecodeFunction,
-    _allow_speculation: bool,
+    allow_speculation: bool,
     sym: u32,
     backedge_counter: u64,
     _allow_traps: bool,
@@ -106,6 +107,9 @@ pub(super) fn emit_native_ppc64le(
     // leave the loop mid-flight; `has_deopt` must report that.
     let mut can_osr_to_t2 = false;
 
+    // One cold stub per guarded bytecode position: a failed fixnum guard records
+    // (bcp, operand depth) and leaves, and T0 resumes exactly there.
+    let mut deopts: std::collections::BTreeMap<u32, Label> = std::collections::BTreeMap::new();
     let mut block_targets: std::collections::HashMap<u32, (u32, u16)> =
         std::collections::HashMap::new();
     let mut tag_sp: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
@@ -152,8 +156,6 @@ pub(super) fn emit_native_ppc64le(
     let builtin_addr =
         c2i_call_builtin as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize as u64;
     let transfer_addr = c2i_transfer_pending as extern "C" fn() -> u64 as usize as u64;
-    let recovery_toggle_addr =
-        c2i_set_native_sigsegv_recovery as extern "C" fn(u64) as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
@@ -169,8 +171,7 @@ pub(super) fn emit_native_ppc64le(
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
-    let take_values_addr =
-        c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
+    let take_values_addr = c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
     let values_to_list_addr = c2i_values_to_list as extern "C" fn(u64) -> u64 as usize as u64;
     let typep_class_addr = c2i_typep_class as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let osr_backedge_addr = c2i_osr_backedge as extern "C" fn() -> u64 as usize as u64;
@@ -244,9 +245,22 @@ pub(super) fn emit_native_ppc64le(
                 emit_push(&mut c)?;
             }
             Instr::ClearMv => {
-                emit_c2i_call(&mut c, clear_mv_addr, transfer_addr, recovery_toggle_addr)?;
+                // Resetting the multiple-values state cannot signal, throw or
+                // allocate, so it needs neither the transfer check nor a root
+                // map: a bare leaf call, not the full helper crossing. SETQ
+                // emits one of these per assignment, so in a counted loop they
+                // were two of the five crossings per iteration.
+                emit_leaf_call(&mut c, clear_mv_addr)?;
             }
             Instr::CallNamed { sym: callee, nargs } => {
+                if allow_speculation
+                    && encode!(
+                        "fixnum template operand",
+                        emit_fixnum_template(&mut c, *callee, *nargs, bcp, &mut deopts)
+                    )
+                {
+                    continue;
+                }
                 let direct_builtin = super::super::direct_builtin_slot(*callee, *nargs as usize);
                 let arg0 = match direct_builtin {
                     Some(slot) => ((slot as u64) << 32) | u64::from(*callee),
@@ -268,7 +282,7 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     c2i_addr
                 };
-                emit_c2i_call(&mut c, target, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, target, transfer_addr)?;
                 emit_add_disp(&mut c, OPSP, OPSP, -8 * i32::from(*nargs))?;
                 emit_push(&mut c)?;
             }
@@ -277,14 +291,14 @@ pub(super) fn emit_native_ppc64le(
                 c.imm64(4, u64::from(*n));
                 emit_add_disp(&mut c, 5, OPSP, -8 * i32::from(*n))?;
                 c.imm64(6, 0);
-                emit_c2i_call(&mut c, c2i_addr, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, c2i_addr, transfer_addr)?;
                 emit_add_disp(&mut c, OPSP, OPSP, -8 * i32::from(*n))?;
                 emit_push(&mut c)?;
             }
             Instr::LoadEnvVar(name_idx) => {
                 c.imm64(3, std::ptr::from_ref(bf) as u64);
                 c.imm64(4, u64::from(u32::from(*name_idx)));
-                emit_c2i_call(&mut c, load_env_addr, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, load_env_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
@@ -296,7 +310,7 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     define_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
             }
             Instr::PushEnvChild | Instr::PopEnvChild => {
                 let helper = if matches!(instr, Instr::PushEnvChild) {
@@ -304,13 +318,13 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     pop_env_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
             }
             Instr::AllocCons => {
                 // The cdr is on top, so it pops first.
                 emit_pop(&mut c, 4)?;
                 emit_pop(&mut c, 3)?;
-                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, alloc_cons_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
@@ -324,69 +338,39 @@ pub(super) fn emit_native_ppc64le(
                 } else {
                     make_closure_addr
                 };
-                emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
+                emit_c2i_call(&mut c, helper, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::TakeValuesToLocals { nvars, slot_base } => {
                 emit_pop(&mut c, 3)?;
                 emit_add_disp(&mut c, 4, SLOTS, 8 * i32::from(*slot_base))?;
                 c.imm64(5, u64::from(*nvars));
-                emit_c2i_call(
-                    &mut c,
-                    take_values_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, take_values_addr, transfer_addr)?;
             }
             Instr::LoadGlobal(global) => {
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(
-                    &mut c,
-                    load_global_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, load_global_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::LoadFunction(global) => {
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(
-                    &mut c,
-                    load_function_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, load_function_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::StoreGlobal(global) => {
                 emit_pop(&mut c, 4)?;
                 c.imm64(3, u64::from(*global));
-                emit_c2i_call(
-                    &mut c,
-                    store_global_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, store_global_addr, transfer_addr)?;
             }
             Instr::ValuesToList => {
                 emit_pop(&mut c, 3)?;
-                emit_c2i_call(
-                    &mut c,
-                    values_to_list_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, values_to_list_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::TypeP(class) => {
                 emit_pop(&mut c, 3)?;
                 c.imm64(4, u64::from(*class as u32));
-                emit_c2i_call(
-                    &mut c,
-                    typep_class_addr,
-                    transfer_addr,
-                    recovery_toggle_addr,
-                )?;
+                emit_c2i_call(&mut c, typep_class_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::Br(target) => {
@@ -445,13 +429,19 @@ pub(super) fn emit_native_ppc64le(
                     let keep = c.label();
                     c.imm64(SCRATCH, backedge_counter);
                     // The counter is an AtomicU32, so these are 32-bit accesses: a
-                    // 64-bit one would read and write the four bytes past it.
+                    // 64-bit one would read and write the four bytes past it. It
+                    // starts at ZERO and counts UP to the threshold, as on the other
+                    // three targets; counting down from that zero start meant the
+                    // first poll fired only when the u32 wrapped, so installed T1
+                    // loops never escalated to T2 and never polled signals or GC
+                    // safepoints (bliss-fsqh3).
                     encode!("poll counter load", c.load_word(ACC, SCRATCH, 0));
-                    c.addi(ACC, ACC, -1);
+                    c.addi(ACC, ACC, 1);
                     encode!("poll counter store", c.store_word(ACC, SCRATCH, 0));
-                    c.compare_imm(0, ACC, 0);
-                    c.branch(Cc::Ne, 0, keep);
-                    c.imm64(ACC, u64::from(t2_backedge_threshold()));
+                    c.imm64(4, u64::from(t2_backedge_threshold()));
+                    c.compare(0, ACC, 4);
+                    c.branch(Cc::L, 0, keep);
+                    c.li(ACC, 0);
                     encode!("poll reset", c.store_word(ACC, SCRATCH, 0));
                     let helper = if is_osr {
                         // Signal-only: an OSR loop has no T1 tier to promote from,
@@ -465,7 +455,7 @@ pub(super) fn emit_native_ppc64le(
                         c.imm64(6, std::ptr::from_ref(bf) as u64);
                         t2_backedge_addr
                     };
-                    emit_c2i_call(&mut c, helper, transfer_addr, recovery_toggle_addr)?;
+                    emit_c2i_call(&mut c, helper, transfer_addr)?;
                     c.compare_imm(0, ACC, 0);
                     c.branch(Cc::E, 0, keep);
                     // Leaving the loop: T2 finished, or a signal is pending. The
@@ -490,6 +480,24 @@ pub(super) fn emit_native_ppc64le(
     // run off the end of the buffer into whatever follows.
     c.li(ACC, 0);
     emit_epilogue(&mut c)?;
+
+    // Cold deopt stubs. The operand stack was not moved before the guard failed, so
+    // the live locals and the untouched operands are still in the frame slots;
+    // report the bytecode position and the operand depth and leave through the
+    // ordinary epilogue. `run_native` sees the recorded state and resumes T0 there.
+    for (&deopt_bcp, &label) in &deopts {
+        c.bind(label);
+        c.subf(4, SLOTS, OPSP);
+        c.sradi(4, 4, 3);
+        emit_add_disp(&mut c, 4, 4, -n_locals)?;
+        c.imm64(3, u64::from(deopt_bcp));
+        emit_leaf_call(
+            &mut c,
+            c2i_deopt_state as extern "C" fn(u64, u64) as usize as u64,
+        )?;
+        c.imm64(ACC, NIL.0);
+        emit_epilogue(&mut c)?;
+    }
 
     // One alternate entry per eligible loop header: the shared prologue, then a
     // branch into the body.
@@ -518,7 +526,7 @@ pub(super) fn emit_native_ppc64le(
         code,
         osr_entries,
         bcp_offsets,
-        has_deopt: can_osr_to_t2,
+        has_deopt: can_osr_to_t2 || !deopts.is_empty(),
         direct_calls: Vec::new(),
     })
 }
@@ -534,6 +542,130 @@ fn emit_push(c: &mut Asm) -> Option<()> {
 fn emit_pop(c: &mut Asm, register: u8) -> Option<()> {
     c.addi(OPSP, OPSP, -8);
     c.load(register, OPSP, 0)
+}
+
+/// Inline guarded fixnum fast path for an arithmetic `CallNamed`, or `Some(false)`
+/// when the callee or arity has no template (`None` only for an unencodable
+/// operand displacement). PEEK-guard-commit, as on x86 and System Z: the operands
+/// are read in place and the operand-stack pointer is not moved until every guard
+/// has passed, so a failed guard leaves the frame exactly as T0 expects at `bcp`.
+///
+/// Multiplication is left to the runtime: its overflow test needs `mulhd` and the
+/// untagging shift, and the baseline tier gains little from it.
+fn emit_fixnum_template(
+    c: &mut Asm,
+    sym: u32,
+    nargs: u16,
+    bcp: u32,
+    deopts: &mut std::collections::BTreeMap<u32, Label>,
+) -> Option<bool> {
+    if nargs == 1 {
+        let Some(op) = inlinable_unary_fixnum_op(sym) else {
+            return Some(false);
+        };
+        let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
+        c.load(ACC, OPSP, -8)?;
+        emit_guard_fixnum(c, ACC, deopt);
+        match op {
+            UnaryFixnumOp::Incr => {
+                c.li(4, 8);
+                emit_add_checked(c, 4, deopt);
+            }
+            UnaryFixnumOp::Decr => {
+                c.li(4, 8);
+                emit_sub_checked(c, 4, deopt);
+            }
+            UnaryFixnumOp::Neg => {
+                c.mov(4, ACC);
+                c.li(ACC, 0);
+                emit_sub_checked(c, 4, deopt);
+            }
+        }
+        c.store(ACC, OPSP, -8)?;
+        return Some(true);
+    }
+    if nargs != 2 {
+        return Some(false);
+    }
+    let Some(op) = inlinable_fixnum_op(sym) else {
+        return Some(false);
+    };
+    if matches!(op, FixnumOp::Mul) {
+        return Some(false);
+    }
+    let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
+    c.load(ACC, OPSP, -16)?;
+    c.load(4, OPSP, -8)?;
+    emit_guard_fixnum(c, ACC, deopt);
+    emit_guard_fixnum(c, 4, deopt);
+    match op {
+        FixnumOp::Add => emit_add_checked(c, 4, deopt),
+        FixnumOp::Sub => emit_sub_checked(c, 4, deopt),
+        comparison => {
+            // Branchless: `isel` picks T or NIL on the compare result.
+            c.compare(0, ACC, 4);
+            c.imm64(5, T.0);
+            c.imm64(6, NIL.0);
+            let cc = match comparison {
+                FixnumOp::Lt => Cc::L,
+                FixnumOp::Gt => Cc::G,
+                FixnumOp::Le => Cc::Le,
+                FixnumOp::Ge => Cc::Ge,
+                FixnumOp::NumEq => Cc::E,
+                FixnumOp::Add | FixnumOp::Sub | FixnumOp::Mul => unreachable!(),
+            };
+            c.isel(ACC, 5, 6, cc, 0);
+        }
+    }
+    c.store(ACC, OPSP, -16)?;
+    c.addi(OPSP, OPSP, -8);
+    Some(true)
+}
+
+/// Deopt unless `register` carries the fixnum tag (low three bits clear).
+fn emit_guard_fixnum(c: &mut Asm, register: u8, deopt: Label) {
+    c.li(SCRATCH, egcl_rt::value::TAG_MASK as i16);
+    c.and(SCRATCH, register, SCRATCH);
+    c.compare_imm(0, SCRATCH, 0);
+    c.branch(Cc::Ne, 0, deopt);
+}
+
+/// `ACC = ACC + rhs`, deopting on signed overflow. Tagged fixnums add directly.
+/// `XER[SO]` is sticky and cannot serve a per-operation guard (see the T2 emitter),
+/// so the sign test is explicit: overflow iff the operands agree in sign and the
+/// result disagrees with them.
+fn emit_add_checked(c: &mut Asm, rhs: u8, deopt: Label) {
+    c.add(5, ACC, rhs);
+    c.xor(6, ACC, 5);
+    c.xor(SCRATCH, rhs, 5);
+    c.and(6, 6, SCRATCH);
+    c.compare_imm(0, 6, 0);
+    c.mov(ACC, 5);
+    c.branch(Cc::L, 0, deopt);
+}
+
+/// `ACC = ACC - rhs`, deopting on signed overflow: overflow iff the operands
+/// differ in sign and the result's sign differs from the minuend's. Subtracting
+/// directly, rather than negating and adding, keeps the most negative fixnum
+/// correct.
+fn emit_sub_checked(c: &mut Asm, rhs: u8, deopt: Label) {
+    c.subf(5, rhs, ACC);
+    c.xor(6, ACC, rhs);
+    c.xor(SCRATCH, ACC, 5);
+    c.and(6, 6, SCRATCH);
+    c.compare_imm(0, 6, 0);
+    c.mov(ACC, 5);
+    c.branch(Cc::L, 0, deopt);
+}
+
+/// Call a Rust leaf that neither allocates nor re-enters Lisp, with the arguments
+/// already in r3 onwards. Only the TOC and the call itself; no transfer check.
+fn emit_leaf_call(c: &mut Asm, target: u64) -> Option<()> {
+    c.store(TOC, 1, frame::TOC_SLOT)?;
+    c.imm64(TARGET, target);
+    c.move_to_count(TARGET);
+    c.call_count();
+    c.load(TOC, 1, frame::TOC_SLOT)
 }
 
 fn emit_epilogue(c: &mut Asm) -> Option<()> {
@@ -566,12 +698,15 @@ fn emit_add_disp(c: &mut Asm, destination: u8, source: u8, displacement: i32) ->
 /// An indirect call goes through the count register, and the ABI expects the
 /// target's address in r12 so that a callee entered at its global entry point can
 /// compute its own TOC. r2 is saved and restored around the call because of that.
-fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64, recovery_toggle: u64) -> Option<()> {
-    // Disable native-frame SIGSEGV recovery while a Rust helper frame is active.
-    // Recovery redirects a fault to a stub that unwinds a JIT frame through the back
-    // chain; with a helper frame on top that would restore the wrong registers and
-    // return to the wrong place.
-    emit_toggle(c, recovery_toggle, 0)?;
+///
+/// Unlike the x86-64 baseline, this does not bracket the call with the
+/// SIGSEGV-recovery toggle. Recovery cannot resume on ppc64le yet
+/// (`rewrite_ucontext_ip` is unimplemented here, bliss-bdly0), so publishing a
+/// zero recovery address around each helper changed nothing observable and cost
+/// about 36 instructions and two extra calls per crossing (bliss-8klqs). When
+/// recovery arrives on this target, publish it once per native entry rather than
+/// per call (bliss-fgtb).
+fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64) -> Option<()> {
     c.store(TOC, 1, frame::TOC_SLOT)?;
     c.imm64(TARGET, target);
     c.move_to_count(TARGET);
@@ -593,28 +728,6 @@ fn emit_c2i_call(c: &mut Asm, target: u64, transfer_addr: u64, recovery_toggle: 
     c.load(ACC, 1, frame::SCRATCH_SLOT)?;
     emit_epilogue(c)?;
     c.bind(resume);
-    emit_toggle(c, recovery_toggle, 1)?;
     c.load(ACC, 1, frame::SCRATCH_SLOT)?;
-    Some(())
-}
-
-/// Call the recovery toggle, preserving the argument registers across it.
-///
-/// The toggle is an ordinary call and clobbers every volatile register, so all four
-/// argument registers are saved — not just the accumulator. Saving only r3 leaves
-/// the helper reading whatever the toggle happened to leave in r4, r5 and r6.
-fn emit_toggle(c: &mut Asm, toggle: u64, enable: i16) -> Option<()> {
-    for (index, register) in [3u8, 4, 5, 6].into_iter().enumerate() {
-        c.store(register, 1, frame::ARGUMENT_SPILL + 8 * index as i32)?;
-    }
-    c.store(TOC, 1, frame::TOC_SLOT)?;
-    c.li(3, enable);
-    c.imm64(TARGET, toggle);
-    c.move_to_count(TARGET);
-    c.call_count();
-    c.load(TOC, 1, frame::TOC_SLOT)?;
-    for (index, register) in [3u8, 4, 5, 6].into_iter().enumerate() {
-        c.load(register, 1, frame::ARGUMENT_SPILL + 8 * index as i32)?;
-    }
     Some(())
 }

@@ -130,10 +130,10 @@ for a release build and validation notes.
 Runtime targets include Linux x86-64, AArch64, ppc64le, s390x, and riscv64;
 macOS arm64; Windows x86-64; and Android ARM64 and x86-64 application
 runtimes. Native compiler coverage and foreign-call support vary by target.
-Linux x86-64, AArch64, ppc64le, and s390x have T1 and T2 backends, OSR, and
-deoptimization for supported code shapes; unsupported shapes remain at a lower
-tier. Linux riscv64 is a native build that currently runs the interpreter and
-bytecode tiers only. The macOS arm64 CLI is built from
+Linux x86-64, AArch64, ppc64le, s390x, and riscv64 have T1 and T2 backends,
+OSR, and deoptimization for supported code shapes; unsupported shapes remain
+at a lower tier. Linux riscv64 is built natively rather than cross-compiled.
+The macOS arm64 CLI is built from
 source and has a narrower validation baseline than Linux.
 
 The Fedora x86-64 repository also offers `egcl-static` and `egcl-target-*`

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Proof that JitBuffer can hold and execute machine code.
+#[cfg(target_arch = "x86_64")]
 use egcl_rt::jit::JitBuffer;
 
 #[cfg(target_arch = "x86_64")]
