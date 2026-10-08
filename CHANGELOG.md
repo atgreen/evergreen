@@ -2,95 +2,97 @@
 
 ## Unreleased
 
-- T2 checks a loop-carried fixnum once on loop entry (and once when a loop
-  is entered through OSR) instead of re-testing its tag on every iteration
-  ([#106](https://github.com/atgreen/evergreen/pull/106)).
-- T2 deopt frame states name only the locals the interpreter can still read.
-  A `LET*` chain inside a loop no longer keeps every binding alive to the end
-  of the function, so its arithmetic stays in registers and the loop
-  back-edge carries only the loop variables
-  ([#103](https://github.com/atgreen/evergreen/pull/103)).
-- T2 no longer emits a runtime call for every `SETQ` in a loop. Multiple-value
-  resets that cannot be observed before the next reset are removed, so a
-  call-free loop of assignments runs as straight-line native code; a ten-SETQ
-  loop went from 1.35 s to 0.02 s for two million iterations
-  ([#100](https://github.com/atgreen/evergreen/pull/100)).
-- s390x foreign calls now accept variadic calls supported by the existing
-  fixed-arity integer dispatcher
-  ([#119](https://github.com/atgreen/evergreen/pull/119)).
+- On s390x, eligible self-recursive functions now call their T2 native entry
+  directly, reducing recursive-call overhead while retaining stack-limit
+  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
 
-- The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
-  that computes on x86-64 computes there too: `(deep 50000)` no longer signals
-  `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
+- T2 now propagates fixnum guards through tail-call loop parameters and
+  recursive results, allowing functions such as `TAK` to use direct native
+  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
+
+- On s390x, native code now calls eligible leaf builtins through cached
+  builtin slots instead of resolving each call by name, while retaining
+  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
+
 - GETF now signals TYPE-ERROR for improper property lists with a non-NIL
   atomic tail instead of returning the default value
   ([#89](https://github.com/atgreen/evergreen/pull/89)).
 
-- RISC-V now supports the opt-in native segment boundary, preserving callee-
-  saved integer and floating-point registers across native returns and
-  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
-
-- riscv64 now has a T1 baseline native compiler with guarded fixnum
-  arithmetic, comparisons, live on-stack replacement, and deoptimization, so
-  hot functions run as RV64 machine code instead of bytecode. T2 optimizing
-  compilation is still x86-64, AArch64, ppc64le and s390x only
-  ([#93](https://github.com/atgreen/evergreen/pull/93)).
-
-- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
-  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
-  operations and constant shifts, GC-safe runtime calls, polled loops, live
-  T1-to-T2 OSR and precise deoptimization
-  ([#112](https://github.com/atgreen/evergreen/pull/112)).
-
-- Fibers on riscv64 now switch stacks natively instead of running on the
-  scheduler's no-context-switch fallback, so cooperative scheduling, parking,
-  and carrier migration behave as on the other Linux ports
-  ([#120](https://github.com/atgreen/evergreen/pull/120)).
-
-- Foreign calls on riscv64 now use the LP64D calling convention for every
-  scalar signature, including floats, doubles, mixed argument lists and
-  variadic functions, instead of the bootstrap dispatcher's fixed integer
-  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
-
-- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
-  the runtime recovery handler instead of terminating the process
-  ([#123](https://github.com/atgreen/evergreen/pull/123)).
-
-- An inline s390x deoptimization now resumes on its owned Lisp frame when
-  available, preserving original arguments without duplicating the function in
-  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
-
-- s390x T2 functions now save and restore only the callee-saved registers they
-  use, reducing native call overhead
-  ([#115](https://github.com/atgreen/evergreen/pull/115)).
-
-- s390x T2 code uses shorter native instruction sequences for small constants
-  and fixnum tag checks
-  ([#113](https://github.com/atgreen/evergreen/pull/113)).
-
-- s390x T2 compilation diagnostics now report the actual register entry offset
-  used by direct recursive calls
-  ([#101](https://github.com/atgreen/evergreen/pull/101)).
-
 - On s390x, T2 now compiles additional type predicates and names unsupported
   opcodes in compilation diagnostics
   ([#91](https://github.com/atgreen/evergreen/pull/91)).
+
+- riscv64 now has a T1 baseline native compiler with guarded fixnum
+  arithmetic, comparisons, live on-stack replacement, and deoptimization, so
+  hot functions run as RV64 machine code instead of bytecode.
+  ([#93](https://github.com/atgreen/evergreen/pull/93)).
 
 - On s390x, T1 native code now calls other native functions directly, pushing
   the callee frame inline instead of dispatching through the generic adapter.
   With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
   to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
 
+- Single-float arithmetic on ppc64le now returns correct values once a
+  function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
+  returned `2.2578125` there while the interpreter and baseline tier were
+  right ([#95](https://github.com/atgreen/evergreen/pull/95)).
+
+- Fixnum `+`, `-`, `1+`, `1-`, unary `-` and the numeric comparisons
+  now compile inline with type and overflow guards in ppc64le baseline native
+  code instead of calling the runtime for every operation, taking a counted
+  loop from about 4,800 to 1,500 instructions per iteration at T1
+  ([#96](https://github.com/atgreen/evergreen/pull/96)).
+
 - On s390x, T2 native code calls other native functions directly as well,
   with the callees resolved when the compile is queued. With T2 on, on a z17:
   takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
   ([#97](https://github.com/atgreen/evergreen/pull/97)).
+
+- Functions containing loops now reach T2 native code on ppc64le instead of
+  stopping at T1: the back-edge safepoint poll had no GC root set, which made
+  the optimizing tier decline every loop
+  ([#98](https://github.com/atgreen/evergreen/pull/98)).
 
 - On s390x, T2 now compiles uncommon traps and the simple-string fast paths
   (`STRINGP`, `LENGTH`, ASCII `CHAR`), so shapes such as UIOP's `FIRST-CHAR`
   and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
   line of every s390x structural decline
   ([#99](https://github.com/atgreen/evergreen/pull/99)).
+
+- T2 no longer emits a runtime call for every `SETQ` in a loop. Multiple-value
+  resets that cannot be observed before the next reset are removed, so a
+  call-free loop of assignments runs as straight-line native code; a ten-SETQ
+  loop went from 1.35 s to 0.02 s for two million iterations
+  ([#100](https://github.com/atgreen/evergreen/pull/100)).
+
+- s390x T2 compilation diagnostics now report the actual register entry offset
+  used by direct recursive calls
+  ([#101](https://github.com/atgreen/evergreen/pull/101)).
+
+- The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
+  that computes on x86-64 computes there too: `(deep 50000)` no longer signals
+  `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
+
+- T2 deopt frame states name only the locals the interpreter can still read.
+  A `LET*` chain inside a loop no longer keeps every binding alive to the end
+  of the function, so its arithmetic stays in registers and the loop
+  back-edge carries only the loop variables
+  ([#103](https://github.com/atgreen/evergreen/pull/103)).
+
+- ppc64le baseline native code no longer brackets every runtime helper call
+  with the SIGSEGV-recovery toggle, which cannot resume on that target yet,
+  and resets multiple-values state with a bare leaf call; a counted loop
+  drops from about 1,500 to 1,000 instructions per iteration at T1
+  ([#104](https://github.com/atgreen/evergreen/pull/104)).
+
+- Functions using `CAR`, `CDR`, `EQ`, `NULL`, `NOT`, the logical bit
+  operations or `ASH` by a constant now reach T2 native code on ppc64le
+  instead of stopping at T1
+  ([#105](https://github.com/atgreen/evergreen/pull/105)).
+
+- T2 checks a loop-carried fixnum once on loop entry (and once when a loop
+  is entered through OSR) instead of re-testing its tag on every iteration
+  ([#106](https://github.com/atgreen/evergreen/pull/106)).
 
 - On s390x, a T2 deoptimization now resumes the interpreter in place, so a
   guard failing deep inside a directly recursive call returns the right value:
@@ -104,15 +106,61 @@
   interpreter in place and returns a finished value: div2 327 to 239 ms on a
   z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
 
+- The sampled back-edge poll in ppc64le baseline native loops now fires at
+  the configured threshold instead of after about four billion iterations, so
+  a hot loop in a warm function requests T2 compilation and responds to
+  signals and GC safepoints ([#110](https://github.com/atgreen/evergreen/pull/110)).
+
 - On s390x, a self-recursive T2 function keeps its direct self-call entry
   when its body also calls other functions, as long as no heap value is live
   across a call; such functions no longer pay the generic adapter on every
   recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
 
+- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
+  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
+  operations and constant shifts, GC-safe runtime calls, polled loops, live
+  T1-to-T2 OSR and precise deoptimization
+  ([#112](https://github.com/atgreen/evergreen/pull/112)).
+
+- s390x T2 code uses shorter native instruction sequences for small constants
+  and fixnum tag checks
+  ([#113](https://github.com/atgreen/evergreen/pull/113)).
+
+- A hot loop in a warm function on ppc64le now hands off from baseline
+  native code into its compiled T2 loop mid-flight instead of finishing at
+  the baseline tier; measured at 78 instead of 978 instructions per
+  iteration ([#114](https://github.com/atgreen/evergreen/pull/114)).
+
+- s390x T2 functions now save and restore only the callee-saved registers they
+  use, reducing native call overhead
+  ([#115](https://github.com/atgreen/evergreen/pull/115)).
+
 - On s390x, `EGCL-EXT:MEMORY-BARRIER`, `LOAD-BARRIER` and `STORE-BARRIER` now
   compile to a native serialization instruction at every tier instead of a
   generic call, and functions using them persist to bfasl as on x86-64
   ([#118](https://github.com/atgreen/evergreen/pull/118)).
+
+- s390x foreign calls now accept variadic calls supported by the existing
+  fixed-arity integer dispatcher
+  ([#119](https://github.com/atgreen/evergreen/pull/119)).
+
+- Fibers on riscv64 now switch stacks natively instead of running on the
+  scheduler's no-context-switch fallback, so cooperative scheduling, parking,
+  and carrier migration behave as on the other Linux ports
+  ([#120](https://github.com/atgreen/evergreen/pull/120)).
+
+- Foreign calls on riscv64 now use the LP64D calling convention for every
+  scalar signature, including floats, doubles, mixed argument lists and
+  variadic functions, instead of the bootstrap dispatcher's fixed integer
+  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
+
+- An inline s390x deoptimization now resumes on its owned Lisp frame when
+  available, preserving original arguments without duplicating the function in
+  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
+
+- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
+  the runtime recovery handler instead of terminating the process
+  ([#123](https://github.com/atgreen/evergreen/pull/123)).
 
 - On s390x, functions that create closures (any LAMBDA in the body) now
   compile at T1 instead of staying interpreted, including loops that create a
@@ -123,17 +171,10 @@
   check instead of calling the numeric runtime for every `*`, deoptimizing to
   the interpreter for a bignum product or a non-fixnum operand
   ([#127](https://github.com/atgreen/evergreen/pull/127)).
-- On s390x, eligible self-recursive functions now call their T2 native entry
-  directly, reducing recursive-call overhead while retaining stack-limit
-  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
 
-- T2 now propagates fixnum guards through tail-call loop parameters and
-  recursive results, allowing functions such as `TAK` to use direct native
-  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
-
-- On s390x, native code now calls eligible leaf builtins through cached
-  builtin slots instead of resolving each call by name, while retaining
-  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
+- RISC-V now supports the opt-in native segment boundary, preserving callee-
+  saved integer and floating-point registers across native returns and
+  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
 
 - Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
   filesystem adapters, pinned setup instructions, and verified fresh
@@ -193,32 +234,6 @@
 - Constant-kind memory barriers now use dedicated bytecode and x86 native
   fence instructions, including after compiled-file loading
   ([#30](https://github.com/atgreen/evergreen/pull/30)).
-
-- Functions containing loops now reach T2 native code on ppc64le instead of
-  stopping at T1: the back-edge safepoint poll had no GC root set, which made
-  the optimizing tier decline every loop
-  ([#98](https://github.com/atgreen/evergreen/pull/98)).
-
-- Functions using `CAR`, `CDR`, `EQ`, `NULL`, `NOT`, the logical bit
-  operations or `ASH` by a constant now reach T2 native code on ppc64le
-  instead of stopping at T1
-  ([#105](https://github.com/atgreen/evergreen/pull/105)).
-- Fixnum `+`, `-`, `1+`, `1-`, unary `-` and the numeric comparisons
-  now compile inline with type and overflow guards in ppc64le baseline native
-  code instead of calling the runtime for every operation, taking a counted
-  loop from about 4,800 to 1,500 instructions per iteration at T1
-  ([#96](https://github.com/atgreen/evergreen/pull/96)).
-
-- ppc64le baseline native code no longer brackets every runtime helper call
-  with the SIGSEGV-recovery toggle, which cannot resume on that target yet,
-  and resets multiple-values state with a bare leaf call; a counted loop
-  drops from about 1,500 to 1,000 instructions per iteration at T1
-  ([#104](https://github.com/atgreen/evergreen/pull/104)).
-
-- A hot loop in a warm function on ppc64le now hands off from baseline
-  native code into its compiled T2 loop mid-flight instead of finishing at
-  the baseline tier; measured at 78 instead of 978 instructions per
-  iteration ([#114](https://github.com/atgreen/evergreen/pull/114)).
 
 ### Platform support
 
@@ -378,15 +393,6 @@
 - Compiled `TYPEP` now returns exactly one value at every execution tier,
   without leaking secondary values from an earlier form or its argument
   ([#29](https://github.com/atgreen/evergreen/pull/29)).
-
-- The sampled back-edge poll in ppc64le baseline native loops now fires at
-  the configured threshold instead of after about four billion iterations, so
-  a hot loop in a warm function requests T2 compilation and responds to
-  signals and GC safepoints ([#110](https://github.com/atgreen/evergreen/pull/110)).
-- Single-float arithmetic on ppc64le now returns correct values once a
-  function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
-  returned `2.2578125` there while the interpreter and baseline tier were
-  right ([#95](https://github.com/atgreen/evergreen/pull/95)).
 
 ## 0.0.2 - 2026-10-05
 
