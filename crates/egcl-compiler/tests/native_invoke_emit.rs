@@ -189,9 +189,11 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
             .reconstruct(|_| panic!("no unboxed floats"))
             .unwrap()
     );
-    assert_eq!(frames[0].locals.as_slice(), unsafe {
-        std::slice::from_raw_parts(state.expected, state.expected_len)
-    });
+    // At the second call all original locals are dead: only the first call's
+    // result on the operand stack belongs to this continuation. Keep the live
+    // payload/relocation assertions below instead of retaining dead roots.
+    assert_eq!(frames[0].locals.len(), state.expected_len);
+    assert!(frames[0].locals.iter().all(|value| *value == egcl_rt::value::UNBOUND));
     assert_eq!(frames[0].stack.as_slice(), &[*payload]);
     unsafe {
         snapshot.write_back(state.code_base, capture).unwrap();
@@ -307,5 +309,114 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
             );
             assert!(native_transfer::current_segment().is_null());
         }
+    }
+}
+
+unsafe extern "C" fn complete_leaf_guard(request: *mut u8, out: *mut NativeOutcome) {
+    let request = unsafe { &*request.cast::<egcl_compiler::t2::emit::TransferDeoptRequest>() };
+    assert_eq!((request.n_scopes, request.n_words), (1, 5));
+    assert_eq!(
+        unsafe { request.words.add(4).read() },
+        EgclVal::from_single_float(1.5).0
+    );
+    unsafe {
+        out.write(NativeOutcome {
+            value: EgclVal::from_fixnum(42),
+            exit: NativeExit::Returned,
+        });
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
+    use egcl_compiler::t2::frame_state::{FrameScope, FrameState, ValueSource};
+    use egcl_compiler::t2::ir::{
+        AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+    };
+    let mut ir = Function::new("guard-only");
+    let entry = ir.entry();
+    let input = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let state = ir.frame_states.add(FrameState {
+        scopes: vec![FrameScope {
+            function: 0,
+            bcp: 0,
+            locals: vec![ValueSource::Value {
+                value: input,
+                repr: ValueRepresentation::Tagged,
+            }],
+            stack: vec![],
+        }],
+        remat: vec![],
+    });
+    let (_, checked) = ir.push_inst(
+        entry,
+        InstData {
+            opcode: Opcode::Guard,
+            args: vec![input],
+            results: vec![],
+            aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+            flags: InstFlags {
+                effectful: true,
+                guard: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: Some(state),
+            source_pos: 0,
+        },
+        &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+    );
+    ir.set_terminator(
+        entry,
+        InstData {
+            opcode: Opcode::Return,
+            args: vec![checked[0]],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags {
+                terminator: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        },
+    );
+    let veneer =
+        JitBuffer::new(&emit_helper_veneer(complete_leaf_guard, std::ptr::null())).unwrap();
+    let (emitted, _) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_recursion(
+        &ir,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        0,
+        None,
+        Some(veneer.as_ptr() as u64),
+    )
+    .unwrap();
+    assert!(emitted.has_deopt);
+    let code = JitBuffer::new(&emitted.code).unwrap();
+    let stack = EgclStack::new(64 * 1024);
+    for (input, expected) in [
+        (EgclVal::from_fixnum(7), EgclVal::from_fixnum(7)),
+        (EgclVal::from_single_float(1.5), EgclVal::from_fixnum(42)),
+    ] {
+        let mut activation = vec![NIL; 1 + usize::from(emitted.shadow_root_slots)];
+        activation[0] = input;
+        let result = unsafe {
+            native_transfer::invoke_native_segment(
+                code.as_ptr(),
+                activation.as_mut_ptr().cast(),
+                &stack,
+            )
+        }
+        .unwrap();
+        assert_eq!(result.exit, NativeExit::Returned);
+        assert_eq!(result.value, expected);
     }
 }

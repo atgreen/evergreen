@@ -160,9 +160,30 @@ pub struct CheckedSysvSite {
 pub struct SysvTransferTable {
     code_len: usize,
     sites: Vec<CheckedSysvSite>,
+    deopt_returns: Vec<u32>,
 }
 
 impl SysvTransferTable {
+    /// Completed deopts have consumed their logical state. Their failure route
+    /// validates this exact return PC but must not recapture pre-deopt homes.
+    pub fn with_deopt_returns(mut self, mut offsets: Vec<u32>) -> Result<Self, TransferSiteError> {
+        offsets.sort_unstable();
+        for (index, &offset) in offsets.iter().enumerate() {
+            if offset == 0 || offset as usize >= self.code_len {
+                return Err(TransferSiteError::InvalidReturnOffset(offset));
+            }
+            if index > 0 && offsets[index - 1] == offset {
+                return Err(TransferSiteError::DuplicateReturnOffset(offset));
+            }
+        }
+        self.deopt_returns = offsets;
+        Ok(self)
+    }
+
+    pub fn is_deopt_return(&self, code_base: usize, return_pc: usize) -> bool {
+        return_pc.checked_sub(code_base).and_then(|n| u32::try_from(n).ok())
+            .is_some_and(|offset| self.deopt_returns.binary_search(&offset).is_ok())
+    }
     pub fn sites(&self) -> impl Iterator<Item = &CheckedSysvSite> {
         self.sites.iter()
     }
@@ -251,6 +272,7 @@ impl SysvTransferTable {
             }
         }
         Ok(Self {
+            deopt_returns: Vec::new(),
             code_len,
             sites: checked,
         })

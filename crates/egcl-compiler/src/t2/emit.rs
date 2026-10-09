@@ -3041,6 +3041,17 @@ pub struct TransferCallRequest {
     pub activation: *mut egcl_rt::value::EgclVal,
 }
 
+/// Precise guard continuation serialized on the generated stack. The helper
+/// must copy the stream into scanned interpreter slots before any GC or yield.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct TransferDeoptRequest {
+    pub n_scopes: u64,
+    pub n_words: u64,
+    pub words: *const u64,
+    pub activation: *mut egcl_rt::value::EgclVal,
+}
+
 /// A generated self-call owns this record until ordinary return or cold
 /// retirement. Its precise Lisp frame belongs to the same retained code as
 /// its caller; the host-stack links contain no movable Lisp values.
@@ -3074,6 +3085,8 @@ pub struct RecursiveTransfer {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const _: () = {
+    assert!(std::mem::size_of::<TransferDeoptRequest>() == 32);
+    assert!(std::mem::offset_of!(TransferDeoptRequest, activation) == 24);
     assert!(std::mem::size_of::<RecursiveCallRequest>() == 64);
     assert!(std::mem::offset_of!(RecursiveCallRequest, activation) == 32);
     assert!(std::mem::offset_of!(RecursiveActivation, frame) == 8);
@@ -3113,6 +3126,8 @@ struct TransferEmission {
     cleanup: Option<CleanupEmission>,
     poll_veneer: Option<u64>,
     recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    deopt_returns: Vec<u32>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
     catch_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32)>>,
@@ -3150,6 +3165,7 @@ pub fn emit_framed_transfers_with_cleanup(
         cleanup.map(|(save, restore)| CleanupEmission::Normal { save, restore }),
         None,
         None,
+        None,
     )
 }
 
@@ -3180,6 +3196,7 @@ pub fn emit_framed_native_cleanups(
             catch_landing: 0,
             handler_landing: 0,
         }),
+        None,
         None,
         None,
     )
@@ -3239,12 +3256,16 @@ pub fn emit_framed_native_handlers_with_poll(
         handler_landing,
         poll_veneer,
         None,
+        None,
     )
 }
 
 /// Extend mapped segment calls with same-definition native recursion. The
 /// runtime must provide distinct precise activation records and cold retirement
 /// for every admitted recursive frame; the ordinary checked ABI cannot use it.
+/// A deopt veneer admits supported tagged guards and consumes
+/// `TransferDeoptRequest`. It must complete the exact continuation, preserve
+/// the owning frame's extent, and use its own completed-deopt failure route.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 pub fn emit_framed_native_handlers_with_recursion(
@@ -3258,6 +3279,7 @@ pub fn emit_framed_native_handlers_with_recursion(
     handler_landing: u64,
     poll_veneer: u64,
     recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
@@ -3275,6 +3297,7 @@ pub fn emit_framed_native_handlers_with_recursion(
         }),
         (poll_veneer != 0).then_some(poll_veneer),
         recursion,
+        deopt_veneer,
     )
 }
 
@@ -3286,8 +3309,12 @@ fn emit_transfer_function(
     cleanup: Option<CleanupEmission>,
     poll_veneer: Option<u64>,
     recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
+    if deopt_veneer == Some(0) {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
     if cleanup.is_some_and(|helper| match helper {
         CleanupEmission::Normal { save, restore } => save == 0 || restore == 0,
@@ -3358,6 +3385,16 @@ fn emit_transfer_function(
             {
                 return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
             }
+            if deopt_veneer.is_some() && matches!(data.opcode,
+                Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub
+                    | Opcode::FixnumMul | Opcode::FixnumNeg
+                    | Opcode::FixnumCmpEq | Opcode::FixnumCmpLt | Opcode::FixnumCmpLe
+                    | Opcode::FixnumCmpGt | Opcode::FixnumCmpGe
+                    | Opcode::LogAnd | Opcode::LogOr | Opcode::LogXor | Opcode::LogNot
+                    | Opcode::FixnumShl | Opcode::FixnumShr)
+            {
+                continue;
+            }
             if !matches!(
                 f.inst(inst).opcode,
                 Opcode::Invoke
@@ -3384,6 +3421,8 @@ fn emit_transfer_function(
         cleanup,
         poll_veneer,
         recursion,
+        deopt_veneer,
+        deopt_returns: Vec::new(),
         sites: vec![],
         landings: std::collections::HashMap::new(),
         catch_landings: std::collections::HashMap::new(),
@@ -3446,6 +3485,7 @@ fn emit_transfer_function(
         }
     }
     let table = crate::t2::transfer_sites::SysvTransferTable::new(code.code.len(), transfers.sites)
+        .and_then(|table| table.with_deopt_returns(transfers.deopt_returns))
         .and_then(|table| table.with_cleanup_landings(&code.code, &landings))
         .and_then(|table| table.with_catch_landings(&code.code, &catch_landings))
         .and_then(|table| {
@@ -3581,24 +3621,24 @@ fn emit_framed_inner(
                 .is_some_and(|id| f.frame_states.get(id).scopes.len() > 1)
         })
     });
-    // A native poll veneer is also a real Rust call.  It can be inserted into
+    // Native poll and deopt veneers are real Rust calls. They can be inserted into
     // an otherwise call-free loop, so it must participate in both ABI stack
     // alignment and callee-saved allocation.  Omitting it leaves a no-call
     // frame with rsp % 16 == 8 at the generated call site; the veneer then
     // enters Rust misaligned and can corrupt unrelated runtime state.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let has_poll_calls = transfers
+    let has_segment_calls = transfers
         .as_ref()
-        .is_some_and(|transfer| transfer.poll_veneer.is_some());
+        .is_some_and(|transfer| transfer.poll_veneer.is_some() || transfer.deopt_veneer.is_some());
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    let has_poll_calls = false;
+    let has_segment_calls = false;
     // A multi-scope guard calls the reconstruction callback even if the fast
     // path has no ordinary call. Give it the call-capable prologue/register set
     // so the callback is ABI-aligned and every live value survives the call.
     // Checked OSR entries call the precise reconstruction callback on failure,
     // even when the ordinary body contains no calls or guards.
     let has_checked_osr = f.osr_entries.iter().any(|osr| !osr.checks.is_empty());
-    let has_calls = has_ir_calls || has_inlined_scopes || has_poll_calls || has_checked_osr
+    let has_calls = has_ir_calls || has_inlined_scopes || has_segment_calls || has_checked_osr
         || code_id != 0;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
@@ -5381,7 +5421,12 @@ fn emit_framed_inner(
                 srcs.push(s);
             }
         }
-        let alloc = ((n_words * 8) + 15) & !15; // 16-aligned buffer bytes
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let segment_deopt = transfers.as_ref().and_then(|t| t.deopt_veneer);
+        #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+        let segment_deopt: Option<u64> = None;
+        let request_bytes = if segment_deopt.is_some() { 32 } else { 0 };
+        let alloc = ((n_words * 8) + request_bytes + 15) & !15;
 
         a.bind(label);
         #[cfg(all(target_arch = "x86_64", windows))]
@@ -5413,17 +5458,42 @@ fn emit_framed_inner(
                 }
             }
         }
-        // c2i_deopt_t2(n_scopes=rdi, n_words=rsi, buf=rdx, reserved=rcx)
-        mov_imm32(&mut a, 7, fs.scopes.len() as u32);
-        mov_imm32(&mut a, 6, n_words as u32);
-        if let Some(home) = entry_kind_home {
-            load_home(&mut a, 1, home, alloc as i32);
-        } else {
-            mov_imm32(&mut a, 1, 0);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some(veneer) = segment_deopt {
+            let request = (n_words * 8) as i32;
+            mov_imm64(&mut a, RAX, fs.scopes.len() as i64);
+            store_to_rsp(&mut a, RAX, request);
+            mov_imm64(&mut a, RAX, n_words as i64);
+            store_to_rsp(&mut a, RAX, request + 8);
+            mov_rr(&mut a, RAX, 4);
+            store_to_rsp(&mut a, RAX, request + 16);
+            load_home(
+                &mut a,
+                RAX,
+                frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                alloc as i32,
+            );
+            store_to_rsp(&mut a, RAX, request + 24);
+            // lea rdi, [rsp + request]
+            a.extend_from_slice(&[0x48, 0x8D, 0xBC, 0x24]);
+            a.extend_from_slice(&request.to_le_bytes());
+            mov_imm64(&mut a, RAX, veneer as i64);
+            emit_runtime_helper_call(&mut a, 0, None);
+            transfers.as_mut().unwrap().deopt_returns.push(a.here() as u32);
         }
-        mov_rr(&mut a, 2, 4); // mov rdx, rsp
-        mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
-        emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+        if segment_deopt.is_none() {
+            // c2i_deopt_t2(n_scopes=rdi, n_words=rsi, buf=rdx, reserved=rcx)
+            mov_imm32(&mut a, 7, fs.scopes.len() as u32);
+            mov_imm32(&mut a, 6, n_words as u32);
+            if let Some(home) = entry_kind_home {
+                load_home(&mut a, 1, home, alloc as i32);
+            } else {
+                mov_imm32(&mut a, 1, 0);
+            }
+            mov_rr(&mut a, 2, 4); // mov rdx, rsp
+            mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
+            emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+        }
         if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
             a.extend_from_slice(&(alloc as i32).to_le_bytes());

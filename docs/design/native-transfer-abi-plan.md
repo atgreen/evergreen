@@ -1215,7 +1215,27 @@ native-stack bounds select the existing flat-interpreter fallback before a
 child frame is published; a successful fallback returns its value to the
 suspended native caller.
 
-This is an integration increment, not default activation or optimized T2
-completion. Generic arithmetic still uses helper veneers. Bodies with dynamic
-scopes, cross-function segment calls, and speculative deoptimization require
-their corresponding continuation and ownership work before using this route.
+### Optimized segment guards
+
+Scope-free tagged bodies run numeric speculation and the existing mid-end
+before residual calls become `Invoke`. Supported fixnum arithmetic executes
+in native code. Each guard serializes its precise `FrameState` through a
+helper-v2 deoptimization veneer, retaining the exact original bytecode body
+and selected speculation metadata independently of the legacy native registry.
+
+The interpreter resumes the current activation at the guarded instruction.
+Earlier effects are not replayed. It owns that precise frame during resumption;
+on completion or a caught Rust panic, a nonallocating guard restores the full
+original frame extent at the same address. Successful results return through
+the generated epilogue to the suspended native caller. Failed continuations
+use a distinct exact-PC-checked retirement path after Rust returns; they never
+recapture the discarded pre-deopt SSA state. This avoids duplicate logical
+backtrace frames and preserves recursive retirement records.
+
+Repeated guard failures retire only the exact cached segment version. Resumed
+bytecode samples the original body, so the next cache lookup recompiles from
+the changed profile. Unsupported numeric types retain generic calls.
+
+This remains an integration increment. Default activation, optimized guards
+inside dynamic scopes, cross-function segment calls, and the full T1/OSR and
+platform gates still require the corresponding continuation and ownership work.

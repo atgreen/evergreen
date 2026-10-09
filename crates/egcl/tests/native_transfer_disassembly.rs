@@ -47,8 +47,10 @@ fn check_listing(enabled: bool) {
             "segment machine code must be shown: {stdout}"
         );
         assert!(
-            segment.contains("native call veneer"),
-            "helper targets must be identifiable: {stdout}"
+            segment.contains("native precise deopt veneer"),
+            "guard continuation targets must be identifiable: {stdout}"
         );
+        assert!(!segment.contains("native call veneer"),
+            "the arithmetic must compile rather than call the generic helper: {stdout}");
     }
 }
