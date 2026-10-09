@@ -26,7 +26,7 @@ use std::sync::Once;
 /// One suspended native caller, valid for the dynamic extent of the helper
 /// that published it. `owner` is frozen at machine-helper entry, before the
 /// logical CAPTURE context can change; `segment` is the active native anchor
-/// whose `saved_sp`/`landing_pc` end the physical walk.
+/// whose `saved_sp`/`return_pc` end the physical walk.
 pub(super) struct PublishedBoundary {
     pub(super) owner: *const TransferCode,
     pub(super) cursor: NativeFrameCursor,
@@ -35,6 +35,9 @@ pub(super) struct PublishedBoundary {
     pub(super) bounds: Range<usize>,
     pub(super) segment: *mut NativeSegment,
     pub(super) previous: *mut PublishedBoundary,
+    /// Root slots the collector reached through this boundary's own frames.
+    #[cfg(test)]
+    pub(super) visited: Cell<usize>,
 }
 
 // SAFETY: only the owning execution links or unlinks its chain; the collector
@@ -56,13 +59,6 @@ pub(super) fn observe() {
     if let Some(hook) = OBSERVE.with(Cell::get) {
         hook();
     }
-}
-
-#[cfg(test)]
-static VISITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-pub(super) fn take_visited_count() -> usize {
-    VISITED.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Restore the enclosing publication on every exit, including unwinding.
@@ -114,6 +110,8 @@ pub(super) unsafe fn published<R>(
         bounds: (image as usize)..saved_sp,
         segment,
         previous: ACTIVE.with(Cell::get),
+        #[cfg(test)]
+        visited: Cell::new(0),
     };
     debug_assert!(
         boundary.bounds.start < cursor.call_sp && cursor.call_sp <= boundary.bounds.end,
@@ -164,7 +162,11 @@ unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut
         };
         match code._native_calls.value_map(offset) {
             Some(NativeCallValues::Frame(map)) => {
-                unsafe { visit_frame(map, &cursor, step.body_sp, visit) }
+                let visited = unsafe { visit_frame(map, &cursor, step.body_sp, visit) };
+                #[cfg(test)]
+                boundary.visited.set(boundary.visited.get() + visited);
+                #[cfg(not(test))]
+                let _ = visited;
             }
             // T0 owns these roots while the native frame is being replaced.
             Some(NativeCallValues::Deoptimizing { .. } | NativeCallValues::Retired) => {}
@@ -177,16 +179,17 @@ unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut
     }
 }
 
-/// Visit every writable heap-referencing copy at one suspended call. Register
-/// copies resolve through the cursor's inherited save-word addresses; stack
-/// copies are body-RSP relative; activation copies are the managed shadow
-/// slots the stack scan also visits, so relocation stays idempotent.
+/// Visit every writable heap-referencing copy at one suspended call and return
+/// how many slots were visited. Register copies resolve through the cursor's
+/// inherited save-word addresses; stack copies are body-RSP relative;
+/// activation copies are the managed shadow slots the stack scan also visits,
+/// so relocation stays idempotent.
 unsafe fn visit_frame(
     map: &NativeFrameValues,
     cursor: &NativeFrameCursor,
     body_sp: Option<usize>,
     visit: &mut dyn FnMut(*mut EgclVal),
-) {
+) -> usize {
     let layout = map.layout();
     let activation = match (layout.activation_base_slot, body_sp) {
         (Some(slot), Some(body_sp)) => {
@@ -196,6 +199,7 @@ unsafe fn visit_frame(
         }
         _ => None,
     };
+    let mut visited = 0;
     for location in map.gc_locations() {
         let slot = match *location {
             NativeValueLocation::Activation(slot) => match activation {
@@ -220,10 +224,10 @@ unsafe fn visit_frame(
             }
             NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => continue,
         };
-        #[cfg(test)]
-        VISITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        visited += 1;
         visit(slot);
     }
+    visited
 }
 
 #[cfg(test)]
@@ -237,21 +241,44 @@ mod tests {
         args: *const Vec<EgclVal>,
         calls: usize,
         moved: bool,
+        /// Root slots reached through the published chain by the nested collection.
         visited: usize,
+        /// Same-owner native frames the walk crossed before the segment entry.
+        frames: usize,
     }
     thread_local! { static PROBE: Cell<*mut Probe> = const { Cell::new(std::ptr::null_mut()) }; }
 
+    fn probe() -> &'static mut Probe {
+        unsafe { &mut *PROBE.with(Cell::get) }
+    }
+
+    fn read_stack_word(address: usize) -> Option<usize> {
+        Some(unsafe { (address as *const usize).read() })
+    }
+
+    /// Slots visited along the whole chain starting at `boundary`.
+    fn chain_visited(mut boundary: *mut PublishedBoundary) -> usize {
+        let mut total = 0;
+        while !boundary.is_null() {
+            total += unsafe { (*boundary).visited.get() };
+            boundary = unsafe { (*boundary).previous };
+        }
+        total
+    }
+
+    fn force_minor_gc() {
+        egcl_rt::HeapCollector::new().minor_gc().unwrap();
+    }
+
     fn observe() {
-        let probe = unsafe { &mut *PROBE.with(Cell::get) };
+        let probe = probe();
         let publication = ACTIVE.with(Cell::get);
         assert!(!publication.is_null(), "publish before the helper can collect");
         let published = unsafe { &*publication };
         let code = unsafe { &*published.owner };
         let offset = published.cursor.pc - code.code.as_ptr() as usize;
         let step = code._native_calls.unwind(code.code.as_ptr() as usize,
-            &published.cursor, published.bounds.clone(), |address| {
-                Some(unsafe { (address as *const usize).read() })
-            }).unwrap();
+            &published.cursor, published.bounds.clone(), read_stack_word).unwrap();
         assert_eq!(step.caller.call_sp, unsafe { (*published.segment).saved_sp });
         assert_eq!(step.caller.pc, unsafe { (*published.segment).return_pc() });
         probe.calls += 1;
@@ -273,11 +300,10 @@ mod tests {
         let publication = unsafe { &*current };
         assert!(!publication.previous.is_null());
         assert_ne!(publication.segment, unsafe { (*publication.previous).segment });
-        let probe = unsafe { &mut *PROBE.with(Cell::get) };
+        let probe = probe();
         let before = unsafe { (&*probe.args)[0] };
-        take_visited_count();
-        egcl_rt::HeapCollector::new().minor_gc().unwrap();
-        probe.visited += take_visited_count();
+        force_minor_gc();
+        probe.visited += chain_visited(current);
         let after = unsafe { (&*probe.args)[0] };
         probe.moved |= before != after;
     }
@@ -295,7 +321,7 @@ mod tests {
         let body = Arc::new(compile_function("PUBLICATION-REENTRY", *params, *forms, &env, false, false).unwrap());
         let code = TransferCode::compile(body).unwrap();
         egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0 };
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
         PROBE.with(|slot| slot.set(&mut probe));
         assert!(ACTIVE.with(Cell::get).is_null());
         OBSERVE.with(|slot| slot.set(Some(observe)));
@@ -306,6 +332,140 @@ mod tests {
         assert!(probe.calls > 0, "the compiled loop must enter a published poll");
         assert!(probe.moved, "the nested collection must relocate a live input");
         assert!(probe.visited > 0, "the collection must reach roots through the published chain");
+        assert_eq!(value, args[0]);
+    }
+
+    const RECURSION_DEPTH: usize = 6;
+
+    /// At each recursive preparation, every enclosing activation is a native
+    /// frame of the same owner. The walk must cross each one through an exact
+    /// map and stop only at the segment entry; the deepest preparation crosses
+    /// one frame per activation.
+    fn observe_recursion() {
+        let probe = probe();
+        let publication = ACTIVE.with(Cell::get);
+        let published = unsafe { &*publication };
+        assert!(published.previous.is_null(), "native self-calls publish no Rust frame");
+        let code = unsafe { &*published.owner };
+        let base = code.code.as_ptr() as usize;
+        let segment = unsafe { &*published.segment };
+        let mut cursor = published.cursor;
+        let mut frames = 0;
+        loop {
+            let offset = cursor.pc - base;
+            assert!(offset < code.code_len, "every crossed PC stays inside the owner");
+            assert!(matches!(code._native_calls.value_map(offset),
+                Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(_))),
+                "exact value map at crossed frame {frames}");
+            let step = code._native_calls.unwind(base, &cursor, published.bounds.clone(), read_stack_word)
+                .unwrap_or_else(|| panic!("exact unwind recipe at crossed frame {frames}"));
+            frames += 1;
+            if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
+                break;
+            }
+            assert!(frames <= RECURSION_DEPTH + 1, "the walk must end at the segment entry");
+            cursor = step.caller;
+        }
+        probe.frames = probe.frames.max(frames);
+        force_minor_gc();
+        probe.visited += chain_visited(publication);
+        probe.calls += 1;
+    }
+
+    #[test]
+    fn published_chain_crosses_direct_recursion_to_the_segment_entry() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let name = "PUBLICATION-RECURSION";
+        // The base case stays scope-free so direct recursion is admitted; the
+        // published recursive preparation is where the hook observes the chain.
+        let form = "(if (= n 0) x (progn (PUBLICATION-RECURSION (- n 1) x) (car x)))";
+        crate::cli::read_eval_all_env(&format!("(defun {name} (n x) {form})"), &mut env).unwrap();
+        egcl_rt::rooted!(params = reader::read_from_string("(n x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(&format!("({form})")).unwrap().0);
+        let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+        let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
+        crate::cli::bytecode::registry_put(symbol, Arc::clone(&body));
+        let code = TransferCode::compile(Arc::clone(&body)).expect("admit recursive source body");
+        egcl_rt::rooted!(args = vec![
+            EgclVal::from_fixnum(RECURSION_DEPTH as i64),
+            crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL),
+        ]);
+        let old_pointer = args[1].to_raw();
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
+        PROBE.with(|slot| slot.set(&mut probe));
+        take_recursive_entries();
+        OBSERVE.with(|slot| slot.set(Some(observe_recursion)));
+        let value = code.run(&args, &mut env);
+        OBSERVE.with(|slot| slot.set(None));
+        PROBE.with(|slot| slot.set(std::ptr::null_mut()));
+        assert_eq!(take_recursive_entries(), RECURSION_DEPTH, "all recursive calls entered native code");
+        assert!(ACTIVE.with(Cell::get).is_null());
+        assert_eq!(probe.calls, RECURSION_DEPTH, "every recursive call runs its published preparation");
+        assert_eq!(probe.frames, RECURSION_DEPTH, "one native frame per preparing activation, then the segment");
+        assert!(probe.visited > 0, "the collection must reach roots through the recursive chain");
+        assert_ne!(args[1].to_raw(), old_pointer, "the suspended callers' heap value actually moved");
+        assert_eq!(crate::cli::cp(args[1]), (EgclVal::from_fixnum(42), NIL));
+        assert_eq!(value.unwrap(), EgclVal::from_fixnum(42));
+    }
+
+    /// A publication the walker cannot trust must end its chain without
+    /// dereferencing anything, while the real chain keeps working.
+    fn observe_malformed() {
+        let probe = probe();
+        let real = ACTIVE.with(Cell::get);
+        let published = unsafe { &*real };
+        let code = unsafe { &*published.owner };
+        let malformed = |owner, pc, bounds| PublishedBoundary {
+            owner,
+            cursor: NativeFrameCursor { pc, ..published.cursor },
+            bounds,
+            segment: published.segment,
+            previous: std::ptr::null_mut(),
+            visited: Cell::new(0),
+        };
+        let past_the_code = code.code.as_ptr() as usize + code.code_len;
+        let mut cases = [
+            ("PC outside the owner", malformed(published.owner, past_the_code, published.bounds.clone())),
+            ("empty stack bounds", malformed(published.owner, published.cursor.pc, 0..0)),
+            ("no owner", malformed(std::ptr::null(), published.cursor.pc, published.bounds.clone())),
+        ];
+        for (label, boundary) in &mut cases {
+            ACTIVE.with(|slot| slot.set(boundary));
+            force_minor_gc();
+            ACTIVE.with(|slot| slot.set(real));
+            assert_eq!(boundary.visited.get(), 0, "{label}: the walk must stop without guessing");
+        }
+        force_minor_gc();
+        assert!(published.visited.get() > 0, "the real publication still reaches its roots");
+        probe.visited += published.visited.get();
+        probe.calls += 1;
+    }
+
+    #[test]
+    fn malformed_publications_end_the_walk_without_dereferencing() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(
+            "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
+        ).unwrap().0);
+        let body = Arc::new(compile_function("PUBLICATION-MALFORMED", *params, *forms, &env, false, false).unwrap());
+        let code = TransferCode::compile(body).unwrap();
+        egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
+        PROBE.with(|slot| slot.set(&mut probe));
+        OBSERVE.with(|slot| slot.set(Some(observe_malformed)));
+        let value = code.run(&args, &mut env).unwrap();
+        OBSERVE.with(|slot| slot.set(None));
+        PROBE.with(|slot| slot.set(std::ptr::null_mut()));
+        assert!(ACTIVE.with(Cell::get).is_null());
+        assert!(probe.calls > 0, "the compiled loop must enter a published poll");
+        assert!(probe.visited > 0);
         assert_eq!(value, args[0]);
     }
 }
