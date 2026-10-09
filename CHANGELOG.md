@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reduce native builtin-call return overhead by returning successful values
+  without copying error payloads, while preserving error and panic recovery.
+  This reduces full Prechelt phone-encoding time by about 4% in the measured
+  x86-64 workload
+  ([#152](https://github.com/atgreen/evergreen/pull/152)).
+
 - Read simple-string characters and lengths directly from their fixed-width
   storage, avoiding registry lookups and temporary string copies on these
   paths, including registered strings. This reduces full Prechelt
