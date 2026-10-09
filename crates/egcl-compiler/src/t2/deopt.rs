@@ -507,7 +507,7 @@ mod tests {
         let mut mf = MachFunc::default();
         mf.stack_maps.push(StackMap {
             code_offset: 0x10,
-            live_refs: vec![],
+            values: vec![],
             frame_state: Some(FrameStateId(0)),
         });
 

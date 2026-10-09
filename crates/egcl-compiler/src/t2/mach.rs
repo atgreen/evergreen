@@ -45,9 +45,10 @@
 //!   Diagnostics and tests only; wrong for any split value.
 //! * `stack_maps` — one [`StackMap`] per `safepoint` instruction, whose
 //!   `code_offset` is the **instruction index** (native offsets do not exist
-//!   until emission), `live_refs` the locations of that instruction's GPR-class
-//!   uses, and `frame_state` its deopt state. Consumed by deopt.rs and
-//!   transfer_map.rs by index; no backend hands `live_refs` to the collector.
+//!   until emission), `values` its typed live values before the instruction,
+//!   and `frame_state` its deopt state. `live_refs()` selects tagged candidates.
+//!   Late deopt operands are a separate phase. Emitters must resolve final
+//!   homes and PCs before using these records for GC or DWARF publication.
 //!
 //! # Register and location model
 //!
@@ -65,6 +66,8 @@
 //! instruction's own writes without adding register pressure (bliss-ad1e).
 
 use crate::t2::frame_state::FrameStateId;
+use crate::t2::ir::ValueRepresentation;
+use std::collections::HashMap;
 
 /// Register class. Tagged values, unboxed integers, and pointers live in GPRs;
 /// unboxed floats live in the target's floating-point registers. `Xmm` is the
@@ -132,6 +135,12 @@ pub struct ValueLocationRange {
     pub location: Location,
 }
 
+impl ValueLocationRange {
+    pub fn contains(&self, point: u32) -> bool {
+        self.start <= point && point < self.end
+    }
+}
+
 /// A machine instruction over virtual (pre-regalloc) or physical (post-regalloc)
 /// operands. The opcode set is defined by `lower::op`; this is the envelope the
 /// allocator and the emitters bind to.
@@ -194,6 +203,9 @@ pub struct MachSucc {
 #[derive(Clone, Debug, Default)]
 pub struct MachFunc {
     pub insts: Vec<MachInst>,
+    /// Explicit machine representation for every VReg. GPR class alone cannot
+    /// distinguish a tagged reference candidate from an unboxed integer.
+    pub value_reprs: HashMap<VReg, ValueRepresentation>,
     /// The block CFG over `insts`; `blocks[0]` is the entry. Populated by
     /// lowering. Empty means "not block-structured" (a straight-line
     /// single-block view over `insts` is the allocator's fallback in that case).
@@ -217,17 +229,56 @@ pub struct MachFunc {
     pub stack_maps: Vec<StackMap>,
 }
 
-/// A GC stack map at one safepoint: which locations hold live tagged pointers,
-/// plus the FrameState whose location bindings deopt resolves from it.
+/// Typed value locations before one safepoint instruction, after Before edits.
+/// GC candidates are the tagged subset; deopt retains separate late operands.
 #[derive(Clone, Debug)]
 pub struct StackMap {
     /// Index of the safepoint instruction in `MachFunc::insts`. Native offsets
     /// are not known until emission; consumers match maps to instructions by
     /// this index.
     pub code_offset: u32,
-    /// Locations holding live GC references at this point.
-    pub live_refs: Vec<Location>,
+    /// Values live immediately before the instruction, after its Before edits.
+    /// Includes dead-after-call arguments, excludes late result definitions.
+    /// These are allocator locations; emitters must resolve their final homes
+    /// and native PCs before publication to GC or DWARF consumers.
+    pub values: Vec<AllocatedValue>,
     /// The deopt frame state resolved to concrete locations, if this is a
     /// deopt point.
     pub frame_state: Option<FrameStateId>,
+}
+
+/// One typed SSA value at a physical allocator location. Multiple locations for
+/// one value represent copies that are simultaneously available at this point.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AllocatedValue {
+    pub vreg: VReg,
+    pub repr: ValueRepresentation,
+    pub location: Location,
+}
+
+impl StackMap {
+    /// Tagged words are reference candidates; the runtime still checks their
+    /// EgclVal tags. Unboxed integers and floats must never be scanned as roots.
+    pub fn live_refs(&self) -> impl Iterator<Item = &AllocatedValue> {
+        self.values
+            .iter()
+            .filter(|value| value.repr == ValueRepresentation::Tagged)
+    }
+}
+
+impl MachFunc {
+    /// Allocator homes at a precise instruction phase. These are not yet native
+    /// PCs or final emitter homes; both GC and debug emission must resolve them.
+    pub fn locations_at(
+        &self,
+        vreg: VReg,
+        inst: usize,
+        position: EditPosition,
+    ) -> impl Iterator<Item = Location> + '_ {
+        let point = inst as u32 * 2 + u32::from(position == EditPosition::After);
+        self.value_locations
+            .iter()
+            .filter(move |range| range.vreg == vreg && range.contains(point))
+            .map(|range| range.location)
+    }
 }
