@@ -187,6 +187,123 @@ pub(super) unsafe extern "C" fn prepare_completed_deopt(capture: *mut SysvTransf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CACHE_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+    static CACHE_ROOTS: std::sync::Mutex<Vec<std::sync::Weak<ActiveBytecodeRoot>>> =
+        std::sync::Mutex::new(Vec::new());
+
+    fn cache_fiber() -> EgclVal {
+        // Keep an assertion failure inside Rust rather than crossing the
+        // scheduler's non-unwinding machine trampoline.
+        std::panic::catch_unwind(cache_fiber_checked).unwrap_or(EgclVal::from_fixnum(0))
+    }
+
+    fn cache_fiber_checked() -> EgclVal {
+        assert!(
+            SEGMENT_CACHE.with(|cache| cache.borrow().is_empty()),
+            "a new fiber must not inherit another execution's code cache"
+        );
+        let mut env = Env::new_impl(false, false, false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string("((+ x 1))").unwrap().0);
+        let body = Arc::new(
+            compile_function(
+                "MIGRATING-SEGMENT-CACHE",
+                *params,
+                *forms,
+                &env,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+        let old = cached_code(&body).expect("optimized segment");
+        assert!(old.has_deopt);
+        for _ in 0..200 {
+            let carrier = egcl_rt::current_thread_id();
+            egcl_rt::thread::fiber_yield().unwrap();
+            if carrier != egcl_rt::current_thread_id() {
+                CACHE_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            let selected = cached_code(&body).unwrap();
+            assert!(
+                Rc::ptr_eq(&old, &selected),
+                "migration changed the retained code version"
+            );
+            assert_eq!(
+                SEGMENT_CACHE.with(|cache| cache.borrow().len()),
+                1,
+                "other fibers must own separate caches"
+            );
+        }
+        let argument = EgclVal::from_single_float(1.5);
+        for _ in 0..deopt_blacklist_threshold() {
+            assert_eq!(
+                old.run(&[argument], &mut env).unwrap(),
+                EgclVal::from_single_float(2.5)
+            );
+        }
+        assert!(
+            old.recompile.get(),
+            "migrated deopts must update the owning cache version"
+        );
+        let replacement = cached_code(&body).unwrap();
+        assert!(!Rc::ptr_eq(&old, &replacement));
+        assert_eq!(
+            replacement.run(&[argument], &mut env).unwrap(),
+            EgclVal::from_single_float(2.5)
+        );
+        assert_eq!(replacement.deopt_count(), 0);
+        assert_eq!(
+            old.run(&[argument], &mut env).unwrap(),
+            EgclVal::from_single_float(2.5)
+        );
+        assert!(
+            !replacement.recompile.get(),
+            "old code must not retire its replacement"
+        );
+        // Only atomic weak root tokens cross executions, never the code's Rc.
+        CACHE_ROOTS.lock().unwrap().extend([
+            Arc::downgrade(&old._body_roots),
+            Arc::downgrade(&replacement._body_roots),
+        ]);
+        EgclVal::from_fixnum(1)
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn native_v2_segment_cache_follows_fiber_and_retires_exact_version() {
+        let _lock = super::super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(egcl_rt::native_transfer::is_supported());
+        let mut startup = Env::new(false);
+        egcl_rt::rooted_ref!(_startup = &mut startup);
+        for num_workers in [1, 4] {
+            CACHE_MIGRATIONS.store(0, Ordering::Relaxed);
+            let group =
+                egcl_rt::SchedulerGroup::init(&egcl_rt::SchedulerConfig { num_workers }).unwrap();
+            for _ in 0..12 {
+                let entry = unsafe { EgclVal::from_function_ptr(cache_fiber as *const () as *mut u8) };
+                group
+                    .submit(egcl_rt::thread::make_fiber(entry).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(1); 12]);
+            let roots = std::mem::take(&mut *CACHE_ROOTS.lock().unwrap());
+            assert_eq!(roots.len(), 24);
+            assert!(roots.iter().all(|root| root.upgrade().is_none()),
+                "stopped fibers must release cached code and its root ownership");
+            if num_workers == 4 {
+                assert!(
+                    CACHE_MIGRATIONS.load(Ordering::Relaxed) > 0,
+                    "probe must actually migrate across workers"
+                );
+            }
+        }
+    }
 
     #[test]
     fn native_v2_deopt_restores_frame_extent_after_caught_panic() {

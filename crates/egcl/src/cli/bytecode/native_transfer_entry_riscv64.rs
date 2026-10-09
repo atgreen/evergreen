@@ -19,10 +19,14 @@ use egcl_compiler::t2::emit_riscv64::{RuntimeCalls, emit_framed_with_runtime};
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer;
 
-thread_local! {
-    static SEGMENT_CACHE: RefCell<std::collections::HashMap<usize, Option<std::rc::Rc<Riscv64Code>>>> =
-        RefCell::new(std::collections::HashMap::new());
-}
+// SAFETY: code owners and their non-Send feedback belong only to this Lisp
+// execution. The slot follows its fiber across carriers and is retired only
+// after that execution stops; no Rc is published to another execution.
+static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashMap<usize, Option<std::rc::Rc<Riscv64Code>>>>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashMap::new()))
+};
 
 struct Riscv64Code {
     body: std::sync::Arc<BytecodeFunction>,

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep native segment code and deoptimization feedback with each Lisp execution
+  across fiber migration, and release their retained roots when it stops
+  ([#160](https://github.com/atgreen/evergreen/pull/160)).
+
 - Validate suspended native continuations before a fiber resumes on another
   worker, preserving live frames and GC roots when that worker is incompatible.
   Preserve all values returned by ordinary and interactive restart invocation
