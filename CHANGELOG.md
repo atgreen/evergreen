@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reduce runtime setup for cached native builtin calls, preserving multiple
+  values, function replacement, and error handling. This reduces full Prechelt
+  phone-encoding time by about 6% in the measured x86-64 workload. Prevent
+  unused native argument registers from being scanned as GC roots
+  ([#150](https://github.com/atgreen/evergreen/pull/150)).
+
 - Retain multiple native `FUNCALL` targets on x86-64 so nested callbacks avoid
   repeatedly resolving each other. Cached identities remain weak and are
   invalidated together after GC or native code replacement. This reduces full
