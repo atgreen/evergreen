@@ -3,7 +3,7 @@
 
 //! Tests for egcl-stdlib hashtable module.
 
-use egcl_rt::value::{NIL, T, EgclVal};
+use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_stdlib::hashtable::*;
 
 // ── HashTest enum ─────────────────────────────────────────────────
@@ -504,5 +504,36 @@ fn make_hash_table_invalid_rehash_threshold() {
             "rehash_threshold={} should error",
             bad
         );
+    }
+}
+
+#[test]
+fn equalp_signed_zero_keys_share_an_entry() {
+    let zeros = [
+        EgclVal::from_fixnum(0),
+        EgclVal::from_single_float(0.0),
+        EgclVal::from_single_float(-0.0),
+    ];
+    for size in [128, 8192] {
+        for inserted in zeros {
+            let table = make_hash_table(&MakeHashTableOptions {
+                test: HashTest::Equalp,
+                size,
+                ..Default::default()
+            })
+            .unwrap();
+            set_gethash(inserted, table, EgclVal::from_fixnum(42)).unwrap();
+            for queried in zeros {
+                assert_eq!(
+                    gethash(queried, table, NIL).unwrap(),
+                    (EgclVal::from_fixnum(42), true),
+                    "size={size} inserted={inserted:?} queried={queried:?}"
+                );
+                set_gethash(queried, table, EgclVal::from_fixnum(42)).unwrap();
+                assert_eq!(hash_table_count(table).unwrap(), 1);
+            }
+            assert!(remhash(EgclVal::from_single_float(-0.0), table).unwrap());
+            assert_eq!(hash_table_count(table).unwrap(), 0);
+        }
     }
 }

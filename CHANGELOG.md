@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix `EQUALP` hash-table lookup, replacement, and removal across integer zero
+  and positive or negative single-float zero
+  ([#154](https://github.com/atgreen/evergreen/pull/154)).
+
 - Reduce name-resolution and allocation overhead when native closures access
   captured variables, preserving shadowing, redefinition, and image restoration.
   This reduces full Prechelt phone-encoding time by about 2% in the measured
