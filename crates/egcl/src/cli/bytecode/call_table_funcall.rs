@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Native FUNCALL dispatch. The last callable is a weak, execution-local cache;
+//! Native FUNCALL dispatch. Recent callables form a weak, execution-local cache;
 //! compiled entries are shared by code version rather than closure instance.
 //! A bounded set of recent code versions (and their constants) is retained
 //! strongly, along with active versions. Cached identity never roots an instance.
@@ -9,9 +9,22 @@ use super::call_table_native::{NativeEntry, immediate, memory};
 use super::*;
 use std::cell::Cell;
 
-pub(super) struct Cache {
+struct CachedCallable {
     function: Cell<u64>,
     target: [Cell<usize>; 2],
+}
+
+impl CachedCallable {
+    fn clear(&self) {
+        self.function.set(NIL.0);
+        self.target.iter().for_each(|target| target.set(0));
+    }
+}
+
+pub(super) struct Cache {
+    callables: [CachedCallable; 4],
+    next_callable: usize,
+    revision: Option<u64>,
     dispatch: Vec<egcl_rt::jit::JitBuffer>,
     #[allow(clippy::vec_box)] // native code embeds stable descriptor addresses
     versions: Vec<Box<NativeEntry>>,
@@ -20,8 +33,12 @@ pub(super) struct Cache {
 impl Cache {
     pub(super) fn new(fallback: [usize; 2]) -> Option<Box<Self>> {
         let mut cache = Box::new(Self {
-            function: Cell::new(NIL.0),
-            target: std::array::from_fn(|_| Cell::new(0)),
+            callables: std::array::from_fn(|_| CachedCallable {
+                function: Cell::new(NIL.0),
+                target: std::array::from_fn(|_| Cell::new(0)),
+            }),
+            next_callable: 0,
+            revision: None,
             dispatch: Vec::new(),
             versions: Vec::new(),
         });
@@ -31,25 +48,33 @@ impl Cache {
             // rdi=FUNCALL cell, rsi=count including designator, rdx=arg0/slice.
             a.extend_from_slice(&[0x48, 0x85, 0xf6]); // test rsi,rsi
             a.jcc(Cc::E, slow);
-            immediate(&mut a, 11, cache.target[usize::from(slice)].as_ptr() as u64);
-            memory(&mut a, 0x8b, 11, 11, 0);
-            a.extend_from_slice(&[0x4d, 0x85, 0xdb]); // test r11,r11
-            a.jcc(Cc::E, slow);
             if slice {
                 memory(&mut a, 0x8b, 0, 2, 0);
             } else {
                 a.extend_from_slice(&[0x48, 0x89, 0xd0]);
             } // mov rax,rdx
-            immediate(&mut a, 10, cache.function.as_ptr() as u64);
-            memory(&mut a, 0x3b, 0, 10, 0); // cmp rax,[r10]
-            a.jcc(Cc::Ne, slow);
-            a.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xff, 0xce]); // function->rdi; dec rsi
-            if slice {
-                a.extend_from_slice(&[0x48, 0x83, 0xc2, 8]); // skip designator in slice
-            } else {
-                a.extend_from_slice(&[0x48, 0x89, 0xca, 0x4c, 0x89, 0xc1]); // rcx->rdx; r8->rcx
+            for callable in &cache.callables {
+                let next = a.label();
+                immediate(&mut a, 10, callable.function.as_ptr() as u64);
+                memory(&mut a, 0x3b, 0, 10, 0); // cmp rax,[r10]
+                a.jcc(Cc::Ne, next);
+                immediate(
+                    &mut a,
+                    11,
+                    callable.target[usize::from(slice)].as_ptr() as u64,
+                );
+                memory(&mut a, 0x8b, 11, 11, 0);
+                a.extend_from_slice(&[0x4d, 0x85, 0xdb]); // test r11,r11
+                a.jcc(Cc::E, next);
+                a.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xff, 0xce]); // function->rdi; dec rsi
+                if slice {
+                    a.extend_from_slice(&[0x48, 0x83, 0xc2, 8]); // skip designator in slice
+                } else {
+                    a.extend_from_slice(&[0x48, 0x89, 0xca, 0x4c, 0x89, 0xc1]); // rcx->rdx; r8->rcx
+                }
+                a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11: native callback entry
+                a.bind(next);
             }
-            a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11: native callback entry
             a.bind(slow);
             immediate(&mut a, 0, fallback as u64);
             a.extend_from_slice(&[0xff, 0xe0]);
@@ -64,8 +89,24 @@ impl Cache {
         std::array::from_fn(|i| self.dispatch[i].as_ptr() as usize)
     }
 
+    pub(super) fn synchronize_revision(&mut self, revision: u64) {
+        if self.revision != Some(revision) {
+            // An invalidated global FUNCALL cell may be refilled by any of its
+            // callers. No identity from the previous revision may survive that
+            // refill, even if its callable was not the one used on this miss.
+            self.clear_callables();
+            self.revision = Some(revision);
+        }
+    }
+
     pub(super) fn select(&mut self, function: EgclVal) -> bool {
-        self.target.iter().for_each(|target| target.set(0));
+        let previous = self
+            .callables
+            .iter()
+            .position(|slot| slot.function.get() == function.0);
+        if let Some(index) = previous {
+            self.callables[index].clear();
+        }
         if !egcl_rt::function::is_interpreted_function(function) {
             return false;
         }
@@ -111,8 +152,14 @@ impl Cache {
             self.versions.push(version);
             entries
         };
-        self.function.set(function.0);
-        for (target, entry) in self.target.iter().zip(entries) {
+        let index = previous.unwrap_or_else(|| {
+            let index = self.next_callable;
+            self.next_callable = (index + 1) % self.callables.len();
+            index
+        });
+        let callable = &self.callables[index];
+        callable.function.set(function.0);
+        for (target, entry) in callable.target.iter().zip(entries) {
             target.set(entry);
         }
         self.trim();
@@ -122,9 +169,13 @@ impl Cache {
     pub(super) fn scan(&mut self) {
         // Function objects are pinned, but collectable. Never retain one merely
         // because a call site last used it. Its active frame is its strong root.
-        self.function.set(NIL.0);
-        self.target.iter().for_each(|target| target.set(0));
+        self.clear_callables();
         self.trim();
+    }
+
+    fn clear_callables(&mut self) {
+        self.callables.iter().for_each(CachedCallable::clear);
+        self.next_callable = 0;
     }
 
     fn trim(&mut self) {
@@ -142,6 +193,12 @@ impl Cache {
                 true
             } else {
                 idle -= 1;
+                let entries = version.entries();
+                for callable in &self.callables {
+                    if callable.target[0].get() == entries[0] {
+                        callable.clear();
+                    }
+                }
                 false
             }
         });

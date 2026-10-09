@@ -100,3 +100,27 @@ fn callback_redefinition_of_funcall_cannot_publish_a_stale_dispatcher() {
       (format t "NATIVE-FUNCALL-OK~%")
     "#);
 }
+
+#[test]
+fn alternating_callback_identities_preserve_captures_across_abis_and_gc() {
+    run(r#"
+      (defun alternating-call-one (f a) (funcall f a))
+      (defun alternating-call-four (f a b c d) (funcall f a b c d))
+      (defun make-alternating-callback (seed)
+        (lambda (&optional (a 0) (b 0) (c 0) (d 0))
+          (values (+ seed a b c d) seed)))
+      (let ((callbacks (loop for seed below 12 collect (make-alternating-callback seed))))
+        (dotimes (round 40)
+          (let ((seed 0))
+            (dolist (f callbacks)
+              (multiple-value-bind (value capture) (alternating-call-one f 5)
+                (assert (= value (+ seed 5))) (assert (= capture seed)))
+              (multiple-value-bind (value capture) (alternating-call-four f 1 2 3 4)
+                (assert (= value (+ seed 10))) (assert (= capture seed)))
+              (incf seed)))
+          (when (= (mod round 7) 0) (egcl-ext:gc :full t))))
+      (assert (= 2 (egcl-ext:function-tier 'alternating-call-one)))
+      (assert (= 2 (egcl-ext:function-tier 'alternating-call-four)))
+      (format t "NATIVE-FUNCALL-OK~%")
+    "#);
+}

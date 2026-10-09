@@ -215,6 +215,7 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         }
         if let Some(cache) = cache.as_mut() {
             *state.target.borrow_mut() = None;
+            cache.synchronize_revision(revision);
             cache.select(args[0]);
             let entries = cache.entries();
             linkage::publish(&state.cell, revision, entries[0], entries[1]);
@@ -538,6 +539,83 @@ mod tests {
     #[test]
     fn captured_native_funcall_does_not_resolve_the_callback_on_warm_calls() {
         check_native_funcall(true);
+    }
+
+    #[test]
+    fn nested_native_funcall_keeps_all_warmed_callback_identities() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        for (name, expression) in [
+            ("PIC-LEAF", "(+ x 1)"),
+            ("PIC-MIDDLE", "(funcall #'pic-leaf x)"),
+            ("PIC-OUTER", "(funcall #'pic-middle x)"),
+            ("PIC-INDEPENDENT", "(+ x 2)"),
+        ] {
+            super::super::super::read_eval_all_env(
+                &format!("(defun {name} (x) {expression})"), &mut env,
+            ).unwrap();
+            let symbol = egcl_rt::symbols::intern(name);
+            egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+            egcl_rt::rooted!(form = reader::read_from_string(&format!("({expression})")).unwrap().0);
+            registry_put(symbol, Arc::new(compile_function(name, *params, *form, &env, false, false).unwrap()));
+            let input = snapshot_t2_input(symbol, 0).unwrap();
+            let generation = input.generation;
+            let input = egcl_rt::CrossThreadRoot::new(input);
+            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+            assert!(install_t2_completion(T2Completion {
+                sym: symbol, generation, artifact: Some(artifact), input,
+            }).unwrap().is_t2);
+        }
+        let cell = resolve(egcl_rt::symbols::intern("FUNCALL")).unwrap();
+        let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+        egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-OUTER")).unwrap());
+        egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
+        struct RestoreEnv(*mut Env);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) { NATIVE_ENV.with(|slot| slot.set(self.0)); }
+        }
+        let _restore = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut env)));
+        for _ in 0..3 { assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42)); }
+        TARGET_LOOKUPS.with(|count| count.set(0));
+        for _ in 0..100 {
+            let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
+            assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
+        }
+        assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
+            "nested callbacks must not evict each other's warmed native identity");
+        let symbol = egcl_rt::symbols::intern("PIC-LEAF");
+        let input = snapshot_t2_input(symbol, 0).unwrap();
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+        install_t2_completion(T2Completion {
+            sym: symbol, generation, artifact: Some(artifact), input,
+        }).unwrap();
+        args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap();
+        assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(43));
+        args[0] = egcl_rt::symbols::symbol_function(symbol).unwrap();
+        TARGET_LOOKUPS.with(|count| count.set(0));
+        let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+        let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
+        assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
+        assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
+            "republication must invalidate every identity, even when another callback refills first");
+        args[0] = *function;
+        assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
+        egcl_rt::gc::full_gc().unwrap();
+        for name in ["PIC-LEAF", "PIC-MIDDLE", "PIC-OUTER"] {
+            args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern(name)).unwrap();
+            TARGET_LOOKUPS.with(|count| count.set(0));
+            let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
+            assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
+            assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
+                "GC must clear every weak callable identity: {name}");
+        }
     }
 
     fn check_native_funcall(captured: bool) {
