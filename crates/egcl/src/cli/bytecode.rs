@@ -22504,8 +22504,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         .map(|(symbol, cell)| egcl_compiler::t2::emit::NamedCallTarget {
             symbol: *symbol,
             cell_address: Arc::as_ptr(cell) as u64,
-            register_entry: cell.entry_address(false) as u64,
-            slice_entry: cell.entry_address(true) as u64,
+            register_entry: cell.checked_entry_address(false) as u64,
+            slice_entry: cell.checked_entry_address(true) as u64,
         })
         .collect();
     let framed = match egcl_compiler::t2::emit::emit_framed_with_direct_natives(

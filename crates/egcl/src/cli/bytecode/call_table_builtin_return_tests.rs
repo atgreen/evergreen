@@ -29,7 +29,7 @@ fn builtin_entry_preserves_errors_contains_panics_and_recovers() {
         *state.target.borrow(),
         Some(Target::Builtin { .. })
     ));
-    let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+    let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
     let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
         unsafe { std::mem::transmute(entry) };
     assert!(!native_error_pending());

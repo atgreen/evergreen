@@ -30,6 +30,13 @@ fn native_v2_named_calls_use_live_call_cells() {
     let code = TransferCode::compile(body).expect("mapped named caller");
     let symbol = egcl_rt::symbols::intern("NATIVE-CELL-LEAF");
     let cell = call_table::resolve(symbol).unwrap();
+    let published = native_transfer_entry::published_entries().unwrap();
+    for (index, slice) in [false, true].into_iter().enumerate() {
+        let entry = unsafe { &*cell.entry_address(slice) }
+            .load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(entry, published[index], "cold cells expose the native contract");
+        assert_ne!(cell.entry_address(slice), cell.checked_entry_address(slice));
+    }
     assert!(cell.is_cold());
     assert_eq!(
         code.run(&[EgclVal::from_fixnum(41)], &mut env).unwrap(),

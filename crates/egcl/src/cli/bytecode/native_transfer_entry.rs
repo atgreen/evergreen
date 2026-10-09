@@ -14,7 +14,7 @@ use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
-    emit_capture_stub, emit_helper_veneer, emit_legacy_cell_veneer, emit_native_landing_stub, SysvNativeLanding,
+    emit_capture_stub, emit_helper_veneer, emit_native_landing_stub, SysvNativeLanding,
     SysvTransferCapture,
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
@@ -177,7 +177,6 @@ pub(super) struct TransferCode {
     pub(super) has_deopt: bool,
     _veneer: JitBuffer,
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
-    _legacy_entries: Vec<JitBuffer>,
     _capture: JitBuffer,
     _poll: JitBuffer,
     _completion: JitBuffer,
@@ -359,10 +358,27 @@ pub(super) fn take_segment_run_count() -> u64 {
     SEGMENT_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
-// This is the legacy boundary's status conversion, not an asynchronous poll.
-// It runs after all checked callees returned and cannot allocate or alter MV.
-extern "C" fn legacy_cell_transfer_pending() -> u64 {
-    u64::from(native_error_pending())
+/// These mappings outlive every target and caller. Child retirement can drop
+/// the last target owner without releasing its own return/continuation PC.
+pub(super) fn published_entries() -> Option<[usize; 2]> {
+    static ENTRIES: OnceLock<Option<[JitBuffer; 2]>> = OnceLock::new();
+    ENTRIES
+        .get_or_init(|| {
+            let entry = |slice| {
+                JitBuffer::new(
+                    &egcl_compiler::t2::native_transfer::emit_published_call_entry(
+                        slice,
+                        prepare_nested,
+                        finish_nested,
+                        resume_nested,
+                        call_table::checked_call,
+                    ),
+                )
+            };
+            Some([entry(false)?, entry(true)?])
+        })
+        .as_ref()
+        .map(|entries| std::array::from_fn(|i| entries[i].as_ptr() as usize))
 }
 
 #[cfg(test)]
@@ -491,31 +507,20 @@ impl TransferCode {
         };
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let mut call_entries = Vec::new();
-        let mut legacy_entries = Vec::new();
         for instruction in &body.code {
             let Instr::CallNamed { sym, .. } = instruction else { continue };
             if call_entries.iter().any(|(symbol, _, _)| symbol == sym) {
                 continue;
             }
             let Some(cell) = call_table::resolve(*sym) else { continue };
-            let adapter = JitBuffer::new(&emit_legacy_cell_veneer(
-                Arc::as_ptr(&cell) as u64,
-                cell.entry_address(true) as u64,
-                c2i_set_native_sigsegv_recovery,
-                legacy_cell_transfer_pending,
-                capture.as_ptr(),
-            ))?;
             let mapped = JitBuffer::new(
-                &egcl_compiler::t2::native_transfer::emit_mapped_call_veneer(
+                &egcl_compiler::t2::native_transfer::emit_published_call_veneer(
                     Arc::as_ptr(&cell) as u64,
-                    prepare_nested,
-                    finish_nested,
-                    resume_nested,
-                    adapter.as_ptr(),
+                    cell.entry_address(false) as u64,
+                    cell.entry_address(true) as u64,
                     capture.as_ptr(),
                 ),
             )?;
-            legacy_entries.push(adapter);
             call_entries.push((*sym, cell, mapped));
         }
         let named_veneers: Vec<_> = call_entries.iter()
@@ -625,7 +630,6 @@ impl TransferCode {
             has_deopt: emitted.has_deopt,
             _veneer: veneer,
             _call_entries: call_entries,
-            _legacy_entries: legacy_entries,
             _capture: capture,
             _poll: poll,
             _completion: completion,
