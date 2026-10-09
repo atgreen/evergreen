@@ -55,6 +55,8 @@ struct State {
     #[cfg(all(target_arch = "x86_64", unix))]
     #[allow(clippy::vec_box)] // generated entries embed stable descriptor addresses
     versions: RefCell<Vec<Box<super::call_table_native::NativeEntry>>>,
+    #[cfg(all(target_arch = "x86_64", unix))]
+    funcall: RefCell<Option<Box<super::call_table_funcall::Cache>>>,
 }
 
 // Box addresses, unlike the vector's storage, stay fixed when ordinals grow.
@@ -111,6 +113,8 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 target: RefCell::new(None),
                 #[cfg(all(target_arch = "x86_64", unix))]
                 versions: RefCell::new(Vec::new()),
+                #[cfg(all(target_arch = "x86_64", unix))]
+                funcall: RefCell::new(None),
             });
             state.cell.bind_state(&*state as *const State as usize);
             linkage::register(&state.cell);
@@ -130,6 +134,9 @@ pub(super) unsafe fn scan(visit: &mut dyn FnMut(*mut EgclVal)) {
             for state in slots.borrow().iter().flatten() {
                 #[cfg(all(target_arch = "x86_64", unix))]
                 {
+                    if let Some(cache) = state.funcall.borrow_mut().as_mut() {
+                        cache.scan();
+                    }
                     let mut versions = state.versions.borrow_mut();
                     versions.retain(|version| version.keep(&state.cell));
                     for version in versions.iter_mut() {
@@ -199,6 +206,21 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     record_target_lookup();
     let revision = linkage::revision(state.cell.ordinal());
     egcl_rt::rooted!(result = c2i_call_result(state.symbol as u64, args, 0)?);
+    #[cfg(all(target_arch = "x86_64", unix))]
+    if !args.is_empty() && super::call_table_funcall::is_builtin(state.symbol) {
+        let entries = bridge_entries().expect("resolved cell owns bridges");
+        let mut cache = state.funcall.borrow_mut();
+        if cache.is_none() {
+            *cache = super::call_table_funcall::Cache::new([entries[0], entries[1]]);
+        }
+        if let Some(cache) = cache.as_mut() {
+            *state.target.borrow_mut() = None;
+            cache.select(args[0]);
+            let entries = cache.entries();
+            linkage::publish(&state.cell, revision, entries[0], entries[1]);
+        }
+        return Ok(*result);
+    }
     let target = select_target(state.symbol, args.len());
     if target.is_some() {
         let entries = bridge_entries().expect("resolved cell owns installed bridges");
@@ -472,6 +494,204 @@ mod tests {
         }
         assert!(matches!(warm(state, &args[..1]), Err(EgclError::ProgramError(_))));
         assert!(matches!(warm(state, &[args[0], NIL]), Err(EgclError::TypeError { .. })));
+    }
+
+    #[test]
+    fn native_frame_header_keeps_its_callable_alive() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let stack = egcl_rt::current_stack();
+        let (frame, symbol) = {
+            egcl_rt::rooted!(form = super::super::super::vec_to_list(&[NIL]));
+            let body = Arc::new(
+                compile_function("FRAME-OWNED-CALLBACK", NIL, *form, &env, false, false).unwrap(),
+            );
+            egcl_rt::rooted!(function = make_bytecode_closure(&body, None));
+            let symbol = egcl_rt::function::name(*function).as_symbol_index();
+            (
+                stack
+                    .push_frame(*function, std::ptr::null(), 0, FLAG_CALL)
+                    .unwrap(),
+                symbol,
+            )
+        };
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        let retained = is_registered(symbol);
+        let callable = unsafe { (*frame).function };
+        stack.pop_frame();
+        assert!(
+            retained,
+            "the activation header must keep its callable and captures alive"
+        );
+        assert!(egcl_rt::function::is_interpreted_function(callable));
+    }
+
+    #[test]
+    fn native_funcall_does_not_resolve_the_callback_on_warm_calls() {
+        check_native_funcall(false);
+    }
+
+    #[test]
+    fn captured_native_funcall_does_not_resolve_the_callback_on_warm_calls() {
+        check_native_funcall(true);
+    }
+
+    fn check_native_funcall(captured: bool) {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        for (name, params, expression) in [
+            ("OBJECT-CALL-LEAF", "(x)", "(+ x 1)"),
+            ("OBJECT-CALL-CALLER", "(f x)", "(funcall f x)"),
+        ] {
+            super::super::super::read_eval_all_env(
+                &format!("(defun {name} {params} {expression})"),
+                &mut env,
+            )
+            .unwrap();
+            let symbol = egcl_rt::symbols::intern(name);
+            egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
+            egcl_rt::rooted!(
+                form = reader::read_from_string(&format!("({expression})"))
+                    .unwrap()
+                    .0
+            );
+            let body = compile_function(name, *params, *form, &env, false, false).unwrap();
+            registry_put(symbol, Arc::new(body));
+            let input = snapshot_t2_input(symbol, 0).unwrap();
+            let generation = input.generation;
+            let input = egcl_rt::CrossThreadRoot::new(input);
+            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+            assert!(
+                install_t2_completion(T2Completion {
+                    sym: symbol,
+                    generation,
+                    artifact: Some(artifact),
+                    input,
+                })
+                .unwrap()
+                .is_t2
+            );
+        }
+        egcl_rt::rooted!(
+            function =
+                egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("OBJECT-CALL-LEAF"))
+                    .unwrap()
+        );
+        if captured {
+            egcl_rt::rooted!(params = reader::read_from_string("(seed)").unwrap().0);
+            egcl_rt::rooted!(
+                form = reader::read_from_string("((lambda (x) (+ seed x)))")
+                    .unwrap()
+                    .0
+            );
+            let factory =
+                compile_function("OBJECT-CAPTURE-FACTORY", *params, *form, &env, true, false)
+                    .unwrap();
+            let body = Arc::clone(&factory.nested_functions[0]);
+            let capture = Arc::new(SharedCell::new(EnvFrame {
+                vars: Default::default(),
+                symbol_vars: Default::default(),
+                parent: None,
+            }));
+            bind_boxed_param(&capture, "SEED", EgclVal::from_fixnum(1));
+            *function = make_bytecode_closure(&body, Some(capture));
+            let symbol = egcl_rt::function::name(*function).as_symbol_index();
+            let input = snapshot_t2_input(symbol, 0).unwrap();
+            let generation = input.generation;
+            let input = egcl_rt::CrossThreadRoot::new(input);
+            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+            assert!(
+                install_t2_completion(T2Completion {
+                    sym: symbol,
+                    generation,
+                    artifact: Some(artifact),
+                    input,
+                })
+                .unwrap()
+                .is_t2
+            );
+        }
+        egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
+        let cell = resolve(egcl_rt::symbols::intern("OBJECT-CALL-CALLER")).unwrap();
+        let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+        struct RestoreEnv(*mut Env);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                NATIVE_ENV.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut env)));
+        TARGET_LOOKUPS.with(|count| count.set(0));
+        assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
+        assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0);
+        TARGET_LOOKUPS.with(|count| count.set(0));
+        for _ in 0..100 {
+            let entry =
+                unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                unsafe { std::mem::transmute(entry) };
+            assert_eq!(
+                call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+                EgclVal::from_fixnum(42).0
+            );
+        }
+        assert_eq!(
+            TARGET_LOOKUPS.with(|count| count.get()),
+            0,
+            "native FUNCALL must bypass target lookup and Rust run_native frame setup"
+        );
+        let symbol = egcl_rt::function::name(*function).as_symbol_index();
+        let input = snapshot_t2_input(symbol, 0).unwrap();
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+        assert!(
+            install_t2_completion(T2Completion {
+                sym: symbol,
+                generation,
+                artifact: Some(artifact),
+                input,
+            })
+            .unwrap()
+            .is_t2
+        );
+        TARGET_LOOKUPS.with(|count| count.set(0));
+        let entry =
+            unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+        let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+            unsafe { std::mem::transmute(entry) };
+        assert_eq!(
+            call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+            EgclVal::from_fixnum(42).0
+        );
+        assert!(
+            TARGET_LOOKUPS.with(|count| count.get()) > 0,
+            "replacing installed native code must invalidate the callback cache"
+        );
+        // A previous ordinary target must not remain a strong root when the
+        // same slot switches to the weak native-FUNCALL dispatcher.
+        let funcall_cell = resolve(egcl_rt::symbols::intern("FUNCALL")).unwrap();
+        let funcall_state = unsafe { super::state(Arc::as_ptr(&funcall_cell) as u64) };
+        let obsolete_symbol = {
+            egcl_rt::rooted!(form = super::super::super::vec_to_list(&[NIL]));
+            let body = Arc::new(compile_function("OBSOLETE-FUNCALL-TARGET", NIL, *form, &env, false, false).unwrap());
+            egcl_rt::rooted!(obsolete = make_bytecode_closure(&body, None));
+            *funcall_state.target.borrow_mut() = Some(Target::Function(*obsolete));
+            egcl_rt::function::name(*obsolete).as_symbol_index()
+        };
+        assert_eq!(cold(funcall_state, &args[..]).unwrap(), EgclVal::from_fixnum(42));
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        assert!(!is_registered(obsolete_symbol),
+            "installing native FUNCALL must release the previous generic target");
+
     }
 
     fn check_native_slot(name: &str, params: &str, expression: &str, args: &[i64], expected: i64) {

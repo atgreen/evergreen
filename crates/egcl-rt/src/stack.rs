@@ -669,6 +669,11 @@ pub unsafe fn visit_stack_refs(fp: *const Frame, mut visit: impl FnMut(&mut Egcl
         let frame = cur as *mut Frame;
         // SAFETY: caller guarantees a valid frame chain.
         unsafe {
+            // Dynamic native entries retain their actual callable here. It is
+            // independent of the activation-slot stack map and may own captures.
+            if is_heap_reference((*frame).function) {
+                visit(&mut (*frame).function);
+            }
             let n = (*frame).num_locals as usize;
             let slots = frame.add(1) as *mut EgclVal;
             // A compiled frame carries a GC stack map (via its CodeInfo) that says
