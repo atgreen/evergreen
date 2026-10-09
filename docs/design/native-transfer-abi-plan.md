@@ -1376,3 +1376,34 @@ clusters, local restarts, replacement transfers from cleanup, multiple values,
 and observed root relocation. The parent remains open for child deoptimization
 and fiber validation, general callable coverage, and universal default entry
 publication.
+
+### Suspended protected child continuations (2026-10-09)
+
+The Linux x86-64 child-fiber tests exercise warmed installed mapped children
+inside their caller's segment while suspending in the body, exceptional cleanup,
+live handler/restart, cold bytecode recovery, and normal cleanup. They check the
+exact child code owner (or masked capture during recovery), segment ownership on
+resume, multiple values, exactly-once execution, and restored frames, depth and
+dynamic scopes. One- and four-carrier cohorts distinguish ordinary suspension
+from observed migration. Root relocation is reported by the owning fiber after
+an external collection; the driver never reads another fiber's stack slots.
+
+The off-by-default `native-transfer-test-hooks` feature exposes the existing
+runtime refusal injection to these cross-crate tests. Once all children pause,
+one selected child allocates a fresh rooted probe and arms its own next carrier
+change. The scheduler refuses that destination, collects before requeue, and
+resumes the child on its previously validated carrier. Tests require an actual
+refusal, collection, relocation and resumption; unrelated fibers and production
+platform capability detection are unaffected.
+
+Run the platform-gated child tests on a supported host with:
+
+```sh
+scripts/egcl-limited.sh cargo test -p egcl --lib \
+  --features native-transfer-test-hooks native_v2_protected_children \
+  -- --ignored --test-threads=1
+```
+
+These tests cover protected baseline child suspension. Optimized child
+deoptimization, broader callable coverage and universal default publication
+remain separate acceptance gates.

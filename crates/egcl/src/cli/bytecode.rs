@@ -61,6 +61,11 @@ mod native_transfer_entry_s390x;
 mod native_transfer_entry_riscv64;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn pause_native_child_for_test() -> Result<EgclVal, EgclError> {
+    native_transfer_tests::pause_child_for_test()
+}
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;

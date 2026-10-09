@@ -25,6 +25,13 @@ use std::cell::Cell;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) mod migration_tests;
 
+#[cfg(all(
+    any(test, feature = "native-transfer-test-hooks"),
+    target_arch = "x86_64",
+    target_os = "linux"
+))]
+pub mod test_hooks;
+
 #[cfg(all(target_arch = "aarch64", unix))]
 mod aarch64;
 #[cfg(all(
@@ -149,8 +156,12 @@ pub fn revalidate_current_segment() -> bool {
 pub(crate) fn prepare_carrier_resume() -> Result<(), crate::thread::NativeThreadId> {
     prepare_carrier_resume_with(|| {
         let supported = is_supported();
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        let supported = migration_tests::destination_supported(supported);
+        #[cfg(all(
+            any(test, feature = "native-transfer-test-hooks"),
+            target_arch = "x86_64",
+            target_os = "linux"
+        ))]
+        let supported = test_hooks::destination_supported(supported);
         supported
     })
 }

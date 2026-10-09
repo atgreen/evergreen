@@ -1,46 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
+use super::test_hooks;
 use super::*;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
-static REFUSALS: AtomicUsize = AtomicUsize::new(0);
-static COLLECTIONS: AtomicUsize = AtomicUsize::new(0);
-static REFUSE_FIBERS: Mutex<Vec<crate::thread::FiberId>> = Mutex::new(Vec::new());
-static REJECTED: Mutex<Option<(crate::thread::FiberId, crate::thread::NativeThreadId)>> =
-    Mutex::new(None);
-
-// Simulate a destination whose hardening policy rejects native stack transfer.
-// Restrict injection to this test's fibers; no environment or global platform
-// policy is changed, and another test's native entries are unaffected.
-pub(super) fn destination_supported(actual: bool) -> bool {
-    let Some(fiber) = crate::thread::current_fiber_id() else {
-        return actual;
-    };
-    let mut fibers = REFUSE_FIBERS.lock().unwrap();
-    if !actual || !fibers.contains(&fiber) {
-        return actual;
-    }
-    fibers.clear();
-    REFUSALS.fetch_add(1, Ordering::Relaxed);
-    let carrier = unsafe { (*current_segment()).carrier() };
-    *REJECTED.lock().unwrap() = Some((fiber, carrier));
-    false
-}
-
-pub(crate) fn before_requeue(fiber: crate::thread::FiberId) {
-    let rejected = REJECTED
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|(id, _)| *id == fiber);
-    if rejected && crate::gc::collect_t0_minor().is_ok() {
-        COLLECTIONS.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 // These assembly entries call Rust helpers normally. The inner entry transfers
 // only AFTER its helper has returned, proving the migrated landing state as
 // well as observing ownership before a later poll could repair stale anchors.
@@ -79,19 +44,16 @@ extern "C" fn inner_helper() -> u64 {
             return EgclVal::from_fixnum(4).0;
         }
         let after = crate::thread::current_thread_id();
-        let mut rejected = REJECTED.lock().unwrap();
-        if let Some((fiber, required_carrier)) = *rejected
-            && Some(fiber) == crate::thread::current_fiber_id()
+        if let Some((required_carrier, refused_carrier)) =
+            test_hooks::take_rejection(crate::thread::current_fiber_id().unwrap())
         {
-            if after != required_carrier {
+            if after != required_carrier || after == refused_carrier {
                 failures |= 32;
             }
             if value.to_raw() == before_value {
                 failures |= 64;
             }
-            *rejected = None;
         }
-        drop(rejected);
         if unsafe { *(value.as_ptr().add(8) as *const f64) } != 42.0 {
             failures |= 128;
         }
@@ -151,8 +113,6 @@ fn scheduler_revalidates_all_native_segments_before_resuming_a_fiber() {
     );
     for (num_workers, refuse) in [(1, false), (4, false), (4, true)] {
         MIGRATIONS.store(0, Ordering::Relaxed);
-        REFUSALS.store(0, Ordering::Relaxed);
-        COLLECTIONS.store(0, Ordering::Relaxed);
         let group = crate::SchedulerGroup::init(&crate::SchedulerConfig { num_workers }).unwrap();
         let mut fibers = Vec::new();
         for _ in 0..12 {
@@ -160,9 +120,7 @@ fn scheduler_revalidates_all_native_segments_before_resuming_a_fiber() {
                 unsafe { EgclVal::from_function_ptr(migrating_fiber as *const () as *mut u8) };
             fibers.push(crate::thread::make_fiber(entry).unwrap());
         }
-        if refuse {
-            *REFUSE_FIBERS.lock().unwrap() = fibers.clone();
-        }
+        test_hooks::arm(if refuse { fibers.clone() } else { Vec::new() });
         for fiber in fibers {
             group.submit(fiber).unwrap();
         }
@@ -178,12 +136,11 @@ fn scheduler_revalidates_all_native_segments_before_resuming_a_fiber() {
             vec![EgclVal::from_fixnum(0); 12],
             "every resumed segment must already belong to its current carrier"
         );
-        assert_eq!(REFUSALS.load(Ordering::Relaxed), usize::from(refuse));
-        assert_eq!(COLLECTIONS.load(Ordering::Relaxed), usize::from(refuse));
-        assert!(
-            REJECTED.lock().unwrap().is_none(),
-            "refused fiber must resume exactly once"
+        assert_eq!(
+            test_hooks::observations(),
+            (usize::from(refuse), usize::from(refuse), false)
         );
+        test_hooks::disarm();
     }
 }
 
