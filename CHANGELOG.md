@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Use native entries for eligible x86-64 T2 `FUNCALL` callbacks, including
+  captured closures, and reuse adapters when callback bodies alternate.
+  Preserve captured bindings and multiple values across GC and deoptimization.
+  This reduces full Prechelt phone-encoding time by about 9% in the measured
+  x86-64 workload ([#148](https://github.com/atgreen/evergreen/pull/148)).
+
+- Preserve the original behavior of saved source-backed function objects after
+  a new `DEFUN`. Saved FASL functions also remain callable when their function
+  cell is aliased to another function
+  ([#148](https://github.com/atgreen/evergreen/pull/148)).
+
 - Compile captured lexical reads and writes at x86-64 T2, preserving shared
   bindings and captured state during deoptimization. Nested closures share
   bytecode templates and native compilations while retaining independent
