@@ -49,7 +49,7 @@
 //! common case in hot loops, pay nothing.
 
 use crate::t2::ir::{AuxData, Function, Inst, Opcode, Value, ValueDef, ValueRepresentation};
-use crate::t2::mach::{Location, MachFunc, PhysReg, RegClass, StackSlot};
+use crate::t2::mach::{Location, MachFunc, PhysReg, RegClass, StackSlot, VReg};
 use egcl_rt::value::EgclVal;
 use std::collections::{HashMap, HashSet};
 
@@ -123,18 +123,26 @@ impl FrameValue {
     }
 }
 
-/// Final body homes at a machine safepoint. These are not yet locations at a
-/// native return PC: call setup can clobber homes or make a shadow authoritative.
+/// Checked final homes at one native template boundary.
 #[derive(Clone, Debug)]
-pub struct FrameSafepoint {
-    pub machine_inst: usize,
-    pub source_inst: Inst,
+pub struct FrameValues {
     values: Vec<FrameValue>,
 }
 
-impl FrameSafepoint {
+impl FrameValues {
     pub fn values(&self) -> &[FrameValue] {
         &self.values
+    }
+    /// Poll calls are invisible to register allocation. Preserve raw registers
+    /// in private native slots; raw stack homes already survive the callback.
+    pub fn raw_registers(&self) -> impl Iterator<Item = ValueHome> + '_ {
+        self.values
+            .iter()
+            .filter_map(|entry| match (entry.repr, entry.location) {
+                (ValueRepresentation::Tagged, _) => None,
+                (_, FrameValueLocation::Home(home @ ValueHome::Reg(_))) => Some(home),
+                _ => None,
+            })
     }
 
     pub fn value(&self, value: Value) -> Option<&FrameValue> {
@@ -142,6 +150,39 @@ impl FrameSafepoint {
             .binary_search_by_key(&value.0, |entry| entry.value.0)
             .ok()
             .map(|index| &self.values[index])
+    }
+}
+
+/// Resolve a poll inserted before any allocated instruction. No source IR
+/// safepoint annotation is required, including at edge-move-only block entries.
+pub fn resolve_values_before(
+    f: &Function,
+    machine: &MachFunc,
+    homes: &FrameHomes,
+    constants: &HashMap<Value, u64>,
+    machine_inst: usize,
+) -> Result<FrameValues, FrameMapError> {
+    let live = machine
+        .live_vregs_before(machine_inst, &machine.read_vregs())
+        .ok_or(FrameMapError::InvalidSource(machine_inst))?;
+    resolve_frame_values(f, machine, homes, constants, live)
+}
+
+/// Final body homes at a machine safepoint. These are not yet locations at a
+/// native return PC: call setup can clobber homes or make a shadow authoritative.
+#[derive(Clone, Debug)]
+pub struct FrameSafepoint {
+    pub machine_inst: usize,
+    pub source_inst: Inst,
+    values: FrameValues,
+}
+
+impl FrameSafepoint {
+    pub fn values(&self) -> &[FrameValue] {
+        self.values.values()
+    }
+    pub fn value(&self, value: Value) -> Option<&FrameValue> {
+        self.values.value(value)
     }
 }
 
@@ -203,14 +244,9 @@ pub fn resolve_safepoint_maps(
         }
         // Validate coverage against the allocator's authoritative split ranges.
         // Consumers below use the checked table, never their own liveness scan.
-        let before = machine_inst as u32 * 2;
-        let expected: HashSet<_> = machine
-            .value_locations
-            .iter()
-            .filter(|range| range.contains(before) && read_vregs.contains(&range.vreg))
-            .map(|range| range.vreg)
-            .chain(instruction.uses.iter().copied())
-            .collect();
+        let expected = machine
+            .live_vregs_before(machine_inst, &read_vregs)
+            .ok_or(FrameMapError::InvalidSource(machine_inst))?;
         let described: HashSet<_> = map.values.iter().map(|entry| entry.vreg).collect();
         if expected != described {
             return Err(FrameMapError::LiveSetMismatch(machine_inst));
@@ -219,59 +255,12 @@ pub fn resolve_safepoint_maps(
             .source_inst
             .filter(|source| source.index() < f.num_insts())
             .ok_or(FrameMapError::InvalidSource(machine_inst))?;
-        let mut values = Vec::new();
-        let mut home_values = HashMap::new();
         for allocated in &map.values {
-            let value = Value(allocated.vreg.num);
-            if value.index() >= f.num_values()
-                || f.value(value).repr != allocated.repr
-                || machine.value_reprs.get(&allocated.vreg) != Some(&allocated.repr)
-            {
-                return Err(FrameMapError::InvalidValue(value));
-            }
-            let location = if let Some(&bits) = constants.get(&value) {
-                let constant = EgclVal(bits);
-                if allocated.repr != ValueRepresentation::Tagged
-                    || immediate_constant(f, value) != Some(constant)
-                {
-                    return Err(FrameMapError::InvalidConstant(value));
-                }
-                FrameValueLocation::Immediate(constant)
-            } else {
-                let home = *homes
-                    .values
-                    .get(&value)
-                    .ok_or(FrameMapError::MissingHome(value))?;
-                let valid = match home {
-                    ValueHome::Reg(reg) => {
-                        FRAME_GPRS.iter().any(|&index| GPR_X86[index] == reg)
-                            && crate::t2::lower::class_of(allocated.repr) == RegClass::Gpr
-                    }
-                    ValueHome::Stack(slot) => {
-                        slot < homes.stack_slots && slot <= i32::MAX as u32 / 8
-                    }
-                };
-                if !valid {
-                    return Err(FrameMapError::InvalidHome(home));
-                }
-                if home_values
-                    .insert(home, value)
-                    .is_some_and(|old| old != value)
-                {
-                    return Err(FrameMapError::ConflictingHome(home));
-                }
-                FrameValueLocation::Home(home)
-            };
-            let entry = FrameValue {
-                value,
-                repr: allocated.repr,
-                location,
-            };
-            if !values.contains(&entry) {
-                values.push(entry);
+            if machine.value_reprs.get(&allocated.vreg) != Some(&allocated.repr) {
+                return Err(FrameMapError::InvalidValue(Value(allocated.vreg.num)));
             }
         }
-        values.sort_by_key(|entry| entry.value.0);
+        let values = resolve_frame_values(f, machine, homes, constants, expected)?;
         maps.push(FrameSafepoint {
             machine_inst,
             source_inst,
@@ -279,6 +268,70 @@ pub fn resolve_safepoint_maps(
         });
     }
     Ok(FrameSafepoints { maps })
+}
+
+fn resolve_frame_values(
+    f: &Function,
+    machine: &MachFunc,
+    homes: &FrameHomes,
+    constants: &HashMap<Value, u64>,
+    live: HashSet<VReg>,
+) -> Result<FrameValues, FrameMapError> {
+    let mut values = Vec::new();
+    let mut home_values = HashMap::new();
+    for vreg in live {
+        let value = Value(vreg.num);
+        let repr = *machine
+            .value_reprs
+            .get(&vreg)
+            .ok_or(FrameMapError::InvalidValue(value))?;
+        if value.index() >= f.num_values()
+            || f.value(value).repr != repr
+            || crate::t2::lower::class_of(repr) != vreg.class
+        {
+            return Err(FrameMapError::InvalidValue(value));
+        }
+        let location = if let Some(&bits) = constants.get(&value) {
+            let constant = EgclVal(bits);
+            if repr != ValueRepresentation::Tagged || immediate_constant(f, value) != Some(constant)
+            {
+                return Err(FrameMapError::InvalidConstant(value));
+            }
+            FrameValueLocation::Immediate(constant)
+        } else {
+            let home = *homes
+                .values
+                .get(&value)
+                .ok_or(FrameMapError::MissingHome(value))?;
+            let valid = match home {
+                ValueHome::Reg(reg) => {
+                    FRAME_GPRS.iter().any(|&index| GPR_X86[index] == reg)
+                        && crate::t2::lower::class_of(repr) == RegClass::Gpr
+                }
+                ValueHome::Stack(slot) => slot < homes.stack_slots && slot <= i32::MAX as u32 / 8,
+            };
+            if !valid {
+                return Err(FrameMapError::InvalidHome(home));
+            }
+            if home_values
+                .insert(home, value)
+                .is_some_and(|old| old != value)
+            {
+                return Err(FrameMapError::ConflictingHome(home));
+            }
+            FrameValueLocation::Home(home)
+        };
+        let entry = FrameValue {
+            value,
+            repr,
+            location,
+        };
+        if !values.contains(&entry) {
+            values.push(entry);
+        }
+    }
+    values.sort_by_key(|entry| entry.value.0);
+    Ok(FrameValues { values })
 }
 
 // Only IR-defined immediates may replace a live physical root.

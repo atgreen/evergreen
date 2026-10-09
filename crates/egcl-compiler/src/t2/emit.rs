@@ -934,6 +934,73 @@ fn emit_shadow_root_restore(
     Ok(())
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct PollFrame {
+    base: FramedHome,
+    activation_slots: u16,
+    shadow_slots: u16,
+    raw_spill_start: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_mapped_poll(
+    a: &mut Asm,
+    values: &crate::t2::x64_frame::FrameValues,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame: &PollFrame,
+    veneer: u64,
+    heat: bool,
+) -> Result<(), EmitError> {
+    for (index, home) in values.raw_registers().enumerate() {
+        load_home(a, RAX, home, 0);
+        store_home(
+            a,
+            FramedHome::Stack(frame.raw_spill_start + index as u32),
+            RAX,
+            0,
+        );
+    }
+    let roots: Vec<_> = values
+        .values()
+        .iter()
+        .filter(|value| value.gc_home().is_some())
+        .map(|value| value.value)
+        .collect();
+    emit_shadow_root_sync(
+        a,
+        &roots,
+        homes,
+        frame.base,
+        frame.activation_slots,
+        frame.shadow_slots,
+    )?;
+    load_home(a, 7, frame.base, 0);
+    if heat {
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
+    }
+    mov_imm64(a, RAX, veneer as i64);
+    emit_runtime_helper_call(a, 0, None);
+    let restore = roots.iter().copied().collect();
+    emit_shadow_root_restore(
+        a,
+        &roots,
+        &restore,
+        homes,
+        frame.base,
+        frame.activation_slots,
+    )?;
+    for (index, home) in values.raw_registers().enumerate() {
+        load_home(
+            a,
+            RAX,
+            FramedHome::Stack(frame.raw_spill_start + index as u32),
+            0,
+        );
+        store_home(a, home, RAX, 0);
+    }
+    Ok(())
+}
+
 /// One home-to-home move, RAX as intermediary where x86 needs one. RAX is
 /// never a value home (framed_machine_env hands out only rcx/r8/rbx/r12-r15),
 /// so it is always free scratch here.
@@ -3939,11 +4006,141 @@ fn emit_framed_inner(
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
-    // A branch-only result may still be live across an intervening call or
-    // needed for recovery. Such a value must exist before the safepoint.
-    let safepoint_values: HashSet<_> = machine.stack_maps.iter()
+    // Native segment polling is placed at loop headers rather than after every
+    // branch. This keeps condition flags intact and guarantees that every
+    // cycle reaches a poll. Header roots use the same split-aware ranges as
+    // runtime-call roots, but are evaluated at the machine block's first
+    // program point so a moving GC can update the homes before the body runs.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let (backedge_headers, loop_points): (
+        HashSet<crate::t2::ir::Block>,
+        HashMap<crate::t2::ir::Block, usize>,
+    ) = if transfers
+        .as_ref()
+        .and_then(|transfer| transfer.poll_veneer)
+        .is_some()
+    {
+        let mut successors: HashMap<_, Vec<_>> = HashMap::new();
+        for &block in &blocks {
+            successors.insert(
+                block,
+                f.terminator(block)
+                    .map(|terminator| {
+                        f.inst(terminator)
+                            .targets
+                            .iter()
+                            .map(|target| target.block)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        let reaches = |start, goal| {
+            let mut pending = vec![start];
+            let mut seen = HashSet::new();
+            while let Some(block) = pending.pop() {
+                if block == goal {
+                    return true;
+                }
+                if !seen.insert(block) {
+                    continue;
+                }
+                if let Some(next) = successors.get(&block) {
+                    pending.extend(next.iter().copied());
+                }
+            }
+            false
+        };
+        let mut headers = HashSet::new();
+        for &block in &blocks {
+            let Some(terminator) = f.terminator(block) else {
+                continue;
+            };
+            for target in &f.inst(terminator).targets {
+                if reaches(target.block, block) {
+                    headers.insert(target.block);
+                }
+            }
+        }
+        let mut points = HashMap::new();
+        for &header in &headers {
+            let Some(block_index) = blocks.iter().position(|&block| block == header) else {
+                return Err(EmitError::UnsupportedOp(0xFE));
+            };
+            points.insert(header, machine.blocks[block_index].start);
+        }
+        (headers, points)
+    } else {
+        (HashSet::new(), HashMap::new())
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let loop_points: HashMap<crate::t2::ir::Block, usize> = HashMap::new();
+    // Keep long straight-line native segments interruptible as well. Polls are
+    // attached to source instructions (before their first machine instruction)
+    // so they never disturb a branch's condition flags. Their roots are the
+    // values live at that exact machine program point, not a guessed block-wide
+    // set; an incomplete map rejects this native artifact before installation.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let (straight_poll_sources, straight_poll_points): (
+        HashSet<Inst>,
+        HashMap<Inst, usize>,
+    ) = if transfers
+        .as_ref()
+        .and_then(|transfer| transfer.poll_veneer)
+        .is_some()
+    {
+        const POLL_INTERVAL: usize = 64;
+        let mut sources = HashSet::new();
+        let mut count = 0usize;
+        for &block in &blocks {
+            for &inst in &f.block(block).insts {
+                let opcode = f.inst(inst).opcode;
+                if opcode.is_terminator()
+                    || opcode == Opcode::CleanupLanding
+                    || is_const_opcode(opcode)
+                {
+                    continue;
+                }
+                count = count.saturating_add(1);
+                if count % POLL_INTERVAL == 0 {
+                    sources.insert(inst);
+                }
+            }
+        }
+        let mut points = HashMap::new();
+        for (mi, machine_inst) in machine.insts.iter().enumerate() {
+            let Some(source) = machine_inst.source_inst else {
+                continue;
+            };
+            if !sources.contains(&source) || points.contains_key(&source) {
+                continue;
+            }
+            points.insert(source, mi);
+        }
+        for source in &sources {
+            if !points.contains_key(source) {
+                return Err(EmitError::UnsupportedOp(0xFE));
+            }
+        }
+        (sources, points)
+    } else {
+        (HashSet::new(), HashMap::new())
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let straight_poll_points: HashMap<crate::t2::ir::Inst, usize> = HashMap::new();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let _straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
+    // A branch-only result may still be live across a call or inserted poll,
+    // or needed for recovery. It must be materialized before that boundary.
+    let mut safepoint_values: HashSet<_> = machine.stack_maps.iter()
         .flat_map(|map| map.values.iter().map(|entry| Value(entry.vreg.num)))
         .collect();
+    let read_vregs = machine.read_vregs();
+    for &point in loop_points.values().chain(straight_poll_points.values()) {
+        let live = machine.live_vregs_before(point, &read_vregs)
+            .ok_or(EmitError::UnsupportedOp(0xFE))?;
+        safepoint_values.extend(live.into_iter().map(|vreg| Value(vreg.num)));
+    }
     fused.retain(|&inst| {
         !f.inst(inst).results.iter().any(|value| safepoint_values.contains(value))
     });
@@ -3961,8 +4158,28 @@ fn emit_framed_inner(
     } else {
         vec![]
     };
+    let resolve_poll = |point| {
+        crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
+            .map_err(|_| EmitError::UnsupportedOp(0xFE))
+    };
+    let loop_maps: HashMap<_, _> = loop_points.iter()
+        .map(|(&block, &point)| Ok((block, resolve_poll(point)?)))
+        .collect::<Result<_, EmitError>>()?;
+    let straight_poll_maps: HashMap<_, _> = straight_poll_points.iter()
+        .map(|(&inst, &point)| Ok((inst, resolve_poll(point)?)))
+        .collect::<Result<_, EmitError>>()?;
     let homes = layout.values;
     let mut next_stack = layout.stack_slots;
+    let raw_poll_spills = loop_maps.values().chain(straight_poll_maps.values())
+        .map(|values| values.raw_registers().count()).max().unwrap_or(0);
+    let raw_poll_spills = u32::try_from(raw_poll_spills)
+        .map_err(|_| EmitError::UnsupportedOp(0xFE))?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let raw_poll_spill_start = next_stack;
+    next_stack = next_stack.checked_add(raw_poll_spills)
+        .filter(|&slots| slots <= i32::MAX as u32 / 8)
+        .ok_or(EmitError::UnsupportedOp(0xFE))?;
+
     // `EGCL_RA_DBG` dump of the three facts a deopt-clobber bug is diagnosed
     // from (bliss-x9c9): each value's stable home, which MachInsts carry a
     // FrameState (and therefore contribute `deopt_uses` liveness), and what
@@ -4087,166 +4304,16 @@ fn emit_framed_inner(
             }
         }
     }
-    // Native segment polling is placed at loop headers rather than after every
-    // branch. This keeps condition flags intact and guarantees that every
-    // cycle reaches a poll. Header roots use the same split-aware ranges as
-    // runtime-call roots, but are evaluated at the machine block's first
-    // program point so a moving GC can update the homes before the body runs.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (backedge_headers, loop_roots): (
-        HashSet<crate::t2::ir::Block>,
-        HashMap<crate::t2::ir::Block, Vec<Value>>,
-    ) = if transfers
-        .as_ref()
-        .and_then(|transfer| transfer.poll_veneer)
-        .is_some()
-    {
-        let mut successors: HashMap<_, Vec<_>> = HashMap::new();
-        for &block in &blocks {
-            successors.insert(
-                block,
-                f.terminator(block)
-                    .map(|terminator| {
-                        f.inst(terminator)
-                            .targets
-                            .iter()
-                            .map(|target| target.block)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            );
-        }
-        let reaches = |start, goal| {
-            let mut pending = vec![start];
-            let mut seen = HashSet::new();
-            while let Some(block) = pending.pop() {
-                if block == goal {
-                    return true;
-                }
-                if !seen.insert(block) {
-                    continue;
-                }
-                if let Some(next) = successors.get(&block) {
-                    pending.extend(next.iter().copied());
-                }
-            }
-            false
-        };
-        let mut headers = HashSet::new();
-        for &block in &blocks {
-            let Some(terminator) = f.terminator(block) else {
-                continue;
-            };
-            for target in &f.inst(terminator).targets {
-                if reaches(target.block, block) {
-                    headers.insert(target.block);
-                }
-            }
-        }
-        let mut roots = HashMap::new();
-        for &header in &headers {
-            let Some(block_index) = blocks.iter().position(|&block| block == header) else {
-                return Err(EmitError::UnsupportedOp(0xFE));
-            };
-            let pp = u32::try_from(machine.blocks[block_index].start)
-                .map_err(|_| EmitError::UnsupportedOp(0xFE))?
-                * 2;
-            // Polls are inserted after allocation, so its call-clobber model
-            // cannot preserve even immediate values for us. Save all live
-            // tagged homes; the GC safely ignores non-pointer slot contents.
-            let mut live = HashSet::new();
-            for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr || range.start > pp || pp >= range.end {
-                    continue;
-                }
-                let value = Value(range.vreg.num);
-                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
-                {
-                    live.insert(value);
-                }
-            }
-            let mut live: Vec<_> = live.into_iter().collect();
-            live.sort_by_key(|value| value.0);
-            roots.insert(header, live);
-        }
-        (headers, roots)
-    } else {
-        (HashSet::new(), HashMap::new())
+    // Polls preserve tagged immediates as well as moving candidates because
+    // their calls were inserted after allocation's clobber analysis.
+    let poll_roots = |values: &crate::t2::x64_frame::FrameValues| {
+        values.values().iter().filter(|value| value.gc_home().is_some())
+            .map(|value| value.value).collect::<Vec<_>>()
     };
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    let loop_roots: HashMap<crate::t2::ir::Block, Vec<Value>> = HashMap::new();
-    // Keep long straight-line native segments interruptible as well. Polls are
-    // attached to source instructions (before their first machine instruction)
-    // so they never disturb a branch's condition flags. Their roots are the
-    // values live at that exact machine program point, not a guessed block-wide
-    // set; an incomplete map rejects this native artifact before installation.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (straight_poll_sources, straight_poll_roots): (
-        HashSet<Inst>,
-        HashMap<Inst, Vec<Value>>,
-    ) = if transfers
-        .as_ref()
-        .and_then(|transfer| transfer.poll_veneer)
-        .is_some()
-    {
-        const POLL_INTERVAL: usize = 64;
-        let mut sources = HashSet::new();
-        let mut count = 0usize;
-        for &block in &blocks {
-            for &inst in &f.block(block).insts {
-                let opcode = f.inst(inst).opcode;
-                if opcode.is_terminator()
-                    || opcode == Opcode::CleanupLanding
-                    || is_const_opcode(opcode)
-                {
-                    continue;
-                }
-                count = count.saturating_add(1);
-                if count % POLL_INTERVAL == 0 {
-                    sources.insert(inst);
-                }
-            }
-        }
-        let mut roots = HashMap::new();
-        for (mi, machine_inst) in machine.insts.iter().enumerate() {
-            let Some(source) = machine_inst.source_inst else {
-                continue;
-            };
-            if !sources.contains(&source) || roots.contains_key(&source) {
-                continue;
-            }
-            let pp = u32::try_from(mi).map_err(|_| EmitError::UnsupportedOp(0xFE))? * 2;
-            let mut live = HashSet::new();
-            for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr || range.start > pp || pp >= range.end {
-                    continue;
-                }
-                let value = Value(range.vreg.num);
-                if machine_inst.defs.contains(&range.vreg) {
-                    continue;
-                }
-                if f.value(value).repr == ValueRepresentation::Tagged && homes.contains_key(&value)
-                {
-                    live.insert(value);
-                }
-            }
-            let mut live: Vec<_> = live.into_iter().collect();
-            live.sort_by_key(|value| value.0);
-            roots.insert(source, live);
-        }
-        for source in &sources {
-            if !roots.contains_key(source) {
-                return Err(EmitError::UnsupportedOp(0xFE));
-            }
-        }
-        (sources, roots)
-    } else {
-        (HashSet::new(), HashMap::new())
-    };
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    let straight_poll_roots: HashMap<crate::t2::ir::Inst, Vec<Value>> = HashMap::new();
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    let _straight_poll_sources: HashSet<crate::t2::ir::Inst> = HashSet::new();
+    let loop_roots: HashMap<_, _> = loop_maps.iter()
+        .map(|(&block, values)| (block, poll_roots(values))).collect();
+    let straight_poll_roots: HashMap<_, _> = straight_poll_maps.iter()
+        .map(|(&inst, values)| (inst, poll_roots(values))).collect();
     let root_shadow_slots = safepoint_roots
         .values()
         .map(Vec::len)
@@ -4498,6 +4565,10 @@ fn emit_framed_inner(
         };
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
+        base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
+    });
     let mut root_sync_sites = Vec::new();
     let mut emitted_safepoints = 0usize;
     // Bytecode→native correlation for the tiered-JIT viewer (bliss-zmmb): the T2
@@ -4543,33 +4614,13 @@ fn emit_framed_inner(
                 .as_ref()
                 .and_then(|transfer| transfer.poll_veneer)
                 .ok_or(EmitError::UnsupportedOp(0xFE))?;
-            let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
-            let roots = loop_roots.get(&b).map(Vec::as_slice).unwrap_or(&[]);
-            emit_shadow_root_sync(
+            emit_mapped_poll(
                 &mut a,
-                roots,
+                loop_maps.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
                 &homes,
-                frame_base,
-                activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
-                shadow_root_slots,
-            )?;
-            // The request is an opaque word, never dereferenced by the poll
-            // helper. Its low bit distinguishes loop heat from ordinary polls;
-            // the precise activation itself remains in CAPTURE and shadow roots.
-            load_home(&mut a, 7, frame_base, 0);
-            if heat_headers.contains(&b) {
-                a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
-            }
-            mov_imm64(&mut a, RAX, poll_veneer as i64);
-            emit_runtime_helper_call(&mut a, 0, None);
-            let restore_roots: HashSet<_> = roots.iter().copied().collect();
-            emit_shadow_root_restore(
-                &mut a,
-                roots,
-                &restore_roots,
-                &homes,
-                frame_base,
-                activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+                poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
+                poll_veneer,
+                heat_headers.contains(&b),
             )?;
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
@@ -4589,30 +4640,13 @@ fn emit_framed_inner(
                     .as_ref()
                     .and_then(|transfer| transfer.poll_veneer)
                     .ok_or(EmitError::UnsupportedOp(0xFE))?;
-                let frame_base = frame_base_home.ok_or(EmitError::UnsupportedOp(0xFE))?;
-                let roots = straight_poll_roots
-                    .get(&inst)
-                    .map(Vec::as_slice)
-                    .ok_or(EmitError::UnsupportedOp(0xFE))?;
-                emit_shadow_root_sync(
+                emit_mapped_poll(
                     &mut a,
-                    roots,
+                    straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
                     &homes,
-                    frame_base,
-                    activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
-                    shadow_root_slots,
-                )?;
-                load_home(&mut a, 7, frame_base, 0);
-                mov_imm64(&mut a, RAX, poll_veneer as i64);
-                emit_runtime_helper_call(&mut a, 0, None);
-                let restore_roots: HashSet<_> = roots.iter().copied().collect();
-                emit_shadow_root_restore(
-                    &mut a,
-                    roots,
-                    &restore_roots,
-                    &homes,
-                    frame_base,
-                    activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    poll_veneer,
+                    false,
                 )?;
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
@@ -7093,5 +7127,107 @@ mod tests {
         let buf = egcl_rt::jit::JitBuffer::new(&code).expect("mmap exec");
         let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
         assert_eq!(f(), 12, "7 + 5 must execute to 12");
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod poll_map_tests {
+    use super::*;
+    use crate::t2::ir::{
+        AuxData, Function, IRType, InstData, InstFlags, Opcode, ValueRepresentation,
+    };
+    use crate::t2::x64_frame::{FrameHomes, resolve_values_before};
+    use egcl_rt::value::{EgclVal, NIL};
+    use egcl_rt::{Collector, HeapCollector};
+    use std::collections::HashMap;
+
+    #[test]
+    fn poll_relocates_tagged_home_without_scanning_raw_register_bits() {
+        extern "C" fn collect(_: *mut u64) -> u64 {
+            HeapCollector::new().minor_gc().unwrap();
+            unsafe {
+                core::arch::asm!("xor rcx,rcx", "xor r8,r8",
+                    out("rcx") _, out("r8") _, options(nomem, nostack));
+            }
+            NIL.0
+        }
+        for (repr, raw_home) in [
+            (ValueRepresentation::UnboxedFixnum, FramedHome::Reg(8)),
+            (ValueRepresentation::UnboxedFixnum, FramedHome::Stack(0)),
+            (ValueRepresentation::UnboxedF64, FramedHome::Stack(0)),
+        ] {
+            let mut f = Function::new("raw-poll-state");
+            let entry = f.entry();
+            let tagged = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+            let raw = f.add_block_param(entry, IRType::TOP, repr);
+            f.set_terminator(
+                entry,
+                InstData {
+                    opcode: Opcode::Return,
+                    args: vec![tagged, raw],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                },
+            );
+            let mut machine = crate::t2::lower::lower(&f);
+            crate::t2::regalloc::allocate_framed(&mut machine).unwrap();
+            let homes = FrameHomes {
+                values: HashMap::from([(tagged, FramedHome::Reg(1)), (raw, raw_home)]),
+                stack_slots: 1,
+            };
+            let values = resolve_values_before(&f, &machine, &homes, &HashMap::new(), 0).unwrap();
+            let mut a = Asm::new();
+            a.extend_from_slice(&[0x48, 0x83, 0xec, 40]); // aligned frame: raw home, base, raw save, padding
+            store_home(&mut a, FramedHome::Stack(1), 7, 0);
+            mov_from_frame(&mut a, 1, 7, 0);
+            store_home(&mut a, raw_home, 6, 0); // second C argument is raw heap-looking bits
+            emit_mapped_poll(
+                &mut a,
+                &values,
+                &homes.values,
+                &PollFrame {
+                    base: FramedHome::Stack(1),
+                    activation_slots: 1,
+                    shadow_slots: 1,
+                    raw_spill_start: 2,
+                },
+                collect as *const () as u64,
+                false,
+            )
+            .unwrap();
+            load_home(&mut a, SCRATCH, FramedHome::Stack(1), 0);
+            store_mem64_disp(&mut a, SCRATCH, 0, 1); // observe the relocated native register
+            load_home(&mut a, RAX, raw_home, 0);
+            a.extend_from_slice(&[0x48, 0x83, 0xc4, 40, 0xc3]);
+            let code = egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap();
+            let run: extern "C" fn(*mut u64, u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            egcl_rt::rooted!(activation = vec![NIL; 2]);
+            let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
+            unsafe {
+                body.cast::<f64>().write(123.5);
+            }
+            egcl_rt::rooted!(expected = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
+            activation[0] = *expected;
+            let original = expected.to_raw();
+            let returned = run(activation.as_mut_ptr().cast(), original);
+            assert_ne!(
+                expected.to_raw(),
+                original,
+                "GC must actually relocate the object"
+            );
+            assert_eq!(
+                activation[0], *expected,
+                "native tagged home must reload the moved root"
+            );
+            assert_eq!(
+                returned, original,
+                "raw bits must survive clobbers without GC rewriting"
+            );
+        }
     }
 }

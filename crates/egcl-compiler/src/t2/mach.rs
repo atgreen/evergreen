@@ -283,6 +283,25 @@ impl MachFunc {
             .collect()
     }
 
+    /// Value identities at Before(inst), after allocator Before edits. The
+    /// same query serves ordinary safepoints and polls inserted after allocation.
+    pub(crate) fn live_vregs_before(
+        &self,
+        inst: usize,
+        read_vregs: &HashSet<VReg>,
+    ) -> Option<HashSet<VReg>> {
+        let instruction = self.insts.get(inst)?;
+        let point = u32::try_from(inst).ok()?.checked_mul(2)?;
+        Some(
+            self.value_locations
+                .iter()
+                .filter(|range| range.contains(point) && read_vregs.contains(&range.vreg))
+                .map(|range| range.vreg)
+                .chain(instruction.uses.iter().copied())
+                .collect(),
+        )
+    }
+
     /// Allocator homes at a precise instruction phase. These are not yet native
     /// PCs or final emitter homes; both GC and debug emission must resolve them.
     pub fn locations_at(
