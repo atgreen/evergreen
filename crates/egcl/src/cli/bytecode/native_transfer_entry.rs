@@ -25,12 +25,14 @@ use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 mod deopt;
 use deopt::{prepare_completed_deopt, resume_guard};
 
-thread_local! {
-    /// Opt-in production cache for the segment ABI. Keep the negative result
-    /// too: an unsupported body must not be recompiled on every invocation.
-    static SEGMENT_CACHE: RefCell<std::collections::HashMap<usize, Option<Rc<TransferCode>>>> =
-        RefCell::new(std::collections::HashMap::new());
-}
+// SAFETY: code owners and their non-Send feedback belong only to this Lisp
+// execution. The slot follows its fiber across carriers and is retired only
+// after that execution stops; no Rc is published to another execution.
+static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashMap<usize, Option<Rc<TransferCode>>>>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashMap::new()))
+};
 
 /// Inspect the separately retained segment entry without compiling or executing
 /// anything. An installed legacy NativeCode does not describe this mapping.
