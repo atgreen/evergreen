@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Read simple-string characters and lengths directly from their fixed-width
+  storage, avoiding registry lookups and temporary string copies on these
+  paths, including registered strings. This reduces full Prechelt
+  phone-encoding time by about 15% in the measured x86-64 workload
+  ([#151](https://github.com/atgreen/evergreen/pull/151)).
+
 - Reduce runtime setup for cached native builtin calls, preserving multiple
   values, function replacement, and error handling. This reduces full Prechelt
   phone-encoding time by about 6% in the measured x86-64 workload. Prevent
