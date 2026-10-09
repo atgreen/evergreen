@@ -31,6 +31,8 @@ libc = "0.2"
 libc = "0.2"
 
 [features]
+# Opt-in fault injection for cross-crate native continuation tests.
+native-transfer-test-hooks = []
 default = []
 # C-ABI FFI: dlopen-based foreign-library loading. Requires a dynamic loader, so
 # it is incompatible with a fully static executable — off by default.

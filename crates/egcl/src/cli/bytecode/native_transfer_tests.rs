@@ -275,3 +275,7 @@ fn native_v2_bridge_preserves_throw_multiple_values_and_first_error() {
     let value = super::super::read_eval_all_env("*v2-count*", &mut env).unwrap();
     assert_eq!(value, EgclVal::from_fixnum(0));
 }
+
+pub(super) fn pause_child_for_test() -> Result<EgclVal, EgclError> {
+    nested::fibers::pause()
+}

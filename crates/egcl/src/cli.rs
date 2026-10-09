@@ -17115,6 +17115,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // computed above for the macro decision.
             _ if shadowed_by_lexical_function
                 && !is_special_operator_name(&name) => {}
+            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+            "%NATIVE-CHILD-SUSPEND-FOR-TEST" => return bytecode::pause_native_child_for_test(),
             #[cfg(test)]
             "%FORCE-MINOR-GC-FOR-TEST" => {
                 egcl_rt::collect_t0_minor()?;

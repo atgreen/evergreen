@@ -2116,8 +2116,12 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
             *state = FiberState::Runnable;
             thread.mounted.store(false, Ordering::Release);
         }
-        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
-        crate::native_transfer::migration_tests::before_requeue(thread.id());
+        #[cfg(all(
+            any(test, feature = "native-transfer-test-hooks"),
+            target_arch = "x86_64",
+            target_os = "linux"
+        ))]
+        crate::native_transfer::test_hooks::before_requeue(thread.id());
         let destination = pool.carrier_ids.lock().unwrap().iter()
             .position(|&id| id == previous_carrier)
             .expect("a suspended segment retains a carrier in its owning pool");

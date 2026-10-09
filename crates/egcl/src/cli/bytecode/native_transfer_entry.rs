@@ -2055,6 +2055,16 @@ struct CaptureContext {
 }
 static CAPTURE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut CaptureContext>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(std::ptr::null_mut())) };
+#[cfg(test)]
+pub(super) fn child_capture_for_test() -> Option<(usize, bool)> {
+    let capture = CAPTURE.with(Cell::get);
+    if capture.is_null() {
+        None
+    } else {
+        Some(unsafe { ((*capture).owner as usize, !(*capture).nested.is_null()) })
+    }
+}
+
 struct EntryGuard {
     env: *mut Env,
     capture: *mut CaptureContext,
