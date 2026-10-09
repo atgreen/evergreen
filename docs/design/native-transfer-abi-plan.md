@@ -1340,7 +1340,39 @@ the original failure; it does not abandon their stack/depth accounting.
 Regression coverage includes preparation success/decline/error, moving roots,
 multiple values, caller handlers/restarts, mutual recursion and depth fallback,
 active redefinition/unbinding, and injected child capture failure below recursive
-callers. `bliss-shih7.16.2` remains open: protected children need cold continuation
-reconstruction before retirement, and child deoptimization and fiber migration
-still need dedicated coverage. Universal entry publication and default ABI
+callers. The initial slice left protected children, child deoptimization and
+fiber migration to `bliss-shih7.16.2`. Universal entry publication and default ABI
 acceptance remain separate outstanding gates.
+
+
+### Protected mapped baseline callees (2026-10-09)
+
+With the opt-in segment ABI enabled after bootstrap, ordinary T1 promotion can
+install a tagged mapped baseline when the legacy emitter declines a protected
+body. Installed code retains its real representation and transfer ABI version;
+legacy direct-call gates reject that version. Admission currently requires fixed,
+unconstrained positional parameters in local slots and no captured
+environment. DISASSEMBLE identifies the tagged baseline explicitly.
+
+A warmed call cell can enter this installed baseline in its caller's segment.
+Outer and child activations share reserved scope storage and precise roots. If a
+child cannot land its selected transfer natively, the caller-owned cold veneer
+reconstructs its exact bytecode continuation. Frame and scope ownership move to
+that rooted continuation before Lisp runs, and the native capture pointer is
+masked during recovery. The child can finish locally and return values, or
+propagate a selected transfer after its cleanups. Retirement releases child code
+only while executing caller-owned storage. Scope-free children retain direct
+native escape without unnecessary reconstruction.
+
+Loop-header visits contribute sampled heat to the exact installed definition
+and request background T2 compilation at the existing threshold. Header visits
+include initial entries; they do not count every block in a cyclic region.
+Redefinition prevents an old activation from heating its replacement. This
+preserves future-call promotion; it does not add mapped OSR.
+
+Dedicated tests cover local catch and handler landing, missing-destination
+recovery followed by allocation and Lisp reentry, crossed handler/restart
+clusters, local restarts, replacement transfers from cleanup, multiple values,
+and observed root relocation. The parent remains open for child deoptimization
+and fiber validation, general callable coverage, and universal default entry
+publication.

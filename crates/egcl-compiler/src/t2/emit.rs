@@ -4542,6 +4542,33 @@ fn emit_framed_inner(
     // offset, bcp) at those points; post-processed into a per-bcp map below.
     let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
 
+    // Tiering samples loop-header visits, not every safepoint in a cyclic
+    // region. Backward RPO edges cover reducible and irreducible loops alike.
+    // The initial header visit also counts; these are sampled heat estimates.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let heat_headers: HashSet<_> = {
+        let order: HashMap<_, _> = f
+            .reverse_postorder()
+            .into_iter()
+            .enumerate()
+            .map(|(rank, block)| (block, rank))
+            .collect();
+        let mut headers = HashSet::new();
+        for &block in &blocks {
+            if let Some(term) = f.terminator(block) {
+                for target in &f.inst(term).targets {
+                    if let (Some(target_rank), Some(source_rank)) =
+                        (order.get(&target.block), order.get(&block))
+                        && target_rank <= source_rank
+                    {
+                        headers.insert(target.block);
+                    }
+                }
+            }
+        }
+        headers
+    };
+
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
     for (bi, &b) in blocks.iter().enumerate() {
@@ -4562,11 +4589,13 @@ fn emit_framed_inner(
                 activation_slots.ok_or(EmitError::UnsupportedOp(0xFE))?,
                 shadow_root_slots,
             )?;
-            // The poll helper ignores the request payload. Passing the rooted
-            // activation pointer keeps the veneer ABI uniform and gives the
-            // capture stub a live, stable request word if it takes the cold
-            // transfer path.
+            // The request is an opaque word, never dereferenced by the poll
+            // helper. Its low bit distinguishes loop heat from ordinary polls;
+            // the precise activation itself remains in CAPTURE and shadow roots.
             load_home(&mut a, 7, frame_base, 0);
+            if heat_headers.contains(&b) {
+                a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
+            }
             mov_imm64(&mut a, RAX, poll_veneer as i64);
             emit_runtime_helper_call(&mut a, 0, None);
             let restore_roots: HashSet<_> = roots.iter().copied().collect();

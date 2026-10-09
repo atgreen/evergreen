@@ -10,8 +10,6 @@
 use super::*;
 use super::native_segment_cache::SegmentCacheEntry;
 use super::super::CONTROL_COUNTER;
-use std::cell::Cell;
-use std::sync::OnceLock;
 use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
@@ -22,10 +20,14 @@ use egcl_compiler::t2::native_transfer::{
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
+use std::cell::Cell;
+use std::sync::OnceLock;
 
+mod activation;
+use activation::ActivationState;
 mod deopt;
 mod nested;
-use nested::{SegmentActivations, finish_nested, prepare_nested};
+use nested::{SegmentActivations, finish_nested, prepare_nested, resume_nested};
 #[cfg(test)]
 mod cache_tests;
 use deopt::{prepare_completed_deopt, resume_guard};
@@ -166,6 +168,7 @@ fn retain_native_body(body: &Arc<BytecodeFunction>) -> Arc<ActiveBytecodeRoot> {
 /// Only constructible through the host-specific emitter. Retaining this value
 /// retains every embedded code address and the original bytecode definition.
 pub(super) struct TransferCode {
+    installed_symbol: Option<u32>,
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
@@ -196,6 +199,55 @@ pub(super) struct TransferCode {
     unavailable_handler: Option<(u32, u32)>,
 }
 
+fn opted_in() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
+}
+pub(super) fn installation_enabled() -> bool {
+    opted_in()
+        && super::super::BOOT_COMPLETE.with(|ready| ready.get())
+        && native_transfer::is_supported()
+}
+
+/// Install a baseline representation with its actual transfer ABI. Legacy
+/// direct-call sites reject its version and enter through run_native instead.
+pub(super) fn install_baseline(symbol: u32, body: Arc<BytecodeFunction>) -> Option<Rc<NativeCode>> {
+    if !native_transfer::is_supported() || !fixed_tagged_parameters(&body) {
+        return None;
+    }
+    install_baseline_code(symbol, TransferCode::compile_variant(body, false, false)?)
+}
+
+pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Option<Rc<NativeCode>> {
+    code.installed_symbol = Some(symbol);
+    let body = Arc::clone(&code.body);
+    let code = Rc::new(code);
+    let code_info = install_stack_map(code.slots, std::sync::Weak::new())?;
+    let native = Rc::new(NativeCode {
+        _env_names: NativeEnvNames::new(&body),
+        _call_cells: Vec::new(),
+        entry: code.code.as_ptr(),
+        code_len: code.code_len,
+        num_slots: code.slots,
+        _storage: NativeCodeStorage::Mapped(code),
+        body: Some(body),
+        transfer_abi_version: MAPPED_TRANSFER_ABI_VERSION,
+        transfer_abi_arch: NATIVE_TRANSFER_ARCH,
+        _direct_calls: Vec::new(),
+        is_t2: false,
+        compiled_entry: 0,
+        code_id: 0,
+        osr_entries: HashMap::new(),
+        bcp_offsets: Vec::new(),
+        code_info,
+        has_deopt: false,
+        t2_metadata: None,
+    });
+    NATIVE_REGISTRY.with(|registry| registry.borrow_mut().insert(symbol, Rc::clone(&native)));
+    Some(native)
+}
+
 /// Try the new segment ABI for an ordinary native invocation. This remains an
 /// explicit rollout switch until the platform gates are complete; callers fall
 /// back to the legacy checked ABI when the machine transition or body shape is
@@ -209,11 +261,6 @@ pub(super) fn try_run(
     // read here cost a getenv plus an OsString allocation per call -- 2.7% of a
     // SHA-256 profile, for a process-wide switch that cannot change. The same
     // OnceLock idiom as nn_direct_enabled and profiling_disabled.
-    fn opted_in() -> bool {
-        use std::sync::OnceLock;
-        static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
-    }
     if !opted_in() {
         return None;
     }
@@ -322,6 +369,11 @@ impl TransferCode {
             .or_else(|| Self::compile_variant(body, false, true))
     }
 
+    #[cfg(test)]
+    pub(super) fn compile_nested_protected(body: Arc<BytecodeFunction>) -> Option<Self> {
+        Self::compile_variant(body, false, false)
+    }
+
     pub(super) fn compile_nested(body: Arc<BytecodeFunction>) -> Option<Self> {
         if body.has_env
             || body.variadic
@@ -411,13 +463,16 @@ impl TransferCode {
                 legacy_cell_transfer_pending,
                 capture.as_ptr(),
             ))?;
-            let mapped = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_mapped_call_veneer(
-                Arc::as_ptr(&cell) as u64,
-                prepare_nested,
-                finish_nested,
-                adapter.as_ptr(),
-                capture.as_ptr(),
-            ))?;
+            let mapped = JitBuffer::new(
+                &egcl_compiler::t2::native_transfer::emit_mapped_call_veneer(
+                    Arc::as_ptr(&cell) as u64,
+                    prepare_nested,
+                    finish_nested,
+                    resume_nested,
+                    adapter.as_ptr(),
+                    capture.as_ptr(),
+                ),
+            )?;
             legacy_entries.push(adapter);
             call_entries.push((*sym, cell, mapped));
         }
@@ -515,6 +570,7 @@ impl TransferCode {
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
         let code = JitBuffer::new(&emitted.code)?;
         Some(Self {
+            installed_symbol: None,
             #[cfg(test)]
             unavailable_catch: None,
             #[cfg(test)]
@@ -555,67 +611,21 @@ impl TransferCode {
             ));
         }
         validate_declared_args(&self.body, &args)?;
-        // Reserve the control-value map while the caller can still report an
-        // ordinary storage condition. Once generated code is running, payload
-        // retirement and restoration must not discover a rehash allocation in
-        // the middle of an unwind. The estimate covers primary, multiple-value
-        // and restart-argument entries for every statically mapped scope.
-        let reserve = self
-            .cleanup_depths
-            .len()
-            .saturating_add(self.body.handler_cases.len())
-            .saturating_add(
-                self.body
-                    .code
-                    .iter()
-                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
-                    .count(),
-            )
-            .saturating_mul(4)
-            .saturating_add(4);
-        reserve_control_values(reserve).map_err(|_| EgclError::Oom)?;
-        // Registration helpers push into the live Env as well as the private
-        // activation records. Reserve those tails while ordinary Rust error
-        // reporting is still available; no helper entered from generated code
-        // may discover a Vec growth allocation halfway through a transfer.
-        env.handlers
-            .try_reserve(
-                self.body
-                    .handler_cases
-                    .len()
-                    .saturating_add(self.body.handler_binds.len()),
-            )
-            .map_err(|_| EgclError::Oom)?;
-        env.restarts
-            .try_reserve(self.body.restart_cases.iter().fold(0usize, |total, info| {
-                total.saturating_add(info.restarts.len())
-            }))
-            .map_err(|_| EgclError::Oom)?;
-        env.catch_stack
-            .try_reserve(
-                self.body
-                    .code
-                    .iter()
-                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
-                    .count(),
-            )
-            .map_err(|_| EgclError::Oom)?;
+        let mut state = ActivationState::prepare(self, env)?;
+        egcl_rt::rooted_ref!(_state = &mut state);
         NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
         let _depth = NativeDepthGuard;
         // Every snapshot is reserved and rooted before machine entry. Cold
         // preparation only copies words; no native frame survives into fallback.
-        let mut snapshots = self
-            .sites
-            .sites()
-            .map(|site| site.reserve_snapshot())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| invalid_capture())?;
-        egcl_rt::rooted_ref!(_snapshots = &mut snapshots);
         let stack = egcl_rt::current_stack();
         // Optimized metadata currently owns exactly one logical definition.
-        let function = self.deopt_metadata.as_ref()
+        let function = self
+            .deopt_metadata
+            .as_ref()
             .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
-            .map(EgclVal::from_symbol_index).unwrap_or(NIL);
+            .or(self.installed_symbol)
+            .map(EgclVal::from_symbol_index)
+            .unwrap_or(NIL);
         let frame = stack
             .push_frame(function, std::ptr::null(), self.slots, FLAG_CALL)
             .ok_or_else(|| {
@@ -626,112 +636,17 @@ impl TransferCode {
             })?;
         let mut frame_guard = FrameGuard(Some(frame));
         bind_params(&self.body, frame, &args, None);
-        let mut cleanups = Vec::<SavedCleanup>::with_capacity(self.cleanup_depths.len());
-        egcl_rt::rooted_ref!(_cleanups = &mut cleanups);
-        let mut catches = Vec::<SavedCatch>::with_capacity(
-            self.body
-                .code
-                .iter()
-                .filter(|i| matches!(i, Instr::PushCatch { .. }))
-                .count(),
-        );
         let _catch_guard = CatchScopeGuard {
             env,
-            base: env.catch_stack.len(),
+            base: state.catch_base,
         };
-        let mut handlers = Vec::<SavedHandler>::with_capacity(self.body.handler_cases.len());
-        let mut handler_binds =
-            Vec::<SavedHandlerBind>::with_capacity(self.body.handler_binds.len());
-        let mut restart_cases =
-            Vec::<SavedRestartCase>::with_capacity(self.body.restart_cases.len());
-        // Restart clause bytecode is immutable apart from GC relocation of its
-        // embedded values. Build one rooted template per static clause while
-        // ordinary Rust allocation is still allowed; dynamic scope entry then
-        // only clones an Rc handle instead of cloning the whole function.
-        let mut restart_templates = RestartFunctionTemplates(Vec::new());
-        restart_templates
-            .0
-            .try_reserve(self.body.restart_cases.len())
-            .map_err(|_| EgclError::Oom)?;
-        for info in &self.body.restart_cases {
-            let mut templates = Vec::new();
-            templates
-                .try_reserve(info.restarts.len())
-                .map_err(|_| EgclError::Oom)?;
-            for restart in &info.restarts {
-                templates.push(Rc::new(RefCell::new((*restart.function).clone())));
-            }
-            restart_templates.0.push(templates);
-        }
-        egcl_rt::rooted_ref!(_restart_templates = &mut restart_templates);
-        let mut dynamic_scopes = Vec::<DynamicScope>::with_capacity(
-            self.body.handler_cases.len()
-                + self.body.handler_binds.len()
-                + self.body.restart_cases.len(),
-        );
-        // `prepare` runs after native code has already crossed the transfer
-        // boundary. Keep its frame-chain validation allocation-free: an
-        // ordinary Vec growth there would turn an otherwise reserved unwind
-        // into an allocator failure before the emergency error path can run.
-        let mut cluster_frames = Vec::<(u32, *mut Frame)>::with_capacity(
-            self.body.handler_cases.len()
-                + self.body.handler_binds.len()
-                + self.body.restart_cases.len(),
-        );
         let _dynamic_scope_guard = DynamicScopeGuard {
             env,
-            scopes: &mut dynamic_scopes,
+            scopes: &mut state.dynamic_scopes,
         };
-        let mut prepared_handler = None::<PreparedHandler>;
-        egcl_rt::rooted_ref!(_prepared_handler = &mut prepared_handler);
-        let mut prepared_catch = None::<PreparedCatch>;
-        egcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut children = SegmentActivations::default();
         egcl_rt::rooted_ref!(_children = &mut children);
-        let mut context = CaptureContext {
-            children: &mut children,
-            nested: std::ptr::null_mut(),
-            owner: self,
-            completed_deopt: false,
-            recursive_enabled: self.recursive,
-            recursive_generation: self.recursive_generation,
-            recursive: std::ptr::null_mut(),
-            recursive_escape: false,
-            #[cfg(test)]
-            unavailable_catch: self.unavailable_catch,
-            #[cfg(test)]
-            unavailable_handler: self.unavailable_handler,
-            prepared_catch: &mut prepared_catch,
-            handlers: &mut handlers,
-            handler_binds: &mut handler_binds,
-            restart_cases: &mut restart_cases,
-            restart_templates: &restart_templates,
-            dynamic_scopes: &mut dynamic_scopes,
-            cluster_frames: &mut cluster_frames,
-            prepared_handler: &mut prepared_handler,
-            frame,
-            body: self.body.as_ref(),
-            catches: &mut catches,
-            completed_cleanup: None,
-            landing_stub: self.landing.as_ptr(),
-            landing: SysvNativeLanding {
-                stack_pointer: std::ptr::null_mut(),
-                entry: std::ptr::null(),
-            },
-            dispatch: DispatchPacket {
-                entry: std::ptr::null(),
-                request: std::ptr::null_mut(),
-            },
-            cleanups: &mut cleanups,
-            cleanup_depths: &self.cleanup_depths,
-            code_base: self.code.as_ptr() as usize,
-            sites: &self.sites,
-            snapshots: snapshots.as_mut_ptr().cast(),
-            activation: unsafe { frame.add(1).cast::<EgclVal>() },
-            slots: usize::from(self.slots),
-            selected: None,
-            failure: None,
-        };
+        let mut context = state.context(self, frame, &mut children, std::ptr::null_mut());
         let _scope = BlockScopeGuard {
             env,
             blocks: std::mem::take(&mut env.block_stack),
@@ -778,15 +693,7 @@ impl TransferCode {
         }
         match outcome.exit {
             NativeExit::Returned
-                if error.is_none()
-                    && context.selected.is_none()
-                    && cleanups.is_empty()
-                    && catches.is_empty()
-                    && handler_binds.is_empty()
-                    && restart_cases.is_empty()
-                    && prepared_catch.is_none()
-                    && handlers.is_empty()
-                    && prepared_handler.is_none() =>
+                if error.is_none() && context.selected.is_none() && state.is_quiescent() =>
             {
                 Ok(*primary)
             }
@@ -797,197 +704,246 @@ impl TransferCode {
                     // or reconstruction of any of its recursive callers.
                     return error.take().ok_or_else(invalid_capture).and_then(Err);
                 }
-                #[cfg(test)]
-                NATIVE_FALLBACK_COUNT.with(|count| count.set(count.get() + 1));
-                let index = context.selected.ok_or_else(invalid_capture)?;
-                if error.is_none() {
-                    return Err(invalid_capture());
+                unsafe {
+                    self.resume_transfer(
+                        &mut context,
+                        &mut frame_guard.0,
+                        env,
+                        error.take().ok_or_else(invalid_capture)?,
+                    )
                 }
-                // This path currently admits only tagged values. A future
-                // unboxed emitter must supply its boxing/emergency contract.
-                egcl_rt::rooted!(
-                    frames = snapshots[index]
-                        .reconstruct(|_| unreachable!("tagged-only entry"))
-                        .map_err(|_| invalid_capture())?
-                );
-                let site = self.sites.sites().nth(index).ok_or_else(invalid_capture)?;
-                let saved = frames
-                    .first()
-                    .filter(|saved| {
-                        frames.len() == 1
-                            && saved.resume_pc == site.map().origin_bcp
-                            && saved.locals.len() == usize::from(self.body.n_locals)
-                            && saved.stack.len() <= usize::from(self.body.max_stack)
-                            && matches!(
-                                self.body.code.get(saved.resume_pc as usize),
-                                Some(
-                                    Instr::CallNamed { .. }
-                                        | Instr::EvalHost(_)
-                                        | Instr::LoadFunction(_)
-                                        | Instr::CleanupReturn
-                                        | Instr::SetValues(_)
-                                        | Instr::Throw
-                                        | Instr::PushCatch { .. }
-                                        | Instr::PopHandler
-                                        | Instr::PushHandlerCase { .. }
-                                        | Instr::PopHandlerCase
-                                        | Instr::PushHandlerBind { .. }
-                                        | Instr::PopHandlerBind
-                                        | Instr::PushRestartCase { .. }
-                                        | Instr::PopRestartCase
-                                )
-                            )
-                    })
-                    .ok_or_else(invalid_capture)?;
-                for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
-                    unsafe { slot_set(frame, index as u16, *value) };
-                }
-                let running = site.map().control_scopes.iter().filter_map(|scope| {
-                    if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
-                        (Some(cleanup_bcp) != context.completed_cleanup).then_some(cleanup_bcp)
-                    } else {
-                        None
-                    }
-                });
-                if !running.eq(cleanups.iter().map(|saved| saved.cleanup_bcp)) {
-                    return Err(invalid_capture());
-                }
-                let live_catches = site.map().control_scopes.iter().filter_map(|scope| {
-                    matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
-                });
-                if !live_catches.eq(catches.iter().map(|saved| saved.push_bcp)) {
-                    return Err(invalid_capture());
-                }
-                let live_handlers = site.map().control_scopes.iter().filter_map(|scope| {
-                    matches!(scope.kind, ScopeKind::HandlerCase { .. }).then_some(scope.push_bcp)
-                });
-                if !live_handlers.eq(handlers.iter().map(|saved| saved.push_bcp)) {
-                    return Err(invalid_capture());
-                }
-                let live_handler_binds = site.map().control_scopes.iter().filter_map(|scope| {
-                    matches!(scope.kind, ScopeKind::HandlerBind { .. }).then_some(scope.push_bcp)
-                });
-                if !live_handler_binds.eq(handler_binds.iter().map(|saved| saved.push_bcp)) {
-                    return Err(invalid_capture());
-                }
-                let live_restart_cases = site.map().control_scopes.iter().filter_map(|scope| {
-                    matches!(scope.kind, ScopeKind::RestartCase { .. }).then_some(scope.push_bcp)
-                });
-                if !live_restart_cases.eq(restart_cases.iter().map(|saved| saved.push_bcp)) {
-                    return Err(invalid_capture());
-                }
-                let restored_handlers = site
-                    .map()
-                    .control_scopes
-                    .iter()
-                    .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }))
-                    .map(|scope| match scope.kind {
-                        ScopeKind::Block {
-                            id,
-                            resume_bcp,
-                            register: false,
-                        } => Handler::Block {
-                            block_id: id,
-                            token: String::new(),
-                            resume_bcp,
-                            sp_restore: scope.sp_restore,
-                        },
-                        ScopeKind::Tagbody { id } => Handler::Tag {
-                            tagbody_id: id,
-                            sp_restore: scope.sp_restore,
-                            token: None,
-                            tag_bcps: Vec::new(),
-                        },
-                        ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
-                            cleanup_bcp,
-                            sp_restore: scope.sp_restore,
-                        },
-                        ScopeKind::HandlerCase { .. } => {
-                            let saved = handlers
-                                .iter_mut()
-                                .find(|saved| saved.push_bcp == scope.push_bcp)
-                                .expect("checked handler identity");
-                            Handler::HandlerCase {
-                                clauses: std::mem::take(&mut saved.clauses),
-                                sp_restore: scope.sp_restore,
-                                cluster_base: saved.cluster_base,
-                                cluster_frame: saved.cluster_frame,
-                            }
-                        }
-                        ScopeKind::HandlerBind { .. } => {
-                            let saved = handler_binds
-                                .iter()
-                                .find(|saved| saved.push_bcp == scope.push_bcp)
-                                .expect("checked handler-bind identity");
-                            Handler::HandlerBind {
-                                cluster_base: saved.cluster_base,
-                                cluster_frame: saved.cluster_frame,
-                            }
-                        }
-                        ScopeKind::RestartCase { resume_bcp, .. } => {
-                            let saved = restart_cases
-                                .iter()
-                                .find(|saved| saved.push_bcp == scope.push_bcp)
-                                .expect("checked restart-case identity");
-                            Handler::RestartCase {
-                                restart_base: saved.restart_base,
-                                resume_bcp,
-                                sp_restore: scope.sp_restore,
-                                cluster_frame: saved.cluster_frame,
-                            }
-                        }
-                        ScopeKind::Catch { resume_bcp } => Handler::Catch {
-                            token: catches
-                                .iter()
-                                .find(|saved| saved.push_bcp == scope.push_bcp)
-                                .expect("checked catch identity")
-                                .token
-                                .clone(),
-                            resume_bcp,
-                            sp_restore: scope.sp_restore,
-                        },
-                        _ => unreachable!("admission checked all scope records"),
-                    })
-                    .collect();
-                // Bytecode now owns the live cluster frames and registrations.
-                handlers.clear();
-                handler_binds.clear();
-                restart_cases.clear();
-                dynamic_scopes.clear();
-                let mut acts = vec![Activation {
-                    frame,
-                    _debug_call: None,
-                    func: self.body.clone(),
-                    bcp: saved.resume_pc as usize,
-                    sp_top: saved.stack.len() as u16,
-                    n_locals: self.body.n_locals,
-                    handlers: restored_handlers,
-                    cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
-                    dyn_binds: Vec::new(),
-                    env_frame: None,
-                    fn_obj: None,
-                    sym: u32::MAX,
-                }];
-                egcl_rt::rooted_ref!(_acts = &mut acts);
-                // Transfer ownership only after constructing the activation.
-                // Crucially: unwind FIRST, never run the failed CallNamed again.
-                frame_guard.0 = None;
-                let pending = error_to_pending(error.take().expect("checked pending error"), env);
-                let result = initiate_unwind(&mut acts, stack, env, pending)
-                    .and_then(|()| run_loop(&mut acts, env));
-                while let Some(mut act) = acts.pop() {
-                    release_activation_handlers(&mut act, stack, env);
-                    stack.pop_frame();
-                }
-                result
             }
             _ => Err(invalid_capture()),
         }
+    }
+    /// Resume only after the owning machine frame has been abandoned. Frame
+    /// ownership moves to T0 once its rooted activation is complete.
+    unsafe fn resume_transfer(
+        &self,
+        context: *mut CaptureContext,
+        frame_owner: *mut Option<*mut Frame>,
+        env: &mut Env,
+        error: EgclError,
+    ) -> Result<EgclVal, EgclError> {
+        egcl_rt::rooted!(error = Some(error));
+        let context = unsafe { &mut *context };
+        let frame = context.frame;
+        let stack = egcl_rt::current_stack();
+        let cleanups = unsafe { &mut *context.cleanups };
+        let catches = unsafe { &mut *context.catches };
+        let handlers = unsafe { &mut *context.handlers };
+        let handler_binds = unsafe { &mut *context.handler_binds };
+        let restart_cases = unsafe { &mut *context.restart_cases };
+        let dynamic_scopes = unsafe { &mut *context.dynamic_scopes };
+        #[cfg(test)]
+        NATIVE_FALLBACK_COUNT.with(|count| count.set(count.get() + 1));
+        let index = context.selected.ok_or_else(invalid_capture)?;
+        if error.is_none() {
+            return Err(invalid_capture());
+        }
+        // This path currently admits only tagged values. A future
+        // unboxed emitter must supply its boxing/emergency contract.
+        egcl_rt::rooted!(
+            frames = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index) }
+                .reconstruct(|_| unreachable!("tagged-only entry"))
+                .map_err(|_| invalid_capture())?
+        );
+        let site = self.sites.sites().nth(index).ok_or_else(invalid_capture)?;
+        let saved = frames
+            .first()
+            .filter(|saved| {
+                frames.len() == 1
+                    && saved.resume_pc == site.map().origin_bcp
+                    && saved.locals.len() == usize::from(self.body.n_locals)
+                    && saved.stack.len() <= usize::from(self.body.max_stack)
+                    && matches!(
+                        self.body.code.get(saved.resume_pc as usize),
+                        Some(
+                            Instr::CallNamed { .. }
+                                | Instr::EvalHost(_)
+                                | Instr::LoadFunction(_)
+                                | Instr::CleanupReturn
+                                | Instr::SetValues(_)
+                                | Instr::Throw
+                                | Instr::PushCatch { .. }
+                                | Instr::PopHandler
+                                | Instr::PushHandlerCase { .. }
+                                | Instr::PopHandlerCase
+                                | Instr::PushHandlerBind { .. }
+                                | Instr::PopHandlerBind
+                                | Instr::PushRestartCase { .. }
+                                | Instr::PopRestartCase
+                        )
+                    )
+            })
+            .ok_or_else(invalid_capture)?;
+        for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
+            unsafe { slot_set(frame, index as u16, *value) };
+        }
+        let running = site.map().control_scopes.iter().filter_map(|scope| {
+            if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+                (Some(cleanup_bcp) != context.completed_cleanup).then_some(cleanup_bcp)
+            } else {
+                None
+            }
+        });
+        if !running.eq(cleanups.iter().map(|saved| saved.cleanup_bcp)) {
+            return Err(invalid_capture());
+        }
+        let live_catches = site.map().control_scopes.iter().filter_map(|scope| {
+            matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
+        });
+        if !live_catches.eq(catches.iter().map(|saved| saved.push_bcp)) {
+            return Err(invalid_capture());
+        }
+        let live_handlers = site.map().control_scopes.iter().filter_map(|scope| {
+            matches!(scope.kind, ScopeKind::HandlerCase { .. }).then_some(scope.push_bcp)
+        });
+        if !live_handlers.eq(handlers.iter().map(|saved| saved.push_bcp)) {
+            return Err(invalid_capture());
+        }
+        let live_handler_binds = site.map().control_scopes.iter().filter_map(|scope| {
+            matches!(scope.kind, ScopeKind::HandlerBind { .. }).then_some(scope.push_bcp)
+        });
+        if !live_handler_binds.eq(handler_binds.iter().map(|saved| saved.push_bcp)) {
+            return Err(invalid_capture());
+        }
+        let live_restart_cases = site.map().control_scopes.iter().filter_map(|scope| {
+            matches!(scope.kind, ScopeKind::RestartCase { .. }).then_some(scope.push_bcp)
+        });
+        if !live_restart_cases.eq(restart_cases.iter().map(|saved| saved.push_bcp)) {
+            return Err(invalid_capture());
+        }
+        let restored_handlers = site
+            .map()
+            .control_scopes
+            .iter()
+            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }))
+            .map(|scope| match scope.kind {
+                ScopeKind::Block {
+                    id,
+                    resume_bcp,
+                    register: false,
+                } => Handler::Block {
+                    block_id: id,
+                    token: String::new(),
+                    resume_bcp,
+                    sp_restore: scope.sp_restore,
+                },
+                ScopeKind::Tagbody { id } => Handler::Tag {
+                    tagbody_id: id,
+                    sp_restore: scope.sp_restore,
+                    token: None,
+                    tag_bcps: Vec::new(),
+                },
+                ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
+                    cleanup_bcp,
+                    sp_restore: scope.sp_restore,
+                },
+                ScopeKind::HandlerCase { .. } => {
+                    let saved = handlers
+                        .iter_mut()
+                        .find(|saved| saved.push_bcp == scope.push_bcp)
+                        .expect("checked handler identity");
+                    Handler::HandlerCase {
+                        clauses: std::mem::take(&mut saved.clauses),
+                        sp_restore: scope.sp_restore,
+                        cluster_base: saved.cluster_base,
+                        cluster_frame: saved.cluster_frame,
+                    }
+                }
+                ScopeKind::HandlerBind { .. } => {
+                    let saved = handler_binds
+                        .iter()
+                        .find(|saved| saved.push_bcp == scope.push_bcp)
+                        .expect("checked handler-bind identity");
+                    Handler::HandlerBind {
+                        cluster_base: saved.cluster_base,
+                        cluster_frame: saved.cluster_frame,
+                    }
+                }
+                ScopeKind::RestartCase { resume_bcp, .. } => {
+                    let saved = restart_cases
+                        .iter()
+                        .find(|saved| saved.push_bcp == scope.push_bcp)
+                        .expect("checked restart-case identity");
+                    Handler::RestartCase {
+                        restart_base: saved.restart_base,
+                        resume_bcp,
+                        sp_restore: scope.sp_restore,
+                        cluster_frame: saved.cluster_frame,
+                    }
+                }
+                ScopeKind::Catch { resume_bcp } => Handler::Catch {
+                    token: catches
+                        .iter()
+                        .find(|saved| saved.push_bcp == scope.push_bcp)
+                        .expect("checked catch identity")
+                        .token
+                        .clone(),
+                    resume_bcp,
+                    sp_restore: scope.sp_restore,
+                },
+                _ => unreachable!("admission checked all scope records"),
+            })
+            .collect();
+        // Bytecode now owns the live cluster frames and registrations.
+        handlers.clear();
+        handler_binds.clear();
+        restart_cases.clear();
+        dynamic_scopes.clear();
+        catches.clear();
+        let mut acts = vec![Activation {
+            frame,
+            _debug_call: None,
+            func: self.body.clone(),
+            bcp: saved.resume_pc as usize,
+            sp_top: saved.stack.len() as u16,
+            n_locals: self.body.n_locals,
+            handlers: restored_handlers,
+            cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
+            dyn_binds: Vec::new(),
+            env_frame: None,
+            fn_obj: None,
+            sym: u32::MAX,
+        }];
+        egcl_rt::rooted_ref!(_acts = &mut acts);
+        // Transfer ownership only after constructing the activation.
+        // Crucially: unwind FIRST, never run the failed CallNamed again.
+        unsafe {
+            *frame_owner = None;
+        }
+        let _capture = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
+        let pending = error_to_pending(error.take().expect("checked pending error"), env);
+        let result = guard_c2i(|| {
+            initiate_unwind(&mut acts, stack, env, pending).and_then(|()| run_loop(&mut acts, env))
+        });
+        while let Some(mut act) = acts.pop() {
+            release_activation_handlers(&mut act, stack, env);
+            stack.pop_frame();
+        }
+        result
     }
 }
 
 fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
+}
+
+pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
+    !body.has_env
+        && !body.variadic
+        && body.min_args == body.arity
+        && body.max_args == Some(body.arity)
+        && body.param_layout.len() == usize::from(body.arity)
+        && body
+            .param_layout
+            .iter()
+            .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+        && body
+            .param_types
+            .iter()
+            .all(|ty| matches!(ty, DeclaredType::Any))
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
@@ -1135,6 +1091,13 @@ unsafe extern "C" fn finish_recursive(activation: *mut RecursiveActivation) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     unsafe {
         retire_recursive(context, activation);
+    }
+}
+
+struct CapturePause(*mut CaptureContext);
+impl Drop for CapturePause {
+    fn drop(&mut self) {
+        CAPTURE.with(|slot| slot.set(self.0));
     }
 }
 
@@ -1895,11 +1858,19 @@ unsafe extern "C" fn call_or_throw(
 /// returns a successful outcome; the veneer never performs a status check in
 /// generated code. A nonzero result enters the existing capture/landing path.
 unsafe extern "C" fn poll_or_transfer(
-    _request: *mut u8,
+    request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
     egcl_rt::safepoint::poll_safepoint();
+    if request as usize & 1 != 0
+        && let Err(error) = guard_c2i(|| {
+            record_loop_heat();
+            Ok(NIL)
+        })
+    {
+        NATIVE_ERROR.with(|slot| slot.set_first(error));
+    }
     // The scheduler validates every active segment before resuming a fiber,
     // including yields inside ordinary helpers. This poll handles only the
     // independent GC, preemption and asynchronous-transfer obligations.
@@ -1911,6 +1882,47 @@ unsafe extern "C" fn poll_or_transfer(
     unsafe {
         out.write(NativeOutcome { value: NIL, exit });
     }
+}
+
+/// Attribute sampled loop visits only to the exact installed definition.
+/// Publication may replace future entry points while this activation retains
+/// its code; it cannot turn the running mapped frame into a legacy OSR frame.
+fn record_loop_heat() {
+    if profiling_disabled() {
+        return;
+    }
+    let capture = CAPTURE.with(Cell::get);
+    if capture.is_null() {
+        return;
+    }
+    let (symbol, body) = unsafe {
+        let code = &*(*capture).owner;
+        (code.installed_symbol, Arc::as_ptr(&code.body))
+    };
+    let Some(symbol) = symbol else {
+        return;
+    };
+    if !recursive_definition_matches(symbol, body) {
+        return;
+    }
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    let count = egcl_rt::function::record_back_edges(*function, 1);
+    let threshold = t2_backedge_threshold().max(1);
+    if !t2_enabled() || count < threshold || count % threshold != 0 {
+        return;
+    }
+    poll_t2_completions();
+    if NATIVE_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .get(&symbol)
+            .is_some_and(|code| code.is_t2)
+    }) {
+        return;
+    }
+    let priority = (u64::from(count) << 32) | u64::from(egcl_rt::function::invoke_count(*function));
+    request_t2_compilation(symbol, priority);
+    poll_t2_completions();
 }
 
 unsafe extern "C" fn complete_cleanup(

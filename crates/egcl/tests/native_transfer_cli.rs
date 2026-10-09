@@ -546,3 +546,43 @@ fn superseding_nested_cleanups_do_not_replay_outer_cleanup_suffixes() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("CLEANUP-CONTINUATIONS-OK"));
     }
 }
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(egcl_no_disassembly)))]
+fn protected_functions_publish_tagged_native_baselines() {
+    let output = bounded_native_probe(&[
+        "--no-init",
+        "--eval",
+        r#"
+        (defvar *protected-baseline-cleanups* 0)
+        (defun protected-baseline-cleanup () (incf *protected-baseline-cleanups*))
+        (defun protected-baseline (x fail)
+          (catch :protected-baseline
+            (unwind-protect
+                (if fail (throw :protected-baseline (values x (list x)))
+                         (values x (list x)))
+              (protected-baseline-cleanup))))
+        (defun protected-baseline-caller (x fail) (protected-baseline x fail))
+        (dotimes (i 30)
+          (let ((x (list i)))
+            (assert (equal (list x (list x))
+                           (multiple-value-list (protected-baseline-caller x nil))))
+            (assert (equal (list x (list x))
+                           (multiple-value-list (protected-baseline-caller x t))))))
+        (assert (= *protected-baseline-cleanups* 60))
+        (disassemble 'protected-baseline)
+        (format t "PROTECTED-BASELINE-OK~%")
+    "#,
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("PROTECTED-BASELINE-OK"), "{stdout}");
+    assert!(
+        stdout.contains("tagged baseline native with mapped exceptional transfers"),
+        "{stdout}"
+    );
+}
