@@ -69,6 +69,7 @@ pub mod pass;
 pub mod slot_map; // per-safepoint slot liveness + representation producer (bliss-ht4)
 pub mod transfer_capture;
 pub mod transfer_map;
+pub mod x64_calls;
 pub mod x64_frame;
 
 // ── Front end ─────────────────────────────────────────────────────

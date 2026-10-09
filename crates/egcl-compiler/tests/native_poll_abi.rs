@@ -180,6 +180,13 @@ fn call_free_poll_loop_emits_an_aligned_call_frame() {
         0x5555_6666_7777_8888,
     )
     .expect("emit poll loop");
+    let polls: Vec<_> = framed.native_calls.as_ref().unwrap().iter().filter(|site|
+        matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(_))).collect();
+    assert!(!polls.is_empty());
+    for site in polls {
+        assert_eq!(&framed.code[site.return_offset - 2..site.return_offset], &[0xff, 0xd0]);
+        assert_eq!(site.stack_adjust, 0);
+    }
     // No value register needs saving, so the alignment-only prologue is the
     // first instruction: sub rsp, 8.  Before this regression fix the emitter
     // omitted it because the bytecode itself contained no call.
@@ -382,5 +389,78 @@ fn inserted_polls_relocate_live_heap_values() {
             "return uses the moved native value"
         );
         assert_eq!(expected.as_double_float(), 123.5);
+    }
+}
+
+#[test]
+fn native_call_sites_match_invoke_and_inserted_poll_return_pcs() {
+    use egcl_compiler::t2::x64_calls::{NativeCallOrigin, NativeStackBase};
+    let mut body = bytecode_fn();
+    body.n_locals = 1;
+    body.arity = 1;
+    body.min_args = 1;
+    body.max_args = Some(1);
+    let mut prefix = Vec::new();
+    for _ in 0..70 {
+        prefix.extend([Instr::LoadLocal(0), Instr::TypeP(egcl_rt::bytecode::typep_class::BOOLEAN), Instr::Pop]);
+    }
+    prefix.append(&mut body.code);
+    body.code = prefix;
+    let function = build_from_bytecode_for_transfers(&body).unwrap();
+    let (framed, transfers) = emit_framed_native_handlers_with_poll(
+        &function, 0x1111_2222_3333_4444, 8, 0x10, 0x20, 0x30, 0x40, 0x50,
+        0x5555_6666_7777_8888,
+    ).unwrap();
+    let sites = framed.native_calls.as_ref().unwrap();
+    let mut invokes = 0;
+    let mut polls = 0;
+    for site in sites.iter() {
+        assert_eq!(&framed.code[site.return_offset - 2..site.return_offset], &[0xff, 0xd0]);
+        assert_eq!(sites.get(site.return_offset), Some(site));
+        assert!(sites.get(site.return_offset - 1).is_none());
+        match site.origin {
+            NativeCallOrigin::Instruction(inst) => {
+                assert_eq!(function.inst(inst).opcode, egcl_compiler::t2::ir::Opcode::Invoke);
+                assert_eq!(site.stack_adjust, 64);
+                assert_eq!(site.stack_base, NativeStackBase::Body);
+                assert!(transfers.lookup(0, site.return_offset).is_some());
+                invokes += 1;
+            }
+            NativeCallOrigin::StraightPoll(_) => {
+                assert_eq!(site.stack_adjust, 0);
+                assert_eq!(site.stack_base, NativeStackBase::Body);
+                polls += 1;
+            }
+            NativeCallOrigin::RestartDeopt => {
+                assert_eq!(site.stack_adjust, 8);
+                assert_eq!(site.stack_base, NativeStackBase::Entry);
+            }
+            other => panic!("unexpected site: {other:?}"),
+        }
+    }
+    assert_eq!(invokes, 71);
+    assert!(polls > 0);
+    assert!(sites.get(framed.code.len()).is_none());
+}
+
+#[test]
+fn ordinary_call_metadata_covers_register_and_slice_arguments() {
+    use egcl_compiler::t2::x64_calls::NativeCallOrigin;
+    for nargs in [0, 3, 5] {
+        let mut body = legacy_bytecode_fn();
+        body.constants = vec![EgclVal::from_fixnum(1)];
+        body.code = vec![Instr::Const(0); nargs];
+        body.code.extend([Instr::CallNamed { sym: 123, nargs: nargs as u16 }, Instr::Return]);
+        body.max_stack = (nargs + 1) as u16;
+        let function = egcl_compiler::t2::build::build_from_bytecode(&body).unwrap();
+        let code = emit_framed_with_activation_slots(&function,
+            1, 2, 3, 4, 5, 6, 7, 8, 0x1234, 0x5678, 0, body.num_slots(), None).unwrap();
+        let calls: Vec<_> = code.native_calls.as_ref().unwrap().iter().filter(|site|
+            matches!(site.origin, NativeCallOrigin::Instruction(_))).collect();
+        assert_eq!(calls.len(), 1, "arity {nargs}");
+        assert_eq!(calls[0].stack_adjust, 0);
+        assert_eq!(&code.code[calls[0].return_offset - 2..calls[0].return_offset], &[0xff, 0xd0]);
+        // RAX is saved immediately on the primary return, before toggling recovery back on.
+        assert_eq!(&code.code[calls[0].return_offset..calls[0].return_offset + 4], &[0x48, 0x83, 0xec, 16]);
     }
 }

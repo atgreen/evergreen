@@ -400,6 +400,20 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     )
     .unwrap();
     assert!(emitted.has_deopt);
+    // One scope header (four words), one local, and the native request area:
+    // 40 + 32 bytes rounded to 16-byte call alignment = 80 bytes.
+    let deopts: Vec<_> = emitted.native_calls.as_ref().unwrap().iter().filter(|site|
+        matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();
+    assert_eq!(deopts.len(), 1);
+    assert_eq!(deopts[0].stack_adjust, 80);
+    assert_eq!(&emitted.code[deopts[0].return_offset - 2..deopts[0].return_offset], &[0xff, 0xd0]);
+    let legacy = egcl_compiler::t2::emit::emit_framed_with_direct_natives(
+        &ir, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 1, None, &[], 1, &[], Default::default(),
+    ).unwrap();
+    let legacy_deopts: Vec<_> = legacy.native_calls.as_ref().unwrap().iter().filter(|site|
+        matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();
+    assert_eq!(legacy_deopts.len(), 1);
+    assert_eq!(legacy_deopts[0].stack_adjust, 48, "legacy serialization has no native request");
     let code = JitBuffer::new(&emitted.code).unwrap();
     let stack = EgclStack::new(64 * 1024);
     for (input, expected) in [
