@@ -178,6 +178,8 @@ pub(super) struct TransferCode {
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
+    // Retired definitions retain their exact value recipes as long as code lives.
+    _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
     code_len: usize,
     #[cfg(test)]
     pub(super) has_deopt: bool,
@@ -398,6 +400,11 @@ pub(super) fn take_nested_entries() -> usize {
 }
 
 impl TransferCode {
+    #[cfg(test)]
+    pub(super) fn value_maps_for_test(&self) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
+        &self._native_calls
+    }
+
     #[cfg(test)]
     pub(super) fn deopt_count(&self) -> u32 {
         self.deopts.get()
@@ -632,6 +639,7 @@ impl TransferCode {
             _body_roots: roots,
             code,
             code_len: emitted.code.len(),
+            _native_calls: Arc::new(emitted.native_calls?),
             #[cfg(test)]
             has_deopt: emitted.has_deopt,
             _veneer: veneer,

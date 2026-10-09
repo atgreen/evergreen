@@ -95,7 +95,9 @@
 //! `native_calls` separately indexes exact primary CALL return offsets, their
 //! source instructions/polls/deopt states, and temporary stack adjustments.
 //! Recovery toggles and other noncollecting leaf callbacks are excluded. These
-//! attachment points do not yet describe the authoritative suspended values.
+//! records bind the authoritative activation shadows, outgoing copies, and
+//! native homes. Deoptimization transfers ownership to reconstructed managed
+//! frames before GC can observe the abandoned native serialization buffer.
 //!
 //! # Native transfers (Linux x86-64 only)
 //!
@@ -127,7 +129,10 @@
 //!   sources serialised by each precise deopt stub.
 //! * `EGCL_NO_DIRECT_SELF_CALL=1` — route self-calls through c2i.
 
-use crate::t2::x64_calls::{CallReturn, NativeCallOrigin, NativeCallSites, NativeStackBase};
+use crate::t2::x64_calls::{
+    CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
+};
+use crate::t2::x64_value_maps::{NativeFrameLayout, NativeFrameValues};
 use egcl_rt::asm::{Asm, Cc};
 
 use crate::t2::ir::Function;
@@ -644,7 +649,8 @@ fn float_operand_to_xmm(
 pub struct FramedCode {
     pub code: Vec<u8>,
     /// Exact x86-64 returning-call attachment points, independent of debugger flags.
-    /// Other backends have not supplied this metadata. These are not GC recipes.
+    /// SysV records bind authoritative value copies; other backends explicitly
+    /// report unavailable metadata.
     pub native_calls: Option<crate::t2::x64_calls::NativeCallSites>,
     /// Owned unwind records for the independently callable Windows entries.
     #[cfg(all(target_arch = "x86_64", windows))]
@@ -949,6 +955,7 @@ struct PollFrame {
     activation_slots: u16,
     shadow_slots: u16,
     raw_spill_start: u32,
+    native_slots: u32,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -959,7 +966,7 @@ fn emit_mapped_poll(
     frame: &PollFrame,
     veneer: u64,
     heat: bool,
-) -> Result<CallReturn, EmitError> {
+) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -975,6 +982,30 @@ fn emit_mapped_poll(
         .filter(|value| value.gc_home().is_some())
         .map(|value| value.value)
         .collect();
+    let layout = NativeFrameLayout {
+        native_slots: frame.native_slots,
+        activation_base_slot: match frame.base {
+            FramedHome::Stack(slot) => Some(slot),
+            _ => return Err(EmitError::UnsupportedOp(0xFE)),
+        },
+        activation_slots: frame
+            .activation_slots
+            .checked_add(frame.shadow_slots)
+            .ok_or(EmitError::UnsupportedOp(0xFE))?,
+    };
+    let map = std::sync::Arc::new(
+        NativeFrameValues::for_call(
+            values.values(),
+            &roots,
+            frame.activation_slots,
+            &[],
+            None,
+            layout,
+            Some(frame.raw_spill_start),
+            |_| false,
+        )
+        .map_err(|_| EmitError::UnsupportedOp(0xFE))?,
+    );
     emit_shadow_root_sync(
         a,
         &roots,
@@ -1007,7 +1038,7 @@ fn emit_mapped_poll(
         );
         store_home(a, home, RAX, 0);
     }
-    Ok(site)
+    Ok((site, map))
 }
 
 /// One home-to-home move, RAX as intermediary where x86 needs one. RAX is
@@ -4595,7 +4626,26 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
         base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
+        native_slots: native_spill_slots,
     });
+    let native_layout = NativeFrameLayout {
+        native_slots: native_spill_slots,
+        activation_base_slot: match frame_base_home {
+            Some(FramedHome::Stack(slot)) => Some(slot),
+            None => None,
+            _ => return Err(EmitError::UnsupportedOp(0xFD)),
+        },
+        activation_slots: activation_slots
+            .unwrap_or(0)
+            .checked_add(shadow_root_slots)
+            .ok_or(EmitError::UnsupportedOp(0xFD))?,
+    };
+    let resolved_by_source: HashMap<_, _> = resolved
+        .iter()
+        .map(|point| (point.source_inst, point))
+        .collect();
+    let mut native_value_maps = HashMap::new();
+
     let mut native_calls = Vec::new();
     let mut root_sync_sites = Vec::new();
     let mut emitted_safepoints = 0usize;
@@ -4642,7 +4692,7 @@ fn emit_framed_inner(
                 .as_ref()
                 .and_then(|transfer| transfer.poll_veneer)
                 .ok_or(EmitError::UnsupportedOp(0xFE))?;
-            let call = emit_mapped_poll(
+            let (call, values) = emit_mapped_poll(
                 &mut a,
                 loop_maps.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
                 &homes,
@@ -4650,6 +4700,7 @@ fn emit_framed_inner(
                 poll_veneer,
                 heat_headers.contains(&b),
             )?;
+            native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
             native_calls.push(call.site(NativeCallOrigin::LoopPoll(b), NativeStackBase::Body));
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
@@ -4669,7 +4720,7 @@ fn emit_framed_inner(
                     .as_ref()
                     .and_then(|transfer| transfer.poll_veneer)
                     .ok_or(EmitError::UnsupportedOp(0xFE))?;
-                let call = emit_mapped_poll(
+                let (call, values) = emit_mapped_poll(
                     &mut a,
                     straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
                     &homes,
@@ -4677,6 +4728,7 @@ fn emit_framed_inner(
                     poll_veneer,
                     false,
                 )?;
+                native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
                 native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
@@ -5173,6 +5225,48 @@ fn emit_framed_inner(
                     inst_deopt_label,
                 )?;
             }
+            if cfg!(all(target_arch = "x86_64", unix))
+                && !inst_calls.is_empty()
+                && let Some(activation_slots) = activation_slots
+            {
+                let outgoing = if d.opcode == Opcode::Invoke || wide_call {
+                    d.args.as_slice()
+                } else {
+                    &[]
+                };
+                let outgoing_base = if outgoing.is_empty() {
+                    None
+                } else {
+                    Some(
+                        activation_slots
+                            .checked_add(root_shadow_slots)
+                            .ok_or(EmitError::UnsupportedOp(0xFD))?,
+                    )
+                };
+                let point = resolved_by_source
+                    .get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(0xFD))?;
+                let values = std::sync::Arc::new(
+                    NativeFrameValues::for_call(
+                        point.values(),
+                        roots.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                        activation_slots,
+                        outgoing,
+                        outgoing_base,
+                        native_layout,
+                        None,
+                        proven_immediate,
+                    )
+                    .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+                );
+                for call in &inst_calls {
+                    native_value_maps.insert(
+                        call.return_offset,
+                        NativeCallValues::Frame(std::sync::Arc::clone(&values)),
+                    );
+                }
+            }
+
             native_calls.extend(inst_calls.into_iter().map(|call| {
                 call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
             }));
@@ -5438,6 +5532,7 @@ fn emit_framed_inner(
     let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
     if !cfg!(windows) {
         call.stack_adjust += 8;
+        native_value_maps.insert(call.return_offset, NativeCallValues::Retired);
     }
     native_calls.push(call.site(
         NativeCallOrigin::RestartDeopt,
@@ -5619,6 +5714,14 @@ fn emit_framed_inner(
             call.stack_adjust = call.stack_adjust
                 .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
+            if cfg!(all(target_arch = "x86_64", unix)) {
+                native_value_maps.insert(
+                    call.return_offset,
+                    NativeCallValues::Deoptimizing {
+                        native_slots: native_spill_slots,
+                    },
+                );
+            }
             native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
         }
         if segment_deopt.is_none() {
@@ -5636,6 +5739,14 @@ fn emit_framed_inner(
             call.stack_adjust = call.stack_adjust
                 .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
                 .ok_or(EmitError::BadBranch)?;
+            if cfg!(all(target_arch = "x86_64", unix)) {
+                native_value_maps.insert(
+                    call.return_offset,
+                    NativeCallValues::Deoptimizing {
+                        native_slots: native_spill_slots,
+                    },
+                );
+            }
             native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
         }
         if alloc > 0 {
@@ -5846,7 +5957,21 @@ fn emit_framed_inner(
     let mut heap_constant_slots: Vec<usize> = heap_const_slots.values().copied().collect();
     heap_constant_slots.sort_unstable();
     heap_constant_slots.dedup();
-    let native_calls = NativeCallSites::new(code.len(), native_calls).ok_or(EmitError::BadBranch)?;
+    let native_calls = NativeCallSites::new(code.len(), native_calls)
+        .and_then(|sites| sites.with_value_maps(native_value_maps))
+        .ok_or(EmitError::BadBranch)?;
+    if cfg!(all(target_arch = "x86_64", unix))
+        && activation_slots.is_some()
+        && native_calls.iter().any(|site| {
+            matches!(
+                native_calls.value_map(site.return_offset),
+                None | Some(NativeCallValues::Unavailable)
+            )
+        })
+    {
+        return Err(EmitError::UnsupportedOp(0xFD));
+    }
+
     Ok(FramedCode {
         native_calls: Some(native_calls),
         code,
@@ -7471,8 +7596,56 @@ mod poll_map_tests {
 
     #[test]
     fn poll_relocates_tagged_home_without_scanning_raw_register_bits() {
-        extern "C" fn collect(_: *mut u64) -> u64 {
+        use crate::t2::x64_value_maps::NativeValueLocation;
+        struct Check {
+            map: std::sync::Arc<NativeFrameValues>,
+            tagged: crate::t2::ir::Value,
+            raw: crate::t2::ir::Value,
+            raw_bits: u64,
+            observed: bool,
+        }
+        thread_local! {
+            static CHECK: std::cell::Cell<*mut Check> = const {
+                std::cell::Cell::new(std::ptr::null_mut())
+            };
+        }
+        extern "C" fn collect(activation: *mut u64, body_rsp: *const u64) -> u64 {
+            let check = unsafe { &mut *CHECK.with(std::cell::Cell::get) };
+            let read = |location: &NativeValueLocation| unsafe {
+                match *location {
+                    NativeValueLocation::Activation(slot) => activation.add(slot as usize).read(),
+                    NativeValueLocation::Stack(offset) => {
+                        body_rsp.byte_offset(offset as isize).read()
+                    }
+                    _ => panic!("unexpected poll location: {location:?}"),
+                }
+            };
+            let base_slot = check.map.layout().activation_base_slot.unwrap();
+            assert_eq!(
+                unsafe { body_rsp.add(base_slot as usize).read() },
+                activation as u64
+            );
+            let tagged = check.map.ssa_value(check.tagged).unwrap();
+            let raw = check.map.ssa_value(check.raw).unwrap();
+            assert_eq!(
+                check.map.gc_locations().collect::<Vec<_>>(),
+                tagged.locations().iter().collect::<Vec<_>>()
+            );
+            assert!(!raw.may_reference_heap());
+            let before = read(&tagged.locations()[0]);
+            assert_eq!(read(&raw.locations()[0]), check.raw_bits);
             HeapCollector::new().minor_gc().unwrap();
+            assert_ne!(
+                read(&tagged.locations()[0]),
+                before,
+                "mapped root must move"
+            );
+            assert_eq!(
+                read(&raw.locations()[0]),
+                check.raw_bits,
+                "raw map must describe unchanged bits"
+            );
+            check.observed = true;
             unsafe {
                 core::arch::asm!("xor rcx,rcx", "xor r8,r8",
                     out("rcx") _, out("r8") _, options(nomem, nostack));
@@ -7508,12 +7681,18 @@ mod poll_map_tests {
                 stack_slots: 1,
             };
             let values = resolve_values_before(&f, &machine, &homes, &HashMap::new(), 0).unwrap();
+            // Pass the actual caller body RSP without changing the CALL return PC.
+            let mut veneer = Asm::new();
+            veneer.extend_from_slice(&[0x48, 0x8d, 0x74, 0x24, 8]); // lea rsi,[rsp+8]
+            mov_imm64(&mut veneer, RAX, collect as *const () as i64);
+            veneer.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+            let veneer = egcl_rt::jit::JitBuffer::new(&veneer.finish().unwrap()).unwrap();
             let mut a = Asm::new();
             a.extend_from_slice(&[0x48, 0x83, 0xec, 40]); // aligned frame: raw home, base, raw save, padding
             store_home(&mut a, FramedHome::Stack(1), 7, 0);
             mov_from_frame(&mut a, 1, 7, 0);
             store_home(&mut a, raw_home, 6, 0); // second C argument is raw heap-looking bits
-            emit_mapped_poll(
+            let (_, map) = emit_mapped_poll(
                 &mut a,
                 &values,
                 &homes.values,
@@ -7522,8 +7701,9 @@ mod poll_map_tests {
                     activation_slots: 1,
                     shadow_slots: 1,
                     raw_spill_start: 2,
+                    native_slots: 5,
                 },
-                collect as *const () as u64,
+                veneer.as_ptr() as u64,
                 false,
             )
             .unwrap();
@@ -7542,7 +7722,17 @@ mod poll_map_tests {
             egcl_rt::rooted!(expected = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
             activation[0] = *expected;
             let original = expected.to_raw();
+            let mut check = Check {
+                map,
+                tagged,
+                raw,
+                raw_bits: original,
+                observed: false,
+            };
+            CHECK.with(|slot| slot.set(&mut check));
             let returned = run(activation.as_mut_ptr().cast(), original);
+            CHECK.with(|slot| slot.set(std::ptr::null_mut()));
+            assert!(check.observed);
             assert_ne!(
                 expected.to_raw(),
                 original,

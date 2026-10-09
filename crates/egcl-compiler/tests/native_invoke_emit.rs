@@ -6,6 +6,8 @@ use egcl_compiler::t2::build::build_from_bytecode_for_transfers;
 use egcl_compiler::t2::emit::{emit_framed, emit_framed_transfers};
 use egcl_rt::bytecode::{BytecodeFunction, Instr};
 use egcl_rt::value::NIL;
+use egcl_compiler::t2::x64_calls::{NativeCallSites, NativeCallValues};
+use egcl_compiler::t2::x64_value_maps::NativeValueLocation;
 
 fn body() -> BytecodeFunction {
     BytecodeFunction {
@@ -85,6 +87,8 @@ use egcl_rt::{Collector, HeapCollector, EgclStack};
 struct RunState {
     anchor: *mut NativeSegment,
     table: *const SysvTransferTable,
+    value_maps: *const NativeCallSites,
+    call_capture: *const [usize; 2],
     code_base: usize,
     snapshots: *mut u8,
     snapshot_count: usize,
@@ -126,7 +130,32 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     );
     state.anchor = native_transfer::current_segment();
     HeapCollector::new().minor_gc().unwrap();
+    let calls = unsafe { &*state.value_maps };
+    let [return_pc, call_rsp] = unsafe { *state.call_capture };
+    let offset = return_pc - state.code_base;
+    let site = calls.get(offset).expect("actual primary return PC must be indexed");
+    assert_eq!(site.stack_adjust, 64);
+    let Some(NativeCallValues::Frame(map)) = calls.value_map(offset) else {
+        panic!("collecting Invoke must have an authoritative map");
+    };
+    let body_rsp = (call_rsp + site.stack_adjust as usize) as *const usize;
+    let activation = unsafe { body_rsp.add(map.layout().activation_base_slot.unwrap() as usize).read() };
+    assert_eq!(activation, request.activation as usize);
+    for value in map.values().iter().filter(|value| value.may_reference_heap()) {
+        let copies: Vec<_> = value.locations().iter().map(|location| {
+            let NativeValueLocation::Activation(slot) = *location else {
+                panic!("Invoke tagged roots must use activation copies");
+            };
+            unsafe { request.activation.add(slot as usize).read() }
+        }).collect();
+        assert!(copies.iter().all(|copy| *copy == copies[0]), "every alias must be updated by GC");
+        let expected = unsafe { std::slice::from_raw_parts(state.expected, state.expected_len) };
+        assert!(expected.contains(&copies[0]), "map must describe a relocated live value");
+    }
     for index in 0..request.nargs {
+        let outgoing_slot = unsafe { request.args.add(index).offset_from(request.activation) } as u16;
+        assert!(map.gc_locations().any(|location| *location == NativeValueLocation::Activation(outgoing_slot)),
+            "every outgoing argument copy must be rooted");
         assert_eq!(unsafe { request.args.add(index).read() }, unsafe {
             state
                 .expected
@@ -249,8 +278,23 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
             let capture =
                 JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)).unwrap();
             let veneer = JitBuffer::new(&emit_helper_veneer(helper, capture.as_ptr())).unwrap();
+            let mut call_capture = Box::new([0usize; 2]);
+            // Observe the actual CALL return PC and pre-CALL RSP; tail-jump into
+            // the real helper veneer so its return and transfer paths are intact.
+            let mut probe = vec![0x48, 0xb8]; // mov rax,capture
+            probe.extend_from_slice(&(call_capture.as_mut_ptr() as u64).to_le_bytes());
+            probe.extend_from_slice(&[
+                0x48, 0x8b, 0x0c, 0x24, // mov rcx,[rsp]
+                0x48, 0x89, 0x08, // mov [rax],rcx
+                0x48, 0x8d, 0x4c, 0x24, 8, // lea rcx,[rsp+8]
+                0x48, 0x89, 0x48, 8, // mov [rax+8],rcx
+                0x48, 0xb8, // mov rax,veneer
+            ]);
+            probe.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
+            probe.extend_from_slice(&[0xff, 0xe0]); // jmp rax
+            let probe = JitBuffer::new(&probe).unwrap();
             let (emitted, table) =
-                emit_framed_transfers(&ir, veneer.as_ptr() as u64, activation_slots).unwrap();
+                emit_framed_transfers(&ir, probe.as_ptr() as u64, activation_slots).unwrap();
             let code = JitBuffer::new(&emitted.code).unwrap();
             let mut snapshots: Vec<_> = table
                 .sites()
@@ -273,6 +317,8 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
             let mut state = RunState {
                 anchor: std::ptr::null_mut(),
                 table: &table,
+                value_maps: emitted.native_calls.as_ref().unwrap(),
+                call_capture: &*call_capture,
                 code_base: code.as_ptr() as usize,
                 snapshots: snapshots.as_mut_ptr().cast(),
                 snapshot_count: snapshots.len(),
@@ -406,6 +452,8 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
         matches!(site.origin, egcl_compiler::t2::x64_calls::NativeCallOrigin::Deopt(_))).collect();
     assert_eq!(deopts.len(), 1);
     assert_eq!(deopts[0].stack_adjust, 80);
+    assert!(matches!(emitted.native_calls.as_ref().unwrap().value_map(deopts[0].return_offset),
+        Some(NativeCallValues::Deoptimizing { .. })));
     assert_eq!(&emitted.code[deopts[0].return_offset - 2..deopts[0].return_offset], &[0xff, 0xd0]);
     let legacy = egcl_compiler::t2::emit::emit_framed_with_direct_natives(
         &ir, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0, 1, None, &[], 1, &[], Default::default(),
