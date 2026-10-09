@@ -87,3 +87,34 @@ fn captured_callbacks_promote_preserve_shared_state_and_survive_gc() {
         }
     }
 }
+
+#[test]
+fn shared_template_feedback_preserves_numeric_phase_recovery() {
+    let program = r#"
+      (defun phase-callback (seed) (lambda (x) (+ seed x)))
+      (let ((a (phase-callback 1)) (b (phase-callback 2)))
+        (format *error-output* "SHARED-PHASE-BEGIN~%")
+        (dotimes (i 40) (assert (= (funcall a i) (+ i 1))))
+        (let ((big 2305843009213693952))
+          (dotimes (i 40) (assert (= (funcall b big) (+ big 2))))
+          (dotimes (i 40) (assert (= (funcall a big) (+ big 1)))))
+        (format *error-output* "SHARED-PHASE-END~%"))
+      (format t "SHARED-PHASE-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_FORCE_TIER", "t2")
+        .env("EGCL_LAZY_COMPILE", "0")
+        .env("EGCL_T2_LOG", "stderr")
+        .output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("SHARED-PHASE-OK"));
+    let trace = stderr.split("SHARED-PHASE-BEGIN").nth(1).unwrap()
+        .split("SHARED-PHASE-END").next().unwrap();
+    assert!(trace.contains("native guard deopt"), "probe must fail a compiled guard: {trace}");
+    assert!(!trace.contains("uninstall + blacklist"), "sibling feedback must preserve phase recovery: {trace}");
+    assert!(trace.contains("supported numeric phase change => generic T1 + recompile"),
+        "the stale version must recover through native recompilation: {trace}");
+}

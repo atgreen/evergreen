@@ -627,7 +627,7 @@ pub(super) fn emit_native(
             // interpreted (native_portable_closure's four factory tests).
             Instr::MakeClosure { func, capture_env } => {
                 let nested =
-                    bf.nested_functions.get(func as usize)?.as_ref() as *const BytecodeFunction;
+                    bf.nested_functions.get(func as usize)? as *const Arc<BytecodeFunction>;
                 a.imm64(2, nested as u64);
                 a.imm64(3, u64::from(capture_env));
                 helper(&mut a, c2i_make_bytecode_closure as *const () as u64, exit);

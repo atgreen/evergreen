@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Compile captured lexical reads and writes at x86-64 T2, preserving shared
-  bindings and captured state during deoptimization
+  bindings and captured state during deoptimization. Nested closures share
+  bytecode templates while retaining independent captures, and numeric phase
+  changes recover even when sibling closures have updated the shared feedback
   ([#147](https://github.com/atgreen/evergreen/pull/147)).
 
 - Compile supported nested callbacks in eagerly compiled x86-64 and s390x
