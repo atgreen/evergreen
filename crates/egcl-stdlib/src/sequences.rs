@@ -124,25 +124,23 @@ fn string_content(v: EgclVal) -> Option<String> {
 
 /// The character (not byte) at `index` of a string sequence, or `None` if `v`
 /// is not a string or `index` is out of range. This is the single choke point
-/// for character indexing (CHAR/SCHAR/ELT/AREF on a string): the compact-string
-/// layout (bliss-qsgq) will make the simple-string case O(1) by swapping only
-/// this function's implementation. Today it is O(n) over the UTF-8 storage.
+/// for character indexing (CHAR/SCHAR/ELT/AREF on a string). Simple strings
+/// use their fixed-width payload for O(1) access, including registered strings.
 pub fn string_char_at(v: EgclVal, index: usize) -> Option<char> {
-    // O(1) for a real simple-string heap object; registry-backed sentinels and
-    // fill-pointer char vectors fall back to the decoded content.
-    if v.is_heap_object() && !crate::pathnames::is_registered_string(v) {
-        let ptr = unsafe { v.as_ptr() };
-        let tid = unsafe { (*(ptr as *const ObjectHeader)).type_id() };
-        if tid == type_id::SIMPLE_BASE_STRING || tid == type_id::SIMPLE_CHARACTER_STRING {
-            return unsafe { egcl_rt::object::simple_string_char_at(ptr, index) };
-        }
+    if v.is_string() {
+        // Registration caches content; the object itself is still a real
+        // simple string. No allocation or safepoint occurs during this read.
+        return unsafe { egcl_rt::object::simple_string_char_at(v.as_ptr(), index) };
     }
     string_content(v).and_then(|s| s.chars().nth(index))
 }
 
 /// The character (not byte) length of a string sequence, or `None` if `v` is
-/// not a string. The other choke point Step B makes O(1).
+/// not a string. Simple strings store their character count in the payload.
 pub fn string_char_count(v: EgclVal) -> Option<usize> {
+    if v.is_string() {
+        return Some(unsafe { egcl_rt::object::simple_string_char_count(v.as_ptr()) });
+    }
     string_content(v).map(|s| s.chars().count())
 }
 
@@ -154,19 +152,11 @@ pub fn string_content_bytes(v: EgclVal) -> Option<Vec<u8>> {
     string_content(v).map(String::into_bytes)
 }
 
-/// True if `v` is a character string usable as a sequence — a real string, and
-/// NOT a pathname. Pathnames are registry-backed values whose EgclVal can pass
-/// `is_string()` (they carry a namestring), but they are not sequences; treating
-/// one as a string in LENGTH/ELT reads a non-string layout and crashes or walks
-/// off the end (bliss-lb6). STRINGP already excludes pathnames the same way.
+/// True if `v` is a character string usable as a sequence. A pathname has a
+/// distinct object type even when its namestring is cached in the registry.
 #[inline]
 fn is_char_seq(v: EgclVal) -> bool {
-    // Classification must not decode/copy the contents: ELT calls this for
-    // every character, making a traversal quadratic if it materializes text.
-    !crate::pathnames::is_pathname(v)
-        && (crate::pathnames::is_registered_string(v)
-            || v.is_string()
-            || (is_complex_vector(v) && cvec_is_string(v)))
+    v.is_string() || (is_complex_vector(v) && cvec_is_string(v))
 }
 
 /// Collect all elements of a sequence into a Vec.
@@ -1434,9 +1424,8 @@ pub fn length(sequence: EgclVal) -> Result<usize, EgclError> {
     if let Some(n) = egcl_rt::types::bit_vector_len(sequence) {
         return Ok(n);
     }
-    if let Some(s) = string_content(sequence) {
-        // Strings are sequences of characters (ANSI). Count characters, not bytes.
-        return Ok(s.chars().count());
+    if let Some(n) = string_char_count(sequence) {
+        return Ok(n);
     }
     Err(EgclError::TypeError {
         datum: sequence,
