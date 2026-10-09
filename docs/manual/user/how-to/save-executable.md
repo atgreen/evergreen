@@ -121,6 +121,46 @@ Plugins, foreign callbacks, and method redefinition also need explicit roots
 when their targets cannot be inferred. This is a delivery policy, not a security
 boundary.
 
+### Describe delivery in a system definition
+
+An application can carry its delivery policy in its own `.asd` and be
+delivered by `asdf:make`, with no spec file to write and no core to save by
+hand. Name `egcl-deliver-asdf` in `:defsystem-depends-on` and give a secondary
+system the delivery class and build operation; the initargs mirror the
+specification keys above one for one:
+
+```lisp
+(asdf:defsystem "my-app"
+  :components ((:file "my-app")))
+
+(asdf:defsystem "my-app/deliver"
+  :defsystem-depends-on ("egcl-deliver-asdf")
+  :class "egcl-deliver-asdf:delivered-application"
+  :build-operation "egcl-deliver-asdf:deliver-op"
+  :depends-on ("my-app")
+  :deliver-entry "my-app::main"
+  :deliver-prune-packages ("MY-APP")
+  :deliver-dynamic :explicit)
+```
+
+```sh
+egcl --eval '(require :asdf)' \
+     --eval '(asdf:load-asd (truename "my-app.asd"))' \
+     --eval '(asdf:make "my-app/deliver")'
+./build/my-app
+```
+
+`asdf:make` loads the application, writes `build/my-app.delivery` from the
+slots, saves `build/my-app.core` in a child process, delivers it in another,
+and leaves the executable and `build/my-app.manifest` beside them. The
+remaining initargs are `:deliver-keep`, `:deliver-runtime` (`:full` or
+`:specialized`), `:deliver-max-tier`, `:deliver-runtime-keep`,
+`:deliver-runtime-source`, `:deliver-system`, and `:deliver-output`; ASDF's
+own `:entry-point` stands in for `:deliver-entry`. The extension is installed
+with `egcl` under `/usr/share/common-lisp/source/`, where ASDF already looks;
+from a source checkout, add `lib/egcl-deliver/` to `CL_SOURCE_REGISTRY`. See
+`lib/egcl-deliver/README.md` for the child processes' registry.
+
 The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions

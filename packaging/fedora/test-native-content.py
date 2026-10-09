@@ -31,6 +31,10 @@ class NativeContentTests(unittest.TestCase):
             (system / 'build/libegcl_jvm.so').write_bytes(b'native bridge')
             (system / 'Makefile').write_text('must not ship')
             (system / 'native.c').write_text('must not ship')
+            deliver = source / 'lib/egcl-deliver'
+            deliver.mkdir(parents=True)
+            for name in ('egcl-deliver-asdf.asd', 'asdf-integration.lisp', 'README.md'):
+                (deliver / name).write_text(name)
             manual = root / 'manual'
             (manual / 'java').mkdir(parents=True)
             (manual / 'assets').mkdir()
@@ -43,6 +47,8 @@ class NativeContentTests(unittest.TestCase):
             self.assertEqual({p.name for p in installed.iterdir()},
                              {'egcl-jvm.asd', 'package.lisp', 'jvm.lisp', 'api.lisp', 'libegcl_jvm.so'})
             self.assertTrue((installed / 'libegcl_jvm.so').is_symlink())
+            self.assertEqual({p.name for p in (stage / 'usr/share/common-lisp/source/egcl-deliver').iterdir()},
+                             {'egcl-deliver-asdf.asd', 'asdf-integration.lisp', 'README.md'})
             self.assertFalse((installed / 'libegcl_jvm.so').readlink().is_absolute())
             relocated = root / 'extracted'
             stage.rename(relocated)
