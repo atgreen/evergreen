@@ -106,7 +106,7 @@ fn named_calls_reload_fixed_slots_without_resolving_symbols() {
         let ir = build_from_bytecode(&body).unwrap();
         let framed = emit_framed_with_direct_natives(
             &ir, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            body.num_slots(), None, &[], 0, &[target],
+            body.num_slots(), None, &[], 0, &[target], Default::default(),
         ).unwrap();
         let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
         let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
@@ -144,7 +144,7 @@ fn deoptimizing_native_entries_report_their_own_code_and_frame_kind() {
     let code_id = 0x1234;
     let framed = emit_framed_with_direct_natives(
         &ir, legacy_resume as *const () as u64, resume as *const () as u64, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        body.num_slots(), None, &[], code_id, &[],
+        body.num_slots(), None, &[], code_id, &[], Default::default(),
     ).unwrap();
     let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };

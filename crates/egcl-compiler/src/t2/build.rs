@@ -895,6 +895,7 @@ impl<'a> Builder<'a> {
                 Instr::Const(_)
                 | Instr::LoadLocal(_)
                 | Instr::LoadGlobal(_)
+                | Instr::LoadEnvVar(_)
                 | Instr::LoadFunction(_)
                 | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
@@ -905,7 +906,7 @@ impl<'a> Builder<'a> {
                 Instr::MemoryFence(_) => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::Pop => {
+                Instr::StoreLocal(_) | Instr::StoreGlobal(_) | Instr::StoreEnvVar(_) | Instr::Pop => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::Throw if self.native_cleanups => {}
@@ -1637,6 +1638,26 @@ impl<'a> Builder<'a> {
                         .pop()
                         .ok_or(BuildError::Unsupported("stack underflow (StoreLocal)"))?;
                     self.write_var(Var::Local(*s), block, v);
+                }
+                Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) => {
+                    if self.bf.names.get(*index as usize).is_none() {
+                        return Err(BuildError::Unsupported("invalid environment name index"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    if matches!(instruction, Instr::LoadEnvVar(_)) {
+                        let value = self.emit(
+                            block, Opcode::EnvironmentValue, vec![],
+                            AuxData::EnvironmentName(*index), runtime_call_flags(),
+                            Some(fs), IRType::TOP,
+                        ).expect("environment read has a result");
+                        stack.push(value);
+                    } else {
+                        let value = stack.pop().ok_or(BuildError::Unsupported(
+                            "stack underflow (StoreEnvVar)",
+                        ))?;
+                        self.emit_effect(block, Opcode::SetEnvironmentValue, vec![value],
+                            AuxData::EnvironmentName(*index), Some(fs));
+                    }
                 }
                 Instr::LoadGlobal(sym) => {
                     let fs = self.build_frame_state(block, &stack, i as u32);

@@ -17986,7 +17986,8 @@ extern "C" fn c2i_deopt_t2_inline(
     // duration of the native call, and nested native calls save and restore it.
     let env = unsafe { &mut *env_ptr };
     let stack = egcl_rt::current_stack();
-    let result = resume_inlined_in_t0(scopes, metadata, env);
+    let active_env_frame = NATIVE_ENV_FRAME.with(|slot| slot.borrow().clone());
+    let result = resume_inlined_in_t0(scopes, metadata, active_env_frame, env);
     if let Some(frame) = outer
         && !std::ptr::eq(stack.fp(), frame)
     {
@@ -20234,7 +20235,8 @@ fn run_native(
                     if std::env::var_os("EGCL_DEOPT_PATH_DBG").is_some() {
                         eprintln!("[deopt-path] Inlined sym={sym} scopes={}", scopes.len());
                     }
-                    resume_inlined_in_t0(scopes, metadata, env)
+                    resume_inlined_in_t0(scopes, metadata,
+                        resume_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)), env)
                 }
             };
         }
@@ -20377,11 +20379,14 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
 fn resume_inlined_in_t0(
     scopes: Vec<InlinedResumeScope>,
     _metadata: Arc<T2InstalledMetadata>,
+    outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let stack = egcl_rt::current_stack();
+    egcl_rt::rooted!(outer_env_frame = outer_env_frame.map(super::SuspendedFrameRoot));
     let mut acts = Vec::with_capacity(scopes.len());
-    for scope in scopes {
+    egcl_rt::rooted_ref!(_acts_root = &mut acts);
+    for (index, scope) in scopes.into_iter().enumerate() {
         let entry = scope.body;
         let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
         let fn_obj = egcl_rt::symbols::symbol_function(scope.function)
@@ -20390,7 +20395,14 @@ fn resume_inlined_in_t0(
             frame: scope.frame,
             _debug_call: None,
             n_locals: entry.n_locals,
-            env_frame: None,
+            // Inlined bodies cannot capture; only the root activation owns
+            // the native environment. Preserve the exact frame, including any
+            // writes already committed before the guard failed.
+            env_frame: if index == 0 {
+                outer_env_frame.as_ref().map(|frame| Arc::clone(&frame.0))
+            } else {
+                None
+            },
             func: entry,
             bcp: scope.bcp as usize,
             sp_top: scope.sp_top,
@@ -20401,7 +20413,6 @@ fn resume_inlined_in_t0(
             sym: scope.function,
         });
     }
-    egcl_rt::rooted_ref!(_acts_root = &mut acts);
     let result = run_loop(&mut acts, env);
     while !acts.is_empty() {
         stack.pop_frame();
@@ -22259,6 +22270,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         &input.direct_natives,
         input.code_id,
         &named_calls,
+        egcl_compiler::t2::emit::EnvironmentCalls {
+            body: bf as *const BytecodeFunction as u64,
+            load: c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64,
+            store: c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64,
+        },
     ) {
         Ok(fc) => fc,
         Err(e) => {
@@ -22270,6 +22286,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
     let mut rooted_bodies = Vec::new();
+    if bf.code.iter().any(|instruction| matches!(instruction,
+        Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
+        // Environment helpers embed this snapshot's address, not the mutable
+        // registry entry. Retain it even when there are no heap constants.
+        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+    }
     for &slot in &framed.heap_constant_slots {
         let owner = std::iter::once(&input.body)
             .chain(input.inline_bodies.iter().map(|saved| &saved.body))
@@ -23791,6 +23813,106 @@ mod direct_call_invalidation_tests {
             EgclVal::from_fixnum(i64::from(iterations)),
             "T1 backedges must not transfer an old activation into a new definition"
         );
+        registry_remove(symbol);
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn t2_captured_value_moves_while_live_only_in_native_code() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let source = resolve_sym("T2-CAPTURE-SOURCE").unwrap();
+        let destination = resolve_sym("T2-CAPTURE-DESTINATION").unwrap();
+        env.define_local_symbol(source, NIL);
+        env.define_local_symbol(destination, NIL);
+        egcl_rt::rooted!(form = reader::read_from_string("(nil)").unwrap().0);
+        let mut body = compile_function("T2-CAPTURE-MOVING", NIL, *form, &env, false, false).unwrap();
+        body.has_env = true;
+        body.names = vec!["T2-CAPTURE-SOURCE".into(), "T2-CAPTURE-DESTINATION".into()];
+        body.constants = vec![NIL];
+        body.n_locals = 0;
+        body.max_stack = 2;
+        body.code = vec![
+            Instr::LoadEnvVar(0),
+            Instr::Const(0),
+            Instr::StoreEnvVar(0), // remove the original root before collection
+            Instr::CallNamed {
+                sym: resolve_sym("%FORCE-MINOR-GC-FOR-TEST").unwrap().as_symbol_index(),
+                nargs: 0,
+            },
+            Instr::Pop,
+            Instr::StoreEnvVar(1),
+            Instr::LoadEnvVar(1),
+            Instr::Return,
+        ];
+        let symbol = egcl_rt::symbols::intern("T2-CAPTURE-MOVING");
+        registry_put(symbol, Arc::new(body.clone()));
+        let input = snapshot_t2_input(symbol, 0).unwrap();
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact).expect("compile lexical GC probe");
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation, artifact: Some(artifact), input,
+        }).unwrap();
+        assert!(native.is_t2);
+        // Redefinition gives the same indexes different meanings. The retained
+        // code must still use its own snapshot, including after registry removal.
+        body.names.swap(0, 1);
+        registry_put(symbol, Arc::new(body));
+        registry_remove(symbol);
+        egcl_rt::rooted!(value = super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
+        let original_address = value.to_raw();
+        env.define_local_symbol(source, *value);
+        drop(value); // only the source binding owns it when native execution begins
+        egcl_rt::rooted!(result = run_native(&native, symbol, &[], &mut env).unwrap());
+        assert_ne!(result.to_raw(), original_address, "the native-only root must actually move");
+        assert_eq!(super::super::cp(*result), (EgclVal::from_fixnum(71), NIL));
+        assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-SOURCE"), Some(NIL));
+        assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-DESTINATION"), Some(*result));
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn t2_captured_read_write_and_deopt_preserve_environment() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(callback = super::super::read_eval_all_env(
+            "(defun t2-capture-factory (seed) (dotimes (i 1))
+               (lambda (delta) (setq seed (+ seed delta))))
+             (t2-capture-factory 10)", &mut env
+        ).unwrap());
+        assert!(egcl_rt::function::is_interpreted_function(*callback));
+        let symbol = egcl_rt::function::name(*callback).as_symbol_index();
+        let body = registry_get(symbol).expect("compiled capturing callback");
+        assert!(body.code.iter().any(|i| matches!(i, Instr::LoadEnvVar(_))));
+        assert!(body.code.iter().any(|i| matches!(i, Instr::StoreEnvVar(_))));
+        let input = snapshot_t2_input(symbol, 0).expect("snapshot callback");
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact)
+            .expect("captured lexical access must compile at T2");
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation, artifact: Some(artifact), input,
+        }).expect("install callback T2");
+        assert!(native.is_t2);
+        assert_eq!(run_native(&native, symbol, &[EgclVal::from_fixnum(2)], &mut env).unwrap(),
+            EgclVal::from_fixnum(12));
+        let before = deopt_count();
+        egcl_rt::rooted!(answer = run_native(&native, symbol,
+            &[EgclVal::from_fixnum(1152921504606846975)], &mut env).unwrap());
+        let mut printed = String::new();
+        super::super::print_val(*answer, &mut printed);
+        assert_eq!(printed, "1152921504606846987");
+        assert!(deopt_count() > before, "overflow must exercise deoptimization");
+        egcl_rt::rooted!(again = super::super::apply_function(*callback,
+            &[EgclVal::from_fixnum(1)], &mut env).unwrap());
+        printed.clear();
+        super::super::print_val(*again, &mut printed);
+        assert_eq!(printed, "1152921504606846988", "resume must update the shared capture once");
         registry_remove(symbol);
     }
 
