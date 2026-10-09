@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Retain multiple native `FUNCALL` targets on x86-64 so nested callbacks avoid
+  repeatedly resolving each other. Cached identities remain weak and are
+  invalidated together after GC or native code replacement. This reduces full
+  Prechelt phone-encoding time by about 30% in the measured x86-64 workload
+  ([#149](https://github.com/atgreen/evergreen/pull/149)).
+
 - Use native entries for eligible x86-64 T2 `FUNCALL` callbacks, including
   captured closures, and reuse adapters when callback bodies alternate.
   Preserve captured bindings and multiple values across GC and deoptimization.
