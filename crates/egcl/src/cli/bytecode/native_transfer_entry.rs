@@ -28,6 +28,45 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
+/// Inspect the separately retained segment entry without compiling or executing
+/// anything. An installed legacy NativeCode does not describe this mapping.
+#[cfg(not(egcl_no_disassembly))]
+pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
+    use iced_x86::Formatter;
+    use std::fmt::Write;
+
+    let key = Arc::as_ptr(body) as usize;
+    let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key).cloned().flatten())?;
+    let mut out = String::from(
+        "; Native segment ABI — cached entry; compatibility calls can still use the checked ABI.\n",
+    );
+    let _ = writeln!(out, "; {} bytes of x86-64:", code.code_len);
+    let base = code.code.as_ptr() as u64;
+    // SAFETY: the cloned owner retains this immutable executable mapping.
+    let bytes = unsafe { std::slice::from_raw_parts(code.code.as_ptr(), code.code_len) };
+    let decoder = iced_x86::Decoder::with_ip(64, bytes, base, iced_x86::DecoderOptions::NONE);
+    let mut formatter = iced_x86::NasmFormatter::new();
+    let mut line = String::new();
+    for instruction in decoder {
+        line.clear();
+        formatter.format(&instruction, &mut line);
+        let _ = write!(out, "  +{:04x}:  {line}", instruction.ip() - base);
+        if let Some(immediate) = native_immediate(&instruction) {
+            for (target, name) in [
+                (code._veneer.as_ptr(), "native call veneer"),
+                (code._poll.as_ptr(), "native poll veneer"),
+                (code._completion.as_ptr(), "native cleanup completion veneer"),
+            ] {
+                if immediate == target as u64 {
+                    let _ = write!(out, "    ; {name}");
+                }
+            }
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -107,6 +146,7 @@ pub(super) struct TransferCode {
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
+    code_len: usize,
     _veneer: JitBuffer,
     _capture: JitBuffer,
     _poll: JitBuffer,
@@ -292,6 +332,7 @@ impl TransferCode {
             body,
             _body_roots: roots,
             code,
+            code_len: emitted.code.len(),
             _veneer: veneer,
             _capture: capture,
             _poll: poll,

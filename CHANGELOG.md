@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Show cached native exceptional-transfer code separately from installed
+  legacy code in `DISASSEMBLE`, including native helper veneer annotations
+  ([#156](https://github.com/atgreen/evergreen/pull/156)).
+
 - Speed up missed lookups in large hash tables with a compact membership
   filter, preserving mutation, GC, and image-restoration behavior. This reduces
   full Prechelt phone-encoding time by about 5% in the measured x86-64 workload
