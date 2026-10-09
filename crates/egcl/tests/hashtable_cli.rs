@@ -65,7 +65,7 @@ fn equal_hash_instance_keys_survive_moving_gc() {
             "--no-init",
             "--eval",
             "(progn (defclass k () ()) \
-               (let ((h (make-hash-table :test 'equal)) (keys nil)) \
+               (let ((h (make-hash-table :test 'equal :size 8192)) (keys nil)) \
                  (dotimes (i 40) \
                    (let ((key (cons i (make-instance 'k)))) \
                      (push key keys) (setf (gethash key h) i))) \
@@ -75,6 +75,9 @@ fn equal_hash_instance_keys_survive_moving_gc() {
                    hits)))",
         ])
         .env("EGCL_GC_STRESS", "1")
+        // Exercise the hash operations under stress without re-testing prelude startup.
+        .env("EGCL_GC_STRESS_AFTER_INIT", "1")
+        .env("EGCL_GC_POISON", "1")
         .output()
         .expect("spawn egcl");
     assert!(
@@ -86,5 +89,32 @@ fn equal_hash_instance_keys_survive_moving_gc() {
         String::from_utf8_lossy(&out.stdout).trim(),
         "40",
         "all instance keys must be found after GC relocation (bliss-jtc.22)"
+    );
+}
+
+#[test]
+fn large_tables_match_equivalent_numeric_and_structural_keys() {
+    assert_eq!(
+        eval(
+            r##"(progn
+      (dolist (case '((eql "100000000000000000000" "100000000000000000000")
+                     (eql "-100000000000000000000" "-100000000000000000000")
+                     (eql "100000000000000000000/3" "100000000000000000000/3")
+                     (eql "1.5d0" "1.5d0")
+                     (equal "(1 2 3)" "(1 2 3)")
+                     (equalp "#(1 2 3)" "#(1.0 2.0 3.0)")
+                     (equalp "#\\A" "#\\a")))
+        (let ((h (make-hash-table :test (first case) :size 8192))
+              (a (read-from-string (second case)))
+              (b (read-from-string (third case))))
+          (setf (gethash a h) 42)
+          (assert (= (gethash b h) 42))
+          (setf (gethash b h) 43)
+          (assert (= (hash-table-count h) 1))
+          (assert (= (gethash a h) 43))
+          (assert (remhash b h))))
+      :ok)"##
+        ),
+        ":OK"
     );
 }
