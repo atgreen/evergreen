@@ -8438,6 +8438,8 @@ impl Env {
     }
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        bytecode::initialize_native_callable_entries();
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
         compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
         install_evaluator_global_root_scanner();

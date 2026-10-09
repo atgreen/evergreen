@@ -6,10 +6,10 @@
 //!
 //! A function is a real heap object reachable through a symbol's function cell,
 //! carrying its lambda list / body / captured env / name *and* the `FnMeta`
-//! tiering substrate (invocation + back-edge counters, active entry point,
+//! tiering substrate (invocation + back-edge counters, permanent callable entries,
 //! current tier, flags). This is what a HotSpot-style engine needs a stable
-//! object for: profiling counters, entry-point patching on tier change, code-
-//! cache ownership, deopt/tracing/debug identity, and precise GC roots — none of
+//! object for: profiling counters, callable dispatch across tier changes, code-
+//! cache identity, deopt/tracing/debug identity, and precise GC roots — none of
 //! which a name→struct map can provide.
 //!
 //! Function objects are **pinned and identity-stable**. Ordinary DEFUN installs
@@ -21,6 +21,37 @@
 use crate::object::{FunctionData, ObjectHeader, type_id};
 use crate::value::EgclVal;
 use core::sync::atomic::{AtomicPtr, Ordering};
+
+/// Process-lifetime callable dispatchers, independent of the execution-owned
+/// code version. RDI identifies a caller-scanned callable slot; the remaining
+/// register/slice arguments use the native call contract.
+#[repr(C)]
+pub struct NativeCallableEntries {
+    pub registers: usize,
+    pub slice: usize,
+}
+
+static NATIVE_ENTRIES: std::sync::OnceLock<&'static NativeCallableEntries> =
+    std::sync::OnceLock::new();
+
+/// Install permanently retained code before publishing callable entries.
+/// Repeated initialization must name the same process descriptor.
+pub fn install_native_entries(entries: &'static NativeCallableEntries) {
+    assert_ne!(entries.registers, 0);
+    assert_ne!(entries.slice, 0);
+    assert!(std::ptr::eq(
+        *NATIVE_ENTRIES.get_or_init(|| entries),
+        entries
+    ));
+}
+
+fn native_entries_pointer() -> *mut NativeCallableEntries {
+    NATIVE_ENTRIES
+        .get()
+        .map_or(std::ptr::null_mut(), |entries| {
+            std::ptr::from_ref(*entries).cast_mut()
+        })
+}
 
 /// FnMeta flag: function is queued for T2 optimising compilation.
 pub const FLAG_QUEUED_FOR_T2: u16 = 1 << 0;
@@ -48,8 +79,7 @@ fn header_size() -> usize {
 /// heap. `gc::heap_object_type_id` applies the same lock-free bounds check, so
 /// it is safe to call with the world stopped.
 pub fn is_interpreted_function(v: EgclVal) -> bool {
-    v.is_heap_object()
-        && crate::gc::heap_object_type_id(v) == Some(type_id::FUNCTION_INTERPRETED)
+    v.is_heap_object() && crate::gc::heap_object_type_id(v) == Some(type_id::FUNCTION_INTERPRETED)
 }
 
 /// # Safety
@@ -60,7 +90,7 @@ unsafe fn data(f: EgclVal) -> *mut FunctionData {
 }
 
 /// Allocate a pinned interpreted function object with all cells set and the
-/// tiering metadata zeroed (tier 0, no entry, counters 0).
+/// tiering metadata zeroed and the current process's native dispatcher pair.
 pub fn alloc_interpreted(
     lambda_list: EgclVal,
     body: EgclVal,
@@ -93,7 +123,7 @@ pub fn alloc_interpreted(
         (*d).name = *name;
         (*d).invoke_count = 0.into();
         (*d).back_edge_count = 0.into();
-        (*d).entry = AtomicPtr::new(std::ptr::null_mut());
+        (*d).native_entries = AtomicPtr::new(native_entries_pointer());
         (*d).tier = 0.into();
         (*d).flags = 0.into();
 
@@ -116,7 +146,8 @@ pub unsafe fn redefine(f: EgclVal, lambda_list: EgclVal, body: EgclVal, env: Egc
         (*d).env = env;
         (*d).invoke_count.store(0, Ordering::Relaxed);
         (*d).back_edge_count.store(0, Ordering::Relaxed);
-        (*d).entry.store(std::ptr::null_mut(), Ordering::Release);
+        (*d).native_entries
+            .store(native_entries_pointer(), Ordering::Release);
         (*d).tier.store(0, Ordering::Release);
         (*d).flags.store(0, Ordering::Release);
     }
@@ -195,14 +226,18 @@ pub fn set_tier(f: EgclVal, tier: u8) {
     unsafe { (*data(f)).tier.store(tier, Ordering::Release) }
 }
 
-/// The active native entry point (null at T0).
-pub fn entry(f: EgclVal) -> *mut u8 {
-    unsafe { (*data(f)).entry.load(Ordering::Acquire) }
-}
-
-/// Install the active native entry point (on tier change).
-pub fn set_entry(f: EgclVal, ptr: *mut u8) {
-    unsafe { (*data(f)).entry.store(ptr, Ordering::Release) }
+/// Publish this process's callable contract, repairing functions allocated
+/// before installation or restored from an image. Never dereference the saved
+/// pointer: older images may contain a raw tier-body address in this word.
+/// Actual code/version selection remains owned by the current execution.
+pub fn native_entries(f: EgclVal) -> Option<&'static NativeCallableEntries> {
+    let entries = *NATIVE_ENTRIES.get()?;
+    let pointer = std::ptr::from_ref(entries).cast_mut();
+    let stored = unsafe { &(*data(f)).native_entries };
+    if stored.load(Ordering::Acquire) != pointer {
+        stored.store(pointer, Ordering::Release);
+    }
+    Some(entries)
 }
 
 /// The FnMeta flags word.
@@ -229,6 +264,33 @@ mod tests {
     }
 
     #[test]
+    fn native_publication_repairs_late_and_restored_function_metadata() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        crate::rooted!(function = alloc_interpreted(NIL, NIL, NIL, NIL));
+        assert!(native_entries(*function).is_none());
+        static ENTRIES: NativeCallableEntries = NativeCallableEntries {
+            registers: 0x1000,
+            slice: 0x2000,
+        };
+        install_native_entries(&ENTRIES);
+        assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
+        // An image can contain an address from another process, including the
+        // old raw tier-body address. Never dereference it during repair.
+        unsafe {
+            (*data(*function))
+                .native_entries
+                .store(std::ptr::dangling_mut::<NativeCallableEntries>(), Ordering::Release);
+        }
+        assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
+        unsafe { redefine(*function, NIL, EgclVal::from_fixnum(17), NIL) };
+        assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
+        let fresh = alloc_interpreted(NIL, NIL, NIL, NIL);
+        assert!(std::ptr::eq(native_entries(fresh).unwrap(), &ENTRIES));
+        assert_eq!(std::mem::size_of::<FunctionData>(), 64);
+        assert_eq!(std::mem::offset_of!(FunctionData, native_entries), 48);
+    }
+
+    #[test]
     fn interpreted_function_carries_cells_and_zeroed_fnmeta() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let ll = EgclVal::from_fixnum(1);
@@ -243,7 +305,7 @@ mod tests {
         assert_eq!(name(f), nm);
         assert_eq!(tier(f), 0);
         assert_eq!(invoke_count(f), 0);
-        assert!(entry(f).is_null());
+        assert_eq!(native_entries(f).is_some(), NATIVE_ENTRIES.get().is_some());
     }
 
     fn egcl_rt_name() -> u32 {

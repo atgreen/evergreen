@@ -52,10 +52,47 @@ pub(super) fn take_capture_failure() -> bool {
 /// Called only by the explicit mapped-call veneer. A live outer segment alone
 /// is not evidence that an arbitrary Rust/legacy caller may use this entry.
 pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCallRecord) {
+    prepare_call(record, || unsafe {
+        let invocation = &mut *(*record).context;
+        if call_table::is_builtin_funcall(cell) && invocation.nargs != 0 {
+            if let Some(entries) = super::super::native_callable::entries_for(*invocation.args) {
+                (*record).target = invocation.args as u64;
+                (*record).forward = entries;
+                invocation.args = invocation.args.add(1);
+                invocation.nargs -= 1;
+                return Ok(NIL);
+            }
+        }
+        prepare_child(record, || call_table::mapped_callee(cell))
+    });
+}
+
+pub(in crate::cli::bytecode) unsafe extern "C" fn prepare_callable(
+    target: u64,
+    record: *mut MappedCallRecord,
+) {
+    prepare_call(record, || unsafe {
+        #[cfg(test)]
+        super::super::native_callable::collect_at_entry(target)?;
+        let invocation = &*(*record).context;
+        // The target word is a stable address into caller-scanned storage.
+        // Read after polling, then root while code selection may allocate.
+        egcl_rt::rooted!(function = *(target as *const EgclVal));
+        prepare_child(record, || {
+            call_table::mapped_callable(*function, invocation.nargs)
+        })
+    });
+}
+
+fn prepare_call(
+    record: *mut MappedCallRecord,
+    prepare: impl FnOnce() -> Result<EgclVal, EgclError>,
+) {
     unsafe {
         (*record).entry = std::ptr::null();
         (*record).activation = std::ptr::null_mut();
         (*record).owner = std::ptr::null_mut();
+        (*record).forward = std::ptr::null();
         (*record).outcome = NativeOutcome {
             value: NIL,
             exit: NativeExit::Returned,
@@ -65,7 +102,7 @@ pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCal
             return;
         }
     }
-    let result = guard_c2i(|| unsafe { prepare_child(cell, record) });
+    let result = guard_c2i(prepare);
     if let Err(error) = result {
         NATIVE_ERROR.with(|slot| slot.set_first(error));
         unsafe {
@@ -74,7 +111,10 @@ pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCal
     }
 }
 
-unsafe fn prepare_child(cell: u64, record: *mut MappedCallRecord) -> Result<EgclVal, EgclError> {
+unsafe fn prepare_child(
+    record: *mut MappedCallRecord,
+    select: impl FnOnce() -> Option<call_table::MappedCallee>,
+) -> Result<EgclVal, EgclError> {
     let here = std::ptr::from_ref(&record) as usize as u64;
     let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
     if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
@@ -84,19 +124,19 @@ unsafe fn prepare_child(cell: u64, record: *mut MappedCallRecord) -> Result<Egcl
     if parent.is_null() {
         return Err(invalid_capture());
     }
-    let Some(mut target) = (unsafe { call_table::mapped_callee(cell) }) else {
+    let Some(mut target) = select() else {
         return Ok(NIL);
     };
     egcl_rt::rooted_ref!(_target = &mut target);
     let code = Rc::clone(&target.code);
-    let request = unsafe { &*(*record).request };
-    if request.nargs != usize::from(code.body.arity) {
+    let invocation = unsafe { &*(*record).context };
+    if invocation.nargs != usize::from(code.body.arity) {
         return Ok(NIL);
     }
-    let args = if request.nargs == 0 {
+    let args = if invocation.nargs == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(request.args, request.nargs) }
+        unsafe { std::slice::from_raw_parts(invocation.args, invocation.nargs) }
     };
     validate_declared_args(&code.body, args)?;
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
@@ -147,7 +187,7 @@ unsafe fn prepare_child(cell: u64, record: *mut MappedCallRecord) -> Result<Egcl
 /// Both normal and cold returns execute this callback from caller-owned code.
 /// Pop the actual child frame (whose previous fp includes any caller clusters),
 /// restore the parent context, then release the child's code and root owners.
-pub(super) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
+pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
     let owner = unsafe { (*record).owner.cast::<ChildActivation>() };
     let child = unsafe { &mut *owner };
     let context = child.context.as_mut().unwrap();
@@ -188,7 +228,7 @@ pub(super) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
 
 /// The child's machine frames are already gone. Resume its captured logical
 /// continuation through Rust before deciding whether the caller must unwind.
-pub(super) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
+pub(in crate::cli::bytecode) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
     let owner = unsafe { (*record).owner.cast::<ChildActivation>() };
     egcl_rt::rooted!(
         result = guard_c2i(|| {

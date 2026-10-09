@@ -1725,9 +1725,9 @@ fn emit_invoke_call(
         assert!(std::mem::size_of::<TransferCleanupRequest>() == 32);
         assert!(std::mem::offset_of!(TransferCleanupRequest, activation) == 24);
     };
-    // Named entries append an explicit two-word continuation context. Other
+    // Named entries append an explicit four-word continuation context. Other
     // helpers ignore that storage; recursive calls retain their own layout.
-    let temporary_bytes = if recursion.is_some() { 64 } else { 48 };
+    let temporary_bytes = 64;
     alu_r_imm(a, 5, 4, temporary_bytes);
     store_to_rsp(a, SCRATCH, 24); // activation
     mov_imm64(a, RAX, request_word0 as i64);

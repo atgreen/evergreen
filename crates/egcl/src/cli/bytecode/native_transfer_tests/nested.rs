@@ -6,6 +6,7 @@ use super::super::native_transfer_entry::{
 };
 use super::*;
 
+mod callable;
 mod deopt;
 pub(super) mod fibers;
 mod protected;

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep eligible `FUNCALL` targets inside opt-in native transfer segments,
+  preserving multiple values, cleanup and moving arguments. Publish callable
+  dispatchers that repair saved-image metadata and preserve exact function,
+  closure and funcallable-instance identity
+  ([#171](https://github.com/atgreen/evergreen/pull/171)).
+
 - Recover failed speculative guards in opt-in native child calls without losing
   the caller, replaying effects, or attributing old code's feedback to a replacement.
   Preserve live restarts, multiple values, and moving roots across fiber suspension
