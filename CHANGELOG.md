@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Recover failed speculative guards in opt-in native child calls without losing
+  the caller, replaying effects, or attributing old code's feedback to a replacement.
+  Preserve live restarts, multiple values, and moving roots across fiber suspension
+  ([#168](https://github.com/atgreen/evergreen/pull/168)).
+
 - Install eligible protected functions in opt-in native transfer segments,
   preserving cleanup, restarts, multiple values, and tiering when child calls
   return through native code or bytecode recovery

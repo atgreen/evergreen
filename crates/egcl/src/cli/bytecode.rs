@@ -20258,7 +20258,19 @@ fn run_native(
     call_table::record_target_lookup();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let NativeCodeStorage::Mapped(code) = &nc._storage {
-        return code.run(args, env);
+        if !code.needs_recompile() {
+            return code.run(args, env);
+        }
+        egcl_rt::rooted!(args = args.to_vec());
+        egcl_rt::rooted_ref!(_env = &mut *env);
+        let replacement = native_transfer_entry::refresh_installed(nc);
+        let code = replacement.as_ref().map_or(code, |native| {
+            let NativeCodeStorage::Mapped(code) = &native._storage else {
+                unreachable!()
+            };
+            code
+        });
+        return code.run(&args, env);
     }
     // The segment ABI carries exceptional exits out-of-band through its cold
     // landing path, so it does not need the legacy post-call transfer poll.
@@ -20607,8 +20619,17 @@ fn resume_inlined_in_t0(
     for (index, scope) in scopes.into_iter().enumerate() {
         let entry = scope.body;
         let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
-        let fn_obj = egcl_rt::symbols::symbol_function(scope.function)
-            .filter(|&v| egcl_rt::function::is_interpreted_function(v));
+        // A resumed child owns the callable in its original frame even when
+        // pre-guard Lisp replaced the name. Loop heat must follow that object.
+        let callable = unsafe { (*scope.frame).function };
+        let fn_obj = if egcl_rt::function::is_interpreted_function(callable) {
+            Some(callable)
+        } else if registry_get(scope.function).is_some_and(|body| Arc::ptr_eq(&body, &entry)) {
+            egcl_rt::symbols::symbol_function(scope.function)
+                .filter(|&v| egcl_rt::function::is_interpreted_function(v))
+        } else {
+            None
+        };
         acts.push(Activation {
             frame: scope.frame,
             _debug_call: None,

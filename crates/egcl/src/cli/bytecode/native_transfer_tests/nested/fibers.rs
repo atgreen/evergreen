@@ -65,7 +65,7 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     });
     assert_eq!(probe.hits, 1, "child pause must execute exactly once");
     let capture = super::super::super::native_transfer_entry::child_capture_for_test();
-    if probe.mode == 3 {
+    if matches!(probe.mode, 3 | 5) {
         assert!(
             capture.is_none(),
             "cold recovery must mask its abandoned capture"
@@ -154,6 +154,7 @@ fn child_fiber_checked() -> EgclVal {
     let name = format!("MIGRATING-CHILD-{case}");
     let pause = format!("CHILD-PAUSE-{case}");
     let handler = format!("CHILD-HANDLER-{case}");
+    let finish = format!("CHILD-FINISH-{case}");
     let restart = format!("CHILD-RESUME-{case}");
     let source = match mode {
         0 => format!("((catch :child ({pause} x active) (values x (list :body))))"),
@@ -167,6 +168,7 @@ fn child_fiber_checked() -> EgclVal {
             "((catch :child (if active (throw :child x) nil)) ({pause} x active) (values x (list :cold)))"
         ),
         4 => format!("((unwind-protect (values x (list :normal-cleanup)) ({pause} x active)))"),
+        5 => format!("((+ n 1) ({pause} x active) ({finish} x))"),
         _ => unreachable!(),
     };
     super::super::super::super::read_eval_all_env(
@@ -177,18 +179,28 @@ fn child_fiber_checked() -> EgclVal {
          (defun {handler} (c)
            ({pause} (slot-value c 'datum) t)
            (invoke-restart '{restart} (slot-value c 'datum)))
-         (defun {name} (x active) {})",
+         (defun {finish} (x) (values x (list :deopt)))
+         (defun {name} (x active n) {})",
             &source[1..source.len() - 1]
         ),
         &mut env,
     )
     .unwrap();
-    egcl_rt::rooted!(params = reader::read_from_string("(x active)").unwrap().0);
+    egcl_rt::rooted!(params = reader::read_from_string("(x active n)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(&source).unwrap().0);
     let symbol = egcl_rt::symbols::intern(&name);
     let body = Arc::new(compile_function(&name, *params, *forms, &env, false, false).unwrap());
     registry_put(symbol, Arc::clone(&body));
-    let mut code = TransferCode::compile_nested_protected(Arc::clone(&body)).unwrap();
+    let mut code = if mode == 5 {
+        let code = TransferCode::compile(Arc::clone(&body)).unwrap();
+        assert!(
+            code.has_deopt,
+            "fiber must suspend in a real guard continuation"
+        );
+        code
+    } else {
+        TransferCode::compile_nested_protected(Arc::clone(&body)).unwrap()
+    };
     if mode == 3 {
         let push = body
             .code
@@ -205,19 +217,23 @@ fn child_fiber_checked() -> EgclVal {
         &installed,
     );
     let caller = compile_caller(
-        "(x active)",
-        &format!("((catch :parent ({name} x active)))"),
+        "(x active n)",
+        &format!("((catch :parent ({name} x active n)))"),
         &env,
     );
     // Global publication invalidates call cells, so finish every setup before
     // resolving the measured callers. Warm helpers before the final barrier too.
-    caller.run(&[NIL, NIL], &mut env).unwrap();
+    caller
+        .run(&[NIL, NIL, EgclVal::from_fixnum(1)], &mut env)
+        .unwrap();
     SETUP.fetch_add(1, Ordering::Release);
     while SETUP.load(Ordering::Acquire) != 8 {
         assert!(!RELEASE.load(Ordering::Acquire), "setup aborted");
         egcl_rt::fiber_sleep(std::time::Duration::from_millis(1)).unwrap();
     }
-    caller.run(&[NIL, NIL], &mut env).unwrap();
+    caller
+        .run(&[NIL, NIL, EgclVal::from_fixnum(1)], &mut env)
+        .unwrap();
     WARMED.fetch_add(1, Ordering::Release);
     while WARMED.load(Ordering::Acquire) != 8 {
         assert!(!RELEASE.load(Ordering::Acquire), "warmup aborted");
@@ -233,7 +249,8 @@ fn child_fiber_checked() -> EgclVal {
     egcl_rt::rooted!(
         args = vec![
             super::super::super::super::arena_cons(EgclVal::from_fixnum(case as i64), NIL),
-            T
+            T,
+            EgclVal::from_single_float(1.5)
         ]
     );
     let address = args[0].to_raw();
@@ -250,6 +267,9 @@ fn child_fiber_checked() -> EgclVal {
     });
     egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
     assert_eq!(PROBE.with(|slot| slot.get().hits), 1);
+    if mode == 5 {
+        assert_eq!(mapped.deopt_count(), 1);
+    }
     assert_eq!(
         take_nested_entries(),
         1,
@@ -278,6 +298,7 @@ fn child_fiber_checked() -> EgclVal {
             ":handler",
             ":cold",
             ":normal-cleanup",
+            ":deopt",
         ][mode],
     )
     .unwrap()
@@ -316,7 +337,7 @@ fn run_children(refuse: bool) {
     egcl_rt::rooted_ref!(_startup = &mut startup);
     for num_workers in if refuse { &[4][..] } else { &[1, 4][..] } {
         let num_workers = *num_workers;
-        for mode in 0..5 {
+        for mode in 0..6 {
             MODE.store(mode, Ordering::Relaxed);
             #[cfg(feature = "native-transfer-test-hooks")]
             {

@@ -202,9 +202,9 @@ pub(super) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
             let error = NATIVE_ERROR
                 .with(|slot| slot.take())
                 .ok_or_else(invalid_capture)?;
-            // Scope-free children have nothing to reconstruct or execute on
-            // escape. Preserve their direct native propagation to the caller.
-            if scope_free_native_body(&code.body, true) {
+            // Completed T0 recovery must not replay the child's continuation.
+            // Scope-free children likewise have nothing left to reconstruct.
+            if unsafe { (*context).recursive_escape } || scope_free_native_body(&code.body, true) {
                 return Err(error);
             }
             unsafe {
