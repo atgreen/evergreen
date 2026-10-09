@@ -1194,3 +1194,28 @@ and the resulting release executable runs a basic `--no-init --eval` smoke under
 Wine. Wine is recorded only as a regression environment: the native Windows
 SEH, CFG, and shadow-stack execution gates still require the checked-in
 `windows-native-transfer` job on an actual Windows runner.
+
+### Recursive segment calls
+
+The opt-in x86-64 Linux segment entry can call its own retained definition
+directly for fixed-arity, tagged bodies without dynamic control scopes or
+captured environments. Each call owns a distinct precise `EgclStack` frame and
+a linked retirement record on the native stack. A root-safe entry poll checks
+for pending transfers and revalidates the carrier after migration. The existing
+definition-generation guard keeps unchanged calls free of symbol lookup;
+after invalidation, both the function cell and retained bytecode identity must
+still match before a direct call is allowed. Redefinition, unbinding, and
+function-cell aliases use ordinary named-call dispatch.
+
+Normal returns retire exactly one activation without allocating or polling.
+An escaping transfer retires the recursive chain after Rust helpers have
+returned, preserving the pending condition or control payload. The successful
+generated-to-generated return has no `c2i_transfer_pending` check. Depth and
+native-stack bounds select the existing flat-interpreter fallback before a
+child frame is published; a successful fallback returns its value to the
+suspended native caller.
+
+This is an integration increment, not default activation or optimized T2
+completion. Generic arithmetic still uses helper veneers. Bodies with dynamic
+scopes, cross-function segment calls, and speculative deoptimization require
+their corresponding continuation and ownership work before using this route.

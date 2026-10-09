@@ -79,7 +79,10 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
             .reconstruct(|_| panic!("tagged inputs only"))
             .unwrap()
     );
-    assert_eq!(frames[0].locals[0], unsafe { state.expected.read() });
+    // X has already been consumed into the call's argument stack. Local
+    // liveness deliberately reconstructs its dead slot as UNBOUND; the live
+    // argument below must still retain the relocated object.
+    assert_eq!(frames[0].locals[0], egcl_rt::value::UNBOUND);
     assert_eq!(
         frames[0].stack.as_slice(),
         &[unsafe { state.expected.read() }]

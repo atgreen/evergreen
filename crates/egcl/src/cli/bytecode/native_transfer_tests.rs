@@ -13,6 +13,7 @@ mod fibers;
 mod handlers;
 mod live_signaling;
 mod payloads;
+mod recursion;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]

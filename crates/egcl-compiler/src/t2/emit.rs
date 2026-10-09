@@ -1646,7 +1646,8 @@ fn emit_invoke_call(
     activation_slots: u16,
     argument_base: u16,
     veneer: u64,
-) -> Result<u32, EmitError> {
+    recursion: Option<(RecursiveTransfer, egcl_rt::asm::Label)>,
+) -> Result<(Vec<u32>, u32), EmitError> {
     let (request_word0, request_word1, cleanup) = match data.aux {
         crate::t2::ir::AuxData::CallTarget(symbol) => {
             (u64::from(symbol), data.args.len() as u64, false)
@@ -1724,7 +1725,8 @@ fn emit_invoke_call(
         assert!(std::mem::size_of::<TransferCleanupRequest>() == 32);
         assert!(std::mem::offset_of!(TransferCleanupRequest, activation) == 24);
     };
-    alu_r_imm(a, 5, 4, 32); // sub rsp, 32
+    let temporary_bytes = if recursion.is_some() { 64 } else { 32 };
+    alu_r_imm(a, 5, 4, temporary_bytes);
     store_to_rsp(a, SCRATCH, 24); // activation
     mov_imm64(a, RAX, request_word0 as i64);
     store_to_rsp(a, RAX, 0);
@@ -1737,10 +1739,30 @@ fn emit_invoke_call(
     }
     store_to_rsp(a, SCRATCH, 16);
     mov_rr(a, 7, 4); // rdi = request
-    mov_imm64(a, RAX, veneer as i64);
+    mov_imm64(a, RAX, recursion.map_or(veneer, |(r, _)| r.prepare) as i64);
     a.extend_from_slice(&[0xff, 0xd0]);
-    let offset = u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?;
-    alu_r_imm(a, 0, 4, 32); // normal return only
+    let mut offsets = vec![u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?];
+    if let Some((recursion, entry)) = recursion {
+        let returned = a.label();
+        // A bounded compatibility fallback has already produced a Lisp value.
+        // Otherwise prepare returns the new, precisely rooted activation slots.
+        load_from_rsp(a, SCRATCH, 40); // RecursiveActivation.frame
+        a.extend_from_slice(&[0x48, 0x85, 0xd2]); // test rdx,rdx
+        a.jcc(egcl_rt::asm::Cc::E, returned);
+        mov_rr(a, 7, RAX);
+        load_from_rsp(a, 6, 48); // RecursiveActivation.stack
+        a.call(entry);
+        offsets.push(u32::try_from(a.here()).map_err(|_| EmitError::BadBranch)?);
+        // Retirement cannot allocate, poll, signal or invoke Lisp. The value
+        // may remain unrooted here while its callee activation is popped.
+        store_to_rsp(a, RAX, 16);
+        a.extend_from_slice(&[0x48, 0x8d, 0x7c, 0x24, 32]); // lea rdi,[rsp+32]
+        mov_imm64(a, RAX, recursion.finish as i64);
+        a.extend_from_slice(&[0xff, 0xd0]);
+        load_from_rsp(a, RAX, 16);
+        a.bind(returned);
+    }
+    alu_r_imm(a, 0, 4, temporary_bytes); // normal return only
     if let Some(value) = data.results.first() {
         store_home(
             a,
@@ -1749,7 +1771,7 @@ fn emit_invoke_call(
             0,
         );
     }
-    Ok(offset)
+    Ok((offsets, temporary_bytes as u32))
 }
 
 /// `(symbol-value sym)` — a global read. Lowers to `c2i_load_global(sym) -> rax`,
@@ -3019,6 +3041,45 @@ pub struct TransferCallRequest {
     pub activation: *mut egcl_rt::value::EgclVal,
 }
 
+/// A generated self-call owns this record until ordinary return or cold
+/// retirement. Its precise Lisp frame belongs to the same retained code as
+/// its caller; the host-stack links contain no movable Lisp values.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct RecursiveActivation {
+    pub previous: *mut RecursiveActivation,
+    pub frame: *mut egcl_rt::stack::Frame,
+    pub stack: *const egcl_rt::EgclStack,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct RecursiveCallRequest {
+    pub call: TransferCallRequest,
+    pub activation: RecursiveActivation,
+    pub reserved: u64,
+}
+
+/// The prepare veneer returns activation slots, or a completed compatibility
+/// result with a null record frame. Finish only retires the supplied record;
+/// it must not allocate, collect, yield, signal, or invoke Lisp.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub struct RecursiveTransfer {
+    pub symbol: u32,
+    pub arity: usize,
+    pub prepare: u64,
+    pub finish: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const _: () = {
+    assert!(std::mem::size_of::<RecursiveCallRequest>() == 64);
+    assert!(std::mem::offset_of!(RecursiveCallRequest, activation) == 32);
+    assert!(std::mem::offset_of!(RecursiveActivation, frame) == 8);
+    assert!(std::mem::offset_of!(RecursiveActivation, stack) == 16);
+};
+
 /// Cleanup completion uses the same temporary area size as a call request.
 /// It returns a restored normal answer or a pending transfer through helper-v2.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -3051,6 +3112,7 @@ struct TransferEmission {
     veneer: u64,
     cleanup: Option<CleanupEmission>,
     poll_veneer: Option<u64>,
+    recursion: Option<RecursiveTransfer>,
     sites: Vec<crate::t2::transfer_sites::SysvTransferSite>,
     landings: std::collections::HashMap<crate::t2::ir::Block, (u32, u32)>,
     catch_landings: std::collections::HashMap<crate::t2::ir::Block, Vec<(u32, u32, u32)>>,
@@ -3087,6 +3149,7 @@ pub fn emit_framed_transfers_with_cleanup(
         activation_slots,
         cleanup.map(|(save, restore)| CleanupEmission::Normal { save, restore }),
         None,
+        None,
     )
 }
 
@@ -3117,6 +3180,7 @@ pub fn emit_framed_native_cleanups(
             catch_landing: 0,
             handler_landing: 0,
         }),
+        None,
         None,
     )
 }
@@ -3164,6 +3228,37 @@ pub fn emit_framed_native_handlers_with_poll(
     handler_landing: u64,
     poll_veneer: u64,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_native_handlers_with_recursion(
+        f,
+        call_veneer,
+        activation_slots,
+        save,
+        complete,
+        clear_mv,
+        catch_landing,
+        handler_landing,
+        poll_veneer,
+        None,
+    )
+}
+
+/// Extend mapped segment calls with same-definition native recursion. The
+/// runtime must provide distinct precise activation records and cold retirement
+/// for every admitted recursive frame; the ordinary checked ABI cannot use it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_recursion(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -3179,6 +3274,7 @@ pub fn emit_framed_native_handlers_with_poll(
             handler_landing,
         }),
         (poll_veneer != 0).then_some(poll_veneer),
+        recursion,
     )
 }
 
@@ -3189,6 +3285,7 @@ fn emit_transfer_function(
     activation_slots: u16,
     cleanup: Option<CleanupEmission>,
     poll_veneer: Option<u64>,
+    recursion: Option<RecursiveTransfer>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
     let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
@@ -3286,6 +3383,7 @@ fn emit_transfer_function(
         veneer: call_veneer,
         cleanup,
         poll_veneer,
+        recursion,
         sites: vec![],
         landings: std::collections::HashMap::new(),
         catch_landings: std::collections::HashMap::new(),
@@ -4292,6 +4390,10 @@ fn emit_framed_inner(
     // Interpreter entry (offset 0): with calls, push the callee-saved value
     // registers and pad; then load entry params from the frame slots into their
     // value registers and fall (or jump) into the entry block.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let frame_entry_label = a.label();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    a.bind(frame_entry_label);
     let _unwind_info = emit_prologue(&mut a);
     if let Some(home) = entry_kind_home {
         mov_imm64(&mut a, RAX, code_id as i64);
@@ -4552,7 +4654,11 @@ fn emit_framed_inner(
                         },
                         _ => return Err(EmitError::UnsupportedOp(0xFA)),
                     };
-                    let return_offset = emit_invoke_call(
+                    let recursion = transfer.recursion.filter(|r| {
+                        matches!(d.aux, AuxData::CallTarget(symbol) if symbol == r.symbol)
+                            && d.args.len() == r.arity
+                    });
+                    let (return_offsets, call_stack_adjust) = emit_invoke_call(
                         &mut a,
                         &d,
                         &homes,
@@ -4561,6 +4667,7 @@ fn emit_framed_inner(
                         activation_slots.unwrap(),
                         root_shadow_slots,
                         veneer,
+                        recursion.map(|r| (r, frame_entry_label)),
                     )?;
                     let index = transfer_maps
                         .iter()
@@ -4600,19 +4707,19 @@ fn emit_framed_inner(
                             return Err(EmitError::UnsupportedOp(0xFD));
                         }
                     }
-                    transfer
-                        .sites
-                        .push(crate::t2::transfer_sites::SysvTransferSite {
+                    for return_offset in return_offsets {
+                        transfer.sites.push(crate::t2::transfer_sites::SysvTransferSite {
                             return_offset,
                             stack_slots: native_spill_slots,
-                            call_stack_adjust: 32,
+                            call_stack_adjust,
                             activation_slots: activation_slots
                                 .unwrap()
                                 .checked_add(shadow_root_slots)
                                 .ok_or(EmitError::UnsupportedOp(0xFD))?,
-                            shadow_roots,
-                            map,
+                            shadow_roots: shadow_roots.clone(),
+                            map: map.clone(),
                         });
+                    }
                 }
                 #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
                 return Err(EmitError::UnsupportedOp(0xFA));
