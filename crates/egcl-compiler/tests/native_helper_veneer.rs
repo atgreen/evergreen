@@ -128,3 +128,158 @@ fn capture_recipes_reject_clobbered_registers_and_invalid_stack_offsets() {
     assert!(SysvCaptureLocation::for_home(ValueHome::Stack(0), 1, 3).is_err());
     assert!(SysvCaptureLocation::for_home(ValueHome::Stack(u32::MAX - 1), u32::MAX, 0).is_err());
 }
+
+#[test]
+fn legacy_cell_veneer_reloads_slice_entries_and_preserves_primary_values() {
+    use egcl_compiler::t2::emit::TransferCallRequest;
+    use egcl_compiler::t2::native_transfer::emit_legacy_cell_veneer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    std::thread_local! {
+        static RECOVERY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static ENTRY_RECOVERY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static STATUS_RECOVERY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    unsafe extern "C" fn first(
+        cell: u64,
+        count: usize,
+        args: *const EgclVal,
+        token: u64,
+    ) -> EgclVal {
+        ENTRY_RECOVERY.set(RECOVERY.get());
+        // Cold bridges restore legacy recovery after their Rust callback.
+        RECOVERY.set(1);
+        assert_eq!(count, 5);
+        assert_eq!(token, 0);
+        unsafe {
+            *(cell as *mut usize) += 1;
+            *args
+        }
+    }
+    unsafe extern "C" fn last(
+        cell: u64,
+        count: usize,
+        args: *const EgclVal,
+        token: u64,
+    ) -> EgclVal {
+        ENTRY_RECOVERY.set(RECOVERY.get());
+        // Cold bridges restore legacy recovery after their Rust callback.
+        RECOVERY.set(1);
+        assert_eq!(count, 5);
+        assert_eq!(token, 0);
+        unsafe {
+            *(cell as *mut usize) += 10;
+            *args.add(4)
+        }
+    }
+    extern "C" fn recovery_toggle(enabled: u64) {
+        RECOVERY.set(enabled);
+    }
+    extern "C" fn returned() -> u64 {
+        STATUS_RECOVERY.set(RECOVERY.get());
+        0
+    }
+
+    let entry = AtomicUsize::new(first as *const () as usize);
+    let mut calls = 0usize;
+    let veneer = JitBuffer::new(&emit_legacy_cell_veneer(
+        &mut calls as *mut usize as u64,
+        &entry as *const AtomicUsize as u64,
+        recovery_toggle,
+        returned,
+        cold_route as *const u8,
+    ))
+    .unwrap();
+    let call: unsafe extern "C" fn(*mut TransferCallRequest) -> EgclVal =
+        unsafe { std::mem::transmute(veneer.as_ptr()) };
+    for value in [NIL, EgclVal::from_fixnum(0), EgclVal::from_fixnum(42)] {
+        let mut args = [value, NIL, NIL, NIL, EgclVal::from_fixnum(99)];
+        let mut request = TransferCallRequest {
+            symbol: 0,
+            nargs: args.len(),
+            args: args.as_mut_ptr(),
+            activation: std::ptr::null_mut(),
+        };
+        entry.store(first as *const () as usize, Ordering::Release);
+        assert_eq!(unsafe { call(&mut request) }, value);
+        assert_eq!(ENTRY_RECOVERY.get(), 1, "legacy target needs its recovery");
+        assert_eq!(
+            STATUS_RECOVERY.get(),
+            0,
+            "mapped status/capture cannot use legacy recovery"
+        );
+        entry.store(last as *const () as usize, Ordering::Release);
+        assert_eq!(unsafe { call(&mut request) }, EgclVal::from_fixnum(99));
+        assert_eq!(ENTRY_RECOVERY.get(), 1);
+        assert_eq!(STATUS_RECOVERY.get(), 0);
+        assert_eq!(RECOVERY.get(), 0);
+    }
+    assert_eq!(calls, 33);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn legacy_cell_error_disables_recovery_after_rust_returns_before_cold_exit() {
+    use egcl_compiler::t2::emit::TransferCallRequest;
+    use egcl_compiler::t2::native_transfer::emit_legacy_cell_veneer;
+    use std::sync::atomic::AtomicUsize;
+    std::thread_local! {
+        static RECOVERY: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        static STATUS_RECOVERY: std::cell::Cell<u64> = const { std::cell::Cell::new(9) };
+    }
+    struct State {
+        request: TransferCallRequest,
+        drops: usize,
+        entry_recovery: u64,
+    }
+    unsafe extern "C" fn legacy(cell: u64, _: usize, _: *const EgclVal, _: u64) -> EgclVal {
+        let state = unsafe { &mut *(cell as *mut State) };
+        let _finished = Finished(&mut state.drops);
+        state.entry_recovery = RECOVERY.get();
+        // The fixture cold route reads the segment anchor from word zero.
+        state.request.symbol = native_transfer::current_segment() as u64;
+        RECOVERY.set(1);
+        EgclVal::from_fixnum(42)
+    }
+    extern "C" fn recovery_toggle(enabled: u64) {
+        RECOVERY.set(enabled);
+    }
+    extern "C" fn pending() -> u64 {
+        STATUS_RECOVERY.set(RECOVERY.get());
+        1
+    }
+    let mut state = State {
+        request: TransferCallRequest {
+            symbol: 0,
+            nargs: 0,
+            args: std::ptr::null_mut(),
+            activation: std::ptr::null_mut(),
+        },
+        drops: 0,
+        entry_recovery: 0,
+    };
+    let entry = AtomicUsize::new(legacy as *const () as usize);
+    let veneer = JitBuffer::new(&emit_legacy_cell_veneer(
+        &mut state as *mut State as u64,
+        &entry as *const AtomicUsize as u64,
+        recovery_toggle,
+        pending,
+        cold_route as *const u8,
+    ))
+    .unwrap();
+    let stack = EgclStack::new(64 * 1024);
+    let outcome = unsafe {
+        native_transfer::invoke_native_segment(
+            veneer.as_ptr(),
+            (&mut state.request as *mut TransferCallRequest).cast(),
+            &stack,
+        )
+    }
+    .unwrap();
+    assert_eq!(outcome.exit, NativeExit::Transfer);
+    assert_eq!(outcome.value, EgclVal::from_fixnum(42));
+    assert_eq!(state.drops, 1);
+    assert_eq!(state.entry_recovery, 1);
+    assert_eq!(STATUS_RECOVERY.get(), 0);
+    assert_eq!(RECOVERY.get(), 0);
+}

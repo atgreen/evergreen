@@ -20,7 +20,7 @@
 //!
 //! # What this file owns
 //!
-//! The three x86-64 stubs and the capture image they share:
+//! The x86-64 stubs and the capture image they share:
 //!
 //! * [`emit_helper_veneer`] — the callable adapter `(request) -> primary` a
 //!   generated caller invokes instead of the raw helper. It calls a
@@ -29,6 +29,9 @@
 //!   primary in RAX; anything else removes the veneer's 24-byte frame and
 //!   tail-jumps to the cold entry with `(request, value, exit)` in
 //!   RDI/RSI/RDX, leaving the caller's frame and return address intact.
+//! * [`emit_legacy_cell_veneer`] — a migration adapter from mapped callers to
+//!   existing CallCell slice entries. It brackets legacy fault recovery and
+//!   converts the legacy pending-error state into the same cold capture route.
 //! * [`emit_capture_stub`] — the cold entry. It writes a
 //!   [`SysvTransferCapture`] on its own stack (request, value, exit, the six
 //!   callee-saved GPRs RBX/RBP/R12–R15, the caller's RSP above the return
@@ -319,7 +322,7 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
     let mut a = Asm::new();
     let exceptional = a.label();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // endbr64
-    // 16 bytes for NativeOutcome and 8 for request; align RSP before Rust CALL.
+                                                    // 16 bytes for NativeOutcome and 8 for request; align RSP before Rust CALL.
     a.extend_from_slice(&[0x48, 0x83, 0xec, 24]); // sub rsp,24
     a.extend_from_slice(&[0x48, 0x89, 0x7c, 0x24, 16]); // mov [rsp+16],rdi
     a.extend_from_slice(&[0x48, 0x89, 0xe6]); // mov rsi,rsp (out)
@@ -339,4 +342,66 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
     a.extend_from_slice(&(cold_entry as usize as u64).to_le_bytes());
     a.extend_from_slice(&[0xff, 0xe0]); // jmp rax
     a.finish().expect("local helper veneer label")
+}
+
+/// Bridge a mapped call to a legacy CallCell slice entry. Load the current entry
+/// on every invocation so definition replacement and invalidation stay visible.
+/// The recovery toggle enables legacy fault handling only during the cell call;
+/// mapped continuation/capture must retain disabled recovery. Both callbacks
+/// must be nonallocating and leave multiple values untouched.
+/// All legacy/Rust frames have returned before capture; restore this adapter's
+/// stack so `cold_entry` sees the original mapped caller's return address.
+/// The installer must retain the cell, its entry storage, and all code targets.
+pub fn emit_legacy_cell_veneer(
+    cell: u64,
+    slice_entry: u64,
+    recovery_toggle: extern "C" fn(u64),
+    pending_error: extern "C" fn() -> u64,
+    cold_entry: *const u8,
+) -> Vec<u8> {
+    const {
+        assert!(std::mem::offset_of!(super::emit::TransferCallRequest, nargs) == 8);
+        assert!(std::mem::offset_of!(super::emit::TransferCallRequest, args) == 16);
+    }
+    let mut a = Asm::new();
+    let exceptional = a.label();
+    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // endbr64
+    a.extend_from_slice(&[0x48, 0x83, 0xec, 24]); // sub rsp,24 (aligned calls)
+    a.extend_from_slice(&[0x48, 0x89, 0x7c, 0x24, 16]); // save request
+    a.extend_from_slice(&[0xbf, 1, 0, 0, 0]); // enable legacy fault recovery
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(recovery_toggle as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xd0]);
+    a.extend_from_slice(&[0x48, 0x8b, 0x7c, 0x24, 16]); // restore request
+    a.extend_from_slice(&[0x48, 0x8b, 0x77, 8]); // mov rsi,[rdi+8] (nargs)
+    a.extend_from_slice(&[0x48, 0x8b, 0x57, 16]); // mov rdx,[rdi+16] (args)
+    a.extend_from_slice(&[0x48, 0xbf]); // mov rdi,cell
+    a.extend_from_slice(&cell.to_le_bytes());
+    a.extend_from_slice(&[0x31, 0xc9]); // xor ecx,ecx (reserved profile token)
+    a.extend_from_slice(&[0x48, 0xb8]); // mov rax,slice_entry
+    a.extend_from_slice(&slice_entry.to_le_bytes());
+    a.extend_from_slice(&[0xff, 0x10]); // call [rax] (current atomic entry)
+    a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // save primary
+    a.extend_from_slice(&[0x31, 0xff]); // disable recovery for mapped caller
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(recovery_toggle as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xd0]);
+    a.extend_from_slice(&[0x48, 0xb8]); // mov rax,pending_error
+    a.extend_from_slice(&(pending_error as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xd0]); // call rax (no GC or MV mutation)
+    a.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax,rax (status only)
+    a.jcc(Cc::Ne, exceptional);
+    a.extend_from_slice(&[0x48, 0x8b, 0x04, 0x24]); // restore primary
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, 24]);
+    a.extend_from_slice(&[0xc3]);
+    a.bind(exceptional);
+    a.extend_from_slice(&[0x48, 0x8b, 0x7c, 0x24, 16]); // restore request
+    a.extend_from_slice(&[0x48, 0x8b, 0x34, 0x24]); // mov rsi,[rsp] (value)
+    a.extend_from_slice(&[0xba]); // mov edx,Transfer
+    a.extend_from_slice(&(NativeExit::Transfer as u32).to_le_bytes());
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, 24]); // discard adapter frame
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(cold_entry as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xe0]); // tail-enter capture
+    a.finish().expect("local CallCell veneer label")
 }

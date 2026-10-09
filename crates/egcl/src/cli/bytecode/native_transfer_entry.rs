@@ -16,7 +16,7 @@ use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
-    emit_capture_stub, emit_helper_veneer, emit_native_landing_stub, SysvNativeLanding,
+    emit_capture_stub, emit_helper_veneer, emit_legacy_cell_veneer, emit_native_landing_stub, SysvNativeLanding,
     SysvTransferCapture,
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
@@ -171,6 +171,7 @@ pub(super) struct TransferCode {
     #[cfg(test)]
     pub(super) has_deopt: bool,
     _veneer: JitBuffer,
+    _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
     _capture: JitBuffer,
     _poll: JitBuffer,
     _completion: JitBuffer,
@@ -271,6 +272,12 @@ pub(super) fn take_segment_run_count() -> u64 {
     SEGMENT_RUNS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+// This is the legacy boundary's status conversion, not an asynchronous poll.
+// It runs after all checked callees returned and cannot allocate or alter MV.
+extern "C" fn legacy_cell_transfer_pending() -> u64 {
+    u64::from(native_error_pending())
+}
+
 impl TransferCode {
     #[cfg(test)]
     pub(super) fn deopt_count(&self) -> u32 {
@@ -360,6 +367,25 @@ impl TransferCode {
             None => None,
         };
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
+        let mut call_entries = Vec::new();
+        for instruction in &body.code {
+            let Instr::CallNamed { sym, .. } = instruction else { continue };
+            if call_entries.iter().any(|(symbol, _, _)| symbol == sym) {
+                continue;
+            }
+            let Some(cell) = call_table::resolve(*sym) else { continue };
+            let adapter = JitBuffer::new(&emit_legacy_cell_veneer(
+                Arc::as_ptr(&cell) as u64,
+                cell.entry_address(true) as u64,
+                c2i_set_native_sigsegv_recovery,
+                legacy_cell_transfer_pending,
+                capture.as_ptr(),
+            ))?;
+            call_entries.push((*sym, cell, adapter));
+        }
+        let named_veneers: Vec<_> = call_entries.iter()
+            .map(|(symbol, _, adapter)| (*symbol, adapter.as_ptr() as u64))
+            .collect();
         let poll = JitBuffer::new(&emit_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
@@ -387,7 +413,7 @@ impl TransferCode {
             prepare: recursive_prepare.as_ref().unwrap().as_ptr() as u64,
             finish: finish_recursive as *const () as u64,
         });
-        let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_recursion(
+        let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -399,6 +425,7 @@ impl TransferCode {
             poll.as_ptr() as u64,
             recursion,
             deopt_veneer.as_ref().map(|code| code.as_ptr() as u64),
+            &named_veneers,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -461,6 +488,7 @@ impl TransferCode {
             #[cfg(test)]
             has_deopt: emitted.has_deopt,
             _veneer: veneer,
+            _call_entries: call_entries,
             _capture: capture,
             _poll: poll,
             _completion: completion,
