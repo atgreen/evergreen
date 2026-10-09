@@ -1524,3 +1524,29 @@ The fresh-process image test checks restored callable invocation and native call
 compilation. Replacing a restored source-free definition still loses its saved
 old body (`bliss-dm7tb`), reproduced with both checked and native-segment dispatch;
 that bug is an explicit dependency of the full callable rollout.
+
+### Native APPLY argument ownership (2026-10-09)
+
+APPLY now forwards through the same permanent callable entries as FUNCALL. Its
+expanded argument vector belongs to the active segment and is scanned alongside
+child activations. Pending owners are keyed by the stable caller context address;
+the context and capture ABI sizes stay unchanged. Expansion uses the interpreter's
+existing list conversion, so the separately tracked improper-tail gap (`bliss-0qbf`)
+is not claimed fixed.
+
+Callable preparation retains the buffer if mapped entry declines. Successful
+binding copies arguments into a scanned child frame, then takes and drops the
+buffer before entering native code. The exact-object adapter instead takes it
+into a rooted Rust local until `apply_function` returns. Both an early poll
+transfer and a preparation error retire the pending owner before assembly captures
+the original caller continuation. Taking an owner clears its obsolete invocation
+pointers; no Rust frame is skipped and no buffer waits for segment destruction.
+
+Tests exercise empty, register and slice invocations, explicit prefixes, measured
+wrapper and argument relocation, normal and throwing mapped targets, depth
+fallback, arity/type/invalid-callable errors, and an injected callable-entry poll
+transfer. A marker verifies zero pending owners while the parent remains live,
+including repeated calls. The exact-code EVAL reentry fixture now includes APPLY;
+fresh-process tests cover closure captures and replacement of a warmed APPLY
+binding. This is `bliss-shih7.16.4.2`; full callable routing and default migration
+remain under the parent tasks.

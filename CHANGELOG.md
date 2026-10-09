@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep eligible `APPLY` targets inside opt-in native transfer segments, with
+  expanded arguments rooted through moving GC and released before the caller
+  continues on normal return or transfer
+  ([#172](https://github.com/atgreen/evergreen/pull/172)).
+
 - Keep eligible `FUNCALL` targets inside opt-in native transfer segments,
   preserving multiple values, cleanup and moving arguments. Publish callable
   dispatchers that repair saved-image metadata and preserve exact function,

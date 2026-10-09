@@ -83,6 +83,11 @@ impl Drop for NativeEvalProbe {
 
 pub(in crate::cli) fn native_reentry_event_for_test(phase: EgclVal) -> Result<EgclVal, EgclError> {
     let position = Position::here();
+    assert_eq!(
+        super::super::super::native_transfer_entry::pending_argument_count(),
+        0,
+        "expanded argument owner must retire while its parent segment is still live"
+    );
     OBSERVATIONS.with(|state| {
         let mut state = state.borrow_mut();
         if state.armed {
@@ -167,7 +172,11 @@ fn native_v2_mapped_child_reenters_through_rust_and_retires_in_order() {
     let inner = install(inner_symbol, inner);
     let (child_symbol, child) = prepare_mapped("REENTRY-CHILD", "(form)", child_forms, &env);
     let child = install(child_symbol, child);
-    for invocation in ["(reentry-child form)", "(funcall #'reentry-child form)"] {
+    for invocation in [
+        "(reentry-child form)",
+        "(funcall #'reentry-child form)",
+        "(apply #'reentry-child (list form))",
+    ] {
         let caller = compile_caller(
             "(form)",
             &format!("((catch :reentry (unwind-protect {invocation} (reentry-mark 3))))"),
