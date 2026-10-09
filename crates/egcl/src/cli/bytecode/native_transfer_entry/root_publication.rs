@@ -65,6 +65,19 @@ pub(super) fn observe() {
     }
 }
 
+/// Separate hook for the cold transfer-preparation route, so a test can
+/// distinguish a publication made there from an ordinary poll's.
+#[cfg(test)]
+pub(super) static OBSERVE_COLD: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+#[cfg(test)]
+pub(super) fn observe_cold() {
+    if let Some(hook) = OBSERVE_COLD.with(Cell::get) {
+        hook();
+    }
+}
+
 /// Boundaries walked that belong to an execution other than the collecting
 /// one, and the root slots reached through them. A suspended execution's
 /// activations validate only against its own managed stack, so a nonzero
@@ -500,6 +513,61 @@ mod tests {
         assert_ne!(args[1].to_raw(), old_pointer, "the suspended callers' heap value actually moved");
         assert_eq!(crate::cli::cp(args[1]), (EgclVal::from_fixnum(42), NIL));
         assert_eq!(value.unwrap(), EgclVal::from_fixnum(42));
+    }
+
+    /// The cold transfer-preparation route signals and allocates after the
+    /// helper's own publication has ended with its Rust frame. It must publish
+    /// the equivalent image the capture stub built for the same caller.
+    static COLD_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static COLD_VISITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn observe_cold_publication() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let current = ACTIVE.with(Cell::get);
+        assert!(!current.is_null(), "publish before cold preparation can signal");
+        COLD_CALLS.fetch_add(1, SeqCst);
+        force_minor_gc();
+        COLD_VISITED.fetch_add(chain_visited(current), SeqCst);
+    }
+
+    #[test]
+    fn cold_transfer_preparation_publishes_before_it_signals() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let token = crate::cli::next_control_token("PUBLICATION-COLD");
+        let tag = reader::read_from_string(":publication-cold-tag").unwrap().0;
+        env.catch_stack.push((tag, token.clone()));
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(
+            "((progn (let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))))
+                     (throw :publication-cold-tag x)))"
+        ).unwrap().0);
+        let body = Arc::new(
+            compile_function("PUBLICATION-COLD", *params, *forms, &env, false, false).unwrap(),
+        );
+        let code = TransferCode::compile(body).unwrap();
+        egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
+        COLD_CALLS.store(0, SeqCst);
+        COLD_VISITED.store(0, SeqCst);
+        OBSERVE_COLD.with(|slot| slot.set(Some(observe_cold_publication)));
+        let result = code.run(&args, &mut env);
+        OBSERVE_COLD.with(|slot| slot.set(None));
+        assert!(ACTIVE.with(Cell::get).is_null(), "retire before the stub discards its image");
+        assert!(COLD_CALLS.load(SeqCst) > 0, "the throw must enter the cold route");
+        assert!(
+            COLD_VISITED.load(SeqCst) > 0,
+            "a collection during cold preparation must reach roots through the publication"
+        );
+        assert!(
+            matches!(&result, Err(EgclError::Internal(t)) if t == &token),
+            "the throw still reaches its catch: {result:?}"
+        );
+        assert_eq!(crate::cli::take_control_mv(&token, &mut env), args[0]);
+        assert_eq!(crate::cli::cp(args[0]).0, T, "the thrown value survived collection");
+        env.catch_stack.pop();
     }
 
     /// Fibers park inside a live publication; the collector then walks their

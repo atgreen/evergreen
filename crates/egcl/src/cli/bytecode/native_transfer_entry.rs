@@ -2220,6 +2220,20 @@ fn prepare_escape(context: &mut CaptureContext) {
 // or reenter Lisp. Rust returns before the capture stub dispatches; assembly
 // only discards generated frames, never a Rust signaling or handler frame.
 unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
+    // The helper's publication ended with its Rust frame, but the capture stub
+    // built an equivalent image describing the same suspended caller, and
+    // preparation below signals and allocates. Publish for its whole extent;
+    // the guard unlinks before the stub discards this image.
+    unsafe {
+        root_publication::published(capture, || {
+            #[cfg(test)]
+            root_publication::observe_cold();
+            prepare_unpublished(capture)
+        })
+    }
+}
+
+unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
     prepare_escape(context);
