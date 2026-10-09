@@ -12595,6 +12595,22 @@ fn compile_defun(
         if body.is_nil() {
             return false; // source-free objects must retain their real bytecode
         }
+        // DEFUN stores an implicit BLOCK around its body. Compile the forms
+        // inside that matching wrapper: compile_function_in reinstates it when
+        // RETURN-FROM needs it, including after local macro expansion. Keeping
+        // an unused wrapper emits handlers that prevent ordinary leaf inlining.
+        let (form, rest) = cp(body);
+        let (op, block_tail) = cp(form);
+        let (block_name, inner_body) = cp(block_tail);
+        let body = if rest.is_nil()
+            && block_name == EgclVal::from_symbol_index(sym)
+            && op.is_symbol()
+            && sym_bare_name_rc(op).as_ref() == "BLOCK"
+        {
+            inner_body
+        } else {
+            body
+        };
         (egcl_rt::function::lambda_list(*function), body)
     } else {
         (params, body)
