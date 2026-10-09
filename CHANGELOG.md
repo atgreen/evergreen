@@ -5,7 +5,7 @@
 - Use native entries for eligible x86-64 T2 `FUNCALL` callbacks, including
   captured closures, and reuse adapters when callback bodies alternate.
   Preserve captured bindings and multiple values across GC and deoptimization.
-  This reduces full Prechelt phone-encoding time by about 9% in the measured
+  This reduces full Prechelt phone-encoding time by about 8% in the measured
   x86-64 workload ([#148](https://github.com/atgreen/evergreen/pull/148)).
 
 - Preserve the original behavior of saved source-backed function objects after
