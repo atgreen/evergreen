@@ -260,7 +260,8 @@ fn machine_call_routes_preserve_operands_and_exception_only_roots() {
             .find(|m| m.code_offset == index as u32)
             .unwrap();
         assert!(
-            map.live_refs.contains(&root),
+            map.live_refs()
+                .any(|value| value.vreg.num == exception_only.0),
             "exception-only local has a root location"
         );
     }
@@ -354,10 +355,66 @@ fn capture_maps_reject_missing_call_roots_or_allocations() {
         .iter_mut()
         .find(|m| m.code_offset == index as u32)
         .unwrap();
-    map.live_refs.clear();
+    map.values.clear();
     assert!(
         lower_transfer_maps(&f, &machine).is_err(),
         "cold-route maps cannot substitute for a missing call root"
+    );
+}
+
+#[test]
+fn capture_maps_reject_wrong_phase_locations_and_representations() {
+    use egcl_compiler::t2::ir::ValueRepresentation;
+    use egcl_compiler::t2::lower::{lower, op};
+    use egcl_compiler::t2::mach::{Location, StackSlot};
+    use egcl_compiler::t2::regalloc::allocate;
+    use egcl_compiler::t2::transfer_map::lower_transfer_maps;
+    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut machine = lower(&f);
+    allocate(&mut machine).unwrap();
+    let index = machine
+        .insts
+        .iter()
+        .position(|i| i.op == op::INVOKE)
+        .unwrap();
+    let instruction = &machine.insts[index];
+    let vreg = instruction.deopt_uses[0];
+    let operand = instruction.defs.len() + instruction.uses.len();
+    let original = machine.inst_allocations[index][operand];
+    machine.inst_allocations[index][operand] = Location::Stack(StackSlot(u32::MAX));
+    assert!(
+        lower_transfer_maps(&f, &machine).is_err(),
+        "late capture needs a real allocated home"
+    );
+    machine.inst_allocations[index][operand] = original;
+    let map = machine
+        .stack_maps
+        .iter_mut()
+        .find(|m| m.code_offset == index as u32)
+        .unwrap();
+    let value = map.values.iter_mut().find(|v| v.vreg == vreg).unwrap();
+    let original = value.location;
+    value.location = Location::Stack(StackSlot(u32::MAX));
+    assert!(
+        lower_transfer_maps(&f, &machine).is_err(),
+        "before map needs its own valid home"
+    );
+    let map = machine
+        .stack_maps
+        .iter_mut()
+        .find(|m| m.code_offset == index as u32)
+        .unwrap();
+    map.values
+        .iter_mut()
+        .find(|v| v.vreg == vreg)
+        .unwrap()
+        .location = original;
+    machine
+        .value_reprs
+        .insert(vreg, ValueRepresentation::UnboxedFixnum);
+    assert!(
+        lower_transfer_maps(&f, &machine).is_err(),
+        "machine representation must match verified IR"
     );
 }
 

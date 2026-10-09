@@ -33,8 +33,10 @@
 //! 4. Lower the frame state through `deopt::lower_one` against that binding
 //!    and collect the tagged roots (`InLocation` with `Rebox::None`, recursing
 //!    into remat inputs).
-//! 5. Require exactly one regalloc stack map at that instruction index, with
-//!    the same frame state, whose `live_refs` contain every collected root.
+//! 5. Require exactly one before-instruction stack map with the same frame
+//!    state and correctly typed live values at valid Before locations. Validate
+//!    late recovery locations independently against the allocation ranges.
+//!    These phases share value identity, not necessarily physical addresses.
 //!
 //! Any failure is a `TransferMapError` and the function declines the transfer
 //! emitter rather than shipping a partial map.
@@ -55,7 +57,7 @@ use crate::control_scope::ControlScope;
 use crate::t2::deopt::{self, LoweredScope, Rebox, SlotDescriptor};
 use crate::t2::ir::{AuxData, Function, Inst, Opcode, Value};
 use crate::t2::lower::op;
-use crate::t2::mach::{Location, MachFunc};
+use crate::t2::mach::{EditPosition, Location, MachFunc};
 
 #[derive(Clone, Debug)]
 pub struct TransferCaptureMap {
@@ -152,6 +154,16 @@ pub fn lower_transfer_maps(
         }
         let mut locations = std::collections::HashMap::new();
         for (value, &location) in inst.deopt_uses.iter().zip(&allocations[base..]) {
+            // Recovery uses are late operands. A before-call GC map cannot
+            // validate these addresses: the allocator may move the value.
+            if value.num as usize >= f.num_values()
+                || machine.value_reprs.get(value) != Some(&f.value(Value(value.num)).repr)
+                || !machine
+                    .locations_at(*value, index, EditPosition::After)
+                    .any(|home| home == location)
+            {
+                return Err(BadCallState(call));
+            }
             if locations
                 .insert(Value(value.num), location)
                 .is_some_and(|old| old != location)
@@ -175,7 +187,15 @@ pub fn lower_transfer_maps(
         let stack_map = stack_maps.next().ok_or(MissingCallRoots(call))?;
         if stack_maps.next().is_some()
             || stack_map.frame_state != data.frame_state
-            || roots.iter().any(|root| !stack_map.live_refs.contains(root))
+            || inst.deopt_uses.iter().any(|vreg| {
+                !stack_map.values.iter().any(|value| {
+                    value.vreg == *vreg
+                        && machine.value_reprs.get(vreg) == Some(&value.repr)
+                        && machine
+                            .locations_at(*vreg, index, EditPosition::Before)
+                            .any(|home| home == value.location)
+                })
+            })
         {
             return Err(MissingCallRoots(call));
         }

@@ -6053,6 +6053,9 @@ mod tests {
     #[test]
     fn emits_const_return_bytes() {
         let mut mf = MachFunc {
+            value_reprs: (0..3)
+                .map(|n| (gpr(n), crate::t2::ir::ValueRepresentation::UnboxedFixnum))
+                .collect(),
             insts: vec![
                 mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
                 mi(op::RET, vec![], vec![gpr(0)], None),
@@ -6288,6 +6291,9 @@ mod tests {
     #[test]
     fn emitted_code_executes() {
         let mut mf = MachFunc {
+            value_reprs: (0..3)
+                .map(|n| (gpr(n), crate::t2::ir::ValueRepresentation::UnboxedFixnum))
+                .collect(),
             insts: vec![
                 mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(12345)),
                 mi(op::RET, vec![], vec![gpr(0)], None),
@@ -6326,6 +6332,9 @@ mod tests {
             acc = out;
         }
         mf.insts.push(mi(op::RET, vec![], vec![acc], None));
+        mf.value_reprs = (0..next)
+            .map(|n| (gpr(n), crate::t2::ir::ValueRepresentation::UnboxedFixnum))
+            .collect();
 
         allocate(&mut mf).expect("regalloc2");
         assert!(
@@ -7106,6 +7115,9 @@ mod tests {
     #[test]
     fn emitted_addition_executes() {
         let mut mf = MachFunc {
+            value_reprs: (0..3)
+                .map(|n| (gpr(n), crate::t2::ir::ValueRepresentation::UnboxedFixnum))
+                .collect(),
             insts: vec![
                 mi(op::MOV_IMM, vec![gpr(0)], vec![], Some(7)),
                 mi(op::MOV_IMM, vec![gpr(1)], vec![], Some(5)),

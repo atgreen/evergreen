@@ -248,6 +248,7 @@ struct Lowering<'f> {
     f: &'f Function,
     insts: Vec<MachInst>,
     next_temp: u32,
+    value_reprs: std::collections::HashMap<VReg, ValueRepresentation>,
 }
 
 impl<'f> Lowering<'f> {
@@ -257,6 +258,18 @@ impl<'f> Lowering<'f> {
             f,
             insts: Vec::new(),
             next_temp: f.num_values() as u32,
+            value_reprs: (0..f.num_values())
+                .map(|index| {
+                    let repr = f.value(Value(index as u32)).repr;
+                    (
+                        VReg {
+                            class: class_of(repr),
+                            num: index as u32,
+                        },
+                        repr,
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -273,10 +286,15 @@ impl<'f> Lowering<'f> {
     }
 
     #[allow(dead_code)]
-    fn fresh(&mut self, class: RegClass) -> VReg {
+    fn fresh(&mut self, repr: ValueRepresentation) -> VReg {
         let num = self.next_temp;
         self.next_temp += 1;
-        VReg { class, num }
+        let vreg = VReg {
+            class: class_of(repr),
+            num,
+        };
+        self.value_reprs.insert(vreg, repr);
+        vreg
     }
 
     /// Emit a plain (non-safepoint, non-deopt) MachInst.
@@ -518,6 +536,7 @@ pub fn lower(f: &Function) -> MachFunc {
 
     MachFunc {
         insts: lo.insts,
+        value_reprs: lo.value_reprs,
         blocks,
         allocation: Vec::new(),
         inst_allocations: Vec::new(),
@@ -964,6 +983,62 @@ mod tests {
         // The float constants were also materialised into XMM registers.
         let fconst = mf.insts.iter().find(|m| m.op == op::LOAD_FCONST).unwrap();
         assert_eq!(fconst.defs[0].class, RegClass::Xmm);
+    }
+
+    #[test]
+    fn loop_call_maps_preserve_typed_phi_liveness() {
+        let mut f = Function::new("loop-map");
+        let entry = f.entry();
+        let loop_block = f.make_block();
+        let exit = f.make_block();
+        let seed = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let condition = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (ty, repr) = ufix();
+        let count = f.add_block_param(entry, ty, repr);
+        let held = f.add_block_param(loop_block, IRType::TOP, ValueRepresentation::Tagged);
+        let raw = f.add_block_param(loop_block, ty, repr);
+        let done = f.add_block_param(exit, IRType::TOP, ValueRepresentation::Tagged);
+        let mut jump = inst(Opcode::Jump, vec![], AuxData::None);
+        jump.targets.push(BlockCall {
+            block: loop_block,
+            args: vec![seed, count],
+        });
+        f.set_terminator(entry, jump);
+        let mut call = inst(Opcode::Call, vec![], AuxData::CallTarget(1));
+        call.flags.call = true;
+        call.flags.safepoint = true;
+        f.push_inst(loop_block, call, &[]);
+        let mut branch = inst(Opcode::Brif, vec![condition], AuxData::None);
+        branch.targets = vec![
+            BlockCall {
+                block: loop_block,
+                args: vec![held, raw],
+            },
+            BlockCall {
+                block: exit,
+                args: vec![held],
+            },
+        ];
+        f.set_terminator(loop_block, branch);
+        f.set_terminator(exit, inst(Opcode::Return, vec![done], AuxData::None));
+        let mut machine = lower(&f);
+        crate::t2::regalloc::allocate(&mut machine).unwrap();
+        let map = &machine.stack_maps[0];
+        let mut roots: Vec<_> = map.live_refs().map(|v| v.vreg.num).collect();
+        roots.sort();
+        let mut expected = vec![held.0, condition.0];
+        expected.sort();
+        assert_eq!(roots, expected);
+        assert!(
+            map.values
+                .iter()
+                .any(|v| v.vreg.num == raw.0 && v.repr == ValueRepresentation::UnboxedFixnum)
+        );
+        assert!(
+            !map.values
+                .iter()
+                .any(|v| v.vreg.num == seed.0 || v.vreg.num == done.0)
+        );
     }
 
     #[test]

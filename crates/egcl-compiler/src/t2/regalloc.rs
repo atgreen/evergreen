@@ -144,32 +144,29 @@
 //!
 //! # Stack maps
 //!
-//! regalloc2 0.15.2 exposes no safepoint or reftype support on the public
-//! `Function` trait (`requires_refs_for_safepoint`, `reftype_vregs`,
-//! `is_safepoint` exist only in its private `fuzzing` module), so the maps are
-//! built after allocation: for each instruction with `safepoint == true`, a
-//! [`StackMap`] whose `live_refs` are the `Location`s of that instruction's
-//! Gpr-class uses (ordinary and `deopt_uses` alike) and whose `frame_state` is
-//! the instruction's `FrameStateId`. `code_offset` carries the **instruction
-//! index**, not a byte offset; transfer_map.rs and deopt.rs match maps to
-//! instructions by that index, and native offsets only exist after emission.
+//! The machine IR carries each VReg's explicit `ValueRepresentation`; GPR
+//! class alone is insufficient because unboxed integers also use GPRs. Missing
+//! representations or representation/class mismatches abort allocation.
 //!
-//! Two known approximations:
+//! Maps sample regalloc2's split live ranges at Before(i), using half-open
+//! bounds. This is the state after Before edits and before the instruction's
+//! writes or call clobbers: live-through values and dead-after-call arguments
+//! are present, late result definitions are absent. Early operand allocations
+//! also describe required copies. The current adapter uses only Reg/Any
+//! constraints; adding FixedReg/Reuse requires auditing copy ownership here.
 //!
-//! * Only operands of the safepoint instruction itself are recorded; a value
-//!   live across the safepoint but not named by it is absent.
-//! * There are no per-VReg reftype flags on `MachInst`, so every Gpr-class
-//!   use is reported, unboxed integers included.
+//! Each map retains typed VReg/location records, with GC candidates derived
+//! from Tagged representation. Unboxed values remain available to debug and
+//! deopt consumers without becoming roots. `code_offset` is an instruction
+//! index, not an emitted byte offset. Late deopt operands retain their own
+//! locations in `inst_allocations`; transfer_map.rs checks their identities,
+//! representations and phase-specific locations independently.
 //!
-//! Both are acceptable because no backend hands `live_refs` to the collector.
-//! All framed emitters take the boundary-synchronisation route instead: before
-//! each runtime call the exact live tagged set is synchronised into shadow
-//! slots on the `EgclStack` activation, which the GC scans, and reloaded
-//! afterwards. The maps here serve as the deopt anchor (deopt.rs lowers each
-//! `FrameState` by walking them) and as a cross-check (transfer_map.rs refuses
-//! a transfer site whose FrameState roots are not all in `live_refs`). A
-//! backend that wants to publish register roots directly needs reftype flags
-//! and cross-instruction liveness here first.
+//! These are allocator maps, not yet collector inputs. Framed emitters still
+//! synchronize live tagged values into scanned EgclStack shadow slots and
+//! reload them after collection. Publication to a native stack walker or DWARF
+//! needs the emitter's final homes and native PC ranges; raw allocator
+//! locations cannot substitute for those if the emitter rehomes a value.
 //!
 //! # Debugging
 //!
@@ -189,9 +186,31 @@ use regalloc2::{
 };
 
 use crate::t2::mach::{
-    AllocationEdit, EditPosition, Location, MachFunc, PhysReg, RegClass, StackMap, StackSlot, VReg,
-    ValueLocationRange,
+    AllocatedValue, AllocationEdit, EditPosition, Location, MachFunc, PhysReg, RegClass, StackMap,
+    StackSlot, VReg, ValueLocationRange,
 };
+
+#[derive(Debug)]
+pub enum AllocationError {
+    Allocator(RegAllocError),
+    MissingRepresentation(VReg),
+    RepresentationClassMismatch(VReg),
+    MissingLocation(VReg),
+}
+
+impl From<RegAllocError> for AllocationError {
+    fn from(error: RegAllocError) -> Self {
+        Self::Allocator(error)
+    }
+}
+
+impl core::fmt::Display for AllocationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for AllocationError {}
 
 /// Number of allocatable GPRs exposed to the allocator (hw_enc `0..N_GPR`); one
 /// extra encoding above this is reserved as the class scratch register.
@@ -577,8 +596,8 @@ impl Ra2Function for Adapter {
 ///
 /// Fills `mf.allocation` with a `VReg → Location` binding for every virtual
 /// register and pushes one [`StackMap`] per safepoint instruction. See the
-/// module docs for the empty-blocks fallback and the stack-map limitations.
-pub fn allocate(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+/// module docs for the empty-blocks fallback and the before-instruction map contract.
+pub fn allocate(mf: &mut MachFunc) -> Result<(), AllocationError> {
     allocate_with_env(mf, machine_env(), x86_call_clobbers())
 }
 
@@ -596,7 +615,7 @@ fn x86_call_clobbers() -> PRegSet {
 
 /// Allocate for the live framed x86 emitter, reserving its ABI and scratch
 /// registers while still using the same regalloc2 pipeline and edit model.
-pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), AllocationError> {
     // Reduced-pool-first (bliss-x5y.29): short prologues for the small hot
     // functions that dominate recursion, with a FULL-pool retry when the
     // reduced pool genuinely runs out of registers — a retry costs one extra
@@ -610,7 +629,7 @@ pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
         _ => {}
     }
     match allocate_with_env(mf, framed_machine_env(true), x86_call_clobbers()) {
-        Err(RegAllocError::TooManyLiveRegs) => {
+        Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => {
             allocate_with_env(mf, framed_machine_env(false), x86_call_clobbers())
         }
         done => done,
@@ -626,7 +645,7 @@ pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), RegAllocError> {
 /// temporaries and f15 is the floating edit scratch; f4-f14 are allocatable.
 /// The emitter must save every callee-saved register it writes, including f15
 /// when an allocation edit uses it, and synchronize tagged roots at safepoints.
-pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), AllocationError> {
     let mut integers = PRegSet::empty();
     for reg in 6..=12 {
         integers.add(PReg::new(reg, Ra2RegClass::Int));
@@ -669,7 +688,7 @@ pub fn allocate_framed_s390x(mf: &mut MachFunc) -> Result<(), RegAllocError> {
 /// Floats: ft0–ft7 and fa0–fa7, all call-clobbered. The callee-saved fs
 /// registers are not offered; nothing in the framed pipeline keeps an unboxed
 /// float live across a call.
-pub fn allocate_framed_riscv64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+pub fn allocate_framed_riscv64(mf: &mut MachFunc) -> Result<(), AllocationError> {
     let mut integers = PRegSet::empty();
     for reg in std::iter::once(9).chain(19..=27) {
         integers.add(PReg::new(reg, Ra2RegClass::Int));
@@ -717,7 +736,7 @@ pub fn allocate_framed_riscv64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
 /// even though they are nominally callee-saved, because AAPCS64 preserves only
 /// their low 64 bits — a caller that stored a wider value there would find the
 /// top half gone, and this pool is not the place to encode that subtlety.
-pub fn allocate_framed_a64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+pub fn allocate_framed_a64(mf: &mut MachFunc) -> Result<(), AllocationError> {
     let mut integers = PRegSet::empty();
     for reg in 19..=27 {
         integers.add(PReg::new(reg, Ra2RegClass::Int));
@@ -765,7 +784,7 @@ pub fn allocate_framed_a64(mf: &mut MachFunc) -> Result<(), RegAllocError> {
 ///
 /// Floats: f14–f29 are nonvolatile, with f30 as the class scratch; f0–f13 are
 /// call-clobbered and used as working registers.
-pub fn allocate_framed_ppc64le(mf: &mut MachFunc) -> Result<(), RegAllocError> {
+pub fn allocate_framed_ppc64le(mf: &mut MachFunc) -> Result<(), AllocationError> {
     let mut integers = PRegSet::empty();
     for reg in 20..=29 {
         integers.add(PReg::new(reg, Ra2RegClass::Int));
@@ -799,7 +818,7 @@ fn allocate_with_env(
     mf: &mut MachFunc,
     env: MachineEnv,
     call_clobbers: PRegSet,
-) -> Result<(), RegAllocError> {
+) -> Result<(), AllocationError> {
     allocate_with_call_operands(mf, env, call_clobbers, false)
 }
 
@@ -808,7 +827,7 @@ fn allocate_with_call_operands(
     env: MachineEnv,
     call_clobbers: PRegSet,
     stack_call_operands: bool,
-) -> Result<(), RegAllocError> {
+) -> Result<(), AllocationError> {
     mf.allocation.clear();
     mf.inst_allocations.clear();
     mf.allocation_edits.clear();
@@ -821,6 +840,15 @@ fn allocate_with_call_operands(
     }
 
     let adapter = Adapter::build(mf, call_clobbers, stack_call_operands);
+    for &vreg in &adapter.reverse {
+        let repr = mf
+            .value_reprs
+            .get(&vreg)
+            .ok_or(AllocationError::MissingRepresentation(vreg))?;
+        if crate::t2::lower::class_of(*repr) != vreg.class {
+            return Err(AllocationError::RepresentationClassMismatch(vreg));
+        }
+    }
 
     // Ion 0.15.2 underflows ProgPoint::prev while diagnosing an impossible
     // register demand at instruction zero. Report that demand ourselves so
@@ -846,7 +874,7 @@ fn allocate_with_call_operands(
             if !regs.contains(&operand.vreg()) {
                 regs.push(operand.vreg());
                 if regs.len() > capacity[class] {
-                    return Err(RegAllocError::TooManyLiveRegs);
+                    return Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs));
                 }
             }
         }
@@ -915,15 +943,16 @@ fn allocate_with_call_operands(
     mf.value_locations = output
         .debug_locations
         .iter()
-        .filter_map(|(label, start, end, allocation)| {
-            Some(ValueLocationRange {
-                vreg: *adapter.reverse.get(*label as usize)?,
+        .map(|(label, start, end, allocation)| {
+            let vreg = adapter.reverse[*label as usize];
+            Ok(ValueLocationRange {
+                vreg,
                 start: start.to_index(),
                 end: end.to_index(),
-                location: to_location(*allocation)?,
+                location: to_location(*allocation).ok_or(AllocationError::MissingLocation(vreg))?,
             })
         })
-        .collect();
+        .collect::<Result<_, AllocationError>>()?;
 
     // ── Write back VReg → Location. Prefer a value's def-site allocation as its
     // canonical location; fall back to a use site if it is only ever used. ────
@@ -952,30 +981,47 @@ fn allocate_with_call_operands(
         }
     }
 
-    // ── Stack maps: one per safepoint, with live tagged (Gpr) refs and the
-    // resolved FrameState id (see module docs for why we compute these
-    // ourselves rather than via regalloc2). ───────────────────────────────────
-    for i in 0..mf.insts.len() {
-        if !mf.insts[i].safepoint {
+    // Before(i) is after the instruction's Before edits but before its
+    // writes/clobbers. Half-open allocation ranges include early uses whose
+    // last use is this call, and exclude its late return definitions.
+    for (index, instruction) in mf.insts.iter().enumerate() {
+        if !instruction.safepoint {
             continue;
         }
-        let allocs = output.inst_allocs(Ra2Inst::new(i));
-        let mut live_refs = Vec::new();
-        for (op, alloc) in adapter.operands[i].iter().zip(allocs) {
-            if op.kind() != OperandKind::Use {
-                continue;
+        let point = regalloc2::ProgPoint::before(Ra2Inst::new(index)).to_index();
+        let mut values = Vec::new();
+        for range in &mf.value_locations {
+            if range.contains(point) {
+                values.push(AllocatedValue {
+                    vreg: range.vreg,
+                    repr: mf.value_reprs[&range.vreg],
+                    location: range.location,
+                });
             }
-            let ours = adapter.reverse[op.vreg().vreg()];
-            if ours.class == RegClass::Gpr {
-                if let Some(loc) = to_location(*alloc) {
-                    live_refs.push(loc);
+        }
+        // Operand allocations name required early copies. Late deopt uses
+        // belong to a different phase and must not be mixed into this map.
+        for (operand, allocation) in adapter.operands[index]
+            .iter()
+            .zip(output.inst_allocs(Ra2Inst::new(index)))
+        {
+            if operand.kind() == OperandKind::Use && operand.pos() == OperandPos::Early {
+                let vreg = adapter.reverse[operand.vreg().vreg()];
+                let value = AllocatedValue {
+                    vreg,
+                    repr: mf.value_reprs[&vreg],
+                    location: to_location(*allocation)
+                        .ok_or(AllocationError::MissingLocation(vreg))?,
+                };
+                if !values.contains(&value) {
+                    values.push(value);
                 }
             }
         }
         mf.stack_maps.push(StackMap {
-            code_offset: i as u32,
-            live_refs,
-            frame_state: mf.insts[i].frame_state,
+            code_offset: index as u32,
+            values,
+            frame_state: instruction.frame_state,
         });
     }
     Ok(())
@@ -985,6 +1031,7 @@ fn allocate_with_call_operands(
 mod tests {
     use super::*;
     use crate::t2::frame_state::FrameStateId;
+    use crate::t2::ir::ValueRepresentation;
     use crate::t2::mach::{MachBlock, MachBlockId, MachInst, MachSucc};
 
     fn vreg(class: RegClass, num: u32) -> VReg {
@@ -1008,6 +1055,12 @@ mod tests {
         let args: Vec<_> = (0..nargs).map(|n| vreg(RegClass::Gpr, n)).collect();
         let result = vreg(RegClass::Gpr, nargs);
         MachFunc {
+            value_reprs: args
+                .iter()
+                .copied()
+                .chain([result])
+                .map(|v| (v, ValueRepresentation::Tagged))
+                .collect(),
             insts: vec![
                 inst(crate::t2::lower::op::CALL, vec![result], args.clone()),
                 inst(0, vec![], vec![result]),
@@ -1027,7 +1080,7 @@ mod tests {
         let mut mf = entry_call(6);
         assert!(matches!(
             allocate_with_env(&mut mf, framed_machine_env(true), x86_call_clobbers()),
-            Err(RegAllocError::TooManyLiveRegs)
+            Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs))
         ));
         allocate_framed(&mut mf).expect("six arguments fit the full register pool");
     }
@@ -1036,7 +1089,7 @@ mod tests {
     fn impossible_entry_call_pressure_returns_an_error() {
         assert!(matches!(
             allocate_framed(&mut entry_call(9)),
-            Err(RegAllocError::TooManyLiveRegs)
+            Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs))
         ));
     }
 
@@ -1078,6 +1131,12 @@ mod tests {
         };
 
         MachFunc {
+            value_reprs: [
+                (g0, ValueRepresentation::Tagged),
+                (g1, ValueRepresentation::Tagged),
+                (f0, ValueRepresentation::UnboxedF64),
+            ]
+            .into(),
             insts: vec![
                 inst(1, vec![g0], vec![]),     // def g0
                 inst(2, vec![f0], vec![]),     // def f0
@@ -1108,6 +1167,11 @@ mod tests {
             safepoint: false,
         };
         let mut mf = MachFunc {
+            value_reprs: [
+                (g0, ValueRepresentation::Tagged),
+                (g1, ValueRepresentation::Tagged),
+            ]
+            .into(),
             insts: vec![
                 inst(1, vec![g0], vec![]), // def g0 — never ordinarily used again
                 guard,                     // inst 1: frame state names g0
@@ -1167,14 +1231,72 @@ mod tests {
         assert_eq!(sm.frame_state, Some(FrameStateId(7)));
         // The safepoint uses g0 (a Gpr tagged ref), so its location is recorded.
         assert!(
-            !sm.live_refs.is_empty(),
+            sm.live_refs().next().is_some(),
             "expected the live Gpr ref (g0) in the stack map"
         );
-        for loc in &sm.live_refs {
-            if let Location::Register(preg) = loc {
+        for value in sm.live_refs() {
+            if let Location::Register(preg) = value.location {
                 assert_eq!(preg.class, RegClass::Gpr);
             }
         }
+    }
+
+    #[test]
+    fn safepoint_roots_values_live_across_a_call_without_argument_uses() {
+        let held = vreg(RegClass::Gpr, 0);
+        let mut call = inst(crate::t2::lower::op::CALL_RUNTIME, vec![], vec![]);
+        call.safepoint = true;
+        let mut mf = MachFunc {
+            value_reprs: [(held, ValueRepresentation::Tagged)].into(),
+            insts: vec![
+                inst(1, vec![held], vec![]),
+                call,
+                inst(0, vec![], vec![held]),
+            ],
+            ..Default::default()
+        };
+        allocate(&mut mf).expect("allocate live-across-call value");
+        assert_eq!(mf.stack_maps.len(), 1);
+        assert!(
+            mf.stack_maps[0].live_refs().next().is_some(),
+            "a reference used after the call must be rooted even when the call does not use it"
+        );
+    }
+
+    #[test]
+    fn representations_are_required_and_must_match_register_classes() {
+        let mut mf = sample();
+        let v = vreg(RegClass::Gpr, 0);
+        mf.value_reprs.remove(&v);
+        assert!(
+            matches!(allocate(&mut mf), Err(AllocationError::MissingRepresentation(x)) if x == v)
+        );
+        assert!(mf.stack_maps.is_empty());
+        mf.value_reprs.insert(v, ValueRepresentation::UnboxedF64);
+        assert!(
+            matches!(allocate(&mut mf), Err(AllocationError::RepresentationClassMismatch(x)) if x == v)
+        );
+        assert!(mf.stack_maps.is_empty());
+    }
+
+    #[test]
+    fn unboxed_gpr_is_debuggable_but_is_not_a_gc_root() {
+        let mut mf = sample();
+        let argument = vreg(RegClass::Gpr, 0);
+        mf.value_reprs
+            .insert(argument, ValueRepresentation::UnboxedFixnum);
+        allocate(&mut mf).unwrap();
+        let map = &mf.stack_maps[0];
+        assert!(
+            map.values
+                .iter()
+                .any(|v| v.vreg == argument && v.repr == ValueRepresentation::UnboxedFixnum)
+        );
+        assert_eq!(map.live_refs().count(), 0);
+        assert!(
+            !map.values.iter().any(|v| v.vreg == vreg(RegClass::Gpr, 1)),
+            "late return value does not exist before the call"
+        );
     }
 
     #[test]
@@ -1200,8 +1322,15 @@ mod tests {
         }
         let deopt_only = vreg(RegClass::Gpr, 100);
         mf.insts.push(inst(op::MOV_IMM, vec![deopt_only], vec![]));
-        let mut call = inst(op::CALL_RUNTIME, vec![vreg(RegClass::Gpr, 101)], vec![]);
+        let argument = vreg(RegClass::Gpr, 102);
+        mf.insts.push(inst(op::MOV_IMM, vec![argument], vec![]));
+        let mut call = inst(
+            op::CALL_RUNTIME,
+            vec![vreg(RegClass::Gpr, 101)],
+            vec![argument],
+        );
         call.deopt_uses.push(deopt_only);
+        call.safepoint = true;
         mf.insts.push(call);
         for class in [RegClass::Gpr, RegClass::Xmm] {
             for num in 0..24 {
@@ -1210,6 +1339,20 @@ mod tests {
         }
         mf.insts
             .push(inst(op::RET, vec![], vec![vreg(RegClass::Gpr, 101)]));
+        mf.value_reprs = mf
+            .insts
+            .iter()
+            .flat_map(|i| &i.defs)
+            .copied()
+            .map(|v| {
+                let repr = match v.class {
+                    RegClass::Gpr if v.num % 2 == 0 => ValueRepresentation::Tagged,
+                    RegClass::Gpr => ValueRepresentation::UnboxedFixnum,
+                    RegClass::Xmm => ValueRepresentation::UnboxedF64,
+                };
+                (v, repr)
+            })
+            .collect();
         allocate_framed_s390x(&mut mf).expect("s390x register allocation");
         assert!(mf.num_spill_slots > 0, "fixture must force spills");
         assert!(!mf.allocation_edits.is_empty());
@@ -1253,6 +1396,30 @@ mod tests {
                         .get(&key(edit.from))
                         .expect("initialized move source");
                     contents.insert(key(edit.to), value);
+                }
+                if position == EditPosition::Before && instruction.safepoint {
+                    let map = mf
+                        .stack_maps
+                        .iter()
+                        .find(|m| m.code_offset == index as u32)
+                        .unwrap();
+                    assert_eq!(
+                        map.values.len(),
+                        50,
+                        "all inputs including dead argument, no return value"
+                    );
+                    assert_eq!(
+                        map.live_refs().count(),
+                        14,
+                        "tagged values, dead argument and deopt-only root"
+                    );
+                    for value in &map.values {
+                        assert_eq!(
+                            contents.get(&key(value.location)),
+                            Some(&value.vreg),
+                            "map must describe the value actually present after Before edits"
+                        );
+                    }
                 }
             }
         }
@@ -1304,6 +1471,10 @@ mod tests {
         };
 
         MachFunc {
+            value_reprs: [g0, gl, gr, gm]
+                .into_iter()
+                .map(|v| (v, ValueRepresentation::Tagged))
+                .collect(),
             insts: vec![
                 inst(1, vec![g0], vec![]), // 0: b0 def g0
                 br(),                      // 1: b0 branch
@@ -1385,6 +1556,21 @@ mod tests {
     }
 
     #[test]
+    fn phi_roots_live_across_an_operand_free_safepoint() {
+        let mut mf = diamond();
+        mf.insts[6].uses.clear();
+        mf.insts[7].uses = vec![vreg(RegClass::Gpr, 0), vreg(RegClass::Gpr, 3)];
+        allocate(&mut mf).unwrap();
+        let mut values: Vec<_> = mf.stack_maps[0].live_refs().map(|v| v.vreg.num).collect();
+        values.sort();
+        assert_eq!(
+            values,
+            vec![0, 3],
+            "only the dominating value and merged phi are live"
+        );
+    }
+
+    #[test]
     fn diamond_safepoint_yields_a_stack_map() {
         let mut mf = diamond();
         allocate(&mut mf).expect("regalloc2");
@@ -1393,9 +1579,9 @@ mod tests {
         let sm = &mf.stack_maps[0];
         assert_eq!(sm.frame_state, Some(FrameStateId(11)));
         // The safepoint's two Gpr uses (g0, gm) are recorded as live refs.
-        assert_eq!(sm.live_refs.len(), 2, "both live Gpr refs recorded");
-        for loc in &sm.live_refs {
-            if let Location::Register(preg) = loc {
+        assert_eq!(sm.live_refs().count(), 2, "both live Gpr refs recorded");
+        for value in sm.live_refs() {
+            if let Location::Register(preg) = value.location {
                 assert_eq!(preg.class, RegClass::Gpr);
             }
         }
