@@ -72,6 +72,9 @@
 //! The ppc64le equivalents are in native_transfer_ppc64le.rs; AArch64 and
 //! s390x have no transfer stubs yet and stay on the checked ABI.
 
+mod mapped_call;
+pub use mapped_call::{MappedCallRecord, emit_mapped_call_veneer};
+
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 

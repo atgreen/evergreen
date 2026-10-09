@@ -426,7 +426,7 @@ mod execution {
                 state.base + site.return_offset() as usize == capture.return_pc as usize
             })
             .unwrap();
-        let snapshot = unsafe { &mut *state.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index) };
+        let snapshot = unsafe { &mut *state.snapshots.cast::<SysvSiteSnapshot>().add(index) };
         unsafe {
             snapshot
                 .capture_from_activation(

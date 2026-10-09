@@ -89,7 +89,7 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         .expect("exact captured return PC")
         .map()
         .origin_bcp;
-    let snapshot = unsafe { &mut *request.snapshot.cast::<SysvSiteSnapshot<'_>>() };
+    let snapshot = unsafe { &mut *request.snapshot.cast::<SysvSiteSnapshot>() };
     unsafe {
         let activation = std::slice::from_raw_parts(request.shadows, 2);
         snapshot
@@ -239,7 +239,7 @@ fn exercise_capture(exit: NativeExit, call_adjust: u32) {
     let mut snapshot = site.reserve_snapshot().unwrap();
     let mut request = Request {
         anchor: std::ptr::null_mut(),
-        snapshot: (&mut snapshot as *mut SysvSiteSnapshot<'_>).cast(),
+        snapshot: (&mut snapshot as *mut SysvSiteSnapshot).cast(),
         observed: [0; 6],
         return_pc: 0,
         stack_bits: 0,

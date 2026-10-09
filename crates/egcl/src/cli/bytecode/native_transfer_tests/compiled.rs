@@ -54,7 +54,7 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         .unwrap();
     let snapshots = unsafe {
         std::slice::from_raw_parts_mut(
-            state.snapshots.cast::<(u32, SysvSiteSnapshot<'_>)>(),
+            state.snapshots.cast::<(u32, SysvSiteSnapshot)>(),
             state.snapshot_count,
         )
     };

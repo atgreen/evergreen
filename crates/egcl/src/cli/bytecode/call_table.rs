@@ -48,10 +48,18 @@ impl Target {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+type MappedCode = Option<(
+    usize,
+    super::native_segment_cache::SegmentCacheEntry<super::native_transfer_entry::TransferCode>,
+)>;
+
 struct State {
     symbol: u32,
     cell: Arc<CallCell>,
     target: RefCell<Option<Target>>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mapped: RefCell<MappedCode>,
     // Both slots belong to the same execution and keep stable Box addresses
     // across fiber migration. Read the cell at entry, not the Env it held when
     // this target was resolved: nested native activations replace that Env.
@@ -117,6 +125,8 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 symbol,
                 cell,
                 target: RefCell::new(None),
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                mapped: RefCell::new(None),
                 native_env: NATIVE_ENV.with(std::ptr::from_ref),
                 #[cfg(all(target_arch = "x86_64", unix))]
                 versions: RefCell::new(Vec::new()),
@@ -152,6 +162,10 @@ pub(super) unsafe fn scan(visit: &mut dyn FnMut(*mut EgclVal)) {
                 }
                 let mut target = state.target.borrow_mut();
                 if state.cell.is_cold() {
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    {
+                        *state.mapped.borrow_mut() = None;
+                    }
                     *target = None;
                 } else if let Some(target) = target.as_mut() {
                     target.trace(visit);
@@ -206,6 +220,63 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
         return Some(Target::Builtin { slot, nargs });
     }
     egcl_rt::function::is_interpreted_function(function).then_some(Target::Function(function))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) struct MappedCallee {
+    pub(super) code: Rc<super::native_transfer_entry::TransferCode>,
+    pub(super) function: EgclVal,
+}
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl egcl_rt::gc::TraceHostRoots for MappedCallee {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.function);
+    }
+}
+
+/// Admit only a warmed, fully promoted definition. Cold resolution and T0/T1
+/// promotion keep using the existing cell; this cache owns a mapped form of
+/// that exact T2 body, not an independent tier or dispatch decision.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
+    let state = unsafe { state(cell) };
+    if state.cell.is_cold() {
+        return None;
+    }
+    let target = state.target.borrow().clone()?;
+    let Target::Native {
+        code,
+        function,
+        promote: false,
+    } = target
+    else {
+        return None;
+    };
+    if !code.is_t2 {
+        return None;
+    }
+    egcl_rt::rooted!(function = function);
+    let body = Arc::clone(code.body.as_ref()?);
+    let key = Arc::as_ptr(&body) as usize;
+    if let Some((cached_key, entry)) = state.mapped.borrow().as_ref()
+        && *cached_key == key
+    {
+        return entry.code.clone().map(|code| MappedCallee {
+            code,
+            function: *function,
+        });
+    }
+    // No borrow spans compilation or another cell's resolution/root scanner.
+    let code =
+        super::native_transfer_entry::TransferCode::compile_nested(Arc::clone(&body)).map(Rc::new);
+    *state.mapped.borrow_mut() = Some((
+        key,
+        super::native_segment_cache::SegmentCacheEntry::new(&body, code.clone()),
+    ));
+    code.map(|code| MappedCallee {
+        code,
+        function: *function,
+    })
 }
 
 fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {

@@ -60,7 +60,7 @@
 //! the capture's return PC, alignment and `Transfer` exit, without
 //! dereferencing memory; they cannot prove that the frame is still live in the
 //! current segment or that the cursor is rooted, which remain the caller's
-//! obligations. `reserve_snapshot` borrows the checked site into a
+//! obligations. `reserve_snapshot` shares immutable checked-site recipes with a
 //! [`SysvSiteSnapshot`] before native entry, so a later redefinition cannot
 //! pair the snapshot with another site's recipes. `capture_from_activation`
 //! reads each root from its activation shadow slot when one exists and other
@@ -80,6 +80,7 @@ use crate::t2::transfer_map::TransferCaptureMap;
 use crate::t2::x64_frame::{GPR_X86, ValueHome};
 use egcl_rt::gc::TraceHostRoots;
 use egcl_rt::value::EgclVal;
+use std::sync::Arc;
 
 /// Emission records the offset immediately following the actual CALL, along
 /// with final homes and any temporary stack space still present at that point.
@@ -149,7 +150,7 @@ struct CaptureRecipe {
 pub struct CheckedSysvSite {
     return_offset: u32,
     map: TransferCaptureMap,
-    recipes: Vec<(Location, CaptureRecipe)>,
+    recipes: Arc<[(Location, CaptureRecipe)]>,
     activation_slots: usize,
     call_stack_adjust: u32,
     cleanup_landing: Option<u32>,
@@ -255,7 +256,7 @@ impl SysvTransferTable {
             checked.push(CheckedSysvSite {
                 return_offset: site.return_offset,
                 map: site.map,
-                recipes,
+                recipes: recipes.into(),
                 activation_slots: usize::from(site.activation_slots),
                 call_stack_adjust: site.call_stack_adjust,
                 cleanup_landing: None,
@@ -539,12 +540,14 @@ impl CheckedSysvSite {
         }))
     }
 
-    /// Reserve execution-owned storage before native entry. The borrow keeps
-    /// the exact checked site alive, independent of any later name redefinition.
+    /// Reserve execution-owned storage before native entry. Shared immutable
+    /// recipes retain exact site identity without borrowing the code table.
     /// Retaining the executing bytecode/code remains the installer's obligation.
-    pub fn reserve_snapshot(&self) -> Result<SysvSiteSnapshot<'_>, CaptureError> {
+    pub fn reserve_snapshot(&self) -> Result<SysvSiteSnapshot, CaptureError> {
         Ok(SysvSiteSnapshot {
-            site: self,
+            return_offset: self.return_offset,
+            recipes: Arc::clone(&self.recipes),
+            activation_slots: self.activation_slots,
             snapshot: TransferSnapshot::new(&self.map)?,
         })
     }
@@ -552,19 +555,21 @@ impl CheckedSysvSite {
 
 /// Cannot be paired with an unrelated site's physical access recipes. Root this
 /// buffer across allocating work between capture, reconstruction and writeback.
-pub struct SysvSiteSnapshot<'a> {
-    site: &'a CheckedSysvSite,
+pub struct SysvSiteSnapshot {
+    return_offset: u32,
+    recipes: Arc<[(Location, CaptureRecipe)]>,
+    activation_slots: usize,
     snapshot: TransferSnapshot,
 }
 
-impl SysvSiteSnapshot<'_> {
+impl SysvSiteSnapshot {
     fn check_pc(
         &self,
         code_base: usize,
         capture: &SysvTransferCapture,
     ) -> Result<(), TransferSiteError> {
         if (capture.return_pc as usize).checked_sub(code_base)
-            == Some(self.site.return_offset as usize)
+            == Some(self.return_offset as usize)
         {
             Ok(())
         } else {
@@ -600,13 +605,12 @@ impl SysvSiteSnapshot<'_> {
     ) -> Result<(), TransferSiteError> {
         self.snapshot.invalidate();
         self.check_pc(code_base, capture)?;
-        if activation.len() < self.site.activation_slots {
+        if activation.len() < self.activation_slots {
             return Err(TransferSiteError::MissingActivation);
         }
         unsafe {
             self.snapshot.capture(|location| {
                 let recipe = &self
-                    .site
                     .recipes
                     .iter()
                     .find(|(key, _)| *key == location)
@@ -640,8 +644,7 @@ impl SysvSiteSnapshot<'_> {
         unsafe {
             self.snapshot
                 .write_back(|location, word| {
-                    self.site
-                        .recipes
+                    self.recipes
                         .iter()
                         .find(|(key, _)| *key == location)
                         .expect("validated descriptor location")
@@ -654,7 +657,7 @@ impl SysvSiteSnapshot<'_> {
     }
 }
 
-impl TraceHostRoots for SysvSiteSnapshot<'_> {
+impl TraceHostRoots for SysvSiteSnapshot {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.snapshot.trace_host_roots(visit);
     }
