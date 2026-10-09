@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Compile supported nested callbacks in eagerly compiled x86-64 and s390x
+  functions while preserving captured lexical state. This reduces full
+  Prechelt phone-encoding time by about 9% in the measured x86-64 workload
+  ([#146](https://github.com/atgreen/evergreen/pull/146)).
+
 - Cache compiled GETHASH call targets while preserving both return values and
   function replacement. This reduces full Prechelt phone-encoding time by
   about 15% in the measured workload
