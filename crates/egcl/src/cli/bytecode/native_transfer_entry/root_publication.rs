@@ -132,20 +132,36 @@ pub(super) unsafe fn published<R>(
             }),
         }
     };
-    unsafe { publish(cursor, image as usize, body) }
+    unsafe { publish_with(cursor, None, image as usize, body) }
 }
 
 /// Link one suspended caller for the extent of `body`. `low` is the lowest
 /// native address the publication owns: its own machine storage, below the
-/// caller's save words and stack slots.
-unsafe fn publish<R>(cursor: NativeFrameCursor, low: usize, body: impl FnOnce() -> R) -> R {
+/// caller's save words and stack slots. `owner` names the code holding
+/// `cursor.pc` when the caller is not the current CAPTURE's own activation.
+unsafe fn publish_with<R>(
+    cursor: NativeFrameCursor,
+    owner: Option<*const TransferCode>,
+    low: usize,
+    body: impl FnOnce() -> R,
+) -> R {
     static SCANNER: Once = Once::new();
     SCANNER.call_once(|| egcl_rt::gc::register_root_scanner(scan_published_roots));
     let context = CAPTURE.with(Cell::get);
     let segment = native_transfer::current_segment();
     debug_assert!(!context.is_null(), "publication needs a captured activation");
     debug_assert!(!segment.is_null(), "publication needs an active native segment");
-    let owner = if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } };
+    let owner = owner.unwrap_or_else(|| {
+        if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } }
+    });
+    debug_assert!(
+        owner.is_null() || {
+            let code = unsafe { &*owner };
+            let offset = cursor.pc.wrapping_sub(code.code.as_ptr() as usize);
+            offset < code.code_len && code._native_calls.value_map(offset).is_some()
+        },
+        "a publication's PC must be a recorded site of its own owner"
+    );
     let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
     let mut boundary = PublishedBoundary {
         owner,
@@ -171,6 +187,9 @@ unsafe fn publish<R>(cursor: NativeFrameCursor, low: usize, body: impl FnOnce() 
 /// record sits at the bottom of that frame, so the caller's exact return PC,
 /// pre-CALL RSP and writable save words are all recoverable from it.
 ///
+/// Use this before a child exists — preparation, and the checked and
+/// interpreted fallbacks — where `CAPTURE` still names the caller itself.
+///
 /// # Safety
 /// `record` must be the live record of an executing adapter frame, and the
 /// caller must not retain a Rust reference to it across the body's writes.
@@ -178,9 +197,33 @@ pub(super) unsafe fn published_mapped<R>(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     body: impl FnOnce() -> R,
 ) -> R {
+    unsafe { publish_with(mapped_cursor(record), None, record as usize, body) }
+}
+
+/// Use this once a child activation is live, i.e. from cold resumption.
+/// `CAPTURE` then names the CHILD, so the owner of the caller's PC has to come
+/// from the record's own activation instead.
+///
+/// # Safety
+/// As `published_mapped`, and `record.owner` must already hold this adapter's
+/// child activation — the adapter leaves that word UNINITIALIZED until
+/// preparation writes it, so this must never run before preparation.
+pub(super) unsafe fn published_mapped_resuming<R>(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+    body: impl FnOnce() -> R,
+) -> R {
+    let owner = unsafe { super::nested::record_parent_owner(record) };
+    debug_assert!(owner.is_some(), "a live child must yield its parent's owner");
+    unsafe { publish_with(mapped_cursor(record), owner, record as usize, body) }
+}
+
+/// The suspended caller's exact geometry, read out of the adapter frame.
+unsafe fn mapped_cursor(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) -> NativeFrameCursor {
     use egcl_compiler::t2::native_transfer::{ADAPTER_FRAME_BYTES, MappedCallRecord};
     let base = record as usize;
-    let cursor = NativeFrameCursor {
+    NativeFrameCursor {
         // SAFETY: the adapter reserved ADAPTER_FRAME_BYTES below the caller's
         // return address, which the tail-jumping veneer left in place.
         pc: unsafe { ((base + ADAPTER_FRAME_BYTES) as *const usize).read() },
@@ -188,8 +231,7 @@ pub(super) unsafe fn published_mapped<R>(
         registers: std::array::from_fn(|index| {
             Some(base + std::mem::offset_of!(MappedCallRecord, preserved) + index * 8)
         }),
-    };
-    unsafe { publish(cursor, base, body) }
+    }
 }
 
 /// Walk every execution's chain under stop-the-world. Each boundary unwinds

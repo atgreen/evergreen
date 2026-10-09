@@ -5,7 +5,12 @@ use super::{Asm, Cc, NativeOutcome, capture_stack_word};
 use crate::t2::emit::TransferCallRequest;
 
 /// Caller-owned machine storage, live until the mapped call returns or escapes.
-/// Preserved words are not roots: caller activation shadows remain authoritative.
+///
+/// The preserved words ARE collector roots: a record-based publication hands
+/// them to the walker as the suspended caller's writable register homes, and
+/// the adapter reloads all six before returning, so a relocation written here
+/// reaches the caller. Do not elide the save/reload, and do not treat these as
+/// a redundant copy of the caller's activation shadows.
 #[repr(C)]
 pub struct MappedCallRecord {
     pub request: *mut TransferCallRequest,
