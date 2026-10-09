@@ -179,6 +179,15 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
 /// Called only after the deopt Rust adapter has returned. Its precise state
 /// was already consumed; ordinary Invoke capture would replay stale state.
 pub(super) unsafe extern "C" fn prepare_completed_deopt(capture: *mut SysvTransferCapture) {
+    // Publish the same suspended caller the capture stub imaged. The deopt
+    // return PC maps to Deoptimizing, so the walk skips this retired top frame
+    // — whose roots T0 already owns — and continues through older ones.
+    unsafe {
+        super::root_publication::published(capture, || prepare_completed_deopt_unpublished(capture))
+    }
+}
+
+unsafe fn prepare_completed_deopt_unpublished(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
     let expected = if context.recursive.is_null() {
