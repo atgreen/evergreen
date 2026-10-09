@@ -248,6 +248,43 @@ pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Opti
     Some(native)
 }
 
+/// Replace a failed installed version only while both its publication and its
+/// definition are still current. Suspended older entries retain their code.
+pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>> {
+    let NativeCodeStorage::Mapped(code) = &expected._storage else {
+        return None;
+    };
+    if !code.needs_recompile() {
+        return None;
+    }
+    let symbol = code.installed_symbol?;
+    let body = Arc::clone(expected.body.as_ref()?);
+    let current = || {
+        registry_get(symbol).is_some_and(|current| Arc::ptr_eq(&current, &body))
+            && recursive_definition_matches(symbol, Arc::as_ptr(&body))
+            && NATIVE_REGISTRY.with(|registry| {
+                registry
+                    .borrow()
+                    .get(&symbol)
+                    .is_some_and(|native| std::ptr::eq(native.as_ref(), expected))
+            })
+    };
+    if !current() {
+        return None;
+    }
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol)?);
+    let replacement = TransferCode::compile_variant(Arc::clone(&body), true, false)
+        .or_else(|| TransferCode::compile_variant(Arc::clone(&body), false, false))?;
+    // Compilation can collect and reenter runtime services. Never let a stale
+    // invocation replace code published for a newer version or callable.
+    if !current() || egcl_rt::symbols::symbol_function(symbol) != Some(*function) {
+        return None;
+    }
+    let replacement = install_baseline_code(symbol, replacement)?;
+    publish_native(symbol, Some(*function), &replacement);
+    Some(replacement)
+}
+
 /// Try the new segment ABI for an ordinary native invocation. This remains an
 /// explicit rollout switch until the platform gates are complete; callers fall
 /// back to the legacy checked ABI when the machine transition or body shape is
@@ -383,7 +420,12 @@ impl TransferCode {
         {
             return None;
         }
-        Self::compile_variant(body, false, false)
+        Self::compile_variant(Arc::clone(&body), true, false)
+            .or_else(|| Self::compile_variant(body, false, false))
+    }
+
+    pub(super) fn needs_recompile(&self) -> bool {
+        self.recompile.get()
     }
 
     fn compile_variant(
@@ -2083,12 +2125,10 @@ impl Drop for EntryGuard {
     }
 }
 
-// Capture into reserved, rooted snapshots before live signaling can allocate
-// or reenter Lisp. Rust returns before the capture stub dispatches; assembly
-// only discards generated frames, never a Rust signaling or handler frame.
-unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
-    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
-    let capture = unsafe { &mut *capture };
+// A completed escape always lands in its immediate machine caller. Nested
+// entries retain their caller-owned cold record; only outer entries leave the
+// segment. No Rust frame is crossed by the subsequent assembly dispatch.
+fn prepare_escape(context: &mut CaptureContext) {
     context.dispatch = DispatchPacket {
         entry: native_transfer::leave_native_segment as *const u8,
         request: native_transfer::current_segment().cast(),
@@ -2104,6 +2144,15 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
             request: std::ptr::from_mut(&mut context.landing).cast(),
         };
     }
+}
+
+// Capture into reserved, rooted snapshots before live signaling can allocate
+// or reenter Lisp. Rust returns before the capture stub dispatches; assembly
+// only discards generated frames, never a Rust signaling or handler frame.
+unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let capture = unsafe { &mut *capture };
+    prepare_escape(context);
     #[cfg(test)]
     if !context.nested.is_null() && nested::take_capture_failure() {
         context.failure = Some(TransferSiteError::InvalidLandingCapture);

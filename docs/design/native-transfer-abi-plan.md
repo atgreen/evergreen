@@ -1404,6 +1404,33 @@ scripts/egcl-limited.sh cargo test -p egcl --lib \
   -- --ignored --test-threads=1
 ```
 
-These tests cover protected baseline child suspension. Optimized child
-deoptimization, broader callable coverage and universal default publication
-remain separate acceptance gates.
+These tests cover protected baseline child suspension. The next slice extends
+this cohort with suspension during optimized child deoptimization, described
+below. Broader callable coverage and universal default publication remain
+separate acceptance gates.
+
+### Optimized mapped child deoptimization (2026-10-09)
+
+Eligible distinct T2 children now compile speculative guards using their retained
+body and deoptimization metadata. A failed guard resumes T0 on the child's
+existing Lisp frame while masking its abandoned native capture. The saved frame
+header is independently rooted until restoration, which completes before the
+capture is reinstalled. Successful recovery returns to the native caller;
+a selected transfer retires the child through the caller-owned cold veneer.
+Neither path replays completed child effects or crosses a live Rust frame.
+
+Resumed loop heat follows the callable saved in the original frame. Legacy
+symbol-only headers may resolve a callable only while the retained body still
+matches the current definition. Guard feedback likewise belongs to the exact
+current segment-cache, installed-code, or warm call-cell version. Failed installed
+versions are rebuilt after the existing threshold; publication and body/callable
+identity are rechecked after compilation, and suspended old code stays retained.
+
+Regression tests cover actual guard execution, numeric-phase rebuilding,
+non-replayed effects, multiple values, parent cleanup and live restarts,
+redefinition before a guard, retired-version feedback isolation, and restored
+frame/depth state. The saved-header root test uses a movable sentinel because
+interpreted callable objects are pinned; it requires observed relocation.
+The fiber cohort adds guard recovery that suspends with native capture masked,
+then migrates or rejects an incompatible carrier while preserving moving roots.
+This remains part of the opt-in Linux x86-64 rollout, not universal ABI completion.

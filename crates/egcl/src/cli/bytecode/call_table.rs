@@ -255,6 +255,11 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         return None;
     }
     if let NativeCodeStorage::Mapped(mapped) = &code._storage {
+        if mapped.needs_recompile() {
+            // The ordinary entry owns refresh/publication; do not rewrite a
+            // cell's retained target without its linkage revision transition.
+            return None;
+        }
         let body = code.body.as_ref()?;
         if !super::native_transfer_entry::fixed_tagged_parameters(body) {
             return None;
@@ -272,6 +277,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     let key = Arc::as_ptr(&body) as usize;
     if let Some((cached_key, entry)) = state.mapped.borrow().as_ref()
         && *cached_key == key
+        && entry.code.as_ref().is_none_or(|code| !code.needs_recompile())
     {
         return entry.code.clone().map(|code| MappedCallee {
             code,
@@ -288,6 +294,23 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     code.map(|code| MappedCallee {
         code,
         function: *function,
+    })
+}
+
+/// Feedback belongs only to the exact version still selected by a warm cell.
+/// A retained child can finish after publication invalidated that selection.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn owns_mapped(code: &super::native_transfer_entry::TransferCode) -> bool {
+    SLOTS.with(|slots| {
+        slots.borrow().iter().flatten().any(|state| {
+            !state.cell.is_cold()
+                && state
+                    .mapped
+                    .borrow()
+                    .as_ref()
+                    .and_then(|(_, entry)| entry.code.as_ref())
+                    .is_some_and(|current| std::ptr::eq(current.as_ref(), code))
+        })
     })
 }
 
