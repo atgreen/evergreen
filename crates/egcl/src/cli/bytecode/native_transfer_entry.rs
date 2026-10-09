@@ -1061,7 +1061,11 @@ unsafe extern "C" fn prepare_recursive(
     image: *mut SysvTransferCapture,
 ) {
     unsafe {
-        root_publication::published(image, || prepare_recursive_unpublished(request, out))
+        root_publication::published(image, || {
+            #[cfg(test)]
+            root_publication::observe();
+            prepare_recursive_unpublished(request, out)
+        })
     }
 }
 
