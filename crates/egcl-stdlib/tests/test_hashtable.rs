@@ -537,3 +537,64 @@ fn equalp_signed_zero_keys_share_an_entry() {
         }
     }
 }
+
+#[test]
+fn large_tables_preserve_entries_across_growth_deletion_and_clear() {
+    for test in [
+        HashTest::Eq,
+        HashTest::Eql,
+        HashTest::Equal,
+        HashTest::Equalp,
+    ] {
+        for size in [2048, 4096] {
+            let table = make_hash_table(&MakeHashTableOptions {
+                test,
+                size,
+                ..Default::default()
+            })
+            .unwrap();
+            for key in 0..7000 {
+                set_gethash(
+                    EgclVal::from_fixnum(key),
+                    table,
+                    EgclVal::from_fixnum(key + 1),
+                )
+                .unwrap();
+            }
+            for key in (0..7000).step_by(3) {
+                assert!(remhash(EgclVal::from_fixnum(key), table).unwrap());
+            }
+            for key in 0..7000 {
+                let expected = if key % 3 == 0 {
+                    (NIL, false)
+                } else {
+                    (EgclVal::from_fixnum(key + 1), true)
+                };
+                assert_eq!(
+                    gethash(EgclVal::from_fixnum(key), table, NIL).unwrap(),
+                    expected
+                );
+            }
+            for key in (0..7000).step_by(3) {
+                set_gethash(EgclVal::from_fixnum(key), table, T).unwrap();
+            }
+            assert_eq!(hash_table_count(table).unwrap(), 7000);
+            clrhash(table).unwrap();
+            for key in 0..7000 {
+                assert_eq!(
+                    gethash(EgclVal::from_fixnum(key), table, T).unwrap(),
+                    (T, false)
+                );
+            }
+            for key in 9000..10_000 {
+                set_gethash(EgclVal::from_fixnum(key), table, T).unwrap();
+            }
+            for key in 9000..10_000 {
+                assert_eq!(
+                    gethash(EgclVal::from_fixnum(key), table, NIL).unwrap(),
+                    (T, true)
+                );
+            }
+        }
+    }
+}

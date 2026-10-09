@@ -219,6 +219,33 @@ struct HashTableInner {
     /// valid. When it differs from the current generation and the table is
     /// `address_sensitive`, the next access rehashes in place first.
     gc_gen: u64,
+    /// A clear bit proves absence without reading an entry. Eight bit positions
+    /// per bucket keep false positives uncommon at normal load. Deletion leaves
+    /// bits set; clearing or rebuilding removes those harmless false positives.
+    miss_filter: Vec<u64>,
+}
+
+// Small tables already fit in cache; avoid the extra filter lookup there.
+const MISS_FILTER_MIN_CAPACITY: usize = 4096;
+
+fn empty_miss_filter(capacity: usize) -> Vec<u64> {
+    if capacity < MISS_FILTER_MIN_CAPACITY {
+        Vec::new()
+    } else {
+        vec![0; capacity / 8]
+    }
+}
+
+fn record_key_hash(filter: &mut [u64], hash: u64) {
+    if !filter.is_empty() {
+        let bit = hash as usize & (filter.len() * 64 - 1);
+        filter[bit / 64] |= 1 << (bit % 64);
+    }
+}
+
+fn hash_may_be_present(filter: &[u64], hash: u64) -> bool {
+    let bit = hash as usize & (filter.len() * 64 - 1);
+    filter[bit / 64] & (1 << (bit % 64)) != 0
 }
 
 /// Round up to the next power of two. If already a power of two, returns it.
@@ -542,6 +569,8 @@ fn cl_equalp(a: EgclVal, b: EgclVal) -> bool {
 /// - Equalp: case-insensitive structural equality — case-insensitive strings
 ///   and characters, numeric cross-type comparison.
 fn keys_equal(a: EgclVal, b: EgclVal, test: HashTest) -> bool {
+    #[cfg(test)]
+    tests::KEY_COMPARISONS.with(|count| count.set(count.get() + 1));
     match test {
         HashTest::Eq => a.0 == b.0,
         // EQL of two distinct heap numerics is T by value (e.g. two bignums).
@@ -896,8 +925,11 @@ fn key_address_sensitive(object: EgclVal, test: HashTest) -> bool {
 fn rehash_in_place(inner: &mut HashTableInner) {
     let cap = inner.capacity;
     let mut new_entries: Vec<Option<RHEntry>> = vec![None; cap];
+    let mut miss_filter = empty_miss_filter(cap);
     for e in inner.entries.iter().flatten() {
-        let mut idx = probe_index(hash_for_test(e.key, inner.test), cap);
+        let hash = hash_for_test(e.key, inner.test);
+        record_key_hash(&mut miss_filter, hash);
+        let mut idx = probe_index(hash, cap);
         let mut incoming = RHEntry {
             key: e.key,
             value: e.value,
@@ -922,6 +954,7 @@ fn rehash_in_place(inner: &mut HashTableInner) {
         }
     }
     inner.entries = new_entries;
+    inner.miss_filter = miss_filter;
 }
 
 /// If this table hashes any key by a movable address and the GC has run since it
@@ -973,6 +1006,7 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<EgclVal, EgclEr
         weakness: options.weakness,
         address_sensitive: false,
         gc_gen: egcl_rt::gc::gc_move_epoch(),
+        miss_filter: empty_miss_filter(capacity),
     });
 
     let ptr = Box::into_raw(inner) as *mut u8;
@@ -1251,6 +1285,9 @@ pub fn gethash(
     let cap = inner.capacity;
     let test = inner.test;
     let key_hash = hash_for_test(key, test);
+    if cap >= MISS_FILTER_MIN_CAPACITY && !hash_may_be_present(&inner.miss_filter, key_hash) {
+        return Ok((default, false));
+    }
     let mut idx = probe_index(key_hash, cap);
 
     for dist in 0..cap {
@@ -1280,9 +1317,12 @@ fn resize_table(inner: &mut HashTableInner) {
     let new_capacity = (inner.capacity as f64 * inner.rehash_size) as usize;
     let new_capacity = next_power_of_two(new_capacity.max(inner.capacity + 1));
     let mut new_entries: Vec<Option<RHEntry>> = vec![None; new_capacity];
+    let mut miss_filter = empty_miss_filter(new_capacity);
 
     for e in inner.entries.iter().flatten() {
-        let mut idx = probe_index(hash_for_test(e.key, inner.test), new_capacity);
+        let hash = hash_for_test(e.key, inner.test);
+        record_key_hash(&mut miss_filter, hash);
+        let mut idx = probe_index(hash, new_capacity);
         let mut incoming = RHEntry {
             key: e.key,
             value: e.value,
@@ -1310,6 +1350,7 @@ fn resize_table(inner: &mut HashTableInner) {
 
     inner.entries = new_entries;
     inner.capacity = new_capacity;
+    inner.miss_filter = miss_filter;
 }
 
 /// Set a value in a hash table (CL `(SETF GETHASH)`).
@@ -1359,6 +1400,7 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
         resize_table(inner);
     }
 
+    record_key_hash(&mut inner.miss_filter, key_hash);
     // Insert into (possibly resized) table using Robin Hood insertion
     let cap = inner.capacity;
     let mut idx = probe_index(key_hash, cap);
@@ -1514,6 +1556,7 @@ pub fn clrhash(table: EgclVal) -> Result<(), EgclError> {
         *entry = None;
     }
     inner.count = 0;
+    inner.miss_filter.fill(0);
     Ok(())
 }
 
@@ -1562,4 +1605,39 @@ pub fn sxhash(object: EgclVal) -> EgclVal {
     EgclVal::from_fixnum(
         (equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT) & MOST_POSITIVE_FIXNUM_MASK) as i64,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egcl_rt::value::NIL;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static KEY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn sparse_large_table_misses_avoid_most_key_comparisons() {
+        let table = make_hash_table(&MakeHashTableOptions {
+            size: 4096,
+            ..Default::default()
+        })
+        .unwrap();
+        for key in 0..2000 {
+            set_gethash(EgclVal::from_fixnum(key), table, NIL).unwrap();
+        }
+        KEY_COMPARISONS.with(|count| count.set(0));
+        for key in 100_000..104_096 {
+            assert_eq!(
+                gethash(EgclVal::from_fixnum(key), table, NIL).unwrap(),
+                (NIL, false)
+            );
+        }
+        let comparisons = KEY_COMPARISONS.with(Cell::get);
+        assert!(
+            comparisons < 410,
+            "4096 absent keys required {comparisons} equality checks"
+        );
+    }
 }
