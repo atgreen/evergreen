@@ -1293,3 +1293,23 @@ the changed profile. Unsupported numeric types retain generic calls.
 This remains an integration increment. Default activation, optimized guards
 inside dynamic scopes, cross-function segment calls, and the full T1/OSR and
 platform gates still require the corresponding continuation and ownership work.
+
+### Mapped calls through existing linkage cells (bliss-shih7.16.1)
+
+SysV mapped `CallTarget` sites now retain the existing execution-owned
+`CallCell` and a generated adapter that loads its current slice entry on every
+call. Cold resolution, warmed native/builtin dispatch, replacement, and
+unbinding therefore use the same linkage state as legacy callers. The caller's
+existing return-PC map and precise activation roots remain unchanged.
+
+This is an explicit migration boundary. The adapter enables legacy fault
+recovery for the cell invocation, then disables it before inspecting the
+nonallocating legacy error predicate. It preserves the primary and multiple
+values. An escaping error removes the adapter's temporary stack and tail-enters
+the original mapped capture only after every legacy and Rust frame has returned.
+Same-definition mapped recursion retains its separate precise-frame path.
+
+This does not publish universal native entries or enable the segment ABI by
+default. Arbitrary mapped native-to-native activations and their retirement
+remain part of bliss-shih7.16; the legacy predicate belongs only to this temporary
+boundary and must disappear when the cell itself exposes the universal ABI.

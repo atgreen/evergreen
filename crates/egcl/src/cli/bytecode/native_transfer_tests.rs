@@ -12,6 +12,7 @@ mod fallback;
 mod fibers;
 mod handlers;
 mod live_signaling;
+mod linkage;
 mod payloads;
 mod recursion;
 mod deopt;

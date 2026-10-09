@@ -3123,6 +3123,7 @@ enum CleanupEmission {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
     veneer: u64,
+    named_veneers: Vec<(u32, u64)>,
     cleanup: Option<CleanupEmission>,
     poll_veneer: Option<u64>,
     recursion: Option<RecursiveTransfer>,
@@ -3166,6 +3167,7 @@ pub fn emit_framed_transfers_with_cleanup(
         None,
         None,
         None,
+        &[],
     )
 }
 
@@ -3199,6 +3201,7 @@ pub fn emit_framed_native_cleanups(
         None,
         None,
         None,
+        &[],
     )
 }
 
@@ -3281,6 +3284,41 @@ pub fn emit_framed_native_handlers_with_recursion(
     recursion: Option<RecursiveTransfer>,
     deopt_veneer: Option<u64>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_native_handlers_with_entries(
+        f,
+        call_veneer,
+        activation_slots,
+        save,
+        complete,
+        clear_mv,
+        catch_landing,
+        handler_landing,
+        poll_veneer,
+        recursion,
+        deopt_veneer,
+        &[],
+    )
+}
+
+/// Supply retained per-symbol adapters for mapped named calls. Each adapter
+/// consumes `TransferCallRequest` and preserves the ordinary veneer contract,
+/// including capture of the caller's mapped return address on exceptional exit.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_entries(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    clear_mv: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -3298,10 +3336,13 @@ pub fn emit_framed_native_handlers_with_recursion(
         (poll_veneer != 0).then_some(poll_veneer),
         recursion,
         deopt_veneer,
+        named_veneers,
     )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+// Keep the common emitter aligned with the public helper-address entry points.
+#[allow(clippy::too_many_arguments)]
 fn emit_transfer_function(
     f: &Function,
     call_veneer: u64,
@@ -3310,9 +3351,10 @@ fn emit_transfer_function(
     poll_veneer: Option<u64>,
     recursion: Option<RecursiveTransfer>,
     deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
-    if deopt_veneer == Some(0) {
+    if deopt_veneer == Some(0) || named_veneers.iter().any(|(_, entry)| *entry == 0) {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
     let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
@@ -3418,6 +3460,7 @@ fn emit_transfer_function(
     }
     let mut transfers = TransferEmission {
         veneer: call_veneer,
+        named_veneers: named_veneers.to_vec(),
         cleanup,
         poll_veneer,
         recursion,
@@ -4680,8 +4723,12 @@ fn emit_framed_inner(
                         .as_deref_mut()
                         .ok_or(EmitError::UnsupportedOp(0xFA))?;
                     let veneer = match d.aux {
-                        AuxData::CallTarget(_)
-                        | AuxData::HostEval(_)
+                        AuxData::CallTarget(symbol) => transfer
+                            .named_veneers
+                            .iter()
+                            .find(|(name, _)| *name == symbol)
+                            .map_or(transfer.veneer, |(_, entry)| *entry),
+                        AuxData::HostEval(_)
                         | AuxData::FunctionLookup(_)
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
