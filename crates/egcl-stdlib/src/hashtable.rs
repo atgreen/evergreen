@@ -755,7 +755,9 @@ fn equalp_hash(object: EgclVal, depth: usize) -> u64 {
         return hash_u64((object.as_fixnum() as f64).to_bits());
     }
     if object.is_single_float() {
-        return hash_u64((object.as_single_float() as f64).to_bits());
+        let value = object.as_single_float() as f64;
+        // EQUALP equates both signed zeros with integer zero.
+        return hash_u64(if value == 0.0 { 0 } else { value.to_bits() });
     }
     if let Some(h) = numeric_value_hash(object, depth) {
         return h;
