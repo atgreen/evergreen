@@ -12,6 +12,7 @@ use super::super::CONTROL_COUNTER;
 use std::cell::Cell;
 use std::sync::OnceLock;
 use egcl_compiler::control_scope::{Ownership, ScopeKind};
+use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
     emit_capture_stub, emit_helper_veneer, emit_native_landing_stub, SysvNativeLanding,
@@ -19,7 +20,7 @@ use egcl_compiler::t2::native_transfer::{
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use egcl_rt::jit::JitBuffer;
-use egcl_rt::native_transfer::{self, NativeExit};
+use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 
 thread_local! {
     /// Opt-in production cache for the segment ABI. Keep the negative result
@@ -56,8 +57,10 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
                 (code._veneer.as_ptr(), "native call veneer"),
                 (code._poll.as_ptr(), "native poll veneer"),
                 (code._completion.as_ptr(), "native cleanup completion veneer"),
+                (code._recursive_prepare.as_ref().map_or(std::ptr::null(), |code| code.as_ptr()), "native recursive entry veneer"),
+                (finish_recursive as *const u8, "native recursive frame retirement"),
             ] {
-                if immediate == target as u64 {
+                if !target.is_null() && immediate == target as u64 {
                     let _ = write!(out, "    ; {name}");
                 }
             }
@@ -70,6 +73,15 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
 #[cfg(test)]
 static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+static RECURSIVE_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+
+#[cfg(test)]
+pub(super) fn take_recursive_entries() -> usize {
+    RECURSIVE_ENTRIES.with(|count| count.replace(0))
+}
 
 fn try_clone_string(value: &str) -> Result<String, EgclError> {
     let mut copy = String::new();
@@ -151,6 +163,9 @@ pub(super) struct TransferCode {
     _capture: JitBuffer,
     _poll: JitBuffer,
     _completion: JitBuffer,
+    _recursive_prepare: Option<JitBuffer>,
+    recursive: bool,
+    recursive_generation: u64,
     landing: JitBuffer,
     sites: SysvTransferTable,
     slots: u16,
@@ -193,11 +208,10 @@ pub(super) fn try_run(
     if !cfg!(test) && !super::super::BOOT_COMPLETE.with(|ready| ready.get()) {
         return None;
     }
-    // A nested segment would need a fresh activation frame and a second host
-    // landing boundary. Recursive calls already have a bounded, frame-safe
-    // c2i/native bridge, so keep them on that path while the outer segment
-    // remains active. This admits the outer native handler/cleanup machinery
-    // without manufacturing an unsafe recursive segment chain.
+    // Eligible direct self calls stay within the existing segment and own
+    // separate precise frames. Calls reentering through a Rust helper still
+    // use the bounded legacy bridge; they cannot jump across that Rust frame
+    // into the enclosing segment's exceptional landing.
     if !native_transfer::current_segment().is_null() {
         return None;
     }
@@ -264,7 +278,30 @@ impl TransferCode {
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
-        let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_poll(
+        // Direct recursion first shares only immutable code/site metadata.
+        // Dynamic handler and cleanup records still require their own mapped
+        // activation ownership before these bodies can use recursive entries.
+        // Sample before reading the definition: a concurrent replacement after
+        // the identity check must leave a generation mismatch at entry.
+        let recursive_generation = direct_call_gen();
+        let recursive_symbol = super::super::resolve_sym(&body.name)
+            .filter(|_| scope_free_recursion(&body))
+            .map(EgclVal::as_symbol_index)
+            .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&body)))
+            .filter(|symbol| body.code.iter().any(|op| {
+                matches!(op, Instr::CallNamed { sym, .. } if sym == symbol)
+            }));
+        let recursive_prepare = match recursive_symbol {
+            Some(_) => Some(JitBuffer::new(&emit_helper_veneer(prepare_recursive, capture.as_ptr()))?),
+            None => None,
+        };
+        let recursion = recursive_symbol.map(|symbol| RecursiveTransfer {
+            symbol,
+            arity: usize::from(body.arity),
+            prepare: recursive_prepare.as_ref().unwrap().as_ptr() as u64,
+            finish: finish_recursive as *const () as u64,
+        });
+        let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_recursion(
             &ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -274,6 +311,7 @@ impl TransferCode {
             deliver_catch as *const () as u64,
             deliver_handler as *const () as u64,
             poll.as_ptr() as u64,
+            recursion,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -337,6 +375,9 @@ impl TransferCode {
             _capture: capture,
             _poll: poll,
             _completion: completion,
+            _recursive_prepare: recursive_prepare,
+            recursive: recursion.is_some(),
+            recursive_generation,
             landing,
             sites,
             slots,
@@ -481,6 +522,10 @@ impl TransferCode {
         let mut prepared_catch = None::<PreparedCatch>;
         egcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut context = CaptureContext {
+            recursive_enabled: self.recursive,
+            recursive_generation: self.recursive_generation,
+            recursive: std::ptr::null_mut(),
+            recursive_escape: false,
             #[cfg(test)]
             unavailable_catch: self.unavailable_catch,
             #[cfg(test)]
@@ -575,6 +620,12 @@ impl TransferCode {
                 Ok(*primary)
             }
             NativeExit::Transfer => {
+                if context.recursive_escape {
+                    // Every scope-free generated activation has been retired.
+                    // The selected transfer leaves this segment without replay
+                    // or reconstruction of any of its recursive callers.
+                    return error.take().ok_or_else(invalid_capture).and_then(Err);
+                }
                 #[cfg(test)]
                 NATIVE_FALLBACK_COUNT.with(|count| count.set(count.get() + 1));
                 let index = context.selected.ok_or_else(invalid_capture)?;
@@ -766,6 +817,152 @@ impl TransferCode {
 
 fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
+}
+
+fn scope_free_recursion(body: &BytecodeFunction) -> bool {
+    body.param_types
+        .iter()
+        .all(|ty| matches!(ty, DeclaredType::Any))
+        && body.param_layout.len() == usize::from(body.arity)
+        && body
+            .param_layout
+            .iter()
+            .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
+        && body.code.iter().all(|op| {
+            matches!(
+                op,
+                Instr::Const(_)
+                    | Instr::LoadLocal(_)
+                    | Instr::StoreLocal(_)
+                    | Instr::Pop
+                    | Instr::Dup
+                    | Instr::ClearMv
+                    | Instr::Br(_)
+                    | Instr::BrIfFalse(_)
+                    | Instr::BrIfTrue(_)
+                    | Instr::CallNamed { .. }
+                    | Instr::Return
+                    | Instr::PushBlock {
+                        register: false,
+                        ..
+                    }
+                    | Instr::PopHandler
+                    | Instr::ReturnFrom { .. }
+            )
+        })
+}
+
+fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> bool {
+    let Some(function) = egcl_rt::symbols::symbol_function(symbol) else {
+        return false;
+    };
+    egcl_rt::function::is_interpreted_function(function)
+        && registered_function_matches(symbol, function)
+        && replacement_function_value(symbol, function).is_none()
+        && registry_get(symbol).is_some_and(|current| std::ptr::eq(Arc::as_ptr(&current), body))
+}
+
+/// Prepare a distinct precise activation, then return before generated code
+/// calls itself. The caller's arguments and suspended roots are already in its
+/// scanned frame. No Rust frame spans the subsequent native self call.
+unsafe extern "C" fn prepare_recursive(request: *mut u8, out: *mut NativeOutcome) {
+    let request = unsafe { &mut *request.cast::<RecursiveCallRequest>() };
+    request.activation = RecursiveActivation {
+        previous: std::ptr::null_mut(),
+        frame: std::ptr::null_mut(),
+        stack: std::ptr::null(),
+    };
+    request.reserved = 0;
+    // Entry polling also covers recursion without a loop back-edge. This is
+    // root-safe because no argument exists only in an unscanned register.
+    unsafe {
+        poll_or_transfer(std::ptr::null_mut(), out);
+    }
+    if unsafe { (*out).exit } != NativeExit::Returned {
+        return;
+    }
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    let generation = direct_call_gen();
+    if generation != context.recursive_generation {
+        // Most calls need only the generation comparison. On invalidation,
+        // compare the retained body with the current definition before updating
+        // the stamp; unrelated definition changes must not disable recursion.
+        if !recursive_definition_matches(request.call.symbol as u32, context.body) {
+            unsafe {
+                c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+            }
+            return;
+        }
+        context.recursive_generation = generation;
+    }
+    let here = std::ptr::from_ref(&request) as usize as u64;
+    let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
+    if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
+        // A completed fallback keeps frame null. Its value returns straight to
+        // the suspended native caller; exceptional status takes the mapped edge.
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
+        return;
+    }
+    let stack = egcl_rt::current_stack();
+    let Some(frame) = stack.push_frame(
+        EgclVal::from_symbol_index(request.call.symbol as u32),
+        std::ptr::null(),
+        context.slots as u16,
+        FLAG_CALL,
+    ) else {
+        unsafe {
+            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
+        }
+        return;
+    };
+    let body = unsafe { &*context.body };
+    for (index, (_, location)) in body.param_layout.iter().enumerate() {
+        let VarLoc::Slot(slot) = location else {
+            unreachable!("admitted slot parameter")
+        };
+        unsafe {
+            slot_set(frame, *slot, request.call.args.add(index).read());
+        }
+    }
+    request.activation = RecursiveActivation {
+        previous: context.recursive,
+        frame,
+        stack,
+    };
+    context.recursive = std::ptr::from_mut(&mut request.activation);
+    #[cfg(test)]
+    RECURSIVE_ENTRIES.with(|count| count.set(count.get() + 1));
+    NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    c2i_clear_mv();
+    // This helper's success value is an untagged activation address, consumed
+    // immediately as RDI by the emitted call, never exposed as a Lisp value.
+    unsafe {
+        out.write(NativeOutcome {
+            value: EgclVal(frame.add(1) as u64),
+            exit: NativeExit::Returned,
+        });
+    }
+}
+
+/// Nonallocating retirement shared by normal returns and cold chain exits.
+unsafe fn retire_recursive(context: &mut CaptureContext, activation: *mut RecursiveActivation) {
+    let record = unsafe { &*activation };
+    let stack = egcl_rt::current_stack();
+    assert_eq!(context.recursive, activation);
+    assert_eq!(stack.fp(), record.frame);
+    assert!(std::ptr::eq(stack, record.stack));
+    stack.pop_frame();
+    context.recursive = record.previous;
+    NATIVE_DEPTH.with(|depth| depth.set(depth.get() - 1));
+}
+
+unsafe extern "C" fn finish_recursive(activation: *mut RecursiveActivation) {
+    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
+    unsafe {
+        retire_recursive(context, activation);
+    }
 }
 
 struct FaultRecoveryGuard {
@@ -1644,6 +1841,10 @@ pub(super) fn take_native_handler_count() -> usize {
 }
 
 struct CaptureContext {
+    recursive_enabled: bool,
+    recursive_generation: u64,
+    recursive: *mut RecursiveActivation,
+    recursive_escape: bool,
     handlers: *mut Vec<SavedHandler>,
     handler_binds: *mut Vec<SavedHandlerBind>,
     restart_cases: *mut Vec<SavedRestartCase>,
@@ -1703,6 +1904,46 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         entry: native_transfer::leave_native_segment as *const u8,
         request: native_transfer::current_segment().cast(),
     };
+    if context.recursive_enabled {
+        // This entry admits no dynamic handlers, cleanups, bindings or captured
+        // environments. An escaping transfer therefore leaves every recursive
+        // activation, but still validates the exact source/root map first.
+        let frame = if context.recursive.is_null() {
+            context.frame
+        } else {
+            unsafe { (*context.recursive).frame }
+        };
+        let sites = unsafe { &*context.sites };
+        let captured = (|| {
+            if egcl_rt::current_stack().fp() != frame {
+                return Err(TransferSiteError::InvalidLandingCapture);
+            }
+            let index = sites
+                .sites()
+                .position(|site| {
+                    context.code_base + site.return_offset() as usize == capture.return_pc as usize
+                })
+                .ok_or(TransferSiteError::WrongReturnPc)?;
+            unsafe {
+                (&mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+                    .capture_from_activation(
+                        context.code_base,
+                        capture,
+                        std::slice::from_raw_parts(frame.add(1).cast(), context.slots),
+                    )?;
+            }
+            Ok(())
+        })();
+        context.failure = captured.err();
+        while !context.recursive.is_null() {
+            unsafe {
+                retire_recursive(context, context.recursive);
+            }
+        }
+        context.recursive_escape = true;
+        capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
+        return;
+    }
     let mut expected_frame = context.frame;
     let mut frames_valid = true;
     let cluster_frames = unsafe { &mut *context.cluster_frames };
