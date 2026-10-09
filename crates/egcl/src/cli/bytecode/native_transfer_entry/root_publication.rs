@@ -34,6 +34,10 @@ pub(super) struct PublishedBoundary {
     /// entry. The six save words live below the caller's `call_sp`.
     pub(super) bounds: Range<usize>,
     pub(super) segment: *mut NativeSegment,
+    /// Managed stack of the publishing execution, for activation validation.
+    /// Captured here because a stop-the-world scan visits other executions'
+    /// chains and cannot ask them for their current stack.
+    pub(super) stack: *const egcl_rt::stack::EgclStack,
     pub(super) previous: *mut PublishedBoundary,
     /// Root slots the collector reached through this boundary's own frames.
     #[cfg(test)]
@@ -109,6 +113,7 @@ pub(super) unsafe fn published<R>(
         cursor,
         bounds: (image as usize)..saved_sp,
         segment,
+        stack: egcl_rt::current_stack(),
         previous: ACTIVE.with(Cell::get),
         #[cfg(test)]
         visited: Cell::new(0),
@@ -138,17 +143,62 @@ fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     }
 }
 
+/// Validated extent of one publication: native stack words it may read, and
+/// the managed stack its activations must live in.
+struct Walk<'a> {
+    bounds: Range<usize>,
+    stack: &'a egcl_rt::stack::EgclStack,
+}
+
+impl Walk<'_> {
+    /// A native stack word this publication actually owns.
+    fn word(&self, address: usize) -> Option<usize> {
+        self.slot(address).map(|slot| unsafe { (slot as *const usize).read() })
+    }
+
+    /// Address of an owned, aligned native stack word, without reading it.
+    fn slot(&self, address: usize) -> Option<usize> {
+        (address % 8 == 0
+            && address >= self.bounds.start
+            && address.checked_add(8)? <= self.bounds.end)
+            .then_some(address)
+    }
+}
+
+/// Accept an activation pointer only as the slot area of a real frame on this
+/// execution's managed stack: a `Frame` header must precede it inside the
+/// stack, the addressed slots must end at or below the stack pointer, and the
+/// header must itself declare at least that many slots. Nothing is
+/// dereferenced until all of that holds.
+fn validated_activation(
+    activation: *mut EgclVal,
+    slots: u16,
+    stack: &egcl_rt::stack::EgclStack,
+) -> Option<*mut EgclVal> {
+    use egcl_rt::stack::Frame;
+    let address = activation as usize;
+    if address % std::mem::align_of::<Frame>() != 0 {
+        return None;
+    }
+    let header = address.checked_sub(std::mem::size_of::<Frame>())?;
+    let end = address.checked_add(usize::from(slots) * std::mem::size_of::<EgclVal>())?;
+    if header < stack.base() as usize || end > stack.sp() as usize {
+        return None;
+    }
+    // SAFETY: the header lies wholly inside this execution's managed stack.
+    (unsafe { (*(header as *const Frame)).num_locals } >= slots).then_some(activation)
+}
+
 unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut EgclVal)) {
-    if boundary.owner.is_null() || boundary.segment.is_null() {
+    if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
         return;
     }
     let code = unsafe { &*boundary.owner };
     let base = code.code.as_ptr() as usize;
     let segment = unsafe { &*boundary.segment };
-    let bounds = boundary.bounds.clone();
-    let read_word = |address: usize| {
-        (address % 8 == 0 && address >= bounds.start && address.checked_add(8)? <= bounds.end)
-            .then(|| unsafe { (address as *const usize).read() })
+    let walk = Walk {
+        bounds: boundary.bounds.clone(),
+        stack: unsafe { &*boundary.stack },
     };
     let mut cursor = boundary.cursor;
     loop {
@@ -156,13 +206,15 @@ unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut
         else {
             return;
         };
-        let Some(step) = code._native_calls.unwind(base, &cursor, bounds.clone(), read_word)
+        let Some(step) =
+            code._native_calls
+                .unwind(base, &cursor, walk.bounds.clone(), |address| walk.word(address))
         else {
             return;
         };
         match code._native_calls.value_map(offset) {
             Some(NativeCallValues::Frame(map)) => {
-                let visited = unsafe { visit_frame(map, &cursor, step.body_sp, visit) };
+                let visited = unsafe { visit_frame(map, &cursor, step.body_sp, &walk, visit) };
                 #[cfg(test)]
                 boundary.visited.set(boundary.visited.get() + visited);
                 #[cfg(not(test))]
@@ -188,15 +240,18 @@ unsafe fn visit_frame(
     map: &NativeFrameValues,
     cursor: &NativeFrameCursor,
     body_sp: Option<usize>,
+    walk: &Walk<'_>,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
     let layout = map.layout();
+    // The activation pointer itself lives in an owned native stack word, and
+    // only names a frame this execution really owns.
     let activation = match (layout.activation_base_slot, body_sp) {
-        (Some(slot), Some(body_sp)) => {
-            let home = body_sp.wrapping_add(slot as usize * 8) as *const *mut EgclVal;
-            let activation = unsafe { home.read() };
-            (!activation.is_null() && activation as usize % 8 == 0).then_some(activation)
-        }
+        (Some(slot), Some(body_sp)) => walk
+            .word(body_sp.wrapping_add(slot as usize * 8))
+            .and_then(|activation| {
+                validated_activation(activation as *mut EgclVal, layout.activation_slots, walk.stack)
+            }),
         _ => None,
     };
     let mut visited = 0;
@@ -208,8 +263,11 @@ unsafe fn visit_frame(
                 }
                 _ => continue,
             },
-            NativeValueLocation::Stack(offset) => match body_sp {
-                Some(body_sp) => body_sp.wrapping_add_signed(offset as isize) as *mut EgclVal,
+            NativeValueLocation::Stack(offset) => match body_sp
+                .map(|body_sp| body_sp.wrapping_add_signed(offset as isize))
+                .and_then(|address| walk.slot(address))
+            {
+                Some(address) => address as *mut EgclVal,
                 None => continue,
             },
             NativeValueLocation::Register(register) => {
@@ -217,7 +275,7 @@ unsafe fn visit_frame(
                 else {
                     continue;
                 };
-                match cursor.registers[index] {
+                match cursor.registers[index].and_then(|address| walk.slot(address)) {
                     Some(address) => address as *mut EgclVal,
                     None => continue,
                 }
@@ -411,6 +469,37 @@ mod tests {
         assert_eq!(value.unwrap(), EgclVal::from_fixnum(42));
     }
 
+    /// An activation pointer is honoured only when a real frame header backs
+    /// it on the owning stack and declares at least the addressed slots.
+    #[test]
+    fn activation_validation_requires_a_real_frame_with_enough_slots() {
+        use egcl_rt::stack::{EgclStack, Frame};
+        let stack = EgclStack::new(64 * 1024);
+        let frame = stack.push_frame(NIL, std::ptr::null(), 4, 0).expect("push a frame");
+        let activation = unsafe { frame.add(1) }.cast::<EgclVal>();
+
+        assert_eq!(validated_activation(activation, 4, &stack), Some(activation),
+            "the frame's own slots are addressable");
+        assert_eq!(validated_activation(activation, 3, &stack), Some(activation),
+            "addressing fewer slots than declared is fine");
+        assert_eq!(validated_activation(activation, 5, &stack), None,
+            "a map claiming more slots than the header declares is rejected");
+        assert_eq!(validated_activation(std::ptr::null_mut(), 1, &stack), None, "null");
+        assert_eq!(validated_activation(activation.wrapping_byte_add(1), 1, &stack), None,
+            "misaligned");
+        assert_eq!(validated_activation(stack.base() as *mut EgclVal, 1, &stack), None,
+            "no room for a header below the stack base");
+        assert_eq!(validated_activation(stack.sp() as *mut EgclVal, 1, &stack), None,
+            "slots must end at or below the stack pointer");
+        assert_eq!(validated_activation(usize::MAX as *mut EgclVal, 1, &stack), None,
+            "an address whose header or slot area would overflow is rejected");
+        // A frame header inside the stack but belonging to no pushed frame is
+        // still rejected when it cannot declare the slots.
+        let unpushed = unsafe { (stack.base() as *const Frame).add(1) } as usize;
+        assert_eq!(validated_activation(
+            (unpushed + std::mem::size_of::<Frame>()) as *mut EgclVal, u16::MAX, &stack), None);
+    }
+
     /// A publication the walker cannot trust must end its chain without
     /// dereferencing anything, while the real chain keeps working.
     fn observe_malformed() {
@@ -418,19 +507,25 @@ mod tests {
         let real = ACTIVE.with(Cell::get);
         let published = unsafe { &*real };
         let code = unsafe { &*published.owner };
-        let malformed = |owner, pc, bounds| PublishedBoundary {
+        let malformed = |owner, pc, bounds, stack| PublishedBoundary {
             owner,
             cursor: NativeFrameCursor { pc, ..published.cursor },
             bounds,
             segment: published.segment,
+            stack,
             previous: std::ptr::null_mut(),
             visited: Cell::new(0),
         };
         let past_the_code = code.code.as_ptr() as usize + code.code_len;
         let mut cases = [
-            ("PC outside the owner", malformed(published.owner, past_the_code, published.bounds.clone())),
-            ("empty stack bounds", malformed(published.owner, published.cursor.pc, 0..0)),
-            ("no owner", malformed(std::ptr::null(), published.cursor.pc, published.bounds.clone())),
+            ("PC outside the owner",
+                malformed(published.owner, past_the_code, published.bounds.clone(), published.stack)),
+            ("empty stack bounds",
+                malformed(published.owner, published.cursor.pc, 0..0, published.stack)),
+            ("no owner",
+                malformed(std::ptr::null(), published.cursor.pc, published.bounds.clone(), published.stack)),
+            ("no managed stack",
+                malformed(published.owner, published.cursor.pc, published.bounds.clone(), std::ptr::null())),
         ];
         for (label, boundary) in &mut cases {
             ACTIVE.with(|slot| slot.set(boundary));
