@@ -407,7 +407,10 @@ extern "C" fn builtin_slice(cell: u64, n: u64, args: *const EgclVal, _: u64) -> 
 }
 
 fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
-    finish_c2i_call(guard_c2i(|| {
+    // Finish each branch inside the panic boundary. Forwarding the full Rust
+    // Result through a shared return block copies its error payload even on
+    // success; the native caller only needs the tagged value and pending error.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let state = unsafe { state(cell) };
         // Copy just the builtin metadata and release its borrow before any
         // allocation or Lisp reentry. Builtins have no callable object to root.
@@ -416,21 +419,24 @@ fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
             _ => None,
         };
         let Some((slot, nargs)) = builtin else {
-            return cold(state, args);
+            return finish_c2i_call(cold(state, args));
         };
         if nargs != args.len() {
-            return cold(state, args);
+            return finish_c2i_call(cold(state, args));
         }
         // The owning execution cannot retire while one of its calls is active.
         let env = unsafe { (*state.native_env).get() };
         if env.is_null() {
-            return Ok(NIL);
+            return NIL.0;
         }
         match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
-            Some(result) => result,
-            None => cold(state, args),
+            Some(result) => finish_c2i_call(result),
+            None => finish_c2i_call(cold(state, args)),
         }
-    }))
+    })) {
+        Ok(value) => value,
+        Err(payload) => finish_c2i_call(Err(c2i_panic_error(payload))),
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +449,10 @@ thread_local! {
 pub(super) fn record_target_lookup() {
     TARGET_LOOKUPS.with(|count| count.set(count.get() + 1));
 }
+
+#[cfg(all(test, target_arch = "x86_64", unix))]
+#[path = "call_table_builtin_return_tests.rs"]
+mod builtin_return_tests;
 
 #[cfg(all(test, target_arch = "x86_64", unix))]
 mod tests {

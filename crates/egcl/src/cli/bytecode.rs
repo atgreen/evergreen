@@ -16917,17 +16917,20 @@ where
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(result) => result,
-        Err(payload) => {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "panic".to_string());
-            Err(EgclError::Internal(format!(
-                "recovered a panic reached from compiled code (bliss-011): {msg}"
-            )))
-        }
+        Err(payload) => Err(c2i_panic_error(payload)),
     }
+}
+
+#[cold]
+fn c2i_panic_error(payload: Box<dyn std::any::Any + Send>) -> EgclError {
+    let msg = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_string());
+    EgclError::Internal(format!(
+        "recovered a panic reached from compiled code (bliss-011): {msg}"
+    ))
 }
 
 fn c2i_eval_form_with_frame(form: EgclVal, capture_native_frame: bool) -> u64 {
