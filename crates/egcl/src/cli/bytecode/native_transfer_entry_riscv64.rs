@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use super::native_segment_cache::SegmentCacheEntry;
 use std::cell::RefCell;
 
 use egcl_compiler::t2::build::build_from_bytecode;
@@ -23,7 +24,7 @@ use egcl_rt::native_transfer;
 // execution. The slot follows its fiber across carriers and is retired only
 // after that execution stops; no Rc is published to another execution.
 static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<std::collections::HashMap<usize, Option<std::rc::Rc<Riscv64Code>>>>,
+    RefCell<std::collections::HashMap<usize, SegmentCacheEntry<Riscv64Code>>>,
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashMap::new()))
 };
@@ -62,8 +63,12 @@ pub(super) fn try_run(
         cache
             .entry(key)
             .or_insert_with(|| {
-                Riscv64Code::compile(std::sync::Arc::clone(&body)).map(std::rc::Rc::new)
+                SegmentCacheEntry::new(
+                    &body,
+                    Riscv64Code::compile(std::sync::Arc::clone(&body)).map(std::rc::Rc::new),
+                )
             })
+            .code
             .clone()
     });
     code.map(|code| code.run(args, env))
