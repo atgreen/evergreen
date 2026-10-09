@@ -292,3 +292,95 @@ fn native_poll_preserves_immediate_live_values() {
         );
     }
 }
+
+#[test]
+fn inserted_polls_relocate_live_heap_values() {
+    use egcl_rt::{Collector, HeapCollector};
+    extern "C" fn collect(_: *mut u64) -> u64 {
+        HeapCollector::new().minor_gc().unwrap();
+        unsafe {
+            core::arch::asm!("xor rcx,rcx", "xor rsi,rsi", "xor r8,r8",
+                out("rcx") _, out("rsi") _, out("r8") _, options(nomem, nostack));
+        }
+        NIL.0
+    }
+    let mut straight = Vec::new();
+    for _ in 0..65 {
+        straight.extend([
+            Instr::LoadLocal(0),
+            Instr::TypeP(egcl_rt::bytecode::typep_class::BOOLEAN),
+            Instr::Pop,
+        ]);
+    }
+    straight.extend([Instr::LoadLocal(0), Instr::Return]);
+    for code in [
+        vec![
+            Instr::Br(1),
+            Instr::Const(0),
+            Instr::BrIfFalse(4),
+            Instr::Br(1),
+            Instr::LoadLocal(0),
+            Instr::Return,
+        ],
+        straight,
+    ] {
+        let mut source = call_free_loop_fn();
+        source.code = code;
+        source.constants = vec![NIL];
+        source.n_locals = 1;
+        source.arity = 1;
+        source.min_args = 1;
+        source.max_args = Some(1);
+        let mut function = build_from_bytecode_for_transfers(&source).unwrap();
+        for block in function.block_order().to_vec() {
+            let instructions = function
+                .block(block)
+                .insts
+                .iter()
+                .copied()
+                .filter(|&inst| {
+                    function.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::ClearMv
+                })
+                .collect();
+            function.block_mut(block).insts = instructions;
+        }
+        let helper = collect as *const () as u64;
+        let (framed, _) = emit_framed_native_handlers_with_poll(
+            &function,
+            helper,
+            source.num_slots(),
+            helper,
+            helper,
+            helper,
+            helper,
+            helper,
+            helper,
+        )
+        .unwrap();
+        assert!(framed.shadow_root_slots > 0);
+        let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        egcl_rt::rooted!(
+            activation = vec![NIL; usize::from(source.num_slots() + framed.shadow_root_slots)]
+        );
+        let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
+        unsafe {
+            body.cast::<f64>().write(123.5);
+        }
+        egcl_rt::rooted!(expected = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
+        activation[0] = *expected;
+        let original = expected.to_raw();
+        let result = run(activation.as_mut_ptr().cast());
+        assert_ne!(
+            expected.to_raw(),
+            original,
+            "the poll must relocate a live root"
+        );
+        assert_eq!(
+            result,
+            expected.to_raw(),
+            "return uses the moved native value"
+        );
+        assert_eq!(expected.as_double_float(), 123.5);
+    }
+}

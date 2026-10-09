@@ -991,9 +991,12 @@ fn allocate_with_call_operands(
             continue;
         }
         let point = regalloc2::ProgPoint::before(Ra2Inst::new(index)).to_index();
+        let live = mf
+            .live_vregs_before(index, &read_vregs)
+            .expect("allocated instruction");
         let mut values = Vec::new();
         for range in &mf.value_locations {
-            if range.contains(point) && read_vregs.contains(&range.vreg) {
+            if range.contains(point) && live.contains(&range.vreg) {
                 values.push(AllocatedValue {
                     vreg: range.vreg,
                     repr: mf.value_reprs[&range.vreg],
