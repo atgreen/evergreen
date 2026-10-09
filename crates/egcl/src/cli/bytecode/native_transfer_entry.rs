@@ -14,8 +14,8 @@ use egcl_compiler::control_scope::{Ownership, ScopeKind};
 use egcl_compiler::t2::emit::{RecursiveActivation, RecursiveCallRequest, RecursiveTransfer};
 use egcl_compiler::native_unwind::{next_unwind_step, NativeUnwindStep, SelectedTarget};
 use egcl_compiler::t2::native_transfer::{
-    emit_capture_stub, emit_helper_veneer, emit_native_landing_stub, SysvNativeLanding,
-    SysvTransferCapture,
+    emit_capture_stub, emit_native_landing_stub, emit_published_helper_veneer,
+    SysvNativeLanding, SysvTransferCapture,
 };
 use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, TransferSiteError};
 use egcl_rt::jit::JitBuffer;
@@ -23,6 +23,7 @@ use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
+mod root_publication;
 mod activation;
 use activation::ActivationState;
 mod deopt;
@@ -515,10 +516,10 @@ impl TransferCode {
             Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
         } else { None };
         let deopt_veneer = match &deopt_capture {
-            Some(capture) => Some(JitBuffer::new(&emit_helper_veneer(resume_guard, capture.as_ptr()))?),
+            Some(capture) => Some(JitBuffer::new(&emit_published_helper_veneer(resume_guard, capture.as_ptr()))?),
             None => None,
         };
-        let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
+        let veneer = JitBuffer::new(&emit_published_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let mut call_entries = Vec::new();
         for instruction in &body.code {
             let Instr::CallNamed { sym, .. } = instruction else { continue };
@@ -539,9 +540,9 @@ impl TransferCode {
         let named_veneers: Vec<_> = call_entries.iter()
             .map(|(symbol, _, adapter)| (*symbol, adapter.as_ptr() as u64))
             .collect();
-        let poll = JitBuffer::new(&emit_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
+        let poll = JitBuffer::new(&emit_published_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
-        let completion = JitBuffer::new(&emit_helper_veneer(complete_cleanup, capture.as_ptr()))?;
+        let completion = JitBuffer::new(&emit_published_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
         // Direct recursion first shares only immutable code/site metadata.
         // Dynamic handler and cleanup records still require their own mapped
@@ -557,7 +558,7 @@ impl TransferCode {
                 matches!(op, Instr::CallNamed { sym, .. } if sym == symbol)
             }));
         let recursive_prepare = match recursive_symbol {
-            Some(_) => Some(JitBuffer::new(&emit_helper_veneer(prepare_recursive, capture.as_ptr()))?),
+            Some(_) => Some(JitBuffer::new(&emit_published_helper_veneer(prepare_recursive, capture.as_ptr()))?),
             None => None,
         };
         let recursion = recursive_symbol.map(|symbol| RecursiveTransfer {
@@ -1054,7 +1055,17 @@ fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> b
 /// Prepare a distinct precise activation, then return before generated code
 /// calls itself. The caller's arguments and suspended roots are already in its
 /// scanned frame. No Rust frame spans the subsequent native self call.
-unsafe extern "C" fn prepare_recursive(request: *mut u8, out: *mut NativeOutcome) {
+unsafe extern "C" fn prepare_recursive(
+    request: *mut u8,
+    out: *mut NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || prepare_recursive_unpublished(request, out))
+    }
+}
+
+unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcome) {
     let request = unsafe { &mut *request.cast::<RecursiveCallRequest>() };
     request.activation = RecursiveActivation {
         previous: std::ptr::null_mut(),
@@ -1065,7 +1076,7 @@ unsafe extern "C" fn prepare_recursive(request: *mut u8, out: *mut NativeOutcome
     // Entry polling also covers recursion without a loop back-edge. This is
     // root-safe because no argument exists only in an unscanned register.
     unsafe {
-        poll_or_transfer(std::ptr::null_mut(), out);
+        poll_or_transfer_unpublished(std::ptr::null_mut(), out);
     }
     if unsafe { (*out).exit } != NativeExit::Returned {
         return;
@@ -1443,6 +1454,16 @@ unsafe extern "C" fn save_cleanup(cleanup_bcp: u32, resume_bcp: u32, value: Egcl
 }
 
 unsafe extern "C" fn call_or_throw(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || call_or_throw_unpublished(request, out))
+    }
+}
+
+unsafe fn call_or_throw_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
@@ -1917,7 +1938,24 @@ unsafe extern "C" fn call_or_throw(
 /// behind the same rooted helper veneer as an exceptional call. A normal poll
 /// returns a successful outcome; the veneer never performs a status check in
 /// generated code. A nonzero result enters the existing capture/landing path.
+///
+/// Published entry for the generated poll veneer. Direct Rust callers that are
+/// already published use `poll_or_transfer_unpublished`.
 unsafe extern "C" fn poll_or_transfer(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || {
+            #[cfg(test)]
+            root_publication::observe();
+            poll_or_transfer_unpublished(request, out)
+        })
+    }
+}
+
+unsafe fn poll_or_transfer_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
@@ -1986,6 +2024,16 @@ fn record_loop_heat() {
 }
 
 unsafe extern "C" fn complete_cleanup(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || complete_cleanup_unpublished(request, out))
+    }
+}
+
+unsafe fn complete_cleanup_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {

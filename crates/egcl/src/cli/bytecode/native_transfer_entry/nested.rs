@@ -177,7 +177,9 @@ fn prepare_call(
             value: NIL,
             exit: NativeExit::Returned,
         };
-        poll_or_transfer(std::ptr::null_mut(), &mut (*record).outcome);
+        // The mapped-call adapter owns no capture image yet; publishing its
+        // original caller is pending (bliss-shih7.2.7.3.2 mapped children).
+        poll_or_transfer_unpublished(std::ptr::null_mut(), &mut (*record).outcome);
         if (*record).outcome.exit != NativeExit::Returned {
             drop(take_call_arguments(record));
             return;

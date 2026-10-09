@@ -283,3 +283,77 @@ fn legacy_cell_error_disables_recovery_after_rust_returns_before_cold_exit() {
     assert_eq!(STATUS_RECOVERY.get(), 0);
     assert_eq!(RECOVERY.get(), 0);
 }
+
+#[repr(C)]
+struct PublishedRequest {
+    return_pc: usize,
+    call_sp: usize,
+    restored: [u64; 6],
+    drops: usize,
+}
+
+unsafe extern "C" fn published_helper(
+    request: *mut u8,
+    out: *mut NativeOutcome,
+    image: *mut egcl_compiler::t2::native_transfer::SysvTransferCapture,
+) {
+    let request = unsafe { &mut *request.cast::<PublishedRequest>() };
+    let image = unsafe { &mut *image };
+    assert_eq!(image.request, (request as *mut PublishedRequest).cast());
+    assert_eq!(image.return_pc as usize, request.return_pc);
+    assert_eq!(image.caller_sp as usize, request.call_sp);
+    assert_eq!(image.value, NIL, "initialize the whole image before Rust borrows it");
+    assert_eq!(image.exit, NativeExit::Returned);
+    for (index, word) in image.preserved.iter_mut().enumerate() {
+        assert_eq!(*word, 0x1100 + index as u64);
+        *word = 0x2200 + index as u64;
+    }
+    let _finished = Finished(&mut request.drops);
+    unsafe { out.write(NativeOutcome { value: EgclVal::from_fixnum(42), exit: NativeExit::Returned }); }
+}
+
+#[test]
+fn published_helper_captures_before_rust_and_reloads_writable_register_words() {
+    use egcl_compiler::t2::native_transfer::emit_published_helper_veneer;
+    let veneer = JitBuffer::new(&emit_published_helper_veneer(published_helper, std::ptr::null())).unwrap();
+    let registers = [3u8, 5, 12, 13, 14, 15];
+    let mut caller = Vec::new();
+    for reg in registers {
+        if reg >= 8 { caller.push(0x41); }
+        caller.push(0x50 | (reg & 7));
+    }
+    caller.extend_from_slice(&[
+        0x48, 0x83, 0xec, 8, // align call and retain request
+        0x48, 0x89, 0x3c, 0x24, // mov [rsp],rdi
+        0x48, 0x89, 0x67, 8, // mov [rdi+8],rsp
+    ]);
+    for (index, reg) in registers.into_iter().enumerate() {
+        caller.extend_from_slice(&[0x48 | (reg >> 3), 0xb8 | (reg & 7)]);
+        caller.extend_from_slice(&(0x1100u64 + index as u64).to_le_bytes());
+    }
+    caller.extend_from_slice(&[0x48, 0xb8]);
+    caller.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
+    caller.extend_from_slice(&[0xff, 0xd0]);
+    let return_offset = caller.len();
+    caller.extend_from_slice(&[0x48, 0x8b, 0x3c, 0x24]); // recover request
+    for (index, reg) in registers.into_iter().enumerate() {
+        caller.extend_from_slice(&[0x48 | ((reg >> 3) << 2), 0x89, 0x47 | ((reg & 7) << 3), (16 + index * 8) as u8]);
+    }
+    caller.extend_from_slice(&[0x48, 0x83, 0xc4, 8]);
+    for reg in registers.into_iter().rev() {
+        if reg >= 8 { caller.push(0x41); }
+        caller.push(0x58 | (reg & 7));
+    }
+    caller.push(0xc3);
+    let caller = JitBuffer::new(&caller).unwrap();
+    let call: unsafe extern "C" fn(*mut PublishedRequest) -> EgclVal = unsafe { std::mem::transmute(caller.as_ptr()) };
+    let mut request = PublishedRequest {
+        return_pc: caller.as_ptr() as usize + return_offset,
+        call_sp: 0,
+        restored: [0; 6],
+        drops: 0,
+    };
+    assert_eq!(unsafe { call(&mut request) }, EgclVal::from_fixnum(42));
+    assert_eq!(request.restored, [0x2200, 0x2201, 0x2202, 0x2203, 0x2204, 0x2205]);
+    assert_eq!(request.drops, 1);
+}
