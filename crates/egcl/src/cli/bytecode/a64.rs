@@ -32,7 +32,7 @@
 //! could disagree with T0.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, c2i_alloc_cons, c2i_call_builtin,
+    BytecodeFunction, DIRECT_CALL_GEN, NativeEmission, NativeEnvNames, c2i_alloc_cons, c2i_call_builtin,
     c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_eval_host, c2i_load_env, c2i_load_function,
     c2i_load_global, c2i_make_closure, c2i_osr_backedge, c2i_pop_env_child, c2i_push_env_child,
     c2i_set_native_sigsegv_recovery, c2i_store_env, c2i_store_global, c2i_t1_backedge,
@@ -72,6 +72,7 @@ pub(super) fn emit_native_a64(
     backedge_counter: u64,
     _allow_traps: bool,
 ) -> Option<NativeEmission> {
+    let env_names = NativeEnvNames::new(bf);
     macro_rules! decline {
         ($($reason:tt)*) => {{
             egcl_rt::blog!("compile", egcl_rt::log::TRACE,
@@ -165,11 +166,11 @@ pub(super) fn emit_native_a64(
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let load_env_addr =
-        c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+        c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64;
     let store_env_addr =
-        c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let define_env_addr =
-        c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
@@ -305,18 +306,17 @@ pub(super) fn emit_native_a64(
                 ));
                 emit_push(&mut c);
             }
-            // Name indexes belong to this exact code version, not to whatever the
-            // symbol is bound to now: NativeCode retains this body across a
-            // redefinition, so the original is what the helper must consult.
+            // The code owner retains this version's name snapshots even
+            // after redefinition.
             Instr::LoadEnvVar(name_idx) => {
-                emit_mov_imm(&mut c, 0, std::ptr::from_ref(bf) as u64);
+                emit_mov_imm(&mut c, 0, std::ptr::from_ref(&*env_names) as u64);
                 emit_mov_imm(&mut c, 1, u64::from(u32::from(*name_idx)));
                 emit_c2i_call(&mut c, load_env_addr, transfer_addr, recovery_toggle_addr)?;
                 emit_push(&mut c);
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
                 emit_pop(&mut c, 2);
-                emit_mov_imm(&mut c, 0, std::ptr::from_ref(bf) as u64);
+                emit_mov_imm(&mut c, 0, std::ptr::from_ref(&*env_names) as u64);
                 emit_mov_imm(&mut c, 1, u64::from(u32::from(*name_idx)));
                 let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
                     store_env_addr
@@ -565,6 +565,7 @@ pub(super) fn emit_native_a64(
         decline!("a branch displacement is out of range (function too large)");
     };
     Some(NativeEmission {
+        env_names,
         code,
         osr_entries,
         bcp_offsets,

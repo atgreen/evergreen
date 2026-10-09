@@ -278,6 +278,7 @@ pub(super) fn emit_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
+    let env_names = NativeEnvNames::new(bf);
     // Parameters live in slots unless the function captures them into a
     // heap EnvFrame, in which case the bytecode reaches them through
     // LoadEnvVar and the activation may be narrower than the arity: a closure
@@ -582,14 +583,14 @@ pub(super) fn emit_native(
                 helper(&mut a, c2i_store_global as *const () as u64, exit);
             }
             Instr::LoadEnvVar(i) => {
-                a.imm64(2, bf as *const BytecodeFunction as u64);
+                a.imm64(2, std::ptr::from_ref(&*env_names) as u64);
                 a.imm64(3, u64::from(i));
                 helper(&mut a, c2i_load_env as *const () as u64, exit);
                 push(&mut a);
             }
             Instr::StoreEnvVar(i) | Instr::DefineEnvVar(i) => {
                 pop(&mut a, 4);
-                a.imm64(2, bf as *const BytecodeFunction as u64);
+                a.imm64(2, std::ptr::from_ref(&*env_names) as u64);
                 a.imm64(3, u64::from(i));
                 helper(
                     &mut a,
@@ -716,6 +717,7 @@ pub(super) fn emit_native(
         .map(|&label| a.label_offset(label).unwrap() as u32)
         .collect();
     Some(NativeEmission {
+        env_names,
         code: a.finish()?,
         osr_entries,
         bcp_offsets,

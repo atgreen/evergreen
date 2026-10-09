@@ -2835,8 +2835,9 @@ pub fn emit_framed_with_activation_slots(
     )
 }
 
-/// Captured lexical access uses the original root bytecode body's name table.
-/// The runtime retains `body` with the generated code. Helpers have C signatures
+/// Captured lexical access uses the original root body's name metadata.
+/// `body` is an opaque runtime-owned metadata address retained with the code.
+/// Helpers have C signatures
 /// `(body, name_index) -> u64` and `(body, name_index, value)` respectively.
 /// Capturing bodies are excluded from inlining, so all indexes name this body.
 #[derive(Clone, Copy, Debug, Default)]

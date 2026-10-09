@@ -9042,6 +9042,14 @@ impl Env {
         // The u32 probe runs first because the name map is a VecMap<String, _>,
         // a linear scan comparing Strings per entry (bliss-2erp).
         let idx = egcl_rt::symbols::find_index(name);
+        Self::lookup_resolved_frame(frame, name, idx)
+    }
+
+    fn lookup_resolved_frame(
+        frame: &Arc<SharedCell<EnvFrame>>,
+        name: &str,
+        idx: Option<u32>,
+    ) -> Option<EgclVal> {
         let mut cur = Some(Arc::clone(frame));
         while let Some(f) = cur {
             let borrowed = f.borrow();
@@ -9075,6 +9083,15 @@ impl Env {
 
     fn set_frame_var(frame: &Arc<SharedCell<EnvFrame>>, name: &str, val: EgclVal) -> bool {
         let symbol_index = egcl_rt::symbols::find_index(name);
+        Self::set_resolved_frame_var(frame, name, symbol_index, val)
+    }
+
+    fn set_resolved_frame_var(
+        frame: &Arc<SharedCell<EnvFrame>>,
+        name: &str,
+        symbol_index: Option<u32>,
+        val: EgclVal,
+    ) -> bool {
         {
             let mut borrowed = frame.borrow_mut();
             if let Some(slot) = borrowed.vars.get_mut(name) {
@@ -9088,7 +9105,7 @@ impl Env {
             let parent = borrowed.parent.clone();
             drop(borrowed);
             if let Some(parent) = parent {
-                return Self::set_frame_var(&parent, name, val);
+                return Self::set_resolved_frame_var(&parent, name, symbol_index, val);
             }
         }
         false

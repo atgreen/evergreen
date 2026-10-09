@@ -74,6 +74,9 @@ struct SymbolRegistry {
 static REGISTRY: OrderedRwLock<Option<SymbolRegistry>> =
     OrderedRwLock::new(LockLevel::GcWorld, 3, "GC-rooted symbol registry", None);
 static UNINTERNED_COUNTER: AtomicU32 = AtomicU32::new(UNINTERNED_BASE);
+// Only operations that can change an existing name's identity invalidate
+// positive lookup snapshots. Adding a new interned name cannot do so.
+static NAME_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Allocate a string on the GC heap holding `s`.
 ///
@@ -286,6 +289,9 @@ pub fn rename_package_prefix(old_pkg: &str, new_pkg: &str) -> Vec<(u32, String, 
             }
             renamed.push((*idx, old_key.clone(), new_key.clone()));
         }
+        if !renamed.is_empty() {
+            NAME_GENERATION.fetch_add(1, Ordering::Release);
+        }
     });
     // Unpin only AFTER releasing the registry lock (lock-order discipline,
     // bliss-52k). The orphaned strings were never published anywhere.
@@ -325,6 +331,42 @@ pub fn registry_key(idx: u32) -> Option<String> {
 /// `FIND-SYMBOL` needs (it must not create a symbol).
 pub fn find_index(name: &str) -> Option<u32> {
     with_registry(|reg| reg.and_then(|r| r.name_to_index.get(name).copied()))
+}
+
+/// An owned name with a positive lookup snapshot for compiled code.
+///
+/// A hit needs no registry lock until a rename or image restore invalidates
+/// the snapshot. Misses always look again: compilation must neither intern
+/// arbitrary lexical names nor hide symbols registered afterwards. The
+/// immutable snapshot is safe to share with background compiler threads.
+#[derive(Debug)]
+pub struct ResolvedSymbolName {
+    name: String,
+    index: Option<u32>,
+    generation: u64,
+}
+
+impl ResolvedSymbolName {
+    pub fn new(name: &str) -> Self {
+        with_registry(|reg| Self {
+            name: name.to_owned(),
+            index: reg.and_then(|reg| reg.name_to_index.get(name).copied()),
+            generation: NAME_GENERATION.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn index(&self) -> Option<u32> {
+        if let Some(index) = self.index {
+            if NAME_GENERATION.load(Ordering::Acquire) == self.generation {
+                return Some(index);
+            }
+        }
+        find_index(&self.name)
+    }
 }
 
 /// All interned symbols as `(index, name)` pairs, in index order — one lock
@@ -529,6 +571,7 @@ pub fn restore(data: &[u8]) -> Result<(), EgclError> {
         reg.uninterned.clear();
         reg.name_to_index.clear();
         reg.index_to_key.clear();
+        NAME_GENERATION.fetch_add(1, Ordering::Release);
     });
     for name in names {
         intern(&name);
@@ -685,6 +728,7 @@ pub fn restore_objects(data: &[u8]) -> Result<(), EgclError> {
         reg.uninterned = uninterned;
         reg.name_to_index = name_to_index;
         reg.index_to_key = index_to_key;
+        NAME_GENERATION.fetch_add(1, Ordering::Release);
     });
     if let Some(max_idx) = max_uninterned {
         // Next free index is one past the highest restored gensym (never below

@@ -34,7 +34,7 @@
 //! presented before it was found.
 
 use super::{
-    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, UnaryFixnumOp, c2i_alloc_cons,
+    BytecodeFunction, DIRECT_CALL_GEN, FixnumOp, NativeEmission, NativeEnvNames, UnaryFixnumOp, c2i_alloc_cons,
     c2i_call_builtin, c2i_call_slice, c2i_clear_mv, c2i_define_env, c2i_deopt_state, c2i_eval_host,
     c2i_load_env, c2i_load_function, c2i_load_global, c2i_make_closure, c2i_osr_backedge,
     c2i_pop_env_child, c2i_push_env_child, c2i_store_env, c2i_store_global, c2i_t1_backedge,
@@ -74,6 +74,7 @@ pub(super) fn emit_native_ppc64le(
     backedge_counter: u64,
     _allow_traps: bool,
 ) -> Option<NativeEmission> {
+    let env_names = NativeEnvNames::new(bf);
     macro_rules! decline {
         ($($reason:tt)*) => {{
             egcl_rt::blog!("compile", egcl_rt::log::TRACE,
@@ -161,11 +162,11 @@ pub(super) fn emit_native_ppc64le(
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let load_env_addr =
-        c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+        c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64;
     let store_env_addr =
-        c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let define_env_addr =
-        c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
@@ -296,14 +297,14 @@ pub(super) fn emit_native_ppc64le(
                 emit_push(&mut c)?;
             }
             Instr::LoadEnvVar(name_idx) => {
-                c.imm64(3, std::ptr::from_ref(bf) as u64);
+                c.imm64(3, std::ptr::from_ref(&*env_names) as u64);
                 c.imm64(4, u64::from(u32::from(*name_idx)));
                 emit_c2i_call(&mut c, load_env_addr, transfer_addr)?;
                 emit_push(&mut c)?;
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
                 emit_pop(&mut c, 5)?;
-                c.imm64(3, std::ptr::from_ref(bf) as u64);
+                c.imm64(3, std::ptr::from_ref(&*env_names) as u64);
                 c.imm64(4, u64::from(u32::from(*name_idx)));
                 let helper = if matches!(instr, Instr::StoreEnvVar(_)) {
                     store_env_addr
@@ -523,6 +524,7 @@ pub(super) fn emit_native_ppc64le(
         decline!("a branch displacement is out of range (function too large)");
     };
     Some(NativeEmission {
+        env_names,
         code,
         osr_entries,
         bcp_offsets,

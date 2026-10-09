@@ -172,6 +172,7 @@ pub(super) fn emit_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
+    let env_names = NativeEnvNames::new(bf);
     if bf.arity > bf.num_slots() {
         return None;
     }
@@ -361,14 +362,14 @@ pub(super) fn emit_native(
                 helper(&mut a, c2i_store_global as *const () as u64, exit);
             }
             Instr::LoadEnvVar(i) => {
-                a.imm64(A0, bf as *const BytecodeFunction as u64);
+                a.imm64(A0, std::ptr::from_ref(&*env_names) as u64);
                 a.imm64(A1, u64::from(i));
                 helper(&mut a, c2i_load_env as *const () as u64, exit);
                 push(&mut a);
             }
             Instr::StoreEnvVar(i) | Instr::DefineEnvVar(i) => {
                 pop(&mut a, A2);
-                a.imm64(A0, bf as *const BytecodeFunction as u64);
+                a.imm64(A0, std::ptr::from_ref(&*env_names) as u64);
                 a.imm64(A1, u64::from(i));
                 helper(
                     &mut a,
@@ -467,6 +468,7 @@ pub(super) fn emit_native(
         .map(|&label| a.label_offset(label).unwrap() as u32)
         .collect();
     Some(NativeEmission {
+        env_names,
         code: a.finish()?,
         osr_entries,
         bcp_offsets,
