@@ -24,6 +24,8 @@ use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 
 mod deopt;
+mod nested;
+use nested::{SegmentActivations, finish_nested, prepare_nested};
 #[cfg(test)]
 mod cache_tests;
 use deopt::{prepare_completed_deopt, resume_guard};
@@ -172,6 +174,7 @@ pub(super) struct TransferCode {
     pub(super) has_deopt: bool,
     _veneer: JitBuffer,
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
+    _legacy_entries: Vec<JitBuffer>,
     _capture: JitBuffer,
     _poll: JitBuffer,
     _completion: JitBuffer,
@@ -278,6 +281,16 @@ extern "C" fn legacy_cell_transfer_pending() -> u64 {
     u64::from(native_error_pending())
 }
 
+#[cfg(test)]
+pub(super) fn fail_next_nested_capture() {
+    nested::fail_next_capture();
+}
+
+#[cfg(test)]
+pub(super) fn take_nested_entries() -> usize {
+    nested::take_nested_entries()
+}
+
 impl TransferCode {
     #[cfg(test)]
     pub(super) fn deopt_count(&self) -> u32 {
@@ -305,11 +318,27 @@ impl TransferCode {
     }
 
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
-        Self::compile_variant(Arc::clone(&body), true)
-            .or_else(|| Self::compile_variant(body, false))
+        Self::compile_variant(Arc::clone(&body), true, true)
+            .or_else(|| Self::compile_variant(body, false, true))
     }
 
-    fn compile_variant(body: Arc<BytecodeFunction>, optimize: bool) -> Option<Self> {
+    pub(super) fn compile_nested(body: Arc<BytecodeFunction>) -> Option<Self> {
+        if body.has_env
+            || body.variadic
+            || body.min_args != body.arity
+            || body.max_args != Some(body.arity)
+            || !scope_free_native_body(&body, true)
+        {
+            return None;
+        }
+        Self::compile_variant(body, false, false)
+    }
+
+    fn compile_variant(
+        body: Arc<BytecodeFunction>,
+        optimize: bool,
+        allow_recursion: bool,
+    ) -> Option<Self> {
         if body.variadic || body.has_env {
             return None;
         }
@@ -324,7 +353,7 @@ impl TransferCode {
             return None;
         }
         let roots = retain_native_body(&body);
-        let optimize = optimize && scope_free_native_body(&body);
+        let optimize = optimize && scope_free_native_body(&body, false);
         let (ir, deopt_metadata) = if optimize {
             let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
             let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
@@ -368,6 +397,7 @@ impl TransferCode {
         };
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let mut call_entries = Vec::new();
+        let mut legacy_entries = Vec::new();
         for instruction in &body.code {
             let Instr::CallNamed { sym, .. } = instruction else { continue };
             if call_entries.iter().any(|(symbol, _, _)| symbol == sym) {
@@ -381,7 +411,15 @@ impl TransferCode {
                 legacy_cell_transfer_pending,
                 capture.as_ptr(),
             ))?;
-            call_entries.push((*sym, cell, adapter));
+            let mapped = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_mapped_call_veneer(
+                Arc::as_ptr(&cell) as u64,
+                prepare_nested,
+                finish_nested,
+                adapter.as_ptr(),
+                capture.as_ptr(),
+            ))?;
+            legacy_entries.push(adapter);
+            call_entries.push((*sym, cell, mapped));
         }
         let named_veneers: Vec<_> = call_entries.iter()
             .map(|(symbol, _, adapter)| (*symbol, adapter.as_ptr() as u64))
@@ -397,7 +435,7 @@ impl TransferCode {
         // the identity check must leave a generation mismatch at entry.
         let recursive_generation = direct_call_gen();
         let recursive_symbol = super::super::resolve_sym(&body.name)
-            .filter(|_| scope_free_native_body(&body))
+            .filter(|_| allow_recursion && scope_free_native_body(&body, false))
             .map(EgclVal::as_symbol_index)
             .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&body)))
             .filter(|symbol| body.code.iter().any(|op| {
@@ -489,6 +527,7 @@ impl TransferCode {
             has_deopt: emitted.has_deopt,
             _veneer: veneer,
             _call_entries: call_entries,
+            _legacy_entries: legacy_entries,
             _capture: capture,
             _poll: poll,
             _completion: completion,
@@ -647,7 +686,11 @@ impl TransferCode {
         egcl_rt::rooted_ref!(_prepared_handler = &mut prepared_handler);
         let mut prepared_catch = None::<PreparedCatch>;
         egcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
+        let mut children = SegmentActivations::default();
+        egcl_rt::rooted_ref!(_children = &mut children);
         let mut context = CaptureContext {
+            children: &mut children,
+            nested: std::ptr::null_mut(),
             owner: self,
             completed_deopt: false,
             recursive_enabled: self.recursive,
@@ -947,7 +990,7 @@ fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
 }
 
-fn scope_free_native_body(body: &BytecodeFunction) -> bool {
+fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -957,7 +1000,9 @@ fn scope_free_native_body(body: &BytecodeFunction) -> bool {
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
         && body.code.iter().all(|op| {
-            matches!(
+            // Nested tagged callees support MV; optimized/direct-recursive
+            // admission retains its existing restriction.
+            (allow_values && matches!(op, Instr::SetValues(_))) || matches!(
                 op,
                 Instr::Const(_)
                     | Instr::LoadLocal(_)
@@ -1959,6 +2004,8 @@ pub(super) fn take_native_handler_count() -> usize {
 }
 
 struct CaptureContext {
+    children: *mut SegmentActivations,
+    nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     owner: *const TransferCode,
     completed_deopt: bool,
     recursive_enabled: bool,
@@ -2024,6 +2071,21 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         entry: native_transfer::leave_native_segment as *const u8,
         request: native_transfer::current_segment().cast(),
     };
+    if !context.nested.is_null() {
+        let record = unsafe { &*context.nested };
+        context.landing = SysvNativeLanding {
+            stack_pointer: context.nested.cast(),
+            entry: record.cold_entry,
+        };
+        context.dispatch = DispatchPacket {
+            entry: context.landing_stub,
+            request: std::ptr::from_mut(&mut context.landing).cast(),
+        };
+    }
+    #[cfg(test)]
+    if !context.nested.is_null() && nested::take_capture_failure() {
+        context.failure = Some(TransferSiteError::InvalidLandingCapture);
+    }
     if context.recursive_enabled {
         // This entry admits no dynamic handlers, cleanups, bindings or captured
         // environments. An escaping transfer therefore leaves every recursive
@@ -2035,6 +2097,9 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
         };
         let sites = unsafe { &*context.sites };
         let captured = (|| {
+            if context.failure.is_some() {
+                return Ok(()); // retain the inherited failure; still retire below
+            }
             if egcl_rt::current_stack().fp() != frame {
                 return Err(TransferSiteError::InvalidLandingCapture);
             }
@@ -2045,7 +2110,7 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
                 })
                 .ok_or(TransferSiteError::WrongReturnPc)?;
             unsafe {
-                (&mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+                (&mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index))
                     .capture_from_activation(
                         context.code_base,
                         capture,
@@ -2054,13 +2119,19 @@ unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
             }
             Ok(())
         })();
-        context.failure = captured.err();
+        if let Err(failure) = captured {
+            context.failure.get_or_insert(failure);
+        }
         while !context.recursive.is_null() {
             unsafe {
                 retire_recursive(context, context.recursive);
             }
         }
         context.recursive_escape = true;
+        capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
+        return;
+    }
+    if context.failure.is_some() {
         capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
         return;
     }
@@ -2126,7 +2197,7 @@ unsafe fn prepare_transfer(
     // End the mutable snapshot borrow before live signaling can allocate or
     // reenter Lisp. The execution-owned snapshot vector remains rooted.
     unsafe {
-        (&mut *context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+        (&mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index))
             .capture_from_activation(
                 context.code_base,
                 capture,
@@ -2324,7 +2395,7 @@ unsafe fn prepare_transfer(
     }
     // Restore native homes while canonical snapshots still own every root.
     unsafe {
-        (&*context.snapshots.cast::<SysvSiteSnapshot<'_>>().add(index))
+        (&*context.snapshots.cast::<SysvSiteSnapshot>().add(index))
             .write_back(context.code_base, capture)?;
     }
     let error = NATIVE_ERROR

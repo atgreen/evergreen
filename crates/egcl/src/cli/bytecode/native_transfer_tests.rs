@@ -13,6 +13,7 @@ mod fibers;
 mod handlers;
 mod live_signaling;
 mod linkage;
+mod nested;
 mod payloads;
 mod recursion;
 mod deopt;

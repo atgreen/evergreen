@@ -117,6 +117,9 @@ fn canonical_shadow_wins_over_stale_native_home_and_requires_owning_activation()
         .unwrap()
         .reserve_snapshot()
         .unwrap();
+    // A heap-owned activation keeps its exact recipes without borrowing the
+    // code table; the executing code owner is retained separately.
+    drop(table);
     let mut words = [0, 0, EgclVal::from_fixnum(1).to_raw(), 0];
     let mut capture = SysvTransferCapture {
         request: std::ptr::null_mut(),

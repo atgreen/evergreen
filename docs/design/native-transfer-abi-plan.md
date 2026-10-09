@@ -1313,3 +1313,34 @@ This does not publish universal native entries or enable the segment ABI by
 default. Arbitrary mapped native-to-native activations and their retirement
 remain part of bliss-shih7.16; the legacy predicate belongs only to this temporary
 boundary and must disappear when the cell itself exposes the universal ABI.
+
+### Distinct mapped callees within a segment (2026-10-09)
+
+The named-call veneer can now prepare a distinct mapped activation for the exact
+fully promoted T2 target retained by its existing call cell. Preparation returns
+through Rust before machine code calls the child. Cold/T0/T1 and unsupported
+bodies keep the cell's existing boundary path and promotion accounting. Initial
+admission covers fixed positional arguments, tagged values and scope-free
+bodies; outer optimization and direct-self-recursion admission are unchanged.
+
+Each child owns retained code, immutable site recipes, reserved snapshots and a
+precise Lisp frame. An outer-segment root container retains stable child owners
+across allocation and reentry. The call record saves machine continuation state;
+its register copies are not GC roots. Canonical activation shadows remain the
+source of relocated values on return and capture.
+
+Normal retirement and escaping-child retirement both run from a caller-owned
+veneer, so dropping the last child code owner cannot unmap a live return PC.
+Cold retirement restores the actual preceding Lisp frame, including a caller's
+recursive activation or handler cluster, then captures the original caller
+Invoke. The existing caller handler/cleanup machinery processes the selected
+transfer. A metadata failure still retires crossed recursive frames and retains
+the original failure; it does not abandon their stack/depth accounting.
+
+Regression coverage includes preparation success/decline/error, moving roots,
+multiple values, caller handlers/restarts, mutual recursion and depth fallback,
+active redefinition/unbinding, and injected child capture failure below recursive
+callers. `bliss-shih7.16.2` remains open: protected children need cold continuation
+reconstruction before retirement, and child deoptimization and fiber migration
+still need dedicated coverage. Universal entry publication and default ABI
+acceptance remain separate outstanding gates.
