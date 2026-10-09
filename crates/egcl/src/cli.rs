@@ -24,7 +24,7 @@ use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 
 mod bytecode;
 mod control_payload;
-mod delivery;
+mod shake;
 mod evaluated_builtins;
 pub mod events;
 mod native_runtime;
@@ -47,7 +47,7 @@ use std::sync::{Arc, LazyLock, Mutex, Once, Weak};
 #[derive(Clone, Debug)]
 pub struct CliArgs {
     pub image: Option<String>,
-    pub deliver: Option<String>,
+    pub shake: Option<String>,
     pub output: Option<String>,
     pub dry_run: bool,
     pub runtime_info: bool,
@@ -86,7 +86,7 @@ impl CliArgs {
         let mut version = false;
         let mut script = None;
         let mut load_report = None;
-        let mut deliver = None;
+        let mut shake = None;
         let mut output = None;
         let mut dry_run = false;
         let mut runtime_info = false;
@@ -104,12 +104,12 @@ impl CliArgs {
             }
 
             match arg.as_str() {
-                "--deliver" | "--output" | "--runtime-source" => {
+                "--shake" | "--output" | "--runtime-source" => {
                     let value = args
                         .get(i + 1)
                         .ok_or_else(|| EgclError::Internal(format!("{arg} requires a value")))?;
-                    let slot = if arg == "--deliver" {
-                        &mut deliver
+                    let slot = if arg == "--shake" {
+                        &mut shake
                     } else if arg == "--runtime-source" {
                         &mut runtime_source
                     } else {
@@ -223,7 +223,7 @@ impl CliArgs {
 
         let r = CliArgs {
             image: extract_flag_value(&shared_args, "--image"),
-            deliver,
+            shake,
             output,
             dry_run,
             runtime_info,
@@ -247,10 +247,10 @@ impl CliArgs {
             script,
             load_report,
         };
-        if r.deliver.is_some() {
+        if r.shake.is_some() {
             if r.image.is_none() || r.output.is_none() {
                 return Err(EgclError::Internal(
-                    "--deliver requires --image and --output".into(),
+                    "--shake requires --image and --output".into(),
                 ));
             }
             if !r.eval_forms.is_empty()
@@ -261,11 +261,11 @@ impl CliArgs {
                 || r.sandbox
                 || !r.cl_args.is_empty()
             {
-                return Err(EgclError::Internal("--deliver cannot be combined with other execution modes or application arguments".into()));
+                return Err(EgclError::Internal("--shake cannot be combined with other execution modes or application arguments".into()));
             }
         } else if r.output.is_some() || r.dry_run || r.runtime_source.is_some() {
             return Err(EgclError::Internal(
-                "--output and --dry-run require --deliver".into(),
+                "--output and --dry-run require --shake".into(),
             ));
         }
         if r.image.is_some() && r.no_image {
@@ -8140,8 +8140,8 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     scan_evaluator_roots(visit, true);
 }
 
-// Delivery follows closure and generic ownership from reachable handles. Ordinary
-// GC must continue scanning every registry entry until delivery removes it.
+// Shaking follows closure and generic ownership from reachable handles. Ordinary
+// GC must continue scanning every registry entry until shake removes it.
 fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool) {
     for &index in PROCLAIMED_DECLARATIONS.borrow().iter() {
         egcl_rt::symbols::trace_symbol_index(index, visit);
@@ -8415,7 +8415,7 @@ impl Env {
         self.visit_roots_with(state, visit, true);
     }
 
-    fn visit_delivery_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+    fn visit_shake_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         with_env_visit_state(|state| self.visit_roots_with(state, visit, false));
     }
 
@@ -15960,12 +15960,12 @@ fn eval_diag_check(form: EgclVal, what: &str) {
 
 fn eval_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     (|| {
-        // The delivery proof excludes every reachable source-evaluation path.
+        // The shake proof excludes every reachable source-evaluation path.
         // Keep a checked boundary for incompatible internal calls; constant folding
         // removes the source dispatcher and its helpers from this native runtime.
         if cfg!(egcl_no_tree_walker) {
             return Err(EgclError::ProgramError(
-                "source evaluation is absent from this delivered runtime".into(),
+                "source evaluation is absent from this shaken runtime".into(),
             ));
         }
         poison_trap(form, "eval_form entry");
@@ -35291,7 +35291,7 @@ fn call_direct_builtin(
     apply_builtin_fast(name, args, env)
 }
 
-#[egcl_delivery_macros::builtin_dispatch(name)]
+#[egcl_shake_macros::builtin_dispatch(name)]
 fn apply_numeric_op(name: &str, args: &[EgclVal]) -> Option<Result<EgclVal, EgclError>> {
     Some(match name {
         "+" => fold_arith_vals(args, 0, 0.0, |a, b| a + b, bigrat_add, |a, b| a + b),
@@ -35863,9 +35863,9 @@ fn is_builtin_function(name: &str) -> bool {
             // resolving to CL-USER's identity from inside another package, so that
             // a program could define its own SAVE-IMAGE — swank/backend does
             // (bliss-zfwfo). That left them reachable ONLY as `cl-user::save-lisp-
-            // and-die`, a legacy accident rather than an API: a delivery script
+            // and-die`, a legacy accident rather than an API: a shake script
             // written in its own package had no supported spelling at all, which
-            // is what broke 13 delivery tests (bliss-icy71). Giving them the same
+            // is what broke 13 shake tests (bliss-icy71). Giving them the same
             // qualified identity every other extension builtin has restores that
             // without giving back the bare-from-anywhere reading. SBCL is the
             // model: sb-ext:save-lisp-and-die, invisible to a plain (:use :cl).
@@ -36086,7 +36086,7 @@ fn is_builtin_function(name: &str) -> bool {
 /// (bliss-x5y.9). This is what closes most of the T1-bytecode-vs-T0-tree-walker
 /// gap on a source-free asdf.bfasl load, where `ensure-package` hammers TYPEP
 /// (check-type) and GETHASH.
-#[egcl_delivery_macros::builtin_dispatch(name)]
+#[egcl_shake_macros::builtin_dispatch(name)]
 fn apply_builtin_fast(
     name: &str,
     args: &[EgclVal],
@@ -36820,11 +36820,11 @@ fn apply_python_builtin(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclErr
     }
 }
 
-#[egcl_delivery_macros::builtin_dispatch(name)]
+#[egcl_shake_macros::builtin_dispatch(name)]
 fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal, EgclError> {
     if cfg!(egcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
         return Err(EgclError::ProgramError(format!(
-            "native delivery omitted dynamic code entry {name}"
+            "native shake omitted dynamic code entry {name}"
         )));
     }
     match name {
@@ -38712,7 +38712,7 @@ fn current_runtime_bytes() -> std::io::Result<Vec<u8>> {
 /// runtime-plus-core scheme SBCL uses for `:executable t`).
 fn wrap_executable(image: &[u8], application: bool) -> std::io::Result<Vec<u8>> {
     let mut bytes = current_runtime_bytes()?;
-    delivery::remove_embedded_images(&mut bytes)?;
+    shake::remove_embedded_images(&mut bytes)?;
     bytes.resize(bytes.len().div_ceil(4096) * 4096, 0);
     bytes.extend_from_slice(image);
     bytes.extend_from_slice(if application { APP_IMAGE_MAGIC } else { EXE_IMAGE_MAGIC });
@@ -38740,7 +38740,7 @@ fn save_core_and_die(path: &str, executable: bool, application: bool, env: &Env)
     std::process::exit(0);
 }
 
-fn save_core(path: &str, executable: bool, delivery: bool, application: bool, env: &Env) -> Result<(), EgclError> {
+fn save_core(path: &str, executable: bool, shake: bool, application: bool, env: &Env) -> Result<(), EgclError> {
     // Expose this Env's generic-function registries to the serialize hook
     // (whose signature has no Env). Rc shares — the full_gc below relocates
     // objects and the Env root scan updates this same storage (egcl-x0f2.7a).
@@ -38758,7 +38758,7 @@ fn save_core(path: &str, executable: bool, delivery: bool, application: bool, en
         }
     }
     let _saved_setf_expanders = ClearSavedSetfExpanders;
-    // Collect reclaimable garbage. Restored pinned objects require the delivery
+    // Collect reclaimable garbage. Restored pinned objects require the shake
     // serializer's separate reachability pass to omit dead objects from disk.
     egcl_rt::gc::full_gc()?;
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
@@ -38770,7 +38770,7 @@ fn save_core(path: &str, executable: bool, delivery: bool, application: bool, en
         compression: egcl_rt::image::ImageCompression::None,
         purify: true,
     };
-    let save_image = if delivery {
+    let save_image = if shake {
         egcl_rt::image::save_reachable_image
     } else {
         egcl_rt::image::save_image
@@ -38778,7 +38778,7 @@ fn save_core(path: &str, executable: bool, delivery: bool, application: bool, en
 
     if executable {
         // Serialize to a temp core file, then append its bytes to a runtime copy.
-        let tmp = delivery::TemporaryFile::new(std::path::Path::new(path))
+        let tmp = shake::TemporaryFile::new(std::path::Path::new(path))
             .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
         save_image(
             tmp.path
@@ -38791,7 +38791,7 @@ fn save_core(path: &str, executable: bool, delivery: bool, application: bool, en
             .map_err(|e| EgclError::FileError(format!("%save-core: reread core: {e}")))?;
         let exe_bytes = wrap_executable(&core_bytes, application)
             .map_err(|e| EgclError::FileError(format!("%save-core :executable: {e}")))?;
-        delivery::write_atomic(std::path::Path::new(path), &exe_bytes, true)
+        shake::write_atomic(std::path::Path::new(path), &exe_bytes, true)
             .map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
     } else {
         save_image(path, &opts).map_err(|e| EgclError::FileError(format!("%save-core: {e}")))?;
@@ -39040,7 +39040,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
             || ca.no_image)
     {
         return Err(EgclError::ProgramError(
-            "dynamic code entry points are absent from this delivered runtime".into(),
+            "dynamic code entry points are absent from this shaken runtime".into(),
         ));
     }
 
@@ -39075,7 +39075,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         let len = file.metadata().map_err(|e| EgclError::FileError(e.to_string()))?.len();
         load_core_image(&file, 0, len, &mut env)?;
         true
-    } else if ca.deliver.is_none() {
+    } else if ca.shake.is_none() {
         if let Some((mut file, len, _)) = embedded_image_header() {
             use std::io::Seek;
             let offset = file.stream_position().map_err(|e| EgclError::FileError(e.to_string()))?;
@@ -39088,19 +39088,19 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
         false
     };
 
-    if ca.deliver.is_some() {
+    if ca.shake.is_some() {
         if !core_loaded {
             return Err(EgclError::FileError(
-                "delivery requires a saved EGCLIMG core image".into(),
+                "shaking requires a saved EGCLIMG core image".into(),
             ));
         }
         BOOT_COMPLETE.with(|c| c.set(true));
-        return delivery::run(&ca, &mut env);
+        return shake::run(&ca, &mut env);
     }
 
     if cfg!(egcl_no_dynamic_code) && !core_loaded {
         return Err(EgclError::ProgramError(
-            "this delivered runtime requires a compatible core image".into(),
+            "this shaken runtime requires a compatible core image".into(),
         ));
     }
 
@@ -39227,7 +39227,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     }
     if cfg!(egcl_no_dynamic_code) {
         return Err(EgclError::ProgramError(
-            "the REPL is absent from this delivered runtime".into(),
+            "the REPL is absent from this shaken runtime".into(),
         ));
     }
     run_repl_env(&mut env)
@@ -39516,10 +39516,10 @@ pub fn help_text() -> &'static str {
         "  --eval, -e EXPR      Evaluate EXPR and exit\n",
         "  --load FILE          Load FILE and exit\n",
         "  --image FILE         Path to the boot image\n",
-        "  --deliver SPEC       Deliver the saved --image using SPEC\n",
-        "  --output FILE        Delivered executable (with FILE.manifest report)\n",
-        "  --dry-run            Report delivery retention without writing files\n",
-        "  --runtime-source DIR Matching EGCL sources for specialized delivery\n",
+        "  --shake SPEC         Shake the saved --image using SPEC\n",
+        "  --output FILE        Shaken executable (with FILE.manifest report)\n",
+        "  --dry-run            Report what the shake would keep, without writing files\n",
+        "  --runtime-source DIR Matching EGCL sources for a specialized runtime\n",
         "  --runtime-info       Print native runtime compatibility contract\n",
         "  --no-image           Start without loading an image\n",
         "  --bootstrap          Deprecated; the prelude now loads by default\n",

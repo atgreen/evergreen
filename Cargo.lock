@@ -89,8 +89,8 @@ name = "egcl"
 version = "0.0.3"
 dependencies = [
  "egcl-compiler",
- "egcl-delivery-macros",
  "egcl-rt",
+ "egcl-shake-macros",
  "egcl-stdlib",
  "iced-x86",
  "libc",
@@ -117,14 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "egcl-delivery-macros"
-version = "0.0.3"
-dependencies = [
- "quote",
- "syn",
-]
-
-[[package]]
 name = "egcl-rt"
 version = "0.0.3"
 dependencies = [
@@ -134,6 +126,14 @@ dependencies = [
  "libc",
  "object",
  "windows-sys",
+]
+
+[[package]]
+name = "egcl-shake-macros"
+version = "0.0.3"
+dependencies = [
+ "quote",
+ "syn",
 ]
 
 [[package]]

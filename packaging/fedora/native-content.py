@@ -28,12 +28,12 @@ def install(source, manual, stage, *, libdir, datadir, docdir):
     link = system / library.name
     link.unlink(missing_ok=True)
     link.symlink_to(os.path.relpath(library, system))
-    # The delivery front end, so `asdf:make` on an application's /deliver
+    # The shake front end, so `asdf:make` on an application's /shake
     # system finds it by name through the same (:TREE ...) that carries egcl-jvm.
-    deliver = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-deliver'
-    deliver.mkdir(parents=True, exist_ok=True)
-    for name in ('egcl-deliver-asdf.asd', 'asdf-integration.lisp', 'README.md'):
-        shutil.copy2(source / 'lib/egcl-deliver' / name, deliver / name)
+    shake = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-shake'
+    shake.mkdir(parents=True, exist_ok=True)
+    for name in ('egcl-shake-asdf.asd', 'asdf-integration.lisp', 'README.md'):
+        shutil.copy2(source / 'lib/egcl-shake' / name, shake / name)
     destination = stage / docdir.lstrip('/') / 'egcl/manual'
     if destination.exists():
         shutil.rmtree(destination)

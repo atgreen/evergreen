@@ -4,11 +4,11 @@
 //! Ownership of generic functions and methods in a saved world.
 use super::*;
 
-// Called under the delivery heap snapshot in the disposable driver process.
+// Called under the shake heap snapshot in the disposable driver process.
 // Reified method callables also hold a copy of the source body. Only discard
 // it when the saved bytecode is independently executable after restoration.
 pub(super) fn discard_compiled_method_sources() {
-    let bytecode = bytecode::delivery_walker_dependencies();
+    let bytecode = bytecode::shake_walker_dependencies();
     for &callable in METHOD_COMPILED.borrow().values() {
         if !egcl_rt::function::is_interpreted_function(callable) {
             continue;
@@ -41,9 +41,9 @@ pub(super) struct GenericDefinitions {
 }
 
 impl GenericDefinitions {
-    // All references are consumed inside the delivery heap snapshot.
+    // All references are consumed inside the shake heap snapshot.
     pub fn discover(env: &Env, packages: &HashSet<String>) -> Self {
-        let definitions = egcl_stdlib::clos::delivery_definitions();
+        let definitions = egcl_stdlib::clos::shake_definitions();
         let handles = definitions.edges.keys().map(|handle| handle.0).collect();
         let mut result = Self {
             names: HashMap::new(),
@@ -203,6 +203,6 @@ pub(super) fn retain(env: &mut Env, live: &HashSet<u64>) {
     METHOD_COMPILED
         .borrow_mut()
         .retain(|id, _| live.contains(id));
-    egcl_stdlib::clos::retain_delivery_definitions(live);
+    egcl_stdlib::clos::retain_shake_definitions(live);
     invalidate_gf_dispatch_cache();
 }

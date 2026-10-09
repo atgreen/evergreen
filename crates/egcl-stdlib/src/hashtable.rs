@@ -75,10 +75,10 @@ fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     }
 }
 
-/// Delivery follows entries only when their table is semantically reached,
+/// Shaking follows entries only when their table is semantically reached,
 /// using `hash_table_entries`. The GC scanner includes package membership and
 /// orphaned tables, which must not root every function during tree shaking.
-pub fn delivery_root_scanner() -> egcl_rt::gc::RootScanner {
+pub fn shake_root_scanner() -> egcl_rt::gc::RootScanner {
     scan_hash_table_roots
 }
 

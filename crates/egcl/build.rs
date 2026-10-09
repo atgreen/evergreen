@@ -38,7 +38,7 @@ fn fingerprint(root: &Path) -> String {
         "egcl-rt",
         "egcl-compiler",
         "egcl-stdlib",
-        "egcl-delivery-macros",
+        "egcl-shake-macros",
     ] {
         let package = root.join("crates").join(name);
         paths.push(package.join("Cargo.toml"));
@@ -122,7 +122,7 @@ fn configure_runtime() {
         )
         .expect("parse runtime manifest");
         // Dependency features are resolved by Cargo, not exposed to this build
-        // script. The executable adds its dependencies' actual features and delivery
+        // script. The executable adds its dependencies' actual features and shake
         // checks that complete contract before using the artifact.
         full.features.extend(
             selected
@@ -132,7 +132,7 @@ fn configure_runtime() {
                 .cloned(),
         );
         full.accepts(&selected)
-            .expect("native runtime build is incompatible with delivery driver");
+            .expect("native runtime build is incompatible with shake driver");
         println!("cargo:rustc-cfg=egcl_specialized_runtime");
         selected
     } else {

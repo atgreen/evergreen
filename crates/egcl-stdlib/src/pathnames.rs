@@ -159,11 +159,11 @@ where
     f(map)
 }
 
-/// Drop redundant heap-string caches before application delivery. Real strings
+/// Drop redundant heap-string caches before application shake. Real strings
 /// decode from their heap bodies; keeping a cache entry must not keep an unused
 /// function's literals in the saved image. Pathname components and logical
 /// translations remain roots, and non-heap sentinel entries remain available.
-pub fn clear_delivery_string_caches() -> Result<(), EgclError> {
+pub fn clear_shake_string_caches() -> Result<(), EgclError> {
     egcl_rt::gc::with_heap_snapshot(|| {
         // Collect addresses without holding a registry lock while consulting
         // the heap. The snapshot keeps these identities stable throughout.

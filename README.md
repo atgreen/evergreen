@@ -4,7 +4,7 @@
 
 **Evergreen Common Lisp (EGCL)** is an experimental Common Lisp implementation
 written in Rust, with a HotSpot-inspired tiered JIT, a moving generational
-garbage collector, and tools for delivering standalone applications.
+garbage collector, and a tree shaker for standalone applications.
 
 > [!WARNING]
 > **This is an experiment.** Evergreen is for people interested in trying and
@@ -34,10 +34,10 @@ garbage collector, and tools for delivering standalone applications.
   writes, and readiness waits on established TCP streams can park an unpinned
   fiber while other work runs. Connect, accept, and DNS still block the carrier.
   See [fibers and socket I/O](docs/manual/fibers.md#socket-io).
-- **Application delivery.** Save a Lisp environment with libraries preloaded,
-  or deliver it as an executable. Delivery can remove unreachable Lisp code
+- **Application shaking.** Save a Lisp environment with libraries preloaded,
+  or shake it into an executable. The shaker removes unreachable Lisp code
   and objects; specialized runtime builds can also omit unused builtins and
-  compiler tiers. See [saved executables and delivery](docs/manual/user/how-to/save-executable.md).
+  compiler tiers. See [saved executables and shaking](docs/manual/user/how-to/save-executable.md).
 - **Interoperability and Android.** Call C libraries through the
   [FFI](docs/manual/foreign.md), use [Java through `egcl-jvm`](docs/manual/java.md),
   or enable the Lisp-facing `PY` CPython API in a Python-enabled build.
@@ -153,7 +153,7 @@ selector: `latest` follows the newest release and `dev` follows `main`.
 | --- | --- |
 | [First program](docs/manual/user/tutorials/first-program.md) | Expressions, the REPL, scripts, and arguments |
 | [ASDF systems](docs/manual/user/how-to/asdf.md) | Load a local Lisp project |
-| [Saved executables](docs/manual/user/how-to/save-executable.md) | Save and deliver an application |
+| [Saved executables](docs/manual/user/how-to/save-executable.md) | Save and shake an application |
 | [Implementation reference](docs/manual/index.md) | Runtime behavior and EGCL-specific interfaces |
 | [Contributing](docs/manual/contributing/index.md) | Repository structure, validation, and runtime development |
 | [Specification](spec/INDEX.md) | Requirements, design, and staged roadmap |

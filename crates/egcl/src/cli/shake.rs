@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Saved-world delivery. Analysis runs without Lisp allocations in a stopped
+//! Saved-world shake. Analysis runs without Lisp allocations in a stopped
 //! world; its result contains symbol indices, never unrooted heap pointers.
 use super::*;
+use egcl_rt::bytecode::{BytecodeFunction, Instr};
+use egcl_rt::symbols;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use egcl_rt::bytecode::{BytecodeFunction, Instr};
-use egcl_rt::symbols;
 mod generics;
 mod macros;
 mod writers;
 
 fn error(message: impl Into<String>) -> EgclError {
-    EgclError::ProgramError(format!("delivery: {}", message.into()))
+    EgclError::ProgramError(format!("shake: {}", message.into()))
 }
 
 struct Spec {
@@ -223,13 +223,13 @@ struct Plan {
 }
 
 // The ordinary evaluator scanner roots the source closure registry during GC.
-// Delivery replaces that scanner with ownership edges, so its temporary Env
+// Shaking replaces that scanner with ownership edges, so its temporary Env
 // root must not independently root the whole registry again.
-struct DeliveryEnvironment<'a>(&'a mut Env);
+struct ShakeEnvironment<'a>(&'a mut Env);
 
-impl egcl_rt::gc::TraceHostRoots for DeliveryEnvironment<'_> {
+impl egcl_rt::gc::TraceHostRoots for ShakeEnvironment<'_> {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        self.0.visit_delivery_roots(visit);
+        self.0.visit_shake_roots(visit);
     }
 }
 
@@ -274,16 +274,16 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             )
             .collect();
         let indices = candidates.keys().copied().collect();
-        let mut exposed_roots = symbols::delivery_roots(&indices);
+        let mut exposed_roots = symbols::shake_roots(&indices);
         let mut roots = Vec::new();
         // SAFETY: this entire analysis runs under with_heap_snapshot and makes
         // no Lisp allocations. The omitted scanner is replaced below.
         unsafe {
-            egcl_rt::gc::visit_delivery_host_roots(
+            egcl_rt::gc::visit_shake_host_roots(
                 &[
-                    bytecode::delivery_root_scanner(),
-                    egcl_stdlib::hashtable::delivery_root_scanner(),
-                    egcl_stdlib::clos::delivery_root_scanner(),
+                    bytecode::shake_root_scanner(),
+                    egcl_stdlib::hashtable::shake_root_scanner(),
+                    egcl_stdlib::clos::shake_root_scanner(),
                     scan_evaluator_global_roots,
                 ],
                 &mut |slot| roots.push((*slot, "runtime host registry")),
@@ -293,10 +293,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             &mut |slot| roots.push((unsafe { *slot }, "evaluator registry")),
             false,
         );
-        env.visit_delivery_roots(&mut |slot| {
-            roots.push((unsafe { *slot }, "delivery environment"))
-        });
-        egcl_stdlib::clos::visit_delivery_roots(&mut |slot| {
+        env.visit_shake_roots(&mut |slot| roots.push((unsafe { *slot }, "shake environment")));
+        egcl_stdlib::clos::visit_shake_roots(&mut |slot| {
             roots.push((unsafe { *slot }, "retained CLOS class state"))
         });
         roots.extend(
@@ -347,9 +345,9 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 ));
             }
         }
-        let edges = bytecode::delivery_dependencies();
+        let edges = bytecode::shake_dependencies();
         let compiled = if spec.specialized {
-            bytecode::delivery_walker_dependencies()
+            bytecode::shake_walker_dependencies()
         } else {
             HashMap::new()
         };
@@ -442,11 +440,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
             if let Some((name, _)) = generics::function_name(value) {
                 if let Some(writers) = writer_definitions.names.get(&name) {
                     for &writer in writers {
-                        queue.push_back((
-                            EgclVal::from_symbol_index(writer),
-                            reason.clone(),
-                            true,
-                        ));
+                        queue.push_back((EgclVal::from_symbol_index(writer), reason.clone(), true));
                     }
                 }
                 if let Some(&handle) = generic_definitions.names.get(&name) {
@@ -652,7 +646,7 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                 // source bodies have already retained the walker above.
                 let child_callable_data =
                     callable_data && !egcl_rt::function::is_interpreted_function(value);
-                egcl_rt::gc::visit_delivery_references(value, &mut |child| {
+                egcl_rt::gc::visit_shake_references(value, &mut |child| {
                     queue.push_back((child, reason.clone(), child_callable_data))
                 });
             }
@@ -771,7 +765,7 @@ fn prepare_source_functions(
             changed = true;
             if !bytecode::lazy_compile_defun(index, &name, *params, *body, env)
                 || symbols::symbol_function(index) != Some(*function)
-                || bytecode::delivery_walker_dependencies().get(&index) != Some(&None)
+                || bytecode::shake_walker_dependencies().get(&index) != Some(&None)
             {
                 continue;
             }
@@ -793,7 +787,7 @@ fn prepare_source_functions(
 }
 
 /// Audited native entry points with complete evaluated-argument dispatch.
-/// This is an implementation dependency catalog, not a delivery allowlist:
+/// This is an implementation dependency catalog, not a shake allowlist:
 /// unknown handlers retain the walker until their source dependencies are
 /// removed. Lisp callbacks remain edges through the saved object/code graph.
 fn builtin_without_source_evaluation(name: &str) -> bool {
@@ -835,7 +829,7 @@ fn builtin_without_source_evaluation(name: &str) -> bool {
             // here because the caller classifies any name starting with "EGCL"
             // as a runtime symbol needing the source evaluator, and a pure data
             // symbol trivially does not need one. Reaching it is enough to make
-            // it a walker root, so EVERY delivered image that defines a single
+            // it a walker root, so EVERY shaken image that defines a single
             // generic function was shipping the tree-walker it does not use —
             // exactly the saving `runtime = specialized` exists to make
             // (bliss-h7oxk). The over-broad "EGCL" prefix test is bliss-0a5z4.
@@ -844,11 +838,11 @@ fn builtin_without_source_evaluation(name: &str) -> bool {
 }
 
 pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
-    let mut delivery_env = DeliveryEnvironment(env);
-    egcl_rt::rooted_ref!(_env_root = &mut delivery_env);
-    let env = &mut *delivery_env.0;
+    let mut shake_env = ShakeEnvironment(env);
+    egcl_rt::rooted_ref!(_env_root = &mut shake_env);
+    let env = &mut *shake_env.0;
     let input = Path::new(args.image.as_ref().unwrap());
-    let spec_path = Path::new(args.deliver.as_ref().unwrap());
+    let spec_path = Path::new(args.shake.as_ref().unwrap());
     let output = Path::new(args.output.as_ref().unwrap());
     let manifest_path = PathBuf::from(format!("{}.manifest", output.display()));
     for destination in [output, manifest_path.as_path()] {
@@ -882,21 +876,21 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
     // the original on-disk image is never written.
     let top = symbols::intern(IMAGE_TOPLEVEL_VAR);
     symbols::set_symbol_value(top, EgclVal::from_symbol_index(entry));
-    egcl_stdlib::pathnames::clear_delivery_string_caches()?;
+    egcl_stdlib::pathnames::clear_shake_string_caches()?;
     let plan = prepare_source_functions(&spec, entry, &keeps, env)?;
     let mut selected = native_runtime::contract();
     if !spec.specialized
         && (selected.builtins.is_some()
             || selected.max_tier != crate::runtime_contract::NativeTier::T2)
     {
-        return Err(error("runtime = full requires a full delivery driver"));
+        return Err(error("runtime = full requires a full runtime"));
     }
     if !spec.specialized
         && crate::runtime_contract::CAPABILITIES
             .iter()
             .any(|name| !selected.capabilities.contains(*name))
     {
-        return Err(error("runtime = full requires a full delivery driver"));
+        return Err(error("runtime = full requires a full runtime"));
     }
     if spec.specialized {
         selected.max_tier = spec.max_tier;
@@ -919,10 +913,10 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
     std::fs::File::open(input)
         .and_then(|mut file| file.read_exact(&mut header))
         .map_err(|e| error(e.to_string()))?;
-    // The core was validated by load_core_image_bytes before delivery started.
+    // The core was validated by load_core_image_bytes before shake started.
     let image_version = u32::from_ne_bytes(header[8..12].try_into().unwrap());
     let mut report = format!(
-        "egcl-delivery-manifest = 1\nruntime = {}\negcl-version = {}\nplatform-tag = {}\ninput-bytes = {input_size}\nentry = {}\ndynamic = {}\n",
+        "egcl-shake-manifest = 1\nruntime = {}\negcl-version = {}\nplatform-tag = {}\ninput-bytes = {input_size}\nentry = {}\ndynamic = {}\n",
         if spec.specialized {
             "specialized"
         } else {
@@ -974,7 +968,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
             report.push_str(&format!("keep {name}: {reason}\n"));
         } else {
             report.push_str(&format!(
-                "remove {name}: unreachable within declared delivery policy\n"
+                "remove {name}: unreachable within declared shake policy\n"
             ));
         }
     }
@@ -1011,7 +1005,7 @@ pub(super) fn run(args: &CliArgs, env: &mut Env) -> Result<i32, EgclError> {
         bytecode::clear_closure_env(index);
     }
     for &symbol in &plan.unreachable_closures {
-        bytecode::remove_delivery_closure(symbol);
+        bytecode::remove_shake_closure(symbol);
     }
     for id in &plan.unreachable_source_closures {
         closure_registry().borrow_mut().remove(id);
@@ -1110,7 +1104,7 @@ impl TemporaryFile {
                 .file_name()
                 .ok_or_else(|| io::Error::other("output must name a file"))?
                 .to_os_string();
-            name.push(format!(".delivery-{}-{serial}.tmp", std::process::id()));
+            name.push(format!(".shake-{}-{serial}.tmp", std::process::id()));
             let path = destination.with_file_name(name);
             match std::fs::OpenOptions::new()
                 .write(true)

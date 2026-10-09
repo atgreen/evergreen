@@ -674,7 +674,7 @@ mod tests {
                 assert_eq!(args.len(), n as usize);
                 let (mut found_used, mut found_unused) = (false, false);
                 egcl_rt::gc::with_heap_snapshot(|| unsafe {
-                    egcl_rt::gc::visit_delivery_host_roots(&[], &mut |slot| {
+                    egcl_rt::gc::visit_shake_host_roots(&[], &mut |slot| {
                         let value = *slot;
                         found_used |= slot == args.as_ptr().cast_mut() && value == used;
                         found_unused |= unused.contains(&value);

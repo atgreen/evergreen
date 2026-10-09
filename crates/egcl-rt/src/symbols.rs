@@ -1032,10 +1032,10 @@ pub fn for_each_bound_function(mut f: impl FnMut(u32, String, EgclVal)) {
     }
 }
 
-/// Snapshot persistent data cells and function cells outside the delivery
+/// Snapshot persistent data cells and function cells outside the shake
 /// candidate set. No Lisp allocations; callers must consume/root the returned
 /// values before allocating. Symbol identities and package membership stay intact.
-pub fn delivery_roots(candidates: &std::collections::HashSet<u32>) -> Vec<EgclVal> {
+pub fn shake_roots(candidates: &std::collections::HashSet<u32>) -> Vec<EgclVal> {
     with_registry(|reg| {
         let mut roots = Vec::new();
         if let Some(reg) = reg {

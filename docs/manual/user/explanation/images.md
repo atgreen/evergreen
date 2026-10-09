@@ -13,16 +13,16 @@ application directly. Its `:toplevel` function supplies the application's entry
 point; without one, the saved executable opens a REPL.
 
 For an application with a known set of entry points, the separate
-[delivery command](../how-to/save-executable.md#deliver-an-application-from-a-saved-image)
+[shaker](../how-to/save-executable.md#shake-an-application-from-a-saved-image)
 can consume a saved core and a retention specification. Its first pass removes
 unreachable named functions in opted-in packages while preserving the full
 runtime and global data. Ordinary image saving still preserves the loaded world.
 
-Delivery builds a new image rather than leaving holes in the input. It removes
+The shaker builds a new image rather than leaving holes in the input. It removes
 unreachable function bindings and bytecode registry entries, then traces the
 remaining image roots and writes only reachable heap objects. This separate
 serialization pass matters because restored objects are pinned: ordinary GC
-cannot reclaim all dead objects in those regions. Their pinning in the delivery
+cannot reclaim all dead objects in those regions. Their pinning in the shaker's
 process does not require retaining them in the output file.
 
 Heap objects are stored as individual records carrying their previous addresses.
@@ -30,7 +30,7 @@ On restore, the loader allocates the objects again and fixes references through
 an old-to-new address map. Symbol identity records and section-alignment padding
 remain, but omitted function bodies and unreachable constants occupy no reserved
 holes. By default, the native runtime is copied in full. With
-`runtime = specialized`, delivery builds a matching Rust runtime from a
+`runtime = specialized`, the shaker builds a matching Rust runtime from a
 capability manifest before appending the reduced image. The initial removable
 capability is disassembly; interpreter and tiered compilation remain available.
 See [native specialization](../how-to/save-executable.md#specialize-the-native-runtime).

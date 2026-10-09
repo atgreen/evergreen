@@ -518,24 +518,24 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
     }
 }
 
-/// Registry ownership edges for stopped-world delivery analysis. Keys are
+/// Registry ownership edges for stopped-world shake analysis. Keys are
 /// stable meta-handles; payload values must not escape the heap snapshot.
-pub struct DeliveryDefinitions {
+pub struct ShakeDefinitions {
     pub generics: Vec<(EgclVal, EgclVal)>,
     pub edges: HashMap<EgclVal, Vec<EgclVal>>,
 }
 
-pub fn delivery_root_scanner() -> egcl_rt::gc::RootScanner {
+pub fn shake_root_scanner() -> egcl_rt::gc::RootScanner {
     scan_clos_state_roots
 }
 
 /// Keep class state rooted while generic and method ownership is traced by
-/// the delivery graph. Call only under a nonallocating heap snapshot.
-pub fn visit_delivery_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+/// the shake graph. Call only under a nonallocating heap snapshot.
+pub fn visit_shake_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     visit_clos_roots(visit, false);
 }
 
-pub fn delivery_definitions() -> DeliveryDefinitions {
+pub fn shake_definitions() -> ShakeDefinitions {
     let state = CLOS_STATE.lock().unwrap();
     let mut edges: HashMap<EgclVal, Vec<EgclVal>> = HashMap::new();
     let mut generics = Vec::new();
@@ -568,12 +568,12 @@ pub fn delivery_definitions() -> DeliveryDefinitions {
     for (&handle, method) in &state.short_form_methods {
         edges.entry(handle).or_default().extend(&method.methods);
     }
-    DeliveryDefinitions { generics, edges }
+    ShakeDefinitions { generics, edges }
 }
 
-/// Remove unreachable metadata before serializing the disposable delivery
+/// Remove unreachable metadata before serializing the disposable shake
 /// world. Surviving handles and their allocation counters retain their IDs.
-pub fn retain_delivery_definitions(live: &HashSet<u64>) {
+pub fn retain_shake_definitions(live: &HashSet<u64>) {
     let mut state = CLOS_STATE.lock().unwrap();
     state
         .generic_functions

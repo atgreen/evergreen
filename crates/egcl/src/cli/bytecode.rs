@@ -685,7 +685,7 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
 /// because a registry owns them. Heap function objects trace their name symbol,
 /// and direct bytecode calls explicitly trace their symbol operands.
 /// Only called in a heap snapshot, without Lisp allocation.
-fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher> {
+fn shake_bodies() -> HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxBuildHasher> {
     let mut bodies = closure_bodies().borrow().clone();
     REGISTRY.with(|r| bodies.extend(r.borrow().iter().map(|(&s, b)| (s, Arc::clone(b)))));
     for (&symbol, definition) in named_definitions().borrow().iter() {
@@ -698,15 +698,15 @@ fn delivery_bodies() -> HashMap<u32, Arc<BytecodeFunction>, egcl_rt::fxhash::FxB
     bodies
 }
 
-pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<(EgclVal, bool)>> {
+pub(super) fn shake_dependencies() -> HashMap<u32, Vec<(EgclVal, bool)>> {
     let mut edges = HashMap::new();
-    for (symbol, body) in delivery_bodies() {
-        let mut refs: Vec<_> = super::delivery::bytecode_references(&body)
+    for (symbol, body) in shake_bodies() {
+        let mut refs: Vec<_> = super::shake::bytecode_references(&body)
             .into_iter()
             .map(|value| (value, false))
             .collect();
         refs.extend(
-            super::delivery::bytecode_callable_references(&body)
+            super::shake::bytecode_callable_references(&body)
                 .into_iter()
                 .map(|value| (value, true)),
         );
@@ -727,7 +727,7 @@ pub(super) fn delivery_dependencies() -> HashMap<u32, Vec<(EgclVal, bool)>> {
 
 /// A saved callable is independent of source evaluation only if its entire
 /// bytecode tree can be restored and contains no source-executing operation.
-pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str>> {
+pub(super) fn shake_walker_dependencies() -> HashMap<u32, Option<&'static str>> {
     fn source_dependency(body: &BytecodeFunction) -> Option<&'static str> {
         if body.variadic {
             return Some("variadic lambda-list binder");
@@ -749,7 +749,7 @@ pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str
                     .find_map(|restart| source_dependency(&restart.function))
             })
     }
-    delivery_bodies()
+    shake_bodies()
         .into_iter()
         .map(|(symbol, body)| {
             let reason = source_dependency(&body).or_else(|| {
@@ -771,16 +771,16 @@ pub(super) fn delivery_walker_dependencies() -> HashMap<u32, Option<&'static str
         .collect()
 }
 
-/// Delivery owns a disposable restored world. Release registry ownership of
+/// Shaking owns a disposable restored world. Release registry ownership of
 /// unreachable private code and captures before the compacting image save.
-pub(super) fn remove_delivery_closure(symbol: u32) {
+pub(super) fn remove_shake_closure(symbol: u32) {
     debug_assert!(egcl_rt::symbols::is_uninterned(symbol));
     closure_bodies().borrow_mut().remove(&symbol);
     clear_lazy_state(symbol);
     clear_closure_env(symbol);
 }
 
-pub(super) fn delivery_root_scanner() -> egcl_rt::gc::RootScanner {
+pub(super) fn shake_root_scanner() -> egcl_rt::gc::RootScanner {
     scan_bytecode_roots
 }
 
@@ -8406,7 +8406,7 @@ fn compile_function_in(
     loop_finish_tag: Option<&str>,
 ) -> Option<BytecodeFunction> {
     // A failed allocating attempt can relocate both inputs before a retry.
-    // Source-free delivery restores bytecode; native tiering compiles that
+    // Source-free shake restores bytecode; native tiering compiles that
     // bytecode independently and does not need the source lowerer.
     if cfg!(egcl_no_tree_walker) {
         return None;
@@ -10303,7 +10303,7 @@ pub fn build_bbu_from_forms(
                 // Keep the original accessor in the portable symbol pool too.
                 // Only emitting the mangled writer name loses its package
                 // ownership when no executable constant mentions the accessor.
-                // Materializing this symbol lets delivery associate the private
+                // Materializing this symbol lets shake associate the private
                 // writer cell with its owner without reversing lossy mangling.
                 let accessor = cp(cp(name_form).1).0;
                 let Some(index) = accessor.symbol_index() else {
@@ -25491,7 +25491,7 @@ mod jtc4_stack_map_tests {
 
 #[cfg(egcl_no_disassembly)]
 fn format_native_listing(_: &NativeCode, _: Option<&mut super::Env>) -> String {
-    "; Native disassembly was omitted at delivery.\n".into()
+    "; Native disassembly was omitted at shake.\n".into()
 }
 
 #[cfg(test)]

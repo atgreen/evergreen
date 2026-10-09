@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Capability selection and matching-runtime builds for saved-image delivery.
+//! Capability selection and matching-runtime builds for saved-image shake.
 use crate::runtime_contract::Contract;
 pub(super) fn contract() -> Contract {
     let mut contract = Contract::parse(include_str!(concat!(
@@ -27,7 +27,7 @@ pub(super) fn build(
 ) -> Result<Vec<u8>, egcl_rt::error::EgclError> {
     use std::{fs, path::Path, process::Command};
     let fail = |message: String| {
-        egcl_rt::error::EgclError::ProgramError(format!("native delivery: {message}"))
+        egcl_rt::error::EgclError::ProgramError(format!("native shake: {message}"))
     };
     let source = Path::new(source.unwrap_or(env!("EGCL_RUNTIME_SOURCE")))
         .canonicalize()
@@ -37,7 +37,7 @@ pub(super) fn build(
             ))
         })?;
     // Separate artifacts for *all* contract inputs, including dependency
-    // features and compiler flags. Concurrent deliveries cannot exchange them.
+    // features and compiler flags. Concurrent shakes cannot exchange them.
     let key = selected
         .encode()
         .bytes()
@@ -45,12 +45,12 @@ pub(super) fn build(
             (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
         });
     let key = format!("{key:016x}");
-    let cache = source.join("target/delivery").join(&selected.source);
+    let cache = source.join("target/shake").join(&selected.source);
     fs::create_dir_all(&cache).map_err(|e| fail(e.to_string()))?;
     let manifest = cache.join(format!("{key}.runtime"));
     let encoded = selected.encode();
     if fs::read_to_string(&manifest).ok().as_deref() != Some(&encoded) {
-        super::delivery::write_atomic(&manifest, encoded.as_bytes(), false)
+        super::shake::write_atomic(&manifest, encoded.as_bytes(), false)
             .map_err(|e| fail(e.to_string()))?;
     }
     let flags: Vec<u8> = selected
