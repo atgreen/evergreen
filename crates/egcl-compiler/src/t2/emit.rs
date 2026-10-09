@@ -3939,14 +3939,24 @@ fn emit_framed_inner(
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
+    // A branch-only result may still be live across an intervening call or
+    // needed for recovery. Such a value must exist before the safepoint.
+    let safepoint_values: HashSet<_> = machine.stack_maps.iter()
+        .flat_map(|map| map.values.iter().map(|entry| Value(entry.vreg.num)))
+        .collect();
+    fused.retain(|&inst| {
+        !f.inst(inst).results.iter().any(|value| safepoint_values.contains(value))
+    });
     let layout = select_frame_homes(f, &machine, |value| {
         const_tagged.contains_key(&value)
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
     })
     .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
+    let resolved = crate::t2::x64_frame::resolve_safepoint_maps(f, &machine, &layout, &const_tagged)
+        .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut transfer_maps = if transfer_mode {
-        crate::t2::transfer_map::lower_framed_transfer_maps(f, &machine, &layout, &const_tagged)
+        crate::t2::transfer_map::lower_resolved_transfer_maps(f, &machine, &resolved)
             .map_err(|_| EmitError::UnsupportedOp(0xFD))?
     } else {
         vec![]
@@ -4000,10 +4010,10 @@ fn emit_framed_inner(
             }
         }
     }
-    // Convert regalloc2's split-aware live ranges into exact tagged roots for
-    // each runtime safepoint. The rich emitter uses stable `homes`, so these are
-    // the locations that must be synchronized, not regalloc2's transient edit
-    // locations. Only tagged values are GC roots; unboxed GPR values are omitted.
+    // Select exact tagged roots from the checked final-home maps. Allocation
+    // ranges have already supplied liveness; no independent range scan belongs
+    // here. Unboxed values and materialized constants remain in the shared map
+    // for debug/recovery consumers without requiring root synchronization.
     // Proven-immediate root filtering (bliss-x5y.25 option b). A value whose
     // inferred type is confined to the NON-POINTER immediates — fixnum,
     // single-float, character, symbol (an interning INDEX, not a pointer), and
@@ -4029,65 +4039,17 @@ fn emit_framed_inner(
     };
     let mut safepoint_roots: HashMap<Inst, Vec<Value>> = HashMap::new();
     if activation_slots.is_some() {
-        for (mi, machine_inst) in machine.insts.iter().enumerate() {
-            if !machine_inst.safepoint {
-                continue;
-            }
-            let mi_u32 = u32::try_from(mi).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-            let source = machine_inst
-                .source_inst
-                .ok_or(EmitError::UnsupportedOp(0xFD))?;
-            // `value_locations` ranges are in regalloc2 ProgPoint units
-            // (`ProgPoint::to_index()` == inst*2 + pos; see regalloc.rs), NOT raw
-            // MachInst indices. A value must be a GC root here if it is live
-            // ACROSS this safepoint call — i.e. live at the point just after the
-            // call (its next use is later), which is program point `mi*2 + 1`.
-            // Comparing the ProgPoint ranges against the bare inst index `mi` (as
-            // the old code did) is a ~2x scale mismatch that silently dropped
-            // every live-through value, leaving only call *args* (rooted via the
-            // uses loop below) in the map. A moving GC during the call then left a
-            // live-through Tagged value — e.g. a loop-carried list held in a
-            // callee-saved register — stale, deopting to a corrupt frame
-            // (bliss-r8pt). Over-including a root is safe (its stable home holds a
-            // valid pointer); under-including corrupts the heap.
-            let pp_after = mi_u32 * 2 + 1;
-            let mut live = HashSet::new();
-            for range in &machine.value_locations {
-                if range.vreg.class != RegClass::Gpr
-                    || range.start > pp_after
-                    || pp_after >= range.end
-                {
-                    continue;
-                }
-                let value = Value(range.vreg.num);
-                // A call result's range starts at the safepoint, but the value
-                // does not exist until the call returns. Restoring a pre-call
-                // shadow for it would overwrite the real result.
-                if machine_inst.defs.contains(&range.vreg) {
-                    continue;
-                }
-                if f.value(value).repr == ValueRepresentation::Tagged
-                    && homes.contains_key(&value)
-                    && !proven_immediate(value)
-                {
-                    live.insert(value);
-                }
-            }
-            // Early uses can end at the safepoint itself. Include them
-            // explicitly in case the allocator's half-open debug range ends at
-            // this instruction boundary.
-            for vreg in &machine_inst.uses {
-                if vreg.class == RegClass::Gpr {
-                    let value = Value(vreg.num);
-                    if f.value(value).repr == ValueRepresentation::Tagged
-                        && homes.contains_key(&value)
-                        && !proven_immediate(value)
-                    {
-                        live.insert(value);
-                    }
-                }
-            }
-            let mut live: Vec<_> = live.into_iter().collect();
+        for point in resolved.iter() {
+            let mi = point.machine_inst;
+            let machine_inst = &machine.insts[mi];
+            let source = point.source_inst;
+            // This is the same checked final-home map consumed by transfer
+            // recovery. Before liveness includes dying call arguments and
+            // excludes the call's as-yet-unwritten result.
+            let mut live: Vec<_> = point.values().iter()
+                .filter(|entry| entry.gc_home().is_some() && !proven_immediate(entry.value))
+                .map(|entry| entry.value)
+                .collect();
             live.sort_by_key(|value| value.0);
             if std::env::var_os("EGCL_SAFEPOINT_DBG").is_some() {
                 let src = machine_inst.source_inst;

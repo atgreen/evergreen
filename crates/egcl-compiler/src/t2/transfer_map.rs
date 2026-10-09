@@ -84,6 +84,7 @@ pub enum TransferMapError {
     MissingAllocations(Inst),
     MissingCallRoots(Inst),
     FrameState(deopt::LowerError),
+    FrameHome(crate::t2::x64_frame::FrameMapError),
 }
 
 /// Resolve all Invoke sites using their own operand allocations. Never consult
@@ -237,17 +238,35 @@ pub fn lower_framed_transfer_maps(
     homes: &crate::t2::x64_frame::FrameHomes,
     constants: &std::collections::HashMap<Value, u64>,
 ) -> Result<Vec<TransferCaptureMap>, TransferMapError> {
+    let resolved = crate::t2::x64_frame::resolve_safepoint_maps(f, machine, homes, constants)
+        .map_err(TransferMapError::FrameHome)?;
+    lower_resolved_transfer_maps(f, machine, &resolved)
+}
+
+/// Consume the same checked home records used for root synchronization.
+pub(crate) fn lower_resolved_transfer_maps(
+    f: &Function,
+    machine: &MachFunc,
+    resolved: &crate::t2::x64_frame::FrameSafepoints,
+) -> Result<Vec<TransferCaptureMap>, TransferMapError> {
     use crate::t2::frame_state::ValueSource;
+    use crate::t2::x64_frame::FrameValueLocation;
     let mut maps = lower_transfer_maps(f, machine)?;
     for map in &mut maps {
+        let point = resolved
+            .get(map.machine_inst)
+            .filter(|point| point.source_inst == map.call)
+            .ok_or(TransferMapError::BadCallState(map.call))?;
         let mut state = f
             .frame_states
             .get(f.inst(map.call).frame_state.unwrap())
             .clone();
         let substitute = |source: &mut ValueSource| {
             if let ValueSource::Value { value, .. } = source {
-                if let Some(&bits) = constants.get(value) {
-                    *source = ValueSource::Const(egcl_rt::value::EgclVal(bits));
+                if let Some(FrameValueLocation::Immediate(constant)) =
+                    point.value(*value).map(|entry| entry.location)
+                {
+                    *source = ValueSource::Const(constant);
                 }
             }
         };
@@ -261,8 +280,9 @@ pub fn lower_framed_transfer_maps(
                 substitute(source);
             }
         }
-        map.frames = deopt::lower_one(0, &state, &|value| {
-            homes.values.get(&value).and_then(|home| home.location())
+        map.frames = deopt::lower_one(0, &state, &|value| match point.value(value)?.location {
+            FrameValueLocation::Home(home) => home.location(),
+            FrameValueLocation::Immediate(_) => None,
         })
         .map_err(TransferMapError::FrameState)?
         .scopes;

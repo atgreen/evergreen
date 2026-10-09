@@ -48,12 +48,17 @@
 //! points. Values the allocator kept in one register for their whole life, the
 //! common case in hot loops, pay nothing.
 
-use crate::t2::ir::{Function, Value};
+use crate::t2::ir::{AuxData, Function, Inst, Opcode, Value, ValueDef, ValueRepresentation};
 use crate::t2::mach::{Location, MachFunc, PhysReg, RegClass, StackSlot};
-use std::collections::HashMap;
+use egcl_rt::value::EgclVal;
+use std::collections::{HashMap, HashSet};
 
 /// Allocator indices to hardware encodings; RSP/RBP are reserved.
 pub(crate) const GPR_X86: [u8; 14] = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15];
+
+/// Allocator indices usable as stable homes; the first four form the reduced
+/// pool. Keep allocation and final-home validation on the same register set.
+pub(crate) const FRAME_GPRS: [usize; 8] = [1, 5, 3, 9, 10, 11, 12, 13];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueHome {
@@ -89,6 +94,208 @@ pub struct FrameHomes {
 pub enum FrameHomeError {
     InvalidRegister(PhysReg),
     SlotOverflow,
+}
+
+/// A value in the rich emitter's physical representation, before an instruction
+/// template starts changing registers or reserving temporary call space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameValueLocation {
+    Home(ValueHome),
+    /// A nonmoving tagged word materialized by the emitter when needed.
+    Immediate(EgclVal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameValue {
+    pub value: Value,
+    pub repr: ValueRepresentation,
+    pub location: FrameValueLocation,
+}
+
+impl FrameValue {
+    /// Raw words remain described for debugging/recovery, but only located
+    /// tagged values can require GC synchronization.
+    pub fn gc_home(&self) -> Option<ValueHome> {
+        match (self.repr, self.location) {
+            (ValueRepresentation::Tagged, FrameValueLocation::Home(home)) => Some(home),
+            _ => None,
+        }
+    }
+}
+
+/// Final body homes at a machine safepoint. These are not yet locations at a
+/// native return PC: call setup can clobber homes or make a shadow authoritative.
+#[derive(Clone, Debug)]
+pub struct FrameSafepoint {
+    pub machine_inst: usize,
+    pub source_inst: Inst,
+    values: Vec<FrameValue>,
+}
+
+impl FrameSafepoint {
+    pub fn values(&self) -> &[FrameValue] {
+        &self.values
+    }
+
+    pub fn value(&self, value: Value) -> Option<&FrameValue> {
+        self.values
+            .binary_search_by_key(&value.0, |entry| entry.value.0)
+            .ok()
+            .map(|index| &self.values[index])
+    }
+}
+
+/// Checked, immutable maps shared by root synchronization and frame recovery.
+pub struct FrameSafepoints {
+    maps: Vec<FrameSafepoint>,
+}
+
+impl FrameSafepoints {
+    pub fn iter(&self) -> impl Iterator<Item = &FrameSafepoint> {
+        self.maps.iter()
+    }
+
+    pub fn get(&self, machine_inst: usize) -> Option<&FrameSafepoint> {
+        self.maps
+            .binary_search_by_key(&machine_inst, |map| map.machine_inst)
+            .ok()
+            .map(|index| &self.maps[index])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameMapError {
+    SafepointCoverage,
+    LiveSetMismatch(usize),
+    InvalidSource(usize),
+    InvalidValue(Value),
+    MissingHome(Value),
+    InvalidHome(ValueHome),
+    ConflictingHome(ValueHome),
+    InvalidConstant(Value),
+}
+
+/// Resolve allocator value identities through the homes actually used by the
+/// instruction templates. Never substitute a transient allocator location for
+/// a missing final home, or silently omit a potentially moving value.
+pub fn resolve_safepoint_maps(
+    f: &Function,
+    machine: &MachFunc,
+    homes: &FrameHomes,
+    constants: &HashMap<Value, u64>,
+) -> Result<FrameSafepoints, FrameMapError> {
+    if machine.stack_maps.len() != machine.insts.iter().filter(|i| i.safepoint).count() {
+        return Err(FrameMapError::SafepointCoverage);
+    }
+    let read_vregs = machine.read_vregs();
+    let mut maps = Vec::with_capacity(machine.stack_maps.len());
+    for (machine_inst, instruction) in machine.insts.iter().enumerate() {
+        if !instruction.safepoint {
+            continue;
+        }
+        let mut candidates = machine
+            .stack_maps
+            .iter()
+            .filter(|map| map.code_offset as usize == machine_inst);
+        let map = candidates.next().ok_or(FrameMapError::SafepointCoverage)?;
+        if candidates.next().is_some() || map.frame_state != instruction.frame_state {
+            return Err(FrameMapError::SafepointCoverage);
+        }
+        // Validate coverage against the allocator's authoritative split ranges.
+        // Consumers below use the checked table, never their own liveness scan.
+        let before = machine_inst as u32 * 2;
+        let expected: HashSet<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| range.contains(before) && read_vregs.contains(&range.vreg))
+            .map(|range| range.vreg)
+            .chain(instruction.uses.iter().copied())
+            .collect();
+        let described: HashSet<_> = map.values.iter().map(|entry| entry.vreg).collect();
+        if expected != described {
+            return Err(FrameMapError::LiveSetMismatch(machine_inst));
+        }
+        let source_inst = instruction
+            .source_inst
+            .filter(|source| source.index() < f.num_insts())
+            .ok_or(FrameMapError::InvalidSource(machine_inst))?;
+        let mut values = Vec::new();
+        let mut home_values = HashMap::new();
+        for allocated in &map.values {
+            let value = Value(allocated.vreg.num);
+            if value.index() >= f.num_values()
+                || f.value(value).repr != allocated.repr
+                || machine.value_reprs.get(&allocated.vreg) != Some(&allocated.repr)
+            {
+                return Err(FrameMapError::InvalidValue(value));
+            }
+            let location = if let Some(&bits) = constants.get(&value) {
+                let constant = EgclVal(bits);
+                if allocated.repr != ValueRepresentation::Tagged
+                    || immediate_constant(f, value) != Some(constant)
+                {
+                    return Err(FrameMapError::InvalidConstant(value));
+                }
+                FrameValueLocation::Immediate(constant)
+            } else {
+                let home = *homes
+                    .values
+                    .get(&value)
+                    .ok_or(FrameMapError::MissingHome(value))?;
+                let valid = match home {
+                    ValueHome::Reg(reg) => {
+                        FRAME_GPRS.iter().any(|&index| GPR_X86[index] == reg)
+                            && crate::t2::lower::class_of(allocated.repr) == RegClass::Gpr
+                    }
+                    ValueHome::Stack(slot) => {
+                        slot < homes.stack_slots && slot <= i32::MAX as u32 / 8
+                    }
+                };
+                if !valid {
+                    return Err(FrameMapError::InvalidHome(home));
+                }
+                if home_values
+                    .insert(home, value)
+                    .is_some_and(|old| old != value)
+                {
+                    return Err(FrameMapError::ConflictingHome(home));
+                }
+                FrameValueLocation::Home(home)
+            };
+            let entry = FrameValue {
+                value,
+                repr: allocated.repr,
+                location,
+            };
+            if !values.contains(&entry) {
+                values.push(entry);
+            }
+        }
+        values.sort_by_key(|entry| entry.value.0);
+        maps.push(FrameSafepoint {
+            machine_inst,
+            source_inst,
+            values,
+        });
+    }
+    Ok(FrameSafepoints { maps })
+}
+
+// Only IR-defined immediates may replace a live physical root.
+fn immediate_constant(f: &Function, value: Value) -> Option<EgclVal> {
+    let ValueDef::Result { inst, .. } = f.value(value).def else {
+        return None;
+    };
+    let instruction = f.inst(inst);
+    match (instruction.opcode, &instruction.aux) {
+        (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => Some(EgclVal::from_fixnum(*v)),
+        (Opcode::ConstFloat, AuxData::FloatImm(v)) => Some(EgclVal::from_single_float(*v)),
+        (Opcode::ConstChar, AuxData::CharImm(v)) => Some(EgclVal::from_char(*v)),
+        (Opcode::ConstSymbol, AuxData::SymbolRef(v)) => Some(EgclVal::from_symbol_index(*v)),
+        (Opcode::ConstNil, _) => Some(egcl_rt::value::NIL),
+        (Opcode::ConstT, _) => Some(egcl_rt::value::T),
+        _ => None,
+    }
 }
 
 /// Preserve register-resident values only when every reported range agrees;
