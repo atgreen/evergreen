@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use super::native_segment_cache::SegmentCacheEntry;
 use super::super::CONTROL_COUNTER;
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -23,13 +24,15 @@ use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 
 mod deopt;
+#[cfg(test)]
+mod cache_tests;
 use deopt::{prepare_completed_deopt, resume_guard};
 
 // SAFETY: code owners and their non-Send feedback belong only to this Lisp
 // execution. The slot follows its fiber across carriers and is retired only
 // after that execution stops; no Rc is published to another execution.
 static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
-    RefCell<std::collections::HashMap<usize, Option<Rc<TransferCode>>>>,
+    RefCell<std::collections::HashMap<usize, SegmentCacheEntry<TransferCode>>>,
 > = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashMap::new()))
 };
@@ -42,7 +45,7 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
     use std::fmt::Write;
 
     let key = Arc::as_ptr(body) as usize;
-    let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key).cloned().flatten())?;
+    let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key)?.code.clone())?;
     let mut out = String::from(
         "; Native segment ABI — cached entry; compatibility calls can still use the checked ABI.\n",
     );
@@ -253,12 +256,13 @@ fn cached_code(body: &Arc<BytecodeFunction>) -> Option<Rc<TransferCode>> {
     let key = Arc::as_ptr(body) as usize;
     SEGMENT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let entry = cache.entry(key)
-            .or_insert_with(|| TransferCode::compile(Arc::clone(body)).map(Rc::new));
-        if entry.as_ref().is_some_and(|code| code.recompile.get()) {
-            *entry = TransferCode::compile(Arc::clone(body)).map(Rc::new);
+        let entry = cache.entry(key).or_insert_with(|| {
+            SegmentCacheEntry::new(body, TransferCode::compile(Arc::clone(body)).map(Rc::new))
+        });
+        if entry.code.as_ref().is_some_and(|code| code.recompile.get()) {
+            entry.code = TransferCode::compile(Arc::clone(body)).map(Rc::new);
         }
-        entry.clone()
+        entry.code.clone()
     })
 }
 

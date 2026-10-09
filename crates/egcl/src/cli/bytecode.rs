@@ -32,6 +32,19 @@
 //! (closures / multiple values / special vars), nmq.6 (parity + default flip),
 //! nmq.2 (codegen via i2c/c2i), nmq.3 (precise GC of frames).
 
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(
+        any(target_arch = "aarch64", target_arch = "s390x", target_arch = "riscv64"),
+        unix
+    ),
+    all(
+        target_arch = "powerpc64",
+        target_endian = "little",
+        target_os = "linux"
+    )
+))]
+mod native_segment_cache;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_entry;
 #[cfg(all(target_arch = "aarch64", unix))]

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Prevent a replacement function from inheriting an earlier definition's native
+  segment compilation rejection when its memory address is reused
+  ([#162](https://github.com/atgreen/evergreen/pull/162)).
+
 - Keep native segment code and deoptimization feedback with each Lisp execution
   across fiber migration, and release their retained roots when it stops
   ([#160](https://github.com/atgreen/evergreen/pull/160)).

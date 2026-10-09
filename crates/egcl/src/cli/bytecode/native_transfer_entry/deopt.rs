@@ -53,7 +53,7 @@ fn note_segment_deopt(code: &TransferCode) {
         cache
             .borrow()
             .get(&key)
-            .and_then(Option::as_ref)
+            .and_then(|entry| entry.code.as_ref())
             .is_some_and(|entry| std::ptr::eq(entry.as_ref(), code))
     });
     if !current {
@@ -372,7 +372,12 @@ mod tests {
         let key = Arc::as_ptr(&body) as usize;
         let old = Rc::new(TransferCode::compile(Arc::clone(&body)).unwrap());
         assert!(old.has_deopt);
-        SEGMENT_CACHE.with(|cache| cache.borrow_mut().insert(key, Some(Rc::clone(&old))));
+        SEGMENT_CACHE.with(|cache| {
+            cache.borrow_mut().insert(
+                key,
+                SegmentCacheEntry::new(&body, Some(Rc::clone(&old))),
+            )
+        });
         let argument = EgclVal::from_single_float(1.5);
         for _ in 0..deopt_blacklist_threshold() {
             assert_eq!(

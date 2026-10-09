@@ -287,7 +287,7 @@ path until an explicit bridge is implemented.
 
 The segment ABI can now be exercised for ordinary native invocations with
 `EGCL_NATIVE_TRANSFER=1`. Eligible bytecode bodies are compiled into a
-thread-local transfer-code cache and entered through `invoke_native_segment`;
+execution-owned transfer-code cache and entered through `invoke_native_segment`;
 unsupported bodies, platforms, or hardening states fall back to the legacy
 checked entry. This rollout switch remains opt-in while native Windows gates and
 the full saved-image bridge are unfinished. Recursive bodies may now form the
@@ -295,6 +295,13 @@ outer segment, but a call made while a segment is active is refused by the
 segment cache and uses the bounded legacy/native bridge. This prevents
 pathological nested segment chains while preserving the existing stack-depth
 guard; `bliss-49gcf` tracks a fully frame-aware recursive segment entry.
+
+Every segment-cache result, including a declined compilation, retains a weak
+reference to its bytecode definition. This reserves the Arc allocation used as
+the cache key until the entry is dropped, preventing a replacement definition
+from inheriting an old decline through address reuse. Rejected bytecode contents
+and their Lisp constants are not retained; successful code keeps its existing
+definition and GC-root ownership.
 
 The process-level switch is deliberately inert until Lisp bootstrap has
 finished. Bootstrap itself exercises ordinary bytecode helpers while evaluator
