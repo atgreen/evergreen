@@ -314,6 +314,32 @@ fn with_traced_bytecode_bodies<R>(f: impl FnOnce(&mut std::collections::HashSet<
     f(&mut traced.1)
 }
 
+// A shared template can outlive every closure made from it. Keeping its code
+// alive must not keep each instance's captured environment alive as well.
+fn with_traced_callables<R>(f: impl FnOnce(&mut std::collections::HashSet<u32>) -> R) -> R {
+    static TRACED: std::sync::OnceLock<SharedCell<(u64, std::collections::HashSet<u32>)>> =
+        std::sync::OnceLock::new();
+    let mut traced = TRACED
+        .get_or_init(|| SharedCell::new((0, std::collections::HashSet::new())))
+        .borrow_mut();
+    let pass = egcl_rt::gc::root_scan_pass();
+    if traced.0 != pass {
+        traced.0 = pass;
+        traced.1.clear();
+    }
+    f(&mut traced.1)
+}
+/// An active call owns its identity even if the heap function object has died.
+struct ActiveCallableRoot(u32);
+
+impl egcl_rt::gc::TraceHostRoots for ActiveCallableRoot {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if self.0 != u32::MAX {
+            trace_private_function_roots(self.0, visit, &mut std::collections::HashSet::new());
+        }
+    }
+}
+
 pub(super) unsafe fn trace_bytecode_function(
     function: *mut BytecodeFunction,
     visit: &mut dyn FnMut(*mut EgclVal),
@@ -353,7 +379,7 @@ unsafe fn trace_bytecode_graph(
     }
     for nested in &mut function.nested_functions {
         unsafe {
-            trace_bytecode_graph(&mut **nested, visit, seen);
+            trace_bytecode_graph(Arc::as_ptr(nested) as *mut BytecodeFunction, visit, seen);
         }
     }
     trace_instruction_roots(&function.code, visit, seen);
@@ -382,6 +408,9 @@ fn trace_private_function_roots(
     visit: &mut dyn FnMut(*mut EgclVal),
     seen: &mut std::collections::HashSet<usize>,
 ) {
+    with_traced_callables(|traced| {
+        traced.insert(symbol);
+    });
     egcl_rt::symbols::trace_symbol_index(symbol, visit);
     // Named definitions have ordinary global owners. Private calls can
     // outlive the heap function object from which they were compiled.
@@ -423,20 +452,21 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
         .filter_map(|definition| definition.body.as_ref())
         .map(|body| Arc::as_ptr(body) as usize)
         .collect();
-    live_bytecode_bodies().borrow_mut().retain(|_, weak| {
+    for weak in live_bytecode_bodies().borrow().values() {
         let Some(function) = weak.upgrade() else {
-            return false;
+            // Keep the Weak allocation reservation until a major collection
+            // has purged address-keyed feedback in every execution.
+            continue;
         };
         let identity = Arc::as_ptr(&function) as usize;
         if private_pools.contains(&identity) && !named_pools.contains(&identity) {
-            return true;
+            continue;
         }
         // All mutators are stopped. Trace the same Arc allocation used by its
         // owning thread, including dormant named functions in that thread's
         // registry; a copied constant pool would leave the original stale.
         unsafe { trace_bytecode_function(Arc::as_ptr(&function) as *mut BytecodeFunction, visit) };
-        true
-    });
+    }
 }
 
 fn sweep_function_captures(names: &[EgclVal]) {
@@ -445,19 +475,49 @@ fn sweep_function_captures(names: &[EgclVal]) {
         .filter_map(|name| name.symbol_index())
         .collect();
     let traced = with_traced_bytecode_bodies(|bodies| bodies.clone());
-    {
-        let bodies = closure_bodies().borrow();
-        dead.retain(|symbol| {
-            bodies
-                .get(symbol)
-                .is_none_or(|body| !traced.contains(&(Arc::as_ptr(body) as usize)))
+    // The last instance can die before its template. Sweep address-keyed
+    // feedback even when this collection finds no newly dead callable.
+    unsafe {
+        TYPE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| traced.contains(body))
         });
-        // A body can lose its heap owner in an earlier collection but remain
-        // callable through other code. Reconsider these bodies every major GC.
-        dead.extend(bodies.iter().filter_map(|(&symbol, body)| {
-            (!traced.contains(&(Arc::as_ptr(body) as usize))).then_some(symbol)
-        }));
+        CALL_SITE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| traced.contains(body))
+        });
+        FUNCTION_SAMPLE_PROFILE.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|body, _| traced.contains(body))
+        });
+        CLOSURE_COMPILATION.scan(|registry| {
+            registry.borrow_mut().retain(|body, _| traced.contains(body))
+        });
+        ANON_OSR_REGISTRY.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|body, _| traced.contains(body))
+        });
+        ANON_BACK_EDGES.scan(|registry| {
+            registry
+                .borrow_mut()
+                .retain(|(body, _), _| traced.contains(body))
+        });
     }
+    // Weak references reserve an Arc's allocation even after its payload dies.
+    // Releasing them earlier (e.g. during a minor GC) could let a new template
+    // reuse an address that still keys another execution's old feedback.
+    live_bytecode_bodies().borrow_mut().retain(|_, weak| weak.strong_count() != 0);
+    with_traced_callables(|callables| {
+        dead.retain(|symbol| !callables.contains(symbol));
+        // Code may still own a private call target after its heap function has
+        // died. Reconsider identities every major GC, independently of bodies.
+        dead.extend(closure_bodies().borrow().keys().copied()
+            .filter(|symbol| !callables.contains(symbol)));
+    });
     if dead.is_empty() {
         return;
     }
@@ -476,18 +536,10 @@ fn sweep_function_captures(names: &[EgclVal]) {
     closure_bodies()
         .borrow_mut()
         .retain(|symbol, _| !dead.contains(symbol));
-    let mut bodies = std::collections::HashSet::new();
     // The major collector has stopped every execution before this callback.
     unsafe {
         REGISTRY.scan(|registry| {
-            registry.borrow_mut().retain(|symbol, body| {
-                if dead.contains(symbol) {
-                    bodies.insert(Arc::as_ptr(body) as usize);
-                    false
-                } else {
-                    true
-                }
-            })
+            registry.borrow_mut().retain(|symbol, _| !dead.contains(symbol))
         });
         REGISTRY_GENERATION.scan(|registry| {
             registry
@@ -549,31 +601,7 @@ fn sweep_function_captures(names: &[EgclVal]) {
                 .borrow_mut()
                 .retain(|symbol| !dead.contains(symbol))
         });
-        TYPE_PROFILE.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|(body, _), _| !bodies.contains(body))
-        });
-        CALL_SITE_PROFILE.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|(body, _), _| !bodies.contains(body))
-        });
-        FUNCTION_SAMPLE_PROFILE.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|body, _| !bodies.contains(body))
-        });
-        ANON_OSR_REGISTRY.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|body, _| !bodies.contains(body))
-        });
-        ANON_BACK_EDGES.scan(|registry| {
-            registry
-                .borrow_mut()
-                .retain(|(body, _), _| !bodies.contains(body))
-        });
+
     }
     bump_direct_call_gen();
 }
@@ -582,6 +610,9 @@ fn trace_function_captures(name: EgclVal, visit: &mut dyn FnMut(*mut EgclVal)) {
     let Some(symbol) = name.symbol_index() else {
         return;
     };
+    with_traced_callables(|traced| {
+        traced.insert(symbol);
+    });
     let body = closure_bodies().borrow().get(&symbol).cloned();
     if let Some(body) = body {
         unsafe { trace_bytecode_function(Arc::as_ptr(&body) as *mut BytecodeFunction, visit) };
@@ -2198,10 +2229,9 @@ struct Lowerer<'e> {
     /// Static `restart-case` tables.
     restart_cases: Vec<RestartCaseInfo>,
     /// Nested noncapturing lambda bodies.
-    // Match BytecodeFunction's boxed nested-body representation; lowering
-    // transfers this vector directly into the completed function.
-    #[allow(clippy::vec_box)]
-    nested_functions: Vec<Box<BytecodeFunction>>,
+    // Match BytecodeFunction's shared nested templates; lowering transfers
+    // this vector directly into the completed function.
+    nested_functions: Vec<Arc<BytecodeFunction>>,
     /// Portable BFASL compilation may lower quasiquote to explicit allocation;
     /// the ordinary opportunistic compiler keeps the tree-walker as its oracle.
     portable: bool,
@@ -2247,7 +2277,7 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
             }
         }
         for nested in &mut self.nested_functions {
-            unsafe { trace_bytecode_function(&mut **nested, visit) };
+            unsafe { trace_bytecode_function(Arc::as_ptr(nested) as *mut BytecodeFunction, visit) };
         }
     }
 }
@@ -6508,7 +6538,7 @@ impl<'e> Lowerer<'e> {
         if idx > u32::MAX as usize {
             return Err(Bail);
         }
-        self.nested_functions.push(Box::new(bf));
+        self.nested_functions.push(Arc::new(bf));
         self.emit(Instr::MakeClosure {
             func: idx as u32,
             capture_env: !captured.is_empty(),
@@ -6886,7 +6916,7 @@ impl<'e> Lowerer<'e> {
             if idx > u32::MAX as usize {
                 return Err(Bail);
             }
-            self.nested_functions.push(Box::new(bf));
+            self.nested_functions.push(Arc::new(bf));
             self.emit(Instr::MakeClosure {
                 func: idx as u32,
                 capture_env: true,
@@ -12140,24 +12170,24 @@ pub(super) fn install_closure_control(
 /// `captured_env` is `Some`, the closure records that heap frame so its body can
 /// read and write the enclosing lexical bindings (portable `flet`/`labels`).
 pub(super) fn make_bytecode_closure(
-    nested: &BytecodeFunction,
+    nested: &Arc<BytecodeFunction>,
     captured_env: Option<Arc<SharedCell<EnvFrame>>>,
 ) -> EgclVal {
-    // Building the installed lambda list can move literals in this cloned
-    // body before the registry owns it. Root the clone, not just its parent.
-    let nested = Arc::new(nested.clone());
-    egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(&nested));
+    // Instances retain the same template; only identity and captures differ.
+    // Root its literal pool before constructing the installed lambda list.
+    egcl_rt::rooted!(_nested_roots = ActiveBytecodeRoot::new(nested));
     egcl_rt::rooted!(sym = egcl_rt::symbols::make_uninterned("CLOSURE"));
     let sym_idx = sym.as_symbol_index();
+    egcl_rt::rooted!(_callable_root = ActiveCallableRoot(sym_idx));
     let lambda_list = if nested.variadic {
         nested.params_form
     } else {
         installed_lambda_list(nested.arity)
     };
-    registry_put(sym_idx, Arc::clone(&nested));
+    registry_put(sym_idx, Arc::clone(nested));
     closure_bodies()
         .borrow_mut()
-        .insert(sym_idx, Arc::clone(&nested));
+        .insert(sym_idx, Arc::clone(nested));
     if let Some(frame) = captured_env {
         closure_envs().borrow_mut().insert(sym_idx, frame);
     }
@@ -13848,7 +13878,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
         // backwards (a lower global index — the child was serialized first),
         // in range, and flagged as a nested function. First-appearance order is
         // preserved when assigning local indices, matching the serializer.
-        let mut nested_functions: Vec<Box<BytecodeFunction>> = Vec::new();
+        let mut nested_functions: Vec<Arc<BytecodeFunction>> = Vec::new();
         let mut global_to_local: HashMap<u32, u32> = HashMap::new();
         for instr in &mut function.code {
             if let Instr::MakeClosure { func, .. } = instr {
@@ -13863,7 +13893,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 let local = *global_to_local.entry(global).or_insert_with(|| {
                     let local = nested_functions.len() as u32;
-                    nested_functions.push(Box::new(decoded_functions[global as usize].clone()));
+                    nested_functions.push(Arc::new(decoded_functions[global as usize].clone()));
                     local
                 });
                 *func = local;
@@ -14246,6 +14276,7 @@ struct Activation {
 
 impl egcl_rt::gc::TraceHostRoots for Activation {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        ActiveCallableRoot(self.sym).trace_host_roots(visit);
         if let Some(fn_obj) = &mut self.fn_obj {
             visit(fn_obj);
         }
@@ -14678,6 +14709,7 @@ fn run_with_binding(
         environment: mut explicit_environment,
         lexical_environment: call_menv,
     } = context;
+    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(entry_sym));
     egcl_rt::rooted!(_active_bytecode_root = ActiveBytecodeRoot::new(&entry));
     egcl_rt::rooted!(args = args.to_vec());
     egcl_rt::rooted_ref!(_macro_whole_root = &mut macro_whole);
@@ -16911,7 +16943,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
-extern "C" fn c2i_make_bytecode_closure(nested: *const BytecodeFunction, capture: u64) -> u64 {
+extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, capture: u64) -> u64 {
     match guard_c2i(|| {
         let env = NATIVE_ENV.with(|slot| slot.get());
         if nested.is_null() || env.is_null() {
@@ -17955,17 +17987,10 @@ extern "C" fn c2i_deopt_t2_inline(
             }
         };
     let sym = scopes[0].function;
-    let (is_t2, body) = match own.as_ref() {
-        Some(code) => (code.is_t2, code.body.clone()),
-        None => ACTIVE_NATIVE_CODE.with(|slot| {
-            // SAFETY: ActiveNativeCode retains a reference for the native call
-            // and restores the enclosing owner after nested calls or OSR return.
-            unsafe { slot.get().as_ref() }
-                .map(|code| (code.is_t2, code.body.clone()))
-                .unwrap_or((true, None))
-        }),
-    };
-    note_native_deopt(sym, is_t2, body.as_ref());
+    let code = own.as_deref().map(std::ptr::from_ref)
+        .unwrap_or_else(|| ACTIVE_NATIVE_CODE.with(|slot| slot.get()));
+    // SAFETY: own or the active native entry retains this exact code version.
+    note_native_deopt(sym, unsafe { code.as_ref() });
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         let stack = egcl_rt::current_stack();
@@ -17986,7 +18011,8 @@ extern "C" fn c2i_deopt_t2_inline(
     // duration of the native call, and nested native calls save and restore it.
     let env = unsafe { &mut *env_ptr };
     let stack = egcl_rt::current_stack();
-    let result = resume_inlined_in_t0(scopes, metadata, env);
+    let active_env_frame = NATIVE_ENV_FRAME.with(|slot| slot.borrow().clone());
+    let result = resume_inlined_in_t0(scopes, metadata, active_env_frame, env);
     if let Some(frame) = outer
         && !std::ptr::eq(stack.fp(), frame)
     {
@@ -18091,6 +18117,14 @@ fn materialize_t2_deopt_scopes(
             unsafe { slot_set(frame, slot as u16, EgclVal(bits)) };
         }
         at += n_slots;
+        // Metadata is keyed by the compilation owner; only the outermost
+        // activation uses the calling closure's identity and captures.
+        let function = if let (0, Some(outer)) = (scope_index, outer) {
+            // SAFETY: the native entry owns this live EgclStack frame.
+            unsafe { (*outer).function.symbol_index() }.unwrap_or(function)
+        } else {
+            function
+        };
         scopes.push(InlinedResumeScope {
             function,
             body: entry,
@@ -18357,7 +18391,23 @@ static LAST_FAILED_SPECULATION: egcl_rt::execution_local::ExecutionLocal<
 fn decay_failed_speculation(
     body: &Arc<BytecodeFunction>,
     forced: Option<SpecType>,
+    installed: Option<&[(u32, SpecType)]>,
 ) -> Vec<(u32, SpecType)> {
+    if let Some(installed) = installed {
+        let key = Arc::as_ptr(body) as usize;
+        TYPE_PROFILE.with(|profiles| {
+            let mut profiles = profiles.borrow_mut();
+            for &(bcp, kind) in installed {
+                if let Some(profile) = profiles.get_mut(&(key, bcp)) {
+                    match kind {
+                        SpecType::Fixnum => profile.fixnum = 0,
+                        SpecType::SingleFloat => profile.single_float = 0,
+                    }
+                }
+            }
+        });
+        return installed.to_vec();
+    }
     let mut failed = Vec::new();
     let func_ptr = Arc::as_ptr(body) as usize;
     TYPE_PROFILE.with(|m| {
@@ -18741,6 +18791,51 @@ static GENERIC_RECEIVER_PROFILE: egcl_rt::execution_local::ExecutionLocal<
 static NATIVE_REGISTRY: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, Rc<NativeCode>, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// A template shares compilation state, never its instances' captured frames.
+/// Weak ownership keeps this cache from retaining dead templates or callables.
+struct ClosureCompilation {
+    body: std::sync::Weak<BytecodeFunction>,
+    owner: u32,
+    invocations: u32,
+}
+static CLOSURE_COMPILATION: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<usize, ClosureCompilation, egcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+
+/// Select a live, unpinned instance to own this execution's compiled version.
+/// Callers still enter run_native with the actual instance identity.
+fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return (sym, count);
+    }
+    let Some(body) = closure_bodies().borrow().get(&sym).cloned() else {
+        return (sym, count);
+    };
+    if registry_get(sym).is_none_or(|current| !Arc::ptr_eq(&current, &body)) {
+        return (sym, count);
+    }
+    let key = Arc::as_ptr(&body) as usize;
+    let previous = CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&key).map(|state| state.owner)
+    });
+    let owner = previous.filter(|&owner| {
+        !is_profile_pinned(owner)
+            && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, &body))
+    }).unwrap_or(sym);
+    let invocations = CLOSURE_COMPILATION.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let state = cache.entry(key).or_insert_with(|| ClosureCompilation {
+            body: Arc::downgrade(&body), owner, invocations: 0,
+        });
+        debug_assert!(state.body.upgrade().is_some_and(|entry| Arc::ptr_eq(&entry, &body)));
+        state.owner = owner;
+        state.invocations = state.invocations.saturating_add(1).max(count);
+        state.invocations
+    });
+    INVOKE_COUNTS.with(|counts| { counts.borrow_mut().insert(owner, invocations); });
+    (owner, invocations)
+}
+
 /// Per-function invocation counters driving T0→T1 promotion.
 static INVOKE_COUNTS: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, u32, egcl_rt::fxhash::FxBuildHasher>>,
@@ -18887,6 +18982,7 @@ impl egcl_rt::gc::TraceHostRoots for T2CompileInput {
 /// write side while waiting for this mutator to reach a safepoint). The root
 /// handle separately protects the movable constants inside the indexed bodies.
 struct T2InstalledMetadata {
+    speculations: Vec<(u32, SpecType)>,
     _roots: egcl_rt::CrossThreadRoot<T2InstalledBodies>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
 }
@@ -18913,6 +19009,7 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 }
 
 struct T2Artifact {
+    speculations: Vec<(u32, SpecType)>,
     call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     code: Vec<u8>,
     #[cfg(all(target_arch = "x86_64", windows))]
@@ -19339,9 +19436,8 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     //
     // This `filter_map` used to return `Some` unconditionally, i.e. "clone the
     // entire registry", once per compilation request — and a `BytecodeFunction`
-    // clone is deep: ten `Vec`s including `nested_functions:
-    // Vec<Box<BytecodeFunction>>`, which clones recursively, plus `Vec<String>`
-    // fields. Measured at ~6.5% of a babel load by ablation (bliss-nzbi).
+    // clone copied ten `Vec`s, including the then-boxed nested function tree,
+    // plus `Vec<String>` fields. Measured at ~6.5% of a babel load by ablation (bliss-nzbi).
     //
     // A never-invoked function cannot be the target of a hot call site: if the
     // function being compiled reaches it, it ran, so its count is non-zero.
@@ -19358,7 +19454,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     // This used to snapshot the whole REGISTRY — note the closure never looked
     // at `sym`, so every promotion rebuilt the identical set, deep-cloning every
     // invoked function in the image each time. A `BytecodeFunction` clone is
-    // deep (ten `Vec`s, recursive `nested_functions`, `Vec<String>`), so with
+    // costly (ten `Vec`s and `Vec<String>` fields), so with
     // ~62 promotions per babel load this dominated everything else T2 did.
     //
     // Measured by ablation on a babel load (`real`, T2 off = 19.80s):
@@ -19676,6 +19772,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         None
     } else {
         Some(Arc::new(T2InstalledMetadata {
+            speculations: std::mem::take(&mut artifact.speculations),
             _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
                 bodies: std::mem::take(&mut artifact.rooted_bodies),
             }),
@@ -19854,9 +19951,13 @@ fn native_for_dispatch(
 ) -> Option<Rc<NativeCode>> {
     #[cfg(test)]
     call_table::record_target_lookup();
-    if profiling_disabled() {
+    if profiling_disabled() || is_profile_pinned(sym) {
         return None;
     }
+    let (owner, invoke_count) = closure_compilation_owner(sym, invoke_count);
+    // A private representative has no public function cell to publish into.
+    let fn_obj = if owner == sym { fn_obj } else { None };
+    let sym = owner;
     // Publication is deliberately performed by the owning mutator: workers
     // compile relocatable bytes only and never touch thread-local registries or
     // executable mappings.
@@ -19934,15 +20035,32 @@ impl Drop for BlockScopeGuard {
 /// Shared with the inline-resume adapter, which handles the deopt without
 /// returning to run_native (bliss-w6aki). An obsolete activation may still
 /// fail a guard; that counts, but must not retire the replacement's code.
-fn note_native_deopt(sym: u32, is_t2: bool, bf: Option<&Arc<BytecodeFunction>>) {
+fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
     DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace("native speculative deopt → interpreter");
     // An obsolete activation may still fail a guard. Resume its original
     // body, but do not retire or blacklist the replacement's native code.
+    let Some(code) = code else { return; };
+    let bf = code.body.as_ref();
+    let is_t2 = code.is_t2;
+    let speculations = code.t2_metadata.as_ref()
+        .map(|metadata| metadata.speculations.as_slice());
+    let owner = bf.and_then(|body| CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
+    })).unwrap_or(sym);
+    // An old shared activation may outlive its representative, while a sibling
+    // installs a newer version. Body equality alone must not retire that code.
+    let sym = if NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner)
+        .is_some_and(|installed| std::ptr::eq(installed.as_ref(), code))) {
+        owner
+    } else if NATIVE_REGISTRY.with(|registry| registry.borrow().get(&sym)
+        .is_some_and(|installed| std::ptr::eq(installed.as_ref(), code))) {
+        sym
+    } else {
+        return;
+    };
     let current = registry_get(sym);
-    if current
-        .as_ref()
-        .zip(bf)
+    if current.as_ref().zip(bf)
         .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
     {
         // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
@@ -19963,7 +20081,7 @@ fn note_native_deopt(sym: u32, is_t2: bool, bf: Option<&Arc<BytecodeFunction>>) 
                 // T1's optimistic arithmetic templates are always Fixnum. T2
                 // follows the profile that was dominant when it was compiled.
                 let forced = (!is_t2).then_some(SpecType::Fixnum);
-                let failed = decay_failed_speculation(bf, forced);
+                let failed = decay_failed_speculation(bf, forced, speculations);
                 LAST_FAILED_SPECULATION.with(|m| {
                     m.borrow_mut().insert(sym, failed);
                 });
@@ -20039,6 +20157,7 @@ fn run_native(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(sym));
     #[cfg(test)]
     call_table::record_target_lookup();
     // The segment ABI carries exceptional exits out-of-band through its cold
@@ -20113,7 +20232,7 @@ fn run_native(
     let stack = egcl_rt::current_stack();
     let frame = stack
         .push_frame(
-            NIL,
+            EgclVal::from_symbol_index(sym),
             nc.code_info as *const CodeInfo,
             nc.num_slots,
             FLAG_CALL,
@@ -20216,7 +20335,7 @@ fn run_native(
     // kept as a fallback when no resume point was recorded; purity of every call
     // makes re-running from the top observably equivalent.)
     if deopt {
-        note_native_deopt(sym, nc.is_t2, bf.as_ref());
+        note_native_deopt(sym, Some(nc));
         let entry = bf.ok_or_else(|| {
             EgclError::Internal("deopt: native code has no bytecode body".into())
         })?;
@@ -20234,7 +20353,8 @@ fn run_native(
                     if std::env::var_os("EGCL_DEOPT_PATH_DBG").is_some() {
                         eprintln!("[deopt-path] Inlined sym={sym} scopes={}", scopes.len());
                     }
-                    resume_inlined_in_t0(scopes, metadata, env)
+                    resume_inlined_in_t0(scopes, metadata,
+                        resume_env_frame.as_ref().map(|frame| Arc::clone(&frame.0)), env)
                 }
             };
         }
@@ -20377,11 +20497,14 @@ fn rebuild_resume_handlers(entry: &BytecodeFunction, bcp: u32, env: &mut Env) ->
 fn resume_inlined_in_t0(
     scopes: Vec<InlinedResumeScope>,
     _metadata: Arc<T2InstalledMetadata>,
+    outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let stack = egcl_rt::current_stack();
+    egcl_rt::rooted!(outer_env_frame = outer_env_frame.map(super::SuspendedFrameRoot));
     let mut acts = Vec::with_capacity(scopes.len());
-    for scope in scopes {
+    egcl_rt::rooted_ref!(_acts_root = &mut acts);
+    for (index, scope) in scopes.into_iter().enumerate() {
         let entry = scope.body;
         let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
         let fn_obj = egcl_rt::symbols::symbol_function(scope.function)
@@ -20390,7 +20513,14 @@ fn resume_inlined_in_t0(
             frame: scope.frame,
             _debug_call: None,
             n_locals: entry.n_locals,
-            env_frame: None,
+            // Inlined bodies cannot capture; only the root activation owns
+            // the native environment. Preserve the exact frame, including any
+            // writes already committed before the guard failed.
+            env_frame: if index == 0 {
+                outer_env_frame.as_ref().map(|frame| Arc::clone(&frame.0))
+            } else {
+                None
+            },
             func: entry,
             bcp: scope.bcp as usize,
             sp_top: scope.sp_top,
@@ -20401,7 +20531,6 @@ fn resume_inlined_in_t0(
             sym: scope.function,
         });
     }
-    egcl_rt::rooted_ref!(_acts_root = &mut acts);
     let result = run_loop(&mut acts, env);
     while !acts.is_empty() {
         stack.pop_frame();
@@ -20656,7 +20785,7 @@ fn emit_native(
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
     let make_closure_addr = c2i_make_closure as extern "C" fn(u64) -> u64 as usize as u64;
     let make_bytecode_closure_addr = c2i_make_bytecode_closure
-        as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+        as extern "C" fn(*const Arc<BytecodeFunction>, u64) -> u64 as usize as u64;
     let alloc_cons_addr = c2i_alloc_cons as extern "C" fn(u64, u64) -> u64 as usize as u64;
     let take_values_addr =
         c2i_take_values as extern "C" fn(u64, *mut EgclVal, u64) as usize as u64;
@@ -21313,8 +21442,8 @@ fn emit_native(
                 push_rax(&mut c);
             }
             Instr::MakeClosure { func, capture_env } => {
-                let nested = bf.nested_functions.get(*func as usize)?.as_ref()
-                    as *const BytecodeFunction;
+                let nested = bf.nested_functions.get(*func as usize)?
+                    as *const Arc<BytecodeFunction>;
                 c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained nested body
                 c.extend_from_slice(&(nested as u64).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, capture flag
@@ -22178,6 +22307,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
     let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &profile);
+    let speculations = t2_numeric_speculations(&f, sym);
     // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
     // speculatable arithmetic site, T2's mid-end (const-fold + GVN + DCE) still
     // optimises the code beyond the T1 baseline template JIT — so we proceed and
@@ -22259,6 +22389,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         &input.direct_natives,
         input.code_id,
         &named_calls,
+        egcl_compiler::t2::emit::EnvironmentCalls {
+            body: bf as *const BytecodeFunction as u64,
+            load: c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64,
+            store: c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64,
+        },
     ) {
         Ok(fc) => fc,
         Err(e) => {
@@ -22270,6 +22405,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
     let mut rooted_bodies = Vec::new();
+    if bf.code.iter().any(|instruction| matches!(instruction,
+        Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
+        // Environment helpers embed this snapshot's address, not the mutable
+        // registry entry. Retain it even when there are no heap constants.
+        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+    }
     for &slot in &framed.heap_constant_slots {
         let owner = std::iter::once(&input.body)
             .chain(input.inline_bodies.iter().map(|saved| &saved.body))
@@ -22329,6 +22470,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     );
 
     Some(T2Artifact {
+        speculations,
         call_cells: input
             .call_cells
             .iter()
@@ -22350,6 +22492,41 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     })
 }
 
+/// Numeric assumptions belong to an installed version. A sibling closure can
+/// update the shared feedback before this version first fails a guard.
+fn t2_numeric_speculations(
+    f: &egcl_compiler::t2::ir::Function,
+    symbol: u32,
+) -> Vec<(u32, SpecType)> {
+    use egcl_compiler::t2::ir::Opcode::*;
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &instruction in &f.block(block).insts {
+            let data = f.inst(instruction);
+            let kind = match data.opcode {
+                FixnumAdd | FixnumSub | FixnumMul | FixnumDiv | FixnumRem | FixnumMod
+                | FixnumNeg | FixnumShl | FixnumShr | LogAnd | LogOr | LogXor | LogNot
+                | FixnumCmpEq | FixnumCmpLt | FixnumCmpLe | FixnumCmpGt | FixnumCmpGe => {
+                    SpecType::Fixnum
+                }
+                FloatAdd | FloatSub | FloatMul | FloatDiv | FloatCmpEq | FloatCmpLt => {
+                    SpecType::SingleFloat
+                }
+                _ => continue,
+            };
+            let Some(state) = data.frame_state else {
+                continue;
+            };
+            let scopes = &f.frame_states.get(state).scopes;
+            if let [scope] = scopes.as_slice() {
+                if scope.function == symbol && !sites.contains(&(scope.bcp, kind)) {
+                    sites.push((scope.bcp, kind));
+                }
+            }
+        }
+    }
+    sites
+}
 fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> bool {
     let start = body.constants.as_ptr() as usize;
     let Some(bytes) = body
@@ -23794,6 +23971,106 @@ mod direct_call_invalidation_tests {
         registry_remove(symbol);
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn t2_captured_value_moves_while_live_only_in_native_code() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let source = resolve_sym("T2-CAPTURE-SOURCE").unwrap();
+        let destination = resolve_sym("T2-CAPTURE-DESTINATION").unwrap();
+        env.define_local_symbol(source, NIL);
+        env.define_local_symbol(destination, NIL);
+        egcl_rt::rooted!(form = reader::read_from_string("(nil)").unwrap().0);
+        let mut body = compile_function("T2-CAPTURE-MOVING", NIL, *form, &env, false, false).unwrap();
+        body.has_env = true;
+        body.names = vec!["T2-CAPTURE-SOURCE".into(), "T2-CAPTURE-DESTINATION".into()];
+        body.constants = vec![NIL];
+        body.n_locals = 0;
+        body.max_stack = 2;
+        body.code = vec![
+            Instr::LoadEnvVar(0),
+            Instr::Const(0),
+            Instr::StoreEnvVar(0), // remove the original root before collection
+            Instr::CallNamed {
+                sym: resolve_sym("%FORCE-MINOR-GC-FOR-TEST").unwrap().as_symbol_index(),
+                nargs: 0,
+            },
+            Instr::Pop,
+            Instr::StoreEnvVar(1),
+            Instr::LoadEnvVar(1),
+            Instr::Return,
+        ];
+        let symbol = egcl_rt::symbols::intern("T2-CAPTURE-MOVING");
+        registry_put(symbol, Arc::new(body.clone()));
+        let input = snapshot_t2_input(symbol, 0).unwrap();
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact).expect("compile lexical GC probe");
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation, artifact: Some(artifact), input,
+        }).unwrap();
+        assert!(native.is_t2);
+        // Redefinition gives the same indexes different meanings. The retained
+        // code must still use its own snapshot, including after registry removal.
+        body.names.swap(0, 1);
+        registry_put(symbol, Arc::new(body));
+        registry_remove(symbol);
+        egcl_rt::rooted!(value = super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
+        let original_address = value.to_raw();
+        env.define_local_symbol(source, *value);
+        drop(value); // only the source binding owns it when native execution begins
+        egcl_rt::rooted!(result = run_native(&native, symbol, &[], &mut env).unwrap());
+        assert_ne!(result.to_raw(), original_address, "the native-only root must actually move");
+        assert_eq!(super::super::cp(*result), (EgclVal::from_fixnum(71), NIL));
+        assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-SOURCE"), Some(NIL));
+        assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-DESTINATION"), Some(*result));
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn t2_captured_read_write_and_deopt_preserve_environment() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(callback = super::super::read_eval_all_env(
+            "(defun t2-capture-factory (seed) (dotimes (i 1))
+               (lambda (delta) (setq seed (+ seed delta))))
+             (t2-capture-factory 10)", &mut env
+        ).unwrap());
+        assert!(egcl_rt::function::is_interpreted_function(*callback));
+        let symbol = egcl_rt::function::name(*callback).as_symbol_index();
+        let body = registry_get(symbol).expect("compiled capturing callback");
+        assert!(body.code.iter().any(|i| matches!(i, Instr::LoadEnvVar(_))));
+        assert!(body.code.iter().any(|i| matches!(i, Instr::StoreEnvVar(_))));
+        let input = snapshot_t2_input(symbol, 0).expect("snapshot callback");
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input.with_gc_stable(compile_t2_artifact)
+            .expect("captured lexical access must compile at T2");
+        let native = install_t2_completion(T2Completion {
+            sym: symbol, generation, artifact: Some(artifact), input,
+        }).expect("install callback T2");
+        assert!(native.is_t2);
+        assert_eq!(run_native(&native, symbol, &[EgclVal::from_fixnum(2)], &mut env).unwrap(),
+            EgclVal::from_fixnum(12));
+        let before = deopt_count();
+        egcl_rt::rooted!(answer = run_native(&native, symbol,
+            &[EgclVal::from_fixnum(1152921504606846975)], &mut env).unwrap());
+        let mut printed = String::new();
+        super::super::print_val(*answer, &mut printed);
+        assert_eq!(printed, "1152921504606846987");
+        assert!(deopt_count() > before, "overflow must exercise deoptimization");
+        egcl_rt::rooted!(again = super::super::apply_function(*callback,
+            &[EgclVal::from_fixnum(1)], &mut env).unwrap());
+        printed.clear();
+        super::super::print_val(*again, &mut printed);
+        assert_eq!(printed, "1152921504606846988", "resume must update the shared capture once");
+        registry_remove(symbol);
+    }
+
     #[cfg(all(any(target_arch = "x86_64", target_arch = "s390x"), unix))]
     #[test]
     fn selected_native_code_uses_its_original_environment_names() {
@@ -24281,6 +24558,7 @@ mod jtc4_stack_map_tests {
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
+            speculations: vec![],
             call_cells: Vec::new(),
             code: vec![0x90; 8],
             #[cfg(all(target_arch = "x86_64", windows))]
@@ -24350,7 +24628,7 @@ mod jtc4_stack_map_tests {
                 ..TypeProfile::default()
             });
         });
-        let failed = decay_failed_speculation(&body, None);
+        let failed = decay_failed_speculation(&body, None, None);
         let cold = type_profile_at(key, 0);
         let empty = type_profile_at(key, 1).unwrap();
         let observed = type_profile_at(key, 2).unwrap();
@@ -24900,6 +25178,183 @@ mod active_bytecode_root_tests {
         egcl_rt::gc::full_gc().unwrap();
         assert_eq!(*result.as_ref().unwrap(), EgclVal::from_fixnum(71));
         assert!(!is_registered(callee_name.as_symbol_index()));
+    }
+
+    #[test]
+    fn closure_instances_share_bytecode_without_sharing_identity() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body =
+            Arc::new(compile_function("SHARED-TEMPLATE", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+        egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+        assert_ne!(*first, *second);
+        let first_body = registry_get(egcl_rt::function::name(*first).as_symbol_index()).unwrap();
+        let second_body = registry_get(egcl_rt::function::name(*second).as_symbol_index()).unwrap();
+        assert!(
+            Arc::ptr_eq(&body, &first_body),
+            "closure must retain its template"
+        );
+        assert!(
+            Arc::ptr_eq(&first_body, &second_body),
+            "instances must share bytecode"
+        );
+    }
+
+    #[test]
+    fn shared_compilation_respects_pins_and_obsolete_native_versions() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(compile_function("SHARED-PINS", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+        egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+        let a = egcl_rt::function::name(*first).as_symbol_index();
+        let b = egcl_rt::function::name(*second).as_symbol_index();
+        let old = native_for_dispatch(a, None, t1_threshold()).unwrap();
+        let shared = native_for_dispatch(b, None, 1).unwrap();
+        assert!(Rc::ptr_eq(&old, &shared));
+        profile_pin(b);
+        assert!(native_for_dispatch(b, None, 1).is_none());
+        assert!(Rc::ptr_eq(&old, &native_for_dispatch(a, None, 1).unwrap()));
+        profile_pin(a);
+        profile_unpin(b);
+        let replacement = native_for_dispatch(b, None, t1_threshold()).unwrap();
+        assert!(!Rc::ptr_eq(&old, &replacement));
+        assert!(native_for_dispatch(a, None, u32::MAX).is_none());
+        assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
+        note_native_deopt(b, Some(&old));
+        assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)),
+            "obsolete shared code must not decay the new version's feedback");
+        assert_eq!(DEOPT_COUNTS.with(|counts| counts.borrow().get(&b).copied()), Some(0));
+        assert!(NATIVE_REGISTRY.with(|codes| Rc::ptr_eq(&replacement, &codes.borrow()[&b])));
+        profile_unpin(a);
+        assert!(Rc::ptr_eq(&replacement, &native_for_dispatch(a, None, 1).unwrap()));
+    }
+
+    #[test]
+    fn shared_compilation_checks_the_actual_instances_current_definition() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(compile_function("SHARED-REPLACEMENT", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+        egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+        let a = egcl_rt::function::name(*first).as_symbol_index();
+        let b = egcl_rt::function::name(*second).as_symbol_index();
+        assert_eq!(closure_compilation_owner(a, 1).0, a);
+        assert_eq!(closure_compilation_owner(b, 1).0, a);
+        egcl_rt::rooted!(replacement_form = super::super::vec_to_list(&[EgclVal::from_fixnum(42)]));
+        let replacement = Arc::new(compile_function("NEW-PRIVATE-DEFINITION", NIL,
+            *replacement_form, &env, false, false).unwrap());
+        registry_put(b, replacement);
+        assert_eq!(closure_compilation_owner(b, 1).0, b,
+            "replaced private definitions must not run a sibling's old body");
+    }
+
+    #[test]
+    fn shared_closure_body_does_not_keep_dead_instance_captures() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body =
+            Arc::new(compile_function("SHARED-LIVENESS", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(live = make_bytecode_closure(&body, None));
+        let captured = Arc::new(SharedCell::new(EnvFrame {
+            vars: Default::default(),
+            symbol_vars: Default::default(),
+            parent: None,
+        }));
+        let weak_capture = Arc::downgrade(&captured);
+        egcl_rt::rooted!(dead = make_bytecode_closure(&body, Some(captured)));
+        let live_symbol = egcl_rt::function::name(*live).as_symbol_index();
+        let dead_symbol = egcl_rt::function::name(*dead).as_symbol_index();
+        // Construct the shared ownership graph explicitly, independently of
+        // whether MakeClosure already retains or copies its template.
+        for symbol in [live_symbol, dead_symbol] {
+            registry_put(symbol, Arc::clone(&body));
+            closure_bodies()
+                .borrow_mut()
+                .insert(symbol, Arc::clone(&body));
+        }
+        let profile_key = Arc::as_ptr(&body) as usize;
+        record_type_profile(profile_key, 0, &[EgclVal::from_fixnum(1)]);
+        drop(dead);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        assert!(is_registered(live_symbol));
+        assert!(
+            !is_registered(dead_symbol),
+            "a sibling's live code is not an instance root"
+        );
+        assert!(!closure_envs().borrow().contains_key(&dead_symbol));
+        assert!(
+            weak_capture.upgrade().is_none(),
+            "the dead environment must be released"
+        );
+        assert_eq!(type_profile_at(profile_key, 0).unwrap().fixnum, 1);
+        assert_eq!(
+            super::super::apply_function(*live, &[], &mut env).unwrap(),
+            NIL
+        );
+        drop(live);
+        env.mv.clear();
+        egcl_rt::gc::full_gc().unwrap();
+        assert!(!is_registered(live_symbol));
+        assert!(type_profile_at(profile_key, 0).is_none());
+    }
+
+    #[test]
+    fn shared_template_profiles_end_when_template_dies_after_instances() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        let (profile_key, template) = {
+            egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+            let body =
+                Arc::new(compile_function("PROFILE-TEMPLATE", NIL, *form, &env, false, false).unwrap());
+            egcl_rt::rooted!(_template_root = ActiveBytecodeRoot::new(&body));
+            egcl_rt::rooted!(closure = make_bytecode_closure(&body, None));
+            let symbol = egcl_rt::function::name(*closure).as_symbol_index();
+            let profile_key = Arc::as_ptr(&body) as usize;
+            record_type_profile(profile_key, 0, &[EgclVal::from_fixnum(1)]);
+            drop(closure);
+            env.mv.clear();
+            egcl_rt::gc::full_gc().unwrap();
+            assert!(!is_registered(symbol));
+            assert_eq!(type_profile_at(profile_key, 0).unwrap().fixnum, 1);
+            (profile_key, Arc::downgrade(&body))
+        };
+        assert!(
+            template.upgrade().is_none(),
+            "the template allocation must actually die"
+        );
+        drop(template);
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        assert!(
+            live_bytecode_bodies().borrow().contains_key(&profile_key),
+            "minor GC must reserve the expired template address until shared profiles are swept"
+        );
+        egcl_rt::gc::full_gc().unwrap();
+        assert!(
+            type_profile_at(profile_key, 0).is_none(),
+            "dead template left address-keyed feedback"
+        );
+        assert!(
+            !live_bytecode_bodies().borrow().contains_key(&profile_key),
+            "major GC must release the expired template address after sweeping its feedback"
+        );
     }
 
     #[test]

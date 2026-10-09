@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Compile captured lexical reads and writes at x86-64 T2, preserving shared
+  bindings and captured state during deoptimization. Nested closures share
+  bytecode templates and native compilations while retaining independent
+  captures. Numeric phase changes recover even when sibling closures have
+  updated the shared feedback, and deoptimization preserves the calling
+  instance across code replacement. This reduces full Prechelt phone-encoding
+  time by about 12% in the measured x86-64 workload
+  ([#147](https://github.com/atgreen/evergreen/pull/147)).
+
 - Compile supported nested callbacks in eagerly compiled x86-64 and s390x
   functions while preserving captured lexical state. This reduces full
   Prechelt phone-encoding time by about 9% in the measured x86-64 workload

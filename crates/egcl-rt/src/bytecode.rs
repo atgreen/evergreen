@@ -266,8 +266,9 @@ pub struct BytecodeFunction {
     pub names: Vec<String>,
     /// Static per-`restart-case` tables (indexed by `PushRestartCase`).
     pub restart_cases: Vec<RestartCaseInfo>,
-    /// Nested bytecode bodies referenced by `MakeClosure`.
-    pub nested_functions: Vec<Box<BytecodeFunction>>,
+    /// Shared lambda templates referenced by `MakeClosure`. Instances retain
+    /// these bodies and carry their own function identity and captured state.
+    pub nested_functions: Vec<std::sync::Arc<BytecodeFunction>>,
     /// Per-parameter `(name, location)` for the entry sequence.
     pub param_layout: Vec<(String, VarLoc)>,
     /// Primitive parameter types retained from leading `TYPE` declarations.

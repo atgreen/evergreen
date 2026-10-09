@@ -327,6 +327,10 @@ pub enum Opcode {
     Throw,
     NlxTransfer,
     Trap,
+    /// Read/write a captured lexical binding in the activation's environment.
+    /// Both are effectful helper calls; reads cannot be hoisted over mutation.
+    EnvironmentValue,
+    SetEnvironmentValue,
 }
 
 impl Opcode {
@@ -380,6 +384,8 @@ pub enum AuxData {
         slot: usize,
     },
     FieldOffset(u32),
+    /// Index in the retained root bytecode body's environment name table.
+    EnvironmentName(u16),
     CallTarget(u32),
     /// Evaluate an owned constant form through the native-transfer bridge.
     HostEval(u16),

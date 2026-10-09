@@ -2782,6 +2782,7 @@ pub fn emit_framed(
         self_sym,
         &[],
         0,
+        EnvironmentCalls::default(),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
     )
@@ -2830,7 +2831,19 @@ pub fn emit_framed_with_activation_slots(
         &[],
         0,
         &[],
+        EnvironmentCalls::default(),
     )
+}
+
+/// Captured lexical access uses the original root bytecode body's name table.
+/// The runtime retains `body` with the generated code. Helpers have C signatures
+/// `(body, name_index) -> u64` and `(body, name_index, value)` respectively.
+/// Capturing bodies are excluded from inlining, so all indexes name this body.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EnvironmentCalls {
+    pub body: u64,
+    pub load: u64,
+    pub store: u64,
 }
 
 /// Execution-owned linkage slots resolved before background compilation.
@@ -2866,6 +2879,7 @@ pub fn emit_framed_with_direct_natives(
     direct_natives: &[DirectNativeTarget],
     code_id: u64,
     named_calls: &[NamedCallTarget],
+    environment: EnvironmentCalls,
 ) -> Result<FramedCode, EmitError> {
     if cfg!(target_arch = "aarch64") {
         return super::emit_a64::emit_framed_with_runtime(
@@ -2962,6 +2976,7 @@ pub fn emit_framed_with_direct_natives(
         self_sym,
         named_calls,
         code_id,
+        environment,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
     )
@@ -3294,6 +3309,7 @@ fn emit_transfer_function(
         None,
         &[],
         0,
+        EnvironmentCalls::default(),
         Some(&mut transfers),
     )?;
     let mut landings = Vec::new();
@@ -3358,6 +3374,7 @@ fn emit_framed_inner(
     self_sym: Option<u32>,
     named_calls: &[NamedCallTarget],
     code_id: u64,
+    environment: EnvironmentCalls,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))] mut transfers: Option<
         &mut TransferEmission,
     >,
@@ -3441,6 +3458,8 @@ fn emit_framed_inner(
                 | Opcode::SymbolValue
                 | Opcode::SymbolFunction
                 | Opcode::SetSymbolValue
+                | Opcode::EnvironmentValue
+                | Opcode::SetEnvironmentValue
                 | Opcode::ClearMv
                 | Opcode::TakeValuesToLocals
                 | Opcode::CleanupSave
@@ -4187,6 +4206,8 @@ fn emit_framed_inner(
                             | Opcode::SymbolValue
                             | Opcode::SymbolFunction
                             | Opcode::SetSymbolValue
+                            | Opcode::EnvironmentValue
+                            | Opcode::SetEnvironmentValue
                             | Opcode::ClearMv
                             | Opcode::TakeValuesToLocals
                             | Opcode::MemoryFence
@@ -4750,6 +4771,33 @@ fn emit_framed_inner(
                     &const_tagged,
                     label,
                 )?;
+            } else if matches!(d.opcode, Opcode::EnvironmentValue | Opcode::SetEnvironmentValue) {
+                let index = match d.aux {
+                    AuxData::EnvironmentName(index) => index,
+                    _ => return Err(EmitError::UnsupportedOp(op_tag(d.opcode))),
+                };
+                let store = d.opcode == Opcode::SetEnvironmentValue;
+                let helper = if store { environment.store } else { environment.load };
+                if environment.body == 0 || helper == 0 {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                if store {
+                    let value = *d.args.first().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    if let Some(&bits) = const_tagged.get(&value) {
+                        mov_imm64(&mut a, 2, bits as i64); // rdx = tagged value
+                    } else {
+                        mov_rr(&mut a, 2, *inst_reg.get(&value).ok_or(EmitError::UnsupportedOp(0xF2))?);
+                    }
+                }
+                mov_imm64(&mut a, 7, environment.body as i64); // rdi = retained body
+                mov_imm64(&mut a, 6, i64::from(index)); // rsi = name index
+                mov_imm64(&mut a, 0, helper as i64);
+                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                if !store {
+                    let result = *d.results.first().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                    let dst = *inst_reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                    mov_rr(&mut a, dst, 0);
+                }
             } else if d.opcode == Opcode::SymbolValue {
                 emit_symbol_value(
                     &mut a,

@@ -28385,7 +28385,7 @@ fn snapshot_macro_expander(env: &Env, definition: &MacroDef) -> EgclVal {
     egcl_rt::rooted!(definition = definition.clone());
     egcl_rt::rooted!(descriptor = if let Some(function) = &definition.bytecode {
         // Release the registered body's lock before closure construction can GC.
-        let function = function.lock().unwrap().clone();
+        let function = Arc::new(function.lock().unwrap().clone());
         bytecode::make_bytecode_closure(&function, Some(Arc::clone(&definition.captured_frame)))
     } else {
         register_tree_closure(Closure {
@@ -39950,12 +39950,13 @@ mod env_gc_root_tests {
             max_args: Some(1),
             variadic: false,
         };
-        {
+        let nested = Arc::new(nested);
+        for _ in 0..128 {
             egcl_rt::rooted!(function = bytecode::make_bytecode_closure(&nested, None));
-            assert_eq!(
-                egcl_rt::symbols::symbol_name_of(egcl_rt::function::name(*function)).as_deref(),
-                Some("CLOSURE")
-            );
+            let name = egcl_rt::function::name(*function);
+            assert_eq!(egcl_rt::symbols::symbol_name_of(name).as_deref(), Some("CLOSURE"));
+            assert!(bytecode::is_registered(name.as_symbol_index()),
+                "closure lost its dispatch entry during construction");
         }
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
