@@ -369,6 +369,29 @@ pub(super) fn take_segment_run_count() -> u64 {
 
 /// These mappings outlive every target and caller. Child retirement can drop
 /// the last target owner without releasing its own return/continuation PC.
+/// Publish the caller suspended beneath a mapped-call adapter frame. Exposed
+/// for the sibling callable adapter, whose checked callback also runs Lisp.
+///
+/// # Safety
+/// Same contract as `root_publication::published_mapped`.
+pub(in crate::cli::bytecode) unsafe fn published_mapped_record<R>(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+    body: impl FnOnce() -> R,
+) -> R {
+    unsafe { root_publication::published_mapped(record, body) }
+}
+
+/// The checked compatibility call runs Lisp through the runtime call table,
+/// which cannot reach this crate's publication; wrap it here instead.
+unsafe extern "C" fn checked_call_published(
+    target: u64,
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) {
+    unsafe {
+        root_publication::published_mapped(record, || call_table::checked_call(target, record))
+    }
+}
+
 pub(super) fn published_entries() -> Option<[usize; 2]> {
     static ENTRIES: OnceLock<Option<[JitBuffer; 2]>> = OnceLock::new();
     ENTRIES
@@ -380,7 +403,7 @@ pub(super) fn published_entries() -> Option<[usize; 2]> {
                         prepare_nested,
                         finish_nested,
                         resume_nested,
-                        call_table::checked_call,
+                        checked_call_published,
                     ),
                 )
             };

@@ -120,30 +120,37 @@ pub(super) unsafe fn published<R>(
     image: *mut egcl_compiler::t2::native_transfer::SysvTransferCapture,
     body: impl FnOnce() -> R,
 ) -> R {
-    static SCANNER: Once = Once::new();
-    SCANNER.call_once(|| egcl_rt::gc::register_root_scanner(scan_published_roots));
     // Copy the geometry out, then let the reference go before `body` writes
     // through the aliasing outcome pointer.
-    let (cursor, context, segment) = unsafe {
+    let cursor = unsafe {
         let image_ref = &*image;
-        let registers = std::array::from_fn(|index| {
-            Some(std::ptr::addr_of!(image_ref.preserved[index]) as usize)
-        });
-        let cursor = NativeFrameCursor {
+        NativeFrameCursor {
             pc: image_ref.return_pc as usize,
             call_sp: image_ref.caller_sp as usize,
-            registers,
-        };
-        (cursor, CAPTURE.with(Cell::get), native_transfer::current_segment())
+            registers: std::array::from_fn(|index| {
+                Some(std::ptr::addr_of!(image_ref.preserved[index]) as usize)
+            }),
+        }
     };
-    debug_assert!(!context.is_null(), "helpers run inside a captured activation");
-    debug_assert!(!segment.is_null(), "helpers run inside an active native segment");
+    unsafe { publish(cursor, image as usize, body) }
+}
+
+/// Link one suspended caller for the extent of `body`. `low` is the lowest
+/// native address the publication owns: its own machine storage, below the
+/// caller's save words and stack slots.
+unsafe fn publish<R>(cursor: NativeFrameCursor, low: usize, body: impl FnOnce() -> R) -> R {
+    static SCANNER: Once = Once::new();
+    SCANNER.call_once(|| egcl_rt::gc::register_root_scanner(scan_published_roots));
+    let context = CAPTURE.with(Cell::get);
+    let segment = native_transfer::current_segment();
+    debug_assert!(!context.is_null(), "publication needs a captured activation");
+    debug_assert!(!segment.is_null(), "publication needs an active native segment");
     let owner = if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } };
     let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
     let mut boundary = PublishedBoundary {
         owner,
         cursor,
-        bounds: (image as usize)..saved_sp,
+        bounds: low..saved_sp,
         segment,
         stack: egcl_rt::current_stack(),
         previous: ACTIVE.with(Cell::get),
@@ -151,12 +158,38 @@ pub(super) unsafe fn published<R>(
         visited: Cell::new(0),
     };
     debug_assert!(
-        boundary.bounds.start < cursor.call_sp && cursor.call_sp <= boundary.bounds.end,
-        "capture image, caller RSP and segment entry must nest"
+        low < cursor.call_sp && cursor.call_sp <= saved_sp,
+        "machine storage, caller RSP and segment entry must nest"
     );
     ACTIVE.with(|slot| slot.set(&mut boundary));
     let _linked = Linked(&mut boundary);
     body()
+}
+
+/// Publish the generated caller suspended beneath a permanent mapped-call
+/// adapter frame. The adapter's own callbacks have no capture image, but the
+/// record sits at the bottom of that frame, so the caller's exact return PC,
+/// pre-CALL RSP and writable save words are all recoverable from it.
+///
+/// # Safety
+/// `record` must be the live record of an executing adapter frame, and the
+/// caller must not retain a Rust reference to it across the body's writes.
+pub(super) unsafe fn published_mapped<R>(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+    body: impl FnOnce() -> R,
+) -> R {
+    use egcl_compiler::t2::native_transfer::{ADAPTER_FRAME_BYTES, MappedCallRecord};
+    let base = record as usize;
+    let cursor = NativeFrameCursor {
+        // SAFETY: the adapter reserved ADAPTER_FRAME_BYTES below the caller's
+        // return address, which the tail-jumping veneer left in place.
+        pc: unsafe { ((base + ADAPTER_FRAME_BYTES) as *const usize).read() },
+        call_sp: base + ADAPTER_FRAME_BYTES + 8,
+        registers: std::array::from_fn(|index| {
+            Some(base + std::mem::offset_of!(MappedCallRecord, preserved) + index * 8)
+        }),
+    };
+    unsafe { publish(cursor, base, body) }
 }
 
 /// Walk every execution's chain under stop-the-world. Each boundary unwinds

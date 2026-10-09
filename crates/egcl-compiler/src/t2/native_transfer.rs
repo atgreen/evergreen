@@ -73,7 +73,9 @@
 //! s390x have no transfer stubs yet and stay on the checked ABI.
 
 mod mapped_call;
-pub use mapped_call::{MappedCallRecord, emit_published_call_entry, emit_published_call_veneer};
+pub use mapped_call::{
+    ADAPTER_FRAME_BYTES, MappedCallRecord, emit_published_call_entry, emit_published_call_veneer,
+};
 
 use egcl_rt::asm::{Asm, Cc};
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};

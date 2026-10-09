@@ -168,6 +168,16 @@ fn prepare_call(
     record: *mut MappedCallRecord,
     prepare: impl FnOnce() -> Result<EgclVal, EgclError>,
 ) {
+    // Preparation polls, compiles and allocates on behalf of a caller that is
+    // suspended beneath this adapter frame. The record carries that caller's
+    // exact geometry, so publish it for the whole extent.
+    unsafe { super::root_publication::published_mapped(record, || prepare_call_published(record, prepare)) }
+}
+
+fn prepare_call_published(
+    record: *mut MappedCallRecord,
+    prepare: impl FnOnce() -> Result<EgclVal, EgclError>,
+) {
     unsafe {
         (*record).entry = std::ptr::null();
         (*record).activation = std::ptr::null_mut();
@@ -177,8 +187,7 @@ fn prepare_call(
             value: NIL,
             exit: NativeExit::Returned,
         };
-        // The mapped-call adapter owns no capture image yet; publishing its
-        // original caller is pending (bliss-shih7.2.7.3.2 mapped children).
+        // Already published by prepare_call from the adapter record.
         poll_or_transfer_unpublished(std::ptr::null_mut(), &mut (*record).outcome);
         if (*record).outcome.exit != NativeExit::Returned {
             drop(take_call_arguments(record));
@@ -315,6 +324,12 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut Map
 /// The child's machine frames are already gone. Resume its captured logical
 /// continuation through Rust before deciding whether the caller must unwind.
 pub(in crate::cli::bytecode) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
+    // Cold resumption runs Lisp. The child's machine frames are gone, so the
+    // record's saved caller is the right publication for this extent.
+    unsafe { super::root_publication::published_mapped(record, || resume_nested_published(record)) }
+}
+
+unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
     let owner = unsafe { (*record).owner.cast::<ChildActivation>() };
     egcl_rt::rooted!(
         result = guard_c2i(|| {
