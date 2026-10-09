@@ -78,7 +78,7 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.format_version, 6);
+    assert_eq!(header.format_version, 7);
     assert!(header.heap_size >= 4096);
     assert_eq!(header.heap_size % 4096, 0);
 
@@ -364,9 +364,16 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
-        6,
-        "mapped heap regions require image format version 6"
+        7,
+        "immutable function definition identities require image format version 7"
     );
+    let mut old_layout = bytes.clone();
+    old_layout[8..12].copy_from_slice(&6_u32.to_ne_bytes());
+    let old_layout_path = temp_path("header-old-function-padding.bimg");
+    fs::write(&old_layout_path, &old_layout).unwrap();
+    let error = validate_image_header(old_layout_path.to_str().unwrap()).err()
+        .expect("old function padding must not become definition metadata");
+    assert!(format!("{error}").contains("unsupported format version"));
     bytes[0] ^= 0xFF;
     let bad_magic = temp_path("header-bad-magic.bimg");
     fs::write(&bad_magic, &bytes).expect("write mutated image");

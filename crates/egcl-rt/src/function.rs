@@ -101,6 +101,11 @@ pub fn alloc_interpreted(
     crate::rooted!(body = body);
     crate::rooted!(env = env);
     crate::rooted!(name = name);
+    crate::rooted!(definition = if name.symbol_index().is_some_and(crate::symbols::is_uninterned) {
+        *name
+    } else {
+        crate::symbols::make_uninterned("FUNCTION-DEFINITION")
+    });
     let body_ptr = crate::gc::alloc_pinned_typed(body_size(), type_id::FUNCTION_INTERPRETED)
         .or_else(|| {
             if std::env::var_os("EGCL_GC_DISABLE").is_some() {
@@ -126,6 +131,7 @@ pub fn alloc_interpreted(
         (*d).native_entries = AtomicPtr::new(native_entries_pointer());
         (*d).tier = 0.into();
         (*d).flags = 0.into();
+        (*d).definition_index = definition.as_symbol_index();
 
         EgclVal::from_heap_ptr(header)
     }
@@ -172,6 +178,11 @@ pub fn env(f: EgclVal) -> EgclVal {
 /// The function name cell.
 pub fn name(f: EgclVal) -> EgclVal {
     unsafe { (*data(f)).name }
+}
+
+/// Immutable identity of the semantic definition, independent of its binding.
+pub fn definition_index(f: EgclVal) -> u32 {
+    unsafe { (*data(f)).definition_index }
 }
 
 /// Record an invocation (T0/T1 prologue): atomically bump and return the new
@@ -288,6 +299,7 @@ mod tests {
         assert!(std::ptr::eq(native_entries(fresh).unwrap(), &ENTRIES));
         assert_eq!(std::mem::size_of::<FunctionData>(), 64);
         assert_eq!(std::mem::offset_of!(FunctionData, native_entries), 48);
+        assert_eq!(std::mem::offset_of!(FunctionData, definition_index), 60);
     }
 
     #[test]

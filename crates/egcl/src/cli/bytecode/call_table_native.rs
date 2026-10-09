@@ -59,7 +59,7 @@ impl NativeEntry {
                 .iter()
                 .any(|ty| !matches!(ty, DeclaredType::Any))
             || (!dynamic
-                && (closure_envs().borrow().contains_key(&symbol)
+                && (closure_captured_env(function).is_some()
                     || closure_controls().borrow().contains_key(&symbol)))
         {
             return None;
@@ -114,7 +114,7 @@ impl NativeEntry {
         let defaults = literal_defaults(body);
         let capture_context = dynamic
             && (egcl_rt::symbols::is_uninterned(symbol)
-                || closure_envs().borrow().contains_key(&symbol)
+                || closure_captured_env(function).is_some()
                 || closure_controls().borrow().contains_key(&symbol));
         let mut entry = Box::new(Self {
             function: if dynamic { NIL } else { function },

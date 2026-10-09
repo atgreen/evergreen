@@ -1045,10 +1045,9 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
 /// source-free stub function objects whose real code lives ONLY in this
 /// registry; the heap snapshot carries the stubs, so without this unit every
 /// such function silently evaluates its NIL body after a core load (babel's
-/// get-character-encoding returned NIL). The ordinary BBU loader executes the
-/// unit post-restore, re-registering the code behind each restored stub (the
-/// kind-3 install reuses an existing interpreted-function object in place, so
-/// heap identity is preserved). Private bodies also include closures produced
+/// get-character-encoding returned NIL). The BBU loader's explicit restore mode
+/// reconnects each stub without replacing its heap identity. Private bodies
+/// include retained old named definitions and closures produced
 /// by exited threads and use kind-10 installs. Functions with non-poolable
 /// constants are skipped. Returns empty bytes when nothing is
 /// serializable. Pool encoding is Rust-only (no EGCL allocation) — GC-safe
@@ -1085,9 +1084,12 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
             // function under this exact (image-stable) uninterned index via
             // the kind-10 action; its stub object and CLOSURE_ENV frame ride
             // separately (heap + CLSR block).
+            let name_ref = egcl_rt::symbols::find_index(&bf.name)
+                .and_then(|name| pool.symbol_by_index(name))
+                .unwrap_or(BBU_NO_INDEX);
             match serialize_bbu_function_tree(
                 &bf,
-                BBU_NO_INDEX,
+                name_ref,
                 BBU_FUNC_NESTED,
                 &mut pool,
                 &mut functions,
@@ -1189,14 +1191,15 @@ pub(super) fn is_registered(sym: u32) -> bool {
 }
 
 fn registry_put(sym: u32, f: Arc<BytecodeFunction>) {
-    publish_bytecode(sym, f, None);
+    let function = egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL);
+    publish_bytecode(sym, f, None, function);
 }
 
 /// Definition loads replace unconditionally; compilation of an existing
 /// definition must still match the generation from which it started. No Lisp
 /// allocation, evaluation, or safepoint may occur while the publication lock
 /// protects the comparison and replacement.
-fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>) -> bool {
+fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>, function: EgclVal) -> bool {
     register_bytecode_roots(&f);
     let private = egcl_rt::symbols::is_uninterned(sym);
     let generation = if private {
@@ -1219,12 +1222,26 @@ fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>) -
         // Invalidate baked targets before exposing the replacement, under the
         // same lock observed by registry_get.
         bump_direct_call_gen();
+        if egcl_rt::function::is_interpreted_function(function) {
+            // This association belongs to the callable, not its mutable public
+            // binding. Retired definitions stay reachable only through their
+            // objects or active code and are swept with private callable bodies.
+            closure_bodies().borrow_mut().entry(
+                egcl_rt::function::definition_index(function)
+            ).or_insert_with(|| Arc::clone(&f));
+        }
+        // A concurrent setter may change the cell before its registry
+        // invalidation. Never attach this body to whichever object won that
+        // race, even when the generation has not changed yet.
+        if egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL) != function {
+            return false;
+        }
         definitions.insert(
             sym,
             NamedBytecodeDefinition {
                 generation,
                 body: Some(Arc::clone(&f)),
-                function: egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL),
+                function,
             },
         );
         generation
@@ -1328,12 +1345,13 @@ pub fn call_registered(
             registry_get(sym).is_some()
         );
     }
-    // A saved named function object retains its own definition after DEFUN
-    // replaces the name. Its source fallback must not use the replacement's
-    // bytecode or native entry. Private closures have unique registry names.
-    if !registered_function_matches(sym, fn_val) {
-        return None;
-    }
+    // Retired objects resolve their immutable body, never the replacement
+    // installed under their public name. Source-free objects have no fallback.
+    let sym = if !registered_function_matches(sym, fn_val) {
+        egcl_rt::function::definition_index(fn_val)
+    } else {
+        sym
+    };
     let callee = registry_get(sym)?;
     if !arity_accepts(&callee, args.len()) {
         if cfg!(egcl_no_tree_walker) {
@@ -1345,8 +1363,7 @@ pub fn call_registered(
         }
         return None; // arg count outside the lambda list's range: tree-walker binds it
     }
-    let fn_obj = egcl_rt::symbols::symbol_function(sym)
-        .filter(|&c| egcl_rt::function::is_interpreted_function(c));
+    let fn_obj = egcl_rt::function::is_interpreted_function(fn_val).then_some(fn_val);
     // The tree-walker already bumped named function objects in `callable_body`.
     // Anonymous/gensym bytecode functions have no FnMeta, so maintain their
     // fallback counter here on every call (including calls after T1 installs).
@@ -1368,7 +1385,7 @@ pub fn call_registered(
     // on entry, and is equivalent to the tree-walker for a compiled function.
     match native {
         Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
-            Some(run_native(&nc, sym, args, env))
+            Some(run_native_callable(&nc, sym, fn_val, args, env))
         }
         _ => Some(run_with_sym(callee, args, fn_val, sym, env)),
     }
@@ -12178,17 +12195,23 @@ pub(super) fn closure_captured_env(fn_val: EgclVal) -> Option<Arc<SharedCell<Env
     // Native call adapters and whole-function deoptimization can enter with
     // a symbol designator; ordinary dispatch passes the function object.
     let symbol = if let Some(symbol) = fn_val.symbol_index() {
-        symbol
+        if let Some(function) = egcl_rt::symbols::symbol_function(symbol)
+            .filter(|&f| egcl_rt::function::is_interpreted_function(f))
+        {
+            egcl_rt::function::definition_index(function)
+        } else {
+            symbol
+        }
     } else if fn_val.is_heap_object() && egcl_rt::function::is_interpreted_function(fn_val) {
-        egcl_rt::function::name(fn_val).symbol_index()?
+        egcl_rt::function::definition_index(fn_val)
     } else {
         return None;
     };
     closure_envs().borrow().get(&symbol).cloned()
 }
 
-/// Record the captured heap frame for a closure whose interpreted-function object
-/// is named by `sym_idx`. Used when a tree-walker closure `(EGCL::CLOSURE . id)`
+/// Record the captured heap frame owned by a function's private definition
+/// identity `sym_idx`. Used when a tree-walker closure `(EGCL::CLOSURE . id)`
 /// is reified into an interpreted-function object (e.g. installed via `(setf
 /// (symbol-function s) (lambda …))` that captures enclosing lexicals): the object
 /// then reaches those lexicals through the same `CLOSURE_ENV` channel the
@@ -12198,9 +12221,7 @@ pub(super) fn register_closure_env(sym_idx: u32, frame: Arc<SharedCell<EnvFrame>
     closure_envs().borrow_mut().insert(sym_idx, frame);
 }
 
-/// Drop any captured heap frame recorded for `sym_idx`. Used when a global
-/// function is (re)defined at top level, so a stale lexical capture from an
-/// earlier definition inside a `let` does not linger (bliss-sdd).
+/// Drop captures when delivery removes an unreachable private definition.
 pub(super) fn clear_closure_env(sym_idx: u32) {
     closure_envs().borrow_mut().remove(&sym_idx);
     closure_controls().borrow_mut().remove(&sym_idx);
@@ -12566,11 +12587,23 @@ fn compile_defun(
     // is_registered refreshed this execution's generation. Macro expansion can
     // run Lisp (including LOAD/DEFUN), so compilation is not a read-only phase.
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL));
+    // Compile a coherent object snapshot. A caller's source forms may have
+    // been read before another execution replaced the public binding.
+    let (params, body) = if egcl_rt::function::is_interpreted_function(*function) {
+        let body = egcl_rt::function::body(*function);
+        if body.is_nil() {
+            return false; // source-free objects must retain their real bytecode
+        }
+        (egcl_rt::function::lambda_list(*function), body)
+    } else {
+        (params, body)
+    };
     egcl_rt::rooted!(params = params);
     egcl_rt::rooted!(body = body);
     let mut compile_env = env.clone();
     let mut captures = std::collections::HashSet::new();
-    if let Some(frame) = closure_envs().borrow().get(&sym).cloned() {
+    if let Some(frame) = closure_captured_env(*function) {
         compile_env.frame = Arc::clone(&frame);
         let mut current = Some(frame);
         while let Some(frame) = current {
@@ -12664,7 +12697,7 @@ fn compile_defun(
             }
         };
     match compiled.filter(|function| !contains_load_time_values(function)) {
-        Some(bf) => publish_bytecode(sym, bf, Some(generation)) || is_registered(sym),
+        Some(bf) => publish_bytecode(sym, bf, Some(generation), *function) || is_registered(sym),
         None => {
             let registered = is_registered(sym);
             let current = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
@@ -13515,6 +13548,15 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclEr
 /// Verify, decode, and execute an authoritative portable BBU. No source reader
 /// or macroexpander participates in this path.
 pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
+    load_bbu_definitions(bytes, env, false)
+}
+
+/// Reconnect an image's already-restored objects to their compiled definitions.
+pub(super) fn restore_registry_unit(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
+    load_bbu_definitions(bytes, env, true)
+}
+
+fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted_ref!(_env_roots = env);
     let mut cursor = BbuCursor::new(bytes);
     if cursor.take(4)? != BBU_MAGIC {
@@ -14051,7 +14093,7 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
                 };
                 egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
                 let fn_obj = match egcl_rt::symbols::symbol_function(sym) {
-                    Some(existing) if egcl_rt::function::is_interpreted_function(existing) => {
+                    Some(existing) if restoring && egcl_rt::function::is_interpreted_function(existing) => {
                         // SAFETY: checked immediately above.
                         unsafe { egcl_rt::function::redefine(existing, lambda_list, NIL, NIL) };
                         existing
@@ -14063,9 +14105,9 @@ pub fn load_bbu(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError> {
                         allocated
                     }
                 };
-                registry_put(sym, function);
+                publish_bytecode(sym, function, None, fn_obj);
                 // Keep the function object's tier metadata tied to this loaded
-                // definition; registry_put has already invalidated old native code.
+                // definition; publication has already invalidated old native code.
                 egcl_rt::function::set_tier(fn_obj, 0);
                 last = symbol;
             }
@@ -15447,10 +15489,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
                 // unified tiering substrate) so the function object reflects real
                 // invocations from the bytecode path, not just the tree-walker.
-                let fn_obj = egcl_rt::symbols::symbol_function(sym)
-                    .filter(|&cell| egcl_rt::function::is_interpreted_function(cell));
+                egcl_rt::rooted!(fn_obj = egcl_rt::symbols::symbol_function(sym)
+                    .filter(|&cell| egcl_rt::function::is_interpreted_function(cell)));
                 if !profiling_disabled()
-                    && let Some(cell) = fn_obj
+                    && let Some(cell) = *fn_obj
                 {
                     egcl_rt::function::record_invocation(cell);
                 }
@@ -15466,8 +15508,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // counter and, on success, tier + entry are recorded on
                         // the object. Anonymous compiled lambdas (gensyms) have no
                         // function object, so they keep the INVOKE_COUNTS fallback.
-                        let count = dispatch_invoke_count(sym, fn_obj);
-                        let native = native_for_dispatch(sym, fn_obj, count);
+                        let count = dispatch_invoke_count(sym, *fn_obj);
+                        let native = native_for_dispatch(sym, *fn_obj, count);
                         // Run native only while under the depth cap (bliss-x5y.4);
                         // once the native call stack is deep, dispatch the callee
                         // through the flat T0 path below instead of pushing yet
@@ -15475,7 +15517,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         let over_cap = NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap();
                         if let Some(nc) = native {
                             if !over_cap {
-                                match run_native(&nc, sym, args, env) {
+                                match run_native_callable(&nc, sym,
+                                    fn_obj.unwrap_or_else(|| EgclVal::from_symbol_index(sym)), args, env) {
                                     Ok(v) => {
                                         acts[top_idx].push_op(v);
                                         continue;
@@ -15496,7 +15539,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             initiate_unwind(acts, stack, env, pending)?;
                             continue;
                         }
-                        let fn_val = EgclVal::from_symbol_index(sym);
+                        let fn_val = fn_obj.unwrap_or_else(|| EgclVal::from_symbol_index(sym));
                         let frame = match stack.push_frame(
                             fn_val,
                             std::ptr::null::<CodeInfo>(),
@@ -15521,7 +15564,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // like an anonymous closure. Match run_with_binding and
                         // run_native instead of borrowing the caller's scope.
                         let debug_call = egcl_rt::debug_stack::CallFrame::enter_managed(&callee.name, args);
-                        let captured = closure_envs().borrow().get(&sym).cloned();
+                        let captured = closure_captured_env(fn_val);
                         let parent = captured.clone()
                             .unwrap_or_else(|| Arc::clone(&env.frame));
                         let env_frame = make_env_frame(&callee, parent).or(captured);
@@ -15549,7 +15592,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             handlers: Vec::new(),
                             cleanup_conts: Vec::new(),
                             dyn_binds: Vec::new(),
-                            fn_obj,
+                            fn_obj: *fn_obj,
                             sym,
                         });
                         continue;
@@ -17402,8 +17445,8 @@ fn c2i_call_result(
                     selected
                 };
                 match native {
-                    Some(nc) => run_native(&nc, sym32, args, env),
-                    None => run(callee, args, fn_val, env),
+                    Some(nc) => run_native_callable(&nc, sym32, fn_obj.unwrap_or(fn_val), args, env),
+                    None => run_with_sym(callee, args, fn_obj.unwrap_or(fn_val), sym32, env),
                 }
             }
             _ => apply_function(fn_val, args, env),
@@ -19696,7 +19739,7 @@ fn direct_native_targets(
             .iter()
             .all(|t| matches!(t, DeclaredType::Any));
         let not_closure = !cbf.has_env
-            && !closure_envs().borrow().contains_key(&callee)
+            && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
             && !closure_controls().borrow().contains_key(&callee);
         if replacement_function(callee).is_none()
             && native_transfer_abi_compatible(&cnc)
@@ -20255,12 +20298,27 @@ fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
     }
 }
 
+#[cfg(test)]
 fn run_native(
     nc: &NativeCode,
     sym: u32,
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    let function = egcl_rt::symbols::symbol_function(sym)
+        .filter(|&value| egcl_rt::function::is_interpreted_function(value))
+        .unwrap_or_else(|| EgclVal::from_symbol_index(sym));
+    run_native_callable(nc, sym, function, args, env)
+}
+
+fn run_native_callable(
+    nc: &NativeCode,
+    sym: u32,
+    function: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(sym));
     #[cfg(test)]
     call_table::record_target_lookup();
@@ -20352,7 +20410,7 @@ fn run_native(
     let stack = egcl_rt::current_stack();
     let frame = stack
         .push_frame(
-            EgclVal::from_symbol_index(sym),
+            *function,
             nc.code_info as *const CodeInfo,
             nc.num_slots,
             FLAG_CALL,
@@ -20369,8 +20427,9 @@ fn run_native(
     // Building the frame as a child of the caller's `env.frame` instead loses
     // those bindings — e.g. a T2-promoted `(lambda (x) (… separator))` passed to
     // substitute-if reports `separator` unbound (bliss-e7t). `CLOSURE_ENV` is
-    // keyed by the closure's own symbol, which is this activation's `sym`.
-    let closure_env = closure_envs().borrow().get(&sym).cloned();
+    // keyed by the selected object's private definition, independent of later
+    // changes to this activation's public symbol.
+    let closure_env = closure_captured_env(*function);
     let parent = closure_env
         .clone()
         .unwrap_or_else(|| Arc::clone(&env.frame));
@@ -20482,7 +20541,7 @@ fn run_native(
             eprintln!("[deopt-path] Rerun sym={sym}");
         }
         stack.pop_frame();
-        return run(entry, args, EgclVal::from_symbol_index(sym), env);
+        return run_with_sym(entry, args, *function, sym, env);
     }
     stack.pop_frame();
     Ok(EgclVal(ret))
@@ -21356,7 +21415,7 @@ fn emit_native(
                             .iter()
                             .all(|t| matches!(t, DeclaredType::Any));
                         let not_closure = !cbf.has_env
-                            && !closure_envs().borrow().contains_key(sym)
+                            && closure_captured_env(EgclVal::from_symbol_index(*sym)).is_none()
                             && !closure_controls().borrow().contains_key(sym);
                         // !has_deopt: a callee with no speculation-guard deopt
                         // point never mid-flight resumes to T0, so a direct call
@@ -25505,6 +25564,103 @@ mod active_bytecode_root_tests {
             !live_bytecode_bodies().borrow().contains_key(&profile_key),
             "major GC must release the expired template address after sweeping its feedback"
         );
+    }
+
+    #[test]
+    fn selected_native_definition_keeps_its_original_capture_after_rebinding() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env(
+            "(let ((held 42)) (defun native-capture-version () held))
+             (dotimes (i 40) (native-capture-version))", &mut env).unwrap();
+        egcl_rt::rooted!(old = super::super::global_fn("NATIVE-CAPTURE-VERSION").unwrap());
+        let symbol = egcl_rt::function::name(*old).as_symbol_index();
+        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
+            .expect("probe must select actual native code before replacement");
+        super::super::read_eval_all_env(
+            "(let ((held 99)) (defun native-capture-version () held))", &mut env).unwrap();
+        assert_eq!(run_native_callable(&code, symbol, *old, &[], &mut env).unwrap(),
+            EgclVal::from_fixnum(42));
+        assert_eq!(super::super::read_eval_all_env("(native-capture-version)", &mut env).unwrap(),
+            EgclVal::from_fixnum(99));
+    }
+
+    #[test]
+    fn publication_cannot_attach_old_code_to_a_new_function_cell() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(name = resolve_sym("DEFINITION-PUBLICATION-RACE").unwrap());
+        let symbol = name.as_symbol_index();
+        egcl_rt::rooted!(old = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *name));
+        egcl_rt::rooted!(new = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *name));
+        egcl_rt::rooted!(old_form = super::super::vec_to_list(&[EgclVal::from_fixnum(11)]));
+        let old_body = Arc::new(compile_function("DEFINITION-PUBLICATION-RACE", NIL,
+            *old_form, &env, false, false).unwrap());
+        egcl_rt::rooted!(_old_body = ActiveBytecodeRoot::new(&old_body));
+        egcl_rt::rooted!(new_form = super::super::vec_to_list(&[EgclVal::from_fixnum(29)]));
+        let new_body = Arc::new(compile_function("DEFINITION-PUBLICATION-RACE", NIL,
+            *new_form, &env, false, false).unwrap());
+        egcl_rt::symbols::set_symbol_function(symbol, *old);
+        // Reproduce a setter preempted before registry invalidation. Its cell
+        // already names NEW when compilation/loading of OLD resumes.
+        egcl_rt::symbols::set_symbol_function(symbol, *new);
+        assert!(!publish_bytecode(symbol, old_body, None, *old));
+        assert!(publish_bytecode(symbol, new_body, None, *new));
+        assert_eq!(call_registered(symbol, &[], *old, &mut env).unwrap().unwrap(),
+            EgclVal::from_fixnum(11));
+        assert_eq!(call_registered(symbol, &[], *new, &mut env).unwrap().unwrap(),
+            EgclVal::from_fixnum(29));
+        egcl_rt::symbols::set_symbol_function(symbol, NIL);
+        registry_remove(symbol);
+    }
+
+    #[test]
+    fn saved_definition_roots_its_moving_constants_until_the_object_dies() {
+        let _lock = super::super::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(name = resolve_sym("SAVED-DEFINITION-LIFETIME").unwrap());
+        let symbol = name.as_symbol_index();
+        egcl_rt::rooted!(saved = egcl_rt::function::alloc_interpreted(NIL, NIL, NIL, *name));
+        let identity = egcl_rt::function::definition_index(*saved);
+        egcl_rt::symbols::set_symbol_function(symbol, *saved);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let mut body = compile_function("SAVED-DEFINITION-LIFETIME", NIL, *form, &env, false, false).unwrap();
+        egcl_rt::rooted!(constant = super::super::arena_cons(NIL, NIL));
+        body.constants.push(*constant);
+        let body = Arc::new(body);
+        let weak_body = Arc::downgrade(&body);
+        registry_put(symbol, body);
+        let mut weak = Box::new(egcl_rt::gc::WeakPointer::new(
+            egcl_rt::gc::finalizer_key(*constant).unwrap(),
+        ));
+        egcl_rt::gc::register_weak_pointer(&mut weak);
+        egcl_rt::symbols::set_symbol_function(symbol, NIL);
+        registry_remove(symbol);
+        drop(form);
+        drop(constant);
+        env.mv.clear();
+        let before = weak.value().0;
+        egcl_rt::gc::full_gc().unwrap();
+        let live = !weak.is_broken();
+        let moved = before != weak.value().0;
+        let updated = weak_body.upgrade().is_some_and(|body| body.constants.iter()
+            .any(|v| egcl_rt::gc::finalizer_key(*v).ok() == Some(weak.value().0)));
+        // Materializing the execution's dispatch cache must not immortalize it.
+        assert!(registry_get(identity).is_some());
+        drop(saved);
+        egcl_rt::gc::full_gc().unwrap();
+        let collected = weak.is_broken();
+        egcl_rt::gc::unregister_weak_pointer(&weak);
+        assert!(live && moved && updated, "saved object must trace and relocate its original constants");
+        assert!(collected, "dead saved definitions must release their constants");
+        assert!(weak_body.upgrade().is_none(), "dead saved definitions must release bytecode");
+        assert!(registry_get(identity).is_none(), "dead definition must leave the dispatch registry");
     }
 
     #[test]

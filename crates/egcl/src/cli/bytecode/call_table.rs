@@ -497,14 +497,15 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 egcl_rt::function::record_invocation(*function);
             }
             if NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap() {
-                run(
+                run_with_sym(
                     Arc::clone(body),
                     args,
-                    EgclVal::from_symbol_index(state.symbol),
+                    *function,
+                    state.symbol,
                     env,
                 )
             } else {
-                run_native(&code, state.symbol, args, env)
+                run_native_callable(&code, state.symbol, *function, args, env)
             }
         }
         Target::Bytecode { body, promote, .. } => {
@@ -519,7 +520,7 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             if !profiling_disabled() {
                 egcl_rt::function::record_invocation(*function);
             }
-            run(body, args, EgclVal::from_symbol_index(state.symbol), env)
+            run_with_sym(body, args, *function, state.symbol, env)
         }
         Target::Builtin { slot, nargs } => {
             if nargs != args.len() {

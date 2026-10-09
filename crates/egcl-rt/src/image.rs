@@ -146,7 +146,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 5 carries native runtime requirements, validated before restoration.
 // Version 6 stores aligned heap spans with precise pointer fixups. Older
 // per-object layouts are deliberately unsupported.
-const FORMAT_VERSION: u32 = 6;
+// Version 7 gives every function an immutable definition index in former
+// padding. Older padding cannot safely be interpreted as a symbol identity.
+const FORMAT_VERSION: u32 = 7;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

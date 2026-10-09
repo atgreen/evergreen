@@ -535,7 +535,18 @@ Offset  Size     Field
  16       8      body: EgclVal         — cons-tree of body forms
  24       8      env: EgclVal          — captured lexical environment
  32       8      name: EgclVal         — function name (symbol or list) or NIL
+ 40       4      invoke_count: AtomicU32
+ 44       4      back_edge_count: AtomicU32
+ 48       8      native_entries: AtomicPtr — process-lifetime callable adapters
+ 56       1      tier: AtomicU8
+ 58       2      flags: AtomicU16
+ 60       4      definition_index: u32 — immutable private symbol identity
 ```
+
+The definition identity retains compiled code independently of the mutable
+public function binding. The GC traces that symbol and its code references;
+unreachable definitions are reclaimed. Image format 7 initializes this field
+explicitly; earlier images used these bytes as padding and are rejected.
 
 ### 1.11.2  Compiled Function — D1.18
 

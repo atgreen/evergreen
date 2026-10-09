@@ -1521,9 +1521,8 @@ that survives Rust preparation, under `bliss-shih7.16.4`. Default emitted caller
 migration, full interpreter routing and other platform gates remain open.
 
 The fresh-process image test checks restored callable invocation and native caller
-compilation. Replacing a restored source-free definition still loses its saved
-old body (`bliss-dm7tb`), reproduced with both checked and native-segment dispatch;
-that bug is an explicit dependency of the full callable rollout.
+compilation. Retention of source-free definitions across replacement is described
+below; it is required by the full callable rollout.
 
 ### Native APPLY argument ownership (2026-10-09)
 
@@ -1550,3 +1549,24 @@ including repeated calls. The exact-code EVAL reentry fixture now includes APPLY
 fresh-process tests cover closure captures and replacement of a warmed APPLY
 binding. This is `bliss-shih7.16.4.2`; full callable routing and default migration
 remain under the parent tasks.
+
+### Retained callable definitions (2026-10-09)
+
+Each interpreted function object owns an immutable private definition identity,
+separate from its public name. Compiled bodies and captured lexical environments
+follow that identity across DEFUN replacement, FASL reload and unbinding. Native
+entry and bytecode fallback carry the selected function object as well as the
+dispatch key, preserving captures, tiering and OSR context. Public publication
+checks the captured owner rather than attaching old code to a newer function cell.
+
+Ordinary FASL loads allocate new function objects. Image restoration explicitly
+reconnects existing objects, and private compiled bodies retain their diagnostic
+names without reinstating old public bindings. Image format 7 records the new
+definition field; older images must be rebuilt. Conditional GC tracing retains
+compiled constants and captures while their function remains reachable and
+releases them after it dies. Tests require actual constant relocation, correct
+saved results across replacement, and eventual release of the retained body.
+
+This addresses `bliss-dm7tb`. Coherent concurrent selection of a named body and its
+owner remains separately tracked by `bliss-s751o`; retaining retired definitions
+does not by itself make that dispatch snapshot atomic.

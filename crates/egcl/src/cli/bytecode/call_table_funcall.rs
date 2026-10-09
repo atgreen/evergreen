@@ -298,7 +298,7 @@ pub(super) unsafe fn scan_contexts(visit: &mut dyn FnMut(*mut EgclVal)) {
 }
 pub(super) extern "C" fn enter_context(context: *mut Context, function: u64) {
     let symbol = egcl_rt::function::name(EgclVal(function)).as_symbol_index();
-    let capture = closure_envs().borrow().get(&symbol).cloned();
+    let capture = closure_captured_env(EgclVal(function));
     let (blocks, tags) = closure_controls()
         .borrow()
         .get(&symbol)

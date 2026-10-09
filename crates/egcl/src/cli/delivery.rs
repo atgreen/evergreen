@@ -494,7 +494,9 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     let reason = if !egcl_rt::function::body(value).is_nil() {
                         Some("source function body")
                     } else {
-                        match name.symbol_index().and_then(|index| compiled.get(&index)) {
+                        let identity = egcl_rt::function::definition_index(value);
+                        match compiled.get(&identity).or_else(||
+                            name.symbol_index().and_then(|index| compiled.get(&index))) {
                             Some(reason) => *reason,
                             None => Some("function without saved bytecode"),
                         }

@@ -29763,8 +29763,8 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // either: `redefine` resets tier, entry and both counters, so that state
         // is discarded whichever way the new definition lands.
         let idx = name_form.as_symbol_index();
-        let f = egcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form);
-        egcl_rt::symbols::set_symbol_function(idx, f);
+        egcl_rt::rooted!(f = egcl_rt::function::alloc_interpreted(params_form, body, NIL, name_form));
+        egcl_rt::symbols::set_symbol_function(idx, *f);
         // Retire the OLD compiled body: a redefinition replaces the definition,
         // and nothing else did this. `lazy_compile_defun` returns early when the
         // symbol is already registered, so once a function had been promoted, a
@@ -29789,9 +29789,8 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // returns 42. Record the definition-time frame so F's interpreted body
         // reaches those lexicals through the same CLOSURE_ENV channel a reified
         // closure uses (see apply_function). Only when there IS an enclosing
-        // scope — a top-level DEFUN keeps no capture (and clears a stale one from
-        // an earlier in-LET definition), so it is never pinned out of tiering
-        // (bliss-sdd).
+        // scope. Captures belong to this definition's private identity, so a
+        // later top-level DEFUN cannot erase a saved function's environment.
         // Capture the enclosing lexicals only for a DEFUN genuinely nested inside
         // a user binding form: its frame differs from the top-level base recorded
         // for the current form. A DEFUN at the top level of a (possibly nested)
@@ -29805,11 +29804,8 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 .is_some_and(|&base| base != frame_addr(&env.frame))
         });
         if nested_in_binding {
-            bytecode::register_closure_env(idx, Arc::clone(&env.frame));
-        } else {
-            // Top-level (re)definition: drop any stale capture from an earlier
-            // in-scope definition of the same name.
-            bytecode::clear_closure_env(idx);
+            bytecode::register_closure_env(
+                egcl_rt::function::definition_index(*f), Arc::clone(&env.frame));
         }
     } else {
         // Non-symbol names, e.g. `(setf foo)`: store GLOBALLY under the canonical
@@ -38816,11 +38812,10 @@ fn load_core_image(file: &std::fs::File, offset: u64, len: u64, env: &mut Env) -
     advance_stdlib_class_id_floor(egcl_stdlib::clos::max_metaobject_id());
     // Re-register the compiled code behind every restored source-free stub
     // (bliss-zz6w): execute the saved bytecode-registry unit through the
-    // ordinary BBU loader (kind-3 installs reuse the restored function objects
-    // in place, so heap identity is preserved).
+    // BBU loader's restore mode, preserving the restored function identities.
     let unit = PENDING_HOST_BYTECODE.with(|p| std::mem::take(&mut *p.borrow_mut()));
     if !unit.is_empty() {
-        bytecode::load_bbu(&unit, env)?;
+        bytecode::restore_registry_unit(&unit, env)?;
     }
     // Function objects and symbol properties are image data; Rust callbacks
     // are not. Rebuild the compiler's dispatch table from the restored world.
@@ -41821,6 +41816,7 @@ mod compiled_closure_lifetime_tests {
         )
         .unwrap();
         let name = resolve_sym("LIFETIME-NAMED").unwrap();
+        let identity = egcl_rt::function::definition_index(global_fn("LIFETIME-NAMED").unwrap());
         let capture = apply_function(name, &[], &mut env).unwrap();
         let mut weak = Box::new(egcl_rt::gc::WeakPointer::new(
             egcl_rt::gc::finalizer_key(capture).unwrap(),
@@ -41835,6 +41831,10 @@ mod compiled_closure_lifetime_tests {
         assert!(
             bytecode::closure_captured_env(name).is_none(),
             "unbound function's host frame must be removed"
+        );
+        assert!(
+            bytecode::closure_captured_env(EgclVal::from_symbol_index(identity)).is_none(),
+            "cold named definition's private host frame must be removed"
         );
     }
 
