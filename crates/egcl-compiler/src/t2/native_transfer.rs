@@ -347,6 +347,75 @@ pub fn emit_helper_veneer(helper: NativeHelperV2, cold_entry: *const u8) -> Vec<
     a.finish().expect("local helper veneer label")
 }
 
+/// A helper receiving a writable caller image captured before entering Rust.
+/// The runtime must publish that image before polling or allocating, and end
+/// publication before returning. The image and outcome overlap; do not hold a
+/// Rust reference to the image across writes through the outcome pointer.
+pub type NativePublishedHelper =
+    unsafe extern "C" fn(*mut u8, *mut NativeOutcome, *mut SysvTransferCapture);
+
+/// Capture the suspended Lisp caller before a collecting Rust boundary.
+/// The callback owns publication for its entire dynamic extent, including Rust
+/// reentry into Lisp. Returning assembly restores the possibly relocated save
+/// words before either normal return or cold capture. Direct native calls need
+/// no additional callbacks. Code owners must retain both callback targets.
+pub fn emit_published_helper_veneer(
+    helper: NativePublishedHelper,
+    cold_entry: *const u8,
+) -> Vec<u8> {
+    use std::mem::{offset_of, size_of};
+    const SIZE: u8 = size_of::<SysvTransferCapture>() as u8;
+    const {
+        assert!(size_of::<SysvTransferCapture>() == 88);
+        assert!(size_of::<NativeOutcome>() == 16);
+        assert!(offset_of!(SysvTransferCapture, exit) == offset_of!(SysvTransferCapture, value) + 8);
+        assert!(offset_of!(NativeOutcome, value) == 0);
+        assert!(offset_of!(NativeOutcome, exit) == 8);
+        assert!(NativeExit::Returned as u64 == 0);
+    }
+    let mut a = Asm::new();
+    let exceptional = a.label();
+    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x83, 0xec, SIZE]);
+    capture_stack_word(&mut a, false, 7, offset_of!(SysvTransferCapture, request));
+    let preserved = offset_of!(SysvTransferCapture, preserved);
+    for (index, reg) in [3, 5, 12, 13, 14, 15].into_iter().enumerate() {
+        capture_stack_word(&mut a, false, reg, preserved + index * 8);
+    }
+    a.extend_from_slice(&[0x48, 0x8d, 0x44, 0x24, SIZE + 8]);
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, caller_sp));
+    capture_stack_word(&mut a, true, 0, SIZE as usize);
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, return_pc));
+    // Initialize every field, including the enum, before Rust may borrow it.
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&egcl_rt::value::NIL.to_raw().to_le_bytes());
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, value));
+    a.extend_from_slice(&[0x31, 0xc0]);
+    capture_stack_word(&mut a, false, 0, offset_of!(SysvTransferCapture, exit));
+    a.extend_from_slice(&[0x48, 0x8d, 0x74, 0x24, offset_of!(SysvTransferCapture, value) as u8]);
+    a.extend_from_slice(&[0x48, 0x89, 0xe2]); // rdx=image; rdi=request; rsi=out
+    a.extend_from_slice(&[0x48, 0xb8]);
+    a.extend_from_slice(&(helper as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xd0]);
+    for (index, reg) in [3, 5, 12, 13, 14, 15].into_iter().enumerate() {
+        capture_stack_word(&mut a, true, reg, preserved + index * 8);
+    }
+    for (reg, offset) in [
+        (0, offset_of!(SysvTransferCapture, value)),
+        (2, offset_of!(SysvTransferCapture, exit)),
+        (7, offset_of!(SysvTransferCapture, request)),
+    ] {
+        capture_stack_word(&mut a, true, reg, offset);
+    }
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, SIZE, 0x48, 0x85, 0xd2]);
+    a.jcc(Cc::Ne, exceptional);
+    a.extend_from_slice(&[0xc3]);
+    a.bind(exceptional);
+    a.extend_from_slice(&[0x48, 0x89, 0xc6, 0x48, 0xb8]);
+    a.extend_from_slice(&(cold_entry as usize as u64).to_le_bytes());
+    a.extend_from_slice(&[0xff, 0xe0]);
+    a.finish().expect("local published helper veneer label")
+}
+
 /// Bridge a mapped call to a legacy CallCell slice entry. Load the current entry
 /// on every invocation so definition replacement and invalidation stay visible.
 /// The recovery toggle enables legacy fault handling only during the cell call;
