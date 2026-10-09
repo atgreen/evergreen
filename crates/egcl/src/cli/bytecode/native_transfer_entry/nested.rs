@@ -15,11 +15,7 @@ pub(super) struct SegmentActivations {
 impl TraceHostRoots for SegmentActivations {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         for child in &mut self.active {
-            child.snapshots.trace_host_roots(visit);
-            child.cleanups.trace_host_roots(visit);
-            child.prepared_handler.trace_host_roots(visit);
-            child.prepared_catch.trace_host_roots(visit);
-            child.restart_templates.trace_host_roots(visit);
+            child.state.trace_host_roots(visit);
         }
     }
 }
@@ -28,17 +24,9 @@ struct ChildActivation {
     code: Rc<TransferCode>,
     parent: *mut CaptureContext,
     context: Option<CaptureContext>,
-    snapshots: Vec<SysvSiteSnapshot>,
-    cleanups: Vec<SavedCleanup>,
-    catches: Vec<SavedCatch>,
-    handlers: Vec<SavedHandler>,
-    handler_binds: Vec<SavedHandlerBind>,
-    restart_cases: Vec<SavedRestartCase>,
-    restart_templates: RestartFunctionTemplates,
-    dynamic_scopes: Vec<DynamicScope>,
-    cluster_frames: Vec<(u32, *mut Frame)>,
-    prepared_handler: Option<PreparedHandler>,
-    prepared_catch: Option<PreparedCatch>,
+    state: ActivationState,
+    frame: Option<*mut Frame>,
+    previous_frame: *const Frame,
 }
 
 #[cfg(test)]
@@ -111,30 +99,17 @@ unsafe fn prepare_child(cell: u64, record: *mut MappedCallRecord) -> Result<Egcl
         unsafe { std::slice::from_raw_parts(request.args, request.nargs) }
     };
     validate_declared_args(&code.body, args)?;
-    let snapshots = code
-        .sites
-        .sites()
-        .map(|site| site.reserve_snapshot())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| invalid_capture())?;
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    let state = ActivationState::prepare(&code, env)?;
     let children = unsafe { (*parent).children };
-    // No borrow of the scanner's container spans compilation or Lisp work.
     unsafe { (*children).active.try_reserve(1) }.map_err(|_| EgclError::Oom)?;
     let mut child = Box::new(ChildActivation {
         code,
         parent,
         context: None,
-        snapshots,
-        cleanups: Vec::new(),
-        catches: Vec::new(),
-        handlers: Vec::new(),
-        handler_binds: Vec::new(),
-        restart_cases: Vec::new(),
-        restart_templates: RestartFunctionTemplates(Vec::new()),
-        dynamic_scopes: Vec::new(),
-        cluster_frames: Vec::new(),
-        prepared_handler: None,
-        prepared_catch: None,
+        state,
+        frame: None,
+        previous_frame: egcl_rt::current_stack().fp(),
     });
     let stack = egcl_rt::current_stack();
     let Some(frame) = stack.push_frame(
@@ -148,50 +123,8 @@ unsafe fn prepare_child(cell: u64, record: *mut MappedCallRecord) -> Result<Egcl
     // Fixed positional slots only. No operation from here through publication
     // can allocate, signal, yield or fail, so no partial frame can escape.
     bind_params(&child.code.body, frame, args, None);
-    child.context = Some(CaptureContext {
-        children,
-        nested: record,
-        owner: Rc::as_ptr(&child.code),
-        completed_deopt: false,
-        recursive_enabled: false,
-        recursive_generation: 0,
-        recursive: std::ptr::null_mut(),
-        recursive_escape: false,
-        handlers: &mut child.handlers,
-        handler_binds: &mut child.handler_binds,
-        restart_cases: &mut child.restart_cases,
-        restart_templates: &child.restart_templates,
-        dynamic_scopes: &mut child.dynamic_scopes,
-        cluster_frames: &mut child.cluster_frames,
-        prepared_handler: &mut child.prepared_handler,
-        #[cfg(test)]
-        unavailable_catch: None,
-        #[cfg(test)]
-        unavailable_handler: None,
-        prepared_catch: &mut child.prepared_catch,
-        frame,
-        body: child.code.body.as_ref(),
-        catches: &mut child.catches,
-        completed_cleanup: None,
-        landing_stub: child.code.landing.as_ptr(),
-        landing: SysvNativeLanding {
-            stack_pointer: std::ptr::null_mut(),
-            entry: std::ptr::null(),
-        },
-        dispatch: DispatchPacket {
-            entry: std::ptr::null(),
-            request: std::ptr::null_mut(),
-        },
-        cleanups: &mut child.cleanups,
-        cleanup_depths: &child.code.cleanup_depths,
-        code_base: child.code.code.as_ptr() as usize,
-        sites: &child.code.sites,
-        snapshots: child.snapshots.as_mut_ptr().cast(),
-        activation: unsafe { frame.add(1).cast() },
-        slots: usize::from(child.code.slots),
-        selected: None,
-        failure: None,
-    });
+    child.frame = Some(frame);
+    child.context = Some(child.state.context(&child.code, frame, children, record));
     let context = child.context.as_mut().unwrap() as *mut CaptureContext;
     let owner = &mut *child as *mut ChildActivation;
     unsafe {
@@ -220,7 +153,6 @@ pub(super) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
     let context = child.context.as_mut().unwrap();
     assert_eq!(CAPTURE.with(Cell::get), context as *mut CaptureContext);
     let stack = egcl_rt::current_stack();
-    assert_eq!(stack.fp(), context.frame);
     let children = context.children;
     let parent = child.parent;
     if let Some(failure) = context.failure.take() {
@@ -228,7 +160,22 @@ pub(super) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
             (*parent).failure.get_or_insert(failure);
         }
     }
-    stack.pop_frame();
+    // Scope ownership may already have moved to the interpreter. Its handoff
+    // clears these ledgers before Lisp runs, preventing duplicate retirement.
+    let env = NATIVE_ENV.with(Cell::get);
+    drop(DynamicScopeGuard {
+        env,
+        scopes: &mut child.state.dynamic_scopes,
+    });
+    drop(CatchScopeGuard {
+        env,
+        base: child.state.catch_base,
+    });
+    if let Some(frame) = child.frame.take() {
+        assert_eq!(stack.fp(), frame);
+        stack.pop_frame();
+    }
+    assert_eq!(stack.fp(), child.previous_frame);
     CAPTURE.with(|slot| slot.set(parent));
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() - 1));
     let retired = unsafe { (*children).active.pop() }.expect("active child owner");
@@ -237,4 +184,56 @@ pub(super) unsafe extern "C" fn finish_nested(record: *mut MappedCallRecord) {
         (*record).owner = std::ptr::null_mut();
     }
     drop(retired);
+}
+
+/// The child's machine frames are already gone. Resume its captured logical
+/// continuation through Rust before deciding whether the caller must unwind.
+pub(super) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
+    let owner = unsafe { (*record).owner.cast::<ChildActivation>() };
+    egcl_rt::rooted!(
+        result = guard_c2i(|| {
+            // Retain only stable pointers and an independent code handle across
+            // allocating Lisp; the root scanner may mutate the child's state.
+            let code = unsafe { Rc::clone(&(*owner).code) };
+            let context = unsafe { (*owner).context.as_mut().unwrap() as *mut CaptureContext };
+            if unsafe { (*context).failure.is_some() } {
+                return Err(invalid_capture());
+            }
+            let error = NATIVE_ERROR
+                .with(|slot| slot.take())
+                .ok_or_else(invalid_capture)?;
+            // Scope-free children have nothing to reconstruct or execute on
+            // escape. Preserve their direct native propagation to the caller.
+            if scope_free_native_body(&code.body, true) {
+                return Err(error);
+            }
+            unsafe {
+                code.resume_transfer(
+                    context,
+                    &mut (*owner).frame,
+                    &mut *NATIVE_ENV.with(Cell::get),
+                    error,
+                )
+            }
+        })
+    );
+    unsafe {
+        finish_nested(record);
+    }
+    let outcome = match std::mem::replace(&mut *result, Ok(NIL)) {
+        Ok(value) => NativeOutcome {
+            value,
+            exit: NativeExit::Returned,
+        },
+        Err(error) => {
+            NATIVE_ERROR.with(|slot| slot.set_first(error));
+            NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Transfer,
+            }
+        }
+    };
+    unsafe {
+        (*record).outcome = outcome;
+    }
 }

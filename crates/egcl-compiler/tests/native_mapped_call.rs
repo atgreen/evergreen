@@ -94,6 +94,7 @@ fn mapped_preparation_distinguishes_entry_decline_and_failure() {
         0x1234,
         prepare,
         finish,
+        finish,
         legacy as *const u8,
         capture as *const u8,
     ))

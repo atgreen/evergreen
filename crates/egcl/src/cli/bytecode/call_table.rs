@@ -234,9 +234,8 @@ impl egcl_rt::gc::TraceHostRoots for MappedCallee {
     }
 }
 
-/// Admit only a warmed, fully promoted definition. Cold resolution and T0/T1
-/// promotion keep using the existing cell; this cache owns a mapped form of
-/// that exact T2 body, not an independent tier or dispatch decision.
+/// Admit a warmed mapped baseline or a mapped form of the exact installed T2
+/// body. Cold resolution and pending promotion still use the existing cell.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     let state = unsafe { state(cell) };
@@ -247,11 +246,24 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     let Target::Native {
         code,
         function,
-        promote: false,
+        promote,
     } = target
     else {
         return None;
     };
+    if promote && promotion_due(function) {
+        return None;
+    }
+    if let NativeCodeStorage::Mapped(mapped) = &code._storage {
+        let body = code.body.as_ref()?;
+        if !super::native_transfer_entry::fixed_tagged_parameters(body) {
+            return None;
+        }
+        return Some(MappedCallee {
+            code: Rc::clone(mapped),
+            function,
+        });
+    }
     if !code.is_t2 {
         return None;
     }
@@ -336,6 +348,11 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     Ok(*result)
 }
 
+fn promotion_due(function: EgclVal) -> bool {
+    egcl_rt::function::invoke_count(function).saturating_add(1) >= t2_invoke_threshold()
+        || egcl_rt::function::back_edge_count(function) >= t2_backedge_threshold()
+}
+
 fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     #[cfg(test)]
     GENERAL_DISPATCHES.with(|count| count.set(count.get() + 1));
@@ -359,11 +376,7 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             if !arity_accepts(body, args.len()) {
                 return cold(state, args);
             }
-            if promote
-                && (egcl_rt::function::invoke_count(*function).saturating_add(1)
-                    >= t2_invoke_threshold()
-                    || egcl_rt::function::back_edge_count(*function) >= t2_backedge_threshold())
-            {
+            if promote && promotion_due(*function) {
                 return cold(state, args);
             }
             if !profiling_disabled() {

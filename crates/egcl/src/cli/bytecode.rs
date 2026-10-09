@@ -1739,7 +1739,14 @@ fn lisp_native_listing(_: &[u8], _: &mut super::Env) -> Option<String> {
 fn format_native_listing(nc: &NativeCode, env: Option<&mut super::Env>) -> String {
     use std::fmt::Write;
     let mut out = String::new();
-    if nc.is_t2 {
+    let mapped_baseline = match &nc._storage {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        NativeCodeStorage::Mapped(_) => true,
+        NativeCodeStorage::Checked { .. } => false,
+    };
+    if mapped_baseline {
+        out.push_str("; T1 — tagged baseline native with mapped exceptional transfers.\n");
+    } else if nc.is_t2 {
         out.push_str("; T2 — profile-guided native: speculates the dominant observed operand\n");
         out.push_str("; types and monomorphic dispatch; a failed guard deoptimises to T0.\n");
     } else {
@@ -18211,13 +18218,21 @@ fn materialize_t2_deopt_scopes(
 /// code addresses it through the frame-slot pointer passed in rdi (§D2.04).
 // Direct-call contract fields remain part of installed metadata on all targets.
 // Only the x86-64 emitter currently consumes them for direct native calls.
+enum NativeCodeStorage {
+    Checked {
+        _buffer: egcl_rt::jit::JitBuffer,
+    },
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    Mapped(Rc<native_transfer_entry::TransferCode>),
+}
+
 struct NativeCode {
     /// Name snapshots addressed by emitted environment accesses.
     _env_names: Box<NativeEnvNames>,
     /// Stable linkage words embedded in this code; cells do not own code.
     _call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
-    /// Retain executable pages while activations and embedded callers own this code.
-    _buffer: egcl_rt::jit::JitBuffer,
+    /// Retain the exact executable representation selected at installation.
+    _storage: NativeCodeStorage,
     /// The exact metadata and constant slots this machine code was built from.
     /// Only synthetic signal-recovery test adapters have no bytecode body.
     body: Option<Arc<BytecodeFunction>>,
@@ -18281,6 +18296,8 @@ struct NativeCode {
 }
 
 const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const MAPPED_TRANSFER_ABI_VERSION: u16 = 2;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_TRANSFER_ARCH: u16 = 0x8664;
@@ -19916,7 +19933,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let nc = Rc::new(NativeCode {
         _env_names: artifact.env_names,
         _call_cells: artifact.call_cells,
-        _buffer: buf,
+        _storage: NativeCodeStorage::Checked { _buffer: buf },
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -20234,6 +20251,10 @@ fn run_native(
     egcl_rt::rooted!(_active_callable_root = ActiveCallableRoot(sym));
     #[cfg(test)]
     call_table::record_target_lookup();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let NativeCodeStorage::Mapped(code) = &nc._storage {
+        return code.run(args, env);
+    }
     // The segment ABI carries exceptional exits out-of-band through its cold
     // landing path, so it does not need the legacy post-call transfer poll.
     // Keep rollout explicit while native Windows and hardening gates are still
@@ -22154,7 +22175,16 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         has_deopt,
         direct_calls,
-    } = emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false)?;
+    } = match emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false) {
+        Some(emission) => emission,
+        None => {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if native_transfer_entry::installation_enabled() {
+                return native_transfer_entry::install_baseline(sym, bf);
+            }
+            return None;
+        }
+    };
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
@@ -22172,7 +22202,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     let nc = Rc::new(NativeCode {
         _env_names: env_names,
         _call_cells: Vec::new(),
-        _buffer: buf,
+        _storage: NativeCodeStorage::Checked { _buffer: buf },
         body: Some(bf),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -24868,7 +24898,7 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
-            _buffer: buf,
+            _storage: NativeCodeStorage::Checked { _buffer: buf },
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -24937,7 +24967,7 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
-            _buffer: buf,
+            _storage: NativeCodeStorage::Checked { _buffer: buf },
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,

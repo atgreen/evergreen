@@ -6,6 +6,8 @@ use super::super::native_transfer_entry::{
 };
 use super::*;
 
+mod protected;
+
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_distinct_callees_share_segment_and_unwind_into_caller() {

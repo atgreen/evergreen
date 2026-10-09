@@ -25,11 +25,13 @@ pub type FinishMappedCall = unsafe extern "C" fn(*mut MappedCallRecord);
 /// failed preparation captures the original caller without invoking the target.
 /// Child escape lands in this caller-owned veneer, so retirement may release
 /// child executable storage without unmapping a live return address.
-/// Both retirement and restoration must neither collect nor change MV.
+/// Normal retirement must neither collect nor change MV. Cold resumption may
+/// run Lisp and must publish a rooted outcome before retiring the child.
 pub fn emit_mapped_call_veneer(
     cell: u64,
     prepare: PrepareMappedCall,
     finish: FinishMappedCall,
+    resume: FinishMappedCall,
     legacy: *const u8,
     capture: *const u8,
 ) -> Vec<u8> {
@@ -55,6 +57,7 @@ pub fn emit_mapped_call_veneer(
     let mut a = Asm::new();
     let fallback = a.label();
     let escape = a.label();
+    let returned = a.label();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x83, 0xec, SIZE]);
     capture_stack_word(&mut a, false, 7, 0);
     for (index, reg) in [3, 5, 12, 13, 14, 15].into_iter().enumerate() {
@@ -81,6 +84,7 @@ pub fn emit_mapped_call_veneer(
     a.extend_from_slice(&[0x48, 0x89, 0xe7]);
     target(&mut a, finish as usize);
     a.extend_from_slice(&[0xff, 0xd0]);
+    a.bind(returned);
     restore(&mut a);
     capture_stack_word(&mut a, true, 0, 88);
     a.extend_from_slice(&[0x48, 0x83, 0xc4, SIZE, 0xc3]);
@@ -89,10 +93,11 @@ pub fn emit_mapped_call_veneer(
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
     capture_stack_word(&mut a, false, 0, 88);
     a.extend_from_slice(&[0x48, 0x89, 0xe7]);
-    target(&mut a, finish as usize);
+    target(&mut a, resume as usize);
     a.extend_from_slice(&[0xff, 0xd0]);
-    a.extend_from_slice(&[0xb8, 1, 0, 0, 0]); // NativeExit::Transfer
-    capture_stack_word(&mut a, false, 0, 96);
+    capture_stack_word(&mut a, true, 0, 96);
+    a.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    a.jcc(Cc::E, returned);
     a.bind(escape);
     restore(&mut a);
     capture_stack_word(&mut a, true, 7, 0);
