@@ -279,3 +279,5 @@ fn native_v2_bridge_preserves_throw_multiple_values_and_first_error() {
 pub(super) fn pause_child_for_test() -> Result<EgclVal, EgclError> {
     nested::fibers::pause()
 }
+
+pub(in crate::cli) use nested::reentry::{NativeEvalProbe, native_reentry_event_for_test};
