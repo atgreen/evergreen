@@ -129,6 +129,14 @@ impl NativeSegment {
     pub fn stack_watermark(&self) -> (*const u8, *const Frame) {
         (self.stack_sp, self.stack_fp)
     }
+
+    /// Return address the entry stub's CALL pushed for this segment's generated
+    /// code. Physical frame walks end at this PC with `saved_sp`; cold transfers
+    /// land at `landing_pc`, which follows the stub's 2-byte `xor edx, edx`.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub fn return_pc(&self) -> usize {
+        self.landing_pc - 2
+    }
 }
 
 // SAFETY: only the owning execution accesses its slot. An anchor stays pinned

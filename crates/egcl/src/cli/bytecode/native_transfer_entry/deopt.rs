@@ -90,7 +90,17 @@ fn note_segment_deopt(code: &TransferCode) {
     }
 }
 
-pub(super) unsafe extern "C" fn resume_guard(request: *mut u8, out: *mut NativeOutcome) {
+pub(super) unsafe extern "C" fn resume_guard(
+    request: *mut u8,
+    out: *mut NativeOutcome,
+    image: *mut egcl_compiler::t2::native_transfer::SysvTransferCapture,
+) {
+    unsafe {
+        super::root_publication::published(image, || resume_guard_unpublished(request, out))
+    }
+}
+
+unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
     let request = unsafe { &*request.cast::<TransferDeoptRequest>() };
     let context = CAPTURE.with(Cell::get);
     let owner = unsafe { (*context).owner };
