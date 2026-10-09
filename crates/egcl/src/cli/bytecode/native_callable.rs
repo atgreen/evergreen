@@ -22,6 +22,25 @@ static COLLECT_NEXT: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bo
 static MOVED: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
 #[cfg(test)]
+static FAIL_NEXT_POLL: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
+#[cfg(test)]
+pub(super) fn fail_next_entry_poll() {
+    FAIL_NEXT_POLL.with(|flag| flag.set(true));
+}
+#[cfg(test)]
+pub(super) fn inject_entry_poll_error() {
+    if FAIL_NEXT_POLL.with(|flag| flag.replace(false)) {
+        assert_eq!(native_transfer_entry::pending_argument_count(), 1);
+        NATIVE_ERROR.with(|slot| {
+            slot.set_first(EgclError::ProgramError(
+                "injected callable poll transfer".into(),
+            ))
+        });
+    }
+}
+
+#[cfg(test)]
 pub(super) fn collect_next_entry() {
     COLLECT_NEXT.with(|flag| flag.set(true));
     MOVED.with(|flag| flag.set(false));
@@ -81,9 +100,14 @@ pub(super) fn entries_for(function: EgclVal) -> Option<&'static NativeCallableEn
 }
 
 unsafe extern "C" fn interpreted(target: u64, record: *mut MappedCallRecord) {
-    let invocation = unsafe { &*(*record).context };
     egcl_rt::rooted!(function = unsafe { *(target as *const EgclVal) });
-    let args = if invocation.nargs == 0 {
+    egcl_rt::rooted!(
+        owned_arguments = unsafe { native_transfer_entry::take_call_arguments(record) }
+    );
+    let invocation = unsafe { &*(*record).context };
+    let args = if let Some(values) = owned_arguments.as_ref() {
+        &values[1..]
+    } else if invocation.nargs == 0 {
         &[]
     } else {
         unsafe { std::slice::from_raw_parts(invocation.args, invocation.nargs) }

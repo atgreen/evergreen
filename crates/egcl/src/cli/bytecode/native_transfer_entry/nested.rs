@@ -11,13 +11,88 @@ use egcl_rt::gc::TraceHostRoots;
 pub(super) struct SegmentActivations {
     #[allow(clippy::vec_box)] // generated records and CAPTURE retain these addresses
     active: Vec<Box<ChildActivation>>,
+    pending_arguments: Vec<PendingArguments>,
 }
 impl TraceHostRoots for SegmentActivations {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         for child in &mut self.active {
             child.state.trace_host_roots(visit);
         }
+        for arguments in &mut self.pending_arguments {
+            arguments.values.trace_host_roots(visit);
+        }
     }
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn pending_argument_count() -> usize {
+    let capture = CAPTURE.with(Cell::get);
+    if capture.is_null() {
+        0
+    } else {
+        unsafe { (*(*capture).children).pending_arguments.len() }
+    }
+}
+
+/// The context is stable caller-owned stack storage. The values' allocation
+/// stays fixed until callable preparation binds a frame or takes Rust ownership.
+struct PendingArguments {
+    context: *mut egcl_rt::call_table::NativeCallContext,
+    values: Vec<EgclVal>,
+}
+
+pub(in crate::cli::bytecode) unsafe fn take_call_arguments(
+    record: *mut MappedCallRecord,
+) -> Option<Vec<EgclVal>> {
+    let capture = CAPTURE.with(Cell::get);
+    if capture.is_null() {
+        return None;
+    }
+    let context = unsafe { (*record).context };
+    let pending = unsafe { &mut (*(*capture).children).pending_arguments };
+    let index = pending
+        .iter()
+        .position(|arguments| arguments.context == context)?;
+    let arguments = pending.swap_remove(index);
+    unsafe {
+        assert_eq!((*context).args, arguments.values.as_ptr().add(1).cast_mut());
+        (*context).args = std::ptr::null_mut();
+        (*context).nargs = 0;
+        (*record).target = 0;
+    }
+    Some(arguments.values)
+}
+
+unsafe fn prepare_apply(record: *mut MappedCallRecord) -> Result<EgclVal, EgclError> {
+    let capture = CAPTURE.with(Cell::get);
+    if capture.is_null() {
+        return Err(invalid_capture());
+    }
+    let context = unsafe { (*record).context };
+    let invocation = unsafe { &mut *context };
+    let args = unsafe { std::slice::from_raw_parts(invocation.args, invocation.nargs) };
+    let Some(entries) = super::super::native_callable::entries_for(args[0]) else {
+        return Ok(NIL);
+    };
+    // The same list expansion as interpreted APPLY. Only Rust storage allocates
+    // here; root it before registering the buffer for the next entry's poll.
+    egcl_rt::rooted!(values = args[..args.len() - 1].to_vec());
+    values.extend(list_to_vec(args[args.len() - 1]));
+    let pending = unsafe { &mut (*(*capture).children).pending_arguments };
+    assert!(!pending.iter().any(|arguments| arguments.context == context));
+    pending.try_reserve(1).map_err(|_| EgclError::Oom)?;
+    let target = values.as_mut_ptr();
+    invocation.args = unsafe { target.add(1) };
+    invocation.nargs = values.len() - 1;
+    pending.push(PendingArguments {
+        context,
+        values: std::mem::take(&mut *values),
+    });
+    unsafe {
+        (*record).target = target as u64;
+        (*record).forward = entries;
+    }
+    Ok(NIL)
 }
 
 struct ChildActivation {
@@ -63,6 +138,9 @@ pub(super) unsafe extern "C" fn prepare_nested(cell: u64, record: *mut MappedCal
                 return Ok(NIL);
             }
         }
+        if call_table::is_builtin_apply(cell) && invocation.nargs >= 2 {
+            return prepare_apply(record);
+        }
         prepare_child(record, || call_table::mapped_callee(cell))
     });
 }
@@ -71,6 +149,8 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn prepare_callable(
     target: u64,
     record: *mut MappedCallRecord,
 ) {
+    #[cfg(test)]
+    super::super::native_callable::inject_entry_poll_error();
     prepare_call(record, || unsafe {
         #[cfg(test)]
         super::super::native_callable::collect_at_entry(target)?;
@@ -99,6 +179,7 @@ fn prepare_call(
         };
         poll_or_transfer(std::ptr::null_mut(), &mut (*record).outcome);
         if (*record).outcome.exit != NativeExit::Returned {
+            drop(take_call_arguments(record));
             return;
         }
     }
@@ -107,6 +188,7 @@ fn prepare_call(
         NATIVE_ERROR.with(|slot| slot.set_first(error));
         unsafe {
             (*record).outcome.exit = NativeExit::Transfer;
+            drop(take_call_arguments(record));
         }
     }
 }
@@ -163,6 +245,8 @@ unsafe fn prepare_child(
     // Fixed positional slots only. No operation from here through publication
     // can allocate, signal, yield or fail, so no partial frame can escape.
     bind_params(&child.code.body, frame, args, None);
+    // The scanned frame now owns independent copies of every argument.
+    drop(unsafe { take_call_arguments(record) });
     child.frame = Some(frame);
     child.context = Some(child.state.context(&child.code, frame, children, record));
     let context = child.context.as_mut().unwrap() as *mut CaptureContext;

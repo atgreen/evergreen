@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn native_v2_funcall_enters_exact_mapped_callable_and_preserves_caller_capture() {
+fn native_v2_funcall_and_apply_enter_exact_mapped_callable_and_preserve_caller_capture() {
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -30,6 +30,16 @@ fn native_v2_funcall_enters_exact_mapped_callable_and_preserves_caller_capture()
             "CALLABLE-WIDE",
             "(x fail a b)",
             "(funcall function x fail 1 2)",
+        ),
+        (
+            "CALLABLE-SMALL",
+            "(x fail)",
+            "(apply function (list x fail))",
+        ),
+        (
+            "CALLABLE-WIDE",
+            "(x fail a b)",
+            "(apply function x fail (list 1 2))",
         ),
     ] {
         install_t2(
@@ -70,14 +80,14 @@ fn native_v2_funcall_enters_exact_mapped_callable_and_preserves_caller_capture()
             );
             assert!(
                 take_nested_entries() > 0,
-                "FUNCALL must enter its mapped target in the caller's segment"
+                "{invocation} must enter its mapped target in the caller's segment"
             );
             assert!(egcl_rt::function::native_entries(*function).is_some());
         }
     }
     assert_eq!(
         super::super::super::super::read_eval_all_env("*callable-cleanups*", &mut env).unwrap(),
-        EgclVal::from_fixnum(6)
+        EgclVal::from_fixnum(12)
     );
     assert_eq!(
         super::super::super::super::read_eval_all_env("*callable-after*", &mut env).unwrap(),
@@ -93,26 +103,28 @@ fn native_v2_callable_slot_reloads_a_moving_builtin_wrapper() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    let code = compile_caller("(function x)", "((funcall function x))", &env);
-    egcl_rt::rooted!(
-        prototype = super::super::super::super::read_eval_all_env("#'list", &mut env).unwrap()
-    );
-    assert!(
-        prototype.is_cons(),
-        "fixture must use the movable wrapper representation"
-    );
-    let (head, identity) = cp(*prototype);
-    // Preserve the wrapper identity while giving this call a fresh nursery
-    // object; the shared builtin-wrapper cache may already be tenured.
-    egcl_rt::rooted!(function = super::super::super::super::arena_cons(head, identity));
-    egcl_rt::rooted!(args = vec![*function, EgclVal::from_fixnum(42)]);
-    native_callable::collect_next_entry();
-    egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
-    assert!(
-        native_callable::take_relocation(),
-        "callable must move during entry preparation"
-    );
-    assert_eq!(cp(*result), (EgclVal::from_fixnum(42), NIL));
+    for form in ["((funcall function x))", "((apply function x nil))"] {
+        let code = compile_caller("(function x)", form, &env);
+        egcl_rt::rooted!(
+            prototype = super::super::super::super::read_eval_all_env("#'list", &mut env).unwrap()
+        );
+        assert!(
+            prototype.is_cons(),
+            "fixture must use the movable wrapper representation"
+        );
+        let (head, identity) = cp(*prototype);
+        // Preserve the wrapper identity while giving this call a fresh nursery
+        // object; the shared builtin-wrapper cache may already be tenured.
+        egcl_rt::rooted!(function = super::super::super::super::arena_cons(head, identity));
+        egcl_rt::rooted!(args = vec![*function, EgclVal::from_fixnum(42)]);
+        native_callable::collect_next_entry();
+        egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
+        assert!(
+            native_callable::take_relocation(),
+            "callable must move during entry preparation"
+        );
+        assert_eq!(cp(*result), (EgclVal::from_fixnum(42), NIL));
+    }
 }
 
 #[test]
@@ -194,5 +206,73 @@ fn native_v2_callable_adapters_preserve_old_definitions_and_closure_captures() {
             .run(&[EgclVal::from_fixnum(7), NIL], &mut env)
             .unwrap(),
         super::super::super::super::resolve_sym(":TYPE").unwrap()
+    );
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_apply_releases_arguments_before_parent_continues() {
+    let _lock = super::super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::super::read_eval_all_env(
+        "(defun apply-check (x) (%native-reentry-event-for-test 0) x)
+         (defun apply-zero () 42)
+         (defun apply-fixnum (x) (declare (type fixnum x)) x)",
+        &mut env,
+    )
+    .unwrap();
+    install_t2("APPLY-ZERO", "()", "(42)", &env);
+    install_t2("APPLY-FIXNUM", "(x)", "((declare (type fixnum x)) x)", &env);
+    egcl_rt::rooted!(
+        zero = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("APPLY-ZERO")).unwrap()
+    );
+    let code = compile_caller(
+        "(function args)",
+        "((handler-case (apply-check (apply function args)) (error () (apply-check :failed))))",
+        &env,
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            code.run(&[*zero, NIL], &mut env).unwrap(),
+            EgclVal::from_fixnum(42)
+        );
+    }
+    let old_depth = NATIVE_DEPTH.with(|depth| depth.replace(native_depth_cap() - 1));
+    let fallback = code.run(&[*zero, NIL], &mut env);
+    NATIVE_DEPTH.with(|depth| depth.set(old_depth));
+    assert_eq!(fallback.unwrap(), EgclVal::from_fixnum(42));
+    let failed = super::super::super::super::resolve_sym(":FAILED").unwrap();
+    egcl_rt::rooted!(one_arg = super::super::super::super::arena_cons(NIL, NIL));
+    egcl_rt::rooted!(
+        number =
+            egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("APPLY-FIXNUM")).unwrap()
+    );
+    for (index, function) in [*zero, *number, EgclVal::from_fixnum(7)]
+        .into_iter()
+        .enumerate()
+    {
+        let args = if index == 2 { NIL } else { *one_arg };
+        assert_eq!(code.run(&[function, args], &mut env).unwrap(), failed);
+    }
+    native_callable::fail_next_entry_poll();
+    assert_eq!(code.run(&[*zero, NIL], &mut env).unwrap(), failed);
+    assert_eq!(
+        code.run(&[*zero, NIL], &mut env).unwrap(),
+        EgclVal::from_fixnum(42)
+    );
+    let repeated = compile_caller(
+        "(function)",
+        "((dotimes (i 40) (apply-check (apply function 1 2 (list 3)))) (apply-check 42))",
+        &env,
+    );
+    egcl_rt::rooted!(
+        list = super::super::super::super::read_eval_all_env("#'list", &mut env).unwrap()
+    );
+    assert_eq!(
+        repeated.run(&[*list], &mut env).unwrap(),
+        EgclVal::from_fixnum(42)
     );
 }
