@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep eligible calls between distinct T2 definitions inside opt-in native
+  transfer segments, preserving multiple values, moving GC roots, caller
+  handlers, and active function replacement
+  ([#165](https://github.com/atgreen/evergreen/pull/165)).
+
 - Route opt-in native segment calls through live linkage cells, preserving
   warmed dispatch, function replacement, multiple values, and native cleanup
   across legacy calls and Rust reentry
