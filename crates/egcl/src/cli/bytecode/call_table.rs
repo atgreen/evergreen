@@ -345,14 +345,17 @@ extern "C" fn warm_register(cell: u64, n: u64, a0: u64, a1: u64, a2: u64, _: u64
 fn registers(cell: u64, n: u64, args: [EgclVal; 3], ready: bool) -> u64 {
     with_register_args(n, args, |args| invoke(cell, args, ready))
 }
-fn with_register_args(n: u64, mut args: [EgclVal; 3], call: impl FnOnce(&[EgclVal]) -> u64) -> u64 {
+fn with_register_args(n: u64, args: [EgclVal; 3], call: impl FnOnce(&[EgclVal]) -> u64) -> u64 {
     if n > 3 {
         return NIL.0;
     }
     // The native ABI leaves unused argument registers unspecified. They must
     // never enter the precise root set, even though the callee ignores them.
-    args[n as usize..].fill(NIL);
-    egcl_rt::rooted!(args = args);
+    egcl_rt::rooted!(args = [
+        if n > 0 { args[0] } else { NIL },
+        if n > 1 { args[1] } else { NIL },
+        if n > 2 { args[2] } else { NIL },
+    ]);
     call(&args[..n as usize])
 }
 extern "C" fn cold_slice(cell: u64, n: u64, args: *const EgclVal, _: u64) -> u64 {
