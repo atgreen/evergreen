@@ -723,6 +723,89 @@ mod tests {
         assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(1); FIBERS]);
     }
 
+    /// Every relocatable value is recorded in an activation slot, so the
+    /// published walk currently reaches no root the EgclStack scan does not.
+    ///
+    /// This is forced by the lowerer, not incidental: `for_call` rejects a
+    /// moving value with no shadow (`MissingRoot`), and whenever a shadow
+    /// exists the location is `Activation`, making the `Register`/`Stack`
+    /// arms unreachable for anything that can move.
+    ///
+    /// The walk is therefore additive-by-construction today, which is exactly
+    /// why shadow synchronization cannot yet be removed (bliss-shih7.2.7.3),
+    /// and why a crossing's negative control is unwritable
+    /// (bliss-shih7.2.7.3.2.1). When the lowerer stops shadowing every moving
+    /// value, this test flips and the walk becomes load-bearing — so a failure
+    /// here is news, not a regression.
+    #[test]
+    fn relocatable_values_live_only_in_activation_slots_for_now() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        crate::cli::read_eval_all_env(
+            "(defun publication-callee (y) y)
+             (defun publication-callee2 (a b) (cons a b))", &mut env).unwrap();
+        let shapes = [
+            // a plain mapped call with a value live across it
+            ("MAPPED", "(x)", "((progn (publication-callee x) (car x)))"),
+            // a loop poll, the shape every other fixture here uses
+            ("POLL", "(x)",
+             "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"),
+            // several simultaneously live heap values across two calls
+            ("MANYLIVE", "(x)",
+             "((let ((a (cons x x)) (b (cons x nil)) (c (list x x)))
+                 (publication-callee2 a b) (publication-callee c) (list a b c)))"),
+        ];
+        let mut non_activation = 0;
+        let mut frames = 0;
+        for (name, params, forms) in shapes {
+            egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
+            egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
+            let Some(body) = compile_function(
+                &format!("PUBLICATION-SHAPE-{name}"), *params, *forms, &env, false, false)
+            else {
+                panic!("{name}: fixture must compile");
+            };
+            let Some(code) = TransferCode::compile(Arc::new(body)) else {
+                eprintln!("  {name}: not admitted for native transfer, skipped");
+                continue;
+            };
+            for site in code._native_calls.iter() {
+                let described = match code._native_calls.value_map(site.return_offset) {
+                    Some(NativeCallValues::Frame(map)) => {
+                        frames += 1;
+                        let mut act = 0;
+                        let mut stk = 0;
+                        let mut reg = 0;
+                        let mut other = 0;
+                        for location in map.gc_locations() {
+                            match location {
+                                NativeValueLocation::Activation(_) => act += 1,
+                                NativeValueLocation::Stack(_) => { stk += 1; non_activation += 1 }
+                                NativeValueLocation::Register(_) => { reg += 1; non_activation += 1 }
+                                _ => other += 1,
+                            }
+                        }
+                        format!("activation={act} stack={stk} register={reg} other={other}")
+                    }
+                    other => format!("{other:?}"),
+                };
+                eprintln!(
+                    "  {name} off={:<5} base={:?} origin={:?} -> {described}",
+                    site.return_offset, site.stack_base, site.origin,
+                );
+            }
+        }
+        assert!(frames > 0, "the shapes must produce real value maps");
+        assert_eq!(
+            non_activation, 0,
+            "a relocatable value now has a non-activation home: the published walk has become \
+             load-bearing, so revisit shadow removal (bliss-shih7.2.7.3) and the crossing's \
+             negative control (bliss-shih7.2.7.3.2.1)"
+        );
+    }
+
     /// An activation pointer is honoured only when a real frame header backs
     /// it on the owning stack and declares at least the addressed slots.
     #[test]
