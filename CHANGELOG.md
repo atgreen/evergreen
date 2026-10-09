@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Restore T2 leaf inlining and inlined-frame deoptimization for retained
+  function bodies, while preserving implicit `RETURN-FROM` semantics
+  ([#175](https://github.com/atgreen/evergreen/pull/175)).
+
 - Preserve saved compiled functions and their lexical captures across `DEFUN`,
   FASL reload, unbinding, and saved-image restoration. Saved images now use
   format 7; rebuild images created by earlier versions
