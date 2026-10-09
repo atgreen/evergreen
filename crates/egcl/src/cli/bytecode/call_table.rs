@@ -52,6 +52,10 @@ struct State {
     symbol: u32,
     cell: Arc<CallCell>,
     target: RefCell<Option<Target>>,
+    // Both slots belong to the same execution and keep stable Box addresses
+    // across fiber migration. Read the cell at entry, not the Env it held when
+    // this target was resolved: nested native activations replace that Env.
+    native_env: *const std::cell::Cell<*mut Env>,
     #[cfg(all(target_arch = "x86_64", unix))]
     #[allow(clippy::vec_box)] // generated entries embed stable descriptor addresses
     versions: RefCell<Vec<Box<super::call_table_native::NativeEntry>>>,
@@ -67,21 +71,23 @@ static SLOTS: egcl_rt::execution_local::ExecutionLocal<RefCell<Slots>> =
 
 /// Interpreter/legacy boundary entries. Their native callers do not perform
 /// Rust recovery toggles: the generated bridge owns that ABI conversion.
-fn bridge_entries() -> Option<[usize; 4]> {
+fn bridge_entries() -> Option<[usize; 6]> {
     let callbacks = [
         cold_register as *const () as usize,
         cold_slice as *const () as usize,
         warm_register as *const () as usize,
         warm_slice as *const () as usize,
+        builtin_register as *const () as usize,
+        builtin_slice as *const () as usize,
     ];
     #[cfg(all(target_arch = "x86_64", unix))]
     {
-        static BRIDGES: std::sync::OnceLock<Option<[egcl_rt::jit::JitBuffer; 4]>> =
+        static BRIDGES: std::sync::OnceLock<Option<[egcl_rt::jit::JitBuffer; 6]>> =
             std::sync::OnceLock::new();
         BRIDGES
             .get_or_init(|| {
                 let toggle = c2i_set_native_sigsegv_recovery as *const () as u64;
-                let mut buffers = Vec::with_capacity(4);
+                let mut buffers = Vec::with_capacity(callbacks.len());
                 for callback in callbacks {
                     let code =
                         egcl_compiler::t2::emit::emit_native_call_bridge(callback as u64, toggle)
@@ -111,6 +117,7 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
                 symbol,
                 cell,
                 target: RefCell::new(None),
+                native_env: NATIVE_ENV.with(std::ptr::from_ref),
                 #[cfg(all(target_arch = "x86_64", unix))]
                 versions: RefCell::new(Vec::new()),
                 #[cfg(all(target_arch = "x86_64", unix))]
@@ -226,7 +233,11 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     if target.is_some() {
         let entries = bridge_entries().expect("resolved cell owns installed bridges");
         #[allow(unused_mut)]
-        let mut native = [entries[2], entries[3]];
+        let mut native = if matches!(target, Some(Target::Builtin { .. })) {
+            [entries[4], entries[5]]
+        } else {
+            [entries[2], entries[3]]
+        };
         #[cfg(all(target_arch = "x86_64", unix))]
         if let Some(Target::Native {
             function,
@@ -255,6 +266,8 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
 }
 
 fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    #[cfg(test)]
+    GENERAL_DISPATCHES.with(|count| count.set(count.get() + 1));
     // Drop the RefCell borrow BEFORE a call can allocate, yield, redefine the
     // target or trigger the GC scanner. The clone keeps its old code alive.
     let target = { state.target.borrow().clone() };
@@ -330,11 +343,17 @@ extern "C" fn warm_register(cell: u64, n: u64, a0: u64, a1: u64, a2: u64, _: u64
     registers(cell, n, [EgclVal(a0), EgclVal(a1), EgclVal(a2)], true)
 }
 fn registers(cell: u64, n: u64, args: [EgclVal; 3], ready: bool) -> u64 {
+    with_register_args(n, args, |args| invoke(cell, args, ready))
+}
+fn with_register_args(n: u64, mut args: [EgclVal; 3], call: impl FnOnce(&[EgclVal]) -> u64) -> u64 {
     if n > 3 {
         return NIL.0;
     }
+    // The native ABI leaves unused argument registers unspecified. They must
+    // never enter the precise root set, even though the callee ignores them.
+    args[n as usize..].fill(NIL);
     egcl_rt::rooted!(args = args);
-    invoke(cell, &args[..n as usize], ready)
+    call(&args[..n as usize])
 }
 extern "C" fn cold_slice(cell: u64, n: u64, args: *const EgclVal, _: u64) -> u64 {
     slice(cell, n, args, false)
@@ -365,9 +384,56 @@ fn invoke(cell: u64, args: &[EgclVal], ready: bool) -> u64 {
     }))
 }
 
+extern "C" fn builtin_register(cell: u64, n: u64, a0: u64, a1: u64, a2: u64, _: u64) -> u64 {
+    with_register_args(n, [EgclVal(a0), EgclVal(a1), EgclVal(a2)], |args| {
+        invoke_builtin(cell, args)
+    })
+}
+
+extern "C" fn builtin_slice(cell: u64, n: u64, args: *const EgclVal, _: u64) -> u64 {
+    if n != 0 && args.is_null() {
+        return NIL.0;
+    }
+    // As in the general slice bridge, the caller's activation roots this slice.
+    let args = if n == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, n as usize) }
+    };
+    invoke_builtin(cell, args)
+}
+
+fn invoke_builtin(cell: u64, args: &[EgclVal]) -> u64 {
+    finish_c2i_call(guard_c2i(|| {
+        let state = unsafe { state(cell) };
+        // Copy just the builtin metadata and release its borrow before any
+        // allocation or Lisp reentry. Builtins have no callable object to root.
+        let builtin = match *state.target.borrow() {
+            Some(Target::Builtin { slot, nargs }) => Some((slot, nargs)),
+            _ => None,
+        };
+        let Some((slot, nargs)) = builtin else {
+            return cold(state, args);
+        };
+        if nargs != args.len() {
+            return cold(state, args);
+        }
+        // The owning execution cannot retire while one of its calls is active.
+        let env = unsafe { (*state.native_env).get() };
+        if env.is_null() {
+            return Ok(NIL);
+        }
+        match super::super::call_direct_builtin(slot, args, unsafe { &mut *env }) {
+            Some(result) => result,
+            None => cold(state, args),
+        }
+    }))
+}
+
 #[cfg(test)]
 thread_local! {
     static TARGET_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GENERAL_DISPATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -378,6 +444,36 @@ pub(super) fn record_target_lookup() {
 #[cfg(all(test, target_arch = "x86_64", unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unused_argument_registers_are_not_exposed_to_the_collector() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _thread = egcl_rt::thread::current_thread_id();
+        let used = EgclVal::from_char('z');
+        // These are deliberately not Lisp values. Inspect the root slots
+        // themselves: out-of-heap poison can be ignored by a normal GC and
+        // therefore would not reliably detect the invalid root publication.
+        let unused = [EgclVal(0xfafafafafafafafa), EgclVal(0xfbfbfbfbfbfbfbfa)];
+        for n in [0, 1] {
+            with_register_args(n, [used, unused[0], unused[1]], |args| {
+                assert_eq!(args.len(), n as usize);
+                let (mut found_used, mut found_unused) = (false, false);
+                egcl_rt::gc::with_heap_snapshot(|| unsafe {
+                    egcl_rt::gc::visit_delivery_host_roots(&[], &mut |slot| {
+                        let value = *slot;
+                        found_used |= slot == args.as_ptr().cast_mut() && value == used;
+                        found_unused |= unused.contains(&value);
+                    });
+                })
+                .unwrap();
+                assert!(!found_unused, "unused register words became precise GC roots");
+                assert_eq!(found_used, n != 0, "only supplied arguments may be rooted");
+                NIL.0
+            });
+        }
+    }
 
     #[test]
     fn warmed_native_slot_does_not_reenter_target_resolution() {
@@ -480,6 +576,7 @@ mod tests {
             assert!(matches!(*state.target.borrow(), Some(Target::Builtin { .. })));
             egcl_stdlib::set_gethash(args[0], *table, NIL).unwrap();
             TARGET_LOOKUPS.with(|count| count.set(0));
+            GENERAL_DISPATCHES.with(|count| count.set(0));
             for _ in 0..100 {
                 let entry = unsafe { &*cell.entry_address(false) }
                     .load(std::sync::atomic::Ordering::Acquire);
@@ -492,9 +589,61 @@ mod tests {
             }
             assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
                 "warmed GETHASH calls must not resolve their target again");
+            assert_eq!(GENERAL_DISPATCHES.with(|count| count.get()), 0,
+                "warmed builtins must bypass general target dispatch");
         }
         assert!(matches!(warm(state, &args[..1]), Err(EgclError::ProgramError(_))));
         assert!(matches!(warm(state, &[args[0], NIL]), Err(EgclError::TypeError { .. })));
+    }
+
+    #[test]
+    fn builtin_slice_reads_the_current_activation_environment() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut first = Env::new(false);
+        egcl_rt::rooted_ref!(_first_root = &mut first);
+        let mut second = Env::new(false);
+        egcl_rt::rooted_ref!(_second_root = &mut second);
+        let symbol = super::super::super::resolve_sym("VALUES")
+            .unwrap()
+            .as_symbol_index();
+        let cell = resolve(symbol).unwrap();
+        let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+        struct RestoreEnv(*mut Env);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                NATIVE_ENV.with(|slot| slot.set(self.0));
+            }
+        }
+        let _restore = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut first)));
+        let args = [1, 2, 3, 4].map(EgclVal::from_fixnum);
+        assert_eq!(cold(state, &args).unwrap(), args[0]);
+        first.clear_mv();
+        NATIVE_ENV.with(|slot| slot.set(&mut second));
+        GENERAL_DISPATCHES.with(|count| count.set(0));
+        for _ in 0..100 {
+            let entry = unsafe { &*cell.entry_address(true) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
+                unsafe { std::mem::transmute(entry) };
+            assert_eq!(call(Arc::as_ptr(&cell) as u64, 4, args.as_ptr(), 0), args[0].0);
+            assert_eq!(second.mv, args);
+            assert!(second.mv_active);
+            assert!(first.mv.is_empty());
+            assert!(!first.mv_active);
+        }
+        assert_eq!(GENERAL_DISPATCHES.with(|count| count.get()), 0);
+        // A new arity must re-resolve and install a usable zero-argument entry.
+        for _ in 0..2 {
+            let entry = unsafe { &*cell.entry_address(true) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
+                unsafe { std::mem::transmute(entry) };
+            assert_eq!(call(Arc::as_ptr(&cell) as u64, 0, std::ptr::null(), 0), NIL.0);
+            assert!(second.mv.is_empty());
+            assert!(second.mv_active);
+        }
     }
 
     #[test]
