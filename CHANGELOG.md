@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Validate suspended native continuations before a fiber resumes on another
+  worker, preserving live frames and GC roots when that worker is incompatible.
+  Preserve all values returned by ordinary and interactive restart invocation
+  ([#159](https://github.com/atgreen/evergreen/pull/159)).
+
 - Compile fixnum arithmetic inside opt-in native exceptional-transfer segments,
   with precise guard fallback that preserves earlier effects, recursive callers,
   multiple values, and the original function definition

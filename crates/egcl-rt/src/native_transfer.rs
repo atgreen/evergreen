@@ -22,6 +22,9 @@ use crate::value::EgclVal;
 use crate::value::NIL;
 use std::cell::Cell;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(crate) mod migration_tests;
+
 #[cfg(all(target_arch = "aarch64", unix))]
 mod aarch64;
 #[cfg(all(
@@ -133,28 +136,61 @@ pub fn current_segment() -> *mut NativeSegment {
     ACTIVE.with(Cell::get)
 }
 
-/// Revalidate the platform hardening contract when a suspended fiber resumes
-/// on a different carrier. The common case is a single comparison with no
-/// syscall or platform query. A failed revalidation is deliberately reported
-/// to the native poll caller so it can leave through the normal bytecode
-/// fallback; generated code must never continue under an unknown contract.
+/// Revalidate all active anchors together. The scheduler calls this before
+/// resuming a fiber, including one suspended inside an ordinary Rust helper.
+/// Capability must not change while any segment is active or suspended.
 pub fn revalidate_current_segment() -> bool {
+    prepare_carrier_resume().is_ok()
+}
+
+/// An incompatible destination must not resume the fiber at all. Return its
+/// last validated carrier so the scheduler can route the still-live stack back
+/// without unwinding Rust frames or discarding precise roots.
+pub(crate) fn prepare_carrier_resume() -> Result<(), crate::thread::NativeThreadId> {
+    prepare_carrier_resume_with(|| {
+        let supported = is_supported();
+        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+        let supported = migration_tests::destination_supported(supported);
+        supported
+    })
+}
+
+fn prepare_carrier_resume_with(
+    supported: impl FnOnce() -> bool,
+) -> Result<(), crate::thread::NativeThreadId> {
     let current = crate::thread::current_thread_id();
     let segment = current_segment();
     if segment.is_null() {
-        return true;
+        return Ok(());
     }
-    // SAFETY: ACTIVE contains a pinned segment owned by this execution and is
-    // only read on that execution's carrier at a poll boundary.
-    let segment = unsafe { &mut *segment };
-    if segment.carrier == current {
-        return true;
+    let owner = crate::thread::current_fiber_id()
+        .map(SegmentOwner::Fiber)
+        .unwrap_or(SegmentOwner::Thread(current));
+    // SAFETY: this execution owns the pinned chain. At mount the fiber is
+    // exclusively claimed and cannot run until this validation finishes.
+    let previous_carrier = unsafe { (*segment).carrier };
+    let mut changed = false;
+    let mut anchor = segment;
+    while !anchor.is_null() {
+        let saved = unsafe { &*anchor };
+        assert_eq!(saved.owner, owner, "native segment belongs to another execution");
+        changed |= saved.carrier != current;
+        anchor = saved.previous;
     }
-    if !is_supported() {
-        return false;
+    if !changed {
+        return Ok(());
     }
-    segment.carrier = current;
-    true
+    if !supported() {
+        return Err(previous_carrier);
+    }
+    // Commit only after the complete chain and destination are accepted.
+    anchor = segment;
+    while !anchor.is_null() {
+        let saved = unsafe { &mut *anchor };
+        saved.carrier = current;
+        anchor = saved.previous;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

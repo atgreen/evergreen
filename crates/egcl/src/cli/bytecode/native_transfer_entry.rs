@@ -1821,20 +1821,10 @@ unsafe extern "C" fn poll_or_transfer(
 ) {
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
     egcl_rt::safepoint::poll_safepoint();
-    // A fiber can resume this pinned segment on another carrier. Recheck the
-    // hardening contract only on that change; the unchanged-carrier path is a
-    // single execution-local comparison. If the new carrier is incompatible,
-    // leave through the ordinary capture/fallback path before running more
-    // generated code.
-    let carrier_ok = egcl_rt::native_transfer::revalidate_current_segment();
-    if !carrier_ok {
-        NATIVE_ERROR.with(|slot| {
-            slot.set_first(EgclError::Internal(
-                "native segment capability changed after fiber migration".into(),
-            ));
-        });
-    }
-    let exit = if !carrier_ok || super::native_loop_should_exit() != 0 {
+    // The scheduler validates every active segment before resuming a fiber,
+    // including yields inside ordinary helpers. This poll handles only the
+    // independent GC, preemption and asynchronous-transfer obligations.
+    let exit = if super::native_loop_should_exit() != 0 {
         NativeExit::Transfer
     } else {
         NativeExit::Returned

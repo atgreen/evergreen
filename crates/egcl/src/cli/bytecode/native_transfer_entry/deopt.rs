@@ -129,15 +129,8 @@ pub(super) unsafe extern "C" fn resume_guard(request: *mut u8, out: *mut NativeO
         // CaptureContext reference or RefCell borrow across resumed Lisp.
         resume_inlined_in_t0(scopes, metadata, None, unsafe { &mut *env })
     });
-    // Revalidation itself cannot allocate or yield; the result is immediately
-    // returned or moved into the rooted pending-error slot.
-    let result = if native_transfer::revalidate_current_segment() {
-        result
-    } else {
-        Err(EgclError::Internal(
-            "native segment capability changed during deopt".into(),
-        ))
-    };
+    // Fiber mounting establishes carrier compatibility before resumed Lisp or
+    // Rust executes. Publish the value/transfer without another capability test.
     let outcome = match result {
         Ok(value) => NativeOutcome {
             value,

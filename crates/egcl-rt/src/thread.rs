@@ -1722,6 +1722,9 @@ struct Worker {
     local: ChaseLevDeque,
     pending: OrderedMutex<VecDeque<WorkerTask>>,
     deferred: OrderedMutex<VecDeque<WorkerTask>>,
+    /// Suspended native segments rejected by another carrier. Never stolen:
+    /// only the last validated carrier may retry these continuations.
+    native_resume: OrderedMutex<VecDeque<WorkerTask>>,
     /// Fiber mounted on this carrier, or zero while the carrier is idle.
     current_fiber: AtomicU64,
 }
@@ -1769,6 +1772,12 @@ impl WorkerPool {
                     LockLevel::ExecutionRegistry,
                     (id << 32) | ((index as u64) << 2) | 2,
                     "carrier deferred queue",
+                    VecDeque::new(),
+                ),
+                native_resume: OrderedMutex::new(
+                    LockLevel::ExecutionRegistry,
+                    (id << 32) | ((index as u64) << 2) | 3,
+                    "carrier native resume queue",
                     VecDeque::new(),
                 ),
                 current_fiber: AtomicU64::new(0),
@@ -1908,6 +1917,9 @@ impl WorkerPool {
     /// Pop this worker's own task (LIFO), else steal one (FIFO) from another
     /// worker's deque. Returns `None` only when every deque is empty.
     fn pop_or_steal(&self, idx: usize) -> Option<WorkerTask> {
+        if let Some(task) = self.workers[idx].native_resume.lock().unwrap().pop_front() {
+            return Some(task);
+        }
         self.drain_pending(idx);
         if let Some(t) = self.workers[idx].local.pop() {
             return Some(t);
@@ -1933,12 +1945,13 @@ impl WorkerPool {
         None
     }
 
-    fn any_work(&self) -> bool {
-        self.workers.iter().any(|w| {
-            !w.local.is_empty()
-                || !w.pending.lock().unwrap().is_empty()
-                || !w.deferred.lock().unwrap().is_empty()
-        })
+    fn any_work(&self, idx: usize) -> bool {
+        !self.workers[idx].native_resume.lock().unwrap().is_empty()
+            || self.workers.iter().any(|w| {
+                !w.local.is_empty()
+                    || !w.pending.lock().unwrap().is_empty()
+                    || !w.deferred.lock().unwrap().is_empty()
+            })
     }
 
     /// Signal all workers to exit at their next scheduling point.
@@ -2042,7 +2055,7 @@ fn worker_loop(pool: Arc<WorkerPool>, idx: usize) {
         if pool.shutdown.load(Ordering::Acquire) {
             return;
         }
-        if pool.any_work() {
+        if pool.any_work(idx) {
             continue;
         }
         // Coordinate both entry and wakeup with an in-progress collection.
@@ -2070,7 +2083,6 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         }
         *state = FiberState::Running;
     }
-    task.thread.publish_stack(0, 0);
     // Refresh the carrier association before Lisp resumes on this OS thread
     // (§2.3.1). The context's ADDRESS does not change here — only this field —
     // which is why a cached context pointer stays valid across migration.
@@ -2088,6 +2100,37 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     // This scope stays on the carrier stack. A suspended fiber's registered
     // root chain remains live independently of whichever carrier resumes it.
     let mounted_roots = unsafe { thread.host_roots.mount() };
+
+    if let Err(previous_carrier) = crate::native_transfer::prepare_carrier_resume() {
+        // No fiber instruction has executed on this carrier. Its published
+        // suspended stack still describes the live roots; do not clear it or
+        // process the suspension reason a second time.
+        drop(mounted_roots);
+        ACTIVE_FIBER.with(|slot| *slot.borrow_mut() = None);
+        pool.workers[carrier_index]
+            .current_fiber
+            .store(0, Ordering::Release);
+        thread.execution().set_carrier_id(previous_carrier.0);
+        {
+            let mut state = thread.state.lock().unwrap();
+            *state = FiberState::Runnable;
+            thread.mounted.store(false, Ordering::Release);
+        }
+        #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+        crate::native_transfer::migration_tests::before_requeue(thread.id());
+        let destination = pool.carrier_ids.lock().unwrap().iter()
+            .position(|&id| id == previous_carrier)
+            .expect("a suspended segment retains a carrier in its owning pool");
+        pool.workers[destination]
+            .native_resume
+            .lock()
+            .unwrap()
+            .push_back(task);
+        // A shared notify_one could wake only an ineligible thief.
+        pool.park_cv.notify_all();
+        return;
+    }
+    thread.publish_stack(0, 0);
 
     match thread.native_faults.mount() {
         Ok(mounted_faults) => {
