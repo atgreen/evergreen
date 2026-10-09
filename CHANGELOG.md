@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Cache compiled GETHASH call targets while preserving both return values and
+  function replacement. This reduces full Prechelt phone-encoding time by
+  about 15% in the measured workload
+  ([#145](https://github.com/atgreen/evergreen/pull/145)).
+
 - Keep hot arithmetic functions native when their operands change from fixnums
   or single floats to bignums. Mixed integer loops now recover to generic T2
   code without repeatedly deoptimizing, reducing full Prechelt phone-encoding
