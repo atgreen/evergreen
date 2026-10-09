@@ -184,6 +184,25 @@ fn build_transfer_cfg(
     builder.transfer_mode = true;
     builder.native_cleanups = native_cleanups;
     let mut f = builder.run()?;
+    legalize_transfer_calls(&mut f, &scopes)?;
+    Ok(f)
+}
+
+/// Build scope-aware SSA while retaining ordinary calls for numeric speculation.
+/// The caller must finish optimization before `legalize_transfer_calls` and
+/// must not install this intermediate form as a native-transfer entry.
+pub fn build_for_transfer_optimization(
+    bf: &BytecodeFunction,
+    symbol: u32,
+) -> Result<Function, BuildError> {
+    let mut builder = Builder::new(bf, InlineOptions::default().with_root_symbol(symbol));
+    builder.transfer_mode = true;
+    builder.run()
+}
+
+/// Give every residual call an explicit exceptional successor after optimization.
+/// The supplied scope map must belong to the retained bytecode definition.
+pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<(), BuildError> {
     let calls: Vec<Inst> = f
         .block_order()
         .iter()
@@ -240,7 +259,7 @@ fn build_transfer_cfg(
         )
         .map_err(BuildError::Unsupported)?;
     }
-    Ok(f)
+    Ok(())
 }
 
 /// Build T2 IR with explicit per-call-site inlining policy. The ordinary

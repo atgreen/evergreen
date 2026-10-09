@@ -22,6 +22,9 @@ use egcl_compiler::t2::transfer_sites::{SysvSiteSnapshot, SysvTransferTable, Tra
 use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 
+mod deopt;
+use deopt::{prepare_completed_deopt, resume_guard};
+
 thread_local! {
     /// Opt-in production cache for the segment ABI. Keep the negative result
     /// too: an unsupported body must not be recompiled on every invocation.
@@ -59,6 +62,7 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
                 (code._completion.as_ptr(), "native cleanup completion veneer"),
                 (code._recursive_prepare.as_ref().map_or(std::ptr::null(), |code| code.as_ptr()), "native recursive entry veneer"),
                 (finish_recursive as *const u8, "native recursive frame retirement"),
+                (code._deopt_veneer.as_ref().map_or(std::ptr::null(), |code| code.as_ptr()), "native precise deopt veneer"),
             ] {
                 if !target.is_null() && immediate == target as u64 {
                     let _ = write!(out, "    ; {name}");
@@ -159,11 +163,18 @@ pub(super) struct TransferCode {
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
     code_len: usize,
+    #[cfg(test)]
+    pub(super) has_deopt: bool,
     _veneer: JitBuffer,
     _capture: JitBuffer,
     _poll: JitBuffer,
     _completion: JitBuffer,
     _recursive_prepare: Option<JitBuffer>,
+    _deopt_capture: Option<JitBuffer>,
+    _deopt_veneer: Option<JitBuffer>,
+    deopt_metadata: Option<Arc<T2InstalledMetadata>>,
+    deopts: Cell<u32>,
+    recompile: Cell<bool>,
     recursive: bool,
     recursive_generation: u64,
     landing: JitBuffer,
@@ -194,7 +205,20 @@ pub(super) fn try_run(
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
     }
-    if !opted_in() || !native_transfer::is_supported() {
+    if !opted_in() {
+        return None;
+    }
+    try_run_enabled(body, args, env)
+}
+
+/// Entry after the process-wide rollout gate. Unit tests use this seam rather
+/// than mutating an environment switch whose value is cached for the process.
+pub(super) fn try_run_enabled(
+    body: Arc<BytecodeFunction>,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    if !native_transfer::is_supported() {
         return None;
     }
 
@@ -215,18 +239,24 @@ pub(super) fn try_run(
     if !native_transfer::current_segment().is_null() {
         return None;
     }
-    let key = Arc::as_ptr(&body) as usize;
-    let code = SEGMENT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        cache
-            .entry(key)
-            .or_insert_with(|| TransferCode::compile(Arc::clone(&body)).map(Rc::new))
-            .clone()
-    });
+    let code = cached_code(&body);
     code.map(|code| {
         #[cfg(test)]
         SEGMENT_RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         code.run(args, env)
+    })
+}
+
+fn cached_code(body: &Arc<BytecodeFunction>) -> Option<Rc<TransferCode>> {
+    let key = Arc::as_ptr(body) as usize;
+    SEGMENT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let entry = cache.entry(key)
+            .or_insert_with(|| TransferCode::compile(Arc::clone(body)).map(Rc::new));
+        if entry.as_ref().is_some_and(|code| code.recompile.get()) {
+            *entry = TransferCode::compile(Arc::clone(body)).map(Rc::new);
+        }
+        entry.clone()
     })
 }
 
@@ -236,6 +266,11 @@ pub(super) fn take_segment_run_count() -> u64 {
 }
 
 impl TransferCode {
+    #[cfg(test)]
+    pub(super) fn deopt_count(&self) -> u32 {
+        self.deopts.get()
+    }
+
     #[cfg(test)]
     pub(super) fn without_catch_destination(mut self, push_bcp: u32) -> Self {
         assert!(matches!(
@@ -257,6 +292,11 @@ impl TransferCode {
     }
 
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
+        Self::compile_variant(Arc::clone(&body), true)
+            .or_else(|| Self::compile_variant(body, false))
+    }
+
+    fn compile_variant(body: Arc<BytecodeFunction>, optimize: bool) -> Option<Self> {
         if body.variadic || body.has_env {
             return None;
         }
@@ -271,8 +311,48 @@ impl TransferCode {
             return None;
         }
         let roots = retain_native_body(&body);
-        let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
+        let optimize = optimize && scope_free_native_body(&body);
+        let (ir, deopt_metadata) = if optimize {
+            let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
+            let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
+            let profile = |bcp| {
+                use egcl_compiler::t2::speculate::SpecType as CompilerType;
+                match type_profile_at(Arc::as_ptr(&body) as usize, bcp) {
+                    None => Some(CompilerType::Fixnum),
+                    Some(profile) => match profile.speculation() {
+                        Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
+                        _ => None,
+                    },
+                }
+            };
+            egcl_compiler::t2::speculate::speculate(&mut ir, &profile);
+            let speculations = t2_numeric_speculations(&ir, symbol);
+            let mut passes = egcl_compiler::t2::pass::PassManager::new();
+            passes.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
+            passes.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
+            passes.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
+            passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
+            passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
+            passes.run(&mut ir);
+            let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+            egcl_compiler::t2::build::legalize_transfer_calls(&mut ir, &scopes).ok()?;
+            let metadata = Arc::new(T2InstalledMetadata {
+                speculations,
+                _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
+                deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+            });
+            (ir, Some(metadata))
+        } else {
+            (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None)
+        };
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
+        let deopt_capture = if optimize {
+            Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
+        } else { None };
+        let deopt_veneer = match &deopt_capture {
+            Some(capture) => Some(JitBuffer::new(&emit_helper_veneer(resume_guard, capture.as_ptr()))?),
+            None => None,
+        };
         let veneer = JitBuffer::new(&emit_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let poll = JitBuffer::new(&emit_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
@@ -285,7 +365,7 @@ impl TransferCode {
         // the identity check must leave a generation mismatch at entry.
         let recursive_generation = direct_call_gen();
         let recursive_symbol = super::super::resolve_sym(&body.name)
-            .filter(|_| scope_free_recursion(&body))
+            .filter(|_| scope_free_native_body(&body))
             .map(EgclVal::as_symbol_index)
             .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&body)))
             .filter(|symbol| body.code.iter().any(|op| {
@@ -312,6 +392,7 @@ impl TransferCode {
             deliver_handler as *const () as u64,
             poll.as_ptr() as u64,
             recursion,
+            deopt_veneer.as_ref().map(|code| code.as_ptr() as u64),
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
@@ -371,11 +452,18 @@ impl TransferCode {
             _body_roots: roots,
             code,
             code_len: emitted.code.len(),
+            #[cfg(test)]
+            has_deopt: emitted.has_deopt,
             _veneer: veneer,
             _capture: capture,
             _poll: poll,
             _completion: completion,
             _recursive_prepare: recursive_prepare,
+            _deopt_capture: deopt_capture,
+            _deopt_veneer: deopt_veneer,
+            deopt_metadata,
+            deopts: Cell::new(0),
+            recompile: Cell::new(false),
             recursive: recursion.is_some(),
             recursive_generation,
             landing,
@@ -451,8 +539,12 @@ impl TransferCode {
             .map_err(|_| invalid_capture())?;
         egcl_rt::rooted_ref!(_snapshots = &mut snapshots);
         let stack = egcl_rt::current_stack();
+        // Optimized metadata currently owns exactly one logical definition.
+        let function = self.deopt_metadata.as_ref()
+            .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
+            .map(EgclVal::from_symbol_index).unwrap_or(NIL);
         let frame = stack
-            .push_frame(NIL, std::ptr::null(), self.slots, FLAG_CALL)
+            .push_frame(function, std::ptr::null(), self.slots, FLAG_CALL)
             .ok_or_else(|| {
                 EgclError::StackOverflow(
                     egcl_rt::current_fiber_id()
@@ -522,6 +614,8 @@ impl TransferCode {
         let mut prepared_catch = None::<PreparedCatch>;
         egcl_rt::rooted_ref!(_prepared_catch = &mut prepared_catch);
         let mut context = CaptureContext {
+            owner: self,
+            completed_deopt: false,
             recursive_enabled: self.recursive,
             recursive_generation: self.recursive_generation,
             recursive: std::ptr::null_mut(),
@@ -819,7 +913,7 @@ fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
 }
 
-fn scope_free_recursion(body: &BytecodeFunction) -> bool {
+fn scope_free_native_body(body: &BytecodeFunction) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -1841,6 +1935,8 @@ pub(super) fn take_native_handler_count() -> usize {
 }
 
 struct CaptureContext {
+    owner: *const TransferCode,
+    completed_deopt: bool,
     recursive_enabled: bool,
     recursive_generation: u64,
     recursive: *mut RecursiveActivation,

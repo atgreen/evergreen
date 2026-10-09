@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Compile fixnum arithmetic inside opt-in native exceptional-transfer segments,
+  with precise guard fallback that preserves earlier effects, recursive callers,
+  multiple values, and the original function definition
+  ([#158](https://github.com/atgreen/evergreen/pull/158)).
+
 - Keep eligible recursive calls inside opt-in native exceptional-transfer
   segments, with precise GC roots, bounded stack fallback, and function
   redefinition checks

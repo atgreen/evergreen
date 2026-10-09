@@ -59,6 +59,26 @@ fn instructions(f: &Function, opcode: Opcode) -> Vec<Inst> {
         .collect()
 }
 
+/// Model a continuation value that is used only by capture metadata. The
+/// bytecode builder correctly prunes body()'s unused second local; these tests
+/// exercise downstream retention of an explicitly supplied cold-only value.
+fn function_with_capture_only_local() -> Function {
+    use egcl_compiler::t2::frame_state::ValueSource;
+    use egcl_compiler::t2::ir::ValueRepresentation;
+    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let value = f.block(f.entry()).params[1];
+    for call in instructions(&f, Opcode::Invoke) {
+        let state = f.inst(call).frame_state.unwrap();
+        f.frame_states.get_mut(state).scopes[0].locals[1] = ValueSource::Value {
+            value,
+            repr: ValueRepresentation::Tagged,
+        };
+    }
+    assert!(f.block_order().iter().all(|&block| f.block(block).insts.iter()
+        .all(|&inst| !f.inst(inst).args.contains(&value))));
+    f
+}
+
 #[test]
 fn builder_automatically_routes_calls_to_mapped_transfer_continuations() {
     let f = build_from_bytecode_for_transfers(&body()).unwrap();
@@ -84,8 +104,12 @@ fn builder_automatically_routes_calls_to_mapped_transfer_continuations() {
         assert_eq!(
             frame.locals.len(),
             2,
-            "exception-only local remains reconstructible"
+            "local slot numbering is preserved"
         );
+        assert!(matches!(
+            frame.locals[1],
+            egcl_compiler::t2::frame_state::ValueSource::Unbound
+        ), "the source bytecode never reads its second local");
         assert_eq!(frame.stack.len(), 1, "capture pre-call operands");
         if *origin_bcp == 2 {
             assert!(
@@ -128,7 +152,7 @@ fn cold_capture_survives_dce_and_reaches_machine_root_liveness() {
     use egcl_compiler::t2::lower::{lower, op};
     use egcl_compiler::t2::opt_dce::Dce;
     use egcl_compiler::t2::pass::{Analyses, Pass};
-    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut f = function_with_capture_only_local();
     let exception_only = f.block(f.entry()).params[1];
     Dce.run(&mut f, &mut Analyses::new());
     assert!(verify(&f).is_ok(), "{:?}", verify(&f));
@@ -163,7 +187,7 @@ fn machine_call_routes_preserve_operands_and_exception_only_roots() {
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::mach::Location;
     use egcl_compiler::t2::regalloc::allocate;
-    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let f = function_with_capture_only_local();
     let mut machine = lower(&f);
     let exception_only = f.block(f.entry()).params[1];
     for call in instructions(&f, Opcode::Invoke) {
@@ -344,7 +368,7 @@ fn capture_maps_find_tagged_inputs_inside_nested_rematerialization() {
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::regalloc::allocate;
     use egcl_compiler::t2::transfer_map::lower_transfer_maps;
-    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut f = function_with_capture_only_local();
     let call = instructions(&f, Opcode::Invoke)[0];
     let fsid = f.inst(call).frame_state.unwrap();
     let state = f.frame_states.get_mut(fsid);
@@ -388,7 +412,7 @@ fn capture_maps_exclude_unboxed_words_and_refuse_uncomposed_inline_scopes() {
     use egcl_compiler::t2::lower::lower;
     use egcl_compiler::t2::regalloc::allocate;
     use egcl_compiler::t2::transfer_map::{TransferMapError, lower_transfer_maps};
-    let mut f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let mut f = function_with_capture_only_local();
     let unboxed = f.block(f.entry()).params[1];
     f.set_repr(unboxed, ValueRepresentation::UnboxedFixnum);
     let states: Vec<_> = f.frame_states.iter().map(|(id, _)| id).collect();
@@ -437,7 +461,7 @@ fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
     use egcl_compiler::t2::regalloc::allocate_framed;
     use egcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
     use egcl_compiler::t2::x64_frame::{ValueHome, select_frame_homes};
-    let f = build_from_bytecode_for_transfers(&body()).unwrap();
+    let f = function_with_capture_only_local();
     let mut machine = lower(&f);
     allocate_framed(&mut machine).unwrap();
     let split = f.block(f.entry()).params[1];
@@ -534,4 +558,29 @@ fn automatic_call_routes_preserve_loop_and_osr_header_state() {
     let frame = f.frame_states.get(f.osr_entries[0].frame_state);
     assert_eq!(frame.scopes.last().unwrap().locals.len(), 2);
     assert!(frame.scopes.last().unwrap().stack.is_empty());
+}
+
+#[test]
+fn optimize_arithmetic_before_legalizing_remaining_calls() {
+    use egcl_compiler::t2::{build, speculate};
+    let plus = egcl_rt::symbols::intern("+");
+    let symbol = egcl_rt::symbols::intern("optimized-transfer-probe");
+    let mut source = body();
+    source.code = vec![Instr::LoadLocal(0), Instr::LoadLocal(1),
+        Instr::CallNamed { sym: plus, nargs: 2 },
+        Instr::CallNamed { sym: 123456, nargs: 1 }, Instr::Return];
+    let mut ir = build::build_for_transfer_optimization(&source, symbol).unwrap();
+    assert_eq!(speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)), 1);
+    build::legalize_transfer_calls(&mut ir,
+        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    verify(&ir).unwrap();
+    assert_eq!(instructions(&ir, Opcode::FixnumAdd).len(), 1);
+    assert_eq!(instructions(&ir, Opcode::Invoke).len(), 1);
+    assert!(instructions(&ir, Opcode::Call).is_empty());
+    let arithmetic = ir.inst(instructions(&ir, Opcode::FixnumAdd)[0]);
+    let state = ir.frame_states.get(arithmetic.frame_state.unwrap());
+    assert_eq!(state.scopes[0].function, symbol);
+    assert_eq!(state.scopes[0].bcp, 2);
+    let invoke = ir.inst(instructions(&ir, Opcode::Invoke)[0]);
+    assert_eq!(ir.frame_states.get(invoke.frame_state.unwrap()).scopes[0].bcp, 3);
 }

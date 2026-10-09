@@ -14,11 +14,12 @@ mod handlers;
 mod live_signaling;
 mod payloads;
 mod recursion;
+mod deopt;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn native_v2_rollout_switch_enters_cached_segment_path() {
-    use super::native_transfer_entry::{take_segment_run_count, try_run};
+fn native_v2_enabled_entry_uses_cached_segment_path() {
+    use super::native_transfer_entry::{take_segment_run_count, try_run_enabled};
     assert!(egcl_rt::native_transfer::is_supported());
     let _lock = super::super::heap_test_lock()
         .lock()
@@ -32,17 +33,14 @@ fn native_v2_rollout_switch_enters_cached_segment_path() {
             .expect("compile rollout probe"),
     );
     egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(41)]);
-    // Rust 2024 makes process-environment mutation explicitly unsafe. This
-    // ignored test is single-purpose and restores the switch before returning.
-    unsafe { std::env::set_var("EGCL_NATIVE_TRANSFER", "1") };
+    // Fresh-process CLI tests cover the process-wide opt-in switch.
     take_segment_run_count();
-    let first = try_run(Arc::clone(&body), &args, &mut env)
+    let first = try_run_enabled(Arc::clone(&body), &args, &mut env)
         .expect("supported rollout must select the segment path")
         .expect("segment probe returns normally");
-    let second = try_run(body, &args, &mut env)
+    let second = try_run_enabled(body, &args, &mut env)
         .expect("cached rollout must select the segment path")
         .expect("cached segment probe returns normally");
-    unsafe { std::env::remove_var("EGCL_NATIVE_TRANSFER") };
     assert_eq!(first, EgclVal::from_fixnum(42));
     assert_eq!(second, EgclVal::from_fixnum(42));
     assert_eq!(take_segment_run_count(), 2);
@@ -87,7 +85,7 @@ fn native_v2_recursive_body_is_admitted_for_outer_segment() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_osr_loop_poll_preserves_native_segment_state() {
-    use super::native_transfer_entry::try_run;
+    use super::native_transfer_entry::try_run_enabled;
     assert!(egcl_rt::native_transfer::is_supported());
     let _lock = super::super::heap_test_lock()
         .lock()
@@ -130,11 +128,9 @@ fn native_v2_osr_loop_poll_preserves_native_segment_state() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     egcl_rt::rooted!(args = vec![egcl_rt::value::T]);
-    unsafe { std::env::set_var("EGCL_NATIVE_TRANSFER", "1") };
-    let result = try_run(body, &args, &mut env)
+    let result = try_run_enabled(body, &args, &mut env)
         .expect("supported native segment should admit the OSR loop")
         .expect("OSR loop should return normally");
-    unsafe { std::env::remove_var("EGCL_NATIVE_TRANSFER") };
     assert_eq!(result, EgclVal::from_fixnum(42));
 }
 
