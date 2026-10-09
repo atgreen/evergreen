@@ -493,6 +493,9 @@ fn sweep_function_captures(names: &[EgclVal]) {
                 .borrow_mut()
                 .retain(|body, _| traced.contains(body))
         });
+        CLOSURE_COMPILATION.scan(|registry| {
+            registry.borrow_mut().retain(|body, _| traced.contains(body))
+        });
         ANON_OSR_REGISTRY.scan(|registry| {
             registry
                 .borrow_mut()
@@ -17984,18 +17987,10 @@ extern "C" fn c2i_deopt_t2_inline(
             }
         };
     let sym = scopes[0].function;
-    let (is_t2, body, version) = match own.as_ref() {
-        Some(code) => (code.is_t2, code.body.clone(), code.t2_metadata.clone()),
-        None => ACTIVE_NATIVE_CODE.with(|slot| {
-            // SAFETY: ActiveNativeCode retains a reference for the native call
-            // and restores the enclosing owner after nested calls or OSR return.
-            unsafe { slot.get().as_ref() }
-                .map(|code| (code.is_t2, code.body.clone(), code.t2_metadata.clone()))
-                .unwrap_or((true, None, None))
-        }),
-    };
-    note_native_deopt(sym, is_t2, body.as_ref(),
-        version.as_ref().map(|metadata| metadata.speculations.as_slice()));
+    let code = own.as_deref().map(std::ptr::from_ref)
+        .unwrap_or_else(|| ACTIVE_NATIVE_CODE.with(|slot| slot.get()));
+    // SAFETY: own or the active native entry retains this exact code version.
+    note_native_deopt(sym, unsafe { code.as_ref() });
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         let stack = egcl_rt::current_stack();
@@ -18122,6 +18117,14 @@ fn materialize_t2_deopt_scopes(
             unsafe { slot_set(frame, slot as u16, EgclVal(bits)) };
         }
         at += n_slots;
+        // Metadata is keyed by the compilation owner; only the outermost
+        // activation uses the calling closure's identity and captures.
+        let function = if let (0, Some(outer)) = (scope_index, outer) {
+            // SAFETY: the native entry owns this live EgclStack frame.
+            unsafe { (*outer).function.symbol_index() }.unwrap_or(function)
+        } else {
+            function
+        };
         scopes.push(InlinedResumeScope {
             function,
             body: entry,
@@ -18788,6 +18791,51 @@ static GENERIC_RECEIVER_PROFILE: egcl_rt::execution_local::ExecutionLocal<
 static NATIVE_REGISTRY: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, Rc<NativeCode>, egcl_rt::fxhash::FxBuildHasher>>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+/// A template shares compilation state, never its instances' captured frames.
+/// Weak ownership keeps this cache from retaining dead templates or callables.
+struct ClosureCompilation {
+    body: std::sync::Weak<BytecodeFunction>,
+    owner: u32,
+    invocations: u32,
+}
+static CLOSURE_COMPILATION: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<HashMap<usize, ClosureCompilation, egcl_rt::fxhash::FxBuildHasher>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::default())) };
+
+/// Select a live, unpinned instance to own this execution's compiled version.
+/// Callers still enter run_native with the actual instance identity.
+fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return (sym, count);
+    }
+    let Some(body) = closure_bodies().borrow().get(&sym).cloned() else {
+        return (sym, count);
+    };
+    if registry_get(sym).is_none_or(|current| !Arc::ptr_eq(&current, &body)) {
+        return (sym, count);
+    }
+    let key = Arc::as_ptr(&body) as usize;
+    let previous = CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&key).map(|state| state.owner)
+    });
+    let owner = previous.filter(|&owner| {
+        !is_profile_pinned(owner)
+            && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, &body))
+    }).unwrap_or(sym);
+    let invocations = CLOSURE_COMPILATION.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let state = cache.entry(key).or_insert_with(|| ClosureCompilation {
+            body: Arc::downgrade(&body), owner, invocations: 0,
+        });
+        debug_assert!(state.body.upgrade().is_some_and(|entry| Arc::ptr_eq(&entry, &body)));
+        state.owner = owner;
+        state.invocations = state.invocations.saturating_add(1).max(count);
+        state.invocations
+    });
+    INVOKE_COUNTS.with(|counts| { counts.borrow_mut().insert(owner, invocations); });
+    (owner, invocations)
+}
+
 /// Per-function invocation counters driving T0→T1 promotion.
 static INVOKE_COUNTS: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<u32, u32, egcl_rt::fxhash::FxBuildHasher>>,
@@ -19903,9 +19951,13 @@ fn native_for_dispatch(
 ) -> Option<Rc<NativeCode>> {
     #[cfg(test)]
     call_table::record_target_lookup();
-    if profiling_disabled() {
+    if profiling_disabled() || is_profile_pinned(sym) {
         return None;
     }
+    let (owner, invoke_count) = closure_compilation_owner(sym, invoke_count);
+    // A private representative has no public function cell to publish into.
+    let fn_obj = if owner == sym { fn_obj } else { None };
+    let sym = owner;
     // Publication is deliberately performed by the owning mutator: workers
     // compile relocatable bytes only and never touch thread-local registries or
     // executable mappings.
@@ -19983,20 +20035,32 @@ impl Drop for BlockScopeGuard {
 /// Shared with the inline-resume adapter, which handles the deopt without
 /// returning to run_native (bliss-w6aki). An obsolete activation may still
 /// fail a guard; that counts, but must not retire the replacement's code.
-fn note_native_deopt(
-    sym: u32,
-    is_t2: bool,
-    bf: Option<&Arc<BytecodeFunction>>,
-    speculations: Option<&[(u32, SpecType)]>,
-) {
+fn note_native_deopt(sym: u32, code: Option<&NativeCode>) {
     DEOPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace("native speculative deopt → interpreter");
     // An obsolete activation may still fail a guard. Resume its original
     // body, but do not retire or blacklist the replacement's native code.
+    let Some(code) = code else { return; };
+    let bf = code.body.as_ref();
+    let is_t2 = code.is_t2;
+    let speculations = code.t2_metadata.as_ref()
+        .map(|metadata| metadata.speculations.as_slice());
+    let owner = bf.and_then(|body| CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
+    })).unwrap_or(sym);
+    // An old shared activation may outlive its representative, while a sibling
+    // installs a newer version. Body equality alone must not retire that code.
+    let sym = if NATIVE_REGISTRY.with(|registry| registry.borrow().get(&owner)
+        .is_some_and(|installed| std::ptr::eq(installed.as_ref(), code))) {
+        owner
+    } else if NATIVE_REGISTRY.with(|registry| registry.borrow().get(&sym)
+        .is_some_and(|installed| std::ptr::eq(installed.as_ref(), code))) {
+        sym
+    } else {
+        return;
+    };
     let current = registry_get(sym);
-    if current
-        .as_ref()
-        .zip(bf)
+    if current.as_ref().zip(bf)
         .is_some_and(|(current, original)| Arc::ptr_eq(current, original))
     {
         // Backoff/blacklist: an occasional deopt (a rare overflow) is fine and
@@ -20168,7 +20232,7 @@ fn run_native(
     let stack = egcl_rt::current_stack();
     let frame = stack
         .push_frame(
-            NIL,
+            EgclVal::from_symbol_index(sym),
             nc.code_info as *const CodeInfo,
             nc.num_slots,
             FLAG_CALL,
@@ -20271,8 +20335,7 @@ fn run_native(
     // kept as a fallback when no resume point was recorded; purity of every call
     // makes re-running from the top observably equivalent.)
     if deopt {
-        note_native_deopt(sym, nc.is_t2, bf.as_ref(),
-            nc.t2_metadata.as_ref().map(|metadata| metadata.speculations.as_slice()));
+        note_native_deopt(sym, Some(nc));
         let entry = bf.ok_or_else(|| {
             EgclError::Internal("deopt: native code has no bytecode body".into())
         })?;
@@ -25140,6 +25203,59 @@ mod active_bytecode_root_tests {
             Arc::ptr_eq(&first_body, &second_body),
             "instances must share bytecode"
         );
+    }
+
+    #[test]
+    fn shared_compilation_respects_pins_and_obsolete_native_versions() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(compile_function("SHARED-PINS", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+        egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+        let a = egcl_rt::function::name(*first).as_symbol_index();
+        let b = egcl_rt::function::name(*second).as_symbol_index();
+        let old = native_for_dispatch(a, None, t1_threshold()).unwrap();
+        let shared = native_for_dispatch(b, None, 1).unwrap();
+        assert!(Rc::ptr_eq(&old, &shared));
+        profile_pin(b);
+        assert!(native_for_dispatch(b, None, 1).is_none());
+        assert!(Rc::ptr_eq(&old, &native_for_dispatch(a, None, 1).unwrap()));
+        profile_pin(a);
+        profile_unpin(b);
+        let replacement = native_for_dispatch(b, None, t1_threshold()).unwrap();
+        assert!(!Rc::ptr_eq(&old, &replacement));
+        assert!(native_for_dispatch(a, None, u32::MAX).is_none());
+        assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
+        note_native_deopt(b, Some(&old));
+        assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)),
+            "obsolete shared code must not decay the new version's feedback");
+        assert_eq!(DEOPT_COUNTS.with(|counts| counts.borrow().get(&b).copied()), Some(0));
+        assert!(NATIVE_REGISTRY.with(|codes| Rc::ptr_eq(&replacement, &codes.borrow()[&b])));
+        profile_unpin(a);
+        assert!(Rc::ptr_eq(&replacement, &native_for_dispatch(a, None, 1).unwrap()));
+    }
+
+    #[test]
+    fn shared_compilation_checks_the_actual_instances_current_definition() {
+        let _lock = super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = super::super::vec_to_list(&[NIL]));
+        let body = Arc::new(compile_function("SHARED-REPLACEMENT", NIL, *form, &env, false, false).unwrap());
+        egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+        egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+        let a = egcl_rt::function::name(*first).as_symbol_index();
+        let b = egcl_rt::function::name(*second).as_symbol_index();
+        assert_eq!(closure_compilation_owner(a, 1).0, a);
+        assert_eq!(closure_compilation_owner(b, 1).0, a);
+        egcl_rt::rooted!(replacement_form = super::super::vec_to_list(&[EgclVal::from_fixnum(42)]));
+        let replacement = Arc::new(compile_function("NEW-PRIVATE-DEFINITION", NIL,
+            *replacement_form, &env, false, false).unwrap());
+        registry_put(b, replacement);
+        assert_eq!(closure_compilation_owner(b, 1).0, b,
+            "replaced private definitions must not run a sibling's old body");
     }
 
     #[test]
