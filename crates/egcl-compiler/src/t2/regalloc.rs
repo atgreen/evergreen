@@ -299,9 +299,9 @@ fn framed_machine_env(reduced: bool) -> MachineEnv {
     // the interpreter entry loads parameter homes — a parameter homed there
     // would clobber the base mid-load).
     let int_pool: &[usize] = if reduced {
-        &[1, 5, 3, 9]
+        &crate::t2::x64_frame::FRAME_GPRS[..4]
     } else {
-        &[1, 5, 3, 9, 10, 11, 12, 13]
+        &crate::t2::x64_frame::FRAME_GPRS
     };
     let mut int_regs = PRegSet::empty();
     for &i in int_pool {
@@ -983,7 +983,9 @@ fn allocate_with_call_operands(
 
     // Before(i) is after the instruction's Before edits but before its
     // writes/clobbers. Half-open allocation ranges include early uses whose
-    // last use is this call, and exclude its late return definitions.
+    // last use is this call, and exclude its late return definitions. Definition-
+    // only ranges for unused block parameters are not runtime-live values.
+    let read_vregs = mf.read_vregs();
     for (index, instruction) in mf.insts.iter().enumerate() {
         if !instruction.safepoint {
             continue;
@@ -991,7 +993,7 @@ fn allocate_with_call_operands(
         let point = regalloc2::ProgPoint::before(Ra2Inst::new(index)).to_index();
         let mut values = Vec::new();
         for range in &mf.value_locations {
-            if range.contains(point) {
+            if range.contains(point) && read_vregs.contains(&range.vreg) {
                 values.push(AllocatedValue {
                     vreg: range.vreg,
                     repr: mf.value_reprs[&range.vreg],
@@ -1567,6 +1569,32 @@ mod tests {
             values,
             vec![0, 3],
             "only the dominating value and merged phi are live"
+        );
+    }
+
+    #[test]
+    fn unused_phi_definition_at_safepoint_is_not_live() {
+        let mut mf = diamond();
+        let live = vreg(RegClass::Gpr, 0);
+        let dead = vreg(RegClass::Gpr, 3);
+        mf.insts[6].uses.clear();
+        mf.insts[7].uses = vec![live];
+        allocate(&mut mf).unwrap();
+        assert!(
+            mf.value_locations
+                .iter()
+                .any(|range| range.vreg == dead && range.contains(12)),
+            "fixture must expose regalloc2's definition-only phi range"
+        );
+        let values: Vec<_> = mf.stack_maps[0]
+            .values
+            .iter()
+            .map(|entry| entry.vreg)
+            .collect();
+        assert_eq!(
+            values,
+            vec![live],
+            "an unused phi definition is not a safepoint root"
         );
     }
 

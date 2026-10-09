@@ -535,6 +535,12 @@ fn framed_capture_uses_the_emitters_final_home_for_a_split_value() {
     let ValueHome::Stack(slot) = homes.values[&split] else {
         panic!("split range needs a stable spill");
     };
+    let maps = egcl_compiler::t2::x64_frame::resolve_safepoint_maps(
+        &f, &machine, &homes, &HashMap::new(),
+    ).unwrap();
+    for map in maps.iter() {
+        assert_eq!(map.value(split).unwrap().gc_home(), Some(ValueHome::Stack(slot)));
+    }
     let captures = lower_framed_transfer_maps(&f, &machine, &homes, &HashMap::new()).unwrap();
     for capture in captures {
         assert_eq!(
@@ -640,4 +646,41 @@ fn optimize_arithmetic_before_legalizing_remaining_calls() {
     assert_eq!(state.scopes[0].bcp, 2);
     let invoke = ir.inst(instructions(&ir, Opcode::Invoke)[0]);
     assert_eq!(ir.frame_states.get(invoke.frame_state.unwrap()).scopes[0].bcp, 3);
+}
+
+#[test]
+fn framed_capture_rejects_a_home_outside_the_emitted_frame() {
+    use std::collections::HashMap;
+    use egcl_compiler::t2::lower::lower;
+    use egcl_compiler::t2::regalloc::allocate_framed;
+    use egcl_compiler::t2::transfer_map::lower_framed_transfer_maps;
+    use egcl_compiler::t2::x64_frame::{select_frame_homes, ValueHome};
+    let f = function_with_capture_only_local();
+    let mut machine = lower(&f);
+    allocate_framed(&mut machine).unwrap();
+    let captured = f.block(f.entry()).params[1];
+    let mut homes = select_frame_homes(&f, &machine, |_| false).unwrap();
+    homes.values.insert(captured, ValueHome::Stack(homes.stack_slots));
+    assert!(
+        lower_framed_transfer_maps(&f, &machine, &homes, &HashMap::new()).is_err(),
+        "a live value cannot be recovered from a slot outside the final frame"
+    );
+}
+
+#[test]
+fn resolved_frame_maps_refuse_missing_live_values() {
+    use std::collections::HashMap;
+    use egcl_compiler::t2::lower::lower;
+    use egcl_compiler::t2::regalloc::allocate_framed;
+    use egcl_compiler::t2::x64_frame::{resolve_safepoint_maps, select_frame_homes};
+    let f = function_with_capture_only_local();
+    let mut machine = lower(&f);
+    allocate_framed(&mut machine).unwrap();
+    let homes = select_frame_homes(&f, &machine, |_| false).unwrap();
+    assert!(!machine.stack_maps[0].values.is_empty());
+    machine.stack_maps[0].values.clear();
+    assert!(
+        resolve_safepoint_maps(&f, &machine, &homes, &HashMap::new()).is_err(),
+        "the final-home map must reject a missing live set"
+    );
 }

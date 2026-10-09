@@ -67,7 +67,7 @@
 
 use crate::t2::frame_state::FrameStateId;
 use crate::t2::ir::ValueRepresentation;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Register class. Tagged values, unboxed integers, and pointers live in GPRs;
 /// unboxed floats live in the target's floating-point registers. `Xmm` is the
@@ -267,6 +267,22 @@ impl StackMap {
 }
 
 impl MachFunc {
+    /// Values read by execution, recovery or an outgoing edge. Allocator debug
+    /// ranges also include definition-only intervals for unused block params;
+    /// those intervals do not make a value live at a safepoint.
+    pub(crate) fn read_vregs(&self) -> HashSet<VReg> {
+        self.insts
+            .iter()
+            .flat_map(|inst| inst.uses.iter().chain(&inst.deopt_uses))
+            .chain(
+                self.blocks
+                    .iter()
+                    .flat_map(|block| block.succs.iter().flat_map(|edge| &edge.args)),
+            )
+            .copied()
+            .collect()
+    }
+
     /// Allocator homes at a precise instruction phase. These are not yet native
     /// PCs or final emitter homes; both GC and debug emission must resolve them.
     pub fn locations_at(
