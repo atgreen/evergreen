@@ -2,6 +2,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 use std::{fs, process::Command};
 
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
+fn source_loop_factory_compiles_callbacks_with_independent_captures() {
+    let program = r#"
+      (defun eager-counter (seed)
+        (dotimes (i 1) (incf seed))
+        (lambda (delta) (incf seed delta)))
+      (dotimes (i 40) (eager-counter i))
+      NATIVE-FACTORY-CHECK
+      (let ((a (eager-counter 10)) (b (eager-counter 100)))
+        (assert (integerp (egcl-ext:function-tier a)))
+        (assert (integerp (egcl-ext:function-tier b)))
+        (dotimes (i 40)
+          (assert (= (funcall a 2) (+ 13 (* i 2))))
+          (assert (= (funcall b 3) (+ 104 (* i 3)))))
+        (egcl-ext:gc)
+        (assert (= (funcall a 4) 95))
+        (assert (= (funcall b 5) 226)))
+      (format t "EAGER-CAPTURES-OK~%")
+    "#;
+    for tier in ["t0", "t1", "t2"] {
+        let program = program.replace("NATIVE-FACTORY-CHECK", if tier == "t0" {
+            ""
+        } else {
+            "(assert (> (egcl-ext:function-tier 'eager-counter) 0))"
+        });
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--eval", &program])
+            .env("EGCL_FORCE_TIER", tier)
+            .env("EGCL_LAZY_COMPILE", "0")
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{tier}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+        assert!(stdout.contains("EAGER-CAPTURES-OK"));
+    }
+}
+
 fn run_case(name: &str, definitions: &str, probe: &str, envs: &[(&str, &str)]) -> String {
     let dir = std::env::temp_dir().join(format!("egcl-native-{name}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();

@@ -12510,9 +12510,9 @@ fn compile_defun(
     // is a little slower per op than the slot path, but far faster than the
     // tree-walker, and this is exactly the ASDF plan-traversal case
     // (TRAVERSE-ACTION's `(labels ((visit-action …)))` captures the plan/status
-    // lexicals) that otherwise runs interpreted (bliss-mr4p). Only reached when
-    // the fast path already declined, so it never slows a function that compiles
-    // opportunistically; a genuinely unsupported form bails in both modes.
+    // lexicals) that otherwise runs interpreted (bliss-mr4p). Also prefer this
+    // complete lowering when an eager or lazy result still evaluates callbacks
+    // through the host. Keep the opportunistic result if portable lowering fails.
     // NOTE the Arc: every arm yields an `Arc<BytecodeFunction>` rather than a bare
     // one, so the opportunistic result can be ROOTED across the portable retry
     // below (bliss-e3op). `ActiveBytecodeRoot` takes `&Arc`, which is why this
@@ -22977,11 +22977,11 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
             if lazy_compile_enabled() && !body_contains_loop(*body) {
                 return Ok(result);
             }
-            // Retry a fast-path decline with capture-aware portable lowering:
-            // a loop may run only once and never reach the invocation threshold.
-            // Keep a successful fast result, including host closure construction,
-            // since its T1 support is broader than portable MakeClosure support.
-            if compile_defun(sym, &name, *params, *body, env, false) {
+            // Prefer compiled callbacks where T1 can construct portable closures.
+            // Other backends still need MakeClosureEnv to keep eager outer loops
+            // native; retrying their successful result would force them to T0.
+            let native_closures = cfg!(any(target_arch = "x86_64", target_arch = "s390x"));
+            if compile_defun(sym, &name, *params, *body, env, native_closures) {
                 trace("compiled");
                 trace_named(&name, "compiled", None);
             } else {
@@ -24068,6 +24068,36 @@ mod direct_call_invalidation_tests {
             generation,
             "named installs remain conservative"
         );
+    }
+}
+
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "s390x")))]
+mod eager_closure_compilation_tests {
+    use super::*;
+
+    #[test]
+    fn eager_loop_factory_compiles_its_capturing_callback() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(form = reader::read_from_string(
+            "(defun eager-callback-probe (seed)
+               (let ((callback (lambda (delta) (setq seed (+ seed delta)))))
+                 (dotimes (i 1) (funcall callback 1))
+                 callback))",
+        ).unwrap().0);
+        eval_toplevel(*form, &mut env).unwrap();
+        let symbol = symbol_index_of("EAGER-CALLBACK-PROBE").unwrap();
+        let body = registry_get(symbol).expect("loop factory must compile eagerly");
+        assert!(!contains_host_eval(&body),
+            "eager compilation must compile supported capturing callbacks too");
+        assert_eq!(super::super::read_eval_all_env(
+            "(let ((a (eager-callback-probe 10)) (b (eager-callback-probe 100)))
+               (and (= (funcall a 2) 13) (= (funcall b 3) 104)
+                    (= (funcall a 4) 17)))", &mut env,
+        ).unwrap(), T);
     }
 }
 
