@@ -23,6 +23,15 @@ pub struct MappedCallRecord {
 pub type PrepareMappedCall = unsafe extern "C" fn(u64, *mut MappedCallRecord);
 pub type FinishMappedCall = unsafe extern "C" fn(*mut MappedCallRecord);
 
+/// Bytes the permanent adapter reserves below its caller's return address, so
+/// the record sits at the bottom of the adapter frame. A callback holding a
+/// record can therefore recover the exact suspended caller: its return PC is
+/// the word at `record + ADAPTER_FRAME_BYTES`, its pre-CALL RSP is
+/// `record + ADAPTER_FRAME_BYTES + 8`, and the writable save words the adapter
+/// reloads before returning are `preserved`. The published call veneer only
+/// tail-jumps here, so that return address is the original generated caller's.
+pub const ADAPTER_FRAME_BYTES: usize = std::mem::size_of::<MappedCallRecord>() + 8;
+
 /// Permanent published native entry. Preparation selects a mapped activation
 /// or completes the checked compatibility call. Helpers return through Rust
 /// before any capture. Child retirement runs in this permanent mapping, so it
@@ -36,8 +45,9 @@ pub fn emit_published_call_entry(
     resume: FinishMappedCall,
     checked: PrepareMappedCall,
 ) -> Vec<u8> {
-    const SIZE: u32 = std::mem::size_of::<MappedCallRecord>() as u32 + 8; // SysV call alignment
+    const SIZE: u32 = ADAPTER_FRAME_BYTES as u32; // SysV call alignment
     const {
+        assert!(SIZE == 136);
         assert!(std::mem::size_of::<MappedCallRecord>() == 128);
         assert!(std::mem::offset_of!(MappedCallRecord, preserved) == 8);
         assert!(std::mem::offset_of!(MappedCallRecord, entry) == 56);

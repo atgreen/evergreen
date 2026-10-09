@@ -100,6 +100,14 @@ pub(super) fn entries_for(function: EgclVal) -> Option<&'static NativeCallableEn
 }
 
 unsafe extern "C" fn interpreted(target: u64, record: *mut MappedCallRecord) {
+    // This adapter applies an arbitrary callable, so publish the generated
+    // caller suspended beneath the adapter frame first.
+    unsafe {
+        native_transfer_entry::published_mapped_record(record, || interpreted_published(target, record))
+    }
+}
+
+unsafe fn interpreted_published(target: u64, record: *mut MappedCallRecord) {
     egcl_rt::rooted!(function = unsafe { *(target as *const EgclVal) });
     egcl_rt::rooted!(
         owned_arguments = unsafe { native_transfer_entry::take_call_arguments(record) }
