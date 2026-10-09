@@ -11,6 +11,8 @@ pub(super) struct NativeEntry {
     function: EgclVal,
     code: Rc<NativeCode>,
     active: Cell<usize>,
+    dynamic: bool,
+    capture_context: bool,
     buffers: Vec<egcl_rt::jit::JitBuffer>,
 }
 
@@ -21,6 +23,25 @@ impl NativeEntry {
         code: Rc<NativeCode>,
         fallback: [usize; 2],
     ) -> Option<Box<Self>> {
+        Self::build(symbol, function, code, fallback, false)
+    }
+
+    pub(super) fn new_dynamic(
+        symbol: u32,
+        function: EgclVal,
+        code: Rc<NativeCode>,
+        fallback: [usize; 2],
+    ) -> Option<Box<Self>> {
+        Self::build(symbol, function, code, fallback, true)
+    }
+
+    fn build(
+        symbol: u32,
+        function: EgclVal,
+        code: Rc<NativeCode>,
+        fallback: [usize; 2],
+        dynamic: bool,
+    ) -> Option<Box<Self>> {
         let body = code.body.as_ref()?;
         // When every optional argument is supplied, binding is positional too.
         // A finite maximum rules out &REST/&KEY. Exactly one slot per argument
@@ -29,7 +50,7 @@ impl NativeEntry {
         let entry_arity = body.max_args?;
         if !code.is_t2
             || !native_transfer_abi_compatible(&code)
-            || body.has_env
+            || (body.has_env && !dynamic)
             || body.min_args != body.arity
             || (!body.variadic && entry_arity != body.arity)
             || body.param_layout.len() != entry_arity as usize
@@ -37,14 +58,19 @@ impl NativeEntry {
                 .param_types
                 .iter()
                 .any(|ty| !matches!(ty, DeclaredType::Any))
-            || closure_envs().borrow().contains_key(&symbol)
-            || closure_controls().borrow().contains_key(&symbol)
+            || (!dynamic
+                && (closure_envs().borrow().contains_key(&symbol)
+                    || closure_controls().borrow().contains_key(&symbol)))
         {
             return None;
         }
-        // These entries share the execution's ambient environment, but do not
-        // borrow a caller's lexical environment or establish named control scope.
+        // Capturing bodies set has_env even when all bindings belong to their
+        // parent. Dynamic entries can use that captured frame directly: slot
+        // parameters and this whitelist exclude any new heap-local bindings.
         if body.code.iter().any(|op| {
+            if dynamic && matches!(op, Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_)) {
+                return false;
+            }
             !matches!(
                 op,
                 Instr::Const(_)
@@ -86,8 +112,14 @@ impl NativeEntry {
             .collect();
         let slots = slots?;
         let defaults = literal_defaults(body);
+        let capture_context = dynamic
+            && (egcl_rt::symbols::is_uninterned(symbol)
+                || closure_envs().borrow().contains_key(&symbol)
+                || closure_controls().borrow().contains_key(&symbol));
         let mut entry = Box::new(Self {
-            function,
+            function: if dynamic { NIL } else { function },
+            dynamic,
+            capture_context,
             code,
             active: Cell::new(0),
             buffers: Vec::new(),
@@ -97,6 +129,13 @@ impl NativeEntry {
             entry.buffers.push(egcl_rt::jit::JitBuffer::new(&bytes)?);
         }
         Some(entry)
+    }
+
+    pub(super) fn owns(&self, code: &Rc<NativeCode>) -> bool {
+        Rc::ptr_eq(&self.code, code)
+    }
+    pub(super) fn is_active(&self) -> bool {
+        self.active.get() != 0
     }
 
     pub(super) fn entries(&self) -> [usize; 2] {
@@ -133,7 +172,13 @@ impl NativeEntry {
         const R10: u8 = 10;
         const R11: u8 = 11;
         // Six incoming words, two saved EgclStack pointers; 72 aligns RSP.
-        const SAVE_BYTES: u8 = 72;
+        let save_bytes = 72_u32
+            + if self.capture_context {
+                std::mem::size_of::<super::call_table_funcall::Context>().next_multiple_of(16)
+                    as u32
+            } else {
+                0
+            };
         const OLD_FP: i32 = 48;
         const OLD_SP: i32 = 56;
         let stack = egcl_rt::current_stack() as *const egcl_rt::EgclStack as u64;
@@ -162,7 +207,8 @@ impl NativeEntry {
             compare_count(&mut a, 3);
             a.jcc(Cc::G, slow);
         }
-        a.extend_from_slice(&[0x48, 0x83, 0xec, SAVE_BYTES]);
+        a.extend_from_slice(&[0x48, 0x81, 0xec]);
+        a.extend_from_slice(&save_bytes.to_le_bytes());
         for (i, register) in [RDI, RSI, RDX, RCX, 8, 9].into_iter().enumerate() {
             memory(&mut a, 0x89, register, RSP, i as i32 * 8);
         }
@@ -197,7 +243,11 @@ impl NativeEntry {
             RAX,
             std::mem::offset_of!(Frame, return_pc) as i32,
         );
-        immediate(&mut a, R11, self.function.0);
+        if self.dynamic {
+            memory(&mut a, 0x8b, R11, RSP, 0);
+        } else {
+            immediate(&mut a, R11, self.function.0);
+        }
         memory(
             &mut a,
             0x89,
@@ -260,20 +310,47 @@ impl NativeEntry {
         a.extend_from_slice(&[0x41, 0xff, 0x03]); // inc dword [r11]
         if !profiling_disabled() {
             // The retained callable is a pinned, interpreted-function object.
-            let count = unsafe { self.function.as_ptr() } as usize
-                + std::mem::offset_of!(egcl_rt::object::FunctionData, invoke_count);
-            immediate(&mut a, R11, count as u64);
+            let offset = std::mem::offset_of!(egcl_rt::object::FunctionData, invoke_count);
+            if self.dynamic {
+                memory(&mut a, 0x8b, R11, RSP, 0);
+                a.extend_from_slice(&[0x49, 0x83, 0xe3, 0xf8]); // clear value tag
+                memory(&mut a, 0x8d, R11, R11, offset as i32);
+            } else {
+                let count = unsafe { self.function.as_ptr() } as usize + offset;
+                immediate(&mut a, R11, count as u64);
+            }
             a.extend_from_slice(&[0xf0, 0x41, 0xff, 0x03]); // lock inc dword [r11]
         }
         // This leaf helper neither allocates nor yields. It clears the real MV
         // buffer, without exposing Rust Vec internals to generated code.
         immediate(&mut a, RAX, c2i_clear_mv as *const () as u64);
         a.extend_from_slice(&[0xff, 0xd0]);
+        if self.capture_context {
+            memory(&mut a, 0x8d, RDI, RSP, 72);
+            memory(&mut a, 0x8b, RSI, RSP, 0);
+            immediate(
+                &mut a,
+                RAX,
+                super::call_table_funcall::enter_context as *const () as u64,
+            );
+            a.extend_from_slice(&[0xff, 0xd0]);
+        }
         immediate(&mut a, RSI, stack);
         memory(&mut a, 0x8b, RDI, RSI, bs_fp);
         memory(&mut a, 0x8d, RDI, RDI, header);
         immediate(&mut a, RAX, self.code.entry as u64);
         a.extend_from_slice(&[0xff, 0xd0]); // native body returns its final value
+        if self.capture_context {
+            memory(&mut a, 0x89, RAX, RSP, 64);
+            memory(&mut a, 0x8d, RDI, RSP, 72);
+            immediate(
+                &mut a,
+                RAX,
+                super::call_table_funcall::leave_context as *const () as u64,
+            );
+            a.extend_from_slice(&[0xff, 0xd0]);
+            memory(&mut a, 0x8b, RAX, RSP, 64);
+        }
         immediate(&mut a, R10, stack);
         memory(&mut a, 0x8b, RCX, RSP, OLD_FP);
         memory(&mut a, 0x89, RCX, R10, bs_fp);
@@ -284,12 +361,15 @@ impl NativeEntry {
         immediate(&mut a, R11, active);
         a.extend_from_slice(&[0x49, 0xff, 0x0b]); // dec qword [r11]
         // No safepoint between releasing the active version and leaving it.
-        a.extend_from_slice(&[0x48, 0x83, 0xc4, SAVE_BYTES, 0xc3]);
+        a.extend_from_slice(&[0x48, 0x81, 0xc4]);
+        a.extend_from_slice(&save_bytes.to_le_bytes());
+        a.push(0xc3);
         a.bind(restore_slow);
         for (i, register) in [RDI, RSI, RDX, RCX, 8, 9].into_iter().enumerate() {
             memory(&mut a, 0x8b, register, RSP, i as i32 * 8);
         }
-        a.extend_from_slice(&[0x48, 0x83, 0xc4, SAVE_BYTES]);
+        a.extend_from_slice(&[0x48, 0x81, 0xc4]);
+        a.extend_from_slice(&save_bytes.to_le_bytes());
         a.bind(slow);
         immediate(&mut a, RAX, fallback as u64);
         a.extend_from_slice(&[0xff, 0xe0]); // tail-enter the interpreter/legacy bridge
@@ -352,7 +432,7 @@ fn compare_count(a: &mut Asm, count: usize) {
     a.extend_from_slice(&(count as u32).to_le_bytes());
 }
 
-fn immediate(a: &mut Asm, register: u8, value: u64) {
+pub(super) fn immediate(a: &mut Asm, register: u8, value: u64) {
     a.extend_from_slice(&[
         if register >= 8 { 0x49 } else { 0x48 },
         0xb8 + (register & 7),
@@ -360,7 +440,7 @@ fn immediate(a: &mut Asm, register: u8, value: u64) {
     a.extend_from_slice(&value.to_le_bytes());
 }
 
-fn memory(a: &mut Asm, opcode: u8, register: u8, base: u8, displacement: i32) {
+pub(super) fn memory(a: &mut Asm, opcode: u8, register: u8, base: u8, displacement: i32) {
     a.push(0x48 | if register >= 8 { 4 } else { 0 } | if base >= 8 { 1 } else { 0 });
     a.push(opcode);
     a.push(0x80 | ((register & 7) << 3) | (base & 7));

@@ -145,3 +145,20 @@ fn native_factory_binds_more_captured_parameters_than_stack_slots() {
     "#, &[("EGCL_FORCE_TIER", "t1")]);
     assert!(out.contains("WIDE-CAPTURE-TIER=1"), "{out}");
 }
+
+#[test]
+fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
+    let out = run_case("saved-fasl-call", r#"
+      (defun saved-fasl-target (x) (+ x 1))
+      (defun saved-fasl-invoke (f x) (funcall f x))
+    "#, r#"
+      (defvar *saved-fasl* #'saved-fasl-target)
+      (dotimes (i 40) (assert (= (saved-fasl-invoke *saved-fasl* i) (+ i 1))))
+      (setf (symbol-function 'saved-fasl-target) (lambda (x) (+ x 100)))
+      (dotimes (i 40)
+        (assert (= (saved-fasl-target i) (+ i 100)))
+        (assert (= (saved-fasl-invoke *saved-fasl* i) (+ i 1))))
+      (format t "SAVED-FASL-OK~%")
+    "#, &[("EGCL_FORCE_TIER", "t2")]);
+    assert!(out.contains("SAVED-FASL-OK"));
+}

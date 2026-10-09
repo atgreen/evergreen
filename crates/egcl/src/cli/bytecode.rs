@@ -52,6 +52,8 @@ mod pending_error;
 mod call_table;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_native;
+#[cfg(all(target_arch = "x86_64", unix))]
+mod call_table_funcall;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use super::control_payload::reserve_control_values;
@@ -257,6 +259,7 @@ fn closure_bodies() -> &'static SharedCell<HashMap<u32, Arc<BytecodeFunction>, e
 struct NamedBytecodeDefinition {
     generation: u64,
     body: Option<Arc<BytecodeFunction>>,
+    function: EgclVal,
 }
 
 fn named_definitions() -> &'static SharedCell<HashMap<u32, NamedBytecodeDefinition, egcl_rt::fxhash::FxBuildHasher>> {
@@ -428,6 +431,8 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     // SAFETY: the collector stopped every execution, including suspended fibers.
     unsafe {
         call_table::scan(visit);
+        #[cfg(all(target_arch = "x86_64", unix))]
+        call_table_funcall::scan_contexts(visit);
         NATIVE_ERROR.scan(|error| {
             use egcl_rt::gc::TraceHostRoots;
             error.visit(|value| value.trace_host_roots(visit));
@@ -439,6 +444,12 @@ fn scan_bytecode_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
                 });
             }
         });
+    }
+
+    // Function-cell aliases can replace the global owner while saved callable
+    // objects still need this source-free definition. Trace its exact owner.
+    for definition in named_definitions().borrow_mut().values_mut() {
+        visit(&mut definition.function);
     }
 
     let private_pools: std::collections::HashSet<_> = closure_bodies()
@@ -952,6 +963,18 @@ fn replacement_function_value(sym: u32, function: EgclVal) -> Option<EgclVal> {
     (name.symbol_index().is_some_and(|own| own != sym)).then_some(function)
 }
 
+/// The registry follows DEFUN publication, while a function-cell alias can
+/// change independently. A saved callable may use only the body it owns.
+fn registered_function_matches(sym: u32, function: EgclVal) -> bool {
+    if !egcl_rt::function::is_interpreted_function(function)
+        || egcl_rt::symbols::is_uninterned(sym)
+    {
+        return true;
+    }
+    named_definitions().borrow().get(&sym)
+        .is_some_and(|definition| definition.function == function)
+}
+
 fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
     #[cfg(test)]
     call_table::record_target_lookup();
@@ -1170,6 +1193,7 @@ fn publish_bytecode(sym: u32, f: Arc<BytecodeFunction>, expected: Option<u64>) -
             NamedBytecodeDefinition {
                 generation,
                 body: Some(Arc::clone(&f)),
+                function: egcl_rt::symbols::symbol_function(sym).unwrap_or(NIL),
             },
         );
         generation
@@ -1191,6 +1215,7 @@ fn registry_remove(sym: u32) {
             NamedBytecodeDefinition {
                 generation,
                 body: None,
+                function: NIL,
             },
         );
         generation
@@ -1271,6 +1296,12 @@ pub fn call_registered(
             sym_label(sym),
             registry_get(sym).is_some()
         );
+    }
+    // A saved named function object retains its own definition after DEFUN
+    // replaces the name. Its source fallback must not use the replacement's
+    // bytecode or native entry. Private closures have unique registry names.
+    if !registered_function_matches(sym, fn_val) {
+        return None;
     }
     let callee = registry_get(sym)?;
     if !arity_accepts(&callee, args.len()) {
@@ -18121,7 +18152,11 @@ fn materialize_t2_deopt_scopes(
         // activation uses the calling closure's identity and captures.
         let function = if let (0, Some(outer)) = (scope_index, outer) {
             // SAFETY: the native entry owns this live EgclStack frame.
-            unsafe { (*outer).function.symbol_index() }.unwrap_or(function)
+            let callable = unsafe { (*outer).function };
+            callable.symbol_index().or_else(|| {
+                egcl_rt::function::is_interpreted_function(callable)
+                    .then(|| egcl_rt::function::name(callable).symbol_index()).flatten()
+            }).unwrap_or(function)
         } else {
             function
         };
@@ -19336,6 +19371,11 @@ fn dispatch_invoke_count_snapshot(sym: u32, fn_obj: Option<EgclVal>) -> u32 {
 fn publish_native(sym: u32, fn_obj: Option<EgclVal>, nc: &NativeCode) {
     // The next slot call must observe the newly installed tier.
     egcl_rt::call_table::invalidate(sym);
+    // Native FUNCALL holds a bounded cache of code versions independently of
+    // the callee's named slot. Publication must retire that dispatch too.
+    if let Some(funcall) = egcl_rt::symbols::find_index("FUNCALL") {
+        egcl_rt::call_table::invalidate(funcall);
+    }
     // Pinned to T0 for deterministic profiling (bliss-xgr5): never install native
     // code, so the interpreter counts every call. Catches the T2 install path too
     // (both tiers publish here).
