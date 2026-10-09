@@ -17117,6 +17117,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 && !is_special_operator_name(&name) => {}
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
             "%NATIVE-CHILD-SUSPEND-FOR-TEST" => return bytecode::pause_native_child_for_test(),
+            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+            "%NATIVE-REENTRY-EVENT-FOR-TEST" => {
+                let phase = eval_form(cp(cdr).0, env)?;
+                return bytecode::native_reentry_event_for_test(phase);
+            }
             #[cfg(test)]
             "%FORCE-MINOR-GC-FOR-TEST" => {
                 egcl_rt::collect_t0_minor()?;
@@ -20358,6 +20363,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.clear_mv();
                 let mut child = env.null_lexical_child();
                 egcl_rt::rooted_ref!(_child_root = &mut child);
+                #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+                let mut native_probe = bytecode::NativeEvalProbe::enter();
+                #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+                egcl_rt::rooted_ref!(_native_probe_root = &mut native_probe);
                 let result = eval_form(form, &mut child)?;
                 // The inner form's OWN values are EVAL's values, so republish the
                 // child's multiple-value state on the caller.

@@ -1434,3 +1434,25 @@ interpreted callable objects are pinned; it requires observed relocation.
 The fiber cohort adds guard recovery that suspends with native capture masked,
 then migrates or rejects an incompatible carrier while preserving moving roots.
 This remains part of the opt-in Linux x86-64 rollout, not universal ABI completion.
+
+### Mapped child reentry through Rust (2026-10-09)
+
+The Linux x86-64 acceptance test now crosses the real `EVAL` implementation
+from a warmed mapped child into a separately installed mapped inner function.
+It verifies the exact inner, child and caller code owners and requires the inner
+entry to establish a distinct native segment. Normal return and `THROW` preserve
+multiple values and restore the original segment, capture, frame, stack extent
+and native depth.
+
+An execution-local, test-only guard lives in the actual Rust `EVAL` frame. Its
+fresh precise root must relocate and retain its contents. The ordered trace must
+show inner cleanup, the Rust guard's destructor, child cleanup, then caller
+cleanup, each exactly once. A negative control with the inner function left
+interpreted fails the distinct-segment assertion. Warmup always returns normally:
+a throwing cold call cannot publish a warmed call-cell target.
+
+This completes the distinct mapped-child ownership/continuation acceptance
+tracked by `bliss-shih7.16.2`, together with protected continuation recovery,
+optimized guard recovery and fiber migration tests. Universal publication,
+broader callable adapters and remaining platform gates stay open under the
+parent tasks; these tests do not claim a default native ABI.

@@ -66,6 +66,9 @@ pub(super) fn pause_native_child_for_test() -> Result<EgclVal, EgclError> {
     native_transfer_tests::pause_child_for_test()
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::{NativeEvalProbe, native_reentry_event_for_test};
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;

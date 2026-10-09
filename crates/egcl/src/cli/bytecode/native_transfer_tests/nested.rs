@@ -9,6 +9,7 @@ use super::*;
 mod deopt;
 pub(super) mod fibers;
 mod protected;
+pub(super) mod reentry;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
