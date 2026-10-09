@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Install eligible protected functions in opt-in native transfer segments,
+  preserving cleanup, restarts, multiple values, and tiering when child calls
+  return through native code or bytecode recovery
+  ([#166](https://github.com/atgreen/evergreen/pull/166)).
+
 - Keep eligible calls between distinct T2 definitions inside opt-in native
   transfer segments, preserving multiple values, moving GC roots, caller
   handlers, and active function replacement
