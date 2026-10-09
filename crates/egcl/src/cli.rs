@@ -35044,6 +35044,7 @@ const DIRECT_FAST: &[&str] = &[
     // arguments, so the direct call reaches an identical kernel.
     "INTEGER-LENGTH",
     "LOGCOUNT",
+    "GETHASH",
 ];
 
 /// The direct-call table. The index into this slice is what a compiled call
