@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep eligible recursive calls inside opt-in native exceptional-transfer
+  segments, with precise GC roots, bounded stack fallback, and function
+  redefinition checks
+  ([#157](https://github.com/atgreen/evergreen/pull/157)).
+
 - Show cached native exceptional-transfer code separately from installed
   legacy code in `DISASSEMBLE`, including native helper veneer annotations
   ([#156](https://github.com/atgreen/evergreen/pull/156)).
