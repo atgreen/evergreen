@@ -1040,6 +1040,7 @@ pub fn emit_framed_with_runtime(
         emitter.deopt(function.frame_states.get(state), deopt_t2)?;
     }
     Ok(FramedCode {
+        native_calls: None,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,

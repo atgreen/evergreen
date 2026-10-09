@@ -1269,6 +1269,7 @@ pub fn emit_framed_with_runtime(
     }
 
     Ok(FramedCode {
+        native_calls: None,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
         code: emitter.asm.finish().ok_or(EmitError::BadBranch)?,

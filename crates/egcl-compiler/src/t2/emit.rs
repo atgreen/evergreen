@@ -82,15 +82,20 @@
 //! slots** appended to the activation after `activation_slots`, clears unused
 //! shadow slots to NIL, and after the call reloads each value into its home,
 //! because a moving collection updates the activation slot, not the host-stack
-//! home. Liveness comes from `value_locations` at program point `mi*2 + 1`
-//! (live *after* the call), plus the call's own early uses, restricted to
-//! `Tagged`-represented values with a home and excluding values whose inferred
-//! type is confined to non-pointer immediates. `shadow_root_slots` is the
+//! home. Checked shared maps sample `value_locations` before the instruction
+//! (`mi*2`), including its early uses and live-through values. Ordinary call
+//! roots select tagged homes and exclude proven non-pointer immediates; inserted
+//! polls also preserve raw registers in private, unscanned spill slots. `shadow_root_slots` is the
 //! maximum root count over all sites plus the slice reserved for wide calls
 //! (more than three args, or `Invoke`) whose arguments are passed through the
 //! activation. Each site is recorded in `root_sync_sites` with its native
 //! offset and root counts, and installation refuses the artifact if the count
 //! disagrees with `emitted_safepoints`.
+//!
+//! `native_calls` separately indexes exact primary CALL return offsets, their
+//! source instructions/polls/deopt states, and temporary stack adjustments.
+//! Recovery toggles and other noncollecting leaf callbacks are excluded. These
+//! attachment points do not yet describe the authoritative suspended values.
 //!
 //! # Native transfers (Linux x86-64 only)
 //!
@@ -122,6 +127,7 @@
 //!   sources serialised by each precise deopt stub.
 //! * `EGCL_NO_DIRECT_SELF_CALL=1` — route self-calls through c2i.
 
+use crate::t2::x64_calls::{CallReturn, NativeCallOrigin, NativeCallSites, NativeStackBase};
 use egcl_rt::asm::{Asm, Cc};
 
 use crate::t2::ir::Function;
@@ -637,6 +643,9 @@ fn float_operand_to_xmm(
 ///   a compiled caller skips the frame load entirely. Result in rax.
 pub struct FramedCode {
     pub code: Vec<u8>,
+    /// Exact x86-64 returning-call attachment points, independent of debugger flags.
+    /// Other backends have not supplied this metadata. These are not GC recipes.
+    pub native_calls: Option<crate::t2::x64_calls::NativeCallSites>,
     /// Owned unwind records for the independently callable Windows entries.
     #[cfg(all(target_arch = "x86_64", windows))]
     pub windows_unwind: Vec<WindowsUnwindRange>,
@@ -950,7 +959,7 @@ fn emit_mapped_poll(
     frame: &PollFrame,
     veneer: u64,
     heat: bool,
-) -> Result<(), EmitError> {
+) -> Result<CallReturn, EmitError> {
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -979,7 +988,7 @@ fn emit_mapped_poll(
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
-    emit_runtime_helper_call(a, 0, None);
+    let site = emit_runtime_helper_call(a, 0, None);
     let restore = roots.iter().copied().collect();
     emit_shadow_root_restore(
         a,
@@ -998,7 +1007,7 @@ fn emit_mapped_poll(
         );
         store_home(a, home, RAX, 0);
     }
-    Ok(())
+    Ok(site)
 }
 
 /// One home-to-home move, RAX as intermediary where x86 needs one. RAX is
@@ -1510,7 +1519,7 @@ fn emit_call(
     self_entry: Option<egcl_rt::asm::Label>,
     self_arity: usize,
     named_calls: &[NamedCallTarget],
-) -> Result<(), EmitError> {
+) -> Result<Vec<CallReturn>, EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
         AuxData::CallTarget(s) => s,
@@ -1590,6 +1599,10 @@ fn emit_call(
             }
             emit_call_arg_moves(a, moves)?;
             a.call(entry);
+            let direct = CallReturn {
+                return_offset: a.here(),
+                stack_adjust: 0,
+            };
             a.jmp(join);
 
             // Slow path: the ordinary three-register c2i dispatch, emitted
@@ -1610,14 +1623,14 @@ fn emit_call(
             mov_imm64(a, 9, 0); // r9 = no profiling token
             mov_imm64(a, 0, c2i_call_addr as i64);
             // The common join checks both the helper and direct entries.
-            emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
+            let fallback = emit_runtime_helper_call(a, c2i_recovery_toggle_addr, None);
 
             a.bind(join);
             emit_transfer_check(a, transfer_check);
             if let Some(&r0) = data.results.first() {
                 mov_rr(a, *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?, 0);
             }
-            return Ok(());
+            return Ok(vec![direct, fallback]);
         }
     }
     // T2 call(sym, n, a0, a1, a2, profile_site): rdx=a0, rcx=a1, r8=a2.
@@ -1652,12 +1665,12 @@ fn emit_call(
         } else {
             mov_imm64(a, 0, c2i_call_slice_addr as i64);
         }
-        emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
+        let site = emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
         if let Some(&result) = data.results.first() {
             let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
             store_home(a, home, RAX, 0);
         }
-        return Ok(());
+        return Ok(vec![site]);
     }
     let mut moves = Vec::with_capacity(nargs);
     for (i, &arg) in data.args.iter().enumerate() {
@@ -1694,12 +1707,12 @@ fn emit_call(
             }
         }
     }
-    emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
+    let site = emit_runtime_target_call(a, named_recovery, transfer_check, named.is_some());
     if let Some(&r0) = data.results.first() {
         let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
         mov_rr(a, dst, 0); // mov result, rax
     }
-    Ok(())
+    Ok(vec![site])
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1854,7 +1867,7 @@ fn emit_symbol_value(
     c2i_load_global_addr: u64,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
-) -> Result<(), EmitError> {
+) -> Result<CallReturn, EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
         AuxData::SymbolRef(s) => s,
@@ -1862,11 +1875,11 @@ fn emit_symbol_value(
     };
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_load_global_addr as i64); // mov rax, c2i_load_global
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+    let site = emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
     let r0 = *data.results.first().ok_or(EmitError::UnsupportedOp(0xFA))?;
     let dst = *reg.get(&r0).ok_or(EmitError::UnsupportedOp(0xF2))?;
     mov_rr(a, dst, 0); // mov result, rax
-    Ok(())
+    Ok(site)
 }
 
 /// `(setf (symbol-value sym) v)` — a global write (side effect). Lowers to
@@ -1879,7 +1892,7 @@ fn emit_set_symbol_value(
     c2i_store_global_addr: u64,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
-) -> Result<(), EmitError> {
+) -> Result<CallReturn, EmitError> {
     use crate::t2::ir::AuxData;
     let sym = match data.aux {
         AuxData::SymbolRef(s) => s,
@@ -1895,8 +1908,8 @@ fn emit_set_symbol_value(
     }
     mov_imm64(a, 7, sym as i64); // mov rdi, sym
     mov_imm64(a, 0, c2i_store_global_addr as i64); // mov rax, c2i_store_global
-    emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
-    Ok(())
+    let site = emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+    Ok(site)
 }
 
 #[derive(Clone, Copy)]
@@ -1941,8 +1954,8 @@ fn emit_runtime_helper_call(
     a: &mut Asm,
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
-) {
-    emit_runtime_target_call(a, c2i_recovery_toggle_addr, transfer_check, false);
+) -> CallReturn {
+    emit_runtime_target_call(a, c2i_recovery_toggle_addr, transfer_check, false)
 }
 
 #[cfg(windows)]
@@ -1951,7 +1964,7 @@ fn emit_runtime_target_call(
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
     indirect: bool,
-) {
+) -> CallReturn {
     // Templates arrange up to six word arguments in rdi/rsi/rdx/rcx/r8/r9.
     // At the C boundary translate to Win64's four registers and two stack args.
     // Reserve 32 bytes of callee-owned shadow space, 16 bytes of stack args,
@@ -1976,6 +1989,10 @@ fn emit_runtime_target_call(
     }
     load_from_rsp(a, RAX, 96);
     a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
+    let site = CallReturn {
+        return_offset: a.here(),
+        stack_adjust: 112,
+    };
     if c2i_recovery_toggle_addr != 0 {
         // Recovery toggles are leaf, nonallocating callbacks: raw operands and
         // the primary result may live here across them, never across a GC.
@@ -1987,6 +2004,7 @@ fn emit_runtime_target_call(
     }
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 112]);
     emit_transfer_check(a, transfer_check);
+    site
 }
 
 #[cfg(not(windows))]
@@ -1995,11 +2013,15 @@ fn emit_runtime_target_call(
     c2i_recovery_toggle_addr: u64,
     transfer_check: Option<NativeTransferCheck>,
     indirect: bool,
-) {
+) -> CallReturn {
     if c2i_recovery_toggle_addr == 0 {
         a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
+        let site = CallReturn {
+            return_offset: a.here(),
+            stack_adjust: 0,
+        };
         emit_transfer_check(a, transfer_check);
-        return;
+        return site;
     }
 
     // The helper target is in rax; runtime helper arguments may already occupy
@@ -2026,6 +2048,10 @@ fn emit_runtime_target_call(
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 64
 
     a.extend_from_slice(&[0xFF, if indirect { 0x10 } else { 0xD0 }]);
+    let site = CallReturn {
+        return_offset: a.here(),
+        stack_adjust: 0,
+    };
 
     a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x10]); // sub rsp, 16
     a.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
@@ -2035,6 +2061,7 @@ fn emit_runtime_target_call(
     a.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp]
     a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x10]); // add rsp, 16
     emit_transfer_check(a, transfer_check);
+    site
 }
 
 fn edge_home_moves(
@@ -4569,6 +4596,7 @@ fn emit_framed_inner(
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
         base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
     });
+    let mut native_calls = Vec::new();
     let mut root_sync_sites = Vec::new();
     let mut emitted_safepoints = 0usize;
     // Bytecode→native correlation for the tiered-JIT viewer (bliss-zmmb): the T2
@@ -4614,7 +4642,7 @@ fn emit_framed_inner(
                 .as_ref()
                 .and_then(|transfer| transfer.poll_veneer)
                 .ok_or(EmitError::UnsupportedOp(0xFE))?;
-            emit_mapped_poll(
+            let call = emit_mapped_poll(
                 &mut a,
                 loop_maps.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
                 &homes,
@@ -4622,6 +4650,7 @@ fn emit_framed_inner(
                 poll_veneer,
                 heat_headers.contains(&b),
             )?;
+            native_calls.push(call.site(NativeCallOrigin::LoopPoll(b), NativeStackBase::Body));
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).
@@ -4640,7 +4669,7 @@ fn emit_framed_inner(
                     .as_ref()
                     .and_then(|transfer| transfer.poll_veneer)
                     .ok_or(EmitError::UnsupportedOp(0xFE))?;
-                emit_mapped_poll(
+                let call = emit_mapped_poll(
                     &mut a,
                     straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
                     &homes,
@@ -4648,6 +4677,7 @@ fn emit_framed_inner(
                     poll_veneer,
                     false,
                 )?;
+                native_calls.push(call.site(NativeCallOrigin::StraightPoll(inst), NativeStackBase::Body));
             }
             if (is_const_opcode(d.opcode) && d.opcode != Opcode::ConstHeapObj)
                 || d.opcode == Opcode::CleanupLanding
@@ -4732,6 +4762,7 @@ fn emit_framed_inner(
             } else {
                 prepare_framed_inst(&mut a, &d, &homes, &const_tagged)?
             };
+            let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
             if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
@@ -4822,6 +4853,10 @@ fn emit_framed_inner(
                         }
                     }
                     for return_offset in return_offsets {
+                        inst_calls.push(CallReturn {
+                            return_offset: return_offset as usize,
+                            stack_adjust: call_stack_adjust,
+                        });
                         transfer.sites.push(crate::t2::transfer_sites::SysvTransferSite {
                             return_offset,
                             stack_slots: native_spill_slots,
@@ -4901,6 +4936,12 @@ fn emit_framed_inner(
                     mov_imm64(&mut a, 6, i64::from(resume_bcp));
                     mov_imm64(&mut a, RAX, helper as i64);
                     a.extend_from_slice(&[0xff, 0xd0]);
+                    if matches!(d.opcode, Opcode::CleanupSave | Opcode::CleanupRestore) {
+                        inst_calls.push(CallReturn {
+                            return_offset: a.here(),
+                            stack_adjust: 0,
+                        });
+                    }
                     if let Some(value) = d.results.first() {
                         store_home(&mut a, homes[value], RAX, 0);
                     }
@@ -4909,7 +4950,7 @@ fn emit_framed_inner(
                 return Err(EmitError::UnsupportedOp(0xFA));
             } else if d.opcode == Opcode::Call {
                 let self_entry = has_reg_entry.then_some(reg_entry_label);
-                emit_call(
+                inst_calls.extend(emit_call(
                     &mut a,
                     &d,
                     &inst_reg,
@@ -4926,7 +4967,7 @@ fn emit_framed_inner(
                     self_entry,
                     f.block(entry).params.len(),
                     named_calls,
-                )?;
+                )?);
             } else if d.opcode == Opcode::MemoryFence {
                 match d.aux {
                     AuxData::MemoryFence(egcl_rt::bytecode::MemoryFenceKind::Read) => {
@@ -5014,34 +5055,38 @@ fn emit_framed_inner(
                 mov_imm64(&mut a, 7, environment.body as i64); // rdi = retained body
                 mov_imm64(&mut a, 6, i64::from(index)); // rsi = name index
                 mov_imm64(&mut a, 0, helper as i64);
-                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                inst_calls.push(emit_runtime_helper_call(
+                    &mut a,
+                    c2i_recovery_toggle_addr,
+                    transfer_check,
+                ));
                 if !store {
                     let result = *d.results.first().ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
                     let dst = *inst_reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
                     mov_rr(&mut a, dst, 0);
                 }
             } else if d.opcode == Opcode::SymbolValue {
-                emit_symbol_value(
+                inst_calls.push(emit_symbol_value(
                     &mut a,
                     &d,
                     &inst_reg,
                     c2i_load_global_addr,
                     c2i_recovery_toggle_addr,
                     transfer_check,
-                )?;
+                )?);
             } else if d.opcode == Opcode::SymbolFunction {
                 // Same shape as a global read, different helper: it reads the
                 // symbol's FUNCTION cell rather than its value cell.
-                emit_symbol_value(
+                inst_calls.push(emit_symbol_value(
                     &mut a,
                     &d,
                     &inst_reg,
                     c2i_load_function_addr,
                     c2i_recovery_toggle_addr,
                     transfer_check,
-                )?;
+                )?);
             } else if d.opcode == Opcode::SetSymbolValue {
-                emit_set_symbol_value(
+                inst_calls.push(emit_set_symbol_value(
                     &mut a,
                     &d,
                     &inst_reg,
@@ -5049,7 +5094,7 @@ fn emit_framed_inner(
                     c2i_store_global_addr,
                     c2i_recovery_toggle_addr,
                     transfer_check,
-                )?;
+                )?);
             } else if d.opcode == Opcode::ClearMv {
                 // A zero count selects the clear operation in the shared T2 MV
                 // helper. Initialise every argument because the same ABI also
@@ -5064,7 +5109,9 @@ fn emit_framed_inner(
                     a.extend_from_slice(&[0xff, 0xd0]);
                 }
                 #[cfg(windows)]
-                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                {
+                    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                }
             } else if d.opcode == Opcode::TakeValuesToLocals {
                 let (nvars, slot_base) = match d.aux {
                     AuxData::ValuesLocals { nvars, slot_base } => (nvars, slot_base),
@@ -5088,7 +5135,11 @@ fn emit_framed_inner(
                 alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
                 mov_imm64(&mut a, 2, i64::from(nvars));
                 mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                inst_calls.push(emit_runtime_helper_call(
+                    &mut a,
+                    c2i_recovery_toggle_addr,
+                    transfer_check,
+                ));
 
                 // The helper writes the activation slots. Materialise each SSA
                 // result into its stable home one at a time; this also handles
@@ -5122,6 +5173,9 @@ fn emit_framed_inner(
                     inst_deopt_label,
                 )?;
             }
+            native_calls.extend(inst_calls.into_iter().map(|call| {
+                call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
+            }));
             for (home, src) in result_stores {
                 store_home(&mut a, home, src, 0);
             }
@@ -5381,7 +5435,14 @@ fn emit_framed_inner(
     mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
                                                  // Deopt stubs have their own temporary stack layout and return immediately;
                                                  // they must finish that cleanup instead of taking the normal transfer exit.
-    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+    let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+    if !cfg!(windows) {
+        call.stack_adjust += 8;
+    }
+    native_calls.push(call.site(
+        NativeCallOrigin::RestartDeopt,
+        if cfg!(windows) { NativeStackBase::Body } else { NativeStackBase::Entry },
+    ));
     if cfg!(windows) {
         emit_epilogue(&mut a);
     } else {
@@ -5552,8 +5613,13 @@ fn emit_framed_inner(
             a.extend_from_slice(&[0x48, 0x8D, 0xBC, 0x24]);
             a.extend_from_slice(&request.to_le_bytes());
             mov_imm64(&mut a, RAX, veneer as i64);
-            emit_runtime_helper_call(&mut a, 0, None);
-            transfers.as_mut().unwrap().deopt_returns.push(a.here() as u32);
+            let mut call = emit_runtime_helper_call(&mut a, 0, None);
+            transfers.as_mut().unwrap().deopt_returns.push(
+                u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?);
+            call.stack_adjust = call.stack_adjust
+                .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
+                .ok_or(EmitError::BadBranch)?;
+            native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
         }
         if segment_deopt.is_none() {
             // c2i_deopt_t2(n_scopes=rdi, n_words=rsi, buf=rdx, reserved=rcx)
@@ -5566,7 +5632,11 @@ fn emit_framed_inner(
             }
             mov_rr(&mut a, 2, 4); // mov rdx, rsp
             mov_imm64(&mut a, 0, c2i_deopt_t2_addr as i64);
-            emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+            let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+            call.stack_adjust = call.stack_adjust
+                .checked_add(u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
+                .ok_or(EmitError::BadBranch)?;
+            native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
         }
         if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
@@ -5776,7 +5846,9 @@ fn emit_framed_inner(
     let mut heap_constant_slots: Vec<usize> = heap_const_slots.values().copied().collect();
     heap_constant_slots.sort_unstable();
     heap_constant_slots.dedup();
+    let native_calls = NativeCallSites::new(code.len(), native_calls).ok_or(EmitError::BadBranch)?;
     Ok(FramedCode {
+        native_calls: Some(native_calls),
         code,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind,
@@ -6062,6 +6134,262 @@ mod tests {
         let code = emit(&mf).expect("emit const-return");
         assert!(!code.is_empty());
         assert_eq!(*code.last().unwrap(), 0xC3, "must end in ret");
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn runtime_call_location_matches_executed_return_pc_and_stack() {
+        use egcl_rt::jit::JitBuffer;
+        for toggle in [false, true] {
+            for indirect in [false, true] {
+                let mut observed = [0u64; 3];
+                let address = observed.as_mut_ptr() as i64;
+                let mut primary = Asm::new();
+                mov_imm64(&mut primary, 10, address);
+                load_from_rsp(&mut primary, RAX, 0);
+                store_mem64_disp(&mut primary, 10, 0, RAX);
+                store_mem64_disp(&mut primary, 10, 8, 4);
+                mov_imm64(&mut primary, RAX, 42);
+                primary.push(0xc3);
+                let primary = JitBuffer::new(&primary.finish().unwrap()).unwrap();
+                let leaf = JitBuffer::new(&[0x31, 0xc0, 0xc3]).unwrap();
+                let cell = primary.as_ptr() as u64;
+                let mut caller = Asm::new();
+                caller.extend_from_slice(&[0x48, 0x83, 0xec, 8]);
+                mov_imm64(&mut caller, 10, address);
+                store_mem64_disp(&mut caller, 10, 16, 4);
+                mov_imm64(
+                    &mut caller,
+                    RAX,
+                    if indirect {
+                        &cell as *const u64 as i64
+                    } else {
+                        cell as i64
+                    },
+                );
+                let exit = caller.label();
+                let site = emit_runtime_target_call(
+                    &mut caller,
+                    if toggle { leaf.as_ptr() as u64 } else { 0 },
+                    Some(NativeTransferCheck {
+                        pending_addr: leaf.as_ptr() as u64,
+                        exit,
+                    }),
+                    indirect,
+                );
+                caller.bind(exit);
+                caller.extend_from_slice(&[0x48, 0x83, 0xc4, 8, 0xc3]);
+                let caller = JitBuffer::new(&caller.finish().unwrap()).unwrap();
+                let run: extern "C" fn() -> u64 = unsafe { std::mem::transmute(caller.as_ptr()) };
+                assert_eq!(run(), 42);
+                assert_eq!(
+                    observed[0] as usize,
+                    caller.as_ptr() as usize + site.return_offset
+                );
+                // Callee-entry RSP includes the eight-byte CALL return word.
+                assert_eq!(observed[2] - observed[1] - 8, u64::from(site.stack_adjust));
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn invoke_records_prepare_and_recursive_calls_but_not_retirement() {
+        use crate::t2::ir::{AuxData, InstData, InstFlags, Opcode};
+        let mut asm = Asm::new();
+        let entry = asm.label();
+        let data = InstData {
+            opcode: Opcode::Invoke,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::CallTarget(123),
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        };
+        let (offsets, adjust) = emit_invoke_call(
+            &mut asm,
+            &data,
+            &Default::default(),
+            &Default::default(),
+            FramedHome::Reg(12),
+            4,
+            2,
+            0x1234,
+            Some((
+                RecursiveTransfer {
+                    symbol: 123,
+                    arity: 0,
+                    prepare: 0x5678,
+                    finish: 0x9abc,
+                },
+                entry,
+            )),
+        )
+        .unwrap();
+        asm.bind(entry);
+        asm.push(0xc3);
+        let code = asm.finish().unwrap();
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(adjust, 64);
+        let first = offsets[0] as usize;
+        let second = offsets[1] as usize;
+        assert_eq!(&code[first - 2..first], &[0xff, 0xd0]);
+        assert_eq!(code[second - 5], 0xe8);
+        let indirect: Vec<_> = code
+            .windows(2)
+            .enumerate()
+            .filter(|(_, b)| *b == [0xff, 0xd0])
+            .map(|(i, _)| i + 2)
+            .collect();
+        assert_eq!(indirect.len(), 2);
+        assert_eq!(indirect[0], first);
+        assert!(!offsets.contains(&(indirect[1] as u32)));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn invoke_location_matches_executed_request_stack() {
+        use crate::t2::ir::{AuxData, InstData, InstFlags, Opcode};
+        use egcl_rt::jit::JitBuffer;
+        let mut observed = [0u64; 3];
+        let address = observed.as_mut_ptr() as i64;
+        let mut callee = Asm::new();
+        mov_imm64(&mut callee, 10, address);
+        load_from_rsp(&mut callee, RAX, 0);
+        store_mem64_disp(&mut callee, 10, 0, RAX);
+        store_mem64_disp(&mut callee, 10, 8, 4);
+        mov_imm64(&mut callee, RAX, 42);
+        callee.push(0xc3);
+        let callee = JitBuffer::new(&callee.finish().unwrap()).unwrap();
+        let mut caller = Asm::new();
+        caller.extend_from_slice(&[0x48, 0x83, 0xec, 24]);
+        mov_imm64(&mut caller, 10, address);
+        store_mem64_disp(&mut caller, 10, 16, 4);
+        store_to_rsp(&mut caller, 10, 0); // activation base (no outgoing arguments)
+        let data = InstData {
+            opcode: Opcode::Invoke,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::CallTarget(123),
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        };
+        let (offsets, adjust) = emit_invoke_call(
+            &mut caller,
+            &data,
+            &Default::default(),
+            &Default::default(),
+            FramedHome::Stack(0),
+            0,
+            0,
+            callee.as_ptr() as u64,
+            None,
+        )
+        .unwrap();
+        caller.extend_from_slice(&[0x48, 0x83, 0xc4, 24, 0xc3]);
+        let caller = JitBuffer::new(&caller.finish().unwrap()).unwrap();
+        let run: extern "C" fn() -> u64 = unsafe { std::mem::transmute(caller.as_ptr()) };
+        assert_eq!(run(), 42);
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(
+            observed[0] as usize,
+            caller.as_ptr() as usize + offsets[0] as usize
+        );
+        assert_eq!(observed[2] - observed[1] - 8, u64::from(adjust));
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn call_template_records_both_direct_self_and_fallback_returns() {
+        use crate::t2::ir::{AuxData, InstData, InstFlags, Opcode};
+        if std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_some() {
+            return;
+        }
+        let mut asm = Asm::new();
+        let entry = asm.label();
+        let data = InstData {
+            opcode: Opcode::Call,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::CallTarget(123),
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        };
+        let calls = emit_call(
+            &mut asm,
+            &data,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            0x1234,
+            0x5678,
+            0x9abc,
+            None,
+            None,
+            None,
+            0,
+            Some(123),
+            Some(entry),
+            0,
+            &[],
+        )
+        .unwrap();
+        asm.bind(entry);
+        asm.push(0xc3);
+        let code = asm.finish().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(code[calls[0].return_offset - 5], 0xe8);
+        assert_eq!(
+            &code[calls[1].return_offset - 2..calls[1].return_offset],
+            &[0xff, 0xd0]
+        );
+        assert!(calls.iter().all(|call| call.stack_adjust == 0));
+        assert!(
+            code.len() > calls[1].return_offset + 2,
+            "fallback still restores recovery after its return"
+        );
+    }
+
+    #[test]
+    fn runtime_call_reports_primary_return_before_leaf_callbacks() {
+        for toggle in [0, 0x1234_5678] {
+            for indirect in [false, true] {
+                let mut asm = Asm::new();
+                let exit = asm.label();
+                let site = emit_runtime_target_call(
+                    &mut asm,
+                    toggle,
+                    Some(NativeTransferCheck {
+                        pending_addr: 0x8765_4321,
+                        exit,
+                    }),
+                    indirect,
+                );
+                asm.bind(exit);
+                asm.push(0xc3);
+                let code = asm.finish().unwrap();
+                let primary = if indirect { 0x10 } else { 0xd0 };
+                let calls: Vec<_> = code
+                    .windows(2)
+                    .enumerate()
+                    .filter(|(_, bytes)| bytes[0] == 0xff && matches!(bytes[1], 0x10 | 0xd0))
+                    .map(|(offset, _)| offset + 2)
+                    .collect();
+                assert_eq!(calls.len(), if toggle == 0 { 2 } else { 4 });
+                assert_eq!(site.return_offset, calls[usize::from(toggle != 0)]);
+                assert_eq!(
+                    &code[site.return_offset - 2..site.return_offset],
+                    &[0xff, primary]
+                );
+                assert_eq!(site.stack_adjust, if cfg!(windows) { 112 } else { 0 });
+            }
+        }
     }
 
     #[test]
