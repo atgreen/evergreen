@@ -71,6 +71,7 @@ pub mod transfer_capture;
 pub mod transfer_map;
 pub mod x64_calls;
 pub mod x64_frame;
+pub mod x64_unwind;
 pub mod x64_value_maps;
 
 // ── Front end ─────────────────────────────────────────────────────

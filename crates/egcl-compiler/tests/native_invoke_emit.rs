@@ -89,6 +89,7 @@ struct RunState {
     table: *const SysvTransferTable,
     value_maps: *const NativeCallSites,
     call_capture: *const [usize; 2],
+    entry_capture: *const [usize; 8],
     code_base: usize,
     snapshots: *mut u8,
     snapshot_count: usize,
@@ -138,6 +139,20 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     let Some(NativeCallValues::Frame(map)) = calls.value_map(offset) else {
         panic!("collecting Invoke must have an authoritative map");
     };
+    let entry = unsafe { *state.entry_capture };
+    let cursor = egcl_compiler::t2::x64_unwind::NativeFrameCursor {
+        pc: return_pc, call_sp: call_rsp, registers: [None; 6],
+    };
+    let step = calls.unwind(state.code_base, &cursor, call_rsp..entry[1], |address| {
+        Some(unsafe { (address as *const usize).read() })
+    }).expect("emitted frame must unwind at the actual Invoke PC");
+    assert_eq!((step.caller.pc, step.caller.call_sp), (entry[0], entry[1]));
+    for (index, location) in step.caller.registers.iter().enumerate() {
+        if let Some(location) = location {
+            assert_eq!(unsafe { (*location as *const usize).read() }, entry[index + 2]);
+        }
+    }
+    assert_eq!(step.body_sp, Some(call_rsp + site.stack_adjust as usize));
     let body_rsp = (call_rsp + site.stack_adjust as usize) as *const usize;
     let activation = unsafe { body_rsp.add(map.layout().activation_base_slot.unwrap() as usize).read() };
     assert_eq!(activation, request.activation as usize);
@@ -279,23 +294,14 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
                 JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)).unwrap();
             let veneer = JitBuffer::new(&emit_helper_veneer(helper, capture.as_ptr())).unwrap();
             let mut call_capture = Box::new([0usize; 2]);
-            // Observe the actual CALL return PC and pre-CALL RSP; tail-jump into
-            // the real helper veneer so its return and transfer paths are intact.
-            let mut probe = vec![0x48, 0xb8]; // mov rax,capture
-            probe.extend_from_slice(&(call_capture.as_mut_ptr() as u64).to_le_bytes());
-            probe.extend_from_slice(&[
-                0x48, 0x8b, 0x0c, 0x24, // mov rcx,[rsp]
-                0x48, 0x89, 0x08, // mov [rax],rcx
-                0x48, 0x8d, 0x4c, 0x24, 8, // lea rcx,[rsp+8]
-                0x48, 0x89, 0x48, 8, // mov [rax+8],rcx
-                0x48, 0xb8, // mov rax,veneer
-            ]);
-            probe.extend_from_slice(&(veneer.as_ptr() as u64).to_le_bytes());
-            probe.extend_from_slice(&[0xff, 0xe0]); // jmp rax
-            let probe = JitBuffer::new(&probe).unwrap();
+            // Tail-jump after observing the actual primary CALL coordinates.
+            let probe = native_unwind::capture_call(veneer.as_ptr(), call_capture.as_mut_ptr(), false);
             let (emitted, table) =
                 emit_framed_transfers(&ir, probe.as_ptr() as u64, activation_slots).unwrap();
+            assert!(emitted.native_calls.as_ref().unwrap().unwind_recipe().is_some(), "SysV emitted code needs its exact prologue recipe");
             let code = JitBuffer::new(&emitted.code).unwrap();
+            let mut entry_capture = Box::new([0usize; 8]);
+            let entry_probe = native_unwind::capture_call(code.as_ptr(), entry_capture.as_mut_ptr(), true);
             let mut snapshots: Vec<_> = table
                 .sites()
                 .map(|site| (site.return_offset(), site.reserve_snapshot().unwrap()))
@@ -319,6 +325,7 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
                 table: &table,
                 value_maps: emitted.native_calls.as_ref().unwrap(),
                 call_capture: &*call_capture,
+                entry_capture: &*entry_capture,
                 code_base: code.as_ptr() as usize,
                 snapshots: snapshots.as_mut_ptr().cast(),
                 snapshot_count: snapshots.len(),
@@ -336,7 +343,7 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
             let stack = EgclStack::new(64 * 1024);
             let outcome = unsafe {
                 native_transfer::invoke_native_segment(
-                    code.as_ptr(),
+                    entry_probe.as_ptr(),
                     activation.as_mut_ptr().cast(),
                     &stack,
                 )
@@ -359,6 +366,7 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
 }
 
 unsafe extern "C" fn complete_leaf_guard(request: *mut u8, out: *mut NativeOutcome) {
+    native_unwind::check_deopt_cursor();
     let request = unsafe { &*request.cast::<egcl_compiler::t2::emit::TransferDeoptRequest>() };
     assert_eq!((request.n_scopes, request.n_words), (1, 5));
     assert_eq!(
@@ -431,6 +439,8 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     );
     let veneer =
         JitBuffer::new(&emit_helper_veneer(complete_leaf_guard, std::ptr::null())).unwrap();
+    let mut top = Box::new([0usize; 2]);
+    let probe = native_unwind::capture_call(veneer.as_ptr(), top.as_mut_ptr(), false);
     let (emitted, _) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_recursion(
         &ir,
         1,
@@ -442,7 +452,7 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
         1,
         0,
         None,
-        Some(veneer.as_ptr() as u64),
+        Some(probe.as_ptr() as u64),
     )
     .unwrap();
     assert!(emitted.has_deopt);
@@ -463,6 +473,14 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
     assert_eq!(legacy_deopts.len(), 1);
     assert_eq!(legacy_deopts[0].stack_adjust, 48, "legacy serialization has no native request");
     let code = JitBuffer::new(&emitted.code).unwrap();
+    let mut entry = Box::new([0usize; 8]);
+    let entry_probe = native_unwind::capture_call(code.as_ptr(), entry.as_mut_ptr(), true);
+    let mut walk = native_unwind::DeoptWalk {
+        calls: emitted.native_calls.as_ref().unwrap(),
+        code_base: code.as_ptr() as usize,
+        top: &*top, entry: &*entry, checked: 0,
+    };
+    native_unwind::DEOPT_WALK.with(|slot| slot.set(&mut walk));
     let stack = EgclStack::new(64 * 1024);
     for (input, expected) in [
         (EgclVal::from_fixnum(7), EgclVal::from_fixnum(7)),
@@ -472,7 +490,7 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
         activation[0] = input;
         let result = unsafe {
             native_transfer::invoke_native_segment(
-                code.as_ptr(),
+                entry_probe.as_ptr(),
                 activation.as_mut_ptr().cast(),
                 &stack,
             )
@@ -481,4 +499,9 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
         assert_eq!(result.exit, NativeExit::Returned);
         assert_eq!(result.value, expected);
     }
+    native_unwind::DEOPT_WALK.with(|slot| slot.set(std::ptr::null_mut()));
+    assert_eq!(walk.checked, 1);
 }
+
+#[path = "support/native_unwind.rs"]
+mod native_unwind;
