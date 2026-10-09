@@ -28,6 +28,9 @@ use activation::ActivationState;
 mod deopt;
 mod nested;
 use nested::{SegmentActivations, finish_nested, prepare_nested, resume_nested};
+pub(super) use nested::{
+    finish_nested as finish_callable, prepare_callable, resume_nested as resume_callable,
+};
 #[cfg(test)]
 mod cache_tests;
 use deopt::{prepare_completed_deopt, resume_guard};

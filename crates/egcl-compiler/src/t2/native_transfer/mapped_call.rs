@@ -16,7 +16,8 @@ pub struct MappedCallRecord {
     pub cold_entry: *const u8,
     pub outcome: NativeOutcome,
     pub context: *mut egcl_rt::call_table::NativeCallContext,
-    pub cell: u64,
+    pub target: u64,
+    pub forward: *const egcl_rt::function::NativeCallableEntries,
 }
 
 pub type PrepareMappedCall = unsafe extern "C" fn(u64, *mut MappedCallRecord);
@@ -35,9 +36,9 @@ pub fn emit_published_call_entry(
     resume: FinishMappedCall,
     checked: PrepareMappedCall,
 ) -> Vec<u8> {
-    const SIZE: u8 = std::mem::size_of::<MappedCallRecord>() as u8;
+    const SIZE: u32 = std::mem::size_of::<MappedCallRecord>() as u32 + 8; // SysV call alignment
     const {
-        assert!(std::mem::size_of::<MappedCallRecord>() == 120);
+        assert!(std::mem::size_of::<MappedCallRecord>() == 128);
         assert!(std::mem::offset_of!(MappedCallRecord, preserved) == 8);
         assert!(std::mem::offset_of!(MappedCallRecord, entry) == 56);
         assert!(std::mem::offset_of!(MappedCallRecord, activation) == 64);
@@ -45,7 +46,14 @@ pub fn emit_published_call_entry(
         assert!(std::mem::offset_of!(MappedCallRecord, cold_entry) == 80);
         assert!(std::mem::offset_of!(MappedCallRecord, outcome) == 88);
         assert!(std::mem::offset_of!(MappedCallRecord, context) == 104);
-        assert!(std::mem::offset_of!(MappedCallRecord, cell) == 112);
+        assert!(std::mem::offset_of!(MappedCallRecord, target) == 112);
+        assert!(std::mem::offset_of!(MappedCallRecord, forward) == 120);
+        assert!(std::mem::offset_of!(egcl_rt::function::NativeCallableEntries, registers) == 0);
+        assert!(std::mem::offset_of!(egcl_rt::function::NativeCallableEntries, slice) == 8);
+    }
+    fn release(a: &mut Asm) {
+        a.extend_from_slice(&[0x48, 0x81, 0xc4]);
+        a.extend_from_slice(&SIZE.to_le_bytes());
     }
     fn target(a: &mut Asm, address: usize) {
         a.extend_from_slice(&[0x48, 0xb8]);
@@ -58,25 +66,28 @@ pub fn emit_published_call_entry(
     }
     let mut a = Asm::new();
     let fallback = a.label();
+    let forward = a.label();
     let escape = a.label();
     let returned = a.label();
-    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x83, 0xec, SIZE]);
+    a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x81, 0xec]);
+    a.extend_from_slice(&SIZE.to_le_bytes());
     capture_stack_word(&mut a, false, if slice { 1 } else { 9 }, 104);
     capture_stack_word(&mut a, false, 7, 112);
     // Copy the context request, then publish incoming arguments in scanned
     // storage before preparation can poll, compile, or allocate.
     if slice {
-        a.extend_from_slice(&[0x48, 0x8b, 0x01]); // rax=[rcx]
+        a.extend_from_slice(&[0x49, 0x89, 0xcb]); // r11=rcx
     } else {
-        a.extend_from_slice(&[0x49, 0x8b, 0x01]); // rax=[r9]
+        a.extend_from_slice(&[0x4d, 0x89, 0xcb]); // r11=r9
     }
+    a.extend_from_slice(&[0x49, 0x8b, 0x03]); // rax=context.request
     capture_stack_word(&mut a, false, 0, 0);
-    a.extend_from_slice(&[0x48, 0x89, 0x70, 8]); // request.nargs=rsi
+    a.extend_from_slice(&[0x49, 0x89, 0x73, 24]); // context.nargs=rsi
     if slice {
-        a.extend_from_slice(&[0x48, 0x89, 0x50, 16]); // request.args=rdx
+        a.extend_from_slice(&[0x49, 0x89, 0x53, 16]); // context.args=rdx
     } else {
         let spilled = a.label();
-        a.extend_from_slice(&[0x4c, 0x8b, 0x50, 16]); // r10=request.args
+        a.extend_from_slice(&[0x4d, 0x8b, 0x53, 16]); // r10=context.args
         a.extend_from_slice(&[0x48, 0x85, 0xf6]);
         a.jcc(Cc::E, spilled);
         a.extend_from_slice(&[0x49, 0x89, 0x12]); // args[0]=rdx
@@ -101,6 +112,9 @@ pub fn emit_published_call_entry(
     capture_stack_word(&mut a, true, 0, 96);
     a.extend_from_slice(&[0x48, 0x85, 0xc0]);
     a.jcc(Cc::Ne, escape);
+    capture_stack_word(&mut a, true, 0, 120);
+    a.extend_from_slice(&[0x48, 0x85, 0xc0]);
+    a.jcc(Cc::Ne, forward);
     capture_stack_word(&mut a, true, 0, 56);
     a.extend_from_slice(&[0x48, 0x85, 0xc0]);
     a.jcc(Cc::E, fallback);
@@ -113,7 +127,8 @@ pub fn emit_published_call_entry(
     a.bind(returned);
     restore(&mut a);
     capture_stack_word(&mut a, true, 0, 88);
-    a.extend_from_slice(&[0x48, 0x83, 0xc4, SIZE, 0xc3]);
+    release(&mut a);
+    a.extend_from_slice(&[0xc3]);
 
     let cold_offset = a.len();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);
@@ -132,7 +147,8 @@ pub fn emit_published_call_entry(
     // r11 is volatile; load before removing the record.
     capture_stack_word(&mut a, true, 11, 104);
     a.extend_from_slice(&[0x4d, 0x8b, 0x5b, 8]); // r11=context.capture
-    a.extend_from_slice(&[0x48, 0x83, 0xc4, SIZE, 0x41, 0xff, 0xe3]);
+    release(&mut a);
+    a.extend_from_slice(&[0x41, 0xff, 0xe3]);
 
     a.bind(fallback);
     capture_stack_word(&mut a, true, 7, 112);
@@ -143,6 +159,37 @@ pub fn emit_published_call_entry(
     a.extend_from_slice(&[0x48, 0x85, 0xc0]);
     a.jcc(Cc::E, returned);
     a.jmp(escape);
+
+    a.bind(forward);
+    restore(&mut a);
+    capture_stack_word(&mut a, true, 7, 112); // rooted callable slot address
+    capture_stack_word(&mut a, true, 1, 104); // original continuation context
+    a.extend_from_slice(&[0x48, 0x8b, 0x71, 24]); // invocation count
+    let wide = a.label();
+    let loaded = a.label();
+    a.extend_from_slice(&[0x48, 0x83, 0xfe, 3]);
+    a.jcc(Cc::G, wide);
+    a.extend_from_slice(&[0x49, 0x89, 0xc9]); // r9=context
+    a.extend_from_slice(&[0x4c, 0x8b, 0x51, 16]); // r10=args
+    a.extend_from_slice(&[0x48, 0x8b, 0x00]); // rax=register entry
+    a.extend_from_slice(&[0x31, 0xd2, 0x31, 0xc9, 0x45, 0x31, 0xc0]);
+    a.extend_from_slice(&[0x48, 0x85, 0xf6]);
+    a.jcc(Cc::E, loaded);
+    a.extend_from_slice(&[0x49, 0x8b, 0x12]);
+    a.extend_from_slice(&[0x48, 0x83, 0xfe, 1]);
+    a.jcc(Cc::E, loaded);
+    a.extend_from_slice(&[0x49, 0x8b, 0x4a, 8]);
+    a.extend_from_slice(&[0x48, 0x83, 0xfe, 2]);
+    a.jcc(Cc::E, loaded);
+    a.extend_from_slice(&[0x4d, 0x8b, 0x42, 16]);
+    a.bind(loaded);
+    release(&mut a);
+    a.extend_from_slice(&[0xff, 0xe0]);
+    a.bind(wide);
+    a.extend_from_slice(&[0x48, 0x8b, 0x51, 16]); // rdx=args; rcx=context
+    a.extend_from_slice(&[0x48, 0x8b, 0x40, 8]); // rax=slice entry
+    release(&mut a);
+    a.extend_from_slice(&[0xff, 0xe0]);
     let mut bytes = a.finish().expect("local mapped entry labels");
     let relative = i32::try_from(cold_offset as isize - (cold_displacement + 4) as isize).unwrap();
     bytes[cold_displacement..cold_displacement + 4].copy_from_slice(&relative.to_le_bytes());
@@ -151,7 +198,7 @@ pub fn emit_published_call_entry(
 
 /// A named caller only marshals its explicit continuation context and loads the
 /// published cell entry. It neither selects the target ABI nor checks results.
-/// The request has 16 trailing bytes reserved for NativeCallContext. Tail jumps
+/// The request has 32 trailing bytes reserved for NativeCallContext. Tail jumps
 /// preserve the original Invoke return PC used by its capture recipe.
 pub fn emit_published_call_veneer(
     cell: u64,
@@ -161,8 +208,10 @@ pub fn emit_published_call_veneer(
 ) -> Vec<u8> {
     const {
         assert!(std::mem::size_of::<TransferCallRequest>() == 32);
-        assert!(std::mem::size_of::<egcl_rt::call_table::NativeCallContext>() == 16);
+        assert!(std::mem::size_of::<egcl_rt::call_table::NativeCallContext>() == 32);
         assert!(std::mem::offset_of!(egcl_rt::call_table::NativeCallContext, capture) == 8);
+        assert!(std::mem::offset_of!(egcl_rt::call_table::NativeCallContext, args) == 16);
+        assert!(std::mem::offset_of!(egcl_rt::call_table::NativeCallContext, nargs) == 24);
     }
     let mut a = Asm::new();
     let wide = a.label();
@@ -173,6 +222,9 @@ pub fn emit_published_call_veneer(
     a.extend_from_slice(&(capture as usize as u64).to_le_bytes());
     a.extend_from_slice(&[0x48, 0x89, 0x47, 40]); // context.capture=rax
     a.extend_from_slice(&[0x48, 0x8b, 0x77, 8]); // rsi=nargs
+    a.extend_from_slice(&[0x48, 0x89, 0x77, 56]); // context.nargs=rsi
+    a.extend_from_slice(&[0x48, 0x8b, 0x47, 16]); // rax=args
+    a.extend_from_slice(&[0x48, 0x89, 0x47, 48]); // context.args=rax
     a.extend_from_slice(&[0x48, 0x83, 0xfe, 3]);
     a.jcc(Cc::G, wide);
     a.extend_from_slice(&[0x4c, 0x8d, 0x4f, 32]); // r9=context

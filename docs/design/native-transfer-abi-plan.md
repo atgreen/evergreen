@@ -1470,10 +1470,11 @@ the slice shape carries cell, count, rooted arguments and a context pointer.
 The context names the caller's request and capture continuation. Live register
 arguments are copied into the caller's writable scanned activation storage before
 preparation can allocate. Slice entries use the supplied scanned slice. Normal
-Invoke requests reserve 48 bytes, including this context; recursive requests keep
+Invoke requests now reserve 64 bytes, including the invocation view added below; recursive requests keep
 their existing 64-byte layout. Capture maps record the actual stack adjustment.
 
-The permanent shared entry owns a 120-byte machine record. Helpers return before
+The permanent shared entry now owns a 128-byte machine record in a 136-byte
+aligned stack reservation, including the forwarding fields described below. Helpers return before
 native entry or capture; child retirement may release its final code owner because
 its continuation runs in permanent code. Checked fallback reloads the cell after
 preparation, restores legacy recovery while executing the checked target, and
@@ -1486,3 +1487,40 @@ root retention and invalidation, while native adapter addresses remain permanent
 The existing T1/T2 emitters still use that checked view. Callable-object coverage,
 full caller migration, default-mode acceptance and other platform gates remain
 open; this publication increment does not complete `bliss-shih7.16` or its parent.
+
+
+### Callable publication and native FUNCALL (2026-10-09)
+
+Interpreted function metadata publishes a process-lifetime register/slice
+callable dispatcher pair. It reuses the old raw native-body pointer word, so the
+heap layout and saved-image format do not grow. The accessor repairs pre-install
+and restored metadata against the trusted process descriptor without dereferencing
+saved address bits. Execution-local registries still own actual compiled versions.
+
+Callable entries receive the address of a scanned callable slot. They reload it
+after polling and root the value while selecting code. Only the exact current
+registered definition without captured bindings can reuse mapped named code.
+Saved definitions, closures, builtin wrappers, generic functions and funcallable
+instances use the exact-object adapter; invalid designators signal there.
+
+The native FUNCALL entry advances the invocation argument view past the callable
+and tail-forwards only after its Rust preparation frame has returned. The original
+request and return PC remain unchanged for capture. The context now holds request,
+capture, argument pointer and argument count; the permanent machine record holds
+an explicit forwarding descriptor separately from child ownership. Register and
+slice forwarding use the same scanned argument storage.
+
+Tests cover measured callable-wrapper and argument relocation, multiple values,
+normal and throwing mapped callees, old definitions after redefinition/unbinding,
+closure captures, funcallable replacement, and invalid designators. The EVAL
+reentry fixture also runs through FUNCALL and checks exact code owners, distinct
+Rust reentry segments, root relocation, destructor return and cleanup order.
+
+This implements `bliss-shih7.16.4.1`. APPLY still needs an expanded argument owner
+that survives Rust preparation, under `bliss-shih7.16.4`. Default emitted caller
+migration, full interpreter routing and other platform gates remain open.
+
+The fresh-process image test checks restored callable invocation and native caller
+compilation. Replacing a restored source-free definition still loses its saved
+old body (`bliss-dm7tb`), reproduced with both checked and native-segment dispatch;
+that bug is an explicit dependency of the full callable rollout.

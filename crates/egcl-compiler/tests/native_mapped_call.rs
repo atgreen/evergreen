@@ -30,23 +30,25 @@ unsafe extern "C" fn prepare(cell: u64, record: *mut MappedCallRecord) {
     STATE.with_borrow_mut(|state| {
         let state = state.as_mut().unwrap();
         assert_eq!(record.request, state.request);
-        let request = unsafe { &*record.request };
-        assert_eq!(request.nargs, state.nargs);
-        for i in 0..request.nargs {
+        let context = unsafe { &*record.context };
+        assert_eq!(context.nargs, state.nargs);
+        for i in 0..context.nargs {
             assert_eq!(
-                unsafe { *request.args.add(i) },
+                unsafe { *context.args.add(i) },
                 EgclVal::from_fixnum(i as i64 + 1)
             );
         }
         assert!(!record.cold_entry.is_null());
         state.events.push("prepare");
         record.entry = std::ptr::null();
+        record.forward = std::ptr::null();
         record.outcome = NativeOutcome {
             value: NIL,
             exit: NativeExit::Returned,
         };
         match state.preparation {
             Preparation::Ready => {
+                record.owner = state.request.cast();
                 record.entry = child as *const u8;
                 record.activation = state.request.cast();
             }
@@ -147,17 +149,19 @@ fn published_entries_accept_register_and_slice_arguments() {
             });
             let mut request = TransferCallRequest {
                 symbol: 9,
-                nargs: n,
-                args: if slice {
-                    std::ptr::null_mut()
-                } else {
-                    args.as_mut_ptr()
-                },
+                nargs: 777,
+                args: std::ptr::null_mut(),
                 activation: std::ptr::null_mut(),
             };
             let mut context = NativeCallContext {
                 request: (&mut request as *mut TransferCallRequest).cast(),
                 capture: capture as *const u8,
+                args: if slice {
+                    std::ptr::null_mut()
+                } else {
+                    args.as_mut_ptr()
+                },
+                nargs: 0,
             };
             STATE.with_borrow_mut(|state| {
                 *state = Some(State {
@@ -196,6 +200,8 @@ fn published_entries_accept_register_and_slice_arguments() {
                 }
             };
             assert_eq!(result, EgclVal::from_fixnum(expected));
+            assert_eq!(request.nargs, 777, "original capture request is immutable");
+            assert!(request.args.is_null());
             if !slice {
                 for (i, value) in args.iter().enumerate() {
                     assert_eq!(
@@ -238,6 +244,8 @@ fn caller_loads_the_current_published_entry_for_each_argument_shape() {
         let request = unsafe { &*context.request.cast::<TransferCallRequest>() };
         assert_eq!(context.capture, capture as *const u8);
         assert_eq!(request.nargs, n);
+        assert_eq!(context.nargs, n);
+        assert_eq!(context.args, request.args);
         for (i, value) in args.iter().take(n).enumerate() {
             assert_eq!(*value, EgclVal::from_fixnum(i as i64 + 1));
         }

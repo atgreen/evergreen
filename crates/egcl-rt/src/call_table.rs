@@ -26,6 +26,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub struct NativeCallContext {
     pub request: *mut u8,
     pub capture: *const u8,
+    /// Invocation storage is distinct from the original capture request.
+    /// Forwarding FUNCALL may skip its designator without changing that request.
+    pub args: *mut crate::value::EgclVal,
+    pub nargs: usize,
 }
 
 /// Stable executable slots and an opaque pointer to their owning execution's

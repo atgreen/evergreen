@@ -447,7 +447,7 @@ pub struct PackageData {
 /// The first four fields are the §1.11.1 (D1.17) interpreted-function layout and
 /// are the *only* GC references (see `trace_object`). The trailing fields are the
 /// per-function tiering metadata (`FnMeta`, §4.4.3) — the substrate a HotSpot-
-/// style engine hangs invocation/back-edge counters, the active entry point, the
+/// style engine hangs invocation/back-edge counters, permanent callable entries, the
 /// current tier, and flags on. They are plain atomics, lock-free readable
 /// (R4.53), and never traced/relocated, so the object is pinned for a stable
 /// identity and stable metadata address across redefinition and tier changes.
@@ -462,8 +462,9 @@ pub struct FunctionData {
     pub invoke_count: core::sync::atomic::AtomicU32,
     /// Incremented by T1 back-edge stubs.
     pub back_edge_count: core::sync::atomic::AtomicU32,
-    /// Active entry point; updated atomically on a tier change (null at T0).
-    pub entry: core::sync::atomic::AtomicPtr<u8>,
+    /// Process-lifetime native dispatcher pair. Image restoration may preserve
+    /// stale address bits; use function::native_entries to validate/repair them.
+    pub native_entries: core::sync::atomic::AtomicPtr<crate::function::NativeCallableEntries>,
     /// Current tier: 0 (T0 interpreter), 1 (baseline), 2 (optimised).
     pub tier: core::sync::atomic::AtomicU8,
     /// FnMeta flags (QUEUED_FOR_T2, T2_FAILED, NEVER_COMPILE, …).

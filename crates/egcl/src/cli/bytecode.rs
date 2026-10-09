@@ -75,6 +75,12 @@ mod native_env;
 use native_env::NativeEnvNames;
 mod pending_error;
 mod call_table;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod native_callable;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn initialize_native_callable_entries() {
+    let _ = native_callable::entries();
+}
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_native;
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -19441,7 +19447,6 @@ fn publish_native(sym: u32, fn_obj: Option<EgclVal>, nc: &NativeCode) {
         return;
     }
     if let Some(f) = fn_obj {
-        egcl_rt::function::set_entry(f, nc.entry as *mut u8);
         egcl_rt::function::set_tier(f, if nc.is_t2 { 2 } else { 1 });
     }
     // JFR-style event stream (bliss-ai8n): a function reached native code. The

@@ -167,76 +167,80 @@ fn native_v2_mapped_child_reenters_through_rust_and_retires_in_order() {
     let inner = install(inner_symbol, inner);
     let (child_symbol, child) = prepare_mapped("REENTRY-CHILD", "(form)", child_forms, &env);
     let child = install(child_symbol, child);
-    let caller = compile_caller(
-        "(form)",
-        "((catch :reentry (unwind-protect (reentry-child form) (reentry-mark 3))))",
-        &env,
-    );
-    let quote = EgclVal::from_symbol_index(egcl_rt::symbols::intern("QUOTE"));
-    for fail in [NIL, T] {
-        egcl_rt::rooted!(value = arena_cons(T, NIL));
-        egcl_rt::rooted!(quoted = vec_to_list(&[quote, *value]));
-        egcl_rt::rooted!(
-            form = vec_to_list(&[EgclVal::from_symbol_index(inner_symbol), *quoted, fail])
+    for invocation in ["(reentry-child form)", "(funcall #'reentry-child form)"] {
+        let caller = compile_caller(
+            "(form)",
+            &format!("((catch :reentry (unwind-protect {invocation} (reentry-mark 3))))"),
+            &env,
         );
-        // Warm the caller's cell without arming observation. The measured
-        // invocation must then own a mapped child rather than a cold fallback.
-        egcl_rt::rooted!(
-            warm_form = vec_to_list(&[EgclVal::from_symbol_index(inner_symbol), *quoted, NIL])
-        );
-        caller.run(&[*warm_form], &mut env).unwrap();
-        assert!(
-            !call_table::resolve(child_symbol).unwrap().is_cold(),
-            "warm child fail={fail:?}"
-        );
-        let _probe = ProbeScope::arm();
-        take_nested_entries();
-        let before = Position::here();
-        let result = caller.run(&[*form], &mut env).unwrap();
-        assert_eq!(result, *value);
-        assert!(env.mv_active);
-        assert_eq!(env.mv.len(), 2);
-        assert_eq!(cp(env.mv[1]), (*value, NIL));
-        assert_eq!(Position::here(), before);
-        assert!(env.handlers.is_empty() && env.restarts.is_empty() && env.catch_stack.is_empty());
-        assert_eq!(
-            take_nested_entries(),
-            1,
-            "fail={fail:?}, events={:?}",
-            OBSERVATIONS.with(|state| state.borrow().events.clone())
-        );
-        OBSERVATIONS.with(|state| {
-            let state = state.borrow();
-            assert_eq!(
-                state.events.iter().map(|e| e.0).collect::<Vec<_>>(),
-                [-1, 0, 1, -2, 2, 3]
+        let quote = EgclVal::from_symbol_index(egcl_rt::symbols::intern("QUOTE"));
+        for fail in [NIL, T] {
+            egcl_rt::rooted!(value = arena_cons(T, NIL));
+            egcl_rt::rooted!(quoted = vec_to_list(&[quote, *value]));
+            egcl_rt::rooted!(
+                form = vec_to_list(&[EgclVal::from_symbol_index(inner_symbol), *quoted, fail])
             );
-            assert!(state.moved, "live EVAL guard root must relocate");
+            // Warm the caller's cell without arming observation. The measured
+            // invocation must then own a mapped child rather than a cold fallback.
+            egcl_rt::rooted!(
+                warm_form = vec_to_list(&[EgclVal::from_symbol_index(inner_symbol), *quoted, NIL])
+            );
+            caller.run(&[*warm_form], &mut env).unwrap();
             assert!(
-                state.restored,
-                "inner entry must return normally to its Rust owner"
+                !call_table::resolve(child_symbol).unwrap().is_cold(),
+                "warm child fail={fail:?}"
             );
-            let outer = &state.events[0].1;
-            let inner_position = &state.events[1].1;
-            assert_ne!(outer.segment, 0);
-            assert_eq!(outer.capture, Some((Rc::as_ptr(&child) as usize, true)));
-            assert_ne!(
-                inner_position.segment, outer.segment,
-                "EVAL must create a separate native segment"
+            let _probe = ProbeScope::arm();
+            take_nested_entries();
+            let before = Position::here();
+            let result = caller.run(&[*form], &mut env).unwrap();
+            assert_eq!(result, *value);
+            assert!(env.mv_active);
+            assert_eq!(env.mv.len(), 2);
+            assert_eq!(cp(env.mv[1]), (*value, NIL));
+            assert_eq!(Position::here(), before);
+            assert!(
+                env.handlers.is_empty() && env.restarts.is_empty() && env.catch_stack.is_empty()
             );
             assert_eq!(
-                inner_position.capture,
-                Some((Rc::as_ptr(&inner) as usize, false))
+                take_nested_entries(),
+                1,
+                "fail={fail:?}, events={:?}",
+                OBSERVATIONS.with(|state| state.borrow().events.clone())
             );
-            assert_eq!(state.events[2].1.segment, inner_position.segment);
-            assert_eq!(state.events[2].1.capture, inner_position.capture);
-            assert_eq!(state.events[4].1.segment, outer.segment);
-            assert_eq!(state.events[4].1.capture, outer.capture);
-            assert_eq!(state.events[5].1.segment, outer.segment);
-            assert_eq!(
-                state.events[5].1.capture,
-                Some((std::ptr::from_ref(&caller) as usize, false))
-            );
-        });
+            OBSERVATIONS.with(|state| {
+                let state = state.borrow();
+                assert_eq!(
+                    state.events.iter().map(|e| e.0).collect::<Vec<_>>(),
+                    [-1, 0, 1, -2, 2, 3]
+                );
+                assert!(state.moved, "live EVAL guard root must relocate");
+                assert!(
+                    state.restored,
+                    "inner entry must return normally to its Rust owner"
+                );
+                let outer = &state.events[0].1;
+                let inner_position = &state.events[1].1;
+                assert_ne!(outer.segment, 0);
+                assert_eq!(outer.capture, Some((Rc::as_ptr(&child) as usize, true)));
+                assert_ne!(
+                    inner_position.segment, outer.segment,
+                    "EVAL must create a separate native segment"
+                );
+                assert_eq!(
+                    inner_position.capture,
+                    Some((Rc::as_ptr(&inner) as usize, false))
+                );
+                assert_eq!(state.events[2].1.segment, inner_position.segment);
+                assert_eq!(state.events[2].1.capture, inner_position.capture);
+                assert_eq!(state.events[4].1.segment, outer.segment);
+                assert_eq!(state.events[4].1.capture, outer.capture);
+                assert_eq!(state.events[5].1.segment, outer.segment);
+                assert_eq!(
+                    state.events[5].1.capture,
+                    Some((std::ptr::from_ref(&caller) as usize, false))
+                );
+            });
+        }
     }
 }

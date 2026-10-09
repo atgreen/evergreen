@@ -200,13 +200,13 @@ pub(super) unsafe extern "C" fn checked_call(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
 ) {
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
-    let request = unsafe { &*(*record).request };
+    let invocation = unsafe { &*(*record).context };
     let entry = unsafe { &*(cell as *const CallCell) }.checked_entry_address(true);
     let entry = unsafe { &*entry }.load(std::sync::atomic::Ordering::Acquire);
     let call: unsafe extern "C" fn(u64, u64, *mut EgclVal, u64) -> u64 =
         unsafe { std::mem::transmute(entry) };
     c2i_set_native_sigsegv_recovery(1);
-    let value = unsafe { call(cell, request.nargs as u64, request.args, 0) };
+    let value = unsafe { call(cell, invocation.nargs as u64, invocation.args, 0) };
     c2i_set_native_sigsegv_recovery(0);
     // All checked frames have returned. This conversion does not allocate,
     // change MV, or transfer control across this Rust frame.
@@ -337,6 +337,45 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
     })
 }
 
+/// Exact callable lookup reuses named code only while that registry still
+/// describes this object. Saved definitions and captured closures retain their
+/// exact-object adapter instead of accidentally entering a replacement.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn mapped_callable(function: EgclVal, nargs: usize) -> Option<MappedCallee> {
+    egcl_rt::rooted!(function = function);
+    if function.is_symbol() {
+        *function = egcl_rt::symbols::symbol_function(function.as_symbol_index())?;
+    }
+    if !egcl_rt::function::is_interpreted_function(*function)
+        || closure_captured_env(*function).is_some()
+    {
+        return None;
+    }
+    let symbol = egcl_rt::function::name(*function).symbol_index()?;
+    if egcl_rt::symbols::symbol_function(symbol) != Some(*function)
+        || !registered_function_matches(symbol, *function)
+    {
+        return None;
+    }
+    let cell = resolve(symbol)?;
+    let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+    if cell.is_cold() {
+        let revision = linkage::revision(cell.ordinal());
+        let target = select_target(symbol, nargs)?;
+        if target.function() != *function {
+            return None;
+        }
+        publish_target(state, revision, Some(target));
+    }
+    let selected = unsafe { mapped_callee(Arc::as_ptr(&cell) as u64) }?;
+    (selected.function == *function).then_some(selected)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn is_builtin_funcall(cell: u64) -> bool {
+    super::call_table_funcall::is_builtin(unsafe { state(cell) }.symbol)
+}
+
 /// Feedback belongs only to the exact version still selected by a warm cell.
 /// A retained child can finish after publication invalidated that selection.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -375,7 +414,11 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         }
         return Ok(*result);
     }
-    let target = select_target(state.symbol, args.len());
+    publish_target(state, revision, select_target(state.symbol, args.len()));
+    Ok(*result)
+}
+
+fn publish_target(state: &State, revision: u64, target: Option<Target>) {
     if target.is_some() {
         let entries = bridge_entries().expect("resolved cell owns installed bridges");
         #[allow(unused_mut)]
@@ -408,7 +451,6 @@ fn cold(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             .borrow_mut()
             .retain(|version| version.keep(&state.cell));
     }
-    Ok(*result)
 }
 
 fn promotion_due(function: EgclVal) -> bool {
