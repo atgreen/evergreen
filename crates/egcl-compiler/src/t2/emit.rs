@@ -5960,6 +5960,11 @@ fn emit_framed_inner(
     let native_calls = NativeCallSites::new(code.len(), native_calls)
         .and_then(|sites| sites.with_value_maps(native_value_maps))
         .ok_or(EmitError::BadBranch)?;
+    #[cfg(not(all(target_arch = "x86_64", windows)))]
+    let native_calls = native_calls.with_unwind(
+        crate::t2::x64_unwind::NativeUnwindRecipe::from_prologue(&saved, pad, spill_bytes)
+            .ok_or(EmitError::BadBranch)?,
+    );
     if cfg!(all(target_arch = "x86_64", unix))
         && activation_slots.is_some()
         && native_calls.iter().any(|site| {

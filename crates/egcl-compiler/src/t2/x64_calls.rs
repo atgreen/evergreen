@@ -5,6 +5,7 @@
 
 use super::frame_state::FrameStateId;
 use super::ir::{Block, Inst};
+use super::x64_unwind::{NativeFrameCursor, NativeFrameStep, NativeUnwindRecipe};
 use super::x64_value_maps::NativeFrameValues;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -58,6 +59,7 @@ pub struct NativeCallSite {
 pub struct NativeCallSites {
     sites: Vec<NativeCallSite>,
     values: Vec<NativeCallValues>,
+    unwind: Option<NativeUnwindRecipe>,
 }
 
 impl NativeCallSites {
@@ -72,7 +74,37 @@ impl NativeCallSites {
             return None;
         }
         let values = vec![NativeCallValues::Unavailable; sites.len()];
-        Some(Self { sites, values })
+        Some(Self {
+            sites,
+            values,
+            unwind: None,
+        })
+    }
+
+    #[cfg(any(test, not(all(target_arch = "x86_64", windows))))]
+    pub(crate) fn with_unwind(mut self, recipe: NativeUnwindRecipe) -> Self {
+        self.unwind = Some(recipe);
+        self
+    }
+
+    pub fn unwind_recipe(&self) -> Option<&NativeUnwindRecipe> {
+        self.unwind.as_ref()
+    }
+
+    /// Step only at an exact recorded return PC. The caller supplies the live
+    /// stack bounds and a reader which refuses unavailable words. Code identity,
+    /// stack ownership and publication remain the runtime's responsibility.
+    pub fn unwind(
+        &self,
+        code_base: usize,
+        cursor: &NativeFrameCursor,
+        bounds: std::ops::Range<usize>,
+        read_word: impl FnMut(usize) -> Option<usize>,
+    ) -> Option<NativeFrameStep> {
+        let site = self.get(cursor.pc.checked_sub(code_base)?)?;
+        self.unwind
+            .as_ref()?
+            .unwind(site, cursor, bounds, read_word)
     }
 
     pub(crate) fn with_value_maps(
@@ -151,6 +183,141 @@ impl CallReturn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unwind_tracks_saved_word_addresses_and_inherits_untouched_registers() {
+        use super::super::x64_unwind::{NativeFrameCursor, NativeUnwindRecipe};
+        let site = NativeCallSite {
+            return_offset: 12,
+            stack_adjust: 64,
+            stack_base: NativeStackBase::Body,
+            origin: NativeCallOrigin::Instruction(Inst(0)),
+        };
+        // Two pushes, alignment pad, and 32 spill bytes: 56-byte body.
+        let recipe = NativeUnwindRecipe::from_prologue(&[3, 12], true, 32).unwrap();
+        let table = NativeCallSites::new(32, vec![site])
+            .unwrap()
+            .with_unwind(recipe);
+        let mut cursor = NativeFrameCursor {
+            pc: 0x100c,
+            call_sp: 0x2000,
+            registers: [Some(0x1ff0); 6],
+        };
+        let step = table
+            .unwind(0x1000, &cursor, 0x1f00..0x2100, |address| {
+                Some(if address == 0x2078 { 0x100c } else { 99 })
+            })
+            .unwrap();
+        assert_eq!(step.body_sp, Some(0x2040));
+        assert_eq!(step.caller.pc, 0x100c);
+        assert_eq!(step.caller.call_sp, 0x2080);
+        assert_eq!(
+            step.caller.registers,
+            [
+                Some(0x2070),
+                Some(0x1ff0),
+                Some(0x2068),
+                Some(0x1ff0),
+                Some(0x1ff0),
+                Some(0x1ff0)
+            ]
+        );
+        // A second frame saving only R13 must preserve the recovered RBX/R12
+        // addresses, not replace them with copied register contents.
+        cursor = step.caller;
+        let outer = NativeCallSites::new(
+            32,
+            vec![NativeCallSite {
+                stack_adjust: 0,
+                ..site
+            }],
+        )
+        .unwrap()
+        .with_unwind(NativeUnwindRecipe::from_prologue(&[13], false, 0).unwrap());
+        let next = outer
+            .unwind(0x1000, &cursor, 0x1f00..0x2100, |_| Some(0x3000))
+            .unwrap();
+        assert_eq!(next.caller.call_sp, 0x2090);
+        assert_eq!(next.caller.registers[0], Some(0x2070));
+        assert_eq!(next.caller.registers[2], Some(0x2068));
+        assert_eq!(next.caller.registers[3], Some(0x2080));
+    }
+
+    #[test]
+    fn unwind_rejects_unknown_or_unreadable_frames_and_handles_retired_entry() {
+        use super::super::x64_unwind::{NativeFrameCursor, NativeUnwindRecipe};
+        let site = NativeCallSite {
+            return_offset: 12,
+            stack_adjust: 16,
+            stack_base: NativeStackBase::Entry,
+            origin: NativeCallOrigin::RestartDeopt,
+        };
+        let bare = NativeCallSites::new(32, vec![site]).unwrap();
+        let cursor = NativeFrameCursor {
+            pc: 0x100c,
+            call_sp: 0x2000,
+            registers: [None; 6],
+        };
+        assert!(
+            bare.unwind(0x1000, &cursor, 0x2000..0x2100, |_| Some(1))
+                .is_none()
+        );
+        let table =
+            bare.with_unwind(NativeUnwindRecipe::from_prologue(&[3, 12], true, 32).unwrap());
+        let result = table
+            .unwind(0x1000, &cursor, 0x2000..0x2018, |address| {
+                assert_eq!(address, 0x2010);
+                Some(0x4000)
+            })
+            .unwrap();
+        assert_eq!(result.body_sp, None);
+        assert_eq!(result.caller.call_sp, 0x2018);
+        assert_eq!(result.caller.registers, [None; 6]);
+        for invalid in [
+            NativeFrameCursor {
+                pc: 0x100d,
+                ..cursor
+            },
+            NativeFrameCursor { pc: 1, ..cursor },
+            NativeFrameCursor {
+                call_sp: 0x2001,
+                ..cursor
+            },
+            NativeFrameCursor {
+                call_sp: usize::MAX - 7,
+                ..cursor
+            },
+            NativeFrameCursor {
+                registers: [Some(0x1ff8); 6],
+                ..cursor
+            },
+        ] {
+            assert!(
+                table
+                    .unwind(0x1000, &invalid, 0x2000..0x2100, |_| Some(1))
+                    .is_none()
+            );
+        }
+        assert!(
+            table
+                .unwind(0x1000, &cursor, 0x2000..0x2017, |_| Some(1))
+                .is_none()
+        );
+        assert!(
+            table
+                .unwind(0x1000, &cursor, 0x2000..0x2100, |_| None)
+                .is_none()
+        );
+        for (saved, spills) in [
+            (&[3, 3][..], 0),
+            (&[0][..], 0),
+            (&[16][..], 0),
+            (&[][..], 8),
+            (&[][..], usize::MAX),
+        ] {
+            assert!(NativeUnwindRecipe::from_prologue(saved, false, spills).is_none());
+        }
+    }
 
     #[test]
     fn bindings_reject_unknown_pcs_and_incompatible_frame_states() {
