@@ -65,6 +65,25 @@ pub(super) fn observe() {
     }
 }
 
+/// Boundaries walked that belong to an execution other than the collecting
+/// one, and the root slots reached through them. A suspended execution's
+/// activations validate only against its own managed stack, so a nonzero
+/// visit count is what distinguishes real cross-execution coverage from a
+/// walk that silently rejected everything.
+#[cfg(test)]
+static FOREIGN_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static FOREIGN_VISITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn take_foreign_walk_counts() -> (usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FOREIGN_WALKS.swap(0, Relaxed),
+        FOREIGN_VISITED.swap(0, Relaxed),
+    )
+}
+
 /// Restore the enclosing publication on every exit, including unwinding.
 struct Linked(*mut PublishedBoundary);
 
@@ -132,11 +151,21 @@ pub(super) unsafe fn published<R>(
 /// roots T0 already owns (deoptimizing or retired) are skipped, and a malformed
 /// or missing map ends that chain rather than guessing.
 fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    #[cfg(test)]
+    let here = egcl_rt::current_stack() as *const egcl_rt::stack::EgclStack;
     unsafe {
         ACTIVE.scan(|slot| {
             let mut boundary = slot.get();
             while !boundary.is_null() {
-                walk_boundary(&*boundary, visit);
+                let visited = walk_boundary(&*boundary, visit);
+                #[cfg(test)]
+                if !std::ptr::eq((*boundary).stack, here) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    FOREIGN_WALKS.fetch_add(1, Relaxed);
+                    FOREIGN_VISITED.fetch_add(visited, Relaxed);
+                }
+                #[cfg(not(test))]
+                let _ = visited;
                 boundary = (*boundary).previous;
             }
         });
@@ -189,9 +218,13 @@ fn validated_activation(
     (unsafe { (*(header as *const Frame)).num_locals } >= slots).then_some(activation)
 }
 
-unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut EgclVal)) {
+/// Returns the number of root slots visited through this boundary's frames.
+unsafe fn walk_boundary(
+    boundary: &PublishedBoundary,
+    visit: &mut dyn FnMut(*mut EgclVal),
+) -> usize {
     if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
-        return;
+        return 0;
     }
     let code = unsafe { &*boundary.owner };
     let base = code.code.as_ptr() as usize;
@@ -201,31 +234,31 @@ unsafe fn walk_boundary(boundary: &PublishedBoundary, visit: &mut dyn FnMut(*mut
         stack: unsafe { &*boundary.stack },
     };
     let mut cursor = boundary.cursor;
+    let mut total = 0;
     loop {
         let Some(offset) = cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
         else {
-            return;
+            return total;
         };
         let Some(step) =
             code._native_calls
                 .unwind(base, &cursor, walk.bounds.clone(), |address| walk.word(address))
         else {
-            return;
+            return total;
         };
         match code._native_calls.value_map(offset) {
             Some(NativeCallValues::Frame(map)) => {
                 let visited = unsafe { visit_frame(map, &cursor, step.body_sp, &walk, visit) };
+                total += visited;
                 #[cfg(test)]
                 boundary.visited.set(boundary.visited.get() + visited);
-                #[cfg(not(test))]
-                let _ = visited;
             }
             // T0 owns these roots while the native frame is being replaced.
             Some(NativeCallValues::Deoptimizing { .. } | NativeCallValues::Retired) => {}
-            Some(NativeCallValues::Unavailable) | None => return,
+            Some(NativeCallValues::Unavailable) | None => return total,
         }
         if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
-            return;
+            return total;
         }
         cursor = step.caller;
     }
@@ -467,6 +500,84 @@ mod tests {
         assert_ne!(args[1].to_raw(), old_pointer, "the suspended callers' heap value actually moved");
         assert_eq!(crate::cli::cp(args[1]), (EgclVal::from_fixnum(42), NIL));
         assert_eq!(value.unwrap(), EgclVal::from_fixnum(42));
+    }
+
+    /// Fibers park inside a live publication; the collector then walks their
+    /// chains from another execution and must validate each activation against
+    /// that fiber's own managed stack, not the collector's.
+    static SUSPENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PARKED: egcl_rt::execution_local::ExecutionLocal<Cell<bool>> =
+        unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(false)) };
+
+    fn park_while_published() {
+        if PARKED.with(|parked| parked.replace(true)) {
+            return; // park once per fiber, on its first published poll
+        }
+        assert!(!ACTIVE.with(Cell::get).is_null(), "parked inside a publication");
+        SUSPENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        egcl_rt::sync::fiber_sleep(std::time::Duration::from_millis(400)).unwrap();
+    }
+
+    fn publication_fiber() -> EgclVal {
+        // Match thread_entry_runner: workers share initialized classes/packages.
+        let mut env = Env::new_impl(false, false, false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(
+            "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 3) (go again))) x))"
+        ).unwrap().0);
+        let body = Arc::new(
+            compile_function("PUBLICATION-FIBER", *params, *forms, &env, false, false).unwrap(),
+        );
+        let code = TransferCode::compile(body).expect("fiber publication body");
+        egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
+        OBSERVE.with(|slot| slot.set(Some(park_while_published)));
+        let value = code.run(&args, &mut env).unwrap();
+        OBSERVE.with(|slot| slot.set(None));
+        assert_eq!(value, args[0]);
+        assert!(ACTIVE.with(Cell::get).is_null(), "retire before the fiber returns");
+        assert_eq!(crate::cli::cp(args[0]).0, T, "the parked input stayed intact");
+        EgclVal::from_fixnum(1)
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn suspended_fiber_publications_are_walked_against_their_own_stack() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        assert!(egcl_rt::native_transfer::is_supported());
+        let mut startup = Env::new(false);
+        egcl_rt::rooted_ref!(_startup = &mut startup);
+        SUSPENDED.store(0, std::sync::atomic::Ordering::SeqCst);
+        const FIBERS: usize = 4;
+        let group = egcl_rt::SchedulerGroup::init(
+            &egcl_rt::SchedulerConfig { num_workers: 2 }).unwrap();
+        for _ in 0..FIBERS {
+            let entry = unsafe {
+                EgclVal::from_function_ptr(publication_fiber as *const () as *mut u8)
+            };
+            group.submit(egcl_rt::thread::make_fiber(entry).unwrap()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while SUSPENDED.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            egcl_rt::poll_safepoint();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "two fibers must park inside a live publication"
+            );
+            std::thread::yield_now();
+        }
+        // Collect from outside the fibers while their publications are live on
+        // distinct native and managed stacks.
+        take_foreign_walk_counts();
+        egcl_rt::HeapCollector::new().minor_gc().unwrap();
+        let (walks, visited) = take_foreign_walk_counts();
+        assert!(walks >= 2, "walk every suspended execution's chain, saw {walks}");
+        assert!(
+            visited > 0,
+            "activations must validate against each fiber's own stack, not the collector's"
+        );
+        assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(1); FIBERS]);
     }
 
     /// An activation pointer is honoured only when a real frame header backs
