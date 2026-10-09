@@ -1963,7 +1963,14 @@ pub fn disassemble_by_symbol(sym: u32, env: Option<&mut super::Env>) -> Option<S
     let native = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned());
     let mut out = disasm_header(sym, &bf);
     match native {
-        Some(nc) => out.push_str(&format_native_listing(&nc, env)),
+        Some(nc) => {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let Some(segment) = nc.body.as_ref().and_then(native_transfer_entry::cached_listing) {
+                out.push_str(&segment);
+            }
+            out.push_str("; Legacy checked ABI — installed native code.\n");
+            out.push_str(&format_native_listing(&nc, env));
+        }
         None => {
             // Re-emit without the duplicate header (format_bytecode_listing adds
             // its own), keeping DISASSEMBLE's single-listing shape.
