@@ -403,7 +403,7 @@ pub(super) fn emit_native(
                             .iter()
                             .all(|t| matches!(t, DeclaredType::Any));
                         let not_closure = !cbf.has_env
-                            && !closure_envs().borrow().contains_key(&callee)
+                            && closure_captured_env(EgclVal::from_symbol_index(callee)).is_none()
                             && !closure_controls().borrow().contains_key(&callee);
                         if replacement_function(callee).is_none()
                             && native_transfer_abi_compatible(&cnc)

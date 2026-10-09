@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve saved compiled functions and their lexical captures across `DEFUN`,
+  FASL reload, unbinding, and saved-image restoration. Saved images now use
+  format 7; rebuild images created by earlier versions
+  ([#174](https://github.com/atgreen/evergreen/pull/174)).
+
 - Keep eligible `APPLY` targets inside opt-in native transfer segments, with
   expanded arguments rooted through moving GC and released before the caller
   continues on normal return or transfer

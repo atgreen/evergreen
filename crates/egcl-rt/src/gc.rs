@@ -1245,6 +1245,17 @@ unsafe fn trace_object(
                     trace(word(3), &mut visit);
                 }
             }
+            if words >= 7 {
+                let offset = core::mem::offset_of!(crate::object::FunctionData, definition_index)
+                    - core::mem::size_of::<ObjectHeader>();
+                let index = unsafe { *body.add(offset).cast::<u32>() };
+                if index != 0 {
+                    crate::symbols::trace_symbol_index(index, &mut visit);
+                    if let Some(trace) = FUNCTION_CAPTURE_TRACE_FN.get() {
+                        trace(EgclVal::from_symbol_index(index), &mut visit);
+                    }
+                }
+            }
         }
         // ── Compiled function (§1.11.2): entry_point and code_size are raw;
         //    name/lambda_list/constants are references. ──
@@ -2524,10 +2535,20 @@ impl HeapCollector {
                             if type_id == crate::object::type_id::FUNCTION_INTERPRETED && body_size >= 32 {
                                 let payload = unsafe { header_ptr.add(body_offset(header_ptr)) };
                                 let name = unsafe { *(payload as *const EgclVal).add(3) };
+                                let definition = if body_size >= 56 {
+                                    let offset = core::mem::offset_of!(crate::object::FunctionData, definition_index)
+                                        - core::mem::size_of::<ObjectHeader>();
+                                    let index = unsafe { *payload.add(offset).cast::<u32>() };
+                                    (index != 0).then(|| EgclVal::from_symbol_index(index))
+                                } else {
+                                    None
+                                };
                                 if object_map.is_marked(body_addr) {
                                     live_functions.insert(name);
+                                    live_functions.extend(definition);
                                 } else {
                                     dead_functions.insert(name);
+                                    dead_functions.extend(definition);
                                     if unsafe { header_is_pinned(header_ptr) } {
                                         dead_function_slots.push((cursor, unsafe {
                                             header_exact_body_len(header_ptr)

@@ -445,12 +445,13 @@ pub struct PackageData {
 /// Heap layout for an interpreted function object.
 ///
 /// The first four fields are the §1.11.1 (D1.17) interpreted-function layout and
-/// are the *only* GC references (see `trace_object`). The trailing fields are the
+/// are GC references (see `trace_object`). The trailing fields are the
 /// per-function tiering metadata (`FnMeta`, §4.4.3) — the substrate a HotSpot-
 /// style engine hangs invocation/back-edge counters, permanent callable entries, the
 /// current tier, and flags on. They are plain atomics, lock-free readable
-/// (R4.53), and never traced/relocated, so the object is pinned for a stable
-/// identity and stable metadata address across redefinition and tier changes.
+/// (R4.53), and never relocated. The final definition index is separately
+/// traced as an immutable symbol identity. The object is pinned for stable
+/// identity and metadata addresses across tier changes.
 #[repr(C)]
 pub struct FunctionData {
     pub header: ObjectHeader,
@@ -469,6 +470,9 @@ pub struct FunctionData {
     pub tier: core::sync::atomic::AtomicU8,
     /// FnMeta flags (QUEUED_FOR_T2, T2_FAILED, NEVER_COMPILE, …).
     pub flags: core::sync::atomic::AtomicU16,
+    /// Immutable private symbol owning this definition's compiled body. Traced
+    /// through the function-capture hook; distinct from the public name.
+    pub definition_index: u32,
 }
 
 // ── Cons cell ──────────────────────────────────────────────────────
