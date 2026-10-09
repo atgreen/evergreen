@@ -14,10 +14,27 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+/// Explicit continuation context for a native call. The request belongs to the
+/// caller's mapped frame; its arguments live in writable, precisely scanned
+/// storage with capacity for the supplied count. Register entries spill live
+/// arguments there before any helper. Slice entries use the supplied rooted
+/// slice. Capture is entered only after all Rust helpers return.
+///
+/// SysV register calls pass this pointer in R9, slice calls in RCX. A Rust
+/// reentry must establish its own segment and must not forward this context.
+#[repr(C)]
+pub struct NativeCallContext {
+    pub request: *mut u8,
+    pub capture: *const u8,
+}
+
 /// Stable executable slots and an opaque pointer to their owning execution's
 /// state. Generated code embeds a slot address computed from its fixed ordinal.
 #[repr(C)]
 pub struct CallCell {
+    // Permanent native-contract entries. The checked view below is temporary
+    // compatibility linkage for callers that still poll after returning.
+    native_entries: Option<[AtomicUsize; 2]>,
     register_entry: AtomicUsize,
     slice_entry: AtomicUsize,
     state: AtomicUsize,
@@ -29,12 +46,23 @@ pub struct CallCell {
 impl CallCell {
     pub fn new(ordinal: usize, cold_register: usize, cold_slice: usize) -> Self {
         Self {
+            native_entries: None,
             register_entry: AtomicUsize::new(cold_register),
             slice_entry: AtomicUsize::new(cold_slice),
             state: AtomicUsize::new(0),
             ordinal,
             cold_register,
             cold_slice,
+        }
+    }
+
+    /// Install the permanent native contract alongside the migrating checked
+    /// view. Target resolution and readiness still have exactly one publisher.
+    pub fn with_native_entries(ordinal: usize, checked: [usize; 2], native: [usize; 2]) -> Self {
+        assert!(native.iter().all(|entry| *entry != 0));
+        Self {
+            native_entries: Some(native.map(AtomicUsize::new)),
+            ..Self::new(ordinal, checked[0], checked[1])
         }
     }
 
@@ -59,6 +87,15 @@ impl CallCell {
     }
 
     pub fn entry_address(&self, slice: bool) -> *const AtomicUsize {
+        match &self.native_entries {
+            Some(entries) => &entries[usize::from(slice)],
+            None => self.checked_entry_address(slice),
+        }
+    }
+
+    /// Explicit legacy return-and-poll contract. Never call these slots as a
+    /// native-transfer entry, even when a native segment happens to be active.
+    pub fn checked_entry_address(&self, slice: bool) -> *const AtomicUsize {
         if slice {
             &self.slice_entry
         } else {
@@ -67,6 +104,8 @@ impl CallCell {
     }
 
     pub fn is_cold(&self) -> bool {
+        // Native entries are permanent adapters, not readiness markers. Both
+        // views resolve through this same checked target publication state.
         self.register_entry.load(Ordering::Acquire) == self.cold_register
     }
 
@@ -194,6 +233,34 @@ pub fn invalidate_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_contract_survives_checked_target_invalidation() {
+        let mut table = Table::default();
+        let ordinal = table.ordinal(19);
+        let cell = Arc::new(CallCell::with_native_entries(ordinal, [11, 12], [31, 32]));
+        table.bindings[ordinal].cells.push(Arc::downgrade(&cell));
+        let entries = [cell.entry_address(false), cell.entry_address(true)];
+        assert!(cell.is_cold());
+        assert!(table.publish(&cell, 0, 21, 22));
+        assert!(!cell.is_cold());
+        table.invalidate(ordinal);
+        assert!(cell.is_cold());
+        assert!(!table.publish(&cell, 0, 41, 42));
+        for (slice, native, checked) in [(false, 31, 11), (true, 32, 12)] {
+            assert_eq!(
+                unsafe { (*cell.entry_address(slice)).load(Ordering::Acquire) },
+                native
+            );
+            assert_eq!(
+                unsafe { (*cell.checked_entry_address(slice)).load(Ordering::Acquire) },
+                checked
+            );
+            assert_eq!(entries[usize::from(slice)], cell.entry_address(slice));
+        }
+        assert!(table.publish(&cell, 1, 41, 42));
+        assert!(!cell.is_cold());
+    }
 
     #[test]
     fn collectable_and_unknown_symbols_do_not_get_embedded_slots() {

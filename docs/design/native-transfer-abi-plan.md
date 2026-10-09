@@ -1456,3 +1456,33 @@ tracked by `bliss-shih7.16.2`, together with protected continuation recovery,
 optimized guard recovery and fiber migration tests. Universal publication,
 broader callable adapters and remaining platform gates stay open under the
 parent tasks; these tests do not claim a default native ABI.
+
+### Published named native entries (2026-10-09)
+
+Linux x86-64 CallCells now expose process-lifetime native register/slice entries.
+Mapped named callers marshal an explicit continuation context and tail-jump
+through the current slot. Target selection, mapped-child preparation, checked
+compatibility adaptation and retirement belong to the shared published entry.
+The caller performs no target-ABI selection or successful-return error check.
+
+The register shape carries cell, count, three arguments and a context pointer;
+the slice shape carries cell, count, rooted arguments and a context pointer.
+The context names the caller's request and capture continuation. Live register
+arguments are copied into the caller's writable scanned activation storage before
+preparation can allocate. Slice entries use the supplied scanned slice. Normal
+Invoke requests reserve 48 bytes, including this context; recursive requests keep
+their existing 64-byte layout. Capture maps record the actual stack adjustment.
+
+The permanent shared entry owns a 120-byte machine record. Helpers return before
+native entry or capture; child retirement may release its final code owner because
+its continuation runs in permanent code. Checked fallback reloads the cell after
+preparation, restores legacy recovery while executing the checked target, and
+converts its result only after all checked frames return. Rust reentry establishes
+its own segment and does not forward the original caller's continuation context.
+
+During migration, explicitly named checked slots retain the old caller contract.
+There is one target, revision and publication path: checked-slot readiness controls
+root retention and invalidation, while native adapter addresses remain permanent.
+The existing T1/T2 emitters still use that checked view. Callable-object coverage,
+full caller migration, default-mode acceptance and other platform gates remain
+open; this publication increment does not complete `bliss-shih7.16` or its parent.

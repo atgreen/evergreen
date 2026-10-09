@@ -113,6 +113,8 @@ fn bridge_entries() -> Option<[usize; 6]> {
 
 pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
     let entries = bridge_entries()?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native = super::native_transfer_entry::published_entries()?;
     let ordinal = linkage::resolve_ordinal(symbol)?;
     install_bytecode_root_scanner();
     Some(SLOTS.with(|slots| {
@@ -120,6 +122,13 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
         let count = slots.len().max(ordinal + 1);
         slots.resize_with(count, || None);
         let state = slots[ordinal].get_or_insert_with(|| {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            let cell = Arc::new(CallCell::with_native_entries(
+                ordinal,
+                [entries[0], entries[1]],
+                native,
+            ));
+            #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
             let cell = Arc::new(CallCell::new(ordinal, entries[0], entries[1]));
             let state = Box::new(State {
                 symbol,
@@ -180,6 +189,37 @@ unsafe fn state(cell: u64) -> &'static State {
     // The execution's SLOTS owns the Box until that execution has stopped.
     let cell = unsafe { &*(cell as *const CallCell) };
     unsafe { &*(cell.state_address() as *const State) }
+}
+
+/// Temporary checked-ABI adapter behind the published native contract. The
+/// shared entry calls this only after preparation has declined. Reload the
+/// slot here: preparation may have invalidated or replaced the target.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe extern "C" fn checked_call(
+    cell: u64,
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) {
+    use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    let request = unsafe { &*(*record).request };
+    let entry = unsafe { &*(cell as *const CallCell) }.checked_entry_address(true);
+    let entry = unsafe { &*entry }.load(std::sync::atomic::Ordering::Acquire);
+    let call: unsafe extern "C" fn(u64, u64, *mut EgclVal, u64) -> u64 =
+        unsafe { std::mem::transmute(entry) };
+    c2i_set_native_sigsegv_recovery(1);
+    let value = unsafe { call(cell, request.nargs as u64, request.args, 0) };
+    c2i_set_native_sigsegv_recovery(0);
+    // All checked frames have returned. This conversion does not allocate,
+    // change MV, or transfer control across this Rust frame.
+    unsafe {
+        (*record).outcome = NativeOutcome {
+            value: EgclVal(value),
+            exit: if native_error_pending() {
+                NativeExit::Transfer
+            } else {
+                NativeExit::Returned
+            },
+        };
+    }
 }
 
 fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
@@ -698,7 +738,7 @@ mod tests {
             TARGET_LOOKUPS.with(|count| count.set(0));
             GENERAL_DISPATCHES.with(|count| count.set(0));
             for _ in 0..100 {
-                let entry = unsafe { &*cell.entry_address(false) }
+                let entry = unsafe { &*cell.checked_entry_address(false) }
                     .load(std::sync::atomic::Ordering::Acquire);
                 let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
                     unsafe { std::mem::transmute(entry) };
@@ -743,7 +783,7 @@ mod tests {
         NATIVE_ENV.with(|slot| slot.set(&mut second));
         GENERAL_DISPATCHES.with(|count| count.set(0));
         for _ in 0..100 {
-            let entry = unsafe { &*cell.entry_address(true) }
+            let entry = unsafe { &*cell.checked_entry_address(true) }
                 .load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
@@ -756,7 +796,7 @@ mod tests {
         assert_eq!(GENERAL_DISPATCHES.with(|count| count.get()), 0);
         // A new arity must re-resolve and install a usable zero-argument entry.
         for _ in 0..2 {
-            let entry = unsafe { &*cell.entry_address(true) }
+            let entry = unsafe { &*cell.checked_entry_address(true) }
                 .load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
@@ -850,7 +890,7 @@ mod tests {
         for _ in 0..3 { assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(42)); }
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
-            let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
             assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
         }
@@ -868,7 +908,7 @@ mod tests {
         assert_eq!(cold(state, &args[..]).unwrap(), EgclVal::from_fixnum(43));
         args[0] = egcl_rt::symbols::symbol_function(symbol).unwrap();
         TARGET_LOOKUPS.with(|count| count.set(0));
-        let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+        let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
         let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
         assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
         assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
@@ -879,7 +919,7 @@ mod tests {
         for name in ["PIC-LEAF", "PIC-MIDDLE", "PIC-OUTER"] {
             args[0] = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern(name)).unwrap();
             TARGET_LOOKUPS.with(|count| count.set(0));
-            let entry = unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
             assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
             assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
@@ -981,7 +1021,7 @@ mod tests {
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
             let entry =
-                unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+                unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
                 unsafe { std::mem::transmute(entry) };
             assert_eq!(
@@ -1011,7 +1051,7 @@ mod tests {
         );
         TARGET_LOOKUPS.with(|count| count.set(0));
         let entry =
-            unsafe { &*cell.entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
+            unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
         let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
             unsafe { std::mem::transmute(entry) };
         assert_eq!(
@@ -1100,7 +1140,7 @@ mod tests {
         ));
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
-            let entry = unsafe { &*cell.entry_address(args.len() > 3) }
+            let entry = unsafe { &*cell.checked_entry_address(args.len() > 3) }
                 .load(std::sync::atomic::Ordering::Acquire);
             let result = if args.len() > 3 {
                 let call: extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 =

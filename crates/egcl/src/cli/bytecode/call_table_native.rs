@@ -147,7 +147,7 @@ impl NativeEntry {
             || self.entries().into_iter().enumerate().any(|(i, entry)| {
                 // Only the owning execution reclaims versions. Foreign executions
                 // can redirect these atomic words, but cannot enter this code.
-                unsafe { &*cell.entry_address(i != 0) }.load(std::sync::atomic::Ordering::Acquire)
+                unsafe { &*cell.checked_entry_address(i != 0) }.load(std::sync::atomic::Ordering::Acquire)
                     == entry
             })
     }

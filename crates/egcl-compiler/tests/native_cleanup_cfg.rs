@@ -254,7 +254,8 @@ fn emitted_cleanup_edges_have_exact_sites_and_checked_native_destinations() {
                 let landing = landing.expect("protected call must enter native cleanup");
                 let offset = landing.entry as usize - 0x1000;
                 assert_eq!(&code.code[offset..offset + 4], &[0xf3, 0x0f, 0x1e, 0xfa]);
-                assert_eq!(landing.stack_pointer as usize, 0x2020);
+                // Invoke request plus its explicit native call context.
+                assert_eq!(landing.stack_pointer as usize, 0x2030);
             }
             9 | 11 => assert!(landing.is_none(), "no enclosing cleanup remains"),
             bcp => panic!("unexpected site {bcp}"),
