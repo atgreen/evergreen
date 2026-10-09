@@ -15507,6 +15507,17 @@ fn package_symbols(env: &Env, package_name: &str, include_inherited: bool) -> Ve
 
 fn resolve_load_path(path: &str) -> Result<String, EgclError> {
     let supplied = Path::new(path);
+    // Image-embedded sources (bliss-vmqe0): the path as given, or with the
+    // .lisp extension; never a cached .bfasl, which only the OS could hold.
+    if egcl_stdlib::embedded_files::is_embedded(path) {
+        return Ok(path.to_string());
+    }
+    if supplied.extension().is_none() {
+        let source = supplied.with_extension("lisp").to_string_lossy().into_owned();
+        if egcl_stdlib::embedded_files::is_embedded(&source) {
+            return Ok(source);
+        }
+    }
     if supplied.exists() {
         return Ok(path.to_string());
     }
@@ -15596,8 +15607,12 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
                 DynBind::establish(load_truename, pathname),
             ))
         });
-        let bytes = std::fs::read(&resolved_path)
-            .map_err(|e| EgclError::FileError(format!("cannot read {}: {}", resolved_path, e)))?;
+        let bytes = match egcl_stdlib::embedded_files::contents(&resolved_path) {
+            Some(bytes) => bytes,
+            None => std::fs::read(&resolved_path).map_err(|e| {
+                EgclError::FileError(format!("cannot read {}: {}", resolved_path, e))
+            })?,
+        };
         // A EGCL FASL (.bfasl) starts with the BFASL magic — verify and load the
         // compiled unit (bliss-lb6.6); otherwise treat the file as source.
         if bytes.len() >= egcl_rt::bfasl::BFASL_MAGIC.len()
@@ -21653,6 +21668,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (path_form, _) = cp(cdr);
                 let pathspec = eval_form(path_form, env)?;
                 let path = path_designator_to_string(pathspec)?;
+                if let Some(date) = egcl_stdlib::embedded_files::write_date(&path) {
+                    return Ok(EgclVal::from_fixnum(date));
+                }
                 let secs = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .map_err(|e| EgclError::FileError(format!("{}: {}", path, e)))?
@@ -23465,6 +23483,57 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     println!("{count:>7}  {reason}");
                 }
                 return Ok(EgclVal::from_fixnum(report.len() as i64));
+            }
+            "EGCL-EXT:EMBED-FILE" => {
+                // (egcl-ext:embed-file path &optional (source path)) -- read
+                // SOURCE on this, the build, host NOW and carry its bytes in the
+                // image under PATH, where OPEN, PROBE-FILE, DIRECTORY, LOAD and
+                // friends find them on any host (bliss-vmqe0). Returns the
+                // normalised PATH. Only the Lisp image sees the file.
+                let (path_form, rest) = cp(cdr);
+                let path = path_designator_to_string(eval_form(path_form, env)?)?;
+                let source = if rest == NIL {
+                    path.clone()
+                } else {
+                    let (source_form, _) = cp(rest);
+                    path_designator_to_string(eval_form(source_form, env)?)?
+                };
+                let bytes = std::fs::read(&source).map_err(|e| {
+                    EgclError::FileError(format!("cannot embed {}: {}", source, e))
+                })?;
+                // The source's modification time, as the universal time
+                // FILE-WRITE-DATE will report; the embed time if it has none.
+                let write_date = std::fs::metadata(&source)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64 + 2_208_988_800)
+                    .unwrap_or_else(egcl_stdlib::time::get_universal_time);
+                let stored = egcl_stdlib::embedded_files::embed(&path, &bytes, write_date)?;
+                return Ok(arena_str(&stored));
+            }
+            "EGCL-EXT:EMBEDDED-FILE-P" => {
+                // (egcl-ext:embedded-file-p path) -- T when PATH is carried by
+                // the image.
+                let (path_form, _) = cp(cdr);
+                let path = path_designator_to_string(eval_form(path_form, env)?)?;
+                return Ok(if egcl_stdlib::embedded_files::is_embedded(&path) {
+                    T
+                } else {
+                    NIL
+                });
+            }
+            "EGCL-EXT:EMBEDDED-FILES" => {
+                // (egcl-ext:embedded-files) -- the embedded paths, as a sorted
+                // list of namestrings.
+                let mut paths = egcl_stdlib::embedded_files::paths();
+                paths.sort();
+                egcl_rt::rooted!(values = Vec::<EgclVal>::new());
+                for path in paths {
+                    let value = arena_str(&path);
+                    values.push(value);
+                }
+                return Ok(vec_to_list(&values));
             }
             "EGCL-EXT:GETCWD" => {
                 // Current working directory as a namestring with a trailing

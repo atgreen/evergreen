@@ -5117,6 +5117,25 @@ pub fn alloc_character_string(s: &str) -> EgclVal {
     }
 }
 
+/// Allocate an 8-bit `SIMPLE_BASE_STRING` holding one character per octet of
+/// `bytes`, on the GC heap like [`alloc_character_string`]. The image-embedded
+/// file registry stores file contents this way: a base string costs one byte
+/// per octet where a `(SIMPLE-ARRAY (UNSIGNED-BYTE 8))` would cost a fixnum
+/// word each, and it rides the core-image snapshot unchanged. Read it back
+/// with `EgclVal::as_string`, whose characters are the octets.
+pub fn alloc_base_string_bytes(bytes: &[u8]) -> EgclVal {
+    let padded = crate::object::simple_string_size(bytes.len(), 1);
+    let body_size = padded - OBJECT_HEADER_SIZE;
+    let body = alloc_typed(body_size, crate::object::type_id::SIMPLE_BASE_STRING)
+        .expect("GC heap unavailable for base-string");
+    unsafe {
+        *(body as *mut u64) = bytes.len() as u64;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), body.add(8), bytes.len());
+        let off = body_header_offset(body_size);
+        EgclVal::from_heap_ptr(body.sub(off))
+    }
+}
+
 /// Allocate a pinned object directly in old-gen.
 ///
 /// This is for process-lifetime objects whose raw addresses are cached outside

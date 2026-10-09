@@ -36,6 +36,34 @@ To restart into a REPL with your definitions available, omit `:toplevel`:
 After the saving process exits, run `./session` and evaluate `(square 9)`.
 The result is `81`.
 
+## Carry files in the image
+
+A library such as local-time reads host files (`/usr/share/zoneinfo/...`)
+through Lisp streams, and an image cross-built or copied to another host lands
+where those files do not exist. `egcl-ext:embed-file` reads a file on the build
+host, now, and carries its bytes in the image under the path the application
+will open:
+
+```lisp
+(egcl-ext:embed-file "/usr/share/zoneinfo/UTC")                     ; same path on both hosts
+(egcl-ext:embed-file "/etc/my-app/config.sexp" "deploy/config.sexp") ; a different source
+(egcl-ext:embedded-file-p "/usr/share/zoneinfo/UTC")               ; => T
+(egcl-ext:embedded-files)                                           ; => the paths
+```
+
+`open` for input, `probe-file`, `truename`, `file-length`, `file-write-date`,
+`directory` and `load` find embedded files; an embedded file shadows a real
+one at the same path, so behaviour does not depend on the host; and they are
+read-only, so opening one for output, renaming or deleting it signals
+`file-error`. Only the Lisp image sees them: the operating system, foreign code
+called through the FFI and child processes do not. Saved images, shaken
+executables and cores carry them; contents cost one byte per octet.
+
+An application can list the files it needs in its own `.asd` with the
+`egcl-embed-asdf` extension, as `(:embedded-file ...)` and `(:embedded-tree
+... :only ...)` components that embed when the system loads; see
+`lib/egcl-embed/README.md`.
+
 ## Save a separate core file
 
 ```lisp

@@ -56,6 +56,7 @@ pub mod format;
 // ── Pathnames ─────────────────────────────────────────────────────
 pub mod offheap_image;
 pub mod pathnames;
+pub mod embedded_files;
 
 // ── Developer tools ───────────────────────────────────────────────
 pub mod devtools;

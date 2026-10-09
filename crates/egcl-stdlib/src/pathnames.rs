@@ -1859,8 +1859,18 @@ fn pathname_from_listed_path(path: &Path) -> Result<EgclVal, EgclError> {
     )))
 }
 
+/// The pathname an embedded entry resolves to: its registry key, which is
+/// already absolute, so no filesystem canonicalisation is involved.
+fn pathname_from_embedded(path_str: &str) -> Result<EgclVal, EgclError> {
+    let parsed = parse_namestring_model(&crate::embedded_files::normalize(path_str), None)?;
+    Ok(make_record_value(build_record_from_namestring(parsed, None)))
+}
+
 pub fn probe_file(pathname: EgclVal) -> Result<Option<EgclVal>, EgclError> {
     let path_str = resolve_relative_path(&extract_path_string(pathname)?);
+    if crate::embedded_files::is_embedded(&path_str) {
+        return pathname_from_embedded(&path_str).map(Some);
+    }
     let path = Path::new(&path_str);
     if path.exists() {
         pathname_from_fs_path(path).map(Some)
@@ -1871,6 +1881,9 @@ pub fn probe_file(pathname: EgclVal) -> Result<Option<EgclVal>, EgclError> {
 
 pub fn truename(pathname: EgclVal) -> Result<EgclVal, EgclError> {
     let path_str = resolve_relative_path(&extract_path_string(pathname)?);
+    if crate::embedded_files::is_embedded(&path_str) {
+        return pathname_from_embedded(&path_str);
+    }
     pathname_from_fs_path(Path::new(&path_str))
 }
 
@@ -2013,18 +2026,29 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
     if !wild_pathname_p(pathname, None) && !extract_path_string(pathname)?.contains('*') {
         let path_str = extract_path_string(pathname)?;
         let base = Path::new(&path_str);
-        let root = if base.is_dir() {
+        // A directory pathname lists that directory even when only the image
+        // holds it (bliss-vmqe0); a file pathname lists its directory.
+        let root = if base.is_dir() || path_str.ends_with(std::path::is_separator) {
             base.to_path_buf()
         } else {
             base.parent().unwrap_or(base).to_path_buf()
         };
         let mut result = Vec::new();
-        for entry in std::fs::read_dir(&root)
-            .map_err(|e| EgclError::FileError(format!("{}: {}", root.display(), e)))?
-        {
-            let entry = entry.map_err(|e| EgclError::FileError(e.to_string()))?;
-            result.push(pathname_from_listed_path(&entry.path())?);
+        let embedded = embedded_entries_in(&root)?;
+        match std::fs::read_dir(&root) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| EgclError::FileError(e.to_string()))?;
+                    result.push(pathname_from_listed_path(&entry.path())?);
+                }
+            }
+            // A directory that exists only in the image lists its embedded files.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !embedded.is_empty() => {}
+            Err(e) => {
+                return Err(EgclError::FileError(format!("{}: {}", root.display(), e)));
+            }
         }
+        result.extend(embedded);
         result.sort_by_key(|bv| lookup_string(namestring(*bv).unwrap()).unwrap_or_default());
         return Ok(result);
     }
@@ -2056,7 +2080,47 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
             result.push(pathname_from_listed_path(&candidate)?);
         }
     }
+    for embedded in embedded_candidates(&rec)? {
+        if !result.contains(&embedded) {
+            result.push(embedded);
+        }
+    }
     result.sort_by_key(|bv| lookup_string(namestring(*bv).unwrap()).unwrap_or_default());
+    Ok(result)
+}
+
+/// The embedded entries a plain (non-wild) listing of ROOT should show.
+fn embedded_entries_in(root: &Path) -> Result<Vec<EgclVal>, EgclError> {
+    if !crate::embedded_files::any() {
+        return Ok(Vec::new());
+    }
+    let root_str = root.to_string_lossy();
+    let mut result = Vec::new();
+    for (name, is_dir) in crate::embedded_files::entries_in(&root_str) {
+        let mut path = format!("{}/{}", root_str.trim_end_matches('/'), name);
+        if is_dir {
+            path.push('/');
+        }
+        let parsed = parse_namestring_model(&path, None)?;
+        result.push(make_record_value(build_record_from_namestring(parsed, None)));
+    }
+    Ok(result)
+}
+
+/// The embedded paths matching a wild pathname, as pathnames. Every entry
+/// is tested against the whole pattern, so a directory that exists only in
+/// the image still answers `(directory "/that/dir/*.lisp")`.
+fn embedded_candidates(pattern: &PathnameRecord) -> Result<Vec<EgclVal>, EgclError> {
+    if !crate::embedded_files::any() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    for path in crate::embedded_files::paths() {
+        let candidate = build_record_from_namestring(parse_namestring_model(&path, None)?, None);
+        if pathname_match_with_captures(&candidate, pattern).is_some() {
+            result.push(make_record_value(candidate));
+        }
+    }
     Ok(result)
 }
 
@@ -2080,6 +2144,12 @@ pub fn ensure_directories_exist(pathname: EgclVal) -> Result<(EgclVal, bool), Eg
 
 pub fn delete_file(pathname: EgclVal) -> Result<(), EgclError> {
     let path_str = extract_path_string(pathname)?;
+    if crate::embedded_files::is_embedded(&path_str) {
+        return Err(EgclError::FileError(format!(
+            "{}: embedded files are read-only",
+            path_str
+        )));
+    }
     std::fs::remove_file(&path_str)
         .map_err(|e| EgclError::FileError(format!("{}: {}", path_str, e)))
 }
@@ -2090,6 +2160,14 @@ pub fn rename_file(
 ) -> Result<(EgclVal, EgclVal, EgclVal), EgclError> {
     let old_path_str = extract_path_string(filespec)?;
     let new_path_str = extract_path_string(new_name)?;
+    if crate::embedded_files::is_embedded(&old_path_str)
+        || crate::embedded_files::is_embedded(&new_path_str)
+    {
+        return Err(EgclError::FileError(format!(
+            "rename {} -> {}: embedded files are read-only",
+            old_path_str, new_path_str
+        )));
+    }
     let old_true = pathname_from_fs_path(Path::new(&old_path_str))?;
     std::fs::rename(&old_path_str, &new_path_str).map_err(|e| {
         EgclError::FileError(format!(

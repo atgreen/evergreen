@@ -2067,6 +2067,36 @@ pub fn open(
         .to_string_lossy()
         .into_owned();
 
+    // An image-embedded file shadows whatever the OS has at that path, and
+    // is read-only (bliss-vmqe0).
+    if let Some(bytes) = crate::embedded_files::contents(&absolute_path) {
+        if !matches!(direction, StreamDirection::Input | StreamDirection::Probe) {
+            return Err(EgclError::FileError(format!(
+                "{}: embedded files are read-only",
+                path_str
+            )));
+        }
+        egcl_rt::rooted!(stream = alloc_stream(
+            elt,
+            StreamInner::FileInput {
+                file: StreamHandle::Memory(std::io::Cursor::new(bytes)),
+                read_buf: Vec::with_capacity(FILE_BUF_SIZE),
+                buf_pos: 0,
+                buf_fill: 0,
+                line: 0,
+                col: 0,
+                unread: None,
+                external_format,
+                element_type: elt,
+            },
+            vec![],
+            Some(absolute_path),
+        ));
+        if direction == StreamDirection::Probe {
+            close(*stream, false)?;
+        }
+        return Ok(*stream);
+    }
     match direction {
         StreamDirection::Input | StreamDirection::Probe => {
             if path.is_dir() {
@@ -2929,6 +2959,9 @@ pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
             StreamInner::FileInput { file, .. }
             | StreamInner::FileOutput { file, .. }
             | StreamInner::FileIo { file, .. } => {
+                if let Some(len) = file.memory_len() {
+                    return Ok(EgclVal::from_fixnum(len as i64));
+                }
                 let metadata = file
                     .metadata()
                     .map_err(|e| EgclError::StreamError(format!("file-length error: {}", e)))?;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Embed read-only build-host files into saved images with `egcl-ext:embed-file`
+  and ASDF components from `egcl-embed-asdf`, so applications can read them
+  after deployment without the original files
+  ([#173](https://github.com/atgreen/evergreen/pull/173)).
+
 - Rename the tree-shaking command to `--shake`, its manifest to
   `egcl-shake-manifest`, and its ASDF extension to `egcl-shake-asdf`
   ([#163](https://github.com/atgreen/evergreen/pull/163)).
