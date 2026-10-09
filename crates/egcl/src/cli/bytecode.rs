@@ -48,6 +48,10 @@ mod native_transfer_entry_s390x;
 mod native_transfer_entry_riscv64;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod native_transfer_tests;
+#[cfg(test)]
+mod native_env_tests;
+mod native_env;
+use native_env::NativeEnvNames;
 mod pending_error;
 mod call_table;
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1502,15 +1506,15 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
                 "store-global (set symbol-value)"
             ),
             e!(
-                c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64,
+                c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64,
                 "load lexical var"
             ),
             e!(
-                c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64),
+                c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64),
                 "store lexical var"
             ),
             e!(
-                c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64),
+                c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64),
                 "define lexical var"
             ),
             e!(c2i_push_env_child as extern "C" fn(), "push env frame"),
@@ -16813,31 +16817,26 @@ fn stash_native_error(error: EgclError) {
     });
 }
 
-fn native_env_name(body: *const BytecodeFunction, name_index: u64) -> Option<String> {
-    // SAFETY: only emitted native code calls these environment adapters. It
-    // embeds its original body's address, retained by NativeCode/OsrCode for
-    // the whole call (including direct callees retained by their callers).
-    // Redefinition changes the registry, never this body's name table.
-    let names: &[String] = unsafe { &(*body).names };
-    names.get(name_index as usize).cloned()
-}
-
-extern "C" fn c2i_load_env(body: *const BytecodeFunction, name_index: u64) -> u64 {
-    let Some(name) = native_env_name(body, name_index) else {
+extern "C" fn c2i_load_env(names: *const NativeEnvNames, name_index: u64) -> u64 {
+    // SAFETY: emitted code retains its boxed name table through its code owner,
+    // including OSR entries and retired direct callees.
+    let Some(resolved) = (unsafe { &*names }).get(name_index) else {
         stash_native_error(EgclError::Internal(
             "native environment name vanished".into(),
         ));
         return NIL.0;
     };
+    let name = resolved.name();
+    let symbol_index = resolved.index();
     NATIVE_ENV_FRAME.with(|slot| {
         let frame = slot.borrow();
         match frame
             .as_ref()
-            .and_then(|frame| Env::lookup_frame(frame, &name))
+            .and_then(|frame| Env::lookup_resolved_frame(frame, name, symbol_index))
         {
             Some(value) => value.0,
             None => {
-                let symbol = resolve_sym(&name).unwrap_or(NIL);
+                let symbol = resolve_sym(name).unwrap_or(NIL);
                 stash_native_error(EgclError::UnboundVariable(symbol));
                 NIL.0
             }
@@ -16845,39 +16844,46 @@ extern "C" fn c2i_load_env(body: *const BytecodeFunction, name_index: u64) -> u6
     })
 }
 
-extern "C" fn c2i_store_env(body: *const BytecodeFunction, name_index: u64, value: u64) {
-    let Some(name) = native_env_name(body, name_index) else {
+extern "C" fn c2i_store_env(names: *const NativeEnvNames, name_index: u64, value: u64) {
+    // SAFETY: emitted code retains its boxed name table through its code owner,
+    // including OSR entries and retired direct callees.
+    let Some(resolved) = (unsafe { &*names }).get(name_index) else {
         stash_native_error(EgclError::Internal(
             "native environment name vanished".into(),
         ));
         return;
     };
+    let name = resolved.name();
+    let symbol_index = resolved.index();
     NATIVE_ENV_FRAME.with(|slot| {
         if let Some(frame) = slot.borrow().as_ref() {
-            if !Env::set_frame_var(frame, &name, EgclVal(value)) {
+            if !Env::set_resolved_frame_var(frame, name, symbol_index, EgclVal(value)) {
                 stash_native_error(EgclError::UnboundVariable(
-                    resolve_sym(&name).unwrap_or(NIL),
+                    resolve_sym(name).unwrap_or(NIL),
                 ));
             }
         }
     });
 }
 
-extern "C" fn c2i_define_env(body: *const BytecodeFunction, name_index: u64, value: u64) {
-    let Some(name) = native_env_name(body, name_index) else {
+extern "C" fn c2i_define_env(names: *const NativeEnvNames, name_index: u64, value: u64) {
+    // SAFETY: emitted code retains its boxed name table through its code owner,
+    // including OSR entries and retired direct callees.
+    let Some(resolved) = (unsafe { &*names }).get(name_index) else {
         stash_native_error(EgclError::Internal(
             "native environment name vanished".into(),
         ));
         return;
     };
+    let name = resolved.name();
+    let symbol_index = resolved.index();
     NATIVE_ENV_FRAME.with(|slot| {
         if let Some(frame) = slot.borrow().as_ref() {
-            let symbol_index = egcl_rt::symbols::find_index(&name);
             let mut borrowed = frame.borrow_mut();
             if let Some(symbol_index) = symbol_index {
                 borrowed.symbol_vars.insert(symbol_index, EgclVal(value));
             }
-            borrowed.vars.insert(name.clone(), EgclVal(value));
+            borrowed.vars.insert(name.to_owned(), EgclVal(value));
         }
     });
 }
@@ -18186,6 +18192,8 @@ fn materialize_t2_deopt_scopes(
 // Direct-call contract fields remain part of installed metadata on all targets.
 // Only the x86-64 emitter currently consumes them for direct native calls.
 struct NativeCode {
+    /// Name snapshots addressed by emitted environment accesses.
+    _env_names: Box<NativeEnvNames>,
     /// Stable linkage words embedded in this code; cells do not own code.
     _call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     /// Retain executable pages while activations and embedded callers own this code.
@@ -18285,6 +18293,7 @@ fn native_transfer_abi_compatible(code: &NativeCode) -> bool {
 }
 
 struct NativeEmission {
+    env_names: Box<NativeEnvNames>,
     code: Vec<u8>,
     osr_entries: Vec<(u32, usize)>,
     bcp_offsets: Vec<u32>,
@@ -19047,6 +19056,7 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 }
 
 struct T2Artifact {
+    env_names: Box<NativeEnvNames>,
     speculations: Vec<(u32, SpecType)>,
     call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     code: Vec<u8>,
@@ -19884,6 +19894,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         }
     }
     let nc = Rc::new(NativeCode {
+        _env_names: artifact.env_names,
         _call_cells: artifact.call_cells,
         _buffer: buf,
         body: Some(Arc::clone(&bf)),
@@ -20784,6 +20795,7 @@ fn emit_native(
     backedge_counter: u64,
     allow_traps: bool,
 ) -> Option<NativeEmission> {
+    let env_names = NativeEnvNames::new(bf);
     let mut direct_calls = Vec::new();
     let mut can_osr_to_t2 = false;
     macro_rules! decline_t1 {
@@ -20818,11 +20830,11 @@ fn emit_native(
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
     let load_env_addr =
-        c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64;
+        c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64;
     let store_env_addr =
-        c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let define_env_addr =
-        c2i_define_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64;
+        c2i_define_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64;
     let push_env_addr = c2i_push_env_child as extern "C" fn() as usize as u64;
     let pop_env_addr = c2i_pop_env_child as extern "C" fn() as usize as u64;
     let eval_host_addr = c2i_eval_host as extern "C" fn(u64) -> u64 as usize as u64;
@@ -21438,12 +21450,11 @@ fn emit_native(
                 // This leaf helper cannot allocate or signal.
                 c.extend_from_slice(&[0xff, 0xd0]); // call rax
             }
-            // Name indexes belong to this exact code version, not the current
-            // symbol definition. NativeCode/OsrCode retain this body even after
-            // redefinition, for invocation and OSR entries alike.
+            // Each installed code version owns its original name snapshots,
+            // including after redefinition and while entered through OSR.
             Instr::LoadEnvVar(name_idx) => {
-                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, original body
-                c.extend_from_slice(&(std::ptr::from_ref(bf) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
                 c.push(0xBE); // mov esi, name index
                 c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -21453,8 +21464,8 @@ fn emit_native(
             }
             Instr::StoreEnvVar(name_idx) | Instr::DefineEnvVar(name_idx) => {
                 pop_into(&mut c, 2, false); // value -> rdx
-                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, original body
-                c.extend_from_slice(&(std::ptr::from_ref(bf) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
                 c.push(0xBE); // mov esi, name index
                 c.extend_from_slice(&u32::from(*name_idx).to_le_bytes());
                 c.extend_from_slice(&[0x48, 0xB8]);
@@ -21770,6 +21781,7 @@ fn emit_native(
         .map(|&l| c.label_offset(l).map_or(u32::MAX, |o| o as u32))
         .collect();
     Some(NativeEmission {
+        env_names,
         code: c.finish()?,
         osr_entries,
         bcp_offsets,
@@ -22116,6 +22128,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // immediately every call. Decline instead, keeping such functions at T0 for
     // top-level calls (the OSR path below still traps to compile their loops).
     let NativeEmission {
+        env_names,
         code,
         osr_entries,
         bcp_offsets,
@@ -22137,6 +22150,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
+        _env_names: env_names,
         _call_cells: Vec::new(),
         _buffer: buf,
         body: Some(bf),
@@ -22257,6 +22271,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
     let sym = input.sym;
     let bf = input.body.as_ref();
+    let env_names = NativeEnvNames::new(bf);
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
     // compiled body, filling every frame *slot* param — &optional/&rest/&key
     // included — so T2's entry (build.rs::seed_entry, now seeding 0..slot-params)
@@ -22433,9 +22448,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         input.code_id,
         &named_calls,
         egcl_compiler::t2::emit::EnvironmentCalls {
-            body: bf as *const BytecodeFunction as u64,
-            load: c2i_load_env as extern "C" fn(*const BytecodeFunction, u64) -> u64 as usize as u64,
-            store: c2i_store_env as extern "C" fn(*const BytecodeFunction, u64, u64) as usize as u64,
+            body: std::ptr::from_ref(&*env_names) as u64,
+            load: c2i_load_env as extern "C" fn(*const NativeEnvNames, u64) -> u64 as usize as u64,
+            store: c2i_store_env as extern "C" fn(*const NativeEnvNames, u64, u64) as usize as u64,
         },
     ) {
         Ok(fc) => fc,
@@ -22450,8 +22465,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let mut rooted_bodies = Vec::new();
     if bf.code.iter().any(|instruction| matches!(instruction,
         Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
-        // Environment helpers embed this snapshot's address, not the mutable
-        // registry entry. Retain it even when there are no heap constants.
+        // Retain the source snapshot for lexical deoptimization metadata,
+        // including when there are no heap constants.
         rooted_bodies.push(std::sync::Arc::clone(&input.body));
     }
     for &slot in &framed.heap_constant_slots {
@@ -22513,6 +22528,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     );
 
     Some(T2Artifact {
+        env_names,
         speculations,
         call_cells: input
             .call_cells
@@ -22590,6 +22606,8 @@ fn bytecode_body_owns_constant_slot(body: &BytecodeFunction, slot: usize) -> boo
 /// entry stub that jumps into that header. Shares the frame/GC layout with the
 /// normal native tier (same `num_slots`/stack map).
 struct OsrCode {
+    /// Name snapshots addressed by emitted environment accesses.
+    _env_names: Box<NativeEnvNames>,
     /// OSR activations retain their code owner across registry invalidation.
     _buffer: egcl_rt::jit::JitBuffer,
     _direct_calls: Vec<Rc<NativeCode>>,
@@ -22775,6 +22793,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
         eprintln!("[osr] emit_native returned None (unsupported) for sym {sym}");
     }
     let NativeEmission {
+        env_names,
         code,
         osr_entries: osr,
         direct_calls,
@@ -22794,6 +22813,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     maybe_write_perf_map(entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
     Some(Rc::new(OsrCode {
+        _env_names: env_names,
         _buffer: buf,
         _direct_calls: direct_calls,
         entry,
@@ -24601,6 +24621,7 @@ mod jtc4_stack_map_tests {
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
+            env_names: Box::default(),
             speculations: vec![],
             call_cells: Vec::new(),
             code: vec![0x90; 8],
@@ -24825,6 +24846,7 @@ mod jtc4_stack_map_tests {
         let entry = buf.as_ptr();
         let code_info = install_stack_map(1, std::sync::Weak::new()).unwrap();
         let nc = NativeCode {
+            _env_names: Box::default(),
             _call_cells: Vec::new(),
             _buffer: buf,
             body: None,
@@ -24893,6 +24915,7 @@ mod jtc4_stack_map_tests {
         let entry = buf.as_ptr();
         let code_info = install_stack_map(1, std::sync::Weak::new()).unwrap();
         let nc = NativeCode {
+            _env_names: Box::default(),
             _call_cells: Vec::new(),
             _buffer: buf,
             body: None,

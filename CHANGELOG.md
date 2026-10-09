@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Reduce name-resolution and allocation overhead when native closures access
+  captured variables, preserving shadowing, redefinition, and image restoration.
+  This reduces full Prechelt phone-encoding time by about 2% in the measured
+  x86-64 workload
+  ([#153](https://github.com/atgreen/evergreen/pull/153)).
+
 - Reduce native builtin-call return overhead by returning successful values
   without copying error payloads, while preserving error and panic recovery.
   This reduces full Prechelt phone-encoding time by about 4% in the measured
