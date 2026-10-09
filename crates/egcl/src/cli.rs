@@ -16124,6 +16124,8 @@ fn mv_operator_preserves(name: &str) -> bool {
             | "HANDLER-CASE"
             | "RESTART-BIND"
             | "RESTART-CASE"
+            | "INVOKE-RESTART"
+            | "INVOKE-RESTART-INTERACTIVELY"
             | "WITH-CONDITION-RESTARTS"
             | "IGNORE-ERRORS"
             | "DESTRUCTURING-BIND"

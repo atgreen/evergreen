@@ -353,8 +353,8 @@ fn invoke_restart_executes_restart_function() {
         Ok(fx(4200))
     });
 
-    // Per R5.99, INVOKE-RESTART must run the active restart's function in the
-    // dynamic environment established by RESTART-BIND.
+    // Per R5.99, INVOKE-RESTART calls the active restart function. The CLI
+    // adapter regression separately checks invocation-time dynamic bindings.
     let observed = restart_bind_fn(
         &[RestartSpec {
             name: restart_name,

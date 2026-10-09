@@ -20,7 +20,7 @@ binding and dispatch, restart machinery, signalling protocol (`SIGNAL`,
 | R5.96 | `RESTART-BIND` and `RESTART-CASE` MUST establish restart clusters on a thread-local restart stack. |
 | R5.97 | `COMPUTE-RESTARTS` MUST return all applicable restarts, newest-first, filtering by any `:test-function`. |
 | R5.98 | `FIND-RESTART` MUST locate the most recently established applicable restart of the given name. |
-| R5.99 | `INVOKE-RESTART` MUST call the restart's function in the dynamic environment of the `RESTART-BIND`/`RESTART-CASE`. |
+| R5.99 | `INVOKE-RESTART` MUST call a `RESTART-BIND` restart's function in the dynamic environment of the invocation; that function MAY return normally or transfer control. A `RESTART-CASE` restart MUST unwind to its selected clause before executing the clause body. |
 | R5.100 | `INVOKE-RESTART-INTERACTIVELY` MUST call the restart's `:interactive` function to obtain arguments, then invoke. |
 | R5.101 | `*DEBUGGER-HOOK*` MUST be called before entering the default debugger; it receives the condition and the hook's own value. |
 | R5.102 | `SIGNAL` MUST search handlers, invoke matching handlers (non-unwound), and return `NIL` if no handler transfers control. |

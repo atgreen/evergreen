@@ -77,6 +77,48 @@ fn process_level_native_transfer_waits_until_bootstrap_finishes() {
 }
 
 #[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(egcl_no_disassembly)))]
+fn native_adapter_preserves_returning_restart_dynamic_context_and_values() {
+    let program = r#"
+        (defvar *restart-dynamic-context* :outside)
+        (defun returning-restart-helper (interactive)
+          (let ((*restart-dynamic-context* :established))
+            (restart-bind
+                ((inspect-context
+                   (lambda () (values *restart-dynamic-context* (list :secondary)))))
+              (let ((*restart-dynamic-context* :invoked))
+                (if interactive
+                    (invoke-restart-interactively 'inspect-context)
+                    (invoke-restart 'inspect-context))))))
+        ;; The native caller crosses the interpreter adapter. RESTART-BIND
+        ;; returns through it, preserving the invocation's dynamic binding and
+        ;; secondary values rather than unwinding to the establishing binding.
+        (defun native-returning-restart (interactive)
+          (returning-restart-helper interactive))
+        (dotimes (i 30)
+          (assert (equal '(:invoked (:secondary))
+                         (multiple-value-list (native-returning-restart nil))))
+          (assert (equal '(:invoked (:secondary))
+                         (multiple-value-list (native-returning-restart t)))))
+        (assert (eq *restart-dynamic-context* :outside))
+        (disassemble 'native-returning-restart)
+        (format t "NATIVE-RETURNING-RESTART-OK~%")
+    "#;
+    let output = bounded_native_probe(&["--no-init", "--eval", program]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("NATIVE-RETURNING-RESTART-OK"), "{stdout}");
+    assert!(
+        stdout.contains("Native segment ABI"),
+        "caller must execute native segment code: {stdout}"
+    );
+}
+
+#[test]
 fn t2_calls_stop_before_later_side_effects() {
     let program = r#"
         (defvar *after-transfer* 0)

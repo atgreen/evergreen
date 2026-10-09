@@ -1,14 +1,60 @@
-# Native transfers without checks after successful native returns
+# Universal native calling ABI and exceptional transfers
 
-Status: in progress. The native transfer path and emergency cleanup slices are
-implemented; final activation still depends on inherited OSR state, native
-Windows mitigation gates, and the remaining cross-version bridge work.
+Status: in progress. The user approved the universal calling contract below on
+2026-10-09. Existing segment compilation, native cleanup and precise deoptimization
+are implementation components; enabling their rollout flag alone is not completion.
 Tracking: **bliss-shih7**, with executable steps in its child Beads.
 Baseline: `2c84d2e1` (the counted pending-error fast path, `bliss-5fzra`).
 That completed mitigation retained return checks; this work replaces the protocol
 on top of it. Do not remove checks until the new boundary contract is verified.
 
 ## Objective and decision
+
+Every callable exposes the native calling ABI by default. A caller may bypass it
+only when both the caller and the currently selected target are known to be
+interpreted. Being difficult to compile does not change a function's public
+calling convention: its entry points to an interpreter adapter instead.
+
+Use the existing stable named-call ordinals and executable `CallCell` slots.
+Publish a compatible entry for compiled code, interpreted code, builtins,
+closures, generic functions and undefined functions. Keep the existing small
+register-argument and large argument-slice entry shapes while integrating the
+transfer contract. Tiering and redefinition update entry publication with the
+existing revision and retained-code lifetime rules. The ordinary caller loads
+the entry and calls it; it does not choose an ABI, resolve a symbol name, or
+check transfer status after a successful native return. `FUNCALL` and `APPLY`
+must obey the same contract. Temporary legacy adapters translate at the boundary;
+they are not permission to preserve a second caller-visible default ABI.
+
+Platform compatibility is an entry-publication and execution-boundary invariant.
+Worker startup and fiber mounting must prevent unsupported native continuations
+from resuming. A scheduler migration issue is not a reason to add checks after
+every Lisp call. Independent GC, preemption and asynchronous-signal polls remain.
+
+Conditions and restarts have two distinct phases:
+
+* **Live signaling:** call matching `HANDLER-BIND` handlers while the signaling
+  computation, dynamic bindings and restarts remain available. Returning from a
+  handler declines; it does not replace the failed operation's result.
+* **Selected transfer:** only a chosen nonlocal exit begins unwinding.
+  `HANDLER-CASE` and `RESTART-CASE` clause bodies execute after the appropriate
+  unwind. A `RESTART-BIND` function runs in the invocation's dynamic environment
+  and may return normally. Lexical captures do not replace that dynamic context.
+
+In particular, a Rust helper must not destroy live restart context by returning
+an unsignaled error outward and only then searching handlers. Signal while the
+required state is live (or precisely reified and rooted); propagate an already
+selected escaping transfer through ordinary Rust returns before native unwinding
+continues. Preserve Rust destructors, exact cleanup order, replacement transfers,
+multiple values, moving roots and the executing definition's identity. Neither
+deoptimization nor transfer fallback may replay completed effects.
+
+The expanded implementation is tracked by `bliss-shih7.15` (contract),
+`bliss-shih7.16` (entry publication), `bliss-shih7.17` (emitted calls and interpreter
+boundaries), `bliss-shih7.18` (live conditions and restarts), and the existing
+exceptional CFG, native scope, boundary, platform
+and performance tasks. This extends the endpoint below; it does not replace it
+with a Linux-only subset or a default-on configuration change.
 
 A successful native-to-native call returns its Lisp value directly, without
 calling `c2i_transfer_pending` or testing a pending-error flag afterward.
@@ -92,8 +138,9 @@ save areas are backend-specific, with compile-time offset assertions. Landing
 stubs must also satisfy enabled control-flow hardening: Win64 unwind/CFG rules,
 x86 shadow-stack and indirect-branch protections, and AArch64 return signing/
 branch-target rules where applicable. A plain stack-pointer reset is not a
-valid shadow-stack unwind. Gate activation on a tested platform-supported
-transition; retain the legacy ABI when that transition is unavailable. An owning
+valid shadow-stack unwind. Gate machine transitions on tested platform support;
+when one is unavailable, publish a compatible adapter instead of exposing a
+different caller ABI. Existing checked entries are temporary bridge inputs. An owning
 Rust guard registers and unregisters the segment and restores enclosing state.
 Do not introduce a mandatory lookup or new reserved register on each successful
 native return; exceptional/helper adapters can obtain the active anchor through
