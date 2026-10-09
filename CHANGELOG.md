@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Speed up missed lookups in large hash tables with a compact membership
+  filter, preserving mutation, GC, and image-restoration behavior. This reduces
+  full Prechelt phone-encoding time by about 5% in the measured x86-64 workload
+  ([#155](https://github.com/atgreen/evergreen/pull/155)).
+
 - Fix `EQUALP` hash-table lookup, replacement, and removal across integer zero
   and positive or negative single-float zero
   ([#154](https://github.com/atgreen/evergreen/pull/154)).
