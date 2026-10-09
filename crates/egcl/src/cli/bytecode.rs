@@ -18294,6 +18294,8 @@ fn materialize_t2_deopt_scopes(
 enum NativeCodeStorage {
     Checked {
         _buffer: egcl_rt::jit::JitBuffer,
+        // Exact code-version metadata, independent of debugger registration.
+        _native_calls: Option<Arc<egcl_compiler::t2::x64_calls::NativeCallSites>>,
     },
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     Mapped(Rc<native_transfer_entry::TransferCode>),
@@ -19179,6 +19181,7 @@ struct T2Artifact {
     shadow_root_slots: u16,
     emitted_safepoints: usize,
     root_sync_sites: Vec<egcl_compiler::t2::emit::RootSyncSite>,
+    native_calls: Option<egcl_compiler::t2::x64_calls::NativeCallSites>,
     has_deopt: bool,
     rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
     deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
@@ -20005,7 +20008,10 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     let nc = Rc::new(NativeCode {
         _env_names: artifact.env_names,
         _call_cells: artifact.call_cells,
-        _storage: NativeCodeStorage::Checked { _buffer: buf },
+        _storage: NativeCodeStorage::Checked {
+            _buffer: buf,
+            _native_calls: artifact.native_calls.map(Arc::new),
+        },
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -22311,7 +22317,10 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     let nc = Rc::new(NativeCode {
         _env_names: env_names,
         _call_cells: Vec::new(),
-        _storage: NativeCodeStorage::Checked { _buffer: buf },
+        _storage: NativeCodeStorage::Checked {
+            _buffer: buf,
+            _native_calls: None,
+        },
         body: Some(bf),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -22703,6 +22712,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         shadow_root_slots: framed.shadow_root_slots,
         emitted_safepoints: framed.emitted_safepoints,
         root_sync_sites: framed.root_sync_sites,
+        native_calls: framed.native_calls,
         has_deopt: framed.has_deopt,
         rooted_bodies,
         deopt_bodies,
@@ -24777,6 +24787,73 @@ mod jtc4_stack_map_tests {
         );
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn t2_native_value_maps_follow_installed_code_versions() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let symbol = egcl_rt::symbols::intern("T2-VALUE-MAP-OWNER");
+        let mut versions = Vec::new();
+        for value in [11, 22] {
+            egcl_rt::rooted!(
+                form = reader::read_from_string(&format!("((car (cons {value} nil)))"))
+                    .unwrap()
+                    .0
+            );
+            let body =
+                compile_function("T2-VALUE-MAP-OWNER", NIL, *form, &env, false, false).unwrap();
+            registry_put(symbol, Arc::new(body));
+            let input = snapshot_t2_input(symbol, 0).unwrap();
+            let generation = input.generation;
+            let input = egcl_rt::CrossThreadRoot::new(input);
+            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
+            let native = install_t2_completion(T2Completion {
+                sym: symbol,
+                generation,
+                artifact: Some(artifact),
+                input,
+            })
+            .unwrap();
+            let NativeCodeStorage::Checked {
+                _native_calls: Some(maps),
+                ..
+            } = &native._storage
+            else {
+                panic!("installed T2 code lost its native maps");
+            };
+            assert!(
+                maps.iter().next().is_some(),
+                "exercise a real collecting call"
+            );
+            assert!(
+                maps.iter()
+                    .all(|site| maps.value_map(site.return_offset).is_some())
+            );
+            versions.push((native.clone(), Arc::downgrade(maps)));
+        }
+        assert!(!std::sync::Weak::ptr_eq(&versions[0].1, &versions[1].1));
+        registry_remove(symbol);
+        for ((native, maps), expected) in versions.iter().zip([11, 22]) {
+            assert!(
+                maps.upgrade().is_some(),
+                "retained old code must retain its own maps"
+            );
+            assert_eq!(
+                run_native(native, symbol, &[], &mut env).unwrap(),
+                EgclVal::from_fixnum(expected)
+            );
+        }
+        let weak: Vec<_> = versions.iter().map(|(_, maps)| maps.clone()).collect();
+        drop(versions);
+        assert!(
+            weak.iter().all(|maps| maps.upgrade().is_none()),
+            "maps must retire with their final code owners"
+        );
+    }
+
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
@@ -24789,6 +24866,7 @@ mod jtc4_stack_map_tests {
             compiled_entry: 0,
             osr_entries: vec![],
             bcp_offsets: vec![],
+            native_calls: None,
             shadow_root_slots: 2,
             emitted_safepoints: 1,
             root_sync_sites: vec![egcl_compiler::t2::emit::RootSyncSite {
@@ -25007,7 +25085,10 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
-            _storage: NativeCodeStorage::Checked { _buffer: buf },
+            _storage: NativeCodeStorage::Checked {
+                _buffer: buf,
+                _native_calls: None,
+            },
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,
@@ -25076,7 +25157,10 @@ mod jtc4_stack_map_tests {
         let nc = NativeCode {
             _env_names: Box::default(),
             _call_cells: Vec::new(),
-            _storage: NativeCodeStorage::Checked { _buffer: buf },
+            _storage: NativeCodeStorage::Checked {
+                _buffer: buf,
+                _native_calls: None,
+            },
             body: None,
             transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
             transfer_abi_arch: NATIVE_TRANSFER_ARCH,

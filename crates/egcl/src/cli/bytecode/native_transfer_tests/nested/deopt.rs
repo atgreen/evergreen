@@ -307,6 +307,11 @@ fn native_v2_child_redefinition_before_guard_keeps_original_result() {
     )
     .unwrap();
     let old = install_guarded_child("GUARD-OLD-CHILD", "(x active)", source, &env);
+    let old_maps = Arc::downgrade(old.value_maps_for_test());
+    assert!(old.value_maps_for_test().iter().any(|site| matches!(
+        old.value_maps_for_test().value_map(site.return_offset),
+        Some(egcl_compiler::t2::x64_calls::NativeCallValues::Deoptimizing { .. })
+    )));
     let caller = compile_caller(
         "(x active)",
         "((catch :old (guard-old-child x active)))",
@@ -334,6 +339,9 @@ fn native_v2_child_redefinition_before_guard_keeps_original_result() {
         read_eval_all_env("(guard-old-child 1.5 nil)", &mut env).unwrap(),
         EgclVal::from_single_float(901.5)
     );
+    assert!(old_maps.upgrade().is_some(), "redefinition must retain old code maps");
+    drop(old);
+    assert!(old_maps.upgrade().is_none(), "maps retire with their code owner");
 }
 
 #[test]

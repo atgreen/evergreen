@@ -416,6 +416,15 @@ fn native_call_sites_match_invoke_and_inserted_poll_return_pcs() {
     let mut polls = 0;
     for site in sites.iter() {
         assert_eq!(&framed.code[site.return_offset - 2..site.return_offset], &[0xff, 0xd0]);
+        use egcl_compiler::t2::x64_calls::NativeCallValues;
+        match sites.value_map(site.return_offset).unwrap() {
+            NativeCallValues::Frame(map) => {
+                assert!(map.layout().native_slots <= framed.native_spill_slots);
+            }
+            NativeCallValues::Retired => assert_eq!(site.origin, NativeCallOrigin::RestartDeopt),
+            NativeCallValues::Deoptimizing { .. } => assert!(matches!(site.origin, NativeCallOrigin::Deopt(_))),
+            NativeCallValues::Unavailable => panic!("missing authoritative map: {:?}", site.origin),
+        }
         assert_eq!(sites.get(site.return_offset), Some(site));
         assert!(sites.get(site.return_offset - 1).is_none());
         match site.origin {
