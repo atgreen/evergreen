@@ -16,7 +16,7 @@
 //! to that one instead.
 //!
 //! This is not a `Pass`. The production driver calls it on the freshly built
-//! SSA, before the mid-end (fold, GVN, guard elimination, DCE), and treats a
+//! SSA (ordinary Call or native-transfer Invoke), before the mid-end (fold, GVN, guard elimination, DCE), and treats a
 //! zero count as fine: the mid-end still improves unspeculated code.
 //!
 //! # Contract
@@ -66,6 +66,10 @@
 //! `GenericEq` rewrite instead clears flags and `frame_state` entirely.
 //! Every rewrite retains the builtin's single-value return effect in a
 //! separate `ClearMv` after the successful operation and its guards.
+//! A specialized Invoke then jumps through its original normal projection;
+//! newly orphaned exceptional blocks are retired before dominance rewrites.
+//! Calls whose exceptional edge is required to reach an OSR header remain
+//! generic so its preheader definitions and import state stay valid.
 //!
 //! Three guard-materialisation steps then run (bliss-x5y.25). Inference
 //! assigns each SSA value one fact from its definition onward, so a raw
@@ -370,7 +374,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     for &b in f.block_order() {
         for &inst in &f.block(b).insts {
             let data = f.inst(inst);
-            if data.opcode != Opcode::Call {
+            if !matches!(data.opcode, Opcode::Call | Opcode::Invoke) {
                 continue;
             }
             let sym = match &data.aux {
@@ -479,6 +483,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     }
 
     // Mutation phase: turn each into a guarded typed op.
+    let mut initially_reachable = None;
     let mut n = 0;
     let mut fixnum_sites: Vec<Inst> = Vec::new();
     for (inst, opcode, ty, extra) in work {
@@ -489,6 +494,21 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             f.block(block).insts.iter().position(|&candidate| candidate == inst)
                 .map(|position| (block, position))
         }).expect("speculation site belongs to a block");
+        let normal = if f.inst(inst).opcode == Opcode::Invoke {
+            // Removing a cold edge must not strand an OSR header or its
+            // preheader definitions. Keep the generic call in that case.
+            let before = reachable_blocks(f, None, false);
+            let after = reachable_blocks(f, Some(inst), false);
+            if !before[block.index()] || f.osr_entries.iter().any(|entry| {
+                before[entry.block.index()] && !after[entry.block.index()]
+            }) {
+                continue;
+            }
+            initially_reachable.get_or_insert_with(|| reachable_blocks(f, None, true));
+            Some(f.inst(inst).targets[0].clone())
+        } else {
+            None
+        };
         super::builtin_binding::insert(f, block, position, state, binding);
         n += 1;
         // Materialise the appended constant operand (1+/1- → const 1; NOT →
@@ -522,6 +542,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         {
             let data = f.inst_mut(inst);
             data.opcode = opcode;
+            data.targets.clear();
             if let Some(v) = extra_value {
                 if replace_second {
                     data.args[1] = v;
@@ -586,8 +607,42 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         let position = insts.iter().position(|&candidate| candidate == inst)
             .expect("speculation site remains in its block");
         insts.insert(position + 1, clear);
+        if let Some(normal) = normal {
+            f.set_terminator(block, crate::t2::ir::InstData {
+                opcode: Opcode::Jump,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![normal],
+                frame_state: None,
+                source_pos: 0,
+            });
+        }
         if fixnum_family(opcode) {
             fixnum_sites.push(inst);
+        }
+    }
+    if let Some(initially_reachable) = initially_reachable {
+        let reachable = reachable_blocks(f, None, true);
+        // Stable block IDs keep surviving edge and OSR references intact.
+        // Only retire paths made unreachable by these successful rewrites.
+        for index in 0..f.num_blocks() {
+            if initially_reachable[index] && !reachable[index] {
+                let block = crate::t2::ir::Block(index as u32);
+                fixnum_sites.retain(|site| !f.block(block).insts.contains(site));
+                f.block_mut(block).insts.clear();
+                f.set_terminator(block, crate::t2::ir::InstData {
+                    opcode: Opcode::Trap,
+                    args: vec![],
+                    results: vec![],
+                    aux: AuxData::None,
+                    flags: InstFlags::default(),
+                    targets: vec![],
+                    frame_state: None,
+                    source_pos: 0,
+                });
+            }
         }
     }
     let self_sym = f
@@ -597,6 +652,26 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     materialize_self_call_result_guards(f, self_sym);
     materialize_fixnum_operand_guards(f, &fixnum_sites);
     n
+}
+
+// Model a selected Invoke's successful edge without mutating the graph.
+fn reachable_blocks(f: &Function, normal_only: Option<Inst>, include_osr: bool) -> Vec<bool> {
+    let mut seen = vec![false; f.num_blocks()];
+    let mut pending = vec![f.entry()];
+    if include_osr {
+        pending.extend(f.osr_entries.iter().map(|entry| entry.block));
+    }
+    while let Some(block) = pending.pop() {
+        if std::mem::replace(&mut seen[block.index()], true) {
+            continue;
+        }
+        if let Some(term) = f.terminator(block) {
+            let targets = &f.inst(term).targets;
+            let count = if Some(term) == normal_only { 1 } else { targets.len() };
+            pending.extend(targets[..count].iter().map(|edge| edge.block));
+        }
+    }
+    seen
 }
 
 /// bliss-x5y.25 (tak shape): pre-guard entry parameters as fixnums AT FUNCTION
