@@ -83,6 +83,93 @@ fn run_tiers(name: &str, program: &str) {
 }
 
 #[test]
+fn interpreted_replacements_override_builtin_dispatch() {
+    for (name, call) in [
+        ("FORMAT", "(format nil \"original\")"),
+        ("VALUES", "(values 7 8)"),
+        ("VALUES", "(values)"),
+        ("LENGTH", "(length '(a b))"),
+        ("FBOUNDP", "(fboundp 'format)"),
+    ] {
+        run_tiers(name, &format!(r#"
+          (defun warmed-caller () {call})
+          (dotimes (i 40) (warmed-caller))
+          (assert (= (egcl-ext:function-tier 'warmed-caller) EXPECTED-TIER))
+          (setf (symbol-function '{name})
+            (lambda (&rest args) (declare (ignore args)) 110))
+          (defun cold-caller () {call})
+          (setq *warm-result* (warmed-caller)
+                *cold-result* (cold-caller))
+          (fmakunbound '{name})
+          (assert (eql *warm-result* 110))
+          (assert (eql *cold-result* 110))
+          (format t "CALLABLE-REBINDING-OK~%")
+        "#));
+    }
+}
+
+#[test]
+fn values_replacements_preserve_captures_effects_and_multiple_values() {
+    run_tiers("VALUES replacement state", r#"
+      (defparameter *calls* 0)
+      (defun values-caller (x) (values (progn (incf *calls*) x) 8))
+      (dotimes (i 40) (values-caller i))
+      (assert (= (egcl-ext:function-tier 'values-caller) EXPECTED-TIER))
+      (let ((captured (list :captured)))
+        (setf (symbol-function 'values)
+          (lambda (&rest args) (values-list (list captured args)))))
+      (setq *calls* 0)
+      (setq *result* (multiple-value-list (values-caller (list :argument))))
+      (fmakunbound 'values)
+      (assert (= *calls* 1))
+      (assert (equal *result* '((:captured) ((:argument) 8))))
+      (setf (symbol-function 'values)
+        (lambda (&rest args) (declare (ignore args)) (values-list nil)))
+      (setq *result* (multiple-value-list (values-caller 42)))
+      (fmakunbound 'values)
+      (assert (null *result*))
+      (setf (symbol-function 'values)
+        (lambda (&rest args) (declare (ignore args)) (throw 'replacement-exit 120)))
+      (setq *calls* 0 *cleanup* 0)
+      (setq *result* (catch 'replacement-exit
+        (unwind-protect (values-caller 42) (incf *cleanup*))))
+      (fmakunbound 'values)
+      (assert (= *result* 120))
+      (assert (= *calls* 1))
+      (assert (= *cleanup* 1))
+      (defun local-values-caller (x)
+        (flet ((values (&rest args) (list :local args))) (values x 8)))
+      (dotimes (i 40)
+        (assert (equal (local-values-caller i) (list :local (list i 8)))))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#);
+}
+
+#[test]
+fn values_rebinding_during_argument_evaluation_is_observed() {
+    run_tiers("VALUES argument-time replacement", r#"
+      (defparameter *armed* nil)
+      (defparameter *effects* 0)
+      (defun values-argument ()
+        (incf *effects*)
+        (if *armed*
+            (egcl::set-symbol-function 'values
+              (lambda (&rest args) (declare (ignore args)) 110))
+            nil)
+        7)
+      (defun values-caller () (values (values-argument) 8))
+      (dotimes (i 40) (values-caller))
+      (assert (= (egcl-ext:function-tier 'values-caller) EXPECTED-TIER))
+      (setq *armed* t *effects* 0)
+      (setq *result* (multiple-value-list (values-caller)))
+      (fmakunbound 'values)
+      (assert (equal *result* '(110)))
+      (assert (= *effects* 1))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#);
+}
+
+#[test]
 fn callable_instance_replaces_funcall() {
     check_rebinding("funcall", "(funcall #'original-callback 10)", "1010");
 }

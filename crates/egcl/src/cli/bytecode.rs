@@ -2800,6 +2800,8 @@ impl<'e> Lowerer<'e> {
                     }
                     self.lower_quasiquote_template(cp(rest).0, 1)
                 }
+                "VALUES" if self.local_fns.contains_key(&name)
+                    || self.closure_fns.contains(&name) => self.lower_call(&name, op, rest),
                 "VALUES" => self.lower_values(rest),
                 "DESTRUCTURING-BIND" => self.lower_destructuring_bind(rest),
                 "IGNORE-ERRORS" => self.lower_ignore_errors(rest),
@@ -15168,6 +15170,18 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
             let instr = act.func.code[act.bcp];
             act.bcp += 1;
             (instr, acts.len() - 1)
+        };
+
+        // SetValues is the compact form of a call to the standard VALUES
+        // binding. Replaced bindings need the ordinary call/unwind path,
+        // including in bodies compiled before the replacement was installed.
+        let instr = if let Instr::SetValues(nargs) = instr
+            && let Some(sym) = egcl_rt::symbols::find_index("VALUES")
+            && super::installed_function(sym).is_some()
+        {
+            Instr::CallNamed { sym, nargs }
+        } else {
+            instr
         };
 
         match instr {

@@ -17104,33 +17104,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
 
         match name.as_str() {
-            // An FLET/LABELS binding shadows a BUILTIN, not just a global macro
-            // or function (bliss-ccgu). Without this the arms below dispatched
-            // on the name alone, so the tree-walker ignored the binding while
-            // the bytecode lowerer honoured it and the two tiers gave DIFFERENT
-            // ANSWERS for the same form:
-            //
-            //   (flet ((cons (a b) (list :shadowed a b))) (cons 1 2))
-            //     compiled    => (:SHADOWED 1 2)
-            //     tree-walked => (1 . 2)
-            //
-            // Same for CAR, 1+ and every builtin with an arm here. CLHS
-            // 11.1.2.1.2 leaves binding a CL symbol undefined, so neither answer
-            // is "wrong" in isolation -- but the two tiers agreeing is a property
-            // this project does hold to, and the compiled answer is the one that
-            // respects the programmer's binding.
-            //
-            // An empty body falls out of the match into the general call path
-            // below, which resolves the lexical binding properly.
-            //
-            // SPECIAL OPERATORS ARE EXCLUDED. `(flet ((if ...)) (if a b))` must
-            // still evaluate IF as the special form -- it is not a function and
-            // cannot be called -- which is also what the lowerer does, so the
-            // exclusion keeps the tiers aligned rather than breaking them.
-            //
-            // Costs nothing extra: `shadowed_by_lexical_function` is already
-            // computed above for the macro decision.
-            _ if shadowed_by_lexical_function
+            // Lexical functions and installed definitions take precedence over
+            // builtin implementations. Fall through to the general call path,
+            // which preserves their captures, tiering, and multiple values.
+            // Special operators retain their own evaluation rules.
+            _ if (shadowed_by_lexical_function
+                || car.symbol_index().and_then(installed_function).is_some())
                 && !is_special_operator_name(&name) => {}
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
             "%NATIVE-CHILD-SUSPEND-FOR-TEST" => return bytecode::pause_native_child_for_test(),
@@ -19106,6 +19085,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     *remaining = rest;
                     let value = eval_form(af, env)?;
                     vals.push(value);
+                }
+                // Arguments can replace VALUES before the call is dispatched,
+                // just as they can on the bytecode/native named-call path.
+                if let Some(function) = car.symbol_index().and_then(installed_function) {
+                    return apply_function(function, &vals, env);
                 }
                 return Ok(env.return_values(std::mem::take(&mut *vals)));
             }

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Honor interpreted replacements of builtins across evaluation tiers, including
+  lexical and global `VALUES` replacements, multiple return values, and cleanup
+  ([#195](https://github.com/atgreen/evergreen/pull/195)).
+
 - Preserve normal return values and cleanup when `ERROR` is replaced, including
   during an active native call. Allow rooted heap literals in native transfer
   entries and retain debugger argument visibility across those entries

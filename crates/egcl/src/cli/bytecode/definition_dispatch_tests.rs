@@ -3,6 +3,41 @@
 
 use super::*;
 
+#[test]
+fn replaced_values_roots_its_argument_through_a_moving_collection() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(name = resolve_sym("VALUES").unwrap());
+    let symbol = name.as_symbol_index();
+    egcl_rt::rooted!(previous = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("((values x))").unwrap().0);
+    let caller = Arc::new(
+        compile_function("MOVING-VALUES-CALLER", *params, *forms, &env, false, false)
+            .unwrap(),
+    );
+    egcl_rt::rooted!(_caller = ActiveBytecodeRoot::new(&caller));
+    egcl_rt::rooted!(replacement_body = reader::read_from_string(
+        "((%force-minor-gc-for-test) x)"
+    ).unwrap().0);
+    egcl_rt::rooted!(replacement = egcl_rt::function::alloc_interpreted(
+        *params, *replacement_body, NIL, *name
+    ));
+    egcl_rt::symbols::set_symbol_function(symbol, *replacement);
+    // Allocate last so the replacement's forced collection must move the
+    // argument held by the ordinary call path selected from SetValues.
+    egcl_rt::rooted!(argument = super::super::arena_cons(EgclVal::from_fixnum(42), NIL));
+    let before = argument.to_raw();
+    let result = run(caller, &[*argument], NIL, &mut env);
+    egcl_rt::symbols::set_symbol_function(symbol, *previous);
+    assert_ne!(argument.to_raw(), before, "the argument must actually move");
+    assert_eq!(result.unwrap(), *argument);
+    assert_eq!(cp(*argument).0, EgclVal::from_fixnum(42));
+}
+
 fn body(name: &str, forms: &str, env: &Env) -> Arc<BytecodeFunction> {
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     Arc::new(compile_function(name, NIL, *forms, env, false, false).unwrap())
