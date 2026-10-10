@@ -157,6 +157,10 @@ def merge_provenance(records, srpm_sha256):
 
 def unwrap_release_prose(body):
     """Remove source wrapping from prose; leave Markdown blocks and hard breaks."""
+    # Raw HTML has its own multiline rules; preserve such sections verbatim
+    # rather than attempting to parse embedded languages or HTML containers.
+    if re.search(r'(?m)^[ \t]*<', body):
+        return body
     output = []
     paragraph_indent = None
     list_indent = 0
@@ -204,6 +208,10 @@ def unwrap_release_prose(body):
         if item := re.match(r'^ *(?:[-+*]|[0-9]+[.)])[ \t]+', expanded):
             output.append(line)
             list_indent = paragraph_indent = item.end()
+            if opening := re.match(r'(`{3,}|~{3,})(.*)$', expanded[item.end():]):
+                fence = opening[1]
+                fence_indent = list_indent
+                paragraph_indent = None
             continue
         previous = output[-1] if output else ''
         hard_break = (previous.endswith('  ')
@@ -223,15 +231,23 @@ def release_notes(changelog, plan):
     lines = changelog.splitlines(keepends=True)
     headings = []
     fence = None
+    fence_indent = 0
     for index, line in enumerate(lines):
-        marker = re.match(r'^ {0,3}(`{3,}|~{3,})(.*)$', line)
+        expanded = line.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(' '))
+        marker = re.match(r'^ *(`{3,}|~{3,})(.*)$', expanded)
         if fence:
-            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+            if (marker and indent <= fence_indent + 3 and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
                     and not marker[2].strip()):
                 fence = None
             continue
-        if marker:
+        if marker and indent <= 3:
             fence = marker[1]
+            fence_indent = 0
+            continue
+        if item := re.match(r'^( {0,3}(?:[-+*]|[0-9]+[.)])[ \t]+)(`{3,}|~{3,})(.*)$', expanded):
+            fence = item[2]
+            fence_indent = len(item[1])
             continue
         if heading := re.fullmatch(r'##[ \t]+(.+?)\s*', line):
             headings.append((index, heading[1]))

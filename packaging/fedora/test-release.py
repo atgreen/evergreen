@@ -99,8 +99,7 @@ class ReleaseNotesTests(unittest.TestCase):
                 'Heading\n-------\n\n'
                 '| Name | Value |\n| ---- | ----- |\n| a | b |\n\n'
                 '[link]: https://example.invalid\n'
-                '    "Link title"\n\n'
-                '<div>\nraw HTML\n</div>\n')
+                '    "Link title"\n')
         notes = release.release_notes('## 0.0.2\n\n' + body, self.stable)
         self.assertEqual(notes, '## 0.0.2\n\n' + body)
 
@@ -111,6 +110,19 @@ class ReleaseNotesTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(release.release_notes('## 0.0.2\n\n' + body, self.stable),
                                  '## 0.0.2\n\n' + body)
+
+    def test_export_preserves_fences_opened_on_list_items(self):
+        for prefix, indent in (('- ', '  '), ('  - ', '    ')):
+            body = f'{prefix}```text\n{indent}one\n{indent}two\n{indent}```\n'
+            text = '## 0.0.2\n\n' + body + '\n## 0.0.1\n\n- Old.\n'
+            with self.subTest(prefix=prefix):
+                self.assertEqual(release.release_notes(text, self.stable),
+                                 '## 0.0.2\n\n' + body)
+
+    def test_export_conservatively_preserves_raw_html(self):
+        body = '<script>\n// before\n\n// comment\nalert(1)\n</script>\n'
+        self.assertEqual(release.release_notes('## 0.0.2\n\n' + body, self.stable),
+                         '## 0.0.2\n\n' + body)
 
     def test_export_preserves_code_at_section_edges(self):
         body = '    first code line\n    second code line\n'
