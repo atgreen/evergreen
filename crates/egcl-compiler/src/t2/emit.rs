@@ -5843,20 +5843,40 @@ fn emit_framed_inner(
         // Liveness at the target, read from regalloc2's precise per-ProgPoint
         // ranges (see the import loop below); needed first to decide whether
         // every checked value will be imported at all.
-        let target_pp = f
+        let Some(target_inst) = f
             .block_order()
             .iter()
             .position(|&b| b == osr.block)
-            .map(|bi| machine.blocks[bi].start as u32 * 2);
-        let live_at_target = |value: Value| -> bool {
-            let Some(pp) = target_pp else { return true };
-            machine.value_locations.iter().any(|r| {
-                r.vreg.class == RegClass::Gpr
-                    && Value(r.vreg.num) == value
-                    && r.start <= pp
-                    && pp < r.end
-            })
+            .map(|bi| machine.blocks[bi].start)
+        else {
+            continue;
         };
+        let Some(live) = machine.live_vregs_before(target_inst, &read_vregs) else {
+            continue;
+        };
+        let live_at_target = |value: Value| -> bool {
+            live.iter()
+                .any(|vreg| vreg.class == RegClass::Gpr && vreg.num == value.0)
+        };
+        // Import is the inverse of recovery only for values actually named by
+        // the header state. Optimizations may leave another value live here
+        // (for example a pre-loop guard's refined alias). Its defining code is
+        // bypassed by OSR, so never publish an entry with an uninitialized home.
+        // Tagged constants are materialized at their uses and need no import.
+        let complete_imports = live.iter().all(|vreg| {
+            let value = Value(vreg.num);
+            vreg.class == RegClass::Gpr
+                && f.value(value).repr == ValueRepresentation::Tagged
+                && (const_tagged.contains_key(&value)
+                    || (homes.contains_key(&value)
+                        && specs.iter().any(|spec| {
+                            matches!(&spec.source, ValueSource::Value { value: source, .. }
+                                if *source == value)
+                        })))
+        });
+        if !complete_imports {
+            continue;
+        }
         // Every checked value must be a fixnum proof on an imported, homed
         // value, or the entry cannot establish it: decline (bliss-5yz5h).
         let checks_emittable = osr.checks.iter().all(|&(v, ty)| {
@@ -5915,7 +5935,7 @@ fn emit_framed_inner(
                         value.0,
                         live_at_target(*value),
                         homes.get(value),
-                        target_pp
+                        Some(target_inst as u32 * 2)
                     );
                 }
                 if !live_at_target(*value) {
@@ -7380,6 +7400,200 @@ mod tests {
         assert!(
             !framed.has_deopt,
             "identity has no guard branch and must be direct-call eligible"
+        );
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    extern "C" fn osr_import_deopt() -> u64 {
+        egcl_rt::value::EgclVal::from_fixnum(-17).0
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn osr_cons_import_fixture(guard_before_target: bool) -> crate::t2::ir::Function {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, BlockCall, Function, IRType, InstData, InstFlags, Opcode, OsrEntry, TypeBits,
+            ValueRepresentation,
+        };
+        let mut f = Function::new("osr-cons-import");
+        let entry = f.entry();
+        let marker = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let target = f.make_block();
+        let frame_state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 7,
+                locals: vec![ValueSource::Value {
+                    value: marker,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let instruction = |opcode, args, aux, flags, state| InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux,
+            flags,
+            targets: vec![],
+            frame_state: state,
+            source_pos: 0,
+        };
+        // This entry-defined immediate is not an interpreter local: consumers
+        // rematerialize it, so completeness checking must not reject it.
+        let (_, expected) = f.push_inst(
+            entry,
+            instruction(
+                Opcode::ConstFixnum,
+                vec![],
+                AuxData::FixnumImm(71),
+                InstFlags::default(),
+                None,
+            ),
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        );
+        let cons = IRType::of(TypeBits::CONS);
+        let guard_block = if guard_before_target { entry } else { target };
+        let (_, refined) = f.push_inst(
+            guard_block,
+            instruction(
+                Opcode::Guard,
+                vec![marker],
+                AuxData::TypeTag(cons),
+                InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                Some(frame_state),
+            ),
+            &[(cons, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                targets: vec![BlockCall {
+                    block: target,
+                    args: vec![],
+                }],
+                ..instruction(
+                    Opcode::Jump,
+                    vec![],
+                    AuxData::None,
+                    InstFlags::default(),
+                    None,
+                )
+            },
+        );
+        let (_, car) = f.push_inst(
+            target,
+            instruction(
+                Opcode::Car,
+                vec![refined[0]],
+                AuxData::None,
+                InstFlags::default(),
+                None,
+            ),
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, equal) = f.push_inst(
+            target,
+            instruction(
+                Opcode::GenericEq,
+                vec![car[0], expected[0]],
+                AuxData::None,
+                InstFlags::default(),
+                None,
+            ),
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            target,
+            instruction(
+                Opcode::Return,
+                vec![equal[0]],
+                AuxData::None,
+                InstFlags::default(),
+                None,
+            ),
+        );
+        f.osr_entries.push(OsrEntry {
+            bcp: 7,
+            block: target,
+            frame_state,
+            checks: vec![],
+        });
+        crate::t2::verify::verify(&f).expect("valid SSA with explicit OSR header state");
+        f
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn osr_declines_unimported_live_guard_alias_without_rejecting_normal_entry() {
+        let f = osr_cons_import_fixture(true);
+        let framed = emit_framed(
+            &f,
+            osr_import_deopt as *const () as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("ordinary entry remains emittable");
+        assert!(
+            framed.osr_entries.is_empty(),
+            "OSR must not jump past a live refined alias absent from its slot map"
+        );
+        let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let normal: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
+        // Headerless cons on the Rust stack; this allocation-free leaf cannot
+        // invoke GC, so no managed heap or root registration is required.
+        let cons = [
+            egcl_rt::value::EgclVal::from_fixnum(71).0,
+            egcl_rt::value::NIL.0,
+        ];
+        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS as u64];
+        assert_eq!(normal(slots.as_mut_ptr()), egcl_rt::value::T.0);
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn osr_keeps_complete_import_and_executes_target_guard() {
+        let f = osr_cons_import_fixture(false);
+        let framed = emit_framed(
+            &f,
+            osr_import_deopt as *const () as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            None,
+        )
+        .expect("complete import remains emittable");
+        assert_eq!(framed.osr_entries.len(), 1);
+        let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let osr: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr().add(framed.osr_entries[0].1)) };
+        let cons = [
+            egcl_rt::value::EgclVal::from_fixnum(71).0,
+            egcl_rt::value::NIL.0,
+        ];
+        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS as u64];
+        assert_eq!(osr(slots.as_mut_ptr()), egcl_rt::value::T.0);
+        slots[0] = egcl_rt::value::NIL.0;
+        assert_eq!(
+            osr(slots.as_mut_ptr()),
+            osr_import_deopt(),
+            "the imported value must execute its target guard before CAR"
         );
     }
 
