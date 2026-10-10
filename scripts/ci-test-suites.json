@@ -1,0 +1,14 @@
+{
+  "fast": {
+    "egcl:lib:egcl": ["cli::bytecode::native_transfer_tests::"],
+    "egcl:test:native_default_policy_cli": [""],
+    "egcl:test:native_transfer_disassembly": [""],
+    "egcl:test:native_callable_image": [""],
+    "egcl:test:tier_corpus": [""]
+  },
+  "areas": {
+    "compiler": {"egcl-compiler:lib:egcl_compiler": [""]},
+    "runtime": {"egcl-rt:lib:egcl_rt": [""]},
+    "reader": {"egcl-compiler:lib:egcl_compiler": ["reader::"]}
+  }
+}

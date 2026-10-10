@@ -19,28 +19,43 @@
 #                     a clean run over objects that never moved proves nothing.
 #
 # Scope: stress fires a collection per allocation, so the full acceptance suite
-# under it takes hours. The PR job runs an allocation-heavy subset; the scheduled
-# job runs the whole thing.
+# under it takes hours. Nightly and explicit validations run the whole suite;
+# manual or reusable callers may select the allocation-heavy subset instead.
+# Fast PR GC regressions belong to ci.yml.
 
 name: gc
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   schedule:
     # 03:00 UTC, before the fuzz (04:00) and sanitizer (05:00) nightlies.
     - cron: "0 3 * * *"
   workflow_dispatch:
+    inputs:
+      scope:
+        description: GC validation scope
+        type: choice
+        options: [full, subset]
+        default: full
+  workflow_call:
+    inputs:
+      scope:
+        description: GC validation scope (full or subset)
+        type: string
+        default: full
+      preserve_run:
+        description: Preserve explicitly requested validation, including scheduled callers
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-# Only future runs using this policy share a PR group. Main, scheduled and
-# manual runs remain independent, including pending runs and rerun attempts.
+# Only automatic nightly runs for the same ref supersede each other.
+# Reusable workflows inherit their caller's event, so preserve_run also protects
+# explicit validation requested by a scheduled release workflow.
 concurrency:
-  group: pr-revision-v1-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: gc-intensive-v1-${{ github.workflow }}-${{ github.event_name == 'schedule' && !inputs.preserve_run && format('scheduled-{0}', github.ref) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' && !inputs.preserve_run }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -53,11 +68,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Per-PR: a curated subset, chosen for allocation density rather than breadth —
+  # Explicit subset, chosen for allocation density rather than breadth —
   # CLOS instances, FFI buffers, closures over captured namespaces, and the
   # tiering paths that hand values across the c2i boundary.
   stress-subset:
-    if: github.event_name != 'schedule'
+    if: inputs.scope == 'subset'
     runs-on: ubuntu-latest
     # MEASURED, not guessed. Locally, release, this desktop:
     #   stress+poison   4 egcl suites 565s, + all of egcl-rt  =  880s (14.7 min)
@@ -77,6 +92,8 @@ jobs:
     name: ${{ matrix.name }} (subset)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -114,10 +131,10 @@ jobs:
           env ${{ matrix.env }} cargo test --release -p egcl-rt --no-fail-fast || status=1
           exit $status
 
-  # Scheduled: the whole suite under stress, which is where a rarely-exercised
+  # Default: the whole suite under stress, which is where a rarely-exercised
   # path gets its collection. Allowed the full timeout budget.
   stress-full:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: inputs.scope != 'subset'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -131,6 +148,8 @@ jobs:
     name: ${{ matrix.name }} (full)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

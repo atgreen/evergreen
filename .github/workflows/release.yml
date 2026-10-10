@@ -25,6 +25,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Full regression is paid once for a release, not on every intermediate PR.
+  # This runs alongside packaging and must pass before publication.
+  validation:
+    if: inputs.mode != 'build'
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] same-repo caller; retain actionlint-compatible syntax
+    with:
+      suite: full
+      preserve_run: true
+
   plan:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -275,7 +284,7 @@ jobs:
           overwrite: true
 
   publish:
-    needs: [plan, collect]
+    needs: [plan, collect, validation]
     if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10

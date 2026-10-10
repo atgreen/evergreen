@@ -98,8 +98,10 @@ fn ansi_expected_failures_and_ci_contracts() {
     for needle in [
         "branches: [main]",
         "cargo check --workspace",
-        "cargo test --workspace",
-        "ubuntu-latest",
+        "scripts/ci-tests.py build",
+        "scripts/ci-tests.py run",
+        "--workspace --doc --release",
+        "ubuntu-24.04",
     ] {
         assert_has(&ci, needle, "ci.yml");
     }
@@ -235,6 +237,36 @@ fn regression_inputs_are_executable_through_standard_test_entrypoints() {
     let _ = load_image(image_regression.to_str().expect("utf8 path"));
 }
 
+fn run_regression(prebuilt_env: &str, package: &str, target: &[&str], test: &str, context: &str) {
+    let mut command = if let Some(executable) = std::env::var_os(prebuilt_env) {
+        // The CI manifest supplies and hashes this configuration's executable.
+        // Match Cargo's package working directory for fixture-relative paths.
+        let mut command = Command::new(executable);
+        command
+            .current_dir(repo_root().join("crates").join(package))
+            .arg(test);
+        command
+    } else {
+        // Preserve ordinary local `cargo test` use without the CI manifest.
+        let mut command = Command::new("cargo");
+        command
+            .current_dir(repo_root())
+            .arg("test")
+            .args(cargo_target_args())
+            .args(["-p", package])
+            .args(target)
+            .args([test, "--"]);
+        command
+    };
+    command.args(["--exact", "--nocapture"]);
+    let output = run(command, context);
+    assert_has(
+        &String::from_utf8_lossy(&output.stdout),
+        "test result: ok. 1 passed; 0 failed; 0 ignored;",
+        context,
+    );
+}
+
 #[test]
 fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     // Per R10.07 and R10.08, GC stress paths and thread-safety scenarios must
@@ -243,91 +275,32 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
     // deoptimisation and image round-trip tests through the standard runner.
     let _guard = cargo_lock().lock().unwrap_or_else(|e| e.into_inner());
 
-    run(
-        {
-            let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root())
-                .arg("test")
-                .args(cargo_target_args())
-                .args([
-                "-p",
-                "egcl-rt",
-                "--test",
-                "spec_memory_gc",
-                "spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths",
-                "--",
-                "--exact",
-                "--nocapture",
-            ]);
-            cmd
-        },
-        "run GC stress regression",
+    run_regression(
+        "EGCL_CI_TEST_EGCL_RT_SPEC_MEMORY_GC",
+        "egcl-rt",
+        &["--test", "spec_memory_gc"],
+        "spec_gc_large_objects_minor_gc_and_full_gc_use_real_collector_paths",
+        "run exactly one GC stress regression",
     );
-
-    run(
-        {
-            let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root())
-                .arg("test")
-                .args(cargo_target_args())
-                .args([
-                "-p",
-                "egcl-stdlib",
-                "--test",
-                "spec_packages_bootstrap",
-                "concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated",
-                "--",
-                "--exact",
-                "--nocapture",
-            ]);
-            cmd
-        },
-        "run package concurrency regression",
+    run_regression(
+        "EGCL_CI_TEST_EGCL_STDLIB_SPEC_PACKAGES_BOOTSTRAP",
+        "egcl-stdlib",
+        &["--test", "spec_packages_bootstrap"],
+        "concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated",
+        "run exactly one package concurrency regression",
     );
-
-    run(
-        {
-            let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root())
-                .arg("test")
-                .args(cargo_target_args())
-                .args([
-                "-p",
-                "egcl-rt",
-                "--test",
-                "spec_image_ops",
-                "spec_image_round_trip_restores_heap_and_entry_state",
-                "--",
-                "--exact",
-                "--nocapture",
-            ]);
-            cmd
-        },
-        "run image round-trip regression",
+    run_regression(
+        "EGCL_CI_TEST_EGCL_RT_SPEC_IMAGE_OPS",
+        "egcl-rt",
+        &["--test", "spec_image_ops"],
+        "spec_image_round_trip_restores_heap_and_entry_state",
+        "run exactly one image round-trip regression",
     );
-
-    let output = run(
-        {
-            let mut cmd = Command::new("cargo");
-            cmd.current_dir(repo_root())
-                .arg("test")
-                .args(cargo_target_args())
-                .args([
-                "-p",
-                "egcl-compiler",
-                "--lib",
-                "t2::deopt::tests::lowers_and_reconstructs_every_inlined_scope_in_order",
-                "--",
-                "--exact",
-                "--nocapture",
-            ]);
-            cmd
-        },
-        "run deoptimisation regression",
-    );
-    assert_has(
-        &String::from_utf8_lossy(&output.stdout),
-        "test result: ok. 1 passed; 0 failed; 0 ignored;",
-        "the exact deoptimisation regression must execute, not merely match zero tests",
+    run_regression(
+        "EGCL_CI_TEST_EGCL_COMPILER_LIB",
+        "egcl-compiler",
+        &["--lib"],
+        "t2::deopt::tests::lowers_and_reconstructs_every_inlined_scope_in_order",
+        "run exactly one deoptimisation regression",
     );
 }

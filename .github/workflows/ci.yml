@@ -1,189 +1,247 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
-#
-# Per-PR gates. Anything slow, scheduled, or cross-target lives in its own
-# workflow: gc.yml (GC-safety fuzzing), cross.yml (the ports), nightly-fuzz.yml
-# and sanitizers.yml.
-#
-# TOOLCHAIN: no toolchain action. rust-toolchain.toml pins 1.94.1 and lists the
-# components and targets a fresh checkout needs, and rustup installs from that
-# file on first use — so `rustup show` is the whole setup step and there is one
-# place that decides which compiler builds EGCL. A `dtolnay/rust-toolchain@stable`
-# step here would be silently overridden by that file anyway, which is how CI
-# stopped noticing new-compiler breakage (bliss-cice); the deliberate
-# stable-drift check lives in nightly-fuzz.yml instead (bliss-75yx).
-#
-# TARGET: .cargo/config.toml sets `[build] target = x86_64-unknown-linux-musl`
-# unconditionally, so every non-Linux job MUST override CARGO_BUILD_TARGET to its
-# own host. Without that, a Windows or macOS runner tries to link a Linux musl
-# binary and the job cannot pass. (The macOS leg was removed for exactly this
-# reason: there is no macOS target in the port set.)
-
+# PRs/main use one Linux build and a bounded regression selection. Full suites
+# reuse immutable build artifacts across named-test shards nightly or on demand.
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+  schedule:
+    - cron: '23 1 * * *'
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'Validation tier'
+        type: choice
+        options: [fast, full]
+        default: full
+  workflow_call:
+    inputs:
+      suite:
+        type: string
+        default: full
+      preserve_run:
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-# Only future runs using this policy share a PR group. Non-PR runs have unique
-# groups so neither running nor pending main-branch runs can supersede others.
 concurrency:
-  group: pr-revision-v1-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-tiered-v1-${{ !inputs.preserve_run && github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || !inputs.preserve_run && github.event_name == 'push' && format('push-{0}', github.ref) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ !inputs.preserve_run && (github.event_name == 'pull_request' || github.event_name == 'push') }}
 
 env:
   CARGO_TERM_COLOR: always
-  # Backtraces on panic. Free — printed only when something fails — and it pays
-  # for itself on unwrap()/expect() failures inside shared helpers, where the
-  # reported file:line is the helper rather than the caller. It would NOT have
-  # helped the failures that prompted it: those were assert! calls whose own
-  # messages already said everything (e.g. "missing bundled ASDF bfasl: <path>").
-  # `1`, not `full`: full adds pages of runtime frames and buries the useful ones.
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 2
+  CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: 'true'
+  CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: 'true'
+  CARGO_PROFILE_RELEASE_LTO: 'false'
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.select.outputs.runtime }}
+      full: ${{ steps.select.outputs.full }}
+      areas: ${{ steps.select.outputs.areas }}
+      pgo: ${{ steps.select.outputs.pgo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: install the pinned toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: lint
-      # NOTE: `make fmt-check` is deliberately NOT a gate yet. The tree has
-      # pre-existing rustfmt drift, so switching it on fails on unrelated files;
-      # it goes in once that is cleaned in its own commit.
-      # Report every independent gate even if an earlier one fails. The driver
-      # preserves each failure and exits nonzero if any check fails.
-      - name: spec coverage, Clippy, GC-root lint, and validation contracts
-        run: bash scripts/ci-lint.sh
+          fetch-depth: 0
+      - name: Test CI selection and shard runner contracts
+        run: |
+          python3 scripts/test_ci_plan.py
+          python3 scripts/test_ci_tests.py
+      - name: Select validation tier
+        id: select
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_SUITE: ${{ inputs.suite || 'fast' }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.sha }}
+        run: python3 scripts/ci-plan.py --event "$CI_EVENT" --suite "$CI_SUITE" --base "$CI_BASE" --head "$CI_HEAD" --output "$GITHUB_OUTPUT"
 
-  # PGO orchestration contracts. Its own job because it must run AFTER a
-  # toolchain exists — in the previous layout it ran before the toolchain step
-  # and only worked because the runner image happens to ship a Rust.
-  pgo-contracts:
-    runs-on: ubuntu-latest
+  lint:
+    needs: plan
+    if: needs.plan.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: install the pinned toolchain (rust-toolchain.toml)
+      - name: Install pinned toolchain
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: pgo
-      - name: PGO build orchestration contracts
+          shared-key: lint
+      - name: Spec coverage, Clippy, root safety and validation contracts
+        run: bash scripts/ci-lint.sh
+      - name: PGO orchestration contracts when affected
+        if: needs.plan.outputs.pgo == 'true'
         run: make test-pgo-build
 
-  # ONE test job, on the release profile. There used to be a debug job and a
-  # release job; the debug one was redundant because [profile.test] is already
-  # opt-level = 3, so it cost a second full compile of ~160 test binaries to
-  # test the same optimized code.
-  #
-  # Two release settings are overridden, because the shipping profile is the
-  # wrong profile for a test run:
-  #
-  #   debug-assertions — release turns off all 59 debug_assert!s, which sit in
-  #     exactly the code most worth checking: the T2 emitter, the speculation
-  #     logic, the IR, and both assembly modules. Testing optimized code with
-  #     its invariant checks disabled tests less than the debug job did.
-  #   lto / codegen-units — `lto = "thin"` with `codegen-units = 1` exists to
-  #     make the SHIPPED binary fast, and it makes linking much slower. A test
-  #     run wants the optimized code, not the optimal link.
-  #
-  # Net effect: same coverage as before plus the tiering paths, at one compile
-  # instead of two.
-  # TIMEOUT RAISED from 90. Before --no-fail-fast this job stopped after TWO
-  # test binaries and finished in 22 minutes; it now attempts all 263, which is
-  # a different order of work. Measured locally (debug, which drives a slower
-  # subprocess than this release job does): 65 binaries in 90 minutes before a
-  # wall-clock kill, with `acceptance` alone taking 693s and this job's own
-  # release run of it 743s. A job that times out reports NOTHING, which would be
-  # worse than the early stop it replaced, so the budget goes up rather than the
-  # coverage coming back down. 180 is an estimate to refine once a full release
-  # run has actually completed once (bliss-hn1cc).
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 180
-    env:
-      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
-      CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  build:
+    needs: plan
+    if: needs.plan.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.plan.outputs.full == 'true' && '[{"name":"musl","target":"x86_64-unknown-linux-musl","features":""},{"name":"gnu","target":"x86_64-unknown-linux-gnu","features":"egcl-rt/c-ffi"}]' || '[{"name":"musl","target":"x86_64-unknown-linux-musl","features":""}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: install the pinned toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain
+      - name: Install pinned toolchain and target
+        env:
+          BUILD_TARGET: ${{ matrix.config.target }}
+        run: |
+          rustup show active-toolchain
+          rustup target add "$BUILD_TARGET"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: test-release
-      # --no-fail-fast, because cargo test stops at the first FAILING TEST
-      # BINARY and `acceptance` fails early. Measured on this workflow before
-      # the flag: the job emitted exactly TWO test-result lines -- one lib
-      # target, then acceptance's 379-passed/5-failed -- and stopped. 263
-      # integration test binaries exist and 2 ran; 519 of the repo's 3588
-      # #[test] functions executed. So ~85% of the suite had never run in CI
-      # across 97 runs, and a regression anywhere in it was invisible. The five
-      # standing failures each have a bead (bliss-uth7a/24uua/pj0n, bliss-kfvi2,
-      # bliss-b7sxl, bliss-jmiza); until they are fixed or quarantined the job
-      # still goes red, but it now goes red with the WHOLE picture (bliss-hn1cc).
-      - name: cargo test (release, musl)
-        run: cargo test --workspace --release --no-fail-fast
+          shared-key: tiered-${{ matrix.config.name }}
+      - name: Start memory-capped runner session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Build test artifacts once
+        env:
+          BUILD_TARGET: ${{ matrix.config.target }}
+          BUILD_FEATURES: ${{ matrix.config.features }}
+          CI_SUITE: ${{ needs.plan.outputs.full == 'true' && 'full' || 'fast' }}
+          CI_SHARDS: ${{ needs.plan.outputs.full == 'true' && '8' || '1' }}
+          CI_AREAS: ${{ needs.plan.outputs.areas }}
+          EGCL_MEM_MAX: 6G
+          EGCL_TIMEOUT: 1200
+        run: |
+          args=(--suite "$CI_SUITE" --target "$BUILD_TARGET" --shards "$CI_SHARDS" --manifest target/ci-tests/manifest.json)
+          if [[ -n "$BUILD_FEATURES" ]]; then args+=(--features "$BUILD_FEATURES"); fi
+          while IFS= read -r area; do if [[ -n "$area" ]]; then args+=(--area "$area"); fi; done < <(python3 -c 'import json,os; print("\n".join(json.loads(os.environ["CI_AREAS"])))')
+          scripts/egcl-limited.sh python3 scripts/ci-tests.py build "${args[@]}"
+      - name: Startup and basic evaluation smoke
+        env:
+          BUILD_TARGET: ${{ matrix.config.target }}
+        run: scripts/egcl-limited.sh "target/$BUILD_TARGET/release/egcl" --no-init --eval '(assert (= 42 (+ 20 22))) (format t "CI-SMOKE-OK~%")'
+      - name: Doctests in the full configuration
+        if: needs.plan.outputs.full == 'true'
+        env:
+          BUILD_TARGET: ${{ matrix.config.target }}
+          BUILD_FEATURES: ${{ matrix.config.features }}
+        run: |
+          args=(test --workspace --doc --release --target "$BUILD_TARGET" --no-fail-fast)
+          if [[ -n "$BUILD_FEATURES" ]]; then args+=(--features "$BUILD_FEATURES"); fi
+          cargo "${args[@]}"
+      - name: Package exact build outputs with executable permissions
+        run: |
+          python3 scripts/ci-tests.py archive --manifest target/ci-tests/manifest.json --output target/ci-tests/archive-files.list
+          tar --null -czf "$RUNNER_TEMP/ci-tests.tar.gz" -T target/ci-tests/archive-files.list
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-tests-${{ matrix.config.name }}
+          path: ${{ runner.temp }}/ci-tests.tar.gz
+          retention-days: 2
+          if-no-files-found: error
 
-  # The FFI surface. `c-ffi` is OFF by default because dlopen is incompatible
-  # with the static musl executable, so the default `cargo test --workspace`
-  # above compiles NONE of the dlopen path — test_ffi, ffi_elf_loader,
-  # spec_security_sandbox_ffi and spec_threading_concurrency are all gated behind
-  # that feature and were therefore never run in CI. This is also the
-  # configuration every Common Lisp library port needs (CFFI's backend is built
-  # on it), so a regression here breaks the library ecosystem rather than just a
-  # test. glibc, not musl, because the feature needs a dynamic loader.
-  # Raised with the `test` job, and for the same reason; this one runs a subset
-  # (-p egcl-rt -p egcl) so it needs less headroom.
-  test-ffi-gnu:
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    env:
-      CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
-      # Same overrides as the `test` job — see the note there.
-      CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
-      CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
-      CARGO_PROFILE_RELEASE_LTO: "false"
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  regression:
+    needs: [plan, build]
+    if: needs.plan.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        config: ${{ fromJSON(needs.plan.outputs.full == 'true' && '["musl","gnu"]' || '["musl"]') }}
+        shard: ${{ fromJSON(needs.plan.outputs.full == 'true' && '[0,1,2,3,4,5,6,7]' || '[0]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: install the pinned toolchain (rust-toolchain.toml)
-        run: rustup show active-toolchain
-      - name: add the glibc target
-        run: rustup target add x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          shared-key: test-ffi-gnu
-      # --no-fail-fast for the same reason as the `test` job above.
-      - name: cargo test with the C-ABI FFI enabled
-        run: cargo test --release --features egcl-rt/c-ffi -p egcl-rt -p egcl --no-fail-fast
+          name: ci-tests-${{ matrix.config }}
+          path: ${{ runner.temp }}/ci-artifact
+      - name: Restore the single producer build
+        run: tar -xzf "$RUNNER_TEMP/ci-artifact/ci-tests.tar.gz"
+      - name: Install the pinned runtime toolchain
+        run: rustup show active-toolchain
+      - name: Start memory-capped runner session
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Run the selected shard without rebuilding
+        env:
+          CI_SHARD: ${{ matrix.shard }}
+          EGCL_MEM_MAX: 6G
+          EGCL_TIMEOUT: ${{ needs.plan.outputs.full == 'true' && '2400' || '600' }}
+        run: scripts/egcl-limited.sh python3 scripts/ci-tests.py run --manifest target/ci-tests/manifest.json --shard "$CI_SHARD" --results "target/ci-tests/results-$CI_SHARD.json"
+      - name: Preserve timings and failure evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-results-${{ matrix.config }}-${{ matrix.shard }}
+          path: target/ci-tests/
+          retention-days: 14
+          if-no-files-found: error
 
-  # The Linux build can only cross-compile the Win64 adapter. Keep a native
-  # Windows gate for the SEH/shadow-space transition itself; mitigation refusal
-  # is a test failure here rather than a silently skipped ABI claim.
+  ci-required:
+    name: ci-required
+    if: always()
+    needs: [plan, lint, build, regression, windows-native-transfer]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require exactly the selected checks
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUNTIME: ${{ needs.plan.outputs.runtime }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          TEST_RESULT: ${{ needs.regression.result }}
+          FULL: ${{ needs.plan.outputs.full }}
+          WINDOWS_RESULT: ${{ needs.windows-native-transfer.result }}
+        run: |
+          test "$PLAN_RESULT" = success
+          if [[ "$RUNTIME" == true ]]; then
+            test "$LINT_RESULT" = success
+            test "$BUILD_RESULT" = success
+            test "$TEST_RESULT" = success
+          else
+            test "$RUNTIME" = false
+            test "$LINT_RESULT" = skipped
+            test "$BUILD_RESULT" = skipped
+            test "$TEST_RESULT" = skipped
+          fi
+          if [[ "$FULL" == true ]]; then
+            test "$WINDOWS_RESULT" = success
+          else
+            test "$FULL" = false
+            test "$WINDOWS_RESULT" = skipped
+          fi
+
   windows-native-transfer:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     env:
-      # Override the repo's musl default — see the TARGET note at the top.
+      # Override the repository's Linux musl target on Windows.
       CARGO_BUILD_TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
