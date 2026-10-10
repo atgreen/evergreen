@@ -50,6 +50,25 @@ pub fn emit_published_call_entry(
     resume: FinishMappedCall,
     checked: PrepareMappedCall,
 ) -> Vec<u8> {
+    emit_published_call_entry_descriptor(slice, prepare, finish, resume, checked).code
+}
+
+/// Exact machine locations retained by the runtime for crossing an adapter.
+/// Only `child_return_offset` is a return PC; the cold entry is a jump target.
+pub struct PublishedCallEntry {
+    pub code: Vec<u8>,
+    pub child_return_offset: usize,
+    pub cold_offset: usize,
+    pub frame_bytes: usize,
+}
+
+pub fn emit_published_call_entry_descriptor(
+    slice: bool,
+    prepare: PrepareMappedCall,
+    finish: FinishMappedCall,
+    resume: FinishMappedCall,
+    checked: PrepareMappedCall,
+) -> PublishedCallEntry {
     const SIZE: u32 = ADAPTER_FRAME_BYTES as u32; // SysV call alignment
     const {
         assert!(SIZE == 136);
@@ -84,6 +103,7 @@ pub fn emit_published_call_entry(
     let forward = a.label();
     let escape = a.label();
     let returned = a.label();
+    let child_return = a.label();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa, 0x48, 0x81, 0xec]);
     a.extend_from_slice(&SIZE.to_le_bytes());
     capture_stack_word(&mut a, false, if slice { 1 } else { 9 }, 104);
@@ -135,6 +155,7 @@ pub fn emit_published_call_entry(
     a.jcc(Cc::E, fallback);
     capture_stack_word(&mut a, true, 7, 64);
     a.extend_from_slice(&[0xff, 0xd0]); // child body: no Rust frame spans this call
+    a.bind(child_return);
     capture_stack_word(&mut a, false, 0, 88);
     a.extend_from_slice(&[0x48, 0x89, 0xe7]);
     target(&mut a, finish as usize);
@@ -205,10 +226,11 @@ pub fn emit_published_call_entry(
     a.extend_from_slice(&[0x48, 0x8b, 0x40, 8]); // rax=slice entry
     release(&mut a);
     a.extend_from_slice(&[0xff, 0xe0]);
+    let child_return_offset = a.label_offset(child_return).expect("bound child return");
     let mut bytes = a.finish().expect("local mapped entry labels");
     let relative = i32::try_from(cold_offset as isize - (cold_displacement + 4) as isize).unwrap();
     bytes[cold_displacement..cold_displacement + 4].copy_from_slice(&relative.to_le_bytes());
-    bytes
+    PublishedCallEntry { code: bytes, child_return_offset, cold_offset, frame_bytes: SIZE as usize }
 }
 
 /// A named caller only marshals its explicit continuation context and loads the

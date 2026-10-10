@@ -23,7 +23,7 @@ use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-mod root_publication;
+pub(super) mod root_publication;
 mod activation;
 use activation::ActivationState;
 mod deopt;
@@ -392,13 +392,18 @@ unsafe extern "C" fn checked_call_published(
     }
 }
 
+static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> = OnceLock::new();
+
+fn mapped_adapter(pc: usize) -> Option<&'static root_publication::PublishedAdapter> {
+    PUBLISHED_ENTRIES.get()?.as_ref()?.iter().find(|entry| entry.contains_return(pc))
+}
+
 pub(super) fn published_entries() -> Option<[usize; 2]> {
-    static ENTRIES: OnceLock<Option<[JitBuffer; 2]>> = OnceLock::new();
-    ENTRIES
+    PUBLISHED_ENTRIES
         .get_or_init(|| {
             let entry = |slice| {
-                JitBuffer::new(
-                    &egcl_compiler::t2::native_transfer::emit_published_call_entry(
+                root_publication::PublishedAdapter::new(
+                    egcl_compiler::t2::native_transfer::emit_published_call_entry_descriptor(
                         slice,
                         prepare_nested,
                         finish_nested,
@@ -410,7 +415,7 @@ pub(super) fn published_entries() -> Option<[usize; 2]> {
             Some([entry(false)?, entry(true)?])
         })
         .as_ref()
-        .map(|entries| std::array::from_fn(|i| entries[i].as_ptr() as usize))
+        .map(|entries| std::array::from_fn(|i| entries[i].code.as_ptr() as usize))
 }
 
 #[cfg(test)]

@@ -130,7 +130,6 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
         }
     );
     state.anchor = native_transfer::current_segment();
-    HeapCollector::new().minor_gc().unwrap();
     let calls = unsafe { &*state.value_maps };
     let [return_pc, call_rsp] = unsafe { *state.call_capture };
     let offset = return_pc - state.code_base;
@@ -156,16 +155,34 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     let body_rsp = (call_rsp + site.stack_adjust as usize) as *const usize;
     let activation = unsafe { body_rsp.add(map.layout().activation_base_slot.unwrap() as usize).read() };
     assert_eq!(activation, request.activation as usize);
-    for value in map.values().iter().filter(|value| value.may_reference_heap()) {
-        let copies: Vec<_> = value.locations().iter().map(|location| {
-            let NativeValueLocation::Activation(slot) = *location else {
-                panic!("Invoke tagged roots must use activation copies");
-            };
-            unsafe { request.activation.add(slot as usize).read() }
-        }).collect();
-        assert!(copies.iter().all(|copy| *copy == copies[0]), "every alias must be updated by GC");
+    // This compiler fixture bypasses the evaluator's root publication. Consume
+    // its exact native maps explicitly, including the newly described aliases.
+    struct MappedRoots(Vec<*mut EgclVal>);
+    impl egcl_rt::gc::TraceHostRoots for MappedRoots {
+        fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+            for &slot in &self.0 { visit(slot); }
+        }
+    }
+    let copies: Vec<Vec<*mut EgclVal>> = map.values().iter()
+        .filter(|value| value.may_reference_heap())
+        .map(|value| value.locations().iter().map(|location| match *location {
+            NativeValueLocation::Activation(slot) => unsafe { request.activation.add(slot as usize) },
+            NativeValueLocation::Stack(offset) =>
+                (body_rsp as usize).wrapping_add_signed(offset as isize) as *mut EgclVal,
+            _ => panic!("this fixture expects stack-homed roots"),
+        }).collect()).collect();
+    let mut roots = MappedRoots(copies.iter().flatten().copied().collect());
+    egcl_rt::rooted_ref!(_roots = &mut roots);
+    for slots in &copies {
+        assert!(slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
+            "native and shadow copies must agree before relocation");
+    }
+    HeapCollector::new().minor_gc().unwrap();
+    for slots in &copies {
+        assert!(slots.iter().all(|slot| unsafe { **slot == *slots[0] }),
+            "every alias must be updated by GC");
         let expected = unsafe { std::slice::from_raw_parts(state.expected, state.expected_len) };
-        assert!(expected.contains(&copies[0]), "map must describe a relocated live value");
+        assert!(expected.contains(unsafe { &*slots[0] }), "map must describe a relocated live value");
     }
     for index in 0..request.nargs {
         let outgoing_slot = unsafe { request.args.add(index).offset_from(request.activation) } as u16;
