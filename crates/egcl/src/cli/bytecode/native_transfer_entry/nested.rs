@@ -416,6 +416,7 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
                     &[],
                     unsafe { &mut *NATIVE_ENV.with(Cell::get) },
                     Some(resume),
+                    NIL,
                 );
             }
             let error = NATIVE_ERROR

@@ -23,6 +23,7 @@ mod ordinary_t1;
 pub(super) mod ordinary_t2;
 mod payloads;
 mod recursion;
+mod recursive_heat;
 mod deopt;
 
 #[test]

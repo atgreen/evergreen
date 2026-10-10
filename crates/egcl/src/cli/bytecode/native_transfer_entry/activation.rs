@@ -234,7 +234,9 @@ impl ActivationState {
             nested,
             owner: code,
             completed_deopt: false,
-            recursive_enabled: code.recursive,
+            recursive_enabled: code.recursive_symbol.is_some(),
+            recursive_profile: !profiling_disabled()
+                && egcl_rt::function::is_interpreted_function(unsafe { (*frame).function }),
             recursive_generation: code.recursive_generation,
             recursive: std::ptr::null_mut(),
             recursive_escape: false,
