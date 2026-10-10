@@ -20,8 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// arguments there before any helper. Slice entries use the supplied rooted
 /// slice. Capture is entered only after all Rust helpers return.
 ///
-/// SysV register calls pass this pointer in R9, slice calls in RCX. A Rust
-/// reentry must establish its own segment and must not forward this context.
+/// SysV register calls pass this pointer in R9, slice calls in RCX. Win64
+/// register calls pass it as argument six (after target/count/a0/a1/a2),
+/// slice calls in R9. A Rust reentry must establish its own segment and must
+/// not forward this context.
 #[repr(C)]
 pub struct NativeCallContext {
     pub request: *mut u8,

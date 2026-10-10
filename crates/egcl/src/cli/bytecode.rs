@@ -80,7 +80,12 @@ mod pending_error;
 mod call_table;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", windows))]
+#[path = "bytecode/native_callable_windows.rs"]
+mod native_callable;
+#[cfg(all(target_arch = "x86_64", windows))]
+pub(super) use native_callable::{enabled as native_callable_enabled, invoke as invoke_native_callable};
+#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
 pub(super) fn initialize_native_callable_entries() {
     let _ = native_callable::entries();
 }

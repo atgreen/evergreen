@@ -202,5 +202,9 @@ jobs:
         run: cargo test -p egcl-rt --test native_segment_windows -- --include-ignored --nocapture
       - name: Win64 runtime adapter probes
         run: cargo test -p egcl-rt --lib native_transfer -- --include-ignored --nocapture
+      - name: Win64 published callable execution and unwind metadata
+        env:
+          EGCL_NATIVE_TRANSFER: '1'
+        run: cargo test -p egcl --lib win64_published_callable -- --include-ignored --test-threads=1
       - name: Win64 runtime transfer regressions
         run: cargo test -p egcl --test native_transfer_cli --test tier_observability
