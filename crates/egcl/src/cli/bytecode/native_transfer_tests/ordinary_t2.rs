@@ -389,3 +389,146 @@ fn ordinary_t2_missing_mapped_artifact_preserves_mapped_t1() {
         EgclVal::from_fixnum(10)
     );
 }
+
+fn install_mv_body(
+    name: &str,
+    body: Arc<BytecodeFunction>,
+    optimized: bool,
+) -> (u32, Rc<NativeCode>) {
+    let symbol = egcl_rt::symbols::intern(name);
+    registry_put(symbol, body);
+    let code = if optimized {
+        let input = snapshot_t2_input(symbol, 0).expect("MV-bind worker snapshot");
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input
+            .with_gc_stable_mutator(compile_t2_artifact)
+            .expect("MV-bind worker artifact");
+        install_t2_completion(T2Completion {
+            sym: symbol,
+            generation,
+            artifact: Some(artifact),
+            input,
+        })
+        .expect("MV-bind mapped T2 installation")
+    } else {
+        try_promote_to_t1(symbol).expect("MV-bind mapped T1 installation")
+    };
+    assert_eq!(code.is_t2, optimized);
+    assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)),
+        "MV binding must execute through the mapped ABI, not checked fallback");
+    assert_eq!(code.transfer_abi_version, MAPPED_TRANSFER_ABI_VERSION);
+    (symbol, code)
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_mv_bind_maps_both_tiers_and_preserves_bound_heap_values() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun b7iai-producer (mode)
+           (if (= mode 0) (values)
+             (if (= mode 1) (values 71)
+               (if (= mode 2)
+                 (let ((a (%ordinary-t2-root-for-test))
+                       (b (%ordinary-t2-root-for-test)))
+                   (setf (car b) 72)
+                   (values a b))
+                 (values 71 72 73 74)))))
+         (defun b7iai-collect ()
+           (%ordinary-t2-entry-for-test)
+           (%force-minor-gc-for-test))",
+        &mut env,
+    ).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(mode)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(
+        "((multiple-value-bind (a b c) (b7iai-producer mode)
+            (values)
+            (b7iai-collect)
+            (values a b c)))"
+    ).unwrap().0);
+    for optimized in [false, true] {
+        let name = if optimized { "B7IAI-MV-T2" } else { "B7IAI-MV-T1" };
+        let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+        assert!(body.code.iter().any(|op| matches!(op,
+            Instr::TakeValuesToLocals { nvars: 3, .. })),
+            "standard MULTIPLE-VALUE-BIND must exercise the local-transfer opcode");
+        let (symbol, code) = install_mv_body(name, body, optimized);
+        for mode in [0, 1, 2, 3] {
+            egcl_rt::collect_t0_minor().unwrap();
+            ALLOCATED_ROOT.with(|slot| slot.set(0));
+            expect_entry(&code);
+            let stack = egcl_rt::current_stack();
+            let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+            egcl_rt::rooted!(primary = run_native(
+                &code, symbol, &[EgclVal::from_fixnum(mode)], &mut env
+            ).unwrap());
+            assert!(observed_entry(), "the installed mapped caller must actually execute");
+            assert!(env.mv_active);
+            assert_eq!(env.mv.len(), 3);
+            assert_eq!(*primary, env.mv[0]);
+            match mode {
+                0 => assert_eq!(env.mv, vec![NIL, NIL, NIL]),
+                1 => assert_eq!(env.mv, vec![EgclVal::from_fixnum(71), NIL, NIL]),
+                2 => {
+                    assert_eq!(super::super::super::cp(env.mv[0]),
+                        (EgclVal::from_fixnum(71), NIL));
+                    assert_eq!(super::super::super::cp(env.mv[1]),
+                        (EgclVal::from_fixnum(72), NIL));
+                    assert_eq!(env.mv[2], NIL, "missing secondary values require NIL padding");
+                    let secondary_before = ALLOCATED_ROOT.with(Cell::get);
+                    assert_ne!(secondary_before, 0, "the producer allocated the secondary value");
+                    assert_ne!(env.mv[1].to_raw(), secondary_before,
+                        "the bound secondary must really move after the MV buffer is overwritten");
+                }
+                _ => assert_eq!(env.mv, vec![EgclVal::from_fixnum(71),
+                    EgclVal::from_fixnum(72), EgclVal::from_fixnum(73)]),
+            }
+            assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_mv_zero_binding_preserves_the_existing_tuple() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun b7iai-zero-producer () (%ordinary-t2-entry-for-test) (values 71 72))",
+        &mut env,
+    ).unwrap();
+    egcl_rt::rooted!(forms = reader::read_from_string("((b7iai-zero-producer))").unwrap().0);
+    for optimized in [false, true] {
+        let name = if optimized { "B7IAI-ZERO-T2" } else { "B7IAI-ZERO-T1" };
+        let mut body = compile_function(name, NIL, *forms, &env, false, false).unwrap();
+        // Exercise the zero-destination bytecode contract directly: ordinary
+        // Lisp body evaluation can legitimately clear MV before observing it.
+        body.code = vec![
+            Instr::CallNamed {
+                sym: egcl_rt::symbols::intern("B7IAI-ZERO-PRODUCER"),
+                nargs: 0,
+            },
+            Instr::TakeValuesToLocals { nvars: 0, slot_base: 0 },
+            Instr::Const(0),
+            Instr::Return,
+        ];
+        body.constants = vec![EgclVal::from_fixnum(71)];
+        body.n_locals = 0;
+        body.max_stack = 1;
+        let (symbol, code) = install_mv_body(name, Arc::new(body), optimized);
+        expect_entry(&code);
+        let primary = run_native(&code, symbol, &[], &mut env).unwrap();
+        assert!(observed_entry());
+        assert_eq!(primary, EgclVal::from_fixnum(71));
+        assert!(env.mv_active, "zero binding must not invoke the ClearMv operation");
+        assert_eq!(env.mv, vec![EgclVal::from_fixnum(71), EgclVal::from_fixnum(72)]);
+    }
+}

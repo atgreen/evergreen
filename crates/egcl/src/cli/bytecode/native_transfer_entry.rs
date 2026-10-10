@@ -652,7 +652,7 @@ impl TransferCode {
             base_slots,
             save_cleanup as *const () as u64,
             completion.as_ptr() as u64,
-            c2i_clear_mv as *const () as u64,
+            c2i_t2_mv as *const () as u64,
             deliver_catch as *const () as u64,
             deliver_handler as *const () as u64,
             poll.as_ptr() as u64,
@@ -1172,7 +1172,7 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
         && body.code.iter().all(|op| {
             // Nested tagged callees support MV; optimized/direct-recursive
             // admission retains its existing restriction.
-            (allow_values && matches!(op, Instr::SetValues(_)))
+            (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
             || (allow_tags && matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
             || matches!(
                 op,

@@ -17096,12 +17096,11 @@ extern "C" fn c2i_take_values(primary: u64, dst: *mut EgclVal, n: u64) {
     if env_ptr.is_null() || (n != 0 && dst.is_null()) {
         return;
     }
-    let env = unsafe { &mut *env_ptr };
-    let values = if env.mv_active {
-        env.mv.clone()
-    } else {
-        Vec::new()
-    };
+    // Destinations are separate managed activation slots. Reading the existing
+    // tuple in place keeps this helper nonallocating, nonpolling and nonsignaling;
+    // mapped native callers rely on that leaf contract.
+    let env = unsafe { &*env_ptr };
+    let values = if env.mv_active { env.mv.as_slice() } else { &[] };
     for index in 0..n as usize {
         let value = if index == 0 {
             EgclVal(primary)
