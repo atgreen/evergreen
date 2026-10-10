@@ -57,6 +57,41 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     use super::super::*;
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn native_segment_arguments_report_original_homes_or_unavailable() {
+        use super::super::native_transfer_entry::{TransferCode, take_native_fallback_count};
+        let _lock = super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(value)").unwrap().0);
+        for (source, available) in [
+            ("((egcl::%debug-backtrace 32 0 nil))", true),
+            ("((setq value 99) (egcl::%debug-backtrace 32 0 nil))", false),
+        ] {
+            egcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
+            let body = Arc::new(compile_function(
+                "NATIVE-SEGMENT-ARGUMENTS", *params, *forms, &env, true, false,
+            ).unwrap());
+            let code = TransferCode::compile(body).expect("native argument fixture");
+            take_native_fallback_count();
+            egcl_rt::rooted!(snapshot = code.run(&[EgclVal::from_fixnum(42)], &mut env).unwrap());
+            assert_eq!(take_native_fallback_count(), 0);
+            // Captured names and arguments must survive retirement of the
+            // executable mapping and its debugger registration.
+            drop(code);
+            let row = list_to_vec(*snapshot).into_iter().map(list_to_vec)
+                .find(|row| super::super::super::val_as_str(row[0]) == "NATIVE-SEGMENT-ARGUMENTS")
+                .expect("retained segment identity");
+            assert_eq!(row[2], if available { T } else { NIL });
+            if available {
+                assert_eq!(list_to_vec(row[1]), vec![EgclVal::from_fixnum(42)]);
+            }
+        }
+    }
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
     fn native_argument_homes_relocate_before_snapshot_capture() {

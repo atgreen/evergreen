@@ -1176,23 +1176,32 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
         1,
     );
     let mut f = build_from_bytecode(&both).expect("build CAR/CDR pair");
-    let guard_count = |f: &egcl_compiler::t2::ir::Function| {
+    let guard_count = |f: &egcl_compiler::t2::ir::Function, binding: bool| {
         f.block_order()
             .iter()
             .flat_map(|&b| f.block(b).insts.iter())
-            .filter(|&&i| f.inst(i).flags.guard)
+            .filter(|&&i| {
+                let inst = f.inst(i);
+                inst.flags.guard && if binding {
+                    matches!(inst.aux, AuxData::BuiltinBinding { .. })
+                } else {
+                    matches!(inst.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+                }
+            })
             .count()
     };
-    assert_eq!(guard_count(&f), 2);
+    assert_eq!(guard_count(&f, false), 2);
+    assert_eq!(guard_count(&f, true), 2);
     let mut pm = PassManager::new();
     pm.add(Box::new(GuardElim));
     pm.add(Box::new(Dce));
     pm.run(&mut f);
     assert_eq!(
-        guard_count(&f),
+        guard_count(&f, false),
         1,
         "CAR and CDR share one dominating cons guard"
     );
+    assert_eq!(guard_count(&f, true), 2, "each binding must still be checked");
     verify(&f).expect("optimized CAR/CDR IR verifies");
 
     let framed = emit_framed(

@@ -19110,7 +19110,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Ok(env.return_values(std::mem::take(&mut *vals)));
             }
             "FORMAT" => return eval_format(cdr, env),
-            "ERROR" => return eval_builtin_arguments(&name, cdr, env),
+            "ERROR" if !fn_bound(env, &name) => return eval_builtin_arguments(&name, cdr, env),
             "LET" => return eval_let(cdr, env, false),
             "LET*" => return eval_let(cdr, env, true),
             "SETQ" => {

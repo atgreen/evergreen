@@ -526,10 +526,8 @@ impl ScopeMap {
                     fallthrough = false;
                     None
                 }
-                Instr::CallNamed { sym, .. } if is_never_returning_call(sym) => {
-                    fallthrough = false;
-                    None
-                }
+                // Named callees, including ERROR, can be replaced by a
+                // function that returns. Their normal edge remains live.
                 _ => None,
             };
             if let Some((sp_restore, kind)) = push {
@@ -630,14 +628,4 @@ fn handler_clause_targets(
             Ok(clause.body_bcp)
         })
         .collect()
-}
-
-/// ERROR has no normal successor; SIGNAL/CERROR/WARN may return normally.
-pub(crate) fn is_never_returning_call(sym: u32) -> bool {
-    matches!(
-        crate::reader::symbol_name(sym)
-            .as_deref()
-            .map(|n| n.rsplit(':').next().unwrap_or(n)),
-        Some("ERROR")
-    )
 }

@@ -21996,6 +21996,9 @@ fn emit_native(
 /// normally, so none of them belong here.
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn is_always_signalling(sym: u32) -> bool {
+    if super::installed_function(sym).is_some() {
+        return false;
+    }
     matches!(
         egcl_rt::symbols::symbol_name(sym)
             .as_deref()

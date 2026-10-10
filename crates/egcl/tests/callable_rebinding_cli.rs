@@ -192,3 +192,105 @@ fn legacy_self_symbol_binding_keeps_builtin_dispatch() {
     "#,
     );
 }
+
+#[test]
+fn replaced_error_returns_to_a_warmed_caller() {
+    run_tiers(
+        "returning ERROR",
+        r#"
+      (defun error-caller (fail)
+        (if fail (progn (error "original") 42) 7))
+      (dotimes (i 40) (assert (= (error-caller nil) 7)))
+      (assert (= (egcl-ext:function-tier 'error-caller) EXPECTED-TIER))
+      (setf (symbol-function 'error)
+        (lambda (&rest args) (declare (ignore args)) 110))
+      (setq *result* (error-caller t))
+      (fmakunbound 'error)
+      (assert (eql *result* 42))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#,
+    );
+}
+
+#[test]
+fn error_replaced_before_compilation_preserves_normal_values() {
+    run_tiers(
+        "preinstalled ERROR",
+        r#"
+      (defclass returning-error () ()
+        (:metaclass egcl-ext:funcallable-standard-class))
+      (defparameter *replacement* (make-instance 'returning-error))
+      (egcl-ext:set-funcallable-instance-function *replacement*
+        (lambda (&rest args) (declare (ignore args)) (values 110 220)))
+      (setf (symbol-function 'error) *replacement*)
+      (defun error-caller () (error "replacement"))
+      (dotimes (i 40) (error-caller))
+      (setq *tier* (egcl-ext:function-tier 'error-caller)
+            *result* (multiple-value-list (error-caller)))
+      (fmakunbound 'error)
+      (assert (= *tier* EXPECTED-TIER))
+      (assert (equal *result* '(110 220)))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#,
+    );
+}
+
+#[test]
+fn error_rebinding_inside_a_native_activation_preserves_effects_and_cleanup() {
+    run_tiers(
+        "live ERROR replacement",
+        r#"
+      (defparameter *armed* nil)
+      (defparameter *before* 0)
+      (defparameter *after* 0)
+      (defparameter *cleanup* 0)
+      (defun install-returning-error ()
+        (if *armed*
+            (egcl::set-symbol-function 'error
+              (lambda (&rest args) (declare (ignore args)) 110))
+            nil))
+      (defun error-caller (fail)
+        (setq *before* (1+ *before*))
+        (install-returning-error)
+        (if fail
+            (progn (error "original")
+                   (setq *after* (1+ *after*))
+                   (values 42 43))
+            7))
+      (dotimes (i 40) (assert (= (error-caller nil) 7)))
+      (assert (= (egcl-ext:function-tier 'error-caller) EXPECTED-TIER))
+      (setq *armed* t *before* 0 *after* 0 *cleanup* 0)
+      (setq *result* (multiple-value-list
+        (unwind-protect (error-caller t) (setq *cleanup* (1+ *cleanup*)))))
+      (fmakunbound 'error)
+      (assert (equal *result* '(42 43)))
+      (assert (= *before* 1))
+      (assert (= *after* 1))
+      (assert (= *cleanup* 1))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#,
+    );
+}
+
+#[test]
+fn original_error_unwinds_without_running_its_normal_continuation() {
+    run_tiers(
+        "original ERROR",
+        r#"
+      (defparameter *after* 0)
+      (defparameter *cleanup* 0)
+      (defun error-caller (fail)
+        (if fail (progn (error "original") (setq *after* 99)) 7))
+      (dotimes (i 40) (assert (= (error-caller nil) 7)))
+      (assert (= (egcl-ext:function-tier 'error-caller) EXPECTED-TIER))
+      (setq *cleanup* 0)
+      (assert (eq (handler-case
+                    (unwind-protect (error-caller t) (setq *cleanup* (1+ *cleanup*)))
+                    (error () :caught))
+                  :caught))
+      (assert (= *after* 0))
+      (assert (= *cleanup* 1))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#,
+    );
+}

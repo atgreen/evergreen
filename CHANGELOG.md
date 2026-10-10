@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve normal return values and cleanup when `ERROR` is replaced, including
+  during an active native call. Allow rooted heap literals in native transfer
+  entries and retain debugger argument visibility across those entries
+  ([#194](https://github.com/atgreen/evergreen/pull/194)).
+
 - Honor callable-instance replacements of named functions and builtins across
   interpreted and native calls, including warmed optimized operations, while
   preserving callable identity and multiple values

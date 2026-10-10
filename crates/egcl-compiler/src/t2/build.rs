@@ -104,7 +104,7 @@
 //! * Loops rely on sealing: a header is read while unsealed, so its reads
 //!   create incomplete φs that the back-edge later completes.
 
-use crate::control_scope::{is_never_returning_call, ScopeError, ScopeKind, ScopeMap};
+use crate::control_scope::{ScopeError, ScopeKind, ScopeMap};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
@@ -782,15 +782,6 @@ impl<'a> Builder<'a> {
                 Instr::Go { target_bcp, .. } => {
                     set.insert(*target_bcp as usize);
                 }
-                // A call that never returns normally ENDS its block, so what
-                // follows begins a new one (bliss-wukf). That block is usually
-                // unreachable, which is what `compute_reachable` exists to
-                // account for.
-                Instr::CallNamed { sym, .. } if is_never_returning_call(*sym) => {
-                    if i + 1 < code.len() {
-                        set.insert(i + 1);
-                    }
-                }
                 Instr::PushBlock {
                     block_id,
                     resume_bcp,
@@ -929,8 +920,6 @@ impl<'a> Builder<'a> {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
                 }
                 Instr::Throw if self.native_cleanups => {}
-                Instr::CallNamed { sym, .. }
-                    if self.transfer_mode && is_never_returning_call(*sym) => {}
                 Instr::CallNamed { nargs, .. } => {
                     push(i + 1, d - (*nargs as i32) + 1, &mut depth_at, &mut work);
                 }
@@ -1104,8 +1093,6 @@ impl<'a> Builder<'a> {
                         push(resume as usize, &mut succs);
                     }
                 }
-                Instr::CallNamed { sym, .. }
-                    if self.transfer_mode && is_never_returning_call(*sym) => {}
                 _ => push(i + 1, &mut succs),
             }
         }
@@ -1304,9 +1291,7 @@ impl<'a> Builder<'a> {
                     for (_, resume, _) in self.exceptional_catches((start + offset) as u32) {
                         successors.push(blk(resume as usize)?);
                     }
-                    if !matches!(instr, Instr::Throw)
-                        && !matches!(instr, Instr::CallNamed { sym, .. } if is_never_returning_call(*sym))
-                    {
+                    if !matches!(instr, Instr::Throw) {
                         successors.push(blk(end)?);
                     }
                     if let Some((cleanup, _)) = self.exceptional_cleanup((start + offset) as u32) {
@@ -1350,15 +1335,6 @@ impl<'a> Builder<'a> {
                 Instr::BrIfTrue(t) => return Ok(vec![blk(*t as usize)?, blk(end)?]),
                 Instr::BrIfFalse(t) => return Ok(vec![blk(end)?, blk(*t as usize)?]),
                 Instr::Return => return Ok(vec![]),
-                // A call that never returns normally has NO successors. Without
-                // this the scan falls through to "no terminator in range" and
-                // counts an edge to the next leader, so that block is sealed
-                // expecting a value from a predecessor Term::Trap never
-                // creates -- regalloc2 then panics with "trying to get a VReg
-                // before observing its class" (bliss-wukf).
-                Instr::CallNamed { sym, .. } if is_never_returning_call(*sym) => {
-                    return Ok(vec![]);
-                }
                 _ => {}
             }
         }
@@ -1981,24 +1957,13 @@ impl<'a> Builder<'a> {
                             stack,
                             results[0],
                             i as u32,
-                            (!is_never_returning_call(*sym)).then_some(end),
+                            Some(end),
                         )?;
                         return Ok(());
                     }
-                    // A call that NEVER RETURNS NORMALLY ends this path
-                    // (bliss-wukf). Without it T2 carried on executing code
-                    // that must not run: a store after the error landed, and a
-                    // later error superseded the real one.
-                    //
-                    // CLHS says ERROR never returns normally, so everything
-                    // after the call is unreachable under correct semantics.
-                    // The result is deliberately NOT pushed -- nothing can
-                    // observe it, and a value defined here that no block
-                    // publishes gives regalloc a use with no def.
-                    if is_never_returning_call(*sym) {
-                        term = Some(Term::Trap);
-                        break;
-                    }
+                    // The selected binding can change, even for ERROR. Keep
+                    // its normal continuation; an actual error takes the call's
+                    // existing exceptional path before this value is consumed.
                     stack.push(results[0]);
                 }
                 Instr::TypeP(class) => {
@@ -3015,8 +2980,7 @@ enum Term {
     /// `Brif(cond, taken_when_true, taken_when_false)`.
     Brif(Value, Block, Block),
     Ret(Value),
-    /// Unreachable continuation with no successors: emitted after a call that
-    /// never returns normally (bliss-wukf).
+    /// Unreachable continuation with no successors.
     Trap,
 }
 
@@ -3480,6 +3444,39 @@ mod tests {
         assert!(call.frame_state.is_some(), "call must carry a FrameState");
         assert_eq!(call.args.len(), 1, "one argument popped for the call");
         assert!(!f.frame_states.is_empty(), "frame-state table populated");
+    }
+
+    #[test]
+    fn mutable_error_call_retains_its_normal_continuation() {
+        let error = egcl_rt::symbols::intern("ERROR");
+        let input = bf(
+            "returning-error",
+            vec![
+                Instr::CallNamed { sym: error, nargs: 0 },
+                Instr::Pop,
+                Instr::Const(0),
+                Instr::Return,
+            ],
+            vec![EgclVal::from_fixnum(42)],
+            0,
+            0,
+            1,
+        );
+        let scopes = ScopeMap::analyze_function(&input).unwrap();
+        assert!(scopes.before(1).is_some(), "a replacement ERROR may return");
+        for result in [
+            build_from_bytecode(&input),
+            build_from_bytecode_for_transfers(&input),
+            build_from_bytecode_for_native_cleanups(&input),
+        ] {
+            let function = result.unwrap();
+            crate::t2::verify::verify(&function).unwrap();
+            assert!(function.block_order().iter().any(|&block| {
+                function.block(block).insts.iter().any(|&inst| {
+                    function.inst(inst).opcode == Opcode::Return
+                })
+            }), "the caller must retain its return after the named call");
+        }
     }
 
     #[test]
