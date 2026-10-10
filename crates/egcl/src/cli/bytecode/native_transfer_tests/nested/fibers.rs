@@ -65,14 +65,35 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     });
     assert_eq!(probe.hits, 1, "child pause must execute exactly once");
     let capture = super::super::super::native_transfer_entry::child_capture_for_test();
-    if matches!(probe.mode, 3 | 5) {
+    let cold_recovery = matches!(probe.mode, 3 | 5);
+    // A Rust pause callback can own one or more outer adapter segments. Follow
+    // their verified physical ancestry to the selected mapped child. Cold
+    // recovery deliberately retired its capture; its fallback/deopt and frame
+    // retirement assertions below remain the evidence for that separate path.
+    let adapter_callers = if cold_recovery {
+        None
+    } else {
+        super::super::super::native_callable::outer::suspended_callers_for_test()
+    };
+    let selected_capture = if let Some(callers) = &adapter_callers {
+        assert!(capture.is_none(), "outer pause adapter must hide CAPTURE");
+        let (last, intermediates) = callers
+            .split_last()
+            .expect("pause adapter retains its caller");
+        assert!(intermediates.iter().all(|(_, capture)| capture.is_none()));
+        assert_ne!(last.0, 0, "selected mapped child segment must remain live");
+        last.1
+    } else {
+        capture
+    };
+    if cold_recovery {
         assert!(
             capture.is_none(),
             "cold recovery must mask its abandoned capture"
         );
     } else {
         assert_eq!(
-            capture,
+            selected_capture,
             Some((probe.code, true)),
             "pause must belong to the selected child"
         );
@@ -132,6 +153,13 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
             super::super::super::native_transfer_entry::child_capture_for_test(),
             capture
         );
+        if !cold_recovery {
+            assert_eq!(
+                super::super::super::native_callable::outer::suspended_callers_for_test(),
+                adapter_callers,
+                "migration must preserve every outer adapter and its selected mapped child"
+            );
+        }
     }
     if before.is_some_and(|before| held.to_raw() != before) {
         MOVED.fetch_add(1, Ordering::Relaxed);

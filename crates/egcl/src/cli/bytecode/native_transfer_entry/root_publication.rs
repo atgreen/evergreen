@@ -344,6 +344,12 @@ pub(super) unsafe fn published_mapped<R>(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     body: impl FnOnce() -> R,
 ) -> R {
+    if unsafe { super::super::native_callable::outer::owns_record(record) } {
+        // The registered Rust boundary has no generated Lisp frame or live
+        // tagged register homes. Its callable and arguments are host roots;
+        // any enclosing mapped publication remains linked throughout reentry.
+        return body();
+    }
     unsafe { publish_with(mapped_cursor(record), None, record as usize, body) }
 }
 

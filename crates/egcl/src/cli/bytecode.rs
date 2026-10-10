@@ -69,6 +69,9 @@ pub(super) fn pause_native_child_for_test() -> Result<EgclVal, EgclError> {
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::{NativeEvalProbe, native_reentry_event_for_test};
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::ordinary_t2::{ordinary_t2_root_for_test, ordinary_t2_entry_for_test};
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;
@@ -81,6 +84,8 @@ mod native_callable;
 pub(super) fn initialize_native_callable_entries() {
     let _ = native_callable::entries();
 }
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_callable::invoke as invoke_native_callable;
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_native;
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -18971,6 +18976,8 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 }
 
 struct T2Artifact {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mapped: Option<native_transfer_entry::PreparedT2>,
     env_names: Box<NativeEnvNames>,
     speculations: Vec<(u32, SpecType)>,
     call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
@@ -19743,6 +19750,16 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     {
         root.insert(Arc::clone(&bf));
         artifact.rooted_bodies.push(Arc::clone(&bf));
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(native) = native_transfer_entry::install_ordinary_t2(done.sym, &bf, &mut artifact) {
+        CODE_BY_ID.with(|m| m.borrow_mut().insert(native.code_id, Rc::downgrade(&native)));
+        NATIVE_REGISTRY.with(|r| r.borrow_mut().insert(done.sym, Rc::clone(&native)));
+        let function = egcl_rt::symbols::symbol_function(done.sym)
+            .filter(|&value| egcl_rt::function::is_interpreted_function(value));
+        mark_fresh_promotion(done.sym);
+        publish_native(done.sym, function, &native);
+        return Some(native);
     }
     let metadata = if artifact.rooted_bodies.is_empty() {
         None
@@ -22473,6 +22490,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         return None;
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mapped = native_transfer_entry::prepare_ordinary_t2(input, &f);
+
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     // These emitters resume the precise callee locally and return its result,
     // so a direct native caller need not re-enter run_native to deoptimize.
@@ -22534,6 +22554,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     };
     let mut rooted_bodies = Vec::new();
+    // Prepared IR can retain constant-slot addresses independently of the
+    // checked fallback emitter. Keep its immutable worker source alive too.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if mapped.is_some() {
+        rooted_bodies.push(Arc::clone(&input.body));
+    }
     if bf.code.iter().any(|instruction| matches!(instruction,
         Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
         // Retain the source snapshot for lexical deoptimization metadata,
@@ -22599,6 +22625,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     );
 
     Some(T2Artifact {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        mapped,
         env_names,
         speculations,
         call_cells: input
@@ -24774,6 +24802,8 @@ mod jtc4_stack_map_tests {
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
         let valid = T2Artifact {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            mapped: None,
             env_names: Box::default(),
             speculations: vec![],
             call_cells: Vec::new(),
