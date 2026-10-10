@@ -3246,7 +3246,7 @@ enum CleanupEmission {
     Native {
         save: u64,
         complete: u64,
-        clear_mv: u64,
+        multiple_values: u64,
         catch_landing: u64,
         handler_landing: u64,
     },
@@ -3316,7 +3316,10 @@ pub fn emit_framed_transfers_with_cleanup(
 }
 
 /// Emit verified exceptional cleanup edges and helper-v2 cleanup completion.
-/// `clear_mv` clears secondary values without allocating, yielding or signaling.
+/// `multiple_values` is a leaf `extern "C" fn(primary: u64, dst: *mut EgclVal,
+/// count: u64)`: count zero clears MV; a positive count copies the primary and
+/// secondary values (NIL padding) into separate activation slots, preserving MV.
+/// It must not allocate, poll, yield, signal, invoke Lisp or unwind.
 /// `save` has the normal save-helper contract above; `complete` is a veneer for
 /// a helper consuming `TransferCleanupRequest`. The owner must root the pending
 /// continuation and repair source homes before entering a checked cold landing.
@@ -3329,7 +3332,7 @@ pub fn emit_framed_native_cleanups(
     activation_slots: u16,
     save: u64,
     complete: u64,
-    clear_mv: u64,
+    multiple_values: u64,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     emit_transfer_function(
         f,
@@ -3338,7 +3341,7 @@ pub fn emit_framed_native_cleanups(
         Some(CleanupEmission::Native {
             save,
             complete,
-            clear_mv,
+            multiple_values,
             catch_landing: 0,
             handler_landing: 0,
         }),
@@ -3359,7 +3362,7 @@ pub fn emit_framed_native_handlers(
     activation_slots: u16,
     save: u64,
     complete: u64,
-    clear_mv: u64,
+    multiple_values: u64,
     catch_landing: u64,
     handler_landing: u64,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
@@ -3369,7 +3372,7 @@ pub fn emit_framed_native_handlers(
         activation_slots,
         save,
         complete,
-        clear_mv,
+        multiple_values,
         catch_landing,
         handler_landing,
         0,
@@ -3388,7 +3391,7 @@ pub fn emit_framed_native_handlers_with_poll(
     activation_slots: u16,
     save: u64,
     complete: u64,
-    clear_mv: u64,
+    multiple_values: u64,
     catch_landing: u64,
     handler_landing: u64,
     poll_veneer: u64,
@@ -3399,7 +3402,7 @@ pub fn emit_framed_native_handlers_with_poll(
         activation_slots,
         save,
         complete,
-        clear_mv,
+        multiple_values,
         catch_landing,
         handler_landing,
         poll_veneer,
@@ -3422,7 +3425,7 @@ pub fn emit_framed_native_handlers_with_recursion(
     activation_slots: u16,
     save: u64,
     complete: u64,
-    clear_mv: u64,
+    multiple_values: u64,
     catch_landing: u64,
     handler_landing: u64,
     poll_veneer: u64,
@@ -3435,7 +3438,7 @@ pub fn emit_framed_native_handlers_with_recursion(
         activation_slots,
         save,
         complete,
-        clear_mv,
+        multiple_values,
         catch_landing,
         handler_landing,
         poll_veneer,
@@ -3457,7 +3460,7 @@ pub fn emit_framed_native_handlers_with_entries(
     activation_slots: u16,
     save: u64,
     complete: u64,
-    clear_mv: u64,
+    multiple_values: u64,
     catch_landing: u64,
     handler_landing: u64,
     poll_veneer: u64,
@@ -3476,7 +3479,7 @@ pub fn emit_framed_native_handlers_with_entries(
         Some(CleanupEmission::Native {
             save,
             complete,
-            clear_mv,
+            multiple_values,
             catch_landing,
             handler_landing,
         }),
@@ -3512,9 +3515,9 @@ fn emit_transfer_function(
         CleanupEmission::Native {
             save,
             complete,
-            clear_mv,
+            multiple_values,
             ..
-        } => save == 0 || complete == 0 || clear_mv == 0,
+        } => save == 0 || complete == 0 || multiple_values == 0,
     }) || call_veneer == 0
         || (0..f.num_values()).any(|i| {
             f.value(crate::t2::ir::Value(i as u32)).repr
@@ -3551,6 +3554,18 @@ fn emit_transfer_function(
                 if cold.insts.len() != 1 || !cold.params.is_empty() || !edge.args.is_empty() {
                     return Err(EmitError::UnsupportedOp(0xFD));
                 }
+            }
+            if data.opcode == Opcode::TakeValuesToLocals {
+                let AuxData::ValuesLocals { nvars, slot_base } = data.aux else {
+                    return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+                };
+                if !native_cleanups || data.args.len() != 1
+                    || data.results.len() != usize::from(nvars)
+                    || slot_base.checked_add(nvars).is_none_or(|end| end > activation_slots)
+                {
+                    return Err(EmitError::UnsupportedOp(op_tag(data.opcode)));
+                }
+                continue;
             }
             if (cleanup.is_some() && data.opcode == Opcode::CleanupSave)
                 || (!native_cleanups && cleanup.is_some() && data.opcode == Opcode::CleanupRestore)
@@ -3634,7 +3649,7 @@ fn emit_transfer_function(
         0,
         0,
         match cleanup {
-            Some(CleanupEmission::Native { clear_mv, .. }) => clear_mv,
+            Some(CleanupEmission::Native { multiple_values, .. }) => multiple_values,
             _ => 0,
         },
         0,
@@ -5255,41 +5270,51 @@ fn emit_framed_inner(
                         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)));
                     }
                 };
-                let primary = *d
-                    .args
-                    .first()
-                    .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
-                if let Some(&bits) = const_tagged.get(&primary) {
-                    mov_imm64(&mut a, 7, bits as i64);
-                } else {
-                    let home = *homes.get(&primary).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                    load_home(&mut a, 7, home, 0);
-                }
-                let frame_base = frame_base_home
-                    .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
-                load_home(&mut a, 6, frame_base, 0);
-                alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
-                mov_imm64(&mut a, 2, i64::from(nvars));
-                mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                inst_calls.push(emit_runtime_helper_call(
-                    &mut a,
-                    c2i_recovery_toggle_addr,
-                    transfer_check,
-                ));
+                // Zero bindings consume the primary in SSA but preserve MV.
+                // They must not select the shared helper's zero-count clear arm.
+                if nvars != 0 {
+                    let primary = *d
+                        .args
+                        .first()
+                        .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
+                    if let Some(&bits) = const_tagged.get(&primary) {
+                        mov_imm64(&mut a, 7, bits as i64);
+                    } else {
+                        let home = *homes.get(&primary).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        load_home(&mut a, 7, home, 0);
+                    }
+                    let frame_base = frame_base_home
+                        .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
+                    load_home(&mut a, 6, frame_base, 0);
+                    alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
+                    mov_imm64(&mut a, 2, i64::from(nvars));
+                    mov_imm64(&mut a, 0, c2i_mv_addr as i64);
+                    if transfer_mode {
+                        // The mapped MV helper is a noncollecting, nonsignaling leaf.
+                        // No exceptional-status poll follows its successful return.
+                        a.extend_from_slice(&[0xff, 0xd0]);
+                    } else {
+                        inst_calls.push(emit_runtime_helper_call(
+                            &mut a,
+                            c2i_recovery_toggle_addr,
+                            transfer_check,
+                        ));
+                    }
 
-                // The helper writes the activation slots. Materialise each SSA
-                // result into its stable home one at a time; this also handles
-                // arbitrarily many bindings without exhausting temp registers.
-                load_home(&mut a, SCRATCH, frame_base, 0);
-                for (offset, &result) in d.results.iter().enumerate() {
-                    load_mem64_disp(
-                        &mut a,
-                        RAX,
-                        SCRATCH,
-                        (i32::from(slot_base) + offset as i32) * 8,
-                    );
-                    let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                    store_home(&mut a, home, RAX, 0);
+                    // The helper writes the activation slots. Materialise each SSA
+                    // result into its stable home one at a time; this also handles
+                    // arbitrarily many bindings without exhausting temp registers.
+                    load_home(&mut a, SCRATCH, frame_base, 0);
+                    for (offset, &result) in d.results.iter().enumerate() {
+                        load_mem64_disp(
+                            &mut a,
+                            RAX,
+                            SCRATCH,
+                            (i32::from(slot_base) + offset as i32) * 8,
+                        );
+                        let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                        store_home(&mut a, home, RAX, 0);
+                    }
                 }
             } else {
                 // In precise mode this inst has its own reconstruction stub (built
