@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.5 - 2026-10-10
+
+### Performance and diagnostics
+
 - Improve native execution performance on Linux x86-64: restore efficient
   direct recursive calls in eligible T2 code, and reduce thread-lookup and
   idle-safepoint overhead, including redundant polls in empty jump blocks.
@@ -20,6 +24,13 @@
   [#235](https://github.com/atgreen/evergreen/pull/235),
   [#237](https://github.com/atgreen/evergreen/pull/237)).
 
+- Correct T2 diagnostics to report the profile choices actually used and the
+  code actually installed; distinguish code emission from publication and
+  clarify baseline arithmetic optimization
+  ([#236](https://github.com/atgreen/evergreen/pull/236)).
+
+### Compatibility
+
 - **Compatibility:** Standard `COMMON-LISP` functions now have fixed semantics,
   following the Common Lisp standard and SBCL policy. Redefining or unbinding
   them is unsupported; this withdraws the earlier builtin-rebinding extension.
@@ -27,10 +38,7 @@
   remain redefinable
   ([#237](https://github.com/atgreen/evergreen/pull/237)).
 
-- Correct T2 diagnostics to report the profile choices actually used and the
-  code actually installed; distinguish code emission from publication and
-  clarify baseline arithmetic optimization
-  ([#236](https://github.com/atgreen/evergreen/pull/236)).
+### Live optimization and control-flow correctness
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
@@ -62,6 +70,8 @@
   ([#215](https://github.com/atgreen/evergreen/pull/215),
   [#216](https://github.com/atgreen/evergreen/pull/216),
   [#217](https://github.com/atgreen/evergreen/pull/217)).
+
+### Packages
 
 - Add an x86-64 Fedora package for building standalone RISC-V Linux
   executables with the static RV64GC musl runtime and QEMU launcher
