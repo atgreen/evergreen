@@ -1254,6 +1254,48 @@ fn library_function_name_retains_its_call_and_deopt_state() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
+fn constant_typep_operands_execute_in_native_code() {
+    use egcl_compiler::t2::emit::emit_framed;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static CLEARS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn clear_values(_primary: u64, _dst: *mut EgclVal, count: u64) {
+        assert_eq!(count, 0);
+        CLEARS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let typep = egcl_rt::symbols::intern("TYPEP");
+    let symbol = EgclVal::from_symbol_index(egcl_rt::symbols::intern("PREDICATE-CONSTANT"));
+    for (kind, values) in [
+        ("SYMBOL", vec![(NIL, true), (T, true), (symbol, true),
+            (EgclVal::from_fixnum(42), false), (EgclVal::from_char('a'), false)]),
+        ("INTEGER", vec![(NIL, false), (T, false), (symbol, false),
+            (EgclVal::from_fixnum(42), true), (EgclVal::from_char('a'), false)]),
+    ] {
+        let type_name = EgclVal::from_symbol_index(egcl_rt::symbols::intern(kind));
+        for (value, matches) in values {
+            let input = bytecode_fn("constant-typep", vec![
+                Instr::Const(0), Instr::Const(1),
+                Instr::CallNamed { sym: typep, nargs: 2 }, Instr::Return,
+            ], vec![value, type_name], 0, 2, 0);
+            let function = build_from_bytecode(&input).expect("build constant TYPEP");
+            verify(&function).expect("constant predicate has valid binding guard");
+            let native = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0,
+                clear_values as *const () as usize as u64, None)
+                .expect("emit constant TYPEP");
+            let buffer = egcl_rt::jit::JitBuffer::new(&native.code).expect("mmap");
+            let run: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut frame = [0; 4];
+            assert_eq!(EgclVal(run(frame.as_mut_ptr())), if matches { T } else { NIL },
+                "TYPEP {value:?} {kind}");
+        }
+    }
+    assert_eq!(CLEARS.load(Ordering::Relaxed), 10);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+#[test]
 fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     use std::sync::Arc;
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;

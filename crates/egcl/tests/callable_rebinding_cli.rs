@@ -83,6 +83,72 @@ fn run_tiers(name: &str, program: &str) {
 }
 
 #[test]
+fn lowered_call_ldb_observes_replacement() {
+    check_lowered_call_binding("LDB", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
+        "(values 110 :replacement)", "'(110 :replacement)");
+}
+
+#[test]
+fn lowered_call_byte_observes_replacement() {
+    check_lowered_call_binding("BYTE", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
+        "(cons 2 1)", "'(3)");
+}
+
+#[test]
+fn lowered_call_typep_observes_replacement() {
+    check_lowered_call_binding("TYPEP", "(typep (progn (incf *effects*) :value) 'symbol)",
+        "(values 110 :replacement)", "'(110 :replacement)");
+}
+
+fn check_lowered_call_binding(name: &str, call: &str, replacement: &str, expected: &str) {
+    let restore = if name == "TYPEP" {
+        "(fmakunbound 'typep)".to_owned()
+    } else {
+        format!("(setf (symbol-function '{name}) *saved-binding*)")
+    };
+    run_tiers(name, &format!(r#"
+      (defparameter *effects* 0)
+      (defparameter *replacement-calls* 0)
+      (setq *saved-binding* (symbol-function '{name}))
+      (defun warmed-lowered-caller () {call})
+      (dotimes (i 40) (warmed-lowered-caller))
+      (assert (= (egcl-ext:function-tier 'warmed-lowered-caller) EXPECTED-TIER))
+      (setf (symbol-function '{name})
+        (lambda (&rest args) (declare (ignore args))
+          (incf *replacement-calls*) {replacement}))
+      (defun installed-after-replacement () {call})
+      (setq *effects* 0 *replacement-calls* 0)
+      (setq *warm-values* (multiple-value-list (warmed-lowered-caller)))
+      (setq *cold-values* (multiple-value-list (installed-after-replacement)))
+      {restore}
+      (assert (equal *warm-values* {expected}))
+      (assert (equal *cold-values* {expected}))
+      (assert (= *effects* 2))
+      (assert (= *replacement-calls* 2))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#));
+}
+
+#[test]
+fn lowered_call_ldb_preserves_lexical_byte_functions() {
+    run_tiers("LDB lexical BYTE", r#"
+      (defun local-byte-caller (x)
+        (flet ((byte (size position) (declare (ignore size position)) (cons 2 1)))
+          (ldb (byte 4 0) x)))
+      (defun captured-byte-caller (x width)
+        (flet ((byte (size position) (declare (ignore size position)) (cons width 1)))
+          (ldb (byte 4 0) x)))
+      (defun captured-byte-entry (x width) (captured-byte-caller x width))
+      (dotimes (i 40)
+        (assert (= (local-byte-caller 15) 3))
+        (assert (= (captured-byte-entry 15 2) 3)))
+      (assert (= (egcl-ext:function-tier 'local-byte-caller) EXPECTED-TIER))
+      (assert (= (egcl-ext:function-tier 'captured-byte-entry) EXPECTED-TIER))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#);
+}
+
+#[test]
 fn library_function_name_preserves_the_installed_definition() {
     run_tiers("FIRST-CHAR custom definition", r#"
       (defpackage :uiop/utility (:use :cl) (:export :first-char))

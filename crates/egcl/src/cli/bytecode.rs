@@ -803,126 +803,6 @@ impl egcl_rt::gc::TraceHostRoots for ActiveBytecodeRoot {
     }
 }
 
-/// Map a *constant* type specifier symbol name to a [`typep_class`] code, or
-/// `None` if it is not an inlinable simple type. Names arrive upcased (reader
-/// :upcase). Only names whose [`typep_class_matches`] result reproduces the
-/// TYPEP builtin ([`super::typep_matches`]) *bit for bit* appear here, so every
-/// tier agrees. Deliberately excluded: BASE-STRING (the builtin does not route
-/// it through `is_string_value`) and ATOM.
-fn find_typep_class(type_name: &str) -> Option<u16> {
-    Some(match type_name {
-        // TYPEP: "STRING" | "SIMPLE-STRING" => is_string_value(object).
-        "STRING" | "SIMPLE-STRING" => typep_class::STRING,
-        "SYMBOL" => typep_class::SYMBOL,
-        "PACKAGE" => typep_class::PACKAGE,
-        "LIST" => typep_class::LIST,
-        "CONS" => typep_class::CONS,
-        "NULL" => typep_class::NULL,
-        "BOOLEAN" => typep_class::BOOLEAN,
-        "HASH-TABLE" => typep_class::HASH_TABLE,
-        _ => return None,
-    })
-}
-
-/// Recognise the compound type designator `(MEMBER NIL T)` / `(MEMBER T NIL)`,
-/// which is exactly the BOOLEAN type. UIOP's ensure-symbol/ensure-inherited
-/// `(check-type x (member nil t))` expands to `(typep x '(member nil t))`, so
-/// this constant compound is worth inlining on the O(n²) package path.
-/// `(size position)` when LDB's argument list is exactly `((byte S P) value)`
-/// with S and P non-negative literal fixnums, for the open-coding in
-/// `lower_call`. Anything else -- a computed specifier, a variable holding one,
-/// a wrong argument count -- yields None and takes the ordinary call path.
-fn literal_byte_spec(args: EgclVal) -> Option<(u32, u32)> {
-    if !args.is_cons() {
-        return None;
-    }
-    let (spec, rest) = cp(args);
-    // Exactly two arguments to LDB, and the first a (BYTE _ _) form.
-    if !rest.is_cons() || !cp(rest).1.is_nil() || !spec.is_cons() {
-        return None;
-    }
-    let (head, spec_args) = cp(spec);
-    if !head.is_symbol() || sym_bare_name_rc(head).as_ref() != "BYTE" || !spec_args.is_cons() {
-        return None;
-    }
-    let (size, after_size) = cp(spec_args);
-    if !after_size.is_cons() || !cp(after_size).1.is_nil() {
-        return None;
-    }
-    let position = cp(after_size).0;
-    if !size.is_fixnum() || !position.is_fixnum() {
-        return None;
-    }
-    match (u32::try_from(size.as_fixnum()), u32::try_from(position.as_fixnum())) {
-        (Ok(size), Ok(position)) => Some((size, position)),
-        _ => None,
-    }
-}
-
-fn is_member_nil_t(form: EgclVal) -> bool {
-    if !form.is_cons() {
-        return false;
-    }
-    let (head, tail) = cp(form);
-    if !head.is_symbol() || sym_bare_name_rc(head).as_ref() != "MEMBER" {
-        return false;
-    }
-    let (mut saw_nil, mut saw_t, mut n, mut cur) = (false, false, 0u8, tail);
-    while cur.is_cons() {
-        let (e, rest) = cp(cur);
-        n += 1;
-        if e.is_nil() {
-            saw_nil = true;
-        } else if e.0 == T.0 {
-            saw_t = true;
-        } else {
-            return false;
-        }
-        cur = rest;
-    }
-    cur.is_nil() && n == 2 && saw_nil && saw_t
-}
-
-/// Recognise `(typep <expr> (quote <SIMPLE-TYPE>))` — exactly two arguments,
-/// the second a quoted constant type naming a tag-checkable [`typep_class`].
-/// Returns the class code (the caller re-derives the value expression from the
-/// still-rooted arg list), or `None` to fall back to a full TYPEP call. Never
-/// allocates a cons — only walks the (already rooted) argument list.
-fn typep_inline_class(rest: EgclVal) -> Option<u16> {
-    if !rest.is_cons() {
-        return None;
-    }
-    let (_val_form, r1) = cp(rest);
-    if !r1.is_cons() {
-        return None;
-    }
-    let (type_form, r2) = cp(r1);
-    if !r2.is_nil() {
-        return None; // exactly two args (the 3-arg env form falls through)
-    }
-    // The type must be a literal `(QUOTE <sym>)`; a bare symbol would be a
-    // variable reference, not a type designator.
-    if !type_form.is_cons() {
-        return None;
-    }
-    let (q, qr) = cp(type_form);
-    if !q.is_symbol() || sym_bare_name_rc(q).as_ref() != "QUOTE" || !qr.is_cons() {
-        return None;
-    }
-    let (tsym, qr2) = cp(qr);
-    if !qr2.is_nil() {
-        return None;
-    }
-    if tsym.is_symbol() {
-        return find_typep_class(&sym_bare_name_rc(tsym));
-    }
-    // A quoted compound type designator: only (MEMBER NIL T) is inlinable.
-    if is_member_nil_t(tsym) {
-        return Some(typep_class::BOOLEAN);
-    }
-    None
-}
-
 #[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
 fn literal_memory_fence(rest: EgclVal) -> Option<MemoryFenceKind> {
     if !rest.is_cons() {
@@ -3446,58 +3326,6 @@ impl<'e> Lowerer<'e> {
             self.push_n(1);
             return Ok(());
         }
-        // `(ldb (byte S P) X)` with a literal byte specifier reduces to
-        // `(logand (ash X -P) mask)`, so emit that instead of calling LDB.
-        //
-        // This is the inner loop of every hash and cipher: Ironclad's mod32+,
-        // rol32 and mod32ash are all LDB, which is why SHA-256 is unusable here
-        // (bliss-omaps). Measured per call, release build, promoted loop: the
-        // boot.lisp LDB costs ~7.1 us -- a cons for the specifier, then
-        // byte-size, byte-position, ash, logand and 1- as separate interpreted
-        // calls -- against ~0.17 us for the LOGAND it reduces to.
-        //
-        // A local LDB or BYTE shadow was already handled above (local_fns /
-        // closure_fns), and redefining a standard function is undefined
-        // behaviour (CLHS 11.1.2.1.2), so the standard meanings hold here.
-        if name == "LDB" {
-            if let Some((size, pos)) = literal_byte_spec(rest) {
-                // Only when the mask survives as a fixnum. A wider field would
-                // need a bignum constant built during lowering; let LDB handle
-                // those. Round-trip rather than assume a tag width: `i64` holds
-                // (1<<62)-1 but an EgclVal fixnum does not, and the wrap made
-                // `(ldb (byte 62 0) x)` mask with -1 and return x unchanged.
-                if let Some(mask) = 1i64
-                    .checked_shl(size)
-                    .map(|m| m - 1)
-                    .filter(|&m| EgclVal::from_fixnum(m).as_fixnum() == m)
-                {
-                    let (_, args) = cp(rest);
-                    let value = cp(args).0;
-                    let ash = resolve_sym("ASH").ok_or(Bail)?.as_symbol_index();
-                    let logand = resolve_sym("LOGAND").ok_or(Bail)?.as_symbol_index();
-                    self.lower_expr(value)?;
-                    // Skip the shift entirely for position 0, the common case.
-                    if pos != 0 {
-                        let c = self.add_const(EgclVal::from_fixnum(-i64::from(pos)));
-                        self.emit(Instr::Const(c));
-                        self.push_n(1);
-                        self.emit(Instr::CallNamed { sym: ash, nargs: 2 });
-                        self.pop_n(2);
-                        self.push_n(1);
-                    }
-                    let c = self.add_const(EgclVal::from_fixnum(mask));
-                    self.emit(Instr::Const(c));
-                    self.push_n(1);
-                    self.emit(Instr::CallNamed {
-                        sym: logand,
-                        nargs: 2,
-                    });
-                    self.pop_n(2);
-                    self.push_n(1);
-                    return Ok(());
-                }
-            }
-        }
         // A macro: expand one level (with the same macro functions the
         // tree-walker uses) and lower the expansion. lower_expr recurses, so a
         // macro that expands to another macro is handled too.
@@ -3552,25 +3380,9 @@ impl<'e> Lowerer<'e> {
                 return Ok(());
             }
         }
-        // Inline `(typep x 'SIMPLE-TYPE)` as a direct tag check instead of a c2i
-        // CallNamed to TYPEP — this is the hottest builtin on the package-
-        // machinery path (ensure-inherited/ensure-symbol call it ~8×/symbol,
-        // bliss-gq5). Only when TYPEP is the standard builtin: local/macro
-        // shadowing was resolved above, and a global redefinition (a `defun
-        // typep`) keeps the call so the user's semantics win.
-        if symbol_bare_name(name) == "TYPEP"
-            && !self.env.funs.borrow().contains_key(name)
-            && !self.env.generics.contains_key(name)
-        {
-            if let Some(class) = typep_inline_class(rest) {
-                // `rest` is rooted (above); its car is the value expression.
-                self.lower_expr(cp(rest).0)?;
-                self.emit(Instr::TypeP(class));
-                self.pop_n(1);
-                self.push_n(1);
-                return Ok(());
-            }
-        }
+        // Keep function calls intact here: source-level LDB/BYTE and TYPEP
+        // substitutions erased bindings that can change after compilation.
+        // Native builtin specialization must carry a live binding guard.
         // An unhandled special operator is not a call.
         if is_bail_special(name) {
             return Err(record_bail(|| format!("special:{name}")));
