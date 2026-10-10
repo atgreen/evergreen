@@ -717,8 +717,14 @@ impl<'a> Builder<'a> {
             let Some(&block) = self.block_of.get(&(bcp as usize)) else {
                 continue;
             };
+            let Some(control_scopes) = self.control_scopes.as_ref()
+                .and_then(|scopes| scopes.before(bcp)).map(<[_]>::to_vec)
+            else {
+                continue; // no entry may advertise an unknown control state
+            };
             let frame_state = self.build_frame_state(block, &[], bcp);
             self.f.osr_entries.push(crate::t2::ir::OsrEntry {
+                control_scopes,
                 bcp,
                 block,
                 frame_state,

@@ -343,8 +343,114 @@ pub(crate) fn lower_poll_transfer_map(
         call: f.terminator(block)?,
         machine_inst,
         origin_bcp: entry.bcp,
-        control_scopes: Vec::new(),
+        control_scopes: entry.control_scopes.clone(),
         frames,
         roots,
     })
+}
+
+#[cfg(test)]
+mod poll_scope_tests {
+    use super::lower_poll_transfer_map;
+    use crate::control_scope::{Ownership, ScopeKind, ScopeMap};
+    use crate::t2::{build, lower, regalloc, verify, x64_frame};
+    use egcl_rt::bytecode::{BytecodeFunction, Instr};
+    use egcl_rt::value::NIL;
+    use std::collections::HashMap;
+
+    #[test]
+    fn osr_poll_preserves_exact_nested_catch_header_scopes() {
+        let body = BytecodeFunction {
+            name: "nested-catch-poll-scopes".into(),
+            code: vec![
+                Instr::LoadLocal(0),
+                Instr::PushCatch {
+                    resume_bcp: 15,
+                    sp_restore: 0,
+                },
+                Instr::LoadLocal(1),
+                Instr::PushCatch {
+                    resume_bcp: 9,
+                    sp_restore: 0,
+                },
+                Instr::LoadLocal(2),
+                Instr::BrIfFalse(7),
+                Instr::Br(4),
+                Instr::Const(0),
+                Instr::PopHandler,
+                Instr::Pop,
+                Instr::LoadLocal(2),
+                Instr::BrIfFalse(13),
+                Instr::Br(10),
+                Instr::Const(0),
+                Instr::PopHandler,
+                Instr::Pop,
+                Instr::LoadLocal(2),
+                Instr::BrIfFalse(19),
+                Instr::Br(16),
+                Instr::Const(0),
+                Instr::Return,
+            ],
+            constants: vec![NIL],
+            load_time_values: vec![],
+            handler_cases: vec![],
+            handler_binds: vec![],
+            restart_cases: vec![],
+            nested_functions: vec![],
+            names: vec![],
+            param_layout: vec![],
+            param_types: vec![],
+            has_env: false,
+            n_locals: 3,
+            max_stack: 1,
+            arity: 3,
+            params_form: NIL,
+            min_args: 3,
+            max_args: Some(3),
+            variadic: false,
+        };
+        let scopes = ScopeMap::analyze_function(&body).unwrap();
+        let function = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+        verify::verify(&function).unwrap();
+        let mut machine = lower::lower(&function);
+        regalloc::allocate(&mut machine).unwrap();
+        let homes = x64_frame::select_frame_homes(&function, &machine, |_| false).unwrap();
+        let constants = HashMap::new();
+        assert_eq!(function.osr_entries.len(), 3);
+        for (bcp, pushes) in [(4, vec![1, 3]), (10, vec![1]), (16, vec![])] {
+            let expected = scopes.before(bcp).unwrap();
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(|scope| scope.push_bcp)
+                    .collect::<Vec<_>>(),
+                pushes
+            );
+            assert!(expected.iter().all(|scope| {
+                scope.ownership == Ownership::Local && matches!(scope.kind, ScopeKind::Catch { .. })
+            }));
+            let entry = function
+                .osr_entries
+                .iter()
+                .find(|entry| entry.bcp == bcp)
+                .unwrap();
+            let block_index = function
+                .block_order()
+                .iter()
+                .position(|&block| block == entry.block)
+                .unwrap();
+            let point = machine.blocks[block_index].start;
+            let values =
+                x64_frame::resolve_values_before(&function, &machine, &homes, &constants, point)
+                    .unwrap();
+            let capture = lower_poll_transfer_map(&function, entry.block, point, &values).unwrap();
+            assert_eq!(capture.origin_bcp, bcp);
+            assert_eq!(capture.frames.len(), 1);
+            assert_eq!(capture.frames[0].resume_pc, bcp);
+            assert_eq!(
+                capture.control_scopes, expected,
+                "poll must describe the exact scope stack at header {bcp}"
+            );
+        }
+    }
 }

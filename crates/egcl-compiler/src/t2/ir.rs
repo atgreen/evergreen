@@ -511,6 +511,10 @@ pub struct BlockData {
 /// shared EgclStack frame.
 #[derive(Clone, Debug)]
 pub struct OsrEntry {
+    /// Exact outer-to-inner bytecode scope stack before this header. These
+    /// scopes belong to the same activation across OSR; ownership is not
+    /// changed to Inherited merely because its machine code is replaced.
+    pub control_scopes: Vec<crate::control_scope::ControlScope>,
     pub bcp: u32,
     pub block: Block,
     pub frame_state: crate::t2::frame_state::FrameStateId,
