@@ -1200,7 +1200,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
             .count()
     };
     assert_eq!(guard_count(&f, false), 2);
-    assert_eq!(guard_count(&f, true), 2);
+    assert_eq!(guard_count(&f, true), 0, "canonical CL bindings are fixed");
     let mut pm = PassManager::new();
     pm.add(Box::new(GuardElim));
     pm.add(Box::new(Dce));
@@ -1210,7 +1210,7 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
         1,
         "CAR and CDR share one dominating cons guard"
     );
-    assert_eq!(guard_count(&f, true), 2, "each binding must still be checked");
+    assert_eq!(guard_count(&f, true), 0, "fixed bindings need no runtime binding guards");
     verify(&f).expect("optimized CAR/CDR IR verifies");
 
     let framed = emit_framed(
@@ -1298,7 +1298,7 @@ fn constant_typep_operands_execute_in_native_code() {
                 Instr::CallNamed { sym: typep, nargs: 2 }, Instr::Return,
             ], vec![value, type_name], 0, 2, 0);
             let function = build_from_bytecode(&input).expect("build constant TYPEP");
-            verify(&function).expect("constant predicate has valid binding guard");
+            verify(&function).expect("constant predicate has valid operand state");
             let native = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0,
                 clear_values as *const () as usize as u64, None)
                 .expect("emit constant TYPEP");
@@ -2002,6 +2002,46 @@ fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
             frame[0] = EgclVal::from_fixnum(iterations).0;
             assert_eq!(run(frame.as_mut_ptr()), EgclVal::from_fixnum(0).0,
                 "entry {offset}, iterations {iterations}");
+        }
+    }
+}
+
+#[test]
+fn standard_intrinsic_identity_does_not_consume_shadowed_user_calls() {
+    use egcl_compiler::t2::ir::{AuxData, Opcode};
+    for spelling in ["CAR", "FIXED-CL-USER::CAR", "CL::CAR"] {
+        // Only bare CAR is the canonical runtime registry identity. The other
+        // entries deliberately have the same print-name but distinct symbols.
+        let symbol = egcl_rt::symbols::intern(spelling);
+        let body = bytecode_fn("binding-identity", vec![
+            Instr::LoadLocal(0), Instr::CallNamed { sym: symbol, nargs: 1 }, Instr::Return,
+        ], vec![], 1, 1, 1);
+        let function = build_from_bytecode(&body).expect("build exact callable identity");
+        verify(&function).expect("binding identity preserves valid IR");
+        let instructions: Vec<_> = function.block_order().iter()
+            .flat_map(|&block| function.block(block).insts.iter())
+            .map(|&instruction| function.inst(instruction)).collect();
+        if spelling == "CAR" {
+            assert!(!instructions.iter().any(|instruction|
+                matches!(instruction.aux, AuxData::BuiltinBinding { .. })));
+            assert!(instructions.iter().any(|instruction| instruction.opcode == Opcode::Car));
+        } else if spelling == "CL::CAR" {
+            // A fabricated qualified registry entry is not the canonical
+            // package symbol. If metadata expands it, the old guard is vital.
+            let address = egcl_rt::symbols::symbol_object_ptr(symbol).unwrap()
+                + core::mem::offset_of!(egcl_rt::object::SymbolData, function);
+            assert!(instructions.iter().any(|instruction|
+                matches!(instruction.aux, AuxData::BuiltinBinding { address: guarded, .. }
+                    if guarded == address)));
+        } else {
+            let calls: Vec<_> = instructions.iter().filter(|instruction|
+                matches!(instruction.aux, AuxData::CallTarget(target) if target == symbol)).collect();
+            assert_eq!(calls.len(), 1, "{spelling} remains a dynamically resolved user call");
+            assert_eq!(calls[0].opcode, Opcode::Call);
+            assert!(calls[0].flags.effectful && calls[0].flags.safepoint);
+            let state = function.frame_states.get(calls[0].frame_state.unwrap());
+            assert_eq!(state.scopes[0].bcp, 1);
+            assert_eq!(state.scopes[0].stack.len(), 1);
         }
     }
 }

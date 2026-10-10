@@ -28,8 +28,9 @@ garbage collector, and a tree shaker for standalone applications.
   functions and unsupported forms can use the tree-walking evaluator.
 - **Optimization without required type declarations.** The compiler can
   specialize supported operations using observed values and guarded assumptions.
-  Failed guards deoptimize to less specialized execution. Functions remain
-  redefinable. See [how Lisp runs](docs/manual/user/explanation/execution.md).
+  Failed guards deoptimize to less specialized execution. User-defined functions
+  remain redefinable; standard `COMMON-LISP` functions have fixed semantics.
+  See [how Lisp runs](docs/manual/user/explanation/execution.md#function-redefinition).
 - **Lightweight concurrency.** Fibers share native carrier threads. Reads,
   writes, and readiness waits on established TCP streams can park an unpinned
   fiber while other work runs. Connect, accept, and DNS still block the carrier.

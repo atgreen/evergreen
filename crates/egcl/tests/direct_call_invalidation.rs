@@ -67,14 +67,18 @@ fn unchanged_builtin_revalidates_after_unrelated_definition() {
 }
 
 #[test]
-fn revalidated_builtin_still_observes_function_cell_replacement() {
+fn shadowed_length_still_observes_function_cell_replacement() {
     let (stdout, _) = run(&[
+        "(defpackage :length-user (:use :cl) (:shadow length))",
+        "(in-package :length-user)",
+        "(setf (symbol-function 'length) #'cl:length)",
         "(defun replaced-length (x) (length x))",
         "(assert (= 3 (replaced-length '(1 2 3))))",
         "(defun unrelated-epoch-change () 42)",
         "(assert (= 3 (replaced-length '(1 2 3))))",
         "(setf (symbol-function 'length) (lambda (x) (declare (ignore x)) (values 91 92)))",
         "(assert (equal '(91 92) (multiple-value-list (replaced-length '(1 2 3)))))",
+        "(assert (= 3 (cl:length '(1 2 3))))",
         "(format t \"REPLACEMENT-SEEN~%\")",
     ]);
     assert!(stdout.contains("REPLACEMENT-SEEN"), "{stdout}");

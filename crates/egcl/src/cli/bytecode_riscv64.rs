@@ -108,14 +108,15 @@ fn arithmetic(
     let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
         || (nargs == 2 && inlinable_fixnum_op(sym).is_some_and(|op| !matches!(op, FixnumOp::Mul)));
     if !supported { return false; }
-    let Some(egcl_compiler::t2::ir::AuxData::BuiltinBinding { address, expected }) =
-        egcl_compiler::t2::builtin_binding::snapshot(sym)
-    else { return false; };
-    let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
-    a.imm64(A0, address as u64);
-    a.load(A0, A0, 0);
-    a.imm64(A1, expected);
-    a.branch(Cond::Ne, A0, A1, deopt);
+    use egcl_compiler::t2::builtin_binding::{self, Binding};
+    let Some(binding) = builtin_binding::snapshot(sym) else { return false; };
+    if let Binding::Guarded { address, expected } = binding {
+        let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
+        a.imm64(A0, address as u64);
+        a.load(A0, A0, 0);
+        a.imm64(A1, expected);
+        a.branch(Cond::Ne, A0, A1, deopt);
+    }
     if nargs == 1 {
         if let Some(op) = inlinable_unary_fixnum_op(sym) {
             let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());

@@ -21296,9 +21296,9 @@ fn emit_native(
                     emit_clear_mv(&mut c);
                     continue;
                 }
-                // Inlined primitives still denote the live function binding.
-                // Check the pinned symbol cell at the operation (not just at
-                // entry): an earlier callback may replace it in this activation.
+                // Standard CL primitives have fixed semantics. Mutable implementation
+                // primitives check their pinned symbol cell at the operation:
+                // an earlier callback may replace it in this activation.
                 let primitive_shape = (*nargs == 1
                     && (inlinable_unary_fixnum_op(*sym).is_some()
                         || inlinable_fixnum_pred(*sym).is_some()
@@ -22251,9 +22251,9 @@ fn inlinable_fixnum_pred_uncached(sym: u32) -> Option<FixnumPred> {
     }
 }
 
-/// Emit an exact binding guard before a speculative builtin operation. Only
-/// absent definitions admit builtin lowering. Symbols are pinned, so their
-/// atomic function-cell address remains valid for the native code's lifetime.
+/// Standard CL primitives need no binding guard. Mutable primitives require
+/// an exact absent binding; their pinned symbol-cell address remains valid
+/// for the native code's lifetime.
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 fn emit_builtin_binding_guard(
     code: &mut Asm,
@@ -22261,10 +22261,11 @@ fn emit_builtin_binding_guard(
     symbol: u32,
     bcp: u32,
 ) -> bool {
-    let Some(egcl_compiler::t2::ir::AuxData::BuiltinBinding { address, expected }) =
-        egcl_compiler::t2::builtin_binding::snapshot(symbol)
-    else {
-        return false;
+    use egcl_compiler::t2::builtin_binding::{self, Binding};
+    let (address, expected) = match builtin_binding::snapshot(symbol) {
+        Some(Binding::FixedStandard) => return true,
+        Some(Binding::Guarded { address, expected }) => (address, expected),
+        None => return false,
     };
     code.extend_from_slice(&[0x48, 0xB8]); // mov rax, &symbol.function
     code.extend_from_slice(&(address as u64).to_le_bytes());
