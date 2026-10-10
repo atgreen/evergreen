@@ -4,9 +4,11 @@
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
-  multiple values and inherited handlers. Nested native calls and locally
+  multiple values and inherited handlers. Multiple-value bindings and standard
+  `SETF` expansions now stay in mapped T1/T2 code. Nested native calls and locally
   registered control scopes remain outside this initial OSR route
-  ([#218](https://github.com/atgreen/evergreen/pull/218)).
+  ([#218](https://github.com/atgreen/evergreen/pull/218),
+  [#219](https://github.com/atgreen/evergreen/pull/219)).
 
 - Preserve required type guards when optimized loops are entered through OSR
   (including nested loop entries) and reject entries with missing live values,
