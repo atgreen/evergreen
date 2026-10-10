@@ -1593,7 +1593,17 @@ Scanner lookups use already-published descriptors without initializing or waitin
 on a registry while mutators are stopped. Protected-child tests exercise this
 crossing; omitting it leaves stale native copies and fails the alias check.
 
-This advances `bliss-shih7.2.7.3.3` and `bliss-shih7.2.7.3.2.1`. Complete-walk
-accounting and exact managed-frame membership validation remain prerequisites for
-making native maps the sole root authority. These changes do not enable the
-universal native ABI by default.
+This advances `bliss-shih7.2.7.3.3` and `bliss-shih7.2.7.3.2.1`. Activation
+validation also follows the publishing execution's actual managed-frame links:
+in-range bytes resembling a header are insufficient. Each uninterrupted native
+walk caches its last matched managed frame so outward traversal does not rescan
+the whole chain for every frame or alias (`bliss-shih7.2.7.3.2.3.1`).
+
+In test builds, every unexpected walker bailout fails immediately across the
+native corpus. The deliberately malformed-publication fixture allows only its
+specific reason during one collection and requires exactly that head's two
+failures, from marking and relocation (`bliss-shih7.2.7.3.4`). These checks retain
+every shadow. Removing redundant shadows still requires a common partition for
+synchronization, restoration and maps; tagged volatile registers continue to need
+shadows to preserve their values. The universal native ABI is not enabled by
+default by these changes.

@@ -138,8 +138,29 @@ static BAILS: [std::sync::atomic::AtomicUsize; BAIL_KINDS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; BAIL_KINDS];
 
 #[cfg(test)]
+thread_local! {
+    static EXPECTED_BAIL: Cell<Option<Bail>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
 fn note_bail(bail: Bail) {
+    assert_eq!(EXPECTED_BAIL.with(Cell::get), Some(bail),
+        "unexpected native root-walk bailout: {bail:?}");
     BAILS[bail as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Only deliberately malformed publications may decline. Keep the permission
+/// local to one collector invocation and restore it even if its fixture panics.
+#[cfg(test)]
+fn with_expected_bail<R>(bail: Bail, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Bail>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            EXPECTED_BAIL.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(EXPECTED_BAIL.with(|slot| slot.replace(Some(bail))));
+    body()
 }
 
 /// Locations the maps said were addressable, and how many the walk actually
@@ -397,7 +418,7 @@ pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
         let code = unsafe { &*published.owner };
         let base = code.code.as_ptr() as usize;
         let segment = unsafe { &*published.segment };
-        let walk = Walk { bounds: published.bounds.clone(), stack: unsafe { &*published.stack } };
+        let walk = Walk::new(published.bounds.clone(), unsafe { &*published.stack });
         let mut cursor = published.cursor;
         loop {
             let Some(offset) =
@@ -475,9 +496,61 @@ fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
 struct Walk<'a> {
     bounds: Range<usize>,
     stack: &'a egcl_rt::stack::EgclStack,
+    // Only valid during this uninterrupted walk over a fixed managed chain.
+    // Native frames normally request activations from youngest to oldest.
+    frame_cursor: Cell<*const egcl_rt::stack::Frame>,
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
+    fn new(bounds: Range<usize>, stack: &'a egcl_rt::stack::EgclStack) -> Self {
+        Self { bounds, stack, frame_cursor: Cell::new(stack.fp()) }
+    }
+
+    /// Match an actual linked header before reading its declared slot count.
+    /// Cache the last match so a native walk follows each managed link at most
+    /// once, regardless of the number of roots or aliases in each frame.
+    fn activation(&self, activation: *mut EgclVal, slots: u16) -> Option<*mut EgclVal> {
+        use egcl_rt::stack::Frame;
+        let address = activation as usize;
+        if address % std::mem::align_of::<Frame>() != 0 {
+            return None;
+        }
+        let header = address.checked_sub(std::mem::size_of::<Frame>())?;
+        let end = address.checked_add(usize::from(slots) * std::mem::size_of::<EgclVal>())?;
+        let base = self.stack.base() as usize;
+        let top = self.stack.sp() as usize;
+        if header < base || end > top {
+            return None;
+        }
+        let mut frame = self.frame_cursor.get();
+        // Support an out-of-order diagnostic lookup without treating the cache
+        // as proof of membership. Ordinary outward native walks never restart.
+        if header > frame as usize {
+            frame = self.stack.fp();
+        }
+        while !frame.is_null() && frame as usize >= header {
+            let current = frame as usize;
+            if current < base || current % std::mem::align_of::<Frame>() != 0
+                || current.checked_add(std::mem::size_of::<Frame>())? > top {
+                return None;
+            }
+            // Start at the real top and follow only its actual frame links.
+            if current == header {
+                if unsafe { (*frame).num_locals } < slots {
+                    return None;
+                }
+                self.frame_cursor.set(frame);
+                return Some(activation);
+            }
+            let previous = unsafe { (*frame).prev_fp };
+            if previous as usize >= current {
+                return None;
+            }
+            frame = previous;
+        }
+        None
+    }
+
     /// A native stack word this publication actually owns.
     fn word(&self, address: usize) -> Option<usize> {
         self.slot(address).map(|slot| unsafe { (slot as *const usize).read() })
@@ -492,28 +565,14 @@ impl Walk<'_> {
     }
 }
 
-/// Accept an activation pointer only as the slot area of a real frame on this
-/// execution's managed stack: a `Frame` header must precede it inside the
-/// stack, the addressed slots must end at or below the stack pointer, and the
-/// header must itself declare at least that many slots. Nothing is
-/// dereferenced until all of that holds.
+/// Unit-test entry point using a fresh managed-frame cursor.
+#[cfg(test)]
 fn validated_activation(
     activation: *mut EgclVal,
     slots: u16,
     stack: &egcl_rt::stack::EgclStack,
 ) -> Option<*mut EgclVal> {
-    use egcl_rt::stack::Frame;
-    let address = activation as usize;
-    if address % std::mem::align_of::<Frame>() != 0 {
-        return None;
-    }
-    let header = address.checked_sub(std::mem::size_of::<Frame>())?;
-    let end = address.checked_add(usize::from(slots) * std::mem::size_of::<EgclVal>())?;
-    if header < stack.base() as usize || end > stack.sp() as usize {
-        return None;
-    }
-    // SAFETY: the header lies wholly inside this execution's managed stack.
-    (unsafe { (*(header as *const Frame)).num_locals } >= slots).then_some(activation)
+    Walk::new(0..0, stack).activation(activation, slots)
 }
 
 /// Returns the number of root slots visited through this boundary's frames.
@@ -534,10 +593,7 @@ unsafe fn walk_boundary(
     }
     let mut code = unsafe { &*boundary.owner };
     let segment = unsafe { &*boundary.segment };
-    let walk = Walk {
-        bounds: boundary.bounds.clone(),
-        stack: unsafe { &*boundary.stack },
-    };
+    let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let mut cursor = boundary.cursor;
     let mut total = 0;
     loop {
@@ -672,7 +728,7 @@ unsafe fn frame_activation(
         (Some(slot), Some(body_sp)) => walk
             .word(body_sp.checked_add(slot as usize * 8)?)
             .and_then(|activation| {
-                validated_activation(activation as *mut EgclVal, layout.activation_slots, walk.stack)
+                walk.activation(activation as *mut EgclVal, layout.activation_slots)
             }),
         _ => None,
     }
@@ -767,6 +823,32 @@ mod tests {
     use super::*;
     use egcl_rt::Collector;
 
+    #[test]
+    #[should_panic(expected = "unexpected native root-walk bailout")]
+    fn unexpected_walk_bailout_fails_the_test() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        note_bail(Bail::PcOutsideOwner);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected native root-walk bailout")]
+    fn expected_bailout_does_not_allow_another_failure_reason() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        with_expected_bail(Bail::NullOwner, || note_bail(Bail::PcOutsideOwner));
+    }
+
+    #[test]
+    fn expected_bailout_permission_ends_when_the_fixture_unwinds() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        assert!(std::panic::catch_unwind(|| {
+            with_expected_bail(Bail::NullOwner, || panic!("leave malformed fixture"));
+        }).is_err());
+        assert!(std::panic::catch_unwind(|| note_bail(Bail::NullOwner)).is_err());
+    }
+
     struct Probe {
         code: *const TransferCode,
         env: *mut Env,
@@ -850,7 +932,7 @@ mod tests {
         };
         let step = code._native_calls.unwind(code.code.as_ptr() as usize,
             &publication.cursor, publication.bounds.clone(), read_stack_word).unwrap();
-        let walk = Walk { bounds: publication.bounds.clone(), stack: unsafe { &*publication.stack } };
+        let walk = Walk::new(publication.bounds.clone(), unsafe { &*publication.stack });
         let aliases = verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).unwrap();
         assert!(aliases > 0, "compare at least one native/shadow pair before collection");
         let native = map.gc_locations().find_map(|location| match location {
@@ -1259,6 +1341,40 @@ mod tests {
             (unpushed + std::mem::size_of::<Frame>()) as *mut EgclVal, u16::MAX, &stack), None);
     }
 
+    #[test]
+    fn activation_validation_rejects_interior_slots_that_look_like_headers() {
+        use egcl_rt::stack::EgclStack;
+        let stack = EgclStack::new(64 * 1024);
+        let frame = stack.push_frame(NIL, std::ptr::null(), 4, 0).unwrap();
+        let activation = unsafe { frame.add(1) }.cast::<EgclVal>();
+        // At a header shifted by one slot, num_locals reads these high bits.
+        // The address and full claimed extent are inside the owning stack.
+        unsafe { activation.write(EgclVal::from_fixnum(1 << 29)) };
+        let interior = unsafe { activation.add(1) };
+        assert_eq!(validated_activation(activation, 4, &stack), Some(activation));
+        assert_eq!(validated_activation(interior, 1, &stack), None,
+            "in-bounds bytes resembling a header do not identify a linked frame");
+    }
+
+    #[test]
+    fn activation_cursor_accepts_linked_frames_and_repeated_alias_lookups() {
+        use egcl_rt::stack::EgclStack;
+        let stack = EgclStack::new(64 * 1024);
+        let older = stack.push_frame(NIL, std::ptr::null(), 4, 0).unwrap();
+        let younger = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+        let older = unsafe { older.add(1) }.cast::<EgclVal>();
+        let younger = unsafe { younger.add(1) }.cast::<EgclVal>();
+        let walk = Walk::new(0..0, &stack);
+        for activation in [younger, younger, older, older, younger, older] {
+            assert_eq!(walk.activation(activation, 2), Some(activation));
+        }
+        assert_eq!(walk.activation(younger, 3), None);
+        assert_eq!(walk.activation(older, 4), Some(older));
+        unsafe { older.write(EgclVal::from_fixnum(1 << 29)) };
+        assert_eq!(walk.activation(unsafe { older.add(1) }, 1), None);
+        assert_eq!(walk.activation(older, 4), Some(older));
+    }
+
     /// A publication the walker cannot trust must end its chain without
     /// dereferencing anything, while the real chain keeps working.
     fn observe_malformed() {
@@ -1280,19 +1396,19 @@ mod tests {
         };
         let past_the_code = code.code.as_ptr() as usize + code.code_len;
         let mut cases = [
-            ("PC outside the owner",
+            ("PC outside the owner", Bail::PcOutsideOwner,
                 malformed(published.owner, past_the_code, published.bounds.clone(), published.stack)),
-            ("empty stack bounds",
+            ("empty stack bounds", Bail::UnwindRefused,
                 malformed(published.owner, published.cursor.pc, 0..0, published.stack)),
-            ("no owner",
+            ("no owner", Bail::NullOwner,
                 malformed(std::ptr::null(), published.cursor.pc, published.bounds.clone(), published.stack)),
-            ("no managed stack",
+            ("no managed stack", Bail::NullStack,
                 malformed(published.owner, published.cursor.pc, published.bounds.clone(), std::ptr::null())),
         ];
-        for (label, boundary) in &mut cases {
+        for (label, reason, boundary) in &mut cases {
             ACTIVE.with(|slot| slot.set(boundary));
             take_completeness();
-            force_minor_gc();
+            with_expected_bail(*reason, force_minor_gc);
             // Positive control for the accounting itself: a malformed
             // publication must not merely visit nothing, it must RECORD why it
             // declined. Silence here would mean the bail counters cannot see
@@ -1301,8 +1417,12 @@ mod tests {
             let (_, _, bails) = take_completeness();
             ACTIVE.with(|slot| slot.set(real));
             assert_eq!(boundary.visited.get(), 0, "{label}: the walk must stop without guessing");
-            assert!(bails.iter().sum::<usize>() > 0,
-                    "{label}: the walk declined without recording a reason");
+            let mut expected = [0; BAIL_KINDS];
+            // Exactly the malformed head in the mark and relocation scans;
+            // an unrelated bad publication cannot hide behind this allowance.
+            expected[*reason as usize] = 2;
+            assert_eq!(bails, expected,
+                "{label}: only the deliberate malformed publication may decline");
             eprintln!("  {label}: bails=[{}]", describe_bails(bails));
         }
         force_minor_gc();
