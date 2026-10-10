@@ -20838,6 +20838,13 @@ fn emit_native(
     let builtin_addr =
         c2i_call_builtin as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize as u64;
     let clear_mv_addr = c2i_clear_mv as extern "C" fn() as usize as u64;
+    // The primary result must already be in its EgclStack slot. This leaf
+    // cannot allocate or signal; r14/r15 survive and rax is dead at the call.
+    let emit_clear_mv = |c: &mut Asm| {
+        c.extend_from_slice(&[0x48, 0xB8]); // mov rax, c2i_clear_mv
+        c.extend_from_slice(&clear_mv_addr.to_le_bytes());
+        c.extend_from_slice(&[0xff, 0xd0]); // call rax
+    };
     let load_global_addr = c2i_load_global as extern "C" fn(u64) -> u64 as usize as u64;
     let load_function_addr = c2i_load_function as extern "C" fn(u64) -> u64 as usize as u64;
     let store_global_addr = c2i_store_global as extern "C" fn(u64, u64) as usize as u64;
@@ -21088,6 +21095,7 @@ fn emit_native(
                         }
                         jcc_deopt(&mut c, &mut deopt_labels, Cc::O, bcp); // jo deopt
                         c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                     if let Some(pred) = inlinable_fixnum_pred(*sym) {
@@ -21119,6 +21127,7 @@ fn emit_native(
                         };
                         c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
                         c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                     if let Some(offset) = inlinable_cons_accessor(*sym) {
@@ -21150,6 +21159,7 @@ fn emit_native(
                         let l_nil = c.len();
                         c.patch_u8(je_site, (l_nil - (je_site + 1)) as u8);
                         c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // mov [r15-8], rax
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                     if let Some(pred) = inlinable_total_unary(*sym) {
@@ -21171,6 +21181,7 @@ fn emit_native(
                         c.extend_from_slice(&egcl_rt::value::T_BITS.to_le_bytes());
                         c.extend_from_slice(&[0x48, 0x0F, cc, 0xC2]); // cmovCC rax, rdx
                         push_rax(&mut c);
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                 }
@@ -21192,6 +21203,7 @@ fn emit_native(
                         c.extend_from_slice(&egcl_rt::value::T_BITS.to_le_bytes());
                         c.extend_from_slice(&[0x48, 0x0F, 0x44, 0xC2]); // cmove rax, rdx
                         push_rax(&mut c);
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                     if let Some(op) = inlinable_fixnum_op(*sym) {
@@ -21277,6 +21289,7 @@ fn emit_native(
                                 commit_bin(&mut c);
                             }
                         }
+                        emit_clear_mv(&mut c);
                         continue;
                     }
                 }
@@ -21470,10 +21483,7 @@ fn emit_native(
                 // value-preserving). rax is dead between statements; r14/r15 are
                 // callee-saved across the call, and the prologue keeps rsp
                 // 16-aligned for calls (same contract as CallNamed).
-                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (c2i_clear_mv)
-                c.extend_from_slice(&clear_mv_addr.to_le_bytes());
-                // This leaf helper cannot allocate or signal.
-                c.extend_from_slice(&[0xff, 0xd0]); // call rax
+                emit_clear_mv(&mut c);
             }
             // Each installed code version owns its original name snapshots,
             // including after redefinition and while entered through OSR.
