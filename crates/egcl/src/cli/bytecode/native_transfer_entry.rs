@@ -2123,7 +2123,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let context = CAPTURE.with(Cell::get);
     let Some(context) = (unsafe { context.as_mut() }) else { return false };
     let code = unsafe { &*context.owner };
-    if code.is_t2 || !context.nested.is_null() || !context.recursive.is_null()
+    if code.is_t2 || !context.recursive.is_null()
         || egcl_rt::current_stack().fp() != context.frame
     {
         return false;
@@ -2488,7 +2488,7 @@ unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
     prepare_escape(context);
     if context.osr.is_some() {
         // The poll's exact state is in scanned canonical slots. Its Rust scope
-        // has returned; retire this outer machine frame before entering T2.
+        // has returned; retire this machine frame before entering T2.
         capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
         return;
     }

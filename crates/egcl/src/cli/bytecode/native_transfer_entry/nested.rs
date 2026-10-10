@@ -179,7 +179,11 @@ fn prepare_call(
     // Preparation polls, compiles and allocates on behalf of a caller that is
     // suspended beneath this adapter frame. The record carries that caller's
     // exact geometry, so publish it for the whole extent.
-    unsafe { super::root_publication::published_mapped(record, || prepare_call_published(record, prepare)) }
+    unsafe {
+        super::root_publication::published_mapped(record, || {
+            prepare_call_published(record, prepare)
+        })
+    }
 }
 
 fn prepare_call_published(
@@ -379,6 +383,32 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
             let context = unsafe { (*owner).context.as_mut().unwrap() as *mut CaptureContext };
             if unsafe { (*context).failure.is_some() } {
                 return Err(invalid_capture());
+            }
+            if let Some((next, offset)) = unsafe { (*context).osr.take() } {
+                if NATIVE_ERROR.with(|slot| slot.is_some())
+                    || unsafe { (*context).selected.is_some() || !(*owner).state.is_quiescent() }
+                {
+                    return Err(invalid_capture());
+                }
+                let NativeCodeStorage::Mapped(next_code) = &next._storage else {
+                    return Err(invalid_capture());
+                };
+                // The parent stays published by the cold adapter. Transfer the
+                // child's managed frame exactly once; the new entry owns it
+                // even if preparation fails before machine execution begins.
+                let frame = unsafe { (*owner).frame.take() }.ok_or_else(invalid_capture)?;
+                if let Some(symbol) = next_code.installed_symbol {
+                    OSR_ENTRY_COUNTS.with(|counts| {
+                        let mut counts = counts.borrow_mut();
+                        let count = counts.entry(symbol).or_insert(0);
+                        *count = count.saturating_add(1);
+                    });
+                }
+                return next_code.run_activation(
+                    &[],
+                    unsafe { &mut *NATIVE_ENV.with(Cell::get) },
+                    Some((frame, offset)),
+                );
             }
             let error = NATIVE_ERROR
                 .with(|slot| slot.take())
