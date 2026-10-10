@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Honor replaced class/structure readers and memory-fence functions in compiled
+  and saved code, including reader methods and replacement multiple values.
+  Saved bytecode now uses version 2.0 and core images use format 8; recompile
+  older FASLs and rebuild older images
+  ([#202](https://github.com/atgreen/evergreen/pull/202)).
+
 - Preserve the selected restart when a `CERROR` handler invokes an outer
   restart also named `CONTINUE`. Restore special-variable bindings before
   cleanup and destination clauses during nonlocal exits, including nested
