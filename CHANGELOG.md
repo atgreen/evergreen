@@ -5,9 +5,13 @@
 - Restore efficient direct recursive calls in eligible optimized native code
   on Linux x86-64, avoiding the generic call setup that made recursive T2
   functions slower than T1. Recursive native calls now count toward automatic
-  T2 promotion, and cold or wrong-arity interpreter fallbacks count only once
+  T2 promotion, and cold or wrong-arity interpreter fallbacks count only once.
+  Reduce thread-lookup overhead in native execution, cutting elapsed time by
+  roughly 35–38% in the measured Linux x86-64 chain200 and Fibonacci benchmarks
+  compared with the preceding development build
   ([#227](https://github.com/atgreen/evergreen/pull/227),
-  [#228](https://github.com/atgreen/evergreen/pull/228)).
+  [#228](https://github.com/atgreen/evergreen/pull/228),
+  [#230](https://github.com/atgreen/evergreen/pull/230)).
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
