@@ -95,8 +95,8 @@
 //! `native_calls` separately indexes exact primary CALL return offsets, their
 //! source instructions/polls/deopt states, and temporary stack adjustments.
 //! Recovery toggles and other noncollecting leaf callbacks are excluded. These
-//! records bind the authoritative activation shadows, outgoing copies, and
-//! native homes. Deoptimization transfers ownership to reconstructed managed
+//! records bind retained activation shadows, outgoing copies, and native homes.
+//! Fully published entries omit shadows for stable native stack/register roots. Deoptimization transfers ownership to reconstructed managed
 //! frames before GC can observe the abandoned native serialization buffer.
 //!
 //! # Native transfers (Linux x86-64 only)
@@ -911,6 +911,10 @@ fn emit_shadow_root_sync(
     activation_slots: u16,
     shadow_slots: u16,
 ) -> Result<(), EmitError> {
+    if shadow_slots == 0 {
+        debug_assert!(roots.is_empty());
+        return Ok(());
+    }
     load_home(a, SCRATCH, frame_base, 0);
     // A single bitmap covers every shadow slot. Clear unused slots at each site
     // so stale values from a previous safepoint are not retained as false roots.
@@ -936,6 +940,9 @@ fn emit_shadow_root_restore(
     frame_base: FramedHome,
     activation_slots: u16,
 ) -> Result<(), EmitError> {
+    if synced_roots.is_empty() {
+        return Ok(());
+    }
     load_home(a, SCRATCH, frame_base, 0);
     for (i, value) in synced_roots.iter().enumerate() {
         if !restore_roots.contains(value) {
@@ -959,9 +966,11 @@ struct PollFrame {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn emit_mapped_poll(
     a: &mut Asm,
     values: &crate::t2::x64_frame::FrameValues,
+    roots: &[crate::t2::ir::Value],
     homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
     frame: &PollFrame,
     veneer: u64,
@@ -976,12 +985,6 @@ fn emit_mapped_poll(
             0,
         );
     }
-    let roots: Vec<_> = values
-        .values()
-        .iter()
-        .filter(|value| value.gc_home().is_some())
-        .map(|value| value.value)
-        .collect();
     let layout = NativeFrameLayout {
         native_slots: frame.native_slots,
         activation_base_slot: match frame.base {
@@ -996,7 +999,7 @@ fn emit_mapped_poll(
     let map = std::sync::Arc::new(
         NativeFrameValues::for_call(
             values.values(),
-            &roots,
+            roots,
             frame.activation_slots,
             &[],
             None,
@@ -1008,7 +1011,7 @@ fn emit_mapped_poll(
     );
     emit_shadow_root_sync(
         a,
-        &roots,
+        roots,
         homes,
         frame.base,
         frame.activation_slots,
@@ -1023,7 +1026,7 @@ fn emit_mapped_poll(
     let restore = roots.iter().copied().collect();
     emit_shadow_root_restore(
         a,
-        &roots,
+        roots,
         &restore,
         homes,
         frame.base,
@@ -3247,8 +3250,19 @@ enum CleanupEmission {
     },
 }
 
+/// How collecting helpers expose a suspended caller's tagged values.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NativeRootPublication {
+    /// Helpers do not publish native frames; retain scanned activation copies.
+    ActivationShadows,
+    /// Every collecting helper, poll, recursive call, adapter and cold route
+    /// publishes exact writable native homes for the entire collecting extent.
+    PublishedHomes,
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
+    roots: NativeRootPublication,
     veneer: u64,
     named_veneers: Vec<(u32, u64)>,
     cleanup: Option<CleanupEmission>,
@@ -3295,6 +3309,7 @@ pub fn emit_framed_transfers_with_cleanup(
         None,
         None,
         &[],
+        NativeRootPublication::ActivationShadows,
     )
 }
 
@@ -3329,6 +3344,7 @@ pub fn emit_framed_native_cleanups(
         None,
         None,
         &[],
+        NativeRootPublication::ActivationShadows,
     )
 }
 
@@ -3424,6 +3440,7 @@ pub fn emit_framed_native_handlers_with_recursion(
         recursion,
         deopt_veneer,
         &[],
+        NativeRootPublication::ActivationShadows,
     )
 }
 
@@ -3445,6 +3462,7 @@ pub fn emit_framed_native_handlers_with_entries(
     recursion: Option<RecursiveTransfer>,
     deopt_veneer: Option<u64>,
     named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
@@ -3464,6 +3482,7 @@ pub fn emit_framed_native_handlers_with_entries(
         recursion,
         deopt_veneer,
         named_veneers,
+        roots,
     )
 }
 
@@ -3479,6 +3498,7 @@ fn emit_transfer_function(
     recursion: Option<RecursiveTransfer>,
     deopt_veneer: Option<u64>,
     named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
     if deopt_veneer == Some(0) || named_veneers.iter().any(|(_, entry)| *entry == 0) {
@@ -3586,6 +3606,7 @@ fn emit_transfer_function(
         }
     }
     let mut transfers = TransferEmission {
+        roots,
         veneer: call_veneer,
         named_veneers: named_veneers.to_vec(),
         cleanup,
@@ -3698,6 +3719,11 @@ fn emit_framed_inner(
     let transfer_mode = transfers.is_some();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let published_native_roots = transfers.as_ref()
+        .is_some_and(|emission| emission.roots == NativeRootPublication::PublishedHomes);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let published_native_roots = false;
     if f.block_order().iter().any(|&b| {
         f.block(b).insts.iter().any(|&i| {
             !transfer_mode
@@ -4312,6 +4338,9 @@ fn emit_framed_inner(
         let bits = inference.ty(value).bits;
         !bits.is_bottom() && bits.meet(IMMEDIATE) == bits
     };
+    let needs_shadow = |entry: &crate::t2::x64_frame::FrameValue| {
+        entry.gc_home().is_some_and(|home| !published_native_roots || !home.survives_sysv_call())
+    };
     let mut safepoint_roots: HashMap<Inst, Vec<Value>> = HashMap::new();
     if activation_slots.is_some() {
         for point in resolved.iter() {
@@ -4322,7 +4351,7 @@ fn emit_framed_inner(
             // recovery. Before liveness includes dying call arguments and
             // excludes the call's as-yet-unwritten result.
             let mut live: Vec<_> = point.values().iter()
-                .filter(|entry| entry.gc_home().is_some() && !proven_immediate(entry.value))
+                .filter(|entry| needs_shadow(entry) && !proven_immediate(entry.value))
                 .map(|entry| entry.value)
                 .collect();
             live.sort_by_key(|value| value.0);
@@ -4365,7 +4394,7 @@ fn emit_framed_inner(
     // Polls preserve tagged immediates as well as moving candidates because
     // their calls were inserted after allocation's clobber analysis.
     let poll_roots = |values: &crate::t2::x64_frame::FrameValues| {
-        values.values().iter().filter(|value| value.gc_home().is_some())
+        values.values().iter().filter(|value| needs_shadow(value))
             .map(|value| value.value).collect::<Vec<_>>()
     };
     let loop_roots: HashMap<_, _> = loop_maps.iter()
@@ -4695,6 +4724,7 @@ fn emit_framed_inner(
             let (call, values) = emit_mapped_poll(
                 &mut a,
                 loop_maps.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
+                loop_roots.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
                 &homes,
                 poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                 poll_veneer,
@@ -4723,6 +4753,7 @@ fn emit_framed_inner(
                 let (call, values) = emit_mapped_poll(
                     &mut a,
                     straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    straight_poll_roots.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
                     &homes,
                     poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                     poll_veneer,
@@ -4888,9 +4919,9 @@ fn emit_framed_inner(
                             shadow_roots.push((location, slot));
                         }
                     }
-                    // Only values live at THIS call justify an unshadowed
-                    // immediate. A register can hold a moving value elsewhere
-                    // in the function after its previous occupant dies.
+                    // Only values live at this call justify an unshadowed
+                    // immediate or a published stable native home. A reused
+                    // register's dead occupants impose no requirement here.
                     let point = resolved_by_source
                         .get(&inst)
                         .ok_or(EmitError::UnsupportedOp(0xFD))?;
@@ -4905,7 +4936,9 @@ fn emit_framed_inner(
                                 .is_some_and(|home| home.location() == Some(*root)))
                             .map(|entry| entry.value)
                             .collect();
-                        if values.is_empty() || !values.into_iter().all(proven_immediate) {
+                        if values.is_empty() || !values.into_iter().all(|value| {
+                            proven_immediate(value) || (published_native_roots && homes[&value].survives_sysv_call())
+                        }) {
                             return Err(EmitError::UnsupportedOp(0xFD));
                         }
                     }
@@ -7605,6 +7638,63 @@ mod poll_map_tests {
     use std::collections::HashMap;
 
     #[test]
+    fn published_poll_does_not_copy_stable_native_roots_to_shadows() {
+        use crate::t2::x64_value_maps::NativeValueLocation;
+        let mut f = Function::new("native-only-poll-homes");
+        let entry = f.entry();
+        let stack = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let register = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(entry, InstData {
+            opcode: Opcode::Return, args: vec![stack, register], results: vec![],
+            aux: AuxData::None, flags: InstFlags::default(), targets: vec![],
+            frame_state: None, source_pos: 0,
+        });
+        let mut machine = crate::t2::lower::lower(&f);
+        crate::t2::regalloc::allocate_framed(&mut machine).unwrap();
+        let homes = FrameHomes {
+            values: HashMap::from([(stack, FramedHome::Stack(0)), (register, FramedHome::Reg(12))]),
+            stack_slots: 1,
+        };
+        let values = resolve_values_before(&f, &machine, &homes, &HashMap::new(), 0).unwrap();
+        let emit = |roots: &[crate::t2::ir::Value], shadow_slots| {
+            let mut a = Asm::new();
+            let (_, map) = emit_mapped_poll(&mut a, &values, roots, &homes.values,
+                &PollFrame { base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
+                    raw_spill_start: 2, native_slots: 3 }, 0x12345678, false).unwrap();
+            (a.finish().unwrap(), map)
+        };
+        let memory_moves = |bytes: &[u8]| {
+            use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+            let mut reads = 0;
+            let mut writes = 0;
+            for instruction in Decoder::new(64, bytes, DecoderOptions::NONE) {
+                assert!(!instruction.is_invalid());
+                if instruction.mnemonic() == Mnemonic::Mov {
+                    writes += usize::from(instruction.op0_kind() == OpKind::Memory);
+                    reads += usize::from(instruction.op1_kind() == OpKind::Memory);
+                }
+            }
+            (reads, writes)
+        };
+        let (shadowed, _) = emit(&[stack, register], 2);
+        let (shared_area, map) = emit(&[], 2);
+        let (native_only, _) = emit(&[], 0);
+        eprintln!("published stable-home poll: shadowed={} bytes {:?} loads/stores; \
+            shared area={} bytes {:?}; no area={} bytes {:?}",
+            shadowed.len(), memory_moves(&shadowed), shared_area.len(), memory_moves(&shared_area),
+            native_only.len(), memory_moves(&native_only));
+        assert_eq!(map.gc_locations().copied().collect::<Vec<_>>(), vec![
+            NativeValueLocation::Stack(0), NativeValueLocation::Register(12),
+        ]);
+        let (old_reads, old_writes) = memory_moves(&shadowed);
+        let (reads, writes) = memory_moves(&shared_area);
+        assert_eq!(old_reads - reads, 4, "remove native read, restore base, and two shadow reads");
+        assert_eq!(old_writes - writes, 3, "remove two shadow writes and native stack restore");
+        assert_eq!(memory_moves(&native_only), (1, 0), "only the poll activation pointer load remains");
+        assert!(native_only.len() < shared_area.len() && shared_area.len() < shadowed.len());
+    }
+
+    #[test]
     fn poll_relocates_tagged_home_without_scanning_raw_register_bits() {
         use crate::t2::x64_value_maps::NativeValueLocation;
         struct Check {
@@ -7705,6 +7795,7 @@ mod poll_map_tests {
             let (_, map) = emit_mapped_poll(
                 &mut a,
                 &values,
+                &[tagged],
                 &homes.values,
                 &PollFrame {
                     base: FramedHome::Stack(1),

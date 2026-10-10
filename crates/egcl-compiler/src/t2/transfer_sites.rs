@@ -65,8 +65,8 @@
 //! pair the snapshot with another site's recipes. `capture_from_activation`
 //! reads each root from its activation shadow slot when one exists and other
 //! words through the native recipe: a helper that collected has updated the
-//! shadows but not yet restored native homes, so reading a root's native home
-//! here could resurrect a stale pointer. `write_back` returns updated words
+//! shadows but not yet restored shadowed native homes. Unshadowed moving roots
+//! require native publication so those homes already contain relocated values. `write_back` returns updated words
 //! through the native recipes. Both are `unsafe`: the frame must be live and
 //! no GC or yield may intervene during the raw copies.
 
@@ -588,15 +588,17 @@ impl SysvSiteSnapshot {
         unsafe { self.capture_from_activation(code_base, capture, &[]) }
     }
 
-    /// Capture updated activation shadows for roots and native homes for raw
-    /// words. Normal-path shadow restoration has not run when a helper exits
-    /// through the veneer, so reading native root homes here can resurrect stale
-    /// pointers. Bounds and mapping checks finish before any native read.
+    /// Capture updated shadows where present, otherwise the native home.
+    /// Unshadowed moving roots require published homes that the collector has
+    /// already updated. Normal-path shadow restoration has not run when a
+    /// helper exits through the veneer, so a retained shadow takes precedence.
+    /// Bounds and mapping checks finish before any native read.
     ///
     /// # Safety
     /// Same live-frame contract as `capture`. `activation` must be the owning
     /// activation, kept rooted across the helper and subsequent reconstruction;
-    /// its mapped shadows must contain the current values for this exact call.
+    /// its mapped shadows and all unshadowed published native roots must contain
+    /// the current values for this exact call.
     pub unsafe fn capture_from_activation(
         &mut self,
         code_base: usize,

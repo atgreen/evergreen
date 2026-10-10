@@ -123,13 +123,19 @@ impl NativeFrameValues {
                 return Err(Error::InvalidValues);
             }
             let moving = entry.gc_home().is_some() && !nonmoving(entry.value);
-            if moving && shadow.is_none() {
+            if moving && shadow.is_none()
+                && !entry.gc_home().is_some_and(ValueHome::survives_sysv_call) {
                 return Err(Error::MissingRoot(entry.value));
             }
             let location = match entry.location {
                 FrameValueLocation::Immediate(value) => NativeValueLocation::Constant(value),
                 FrameValueLocation::Home(_) if shadow.is_some() => {
                     NativeValueLocation::Activation(shadow.unwrap())
+                }
+                FrameValueLocation::Home(ValueHome::Reg(reg))
+                    if entry.repr == ValueRepresentation::Tagged
+                        && ValueHome::Reg(reg).survives_sysv_call() => {
+                    NativeValueLocation::Register(reg)
                 }
                 FrameValueLocation::Home(ValueHome::Reg(_)) if poll_spill_start.is_some() => {
                     if entry.repr == ValueRepresentation::Tagged {
@@ -148,23 +154,10 @@ impl NativeFrameValues {
                 FrameValueLocation::Home(ValueHome::Reg(_)) => NativeValueLocation::Unavailable,
             };
             let mut locations = vec![location];
-            // Record the value's real native home ALONGSIDE its shadow slot.
-            //
-            // The `Home(_) if shadow.is_some()` arm above MASKS the Stack and
-            // Register arms, and a moving value is required to have a shadow, so
-            // until this a map could not describe a non-activation home at all
-            // and the precise walk could reach nothing the managed-stack scan
-            // already reached (bliss-shih7.2.7.3). Appending rather than
-            // reordering keeps the primary location, and the poll-spill arm's
-            // `raw_slot` counter, exactly as they were: that arm rejects a
-            // Tagged value and is unreachable only because the shadow arm
-            // precedes it.
-            //
-            // Only a home that SURVIVES the helper call may be added. A
-            // caller-saved register's contents are destroyed by the call, which
-            // is what the shadow store and restore exist to preserve; the
-            // Register arm is already restricted to the callee-saved set, whose
-            // save words the published capture image makes writable.
+            // Preserve every real writable copy when a shadow is retained.
+            // Tagged volatile registers need that shadow to preserve their
+            // value across the call; stable native homes can stand alone when
+            // the emitter has guaranteed publication of the caller.
             if moving {
                 let native_home = match entry.location {
                     FrameValueLocation::Home(ValueHome::Stack(slot)) => {
@@ -335,6 +328,33 @@ mod tests {
                 if poll.is_some() { NativeValueLocation::Stack(16) }
                 else { NativeValueLocation::Unavailable },
             ], "tagged poll registers must not consume raw spill positions");
+        }
+    }
+
+    #[test]
+    fn moving_native_homes_do_not_require_activation_shadows() {
+        let values = [
+            home(0, Repr::Tagged, ValueHome::Stack(0)),
+            home(1, Repr::Tagged, ValueHome::Reg(12)),
+            home(2, Repr::UnboxedFixnum, ValueHome::Reg(13)),
+            home(3, Repr::Tagged, ValueHome::Reg(1)),
+            home(4, Repr::UnboxedFixnum, ValueHome::Reg(8)),
+        ];
+        for poll in [None, Some(2)] {
+            let map = NativeFrameValues::for_call(
+                &values, &[Value(3)], 4, &[], None, layout(), poll, |_| false,
+            ).expect("stable native homes are sufficient roots");
+            assert_eq!(map.gc_locations().copied().collect::<Vec<_>>(), vec![
+                NativeValueLocation::Stack(0), NativeValueLocation::Register(12),
+                NativeValueLocation::Activation(4),
+            ]);
+            if poll.is_some() {
+                assert_eq!(map.ssa_value(Value(2)).unwrap().locations(),
+                    &[NativeValueLocation::Stack(16)]);
+                assert_eq!(map.ssa_value(Value(4)).unwrap().locations(),
+                    &[NativeValueLocation::Stack(24)],
+                    "tagged native homes must not consume raw poll spill slots");
+            }
         }
     }
 
