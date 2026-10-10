@@ -1,0 +1,2372 @@
+slli	s6,s6,0x12
+fld	fa2,248(a0)
+fld	fa4,200(a5)
+.insn	4, 0xf716fb47
+lui	a3,0xc84f3
+fsd	fa1,104(a1)
+lui	a6,0x911f6
+.insn	8, 0x493c395d660777bf
+.insn	2, 0x73ff
+.insn	4, 0x8d17310f
+sw	s4,120(sp)
+sd	s2,48(sp)
+ld	a0,72(a5)
+ld	a2,504(sp)
+ld	a5,232(a3)
+slli	tp,tp,0x3
+lw	a1,52(a3)
+xori	sp,s11,263
+sw	a3,28(a0)
+.insn	2, 0x8794
+.insn	4, 0x2151119b
+beqz	s0,0xffffffffffffffca
+addi	s0,s0,-29
+addi	a5,sp,888
+sw	a0,88(sp)
+fnmsub.s	ft6,fa2,fa4,fs0,rup
+fsd	fs2,352(sp)
+.insn	4, 0xce45152b
+addiw	sp,sp,-32
+.insn	4, 0x87041bc7
+beqz	s0,0x14e
+slli	tp,tp,0x21
+beqz	a3,0xffffffffffffff88
+fsd	fs1,160(a5)
+lui	t3,0x5
+.insn	4, 0xe70a19cf
+fld	fs0,216(sp)
+.insn	8, 0x12c3ab6f52b22ebf
+lw	a1,20(a2)
+lw	s0,116(a5)
+srli	a2,a2,0x27
+sd	s1,128(a1)
+addi	a5,sp,276
+j	0xfffffffffffffbb4
+sw	a7,204(sp)
+sd	t2,1217(a4)
+fsd	fs1,176(a4)
+sd	s0,280(sp)
+addi	a3,sp,588
+fsd	fa5,152(sp)
+slli	s3,s3,0x23
+addi	s1,sp,132
+.insn	4, 0x83bc4377
+.insn	4, 0x55d89a3b
+addi	a0,sp,892
+lw	a0,16(a1)
+add	s2,s2,s3
+fsd	ft2,176(sp)
+addi	a0,sp,916
+lh	ra,1424(s2)
+addi	t1,t1,6
+c.nop	-4
+ld	s4,184(sp)
+lui	tp,0xb35ec
+c.li	zero,9
+sw	t5,100(sp)
+addiw	a0,a0,13
+beqz	s1,0x18c
+beqz	a1,0x1b0
+beqz	s0,0x86
+addiw	a4,a4,26
+fld	fa4,232(a1)
+fsd	fs3,280(sp)
+srli	a3,a3,0xf
+addi	s11,s11,15
+fsd	fs1,224(a5)
+sw	gp,-38(t0)
+j	0x5aa
+.insn	8, 0xa84d3d5c75a323bf
+addiw	gp,gp,10
+.insn	4, 0xe546ee0b
+lw	s1,80(a3)
+addi	t3,t3,11 # 0x500b
+andi	a0,a0,4
+csrrci	s8,0xf90,3
+sd	s10,216(sp)
+fld	fa4,184(s1)
+sw	t2,208(sp)
+fsd	ft4,504(sp)
+fld	ft9,152(sp)
+.insn	4, 0x7744d5b3
+.insn	4, 0x3e301177
+fld	ft8,168(sp)
+add	s6,s6,t4
+.insn	4, 0x63f9a653
+li	s1,15
+addi	a1,a1,26
+j	0xffffffffffffff9c
+beqz	a5,0x90
+slli	s4,s4,0x1d
+ld	a4,16(a5)
+lui	s9,0xb896b
+fsd	fa1,112(a3)
+ld	s3,296(sp)
+.insn	4, 0x7ded309b
+lui	a3,0xffff1
+fld	fs0,104(a1)
+beqz	a4,0x1ca
+j	0x1a8
+sw	a3,240(sp)
+fsd	fs1,72(a2)
+fld	fs11,416(sp)
+fld	fa4,128(a3)
+.insn	4, 0xb8ecedfb
+ld	a0,72(a0)
+sw	s5,148(sp)
+fld	ft4,208(sp)
+beqz	a5,0x204
+beqz	a2,0x5a
+ld	a0,168(a0)
+jal	a3,0xd14ae
+.insn	4, 0xe78d3043
+slli	s9,s9,0x3a
+add	a1,a1,t4
+fsd	fa1,88(a0)
+sd	a2,240(s0)
+li	a4,28
+.insn	4, 0x2c693747
+fmadd.d	fa0,ft3,ft6,ft0,unknown
+addiw	s2,s2,7
+ld	s4,88(sp)
+csrrw	a4,mhpmcounter11,gp
+beqz	a0,0x250
+beqz	a3,0x146
+.insn	4, 0xbf135aaf
+fmadd.d	fs8,fa4,fs6,fs9,rmm
+.insn	4, 0xaf9951a3
+.insn	2, 0x8888
+sd	s1,160(s0)
+mv	t4,a2
+sd	s1,72(a5)
+.insn	4, 0x7f5154bb
+.insn	4, 0x91a09ebb
+.insn	4, 0x1f64e06b
+ld	a2,152(s0)
+lw	a1,100(a2)
+jal	t1,0xfffffffffffb823c
+slli	s7,s7,0x1c
+j	0xfffffffffffffdbe
+li	a6,-15
+lw	a1,12(a4)
+sd	s11,-1971(s2)
+slli	t2,t2,0x7
+addiw	a6,a6,12 # 0xffffffff911f600c
+beqz	a5,0x212
+.insn	4, 0x7e042967
+.insn	4, 0x2f3426e3
+c.lui	zero,0x7
+ld	a4,40(a3)
+li	t2,-18
+.insn	4, 0x180bcb1b
+.insn	2, 0x9a9c
+bltu	s6,t2,0x1d8
+li	tp,-28
+sext.w	s10,s10
+sw	s4,84(sp)
+c.slli	zero,0x29
+lui	t5,0x10
+ld	gp,312(sp)
+.insn	4, 0x279d670b
+.insn	4, 0x60edb90f
+ld	a0,224(s1)
+.insn	4, 0x5bc9482f
+lw	s6,4(sp)
+j	0xfffffffffffffdf8
+addi	s11,s11,0
+addiw	t0,t0,-15
+jr	gp
+ld	a3,8(a5)
+sw	t3,212(sp)
+fsd	ft2,448(sp)
+lui	s9,0x16
+sd	a1,48(s0)
+add	t0,t0,s5
+ld	a1,416(sp)
+slti	a1,gp,404
+fsd	fa4,128(sp)
+addi	s1,sp,812
+fsd	fa5,208(a2)
+.insn	4, 0xbcd2a80f
+add	t1,t1,a6
+sd	a4,72(a2)
+lui	s4,0x5de0
+sw	t4,220(sp)
+.insn	8, 0xb5c055c32de7f7bf
+.insn	4, 0x149bdd77
+li	t1,-22
+j	0x588
+srai	a0,a0,0x36
+beqz	a1,0x1ba
+.insn	2, 0x8d78
+.insn	4, 0xc29f8c3b
+sd	a5,56(s0)
+j	0x380
+lui	t0,0x2893b
+fsd	fa0,120(a1)
+.insn	4, 0xddd77827
+addiw	s6,s6,12
+addiw	a4,a4,6
+li	t4,-7
+li	s10,17
+lw	t3,132(sp)
+fsd	ft8,320(sp)
+j	0x57a
+.insn	4, 0xbe607403
+slli	t3,t3,0x3a
+csrrw	s6,0xe42,zero
+li	a2,-20
+lw	a4,100(s0)
+addi	a0,sp,176
+j	0x15e
+lw	a4,52(sp)
+lui	a0,0x20a4b
+addi	s8,s8,26
+.insn	4, 0x5d8e48e7
+bnez	a2,0x15e
+.insn	4, 0xebda063b
+fsd	fa4,88(s0)
+.insn	4, 0xd4c3ff1b
+.insn	2, 0x8890
+fld	fs0,200(a4)
+fsd	fa1,448(sp)
+sd	a3,232(a1)
+add	t5,t5,s8
+lui	s7,0xcfd58
+addi	sp,sp,0
+.insn	2, 0x8e34
+lw	a1,120(sp)
+j	0x7ce
+fld	ft4,344(sp)
+fnmadd.d	ft1,fa0,fs1,ft11,rmm
+sw	t0,52(sp)
+jal	a0,0xfffffffffff4da96
+j	0x4d4
+.insn	2, 0x8518
+.insn	4, 0x16abdfeb
+j	0x146
+slli	t2,t2,0x10
+lw	s4,188(sp)
+lw	a2,32(a5)
+ld	s1,48(sp)
+ld	a3,64(s1)
+addiw	a5,ra,1082
+fmadd.s	fs6,ft5,ft1,ft0
+xor	s0,s0,s1
+fsd	ft9,72(sp)
+lui	t3,0xdf205
+sd	a1,184(a3)
+fld	fs0,104(sp)
+fld	ft11,0(sp)
+bnez	a0,0x396
+fsd	ft3,846(t1)
+.insn	4, 0xc76fe8c3
+sd	a5,96(a1)
+mv	s8,tp
+sw	a4,36(a1)
+bnez	a4,0x1f8
+fld	fs11,48(sp)
+addiw	a3,a3,-15 # 0xffffffffffff0ff1
+beqz	s0,0x394
+.insn	8, 0x4375f23d913f0ebf
+csrrs	t1,0x232,a3
+ld	s4,56(sp)
+fld	ft9,352(sp)
+fld	fa4,200(s0)
+lw	t5,36(sp)
+lw	a2,8(a1)
+.insn	4, 0xfcb66c9b
+sw	s1,100(s1)
+ld	s0,128(a4)
+addi	s2,s2,-28
+fld	fa0,64(a5)
+j	0x73c
+srai	a0,a0,0x1a
+.insn	2, 0x92e4
+ld	a0,432(sp)
+fld	fa2,128(s1)
+sd	a5,264(sp)
+beqz	s1,0x348
+fmsub.d	fs1,fa7,fa0,ft7,rup
+beqz	a2,0x31c
+fld	fa5,152(s0)
+sd	a5,136(a5)
+lw	s1,56(a3)
+lw	s0,108(sp)
+addi	t2,t2,-1
+.insn	4, 0xa6012057
+fld	fs10,104(sp)
+andi	a1,a1,-26
+lw	s0,60(a1)
+sd	a1,424(sp)
+addi	a1,sp,104
+.insn	2, 0x95ec
+bnez	a3,0x26a
+lw	a5,40(s0)
+.insn	4, 0xa63b22d3
+.insn	4, 0x84bc38db
+addi	a2,sp,616
+.insn	4, 0xe25fdd23
+.insn	4, 0xf5b70c3b
+.insn	4, 0x8940faf7
+addi	a2,a2,29
+.insn	2, 0x9c20
+li	a2,0
+.insn	2, 0x91a4
+fsd	fa2,168(s1)
+sd	t0,312(sp)
+fld	fs3,224(sp)
+.insn	14, 0xf0cc600f8401891b0f4387fba37f
+fld	fs0,80(a1)
+beqz	a4,0x264
+beqz	a3,0x434
+ld	s6,16(sp)
+fld	fa4,0(s0)
+.insn	4, 0x1bd39b6b
+fsd	fa1,200(a2)
+lw	a0,40(a1)
+sd	a3,216(a0)
+andi	a5,a5,-8
+fnmadd.s	fa4,ft10,ft10,fs1,rtz
+fsd	fa4,136(a1)
+sw	a0,16(a0)
+.insn	2, 0x9ce4
+ld	gp,288(sp)
+beqz	s1,0x384
+.insn	4, 0x1543e44b
+addiw	a6,a6,15
+fsd	fa4,24(a5)
+addi	s2,s2,-27
+sw	a2,68(a2)
+addi	a4,sp,748
+sd	s6,240(sp)
+lui	s4,0xffffe
+sd	s3,144(sp)
+.insn	4, 0x166bc8d3
+.insn	4, 0x8baff833
+.insn	20, 0x32cb13915993cd987579cb11fd20ecf4c24e577f
+sd	a4,176(a4)
+.insn	2, 0x9ddc
+addiw	a3,a3,-19
+.insn	6, 0x7dc6614d815f
+fld	fa1,16(a2)
+slli	t6,t6,0x1
+.insn	6, 0xfb168b64c1df
+.insn	4, 0x14ac3e53
+li	sp,0
+sw	a4,32(a1)
+andi	a5,a5,2
+addi	s10,s10,-29
+andi	gp,ra,2033
+ld	a3,112(a5)
+ld	a1,208(a3)
+beqz	s0,0x2c6
+jal	s6,0x72188
+.insn	4, 0xe9e9f20b
+sd	a4,16(sp)
+sd	a4,328(sp)
+lw	s2,104(sp)
+addiw	a1,a1,31
+slli	a2,a2,0x35
+ld	a4,96(a0)
+sw	s0,80(a2)
+ld	a3,440(sp)
+addiw	gp,gp,23
+sw	t2,228(sp)
+lw	s3,88(sp)
+addi	s1,sp,500
+sw	a6,12(sp)
+.insn	2, 0x9580
+mv	t3,t5
+lw	s1,228(sp)
+.insn	4, 0x3af536bb
+li	a4,-3
+fsd	fa7,280(sp)
+fld	fs1,176(a1)
+sw	a5,108(sp)
+addi	tp,tp,-10 # 0xffffffffb35ebff6
+.insn	2, 0x9a18
+lw	a0,44(s1)
+beq	tp,tp,0x14c
+addiw	s8,s8,-22
+mv	s6,s3
+fld	fa4,440(sp)
+fld	fa0,232(a1)
+ld	a4,32(s1)
+ld	s1,208(a2)
+srai	s0,s0,0x36
+lw	tp,168(sp)
+li	s2,23
+lw	a5,20(sp)
+fld	fa7,200(sp)
+sw	sp,20(sp)
+fsd	fa4,136(a0)
+mv	s5,s9
+sd	a3,144(sp)
+lw	a0,40(a1)
+addi	a2,sp,32
+ld	a4,24(s0)
+addi	a0,sp,836
+fsd	ft2,32(sp)
+fld	fs0,208(a5)
+slli	a1,a1,0x36
+lui	a6,0xc
+addi	s5,s5,-17
+ld	a1,168(s1)
+.insn	4, 0x1f67270b
+lw	t6,180(sp)
+fsw	fs3,719(t2)
+andi	a4,a4,-24
+lui	t3,0xe
+ld	a0,120(s0)
+bnez	s1,0x49c
+srli	a1,a1,0x31
+.insn	4, 0x3f36a2c7
+.insn	2, 0x8810
+.insn	2, 0x9570
+fsd	fs7,-1833(sp)
+slli	s11,s11,0x3d
+ld	a4,224(a0)
+bnez	s0,0x402
+.insn	2, 0x9bc0
+j	0xde
+fld	fa4,272(sp)
+bnez	s0,0x41c
+addiw	t6,t6,-28
+addi	s0,sp,648
+.insn	4, 0x696d5c53
+sd	s2,280(sp)
+.insn	4, 0xdca01aa7
+addi	a3,a3,14
+addi	t6,t6,-5
+beqz	a4,0x52e
+lui	a7,0xffff9
+lw	s4,160(sp)
+.insn	4, 0x199843a3
+add	a3,a3,t4
+.insn	8, 0xdb892a2e8b269ebf
+j	0x542
+lw	s11,96(sp)
+li	ra,1
+lw	s9,108(sp)
+fld	fs1,200(s0)
+ld	a0,16(a5)
+sd	a1,48(a1)
+jalr	t0,1671(s6)
+li	a2,28
+ld	s2,168(sp)
+addiw	s4,s4,9 # 0xffffffffffffe009
+fld	ft8,272(sp)
+sd	a1,48(a3)
+.insn	4, 0x96d51b43
+ld	t2,24(sp)
+.insn	4, 0xc10fc98b
+lui	a3,0xfffef
+bnez	s1,0x3ca
+ld	a3,224(a4)
+fnmadd.s	ft7,fs0,fa3,fa1,unknown
+lui	t2,0xfffe2
+lui	a4,0xfffe4
+ld	a4,112(a2)
+.insn	4, 0x011b55db
+sd	a4,0(a4)
+ld	s1,72(a4)
+li	a7,28
+.insn	4, 0x3dd68b8b
+sd	s10,168(sp)
+c.lui	zero,0x18
+sd	t6,312(sp)
+sw	s4,64(sp)
+sd	s0,168(a1)
+sd	a5,40(a2)
+addiw	s1,s1,-9
+lw	a3,136(sp)
+add	sp,sp,a2
+fld	fa4,376(sp)
+lui	a1,0x16
+.insn	6, 0x5cd597dbf65f
+fsd	fa0,0(a3)
+fld	fs1,184(a2)
+.insn	4, 0x2ba89b27
+j	0xe2
+ld	a4,16(s1)
+li	a3,15
+addiw	s3,s3,-2
+jal	a7,0xb8120
+lui	s6,0xffffa
+.insn	4, 0xbe491c1b
+sd	s6,80(sp)
+addiw	s9,s2,-1572
+ld	a2,32(s0)
+lui	tp,0x1
+.insn	4, 0x49606a77
+fld	fa0,168(a1)
+j	0xcd4
+.insn	4, 0xbae305d3
+.insn	4, 0x68f32f3b
+.insn	4, 0xd87089fb
+li	s4,13
+lw	s1,64(a4)
+sw	a5,0(a5)
+fsd	fs4,408(sp)
+sd	a4,144(s1)
+fsd	fa4,144(s1)
+.insn	4, 0xbc275f6b
+lui	a6,0x1b
+mv	s4,s4
+sub	a4,a4,s1
+lui	t0,0xa
+addi	a1,a1,-9 # 0x15ff7
+.insn	4, 0x6a51456b
+.insn	4, 0xbf0f7fe7
+fsd	fa3,48(a2)
+lui	s4,0x18
+.insn	4, 0x9a6a507b
+fld	fs0,104(a2)
+ld	a5,448(sp)
+.insn	18, 0xe4aafb57bca5e6953e78f33dd4e61c5bc2ff
+.insn	4, 0xc957792f
+lw	s0,72(s0)
+.insn	4, 0x520e36fb
+fsd	fa1,136(a0)
+andi	s1,s1,-6
+lw	a3,124(s1)
+lw	s10,76(sp)
+.insn	10, 0x612ef6e8c412e298037f
+j	0xffffffffffffff08
+srai	a1,a1,0x2f
+fld	fa4,128(a4)
+bnez	a0,0x4f6
+mv	a6,s8
+beqz	a5,0x570
+li	t2,-25
+fld	ft4,248(sp)
+.insn	4, 0x48b162db
+fnmadd.d	ft7,fs3,ft9,fs0
+li	t3,9
+lui	ra,0x19
+lui	s10,0x17
+sw	a3,32(a0)
+fld	fs0,160(sp)
+fld	fa2,104(s1)
+ld	a1,56(s0)
+slli	t3,t3,0x7
+add	t6,t6,a0
+beqz	s0,0x572
+mv	s7,a3
+addi	s10,s10,29 # 0x1701d
+fsd	fa5,16(a0)
+lw	a5,192(sp)
+addi	a0,a0,20 # 0x20a4b014
+fsd	fa5,88(a1)
+ld	a2,32(s0)
+.insn	4, 0x8cfd31fb
+addi	a5,sp,688
+fsd	fa3,104(a5)
+addi	a2,sp,776
+sd	ra,464(sp)
+csrrci	t1,0x12c,6
+.insn	4, 0x752c708f
+li	s0,-22
+lui	a0,0xfffee
+sw	a3,96(s1)
+.insn	2, 0x6062
+addi	a0,a0,-5 # 0xfffffffffffedffb
+fld	fa5,120(a3)
+ld	a5,120(a4)
+mv	t0,s1
+sd	a0,64(a5)
+fld	fa5,80(sp)
+addi	s1,sp,404
+addi	a5,sp,20
+fsd	fa0,72(a4)
+fsd	fa1,40(a3)
+addi	a1,sp,520
+sd	a6,312(sp)
+beqz	a5,0x5ae
+auipc	tp,0xd8f6d
+fsd	ft10,432(sp)
+sw	a0,132(sp)
+fld	fa0,104(a4)
+lui	t3,0x10135
+lui	s1,0xe
+lw	a4,8(a0)
+addiw	s8,s8,15
+addi	s4,s4,21 # 0x18015
+lw	a2,120(a4)
+lui	t0,0x7
+ld	a2,96(a2)
+lw	t1,160(sp)
+mv	a3,ra
+.insn	4, 0x2c682a0f
+addi	a5,sp,460
+.insn	2, 0x8002
+addi	a1,sp,780
+fld	ft6,176(sp)
+sw	s1,116(a5)
+ld	a1,184(a0)
+fld	fs4,368(sp)
+lw	sp,164(sp)
+sd	s1,56(a2)
+lui	a5,0x1
+fld	ft0,-1150(a6) # 0x1ab82
+sw	a5,36(s1)
+slli	a2,a2,0x7
+lui	s10,0xffff9
+fsd	ft6,24(sp)
+j	0xd24
+.insn	4, 0xabfad52f
+addi	a2,sp,800
+ld	a3,24(a4)
+fld	fs0,208(a0)
+ld	a4,264(sp)
+fsd	fa1,136(a2)
+lw	a0,68(s0)
+sw	s0,32(s0)
+fld	fs6,224(sp)
+sw	t1,28(sp)
+.insn	4, 0x341c4033
+sd	a5,72(a4)
+j	0xffffffffffffff04
+sd	s0,152(a5)
+fsd	fa4,248(a4)
+ld	a1,216(sp)
+sw	s3,92(sp)
+.insn	4, 0x857f1f33
+.insn	2, 0x8e80
+beqz	a3,0x748
+.insn	4, 0x3dcc6ad7
+sw	s1,28(a1)
+j	0x80c
+.insn	4, 0xf420d1eb
+addi	t6,t6,28
+j	0x604
+.insn	4, 0x044bf0ab
+auipc	t6,0x8463f
+.insn	12, 0xd79ea2a00df46fbaf21f97ff
+.insn	2, 0x9d7c
+sw	s0,20(a1)
+fmsub.s	fs0,fs5,fs0,ft11,unknown
+lw	a2,20(a0)
+ld	a4,416(sp)
+mv	t3,s7
+.insn	6, 0xec120854809f
+addiw	s0,s0,-13
+li	s0,-19
+.insn	4, 0x8ef1217b
+sw	a4,48(a0)
+slli	gp,gp,0x2d
+addw	a5,a5,a2
+sd	zero,216(sp)
+li	a1,-13
+sd	a1,72(a0)
+li	tp,29
+slli	a5,a5,0x1b
+sw	a3,112(s1)
+sd	s7,304(sp)
+fld	fa3,320(sp)
+fld	fa4,232(a1)
+sw	t3,252(sp)
+sw	s0,120(s0)
+ld	a4,48(a5)
+beqz	s0,0x75c
+sd	a4,64(a3)
+addi	s1,s1,15 # 0xe00f
+j	0x856
+add	t6,t6,s6
+.insn	2, 0x8e10
+addi	t2,a3,-1132 # 0xfffffffffffeeb94
+.insn	4, 0xa44de753
+.insn	4, 0x9764b6fb
+fsd	fa3,96(a2)
+fsd	fs10,24(sp)
+lw	a1,40(a3)
+mv	t5,t0
+fsd	fa6,64(sp)
+sw	t5,172(sp)
+fld	fa3,72(a4)
+addi	a3,sp,656
+bnez	a5,0x690
+fsd	fa2,336(sp)
+lw	t5,216(sp)
+.insn	4, 0x5d0dfdd7
+j	0xdce
+sw	a1,100(a5)
+andi	a2,a2,-10
+j	0x692
+ld	t5,272(sp)
+jalr	a5,-238(t5) # 0xff12
+addi	t6,t6,-10 # 0xffffffff8463f664
+addi	a1,sp,988
+andi	s1,s1,-6
+bnez	a1,0x71e
+addiw	s9,s9,25 # 0x16019
+.insn	4, 0x5b1d812b
+sw	a6,212(sp)
+addi	a4,a4,-19 # 0xfffffffffffe3fed
+li	s4,-13
+fld	fs1,48(sp)
+beqz	a0,0x7e0
+.insn	2, 0x89e0
+.insn	2, 0x400a
+sw	a5,100(a5)
+auipc	s10,0x635f8
+bnez	s0,0x636
+ld	gp,296(sp)
+lui	s7,0x4
+.insn	2, 0x7dff
+mv	s0,s2
+fld	fs0,168(sp)
+sd	t1,504(sp)
+fnmsub.d	ft9,fs5,fs10,ft7,unknown
+slli	a0,a0,0x35
+addi	t3,t3,30 # 0x1013501e
+.insn	8, 0x3afdd804de502bbf
+.insn	4, 0xc512bfb3
+ld	a6,376(sp)
+.insn	2, 0x9ed0
+ori	t0,a0,-996
+fsd	fa3,96(a0)
+sd	t1,432(sp)
+mv	t0,s7
+.insn	4, 0x55942a63
+beqz	a2,0x726
+lw	s2,200(sp)
+.insn	2, 0x9fed
+addi	a2,sp,428
+.insn	4, 0xeb865bd3
+.insn	4, 0x5c5da2c3
+or	a2,a2,a3
+fsd	fa0,72(s0)
+fsw	ft2,157(a4)
+.insn	4, 0x2384e0e7
+.insn	4, 0x40f64407
+sd	a1,240(s1)
+add	s10,s10,s10
+li	s9,-25
+.insn	4, 0xb800df1b
+fsd	ft10,336(sp)
+.insn	16, 0x6b7d1445f904f9b7e878ccacfe11b27f
+andi	s0,s0,-14
+sw	s0,108(a1)
+slli	s8,s8,0xa
+fsd	fa1,8(a0)
+li	a1,-25
+fld	ft11,448(sp)
+addiw	s2,s2,16
+.insn	4, 0x07bed5b3
+.insn	2, 0x97d4
+fld	ft1,352(sp)
+.insn	2, 0x8f4c
+sw	t2,28(sp)
+.insn	4, 0xa8158f5b
+bnez	s1,0x6e2
+.insn	4, 0xad037647
+.insn	4, 0xa4a253c3
+addi	a4,a4,-19
+sw	s0,120(a5)
+sd	a5,104(a4)
+addiw	s4,s4,13
+addi	s1,sp,892
+.insn	2, 0x9a44
+sd	a4,248(sp)
+auipc	s8,0xf28ad
+sd	s0,192(a0)
+j	0xdb8
+addi	a4,a4,-9
+fsd	fs9,272(sp)
+lui	a5,0xfffe9
+bnez	a1,0x830
+fnmadd.s	fs2,ft5,ft3,ft2,unknown
+.insn	2, 0x82f4
+sb	s8,921(ra) # 0x19399
+.insn	20, 0x20948a5d9fc8d692e69918dc1d2cf476f4ca5f7f
+lw	s10,88(sp)
+beqz	a3,0x7ce
+lw	a3,68(a0)
+.insn	4, 0x6552ff0f
+.insn	4, 0x57efeb53
+fld	fs1,8(s0)
+mv	s8,sp
+ld	s2,144(sp)
+addi	a4,sp,552
+li	gp,-26
+lw	a2,96(a0)
+csrrs	s8,pmpaddr22,s11
+srai	s1,s1,0x26
+jal	s6,0xfffffffffffd6e06
+fnmadd.s	fs4,fs9,fa3,fa3,rup
+addi	a1,sp,820
+sd	s10,184(sp)
+addiw	a6,zero,-465
+.insn	2, 0x8104
+sw	t6,12(sp)
+bnez	a4,0x90c
+j	0x3a2
+addiw	t4,t4,12
+srli	a0,a0,0x13
+.insn	4, 0xc4a54ce7
+.insn	8, 0x0c39fe462dbcd3bf
+addi	a3,sp,268
+slli	sp,sp,0x27
+mv	gp,s1
+lw	a0,20(a1)
+fld	fa0,176(a0)
+lui	a0,0x12
+.insn	4, 0x8fa5be0f
+lw	sp,44(sp)
+sd	s1,120(sp)
+add	s1,s1,a7
+slli	s6,s6,0x3e
+addi	t0,t0,-14 # 0x6ff2
+lui	a6,0x55934
+fsd	ft6,352(sp)
+addi	s1,sp,348
+mv	a5,t6
+lb	sp,-596(t6)
+sw	a4,88(a3)
+addi	gp,gp,30
+ld	s6,-1143(zero) # 0xfffffffffffffb89
+fld	fa4,216(a4)
+addiw	t0,t0,-7
+bnez	a3,0x8fc
+slli	t3,t3,0x32
+addiw	a0,a0,23 # 0x12017
+.insn	4, 0x6518354b
+fld	fa5,104(s0)
+sw	s1,64(a2)
+sw	t4,124(sp)
+lui	t5,0xb
+.insn	4, 0xf4a0c5c3
+sd	a6,416(sp)
+li	sp,12
+lw	a0,12(s0)
+sd	a3,176(sp)
+sd	a1,184(s1)
+.insn	4, 0x1196b0e7
+ld	a6,192(sp)
+.insn	4, 0x1826a9d7
+amoand.w	a7,a3,(s7)
+j	0x86c
+addi	t1,t1,-21
+sd	a7,24(sp)
+.insn	2, 0x850c
+mv	s3,s9
+sw	a5,40(a2)
+lui	s4,0xffff8
+li	t3,25
+lw	t6,128(sp)
+ld	ra,280(sp)
+bnez	s1,0x8be
+bnez	a0,0x880
+.insn	4, 0x8680fc2b
+.insn	4, 0x8e2ddcd3
+li	s5,27
+.insn	4, 0xa77e8b5b
+fld	ft9,168(sp)
+fsd	fa1,32(sp)
+sw	a2,24(s1)
+fsd	fa5,64(a0)
+sw	s4,24(sp)
+beqz	s1,0x8ce
+addiw	s2,s2,5
+j	0x104a
+beqz	a5,0x8e2
+lw	a5,188(sp)
+.insn	4, 0xd0dd0557
+fld	ft4,400(sp)
+.insn	4, 0xf6350547
+.insn	4, 0xe89a8607
+addi	a4,sp,284
+addi	s1,sp,112
+ld	t1,128(sp)
+bnez	a1,0x82c
+sw	a1,240(sp)
+lui	s11,0xf
+.insn	4, 0x18947f77
+addiw	gp,gp,-27
+fsd	ft10,440(sp)
+lui	a5,0x19
+j	0x61a
+addiw	gp,gp,-6
+.insn	4, 0x37dc9a53
+bnez	s1,0x946
+beqz	a5,0x976
+ld	a2,192(s1)
+ld	s6,264(sp)
+sd	t6,16(sp)
+bnez	s0,0x99c
+srai	s1,s1,0x29
+sw	a3,92(a5)
+fsd	fs0,272(sp)
+mv	t0,s2
+.insn	4, 0xc4c45c3b
+auipc	a0,0x50ee8
+slli	a4,a4,0x5
+addi	t2,t2,30 # 0xfffffffffffe201e
+sd	t3,88(sp)
+lw	t5,8(sp)
+.insn	4, 0x154571db
+.insn	4, 0xb75779a7
+srai	a1,a1,0xf
+lui	t0,0xffffa
+lw	a4,0(a3)
+fsd	fa6,472(sp)
+addiw	s7,s7,2 # 0x4002
+subw	a2,a2,a1
+ld	a1,16(a0)
+srli	a3,a3,0x28
+lui	s2,0xfffe5
+addi	a0,sp,536
+jal	s7,0x1220a
+fsd	fa1,96(a4)
+fsd	fa4,88(sp)
+.insn	2, 0x2041
+ld	s0,216(a1)
+addiw	t1,t1,22
+.insn	4, 0x9a58560f
+fsd	fs0,224(a4)
+beqz	a1,0x916
+.insn	4, 0xfa5eb38f
+fsd	fa4,248(sp)
+li	sp,28
+beqz	a5,0x968
+fsd	fa3,112(a3)
+j	0xabc
+fld	fa1,168(sp)
+sw	a0,44(a2)
+lw	s1,52(s0)
+ld	a2,424(sp)
+lui	gp,0xfffee
+j	0xba0
+.insn	4, 0xe631f907
+ld	a5,192(a1)
+addi	a4,sp,780
+lui	t2,0xe657c
+addw	s1,s1,a5
+.insn	8, 0x080dd076b9dac53f
+ld	a2,400(sp)
+lui	a4,0xf
+.insn	10, 0x7abc771edcb70a3c08ff
+fsd	fa0,152(a2)
+bnez	a3,0xa2a
+fld	fs4,32(sp)
+sw	s9,120(sp)
+lui	t4,0x1e61d
+beqz	a1,0xa6c
+slli	s7,s7,0x1a
+bnez	a5,0xa3e
+.insn	4, 0x9469b2db
+sw	t1,76(sp)
+ld	gp,248(sp)
+ld	s5,424(sp)
+addi	t4,t4,21 # 0x1e61d015
+ld	s9,360(sp)
+sd	a5,184(a3)
+li	t3,28
+sd	a3,136(a0)
+c.slli	zero,0x1
+lw	a3,60(a4)
+addiw	s0,s0,-24
+fnmadd.s	fs10,ft5,fa3,fs11,rne
+sw	s1,100(a5)
+.insn	2, 0x7cff
+addiw	s0,s0,11
+lw	a3,88(s1)
+fsd	fa4,104(sp)
+lui	s2,0xb8907
+fld	fa3,144(sp)
+fld	fs8,320(sp)
+addi	t6,t6,-29
+ld	a5,176(s0)
+bnez	a5,0x92c
+fsd	fs0,216(s0)
+bnez	a4,0x9d4
+sd	s2,504(sp)
+sb	ra,1498(t5) # 0xb5da
+fmsub.d	fs8,ft10,fa0,ft10
+sd	a2,112(s1)
+addi	s0,s0,6
+.insn	4, 0x2ad1e23b
+sw	a3,68(a5)
+.insn	2, 0x9eb4
+.insn	2, 0x973c
+.insn	4, 0x4bf702eb
+.insn	4, 0x0eb9f90f
+sw	a4,24(a1)
+.insn	4, 0x32ae71a3
+sw	a0,104(a2)
+fsd	fa5,176(s0)
+.insn	4, 0xa9e0ec87
+sw	a3,88(a1)
+.insn	4, 0x753e6f07
+jal	s2,0x158f4
+fsd	fs2,32(sp)
+lui	t0,0xfffeb
+fmadd.d	fs9,fa5,ft10,ft11
+ld	a1,240(s0)
+.insn	4, 0x65710c77
+.insn	4, 0xd611aeab
+beqz	s1,0xa16
+sext.w	s11,s11
+fld	fa3,32(a4)
+addiw	s9,s9,17
+fsd	fs1,232(a0)
+.insn	4, 0x2af333fb
+.insn	8, 0x5967b7d7cf36213f
+.insn	4, 0xf1d97927
+sd	a0,112(a5)
+li	t0,14
+fsd	fa1,8(s0)
+csrrw	s5,0x6c4,s1
+ld	a5,280(sp)
+.insn	4, 0x3a23cc77
+sw	a5,56(s1)
+fsd	ft1,136(sp)
+fld	fa4,184(a5)
+sd	a0,16(sp)
+bnez	a0,0xb48
+fld	fs1,160(a4)
+addiw	s2,s2,-8 # 0xffffffffb8906ff8
+.insn	4, 0x0890990b
+fsd	fa0,368(sp)
+slli	s10,s10,0x20
+.insn	4, 0x293fca07
+fsd	fa4,216(a1)
+sd	a5,96(a2)
+fsd	fa5,280(sp)
+fmsub.d	ft5,fs7,fs5,ft1,unknown
+.insn	4, 0xea93f31b
+lui	a4,0x1a
+ld	gp,144(sp)
+jal	s5,0xfffffffffff49808
+fsd	fa0,456(sp)
+fmadd.d	fs0,fs11,ft4,fs3
+beqz	s1,0xa60
+lw	a1,80(s1)
+fnmadd.d	fs2,fa2,fs8,ft4,rne
+sw	a3,84(a1)
+auipc	a0,0x89cea
+sw	a4,20(s1)
+sd	a4,40(a1)
+.insn	4, 0x46d3604b
+.insn	4, 0x74f74f27
+lw	a3,12(sp)
+lw	a1,4(s0)
+.insn	4, 0x0772922b
+fld	fs0,192(s1)
+addi	s4,s4,-28 # 0xffffffffffff7fe4
+fsd	fa3,208(a1)
+srai	a5,a5,0x1d
+beqz	a2,0xafa
+fld	fs0,376(sp)
+fld	fs8,360(sp)
+sd	a1,184(a2)
+bnez	s1,0x9f6
+flw	fa2,-257(zero) # 0xfffffffffffffeff
+sw	tp,148(sp)
+lw	s1,124(a1)
+.insn	4, 0x6c1be523
+andi	a5,a5,5
+fsd	fa0,88(a5)
+sd	a5,208(a3)
+addi	a2,sp,212
+.insn	4, 0x1c74f2d7
+lw	s0,92(a4)
+fsd	fs0,24(sp)
+addi	a1,sp,532
+lw	s0,48(a1)
+sw	a5,120(s0)
+li	s2,7
+fsd	fs0,224(a3)
+.insn	4, 0xdb12bfe3
+.insn	4, 0x0be1b92b
+ld	a6,456(sp)
+.insn	8, 0x960a3e8cba361abf
+.insn	4, 0x7c0a5b77
+beqz	a1,0xb76
+bnez	a2,0xa12
+.insn	4, 0x90c5dd8f
+lui	s6,0xffff8
+fld	fa1,24(a3)
+.insn	4, 0xa3e8919b
+mv	a7,s10
+sd	a0,72(s1)
+lw	a2,124(a4)
+fld	fa2,40(a0)
+addi	a2,sp,916
+.insn	8, 0x927307d9d5e8bdbf
+.insn	4, 0x4492fa03
+mv	s7,s0
+ld	a5,232(s0)
+li	a2,8
+.insn	4, 0x01f9b73b
+sd	s0,80(a3)
+sd	t5,96(sp)
+beqz	a1,0xb52
+lwu	s6,-1506(a3)
+li	gp,-18
+fsd	fa1,56(a3)
+.insn	4, 0x8bce9887
+.insn	4, 0xf90b0efb
+slli	s6,s6,0x15
+fsd	fa0,8(a2)
+li	a0,30
+ld	a3,136(s0)
+sw	a5,0(s0)
+addiw	s10,s10,-12 # 0x635f870a
+fsd	fs2,272(sp)
+sw	gp,28(sp)
+ld	a5,208(a1)
+j	0x61c
+beqz	a4,0xb46
+fld	fa4,224(a0)
+sd	tp,368(sp)
+.insn	6, 0x980d0f7cd2df
+.insn	4, 0x560b73c3
+fld	fa2,136(sp)
+sw	a2,4(a1)
+ld	a2,64(a1)
+slli	t5,t5,0x26
+fsd	fs0,104(a3)
+lw	gp,168(sp)
+.insn	12, 0x0a547587e9d140e4edff1c7f
+bnez	a0,0xaa6
+or	a2,a2,a2
+lw	t1,120(sp)
+sw	t2,132(sp)
+jal	t1,0xfffffffffffdb91a
+fsd	fa3,144(s0)
+beqz	a4,0xc6a
+ld	a3,144(s1)
+beqz	s0,0xb6c
+fld	fa6,120(sp)
+bnez	a0,0xb02
+.insn	6, 0xca1e001c2fdf
+fld	ft2,128(sp)
+.insn	2, 0x8174
+ld	a5,328(sp)
+addiw	a4,a4,-19 # 0x19fed
+fsd	fa2,344(sp)
+ld	a0,64(a1)
+fnmadd.s	ft0,ft8,fs6,fs6,rtz
+ld	a1,88(a0)
+ld	a3,112(a0)
+addi	sp,sp,-29
+srli	a1,a1,0xf
+beqz	a0,0xab8
+fsd	fa4,16(a0)
+beqz	s0,0xc0c
+sw	s1,32(s0)
+addiw	s1,s1,-15
+fsd	fa5,72(a5)
+ld	a1,32(a2)
+j	0x9f0
+add	gp,gp,tp
+sw	s8,188(sp)
+bnez	a0,0xbca
+addiw	t6,t6,-9
+.insn	4, 0xba4f19ab
+addi	s9,a0,2028 # 0xffffffff89ceb27e
+sw	s0,192(sp)
+beqz	a3,0xc80
+addi	a7,a7,-4 # 0xffffffffffff8ffc
+sd	s10,184(sp)
+.insn	4, 0xed237fd7
+ld	t0,456(sp)
+.insn	4, 0xa2369d33
+fsd	fa1,184(s1)
+sd	a0,96(a5)
+lw	a2,40(a5)
+.insn	4, 0x0297fe0b
+bnez	a0,0xb86
+.insn	4, 0xaf7714e7
+addiw	a7,a7,-17
+srli	s1,s1,0x1b
+.insn	4, 0xe430e21b
+slli	a5,a5,0x1
+lw	s1,212(sp)
+lw	a1,72(a5)
+or	s0,s0,a3
+sd	a7,416(sp)
+lw	a0,124(a5)
+fmadd.s	fs11,fa1,fa4,ft8,rmm
+sw	a3,104(sp)
+bnez	s1,0xbd4
+bnez	s0,0xbca
+sw	a1,64(a1)
+.insn	4, 0xae440933
+auipc	gp,0xf23ab
+fld	fa3,24(a1)
+fld	fs0,160(sp)
+.insn	4, 0x58000c5b
+lw	s0,48(s0)
+jr	t5
+addi	s4,s4,27
+sw	a5,100(a1)
+lw	a2,8(a1)
+beqz	s0,0xd00
+xori	t4,s0,-805
+sd	s1,296(sp)
+addiw	gp,gp,9 # 0xfffffffff23abc1f
+fsd	fs7,200(sp)
+sw	a5,36(a2)
+ld	a0,56(a3)
+ld	a0,40(a4)
+sd	a4,80(a5)
+mv	a1,s2
+j	0x8b0
+beqz	s0,0xc68
+slli	s9,s9,0x4
+slli	s11,s11,0x2b
+.insn	4, 0x40f09087
+li	t0,-23
+.insn	2, 0x9380
+addi	a2,sp,164
+li	sp,28
+.insn	4, 0xbcdff783
+.insn	4, 0x780c186b
+lw	a1,8(s0)
+.insn	4, 0xa0daebe7
+fld	ft7,416(sp)
+.insn	6, 0xdd5ece0a839f
+j	0x72a
+add	s8,s8,t5
+lw	t0,120(sp)
+sd	a4,40(s0)
+.insn	4, 0x92dc3ad7
+beqz	a0,0xbde
+addiw	s6,s6,-10 # 0xffffffffffff7ff6
+fld	fs0,8(s0)
+li	t0,29
+sd	a5,80(a3)
+lw	s1,108(a2)
+add	a1,a1,s1
+.insn	2, 0x91b8
+.insn	4, 0x706b827b
+auipc	a3,0x169e2
+.insn	2, 0x90c0
+sw	a5,104(s0)
+.insn	4, 0x4d5eecd7
+fld	fa4,184(a2)
+.insn	4, 0xd9ffec8b
+fsd	ft0,480(sp)
+.insn	2, 0x80b8
+.insn	4, 0x16afa6f7
+bnez	a3,0xd68
+lw	a2,84(a4)
+j	0x4ae
+c.nop	19
+fsd	fs9,224(sp)
+.insn	4, 0x3df95bab
+ld	t3,40(sp)
+bnez	a1,0xc68
+.insn	2, 0x8a4c
+bnez	a4,0xc2a
+fnmsub.d	fs10,fs9,ft10,fs7,unknown
+.insn	4, 0xd356ed33
+fsd	fa3,8(a5)
+bnez	s1,0xc1a
+beqz	a5,0xc62
+.insn	4, 0xad843857
+.insn	4, 0x108a0287
+j	0x1474
+.insn	6, 0xc3fafa26da1f
+.insn	4, 0xdf0db8d3
+lui	gp,0xfffee
+bne	a3,a6,0xffffffffffffff28
+fsd	fa3,176(a4)
+beqz	a2,0xc64
+addiw	a1,a1,15
+bnez	a3,0xc88
+fsd	fs1,56(a2)
+ld	s1,56(a2)
+fld	fa2,168(sp)
+bnez	a1,0xd1e
+li	t1,21
+bnez	a2,0xcaa
+fld	fs6,360(sp)
+sw	a1,48(a0)
+fsd	ft10,104(sp)
+.insn	4, 0x1c88d39b
+.insn	6, 0x1dd53eb237df
+addiw	a3,a3,12 # 0x169e2c98
+ld	a0,144(a2)
+sw	s1,36(a1)
+.insn	4, 0xf98fdbbb
+j	0x64e
+ld	s1,224(a4)
+add	s6,s6,t5
+li	t3,27
+.insn	4, 0x3692ff0f
+fld	ft3,424(sp)
+.insn	4, 0x49cc213b
+.insn	4, 0xdef97477
+fsd	fa5,104(a0)
+jal	s1,0xfffffffffff90ce0
+add	s7,s7,s7
+addi	gp,gp,23 # 0xfffffffffffee017
+fld	fa2,176(s1)
+lui	a7,0x10
+fmadd.s	ft7,ft2,ft0,fa0,rtz
+sd	ra,56(sp)
+sw	s9,44(sp)
+ld	s1,16(s0)
+beqz	a4,0xdb4
+fld	fa1,200(a4)
+fld	fs11,496(sp)
+add	s3,s3,s11
+fsd	fa0,184(a0)
+srai	a0,a0,0xc
+sd	t3,32(sp)
+.insn	4, 0x83aff7f7
+sw	gp,32(sp)
+lui	a7,0xfffe0
+fsd	fa0,104(s1)
+.insn	4, 0x71b3b52f
+sw	s0,32(s1)
+fld	fa6,16(sp)
+.insn	4, 0xc6c9540f
+fmsub.d	fs7,ft10,ft7,fa7,unknown
+.insn	8, 0x48711848c68cee3f
+slli	a0,a0,0x3e
+.insn	2, 0x811c
+.insn	2, 0x87e0
+fnmsub.d	ft11,fs5,ft0,ft5
+auipc	a7,0xda592
+addi	s2,s2,16
+sd	a5,128(a1)
+fsd	fa4,136(s0)
+.insn	4, 0xc0f9752b
+.insn	4, 0x9ceb88cb
+fld	fa0,144(a0)
+j	0xebe
+ld	s0,248(a5)
+sd	a3,8(a0)
+sw	s0,76(a1)
+.insn	4, 0xb4ad79d3
+sd	s2,224(sp)
+.insn	4, 0x5cf93fcb
+.insn	4, 0x7403fda3
+sw	t3,8(sp)
+fsd	fa5,32(s0)
+.insn	4, 0x00f9610b
+.insn	4, 0x3cacdb77
+lw	a0,12(a0)
+.insn	4, 0xad952b9b
+flw	fs1,317(a2)
+fsd	fa2,112(a0)
+j	0x14d4
+sw	a5,72(s1)
+sd	t6,480(sp)
+sh	s2,505(s11) # 0xf1f9
+sw	t2,228(sp)
+sw	s5,140(sp)
+addi	sp,sp,-9
+.insn	4, 0x5d746a3b
+.insn	8, 0xa827056c5fb66abf
+.insn	2, 0x9954
+.insn	4, 0xfde5fe0f
+lw	tp,48(sp)
+fsd	fs1,32(a0)
+fld	fs1,144(s0)
+csrrw	s4,senvcfg,t2
+andi	a0,a0,-23
+lui	t0,0xffff1
+sd	a3,368(sp)
+auipc	s1,0xdab5b
+beqz	a3,0xd66
+slli	t4,t4,0x11
+slli	s7,s7,0x13
+lw	gp,132(sp)
+lw	a5,40(a5)
+.insn	6, 0x51cb6963495f
+.insn	4, 0xe2a3e0a7
+fld	fa5,32(a0)
+slli	gp,gp,0x16
+addi	a4,sp,416
+.insn	2, 0x704e
+fld	fa3,248(a5)
+fmsub.d	fa7,fs1,fs8,fs11,rne
+sw	a0,40(a3)
+sw	sp,128(sp)
+sd	s0,200(a1)
+.insn	4, 0x479b66a7
+ori	s3,a1,1016
+.insn	4, 0x0d5aedd7
+addi	a5,sp,824
+.insn	6, 0xe1604f46c91f
+ld	a4,8(sp)
+.insn	4, 0xc23dc7f3
+addi	a2,a2,14
+.insn	4, 0x6fdb472b
+addi	t3,t3,-30
+j	0xb30
+.insn	4, 0x09fd3467
+.insn	6, 0x9598f27a215f
+bnez	a1,0xe8a
+addi	sp,sp,96
+lw	a3,8(a4)
+.insn	4, 0x1500663b
+.insn	2, 0x95c4
+bnez	a0,0xe84
+sw	s1,84(s1)
+.insn	4, 0xcecec28f
+lui	t0,0xfffe5
+li	a3,-21
+sd	s11,400(sp)
+.insn	4, 0xd94dfcdb
+fsd	fs0,208(s1)
+sd	a2,104(a1)
+lw	s0,84(a4)
+.insn	4, 0x7d72052b
+.insn	2, 0x8aa8
+addi	a3,sp,72
+fsd	fa3,88(a3)
+.insn	4, 0x72f1f99b
+slli	s6,s6,0x22
+srli	a0,a0,0x14
+fmsub.d	fa2,fs10,ft10,ft5
+.insn	2, 0x9d18
+add	s0,s0,a7
+lw	s1,32(a4)
+beqz	a0,0xf50
+j	0x872
+sw	a4,24(a1)
+.insn	4, 0xb4997233
+addi	s10,s10,27
+fsd	fa5,184(a5)
+add	a3,a3,s5
+j	0x138e
+.insn	4, 0xbe83d667
+lw	sp,204(sp)
+fld	fa4,168(a0)
+sw	a0,100(a2)
+srli	s0,s0,0x8
+.insn	4, 0x88b5fa03
+addi	s0,sp,216
+sw	a3,36(a4)
+fsd	fs0,216(a4)
+beqz	a1,0xe66
+sw	a5,20(s0)
+lw	s1,40(s0)
+fld	fa1,400(sp)
+.insn	4, 0x537b9427
+addi	ra,ra,26
+.insn	4, 0x32443bfb
+fsd	fa5,320(sp)
+sd	a4,136(a2)
+.insn	4, 0x0de21377
+ld	a4,0(a2)
+sd	t0,328(sp)
+bnez	a0,0xfbc
+beqz	a5,0xf62
+li	ra,16
+andi	a1,a1,-1
+ld	a2,152(a5)
+sd	t6,248(sp)
+.insn	6, 0x7f5701a6d5df
+andi	a3,a3,15
+fnmadd.d	fa4,fs7,fs1,fa5,rup
+fsd	fa0,144(sp)
+.insn	4, 0xb5f35d33
+srli	a4,a4,0x18
+mv	s11,t3
+ld	a3,80(s1)
+ld	a5,144(a0)
+fld	fs0,128(sp)
+csrrw	a6,0x4ec,t3
+addi	s0,sp,52
+auipc	t5,0xc9aa9
+j	0x73a
+bltu	s4,t3,0x1472
+sd	a1,136(s1)
+ld	s6,56(sp)
+.insn	4, 0xeb3b78af
+sw	a0,140(sp)
+.insn	4, 0x0755fc8b
+andi	s1,s1,-28
+j	0xcb8
+addi	s9,s9,11
+.insn	4, 0x52bbb5e7
+lw	s4,8(sp)
+fld	fa0,96(sp)
+.insn	4, 0x57a2a14b
+auipc	t2,0x49e6d
+sw	s0,100(sp)
+slli	t5,t5,0xd
+fsd	fs6,376(sp)
+j	0xe8e
+.insn	6, 0x504c60202fdf
+fsd	fs4,456(sp)
+lw	a3,160(sp)
+sw	a3,4(s1)
+mv	a0,s11
+lui	s10,0x243a5
+ld	a4,112(a5)
+.insn	4, 0x44bb8c87
+bnez	a2,0xf80
+.insn	4, 0x914099b3
+.insn	4, 0x3f73fc3b
+sd	t1,224(sp)
+srai	s1,s1,0x27
+fld	fa3,72(a1)
+addiw	a0,a0,5
+lbu	t5,-869(a7) # 0xffffffffda592a15
+bnez	a1,0x1040
+addi	a4,sp,448
+.insn	4, 0x20c3c473
+jal	s11,0xfffffffffff3de68
+li	s3,27
+li	a4,21
+.insn	4, 0x90c8dd53
+slli	s7,s7,0x38
+ld	a1,424(sp)
+lw	a2,28(a2)
+j	0xed6
+addi	a2,sp,992
+.insn	2, 0x4036
+csrrsi	ra,0x177,24
+sd	s0,144(s1)
+li	s3,-10
+fld	fs2,168(sp)
+ld	s6,472(sp)
+add	sp,sp,s7
+.insn	4, 0xee39d08f
+ld	s10,184(sp)
+fld	fa0,96(a2)
+fsd	fa2,160(s0)
+fsd	fa5,112(a5)
+addi	a5,sp,860
+bnez	a3,0xeee
+li	t5,23
+fsd	ft8,360(sp)
+bnez	a4,0x1006
+sw	a2,76(sp)
+li	s8,3
+j	0x866
+mv	t4,ra
+ld	a7,1769(t3)
+.insn	4, 0x22d39d8b
+.insn	4, 0xbc6ea5bb
+fsd	fs1,248(a5)
+fnmadd.s	fa5,fs6,fs5,fa0,rdn
+.insn	4, 0x80b08b8b
+lw	s3,52(sp)
+ld	t3,56(sp)
+fsd	fa5,96(a4)
+addiw	s8,s8,-25 # 0xfffffffff28ad7a7
+.insn	4, 0x91b80cab
+li	t5,-4
+fnmadd.d	fs3,fa5,ft5,fa5,rmm
+.insn	4, 0xc3aac867
+lw	s0,96(a5)
+.insn	4, 0xcaa36233
+li	s11,30
+j	0xf1e
+fld	fs0,40(a4)
+auipc	s7,0xb093e
+bnez	a1,0x10a4
+.insn	4, 0x0918ea0b
+lw	a4,208(sp)
+sd	a2,64(a5)
+.insn	4, 0xe4f6ab0f
+addiw	ra,ra,10
+lw	s11,216(sp)
+ld	s0,136(a5)
+sd	s3,392(sp)
+slli	a0,a0,0x7
+srai	a1,a1,0x1f
+addiw	a5,a5,-3 # 0x18ffd
+fld	fs3,312(sp)
+slli	t4,t4,0x28
+j	0xeb6
+lui	a4,0x4321
+addi	a2,sp,904
+lw	a4,184(sp)
+sw	a4,120(a3)
+lw	a3,52(a1)
+fsd	fa5,312(sp)
+ld	gp,56(sp)
+srai	a5,a5,0xa
+sd	a3,224(a2)
+sd	ra,248(sp)
+ld	s0,32(a4)
+sd	s7,360(sp)
+li	sp,3
+bne	t0,tp,0x1366
+addi	a1,sp,376
+srai	s1,s1,0x2f
+lui	s4,0xffff1
+.insn	4, 0x2b2e227b
+bnez	s0,0x1122
+li	s4,-17
+sw	a0,12(sp)
+sw	a5,104(a4)
+.insn	4, 0x741da22b
+.insn	4, 0x4999eb67
+sd	a3,216(s0)
+fsd	fs0,160(s1)
+mv	s8,s10
+add	s1,s1,t1
+sd	a1,208(a2)
+addi	s0,sp,720
+.insn	4, 0x161e63c3
+j	0x986
+fsd	fa2,160(a5)
+slli	t0,t0,0x37
+fld	ft1,272(sp)
+addi	a3,sp,764
+.insn	8, 0xf52bfbb76d20fb3f
+fld	fa2,216(sp)
+sd	a0,56(a5)
+.insn	2, 0x8488
+.insn	2, 0x8d74
+.insn	4, 0x25a1c7a7
+slli	s1,s1,0x37
+fnmsub.d	ft8,fa4,fa6,fs9,unknown
+.insn	4, 0x64a4cb33
+fld	ft6,368(sp)
+ld	s9,88(sp)
+.insn	6, 0x543a63f7cadf
+beqz	a1,0x117a
+.insn	4, 0x27c68f2f
+bnez	a3,0x1126
+fsd	fs3,152(sp)
+addi	tp,tp,4 # 0xffffffffd8f6d5ea
+fmsub.d	fa7,ft10,fs7,ft7,rne
+bnez	s1,0xfac
+sw	a3,108(a4)
+sw	a1,64(s1)
+add	gp,gp,t3
+addiw	s3,s3,24
+srai	a3,a3,0xf
+lw	a0,124(a2)
+.insn	4, 0xe3e316d3
+mv	s0,t5
+.insn	4, 0xb8ddfb23
+addiw	tp,tp,-14 # 0xfffffffffffffff2
+addi	a3,sp,960
+.insn	4, 0xdb17b6bb
+fsd	fa0,32(a0)
+j	0x175e
+fld	fa4,152(s1)
+sw	a3,168(sp)
+mv	s5,s10
+.insn	4, 0xa9a15a53
+lw	a4,100(sp)
+.insn	4, 0x1811f4eb
+fsd	fs1,496(sp)
+lw	a0,12(a0)
+li	t2,27
+addi	a3,sp,876
+.insn	4, 0xc6522f0b
+fld	fs3,312(sp)
+ld	t1,104(sp)
+sw	s0,124(s0)
+mv	s6,s7
+.insn	4, 0xf386cef3
+addi	a2,sp,176
+fsd	fa1,136(a3)
+sd	t4,432(sp)
+lw	a7,76(sp)
+slli	a3,a3,0x3
+addi	a7,a7,-4
+bnez	s1,0x10a4
+ld	a2,56(s1)
+lh	t0,-621(s7) # 0xffffffffb093ed77
+lui	s11,0xffff7
+.insn	2, 0x9c64
+addi	a2,a2,31
+.insn	4, 0x798e3e9b
+.insn	10, 0x004ddffa7286c4628d7f
+mv	a7,t5
+slli	s9,s9,0x2a
+addiw	s0,s0,-2
+csrrw	s5,0xfd,a4
+.insn	4, 0xb47bb81b
+.insn	4, 0x5c06aeab
+.insn	6, 0x1e85fb2b8adf
+fld	fa5,184(a4)
+lw	a7,248(sp)
+j	0xed0
+slli	tp,tp,0x2b
+slli	t1,t1,0x4
+.insn	4, 0xe49fc3eb
+addi	t6,t6,28
+jalr	s2,174(s7)
+li	ra,9
+ld	a2,504(sp)
+fsd	ft10,128(sp)
+.insn	2, 0x9980
+.insn	2, 0x9e5d
+fld	fa5,32(a4)
+j	0xb24
+ld	a4,64(s1)
+c.mv	zero,a6
+.insn	2, 0x85a4
+mv	a6,tp
+.insn	6, 0x589fb3f24c9f
+sw	s0,92(a5)
+slli	s9,s9,0x8
+sw	s1,48(a1)
+sd	t4,128(sp)
+sd	t0,296(sp)
+lwu	s9,2030(s7)
+sd	a5,8(a2)
+lw	t6,28(sp)
+slli	t4,t4,0x2e
+mv	a0,a5
+slli	ra,ra,0x3e
+ld	a5,128(sp)
+fsd	fs0,144(s1)
+.insn	4, 0xf2fbc51b
+beqz	s1,0x1216
+bnez	s1,0x10f0
+slli	tp,tp,0xa
+sd	s1,64(sp)
+lui	t4,0xffff9
+ld	t2,-213(a6) # 0x55933f2b
+lw	s0,100(a1)
+.insn	4, 0x7e699327
+j	0xb5a
+lui	sp,0x221f0
+bnez	a4,0x10f8
+jal	t5,0x308d4
+sd	t2,-1816(s4) # 0xffffffffffff08e8
+j	0x1618
+lui	tp,0x18
+.insn	4, 0x95f11dc3
+lw	a7,32(sp)
+j	0x12d0
+fmsub.s	fa0,ft2,fs11,fa6,unknown
+addi	a5,sp,1008
+sd	tp,224(sp)
+lw	s0,4(sp)
+jr	a1
+addi	a3,sp,748
+ld	a4,96(a2)
+fld	fa2,104(a4)
+fsd	fs6,232(sp)
+beqz	s1,0x1204
+slli	s4,s4,0x4
+.insn	4, 0x22ef2d6b
+j	0x1340
+.insn	2, 0x9df9
+addi	t1,t1,-24
+li	t3,-14
+fsd	fs6,384(sp)
+sd	a1,216(a5)
+fsd	fa5,168(a4)
+addw	a3,a3,a1
+.insn	12, 0x6946e649824bdd4d978510ff
+fld	fa2,240(a5)
+addiw	t0,t0,5 # 0xfffffffffffe5005
+j	0x1972
+addi	t3,t3,-7
+lw	s0,104(a2)
+j	0x1982
+lw	t3,236(sp)
+sd	s5,176(sp)
+lw	a1,240(sp)
+beq	a7,t1,0x30a
+fmsub.d	ft3,fa3,ft2,ft8,rup
+sw	s10,0(sp)
+li	s5,-4
+sd	s3,160(sp)
+.insn	4, 0x06e90607
+fld	fa1,168(a3)
+.insn	6, 0x64460cdf87df
+.insn	6, 0x51610aaf9b5f
+subw	s0,s0,a0
+addi	a1,sp,140
+lui	a1,0x19
+ld	s1,1519(s11) # 0xffffffffffff75ef
+sw	s1,104(s0)
+slti	t5,s2,179
+.insn	4, 0x4729d6cb
+addi	s5,s5,-32
+j	0xdc4
+lw	s1,64(sp)
+.insn	4, 0xe58a7cc7
+.insn	4, 0x8c9fffd3
+lw	a5,4(a0)
+.insn	4, 0xf5938447
+fsd	fa2,16(a0)
+flt.d	s3,ft11,fs2
+.insn	4, 0xd64559d3
+.insn	6, 0xee444a92605f
+bnez	a0,0x12d2
+fsd	fa1,64(a3)
+fld	fs11,360(sp)
+.insn	2, 0x919c
+lw	a1,112(a0)
+sd	a4,160(a4)
+.insn	4, 0xe3a2d223
+fld	ft4,376(sp)
+fsd	fs1,216(a0)
+j	0x15d4
+fsd	fs4,240(sp)
+.insn	4, 0xfbb53953
+fld	fa1,128(sp)
+andi	a0,a0,2
+fsd	fs3,184(sp)
+addiw	t5,t5,26 # 0xffffffffc9aa9f16
+fld	ft10,424(sp)
+.insn	4, 0xfc575f43
+sw	gp,140(sp)
+sd	t5,208(sp)
+fsd	fs10,32(sp)
+fsd	fa1,64(sp)
+addw	a3,a3,s0
+addiw	s9,s9,-12
+.insn	4, 0x7fdad3eb
+mv	s2,t6
+lui	s9,0x1e
+sw	a5,100(a2)
+.insn	4, 0x5cd45c13
+flw	fa1,-1615(s11)
+lw	s9,168(sp)
+fsd	fs0,416(sp)
+or	a4,a4,a5
+ld	s1,208(a3)
+li	a2,-15
+slli	t5,t5,0x33
+ld	s0,80(s0)
+slli	s8,s8,0x3c
+li	s5,0
+lui	t3,0x8
+ld	a4,16(a0)
+fld	fs0,376(sp)
+.insn	2, 0x8f04
+.insn	4, 0x4cbde20f
+.insn	4, 0xd9185b23
+lw	s0,88(s1)
+.insn	4, 0xea7c466b
+addi	a2,sp,252
+andi	a1,a1,-29
+.insn	4, 0x7d8578cf
+fsd	fa1,176(s1)
+sh	zero,-797(t1)
+.insn	4, 0xf4e81887
+fld	fa0,168(a4)
+addiw	s0,s0,-15
+ld	s1,56(a1)
+.insn	4, 0x4438369b
+addiw	a3,a3,2
+sd	s9,0(sp)
+addi	a5,sp,624
+fsd	fa4,240(a0)
+sw	s9,92(sp)
+add	sp,sp,t0
+ld	a1,232(a2)
+.insn	4, 0x4637f283
+sw	a5,80(a5)
+ld	a3,8(s0)
+add	s9,s9,s0
+.insn	6, 0x4c80fa1e4b1f
+.insn	2, 0x94c8
+j	0xbc4
+.insn	10, 0x3a3542146ec2e2a2017f
+lw	a0,216(sp)
+lw	a4,4(a5)
+fld	ft7,448(sp)
+sd	a3,200(s0)
+.insn	4, 0x5739a08f
+fsd	fs1,48(a4)
+.insn	12, 0x6ac6a04685278ebbfb031c7f
+sw	gp,64(sp)
+li	a2,-12
+addiw	tp,tp,7 # 0x18007
+addi	a3,sp,176
+lw	a4,24(a4)
+sd	a0,160(sp)
+addi	t5,t5,-18
+addiw	s6,s6,13
+sd	s0,168(a2)
+.insn	8, 0x21f69ab9de868bbf
+fsd	fs10,344(sp)
+.insn	8, 0xc19bb3cca23e4ebf
+li	s1,-32
+fsd	fa2,224(a0)
+lw	t3,76(sp)
+sw	a5,40(a0)
+addiw	s6,s6,16
+lw	s10,48(sp)
+addi	a7,a7,12
+.insn	4, 0x80684b2b
+.insn	4, 0xd2d9aa2b
+j	0xe98
+sd	a0,64(a2)
+slli	s4,s4,0x2f
+sw	a6,36(sp)
+mv	s0,a2
+andi	a5,a5,-6
+.insn	4, 0x91a67207
+.insn	2, 0x8130
+lh	a0,1831(s2)
+fsd	fa1,144(s0)
+srai	s1,s1,0x35
+lw	a2,32(s1)
+add	s5,s7,a3
+bnez	s1,0x13da
+slli	s10,s10,0x1
+.insn	4, 0x64f2979b
+.insn	4, 0x0f3925d3
+.insn	4, 0x6bdb0873
+fsd	fa4,168(a1)
+addi	s1,s1,24 # 0xffffffffdab5be06
+sw	a5,48(a1)
+sd	a0,352(sp)
+.insn	2, 0x604a
+.insn	8, 0x768cff2319555d3f
+sext.w	a3,a3
+ld	a2,240(a2)
+fsd	fa4,184(a3)
+fsd	ft3,456(sp)
+fld	ft6,464(sp)
+ld	a4,40(a3)
+sw	s1,16(a0)
+beqz	a1,0x13ee
+sw	ra,244(sp)
+addi	gp,gp,15
+beqz	s1,0x137c
+fld	ft5,104(sp)
+fld	ft7,176(sp)
+lw	s1,40(s1)
+.insn	4, 0xf204a4eb
+addi	a4,sp,632
+beqz	a1,0x14a8
+lui	s2,0x1
+fld	fa5,88(a0)
+ld	s9,272(sp)
+sw	t0,192(sp)
+fsd	fa5,0(a4)
+li	s1,13
+j	0x108a
+.insn	4, 0xaa4a8577
+fsd	fs1,320(sp)
+.insn	10, 0x545b346652b19d5d0fff
+fsd	fa0,128(a2)
+.insn	12, 0x3e884a99885bd6554e891e7f
+sw	a3,84(a2)
+ld	tp,72(sp)
+andi	a5,a5,12
+lui	s0,0xfffff
+sw	a3,80(a0)
+beqz	s0,0x1400
+lw	gp,64(sp)
+.insn	4, 0x4d0c6c2b
+.insn	2, 0x81b4
+.insn	2, 0x9b20
+.insn	20, 0x542681be1b734df7cf1c80c23908ad9e478b50ff
+ld	t5,232(sp)
+lw	a1,48(a5)
+.insn	2, 0x8670
+fld	fa4,192(a5)
+jal	t6,0xfffffffffffbc9b0
+.insn	4, 0x2a9ca38b
+.insn	2, 0x8b5c
+fmadd.d	ft10,fs7,ft6,ft10,rup
+beqz	a0,0x1458
+.insn	4, 0xb63f1de7
+slli	s9,s9,0x25
+addiw	s2,s2,17 # 0x1011
+fsd	fa3,160(a1)
+fsd	fa0,24(a1)
+fsd	fa2,480(sp)
+fmul.d	fa5,fs8,ft5
+fmsub.s	ft11,fa3,ft9,ft2,unknown
+bnez	a0,0x1388
+sd	sp,200(sp)
+beqz	a0,0x149e
+addi	a5,a5,10
+fld	fa4,176(a1)
+sd	s0,200(a2)
+bnez	a5,0x13ea
+ld	a1,24(a5)
+sd	s5,136(sp)
+ld	a1,192(a0)
+sw	s9,216(sp)
+mv	t1,s8
+slli	t0,t0,0xe
+.insn	8, 0x94c0b7bf030bef3f
+fsd	fa2,88(a1)
+.insn	2, 0x2009
+fsd	fs10,152(sp)
+lw	a2,96(a1)
+addi	a2,sp,280
+addiw	gp,gp,-4
+.insn	4, 0x66f2929b
+ld	sp,384(sp)
+ld	a0,112(s1)
+fsd	ft0,280(sp)
+.insn	4, 0x08705d0f
+fld	fs6,176(sp)
+fsd	ft5,352(sp)
+lw	a0,108(a1)
+sw	s3,64(sp)
+fld	fa2,216(a4)
+fsd	fa3,456(sp)
+ld	a5,136(s1)
+ld	t6,264(sp)
+srli	a2,a2,0x30
+fsd	fa5,16(a4)
+srli	a4,a4,0x12
+sh	ra,337(s2)
+ld	s1,56(a1)
+add	a7,a7,a5
+.insn	4, 0x9ddb5fa7
+addiw	s9,s9,24 # 0x1e018
+beqz	a5,0x13b8
+.insn	6, 0x36ef32792c9f
+sw	t4,56(sp)
+slli	t0,t0,0x22
+addiw	s11,tp,1806 # 0x70e
+.insn	4, 0xcd7acb8f
+bnez	s1,0x156e
+fmadd.d	ft3,fs1,fa0,fs11,unknown
+ld	s10,312(sp)
+jal	a4,0xfffffffffff5babe
+slli	a6,a6,0x31
+mv	s2,a3
+.insn	4, 0xc9b275fb
+sd	s0,88(s1)
+sd	a1,56(sp)
+slli	s6,s6,0x31
+sd	a0,216(a5)
+sd	a4,392(sp)
+addi	a3,a3,0
+addi	s11,s11,-18
+fsd	ft1,304(sp)
+mv	t6,t3
+bnez	a1,0x1452
+sd	a1,88(s0)
+fld	fs5,144(sp)
+sw	s1,12(a2)
+.insn	4, 0x6409a95b
+.insn	4, 0x97889f0f
+fld	fs4,16(sp)
+fsd	fs8,496(sp)
+sw	a2,92(a0)
+sw	a0,108(a1)
+bltu	s2,s8,0x1f7e
+ld	a2,144(a5)
+sd	s10,16(sp)
+sw	t2,100(sp)
+ld	s0,32(a0)
+lw	a4,48(a5)
+lui	s8,0xfffee
+.insn	2, 0x9a74
+.insn	4, 0xb7f64f73
+bnez	a2,0x15e4
+fsd	fa4,96(a1)
+sd	a5,152(a2)
+.insn	2, 0x92c8
+addi	a5,sp,144
+mv	t1,a7
+fsd	fa5,96(a3)
+.insn	4, 0x4812adfb
+lw	a1,64(a3)
+fsd	ft0,72(sp)
+sw	a4,112(s0)
+sw	s1,0(sp)
+sd	a0,504(sp)
+addi	a5,sp,1020
+.insn	2, 0x80e8
+fld	fa0,40(a1)
+li	s7,-20
+.insn	4, 0xc575ccbb
+lui	s5,0xfffeb
+sd	s7,488(sp)
+slli	t5,t5,0x25
+fld	fa2,128(a5)
+fld	ft10,504(sp)
+.insn	2, 0x8448
+addiw	s5,s5,3 # 0xfffffffffffeb003
+srai	a3,a3,0x30
+sd	s8,384(sp)
+sd	a0,64(s1)
+.insn	2, 0x8740
+addi	s7,s7,20
+lw	a0,56(a3)
+li	a0,24
+j	0x13bc
+.insn	4, 0xfca45bcb
+add	a5,a5,a2
+sd	s0,152(s0)
+slli	a6,a6,0x1
+add	a2,a2,t4
+fsd	ft6,488(sp)
+jal	sp,0x2f8ee
+sd	a3,384(sp)
+.insn	4, 0x6fa9eaf7
+jal	tp,0xfffffffffff4bcb2
+beqz	a3,0x1652
+slli	t3,t3,0xb
+addi	s0,s0,-13 # 0xffffffffffffeff3
+fsd	fs0,480(sp)
+bnez	a2,0x152c
+lw	s10,136(sp)
+ld	s8,264(sp)
+slli	s10,s10,0x2f
+fld	fa1,24(a5)
+lw	a6,217(tp) # 0xd9
+.insn	6, 0x63feadf2879f
+.insn	6, 0xe8ab7d66ae1f
+addi	a4,sp,484
+.insn	4, 0xa8cc4b87
+addi	s1,sp,908
+.insn	4, 0xc8a91113
+fnmadd.d	ft1,ft6,fs4,fs11,rne
+addi	sp,sp,4 # 0x221f0004
+j	0x1a32
+.insn	2, 0x845c
+j	0x1c0e
+slli	t5,t5,0x37
+.insn	4, 0xb967ca53
+jal	s2,0xfffffffffff2e552
+slli	s7,s7,0x15
+sd	s10,344(sp)
+lui	s4,0x8
+add	a1,a1,a5
+beqz	a4,0x156e
+lui	s4,0xfffe1
+addi	s1,sp,908
+lw	s0,56(a1)
+.insn	4, 0xc9478577
+.insn	4, 0xcebd9e2b
+fsw	ft1,215(a0)
+fsd	fa5,200(a4)
+addi	s0,sp,1004
+addi	tp,tp,-10 # 0xfffffffffffffff6
+.insn	4, 0xc0d007eb
+li	s2,22
+lui	a1,0xffffd
+.insn	4, 0x3000ad63
+sw	a1,48(a0)
+li	s10,9
+fld	ft11,88(sp)
+add	s9,s9,t5
+j	0x1dba
+fmsub.s	fs9,ft6,ft0,fa7,rtz
+lw	t0,76(sp)
+addiw	a6,a6,-21
+.insn	4, 0x999e41a7
+.insn	4, 0xab64f71b
+lui	a3,0x19
+sw	a5,84(s1)
+c.srai64	s0
+bgeu	a5,s5,0x195a
+sd	s0,128(s0)
+sw	a0,68(a0)
+li	s5,15
+beqz	a2,0x161c
+srai	a4,a4,0x2d
+fsd	fa3,32(a5)
+.insn	4, 0x255c5943
+lw	t0,92(sp)
+sd	a3,136(sp)
+srli	s1,s1,0x3f
+addi	a2,sp,760
+j	0x1cba
+addiw	s7,s7,13
+beqz	s1,0x166a
+beqz	a0,0x15e8
+add	a3,a3,s10
+slli	s2,s2,0x37
+sw	a1,120(a5)
+fld	ft5,496(sp)
+sd	a1,472(sp)
+fsd	fa4,48(a0)
+lui	a5,0xfffeb
+sd	s0,72(a1)
+fsd	fs1,184(a1)
+lui	a0,0xffff5
+lui	tp,0x1d
+addi	a3,sp,132
+beqz	a0,0x166e
+sw	s0,108(a2)
+j	0x1000
+fld	fs10,176(sp)
+fsd	fa1,240(s1)
+ld	a4,192(s1)
+addiw	t6,t6,11
+lui	t5,0xfffff
+.insn	4, 0x3d9fc9f7
+beqz	a0,0x16bc
+addiw	tp,tp,14 # 0x1d00e
+ld	a0,248(a0)
+addiw	t0,t0,-1
+.insn	4, 0xc83574d3
+fld	fa0,32(a4)
+.insn	4, 0xade0424f
+fsd	fa2,216(a3)
+addi	a3,a3,10 # 0x1900a
+.insn	4, 0xade21847
+.insn	4, 0x2c1cf3d3
+beqz	a2,0x15c2
+.insn	4, 0x800bbf8f
+jal	s3,0xfffffffffffca13a
+.insn	4, 0xfd2bfa87
+sw	s3,8(sp)
+j	0x19da
+.insn	2, 0x86ec
+andi	a0,a0,-2
+ld	a0,112(s0)
+beqz	a0,0x16ac
+lw	a0,124(s0)
+.insn	8, 0x3390246002d163bf
+c.lui	zero,0xf
+sd	s1,24(a5)
+sw	s3,32(sp)
+sw	a2,12(sp)
+ld	a3,72(a4)
+beqz	a4,0x15de
+addi	s1,sp,560
+add	t3,t3,a4
+ld	s1,424(sp)
+lui	t1,0x6
+fld	fs1,336(sp)
+fld	fa1,40(a2)
+addiw	t4,t4,-19 # 0xffffffffffff8fed
+c.slli64	t4
+.insn	4, 0xd1b77c23
+c.li	zero,5
+sd	a1,8(sp)
+lw	a1,80(s0)
+.insn	4, 0xcc2731cf
+j	0x15e0
+.insn	4, 0xe060f5fb
+sw	a4,52(a3)
+.insn	2, 0x9ad8
+addi	s6,s6,0
+ld	a2,40(a2)
+.insn	4, 0x5aab7a53
+mv	t6,s7
+lw	t0,188(sp)
+fsd	fa1,64(a1)
+.insn	2, 0x8874
+addi	a0,a0,0 # 0xffffffffffff5000
+.insn	2, 0x9184
+ld	a3,24(a4)
+addi	sp,sp,-17
+fld	fs8,328(sp)
+.insn	4, 0xf6e1169b
+li	a2,25
+.insn	4, 0xfb29b52b
+addi	s0,sp,24
+add	sp,sp,t0
+j	0x1dd6
+fmadd.d	fa1,ft2,fs1,ft1
+ld	s1,216(s1)
+lw	s9,8(sp)
+sw	s1,52(s1)
+fsd	fa0,112(a1)
+sw	ra,124(sp)
+lw	a1,52(s1)
+ld	t2,392(sp)
+lui	a6,0x3
+sw	a3,88(a2)
+add	a4,a4,t4
+.insn	4, 0xe4d80baf
+j	0xfec
+fld	fs8,104(sp)
+beqz	a0,0x172a
+fld	fa6,352(sp)
+fmadd.d	fa1,ft3,fs7,fs2,unknown
+li	t1,-7
+fld	fa0,128(s1)
+beqz	a4,0x1732
+j	0x18ac
+.insn	4, 0x3ffa305b
+addi	a1,a1,-4 # 0xffffffffffffcffc
+mv	ra,s7
+fnmadd.d	ft1,fs3,fa2,fa5,rtz
+.insn	8, 0xb5066ce008c2b23f
+addiw	a7,a7,23
+srli	a3,a3,0x26
+.insn	2, 0x94a4
+ld	s1,40(a5)
+li	tp,1
+c.mv	zero,s7
+fsd	fs0,104(sp)
+sd	s0,256(sp)
+fld	fa3,152(a1)
+c.li	zero,-3
+j	0x11c0
+.insn	4, 0x65d1e1a7
+sd	a3,112(s0)
+sd	a3,168(a1)
+ld	t6,88(sp)
+slli	t6,t6,0x2b
+add	s3,s3,tp
+bnez	a0,0x17de
+j	0x1af4
+j	0x143a
+mv	t4,s9
+sw	a1,64(a4)
+.insn	4, 0xac1455d7
+.insn	4, 0xf3204977
+addi	t2,t2,28 # 0x49e6df42
+.insn	4, 0xa933de5b
+.insn	4, 0xa73356cb
+fld	fa3,176(a5)
+lw	s2,52(sp)
+addiw	tp,tp,-31 # 0xffffffffffffffe1
+.insn	4, 0x828cf127
+fld	fa4,80(a0)
+srli	a2,a2,0x1c
+lui	t2,0xffffb
+fsd	fs2,232(sp)
+srli	a3,a3,0x2a
+ld	a1,8(a5)
+sd	sp,88(sp)
+.insn	4, 0xc81a309b
+sd	a1,40(a2)
+j	0x1b6c
+beqz	a2,0x16aa
+beqz	a0,0x16d0
+.insn	4, 0x5caaefa7
+lui	s11,0xffff6
+add	s4,s4,a3
+fsd	fa2,96(sp)
+ld	a1,112(a4)
+sd	s1,368(sp)
+j	0x18b0
+lw	a7,44(sp)
+.insn	6, 0x1796ae3b2e1f
+lw	t5,168(sp)
+lw	a5,128(sp)
+bnez	a5,0x17b6
+beqz	a3,0x1706
+.insn	4, 0x91ab87bb
+addi	a2,sp,864
+.insn	8, 0x943e006dcbe7cabf
+lui	s10,0x279cc
+ld	a2,48(s1)
+.insn	4, 0x5f517c33
+addi	ra,ra,0
+lw	s5,84(sp)
+bnez	s1,0x16ce
+fld	fs1,8(sp)
+sd	a2,248(sp)
+slli	s6,s6,0x20
+lw	a0,0(a3)
+addi	gp,s1,-768
+sd	tp,480(sp)
+ld	a4,160(s0)
+lw	a4,64(a5)
+addi	sp,sp,-16
+beqz	s0,0x17bc
+.insn	2, 0x3055
+sd	s7,112(sp)
+beqz	a3,0x178a
+sd	s6,392(sp)
+csrrsi	t5,0x92b,9
+.insn	6, 0x47266f11e65f
+fld	fa5,368(sp)
+li	s4,27
+ld	t4,256(sp)
+lw	s1,4(a2)
+ld	ra,1628(t1) # 0x665c

@@ -1,0 +1,59 @@
+.option rvc
+.text
+c.addi sp,-16
+c.addi a0,31
+c.addi a0,-32
+c.addiw a0,-3
+c.li a0,1
+c.li a0,-32
+c.lui a0,31
+c.lui a0,0xfffe0
+c.mv a0,a1
+c.add a0,a1
+c.ld a0,8(a1)
+c.ld a0,248(a1)
+c.sd a0,8(a1)
+c.ldsp a0,16(sp)
+c.ldsp a0,504(sp)
+c.sdsp a0,16(sp)
+c.sdsp a0,504(sp)
+c.lw a0,8(a1)
+c.lw a0,124(a1)
+c.sw a0,8(a1)
+c.lwsp a0,16(sp)
+c.lwsp a0,252(sp)
+c.swsp a0,16(sp)
+c.swsp a0,252(sp)
+c.fld fa0,8(a1)
+c.fsd fa0,8(a1)
+c.fldsp fa0,16(sp)
+c.fsdsp fa0,16(sp)
+1:
+c.j 1b
+c.j 2f
+c.beqz a0,1b
+c.bnez a0,2f
+c.beqz a5,2f
+2:
+c.jr ra
+c.jr t0
+c.jalr a0
+c.slli a0,3
+c.slli a0,63
+c.srli a0,3
+c.srli a0,63
+c.srai a0,3
+c.andi a0,7
+c.andi a0,-32
+c.sub a0,a1
+c.xor a0,a1
+c.or a0,a1
+c.and a0,a1
+c.subw a0,a1
+c.addw a0,a1
+c.nop
+c.addi16sp sp,32
+c.addi16sp sp,-512
+c.addi4spn a0,sp,16
+c.addi4spn a5,sp,1020
+c.ebreak
