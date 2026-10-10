@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 use super::*;
+use super::super::super::native_transfer_entry;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
@@ -349,5 +350,132 @@ fn native_v2_protected_child_restart_and_replacement_transfer() {
                 .unwrap(),
             EgclVal::from_fixnum(i64::from(restart))
         );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HeatMutation {
+    symbol: u32,
+    owner: usize,
+    original: *mut EgclVal,
+    replacement: *mut EgclVal,
+}
+
+thread_local! {
+    static HEAT_MUTATION: std::cell::Cell<Option<HeatMutation>> = const { std::cell::Cell::new(None) };
+    static HEAT_MUTATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn replace_validated_heat_callable() {
+    let Some(mutation) = HEAT_MUTATION.with(|state| state.take()) else {
+        return;
+    };
+    let (owner, nested, frame) = native_transfer_entry::condition_capture_for_test()
+        .expect("heat hook must execute inside a live mapped activation");
+    assert_eq!(owner, mutation.owner);
+    assert!(!nested);
+    assert_eq!(unsafe { (*frame).function }, unsafe { *mutation.original });
+    let replacement = if mutation.replacement.is_null() {
+        egcl_rt::value::UNBOUND
+    } else {
+        unsafe { *mutation.replacement }
+    };
+    // Deliberately do not touch bytecode publication or its generation: model
+    // the setter paused between updating the function cell and its registry.
+    egcl_rt::symbols::set_symbol_function(mutation.symbol, replacement);
+    HEAT_MUTATED.with(|done| done.set(true));
+}
+
+struct HeatMutationGuard {
+    symbol: u32,
+    original: *mut EgclVal,
+}
+
+impl Drop for HeatMutationGuard {
+    fn drop(&mut self) {
+        native_transfer_entry::AFTER_HEAT_VALIDATION.with(|hook| hook.set(None));
+        HEAT_MUTATION.with(|state| state.set(None));
+        egcl_rt::symbols::set_symbol_function(self.symbol, unsafe { *self.original });
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_loop_heat_retains_validated_callable_during_cell_replacement() {
+    const CHILD: &str = "EGCL_TEST_HEAT_CELL_REPLACEMENT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // The broken UNBOUND case can dereference a nonfunction. Keep it in a
+        // child process so that a regression cannot abort the whole test suite.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::bytecode::native_transfer_tests::nested::protected::native_v2_loop_heat_retains_validated_callable_during_cell_replacement",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("EGCL_T2", "0")
+            .env_remove("EGCL_PROFILING_DISABLED")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "heat child failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let _lock = super::super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::super::read_eval_all_env(
+        "(defun heat-cell-loop (n) (catch :heat-cell (dotimes (i n))) n)
+         (defun heat-cell-replacement (n) n)", &mut env).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(
+        "((catch :heat-cell (dotimes (i n))) n)").unwrap().0);
+    let symbol = egcl_rt::symbols::intern("HEAT-CELL-LOOP");
+    let body = Arc::new(compile_function("HEAT-CELL-LOOP", *params, *forms, &env, false, false).unwrap());
+    registry_put(symbol, Arc::clone(&body));
+    let installed = native_transfer_entry::install_baseline(symbol, body).unwrap();
+    let NativeCodeStorage::Mapped(mapped) = &installed._storage else {
+        panic!("test must install a real mapped baseline");
+    };
+    egcl_rt::rooted!(original = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    let replacement_symbol = egcl_rt::symbols::intern("HEAT-CELL-REPLACEMENT");
+    egcl_rt::rooted!(replacement = egcl_rt::symbols::symbol_function(replacement_symbol).unwrap());
+    assert_ne!(*original, *replacement);
+    publish_native(symbol, Some(*original), &installed);
+    for unbind in [false, true] {
+        let original_before = egcl_rt::function::back_edge_count(*original);
+        let replacement_before = egcl_rt::function::back_edge_count(*replacement);
+        let stack = egcl_rt::current_stack();
+        let before_stack = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(std::cell::Cell::get));
+        {
+            let _restore = HeatMutationGuard { symbol, original: &mut *original };
+            HEAT_MUTATED.with(|done| done.set(false));
+            HEAT_MUTATION.with(|state| state.set(Some(HeatMutation {
+                symbol,
+                owner: Rc::as_ptr(mapped) as usize,
+                original: &mut *original,
+                replacement: if unbind { std::ptr::null_mut() } else { &mut *replacement },
+            })));
+            native_transfer_entry::AFTER_HEAT_VALIDATION.with(|hook|
+                hook.set(Some(replace_validated_heat_callable)));
+            let result = run_native_callable(&installed, symbol, *original,
+                &[EgclVal::from_fixnum(8)], &mut env).unwrap();
+            assert_eq!(result, EgclVal::from_fixnum(8));
+            assert!(HEAT_MUTATED.with(std::cell::Cell::get));
+            assert_eq!(egcl_rt::symbols::symbol_function(symbol),
+                Some(if unbind { egcl_rt::value::UNBOUND } else { *replacement }));
+            assert_eq!(egcl_rt::function::back_edge_count(*original) - original_before, 1,
+                "the validated header belongs to the original; subsequent headers must decline (unbind={unbind})");
+            assert_eq!(egcl_rt::function::back_edge_count(*replacement), replacement_before,
+                "replacement must receive no heat from the retained old body");
+            assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(std::cell::Cell::get)), before_stack);
+            assert!(env.catch_stack.is_empty());
+        }
+        assert_eq!(egcl_rt::symbols::symbol_function(symbol), Some(*original));
     }
 }
