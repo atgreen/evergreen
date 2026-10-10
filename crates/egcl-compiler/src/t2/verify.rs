@@ -167,6 +167,8 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             | AuxData::HandlerScope { .. }
                             | AuxData::HandlerBindScope { .. }
                             | AuxData::RestartCaseScope { .. }
+                            | AuxData::SpecialBinding { .. }
+                            | AuxData::GlobalValue { .. }
                             | AuxData::CleanupContinuation { .. }
                     ))
             {
@@ -188,6 +190,21 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "V11 invoke-shape",
                     "host evaluation and function lookup require argument-free Invoke",
                 ));
+            }
+            if let AuxData::SpecialBinding { bcp, enter } = data.aux {
+                let identity_matches = data.frame_state
+                    .filter(|id| (id.0 as usize) < f.frame_states.len())
+                    .and_then(|id| f.frame_states.get(id).scopes.last())
+                    .is_some_and(|scope| scope.bcp == bcp);
+                if data.opcode != Opcode::Invoke || data.args.len() != usize::from(enter)
+                    || !identity_matches {
+                    errors.push(VerifyError::new("V11 invoke-shape", "special binding requires exact bytecode identity and entry value"));
+                }
+            }
+            if let AuxData::GlobalValue { store, .. } = data.aux {
+                if data.opcode != Opcode::Invoke || data.args.len() != usize::from(store) {
+                    errors.push(VerifyError::new("V11 invoke-shape", "global value access has invalid operands"));
+                }
             }
             if let AuxData::HandlerScope { push_bcp, enter } = data.aux {
                 let identity_matches = if enter {

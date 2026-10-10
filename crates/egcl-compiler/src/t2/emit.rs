@@ -1803,6 +1803,14 @@ fn emit_invoke_call(
             0,
             false,
         ),
+        crate::t2::ir::AuxData::SpecialBinding { bcp, enter } => (
+            (if enter { TRANSFER_SPECIAL_BIND_REQUEST } else { TRANSFER_SPECIAL_UNBIND_REQUEST }) | u64::from(bcp),
+            u64::from(enter), false,
+        ),
+        crate::t2::ir::AuxData::GlobalValue { symbol, store } => (
+            (if store { TRANSFER_GLOBAL_STORE_REQUEST } else { TRANSFER_GLOBAL_LOAD_REQUEST }) | u64::from(symbol),
+            u64::from(store), false,
+        ),
         crate::t2::ir::AuxData::HostEval(index) => {
             (TRANSFER_HOST_EVAL_REQUEST | u64::from(index), 0, false)
         }
@@ -3160,6 +3168,12 @@ pub const TRANSFER_RESTART_CASE_ENTER_REQUEST: u64 = 7_u64 << 32;
 pub const TRANSFER_RESTART_CASE_LEAVE_REQUEST: u64 = 8_u64 << 32;
 pub const TRANSFER_HOST_EVAL_REQUEST: u64 = 9_u64 << 32;
 pub const TRANSFER_FUNCTION_LOOKUP_REQUEST: u64 = 10_u64 << 32;
+/// Low word identifies the retained BindSpecial/UnbindSpecial bytecode PC.
+pub const TRANSFER_SPECIAL_BIND_REQUEST: u64 = 11_u64 << 32;
+pub const TRANSFER_SPECIAL_UNBIND_REQUEST: u64 = 12_u64 << 32;
+/// Low word identifies the execution-local symbol value cell.
+pub const TRANSFER_GLOBAL_LOAD_REQUEST: u64 = 13_u64 << 32;
+pub const TRANSFER_GLOBAL_STORE_REQUEST: u64 = 14_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. Arguments and shadow roots
@@ -3586,6 +3600,8 @@ fn emit_transfer_function(
                             | AuxData::HandlerScope { .. }
                             | AuxData::HandlerBindScope { .. }
                             | AuxData::RestartCaseScope { .. }
+                            | AuxData::SpecialBinding { .. }
+                            | AuxData::GlobalValue { .. }
                     )
                     || data.opcode == Opcode::NlxTransfer && !data.targets.is_empty())
             {
@@ -4296,7 +4312,8 @@ fn emit_framed_inner(
                 | crate::control_scope::ScopeKind::Cleanup { .. }
                 | crate::control_scope::ScopeKind::HandlerCase { .. }
                 | crate::control_scope::ScopeKind::HandlerBind { .. }
-                | crate::control_scope::ScopeKind::RestartCase { .. })
+                | crate::control_scope::ScopeKind::RestartCase { .. }
+                | crate::control_scope::ScopeKind::SpecialBinding { .. })
     }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
@@ -4954,7 +4971,9 @@ fn emit_framed_inner(
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }
                         | AuxData::HandlerBindScope { .. }
-                        | AuxData::RestartCaseScope { .. } => transfer.veneer,
+                        | AuxData::RestartCaseScope { .. }
+                        | AuxData::SpecialBinding { .. }
+                        | AuxData::GlobalValue { .. } => transfer.veneer,
                         AuxData::CleanupContinuation { .. } => match transfer.cleanup {
                             Some(CleanupEmission::Native { complete, .. }) => complete,
                             _ => return Err(EmitError::UnsupportedOp(0xFA)),

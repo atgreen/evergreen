@@ -81,6 +81,9 @@ pub(super) use native_transfer_tests::ordinary_cleanup_osr::ordinary_cleanup_osr
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::ordinary_condition_osr::ordinary_condition_osr_observe_for_test;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::ordinary_special_osr::ordinary_special_osr_observe_for_test;
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;
@@ -20728,10 +20731,20 @@ fn resume_inlined_in_t0(
 struct OuterResumeState {
     handlers: Vec<Handler>,
     cleanup_conts: Vec<CleanupCont>,
+    dyn_binds: Vec<ScopedDynBind>,
+}
+
+impl Drop for OuterResumeState {
+    fn drop(&mut self) {
+        while self.dyn_binds.pop().is_some() {}
+    }
 }
 
 impl egcl_rt::gc::TraceHostRoots for OuterResumeState {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for binding in &mut self.dyn_binds {
+            binding.guard.trace_host_roots(visit);
+        }
         for cleanup in &mut self.cleanup_conts {
             egcl_rt::gc::TraceHostRoots::trace_host_roots(cleanup, visit);
         }
@@ -20756,6 +20769,7 @@ fn resume_inlined_in_t0_with_state(
             .unwrap_or_else(|| OuterResumeState {
                 handlers: rebuild_resume_handlers(&entry, scope.bcp, env),
                 cleanup_conts: Vec::new(),
+                dyn_binds: Vec::new(),
             });
         egcl_rt::rooted_ref!(_state_root = &mut state);
         // A resumed child owns the callable in its original frame even when
@@ -20786,7 +20800,7 @@ fn resume_inlined_in_t0_with_state(
             sp_top: scope.sp_top,
             handlers: std::mem::take(&mut state.handlers),
             cleanup_conts: std::mem::take(&mut state.cleanup_conts),
-            dyn_binds: Vec::new(),
+            dyn_binds: std::mem::take(&mut state.dyn_binds),
             fn_obj,
             sym: scope.function,
         });
@@ -22658,7 +22672,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
-            | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }))
+            | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
+            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+            | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else {

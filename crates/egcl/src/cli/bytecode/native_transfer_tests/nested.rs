@@ -154,6 +154,17 @@ fn native_v2_distinct_mutual_calls_bound_depth_and_retire_crossed_frames() {
          (defun distinct-mutual-a (n x fail) {a})
          (defun distinct-mutual-b (n x fail) {b})",
          a=&a[1..a.len()-1], b=&b[1..b.len()-1]), &mut env).unwrap();
+    // Global access now lets the tick helper promote. Keep bookkeeping in T0
+    // so exact native child counts continue to measure only mutual A/B calls.
+    struct HelperPin(u32);
+    impl Drop for HelperPin {
+        fn drop(&mut self) {
+            profile_unpin(self.0);
+        }
+    }
+    let helper = egcl_rt::symbols::intern("DISTINCT-MUTUAL-TICK");
+    profile_pin(helper);
+    let _helper_pin = HelperPin(helper);
     install_t2("DISTINCT-MUTUAL-A", "(n x fail)", a, &env);
     install_t2("DISTINCT-MUTUAL-B", "(n x fail)", b, &env);
     let code = compile_caller(
