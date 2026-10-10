@@ -125,7 +125,10 @@ impl LispExecutionContext {
     /// Take the pending yield request, clearing it. `SeqCst` to match the
     /// swap-based accessors this replaces.
     pub fn take_yield_request(&self) -> bool {
-        self.yield_requested.swap(0, Ordering::SeqCst) != 0
+        // Leave the idle flag untouched. A request posted after the load is
+        // retained for the next poll; consumption keeps the original ordering.
+        self.yield_requested.load(Ordering::SeqCst) != 0
+            && self.yield_requested.swap(0, Ordering::SeqCst) != 0
     }
 
     pub fn yield_requested(&self) -> bool {
@@ -206,5 +209,34 @@ mod tests {
             "a request must not be taken twice"
         );
         assert!(!ctx.yield_requested());
+    }
+
+    #[test]
+    fn requests_posted_after_idle_polls_are_taken_and_can_be_rearmed() {
+        use std::sync::mpsc::sync_channel;
+        use std::time::Duration;
+
+        for kind in [ExecutionKind::NativeThread, ExecutionKind::Fiber] {
+            let ctx = LispExecutionContext::new(kind, 1, 1);
+            let (request_tx, request_rx) = sync_channel(0);
+            let (posted_tx, posted_rx) = sync_channel(0);
+            std::thread::scope(|scope| {
+                let ctx = &ctx;
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        ctx.request_yield();
+                        posted_tx.send(()).unwrap();
+                    }
+                });
+                for _ in 0..64 {
+                    assert!(!ctx.take_yield_request(), "start with an idle poll");
+                    request_tx.send(()).unwrap();
+                    posted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(ctx.take_yield_request(), "retain the later request");
+                    assert!(!ctx.take_yield_request(), "take each request once");
+                }
+            });
+        }
     }
 }

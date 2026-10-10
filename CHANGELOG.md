@@ -8,10 +8,12 @@
   T2 promotion, and cold or wrong-arity interpreter fallbacks count only once.
   Reduce thread-lookup overhead in native execution, cutting elapsed time by
   roughly 35–38% in the measured Linux x86-64 chain200 and Fibonacci benchmarks
-  compared with the preceding development build
+  compared with the preceding development build. Avoid atomic writes during
+  idle safepoint polls, further reducing loop overhead
   ([#227](https://github.com/atgreen/evergreen/pull/227),
   [#228](https://github.com/atgreen/evergreen/pull/228),
-  [#230](https://github.com/atgreen/evergreen/pull/230)).
+  [#230](https://github.com/atgreen/evergreen/pull/230),
+  [#231](https://github.com/atgreen/evergreen/pull/231)).
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,

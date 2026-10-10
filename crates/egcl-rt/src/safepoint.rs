@@ -449,7 +449,11 @@ pub(crate) fn retire_native_thread(thread: &crate::thread::NativeThread) {
 #[inline(always)]
 pub fn poll_safepoint() {
     let page = global_safepoint_page();
-    let interrupted = SIGUSR1_PENDING.swap(false, Ordering::Relaxed);
+    // An idle poll need not write the shared flag. A signal posted after this
+    // load stays pending for the next poll; a set flag still needs an atomic
+    // take because another mutator can consume it concurrently.
+    let interrupted =
+        SIGUSR1_PENDING.load(Ordering::Relaxed) && SIGUSR1_PENDING.swap(false, Ordering::Relaxed);
     if page.is_requested() || interrupted {
         enter_safepoint();
     } else {
