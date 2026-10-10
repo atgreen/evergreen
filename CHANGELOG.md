@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reduce garbage-collection bookkeeping in opt-in native calls by tracing
+  stable native stack and register roots directly
+  ([#189](https://github.com/atgreen/evergreen/pull/189)).
+
 - Avoid unnecessary baseline fallbacks in opt-in native transfer code when a
   register is reused for an immediate value
   ([#187](https://github.com/atgreen/evergreen/pull/187)).
