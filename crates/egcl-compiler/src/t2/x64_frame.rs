@@ -69,6 +69,12 @@ pub enum ValueHome {
 }
 
 impl ValueHome {
+    /// A stable home whose value survives a SysV call. Native publication must
+    /// still expose its writable slot/save word before it can replace a shadow.
+    pub(crate) fn survives_sysv_call(self) -> bool {
+        matches!(self, Self::Stack(_) | Self::Reg(3 | 12..=15))
+    }
+
     /// Give descriptors a canonical Location key without confusing hardware
     /// registers with allocator indices. Physical access still needs a recipe.
     pub fn location(self) -> Option<Location> {

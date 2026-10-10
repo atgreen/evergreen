@@ -608,6 +608,7 @@ impl TransferCode {
             recursion,
             deopt_veneer.as_ref().map(|code| code.as_ptr() as u64),
             &named_veneers,
+            egcl_compiler::t2::emit::NativeRootPublication::PublishedHomes,
         )
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
