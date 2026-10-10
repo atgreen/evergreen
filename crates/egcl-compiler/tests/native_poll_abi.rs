@@ -473,3 +473,202 @@ fn ordinary_call_metadata_covers_register_and_slice_arguments() {
         assert_eq!(&code.code[calls[0].return_offset..calls[0].return_offset + 4], &[0x48, 0x83, 0xec, 16]);
     }
 }
+
+#[test]
+fn empty_forwarding_poll_is_removed_only_before_a_retained_adjacent_poll() {
+    use egcl_compiler::t2::ir::{
+        AuxData, BlockCall, Function, IRType, InstData, InstFlags, Opcode, Value,
+        ValueRepresentation,
+    };
+    use egcl_compiler::t2::x64_calls::NativeCallOrigin;
+    use egcl_rt::{Collector, HeapCollector};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static HEAT_POLLS: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn poll(request: *mut u64) -> u64 {
+        if request as usize & 1 != 0 {
+            HEAT_POLLS.fetch_add(1, Ordering::Relaxed);
+        }
+        let count = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+        // In the positive fixture the second poll is the retained destination:
+        // header -> removed forwarder -> destination -> header -> return.
+        if count == 2 {
+            HeapCollector::new().minor_gc().unwrap();
+        }
+        NIL.0
+    }
+    fn instruction(opcode: Opcode, args: Vec<Value>) -> InstData {
+        InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+    for shape in [
+        "adjacent",
+        "source-param",
+        "edge-arg",
+        "nonadjacent",
+        "heat-header",
+    ] {
+        let mut f = Function::new(format!("forwarding-poll-{shape}"));
+        let entry = f.entry();
+        let header = f.make_block();
+        let forward = f.make_block();
+        let spacer = (shape == "nonadjacent").then(|| f.make_block());
+        let body = f.make_block();
+        let exit = f.make_block();
+        let flag = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let held = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let carried = (shape != "heat-header")
+            .then(|| f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged));
+        let forward_arg = (shape == "source-param")
+            .then(|| f.add_block_param(forward, IRType::TOP, ValueRepresentation::Tagged));
+        if shape == "edge-arg" {
+            f.add_block_param(body, IRType::TOP, ValueRepresentation::Tagged);
+        }
+        let mut jump = instruction(Opcode::Jump, vec![]);
+        jump.targets.push(BlockCall {
+            block: header,
+            args: carried.map(|_| vec![flag]).unwrap_or_default(),
+        });
+        f.set_terminator(entry, jump);
+        if let Some(carried) = carried {
+            let mut branch = instruction(Opcode::Brif, vec![carried]);
+            branch.targets = vec![
+                BlockCall {
+                    block: forward,
+                    args: forward_arg.map(|_| vec![held]).unwrap_or_default(),
+                },
+                BlockCall {
+                    block: spacer.unwrap_or(exit),
+                    args: vec![],
+                },
+            ];
+            f.set_terminator(header, branch);
+        } else {
+            let mut jump = instruction(Opcode::Jump, vec![]);
+            jump.targets.push(BlockCall {
+                block: forward,
+                args: vec![],
+            });
+            f.set_terminator(header, jump);
+        }
+        let mut jump = instruction(Opcode::Jump, vec![]);
+        jump.targets.push(BlockCall {
+            block: body,
+            args: if shape == "edge-arg" {
+                vec![held]
+            } else {
+                vec![]
+            },
+        });
+        f.set_terminator(forward, jump);
+        if let Some(spacer) = spacer {
+            let mut jump = instruction(Opcode::Jump, vec![]);
+            jump.targets.push(BlockCall {
+                block: exit,
+                args: vec![],
+            });
+            f.set_terminator(spacer, jump);
+        }
+        if shape == "heat-header" {
+            // The empty source is the actual backward-edge target, so its
+            // heat poll must survive despite satisfying the adjacency shape.
+            let mut branch = instruction(Opcode::Brif, vec![flag]);
+            branch.targets = vec![
+                BlockCall {
+                    block: forward,
+                    args: vec![],
+                },
+                BlockCall {
+                    block: exit,
+                    args: vec![],
+                },
+            ];
+            f.set_terminator(body, branch);
+        } else {
+            let (nil, _) = f.push_inst(
+                body,
+                instruction(Opcode::ConstNil, vec![]),
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+            let mut jump = instruction(Opcode::Jump, vec![]);
+            jump.targets.push(BlockCall {
+                block: header,
+                args: vec![f.inst(nil).results[0]],
+            });
+            f.set_terminator(body, jump);
+        }
+        f.set_terminator(exit, instruction(Opcode::Return, vec![held]));
+        egcl_compiler::t2::verify::verify(&f).expect("well-formed cyclic forwarding fixture");
+        let helper = poll as *const () as u64;
+        let (framed, _) = emit_framed_native_handlers_with_poll(
+            &f, helper, 2, helper, helper, helper, helper, helper, helper,
+        )
+        .unwrap();
+        let sites = framed.native_calls.as_ref().unwrap();
+        let has_poll = |block| {
+            sites
+                .iter()
+                .any(|site| site.origin == NativeCallOrigin::LoopPoll(block))
+        };
+        assert_eq!(
+            has_poll(forward),
+            shape != "adjacent",
+            "source eligibility: {shape}"
+        );
+        assert!(has_poll(body), "destination poll must remain: {shape}");
+        if shape != "heat-header" {
+            assert!(has_poll(header), "real loop header must remain");
+        }
+        let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
+        let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+        egcl_rt::rooted!(activation = vec![NIL; usize::from(2 + framed.shadow_root_slots)]);
+        let object = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
+        unsafe {
+            object.cast::<f64>().write(123.5);
+        }
+        egcl_rt::rooted!(expected = unsafe { EgclVal::from_heap_ptr(object.sub(8)) });
+        activation[0] = if shape == "heat-header" {
+            NIL
+        } else {
+            egcl_rt::value::T
+        };
+        activation[1] = *expected;
+        let original = expected.to_raw();
+        POLLS.store(0, Ordering::Relaxed);
+        HEAT_POLLS.store(0, Ordering::Relaxed);
+        let result = run(activation.as_mut_ptr().cast());
+        assert_eq!(
+            POLLS.load(Ordering::Relaxed),
+            match shape {
+                "adjacent" => 3,
+                "heat-header" => 2,
+                _ => 4,
+            },
+            "executed poll count: {shape}"
+        );
+        assert_eq!(
+            HEAT_POLLS.load(Ordering::Relaxed),
+            if shape == "heat-header" { 1 } else { 2 },
+            "heat header visits must remain: {shape}"
+        );
+        assert_ne!(
+            expected.to_raw(),
+            original,
+            "retained poll must really relocate live value: {shape}"
+        );
+        assert_eq!(
+            result,
+            expected.to_raw(),
+            "return must consume relocated native value: {shape}"
+        );
+        assert_eq!(expected.as_double_float(), 123.5);
+    }
+}

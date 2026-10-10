@@ -4129,6 +4129,33 @@ fn emit_framed_inner(
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
+    // Tiering samples loop-header visits, not every safepoint in a cyclic
+    // region. Backward RPO edges cover reducible and irreducible loops alike.
+    // The initial header visit also counts; these are sampled heat estimates.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let heat_headers: HashSet<_> = {
+        let order: HashMap<_, _> = f
+            .reverse_postorder()
+            .into_iter()
+            .enumerate()
+            .map(|(rank, block)| (block, rank))
+            .collect();
+        let mut headers = HashSet::new();
+        for &block in &blocks {
+            if let Some(term) = f.terminator(block) {
+                for target in &f.inst(term).targets {
+                    if let (Some(target_rank), Some(source_rank)) =
+                        (order.get(&target.block), order.get(&block))
+                        && target_rank <= source_rank
+                    {
+                        headers.insert(target.block);
+                    }
+                }
+            }
+        }
+        headers
+    };
+
     // Native segment polling is placed at loop headers rather than after every
     // branch. This keeps condition flags intact and guarantees that every
     // cycle reaches a poll. Header roots use the same split-aware ranges as
@@ -4183,6 +4210,30 @@ fn emit_framed_inner(
                 if reaches(target.block, block) {
                     headers.insert(target.block);
                 }
+            }
+        }
+        // A parameter-free jump to the next block emits no edge moves or
+        // branch. Its poll is redundant when that next block still polls.
+        // Keep heat and OSR entries: their polls also implement tier transfer.
+        // Work backwards so every removed poll has a retained destination.
+        for pair in blocks.windows(2).rev() {
+            let (block, next) = (pair[0], pair[1]);
+            let data = f.block(block);
+            if block == entry || !headers.contains(&block) || !headers.contains(&next)
+                || heat_headers.contains(&block)
+                || f.osr_entries.iter().any(|osr| osr.block == block)
+                || !data.params.is_empty() || !f.block(next).params.is_empty()
+                || data.insts.len() != 1
+            {
+                continue;
+            }
+            let jump = f.inst(data.insts[0]);
+            if jump.opcode == Opcode::Jump && jump.args.is_empty()
+                && jump.results.is_empty() && jump.frame_state.is_none()
+                && jump.targets.len() == 1 && jump.targets[0].block == next
+                && jump.targets[0].args.is_empty()
+            {
+                headers.remove(&block);
             }
         }
         let mut points = HashMap::new();
@@ -4756,33 +4807,6 @@ fn emit_framed_inner(
     // state knows the bytecode position it deoptimizes to. Collect (native
     // offset, bcp) at those points; post-processed into a per-bcp map below.
     let mut bcp_sites: Vec<(u32, u32)> = Vec::new();
-
-    // Tiering samples loop-header visits, not every safepoint in a cyclic
-    // region. Backward RPO edges cover reducible and irreducible loops alike.
-    // The initial header visit also counts; these are sampled heat estimates.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let heat_headers: HashSet<_> = {
-        let order: HashMap<_, _> = f
-            .reverse_postorder()
-            .into_iter()
-            .enumerate()
-            .map(|(rank, block)| (block, rank))
-            .collect();
-        let mut headers = HashSet::new();
-        for &block in &blocks {
-            if let Some(term) = f.terminator(block) {
-                for target in &f.inst(term).targets {
-                    if let (Some(target_rank), Some(source_rank)) =
-                        (order.get(&target.block), order.get(&block))
-                        && target_rank <= source_rank
-                    {
-                        headers.insert(target.block);
-                    }
-                }
-            }
-        }
-        headers
-    };
 
     // Emit each block: bind its label, emit its instructions, then its terminator
     // (with block-parameter moves on each out-edge).
