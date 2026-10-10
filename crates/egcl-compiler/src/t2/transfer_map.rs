@@ -295,3 +295,56 @@ pub(crate) fn lower_resolved_transfer_maps(
     }
     Ok(maps)
 }
+
+/// Reuse precise deopt descriptors for a cold OSR capture at an inserted poll.
+/// The poll's resolved values are authoritative for liveness and physical
+/// homes, including constants; absent dead locals have no import destination.
+pub(crate) fn lower_poll_transfer_map(
+    f: &Function,
+    block: crate::t2::ir::Block,
+    machine_inst: usize,
+    values: &crate::t2::x64_frame::FrameValues,
+) -> Option<TransferCaptureMap> {
+    use crate::t2::frame_state::ValueSource;
+    use crate::t2::x64_frame::FrameValueLocation;
+    let entry = f.osr_entries.iter().find(|entry| entry.block == block)?;
+    let mut state = f.frame_states.get(entry.frame_state).clone();
+    if state.scopes.len() != 1 || !state.scopes[0].stack.is_empty() {
+        return None;
+    }
+    let substitute = |source: &mut ValueSource| {
+        if let ValueSource::Value { value, .. } = source {
+            match values.value(*value).map(|entry| entry.location) {
+                Some(FrameValueLocation::Immediate(value)) => *source = ValueSource::Const(value),
+                None => *source = ValueSource::Const(egcl_rt::value::NIL),
+                _ => {}
+            }
+        }
+    };
+    for source in &mut state.scopes[0].locals {
+        substitute(source);
+    }
+    for recipe in &mut state.remat {
+        for source in &mut recipe.inputs {
+            substitute(source);
+        }
+    }
+    let frames = deopt::lower_one(0, &state, &|value| match values.value(value)?.location {
+        FrameValueLocation::Home(home) => home.location(),
+        FrameValueLocation::Immediate(_) => None,
+    }).ok()?.scopes;
+    let mut roots = Vec::new();
+    for frame in &frames {
+        for slot in &frame.slots {
+            collect_roots(slot, &mut roots);
+        }
+    }
+    Some(TransferCaptureMap {
+        call: f.terminator(block)?,
+        machine_inst,
+        origin_bcp: entry.bcp,
+        control_scopes: Vec::new(),
+        frames,
+        roots,
+    })
+}

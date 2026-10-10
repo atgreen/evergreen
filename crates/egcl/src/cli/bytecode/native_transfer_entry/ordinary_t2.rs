@@ -23,11 +23,8 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         ));
         None
     };
-    if !fixed_tagged_parameters(&input.body) || !scope_free_native_body(&input.body, true) {
+    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true) {
         return decline("unsupported parameter or control-scope shape");
-    }
-    if !optimized.osr_entries.is_empty() {
-        return decline("OSR entry mapping not admitted");
     }
     // Transfer capture currently reconstructs one logical frame. In particular,
     // never attach the root body's scope map to an inlined callee's bytecode PC.
@@ -96,6 +93,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         return None;
     };
     code.installed_symbol = Some(symbol);
+    code.is_t2 = true;
     let code = Rc::new(code);
     let entry = code.code.as_ptr();
     // Report the actual mapped bytes and positions, never the checked fallback.
@@ -115,7 +113,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         num_slots: code.slots,
         compiled_entry: 0,
         code_id: artifact.code_id,
-        osr_entries: HashMap::new(),
+        osr_entries: code.osr_entries.clone(),
         bcp_offsets: code.bcp_offsets.clone(),
         code_info: code.code_info,
         has_deopt: code.has_deopt,

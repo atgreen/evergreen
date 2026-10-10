@@ -3602,6 +3602,8 @@ fn emit_transfer_function(
                     | Opcode::ConstHeapObj
                     | Opcode::GenericEq
                     | Opcode::TypeCheck
+                    | Opcode::Car
+                    | Opcode::Cdr
                     | Opcode::MemoryFence
             ) {
                 return Err(EmitError::UnsupportedOp(op_tag(f.inst(inst).opcode)));
@@ -3648,6 +3650,9 @@ fn emit_transfer_function(
     let mut catch_landings = Vec::new();
     let mut handler_landings = Vec::new();
     for site in &transfers.sites {
+        if f.inst(site.map.call).opcode != Opcode::Invoke {
+            continue; // inserted OSR polls have no exceptional CFG successor
+        }
         let cold = f.inst(site.map.call).targets[1].block;
         if let Some(entries) = transfers.handler_landings.get(&cold) {
             for &(entry_offset, push_bcp, table_index, clause_index) in entries {
@@ -4245,6 +4250,12 @@ fn emit_framed_inner(
     } else {
         vec![]
     };
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let local_osr_scopes = transfer_maps.iter().all(|map| map.control_scopes.iter().all(|scope| {
+        scope.ownership == crate::control_scope::Ownership::Local
+            && matches!(scope.kind, crate::control_scope::ScopeKind::Block { register: false, .. }
+                | crate::control_scope::ScopeKind::Tagbody { .. })
+    }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
             .map_err(|_| EmitError::UnsupportedOp(0xFE))
@@ -4735,6 +4746,29 @@ fn emit_framed_inner(
             )?;
             native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
             native_calls.push(call.site(NativeCallOrigin::LoopPoll(b), NativeStackBase::Body));
+            if local_osr_scopes
+                && let Some(map) = crate::t2::transfer_map::lower_poll_transfer_map(
+                    f, b, loop_points[&b], &loop_maps[&b],
+                )
+            {
+                let mut shadow_roots = Vec::new();
+                for (index, value) in loop_roots[&b].iter().enumerate() {
+                    let location = homes[value].location().ok_or(EmitError::UnsupportedOp(0xFE))?;
+                    if map.roots.contains(&location) {
+                        shadow_roots.push((location, activation_slots.unwrap()
+                            .checked_add(index as u16).ok_or(EmitError::UnsupportedOp(0xFE))?));
+                    }
+                }
+                transfers.as_mut().unwrap().sites.push(crate::t2::transfer_sites::SysvTransferSite {
+                    return_offset: call.return_offset.try_into().map_err(|_| EmitError::BadBranch)?,
+                    stack_slots: native_spill_slots,
+                    call_stack_adjust: call.stack_adjust,
+                    activation_slots: activation_slots.unwrap().checked_add(shadow_root_slots)
+                        .ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    shadow_roots,
+                    map,
+                });
+            }
         }
         // Fixnum operands proven by a dominating guard: the entry block dominates
         // all others, so its guards carry over (the entry block itself starts fresh).

@@ -165,6 +165,7 @@ impl ActivationState {
         nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     ) -> CaptureContext {
         CaptureContext {
+            osr: None,
             children,
             nested,
             owner: code,
