@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Describe delivered executables in ASDF system definitions with
+  `egcl-deliver-asdf`; `asdf:make` writes the specification, saves the core
+  and runs the tree shaker to produce the executable
+  ([#161](https://github.com/atgreen/evergreen/pull/161)).
+
 ### Compatibility
 
 - Saved bytecode now uses version 2.0 and core images use format 9. Recompile
