@@ -19,22 +19,24 @@
 name: cross
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - 'crates/egcl-rt/**'
-      - 'crates/egcl-compiler/**'
-      - 'crates/egcl-android/**'
-      - 'Cross.toml'
-      - 'scripts/cross-port.sh'
-      - '.github/workflows/cross.yml'
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      preserve_run:
+        description: Preserve explicitly requested validation, including scheduled callers
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+# Cancel stale automatic nightly runs, while explicit validations remain
+# independent even when a reusable caller inherited a schedule event.
+concurrency:
+  group: cross-intensive-v1-${{ github.workflow }}-${{ github.event_name == 'schedule' && !inputs.preserve_run && format('scheduled-{0}', github.ref) || format('run-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' && !inputs.preserve_run }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -74,6 +76,8 @@ jobs:
     name: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
@@ -151,6 +155,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install the pinned toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain
       - name: add both Android ABIs

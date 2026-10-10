@@ -1,0 +1,10 @@
+{
+  "note": "Historical Linux harness totals in seconds; divide by discovered case count until per-case measurements are available. These are estimates, not CI performance guarantees.",
+  "harness_seconds": {
+    "acceptance": 1386,
+    "funcallable_instance_cli": 960,
+    "print_instance_gc": 414,
+    "socket_listener_options": 414
+  },
+  "tests": {}
+}

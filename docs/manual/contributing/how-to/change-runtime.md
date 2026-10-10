@@ -33,21 +33,45 @@ are correct.
 
 ## Validate the change
 
-Run the affected tests and their direct callers. For a broad runtime change,
-run the wider workspace gates with the project's memory cap:
+Run the changed behavior and its direct callers first. GitHub Actions uses the
+same tiered runner locally and on hosted machines:
 
 ```sh
-EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh cargo test --workspace
-cargo check --workspace
-cargo fmt --all -- --check
-bash scripts/gc-root-lint.sh
-python3 scripts/spec-coverage.py --gate
+EGCL_MEM_MAX=8G EGCL_TIMEOUT=1200 scripts/egcl-limited.sh \
+  python3 scripts/ci-tests.py build --suite fast \
+  --target x86_64-unknown-linux-musl --shards 1 \
+  --manifest target/ci-tests/manifest.json
+scripts/egcl-limited.sh python3 scripts/ci-tests.py run \
+  --manifest target/ci-tests/manifest.json --shard 0 \
+  --results target/ci-tests/results-0.json
+bash scripts/ci-lint.sh
 ```
 
-The normal lint gate is `cargo clippy --workspace --all-targets -- -D warnings`.
-If an existing failure blocks a gate, record the precise failure instead of
-calling the tree green. Cross-target changes need checks on the affected target;
-a host build cannot validate target-specific `cfg` branches.
+PRs and pushes to main run smoke, fast regression, and relevant additional
+checks. Documentation-only changes run the CI contract checks and skip Rust
+builds; unknown paths or an unavailable change range select runtime validation.
+The stable `ci-required` check verifies the expected jobs, including intentional
+skips. It does not turn a failed or canceled test into success. Required branch
+protection should use this check only after its hosted reliability is established.
+
+Full musl and GNU/FFI regression runs nightly, on a manual `full` dispatch,
+for a merge-group event where supported, and before future release publication.
+Each configuration builds once. Eight deterministic shards reuse that exact
+artifact and split large harnesses by named tests, using recorded duration
+estimates rather than balancing by test count alone. Results and timings are
+uploaded even when tests fail. The archived binaries require the same absolute
+checkout path as the build because existing tests embed executable paths.
+
+GC stress and cross-platform matrices run nightly or when explicitly requested.
+Manual GC runs select either `full` or `subset`, avoiding duplicate execution.
+Superseded PR and main validation runs cancel; explicit release/manual runs are
+preserved. Merge-group support is present, but GitHub does not currently offer
+merge queues for this personal-account repository.
+
+Targeted tests do not replace comprehensive coverage. Existing full-suite
+failures remain failures and must be tracked in Beads, not hidden by ignores or
+weakened assertions. Cross-target code still needs execution on the affected
+platform; a host build cannot validate another platform's `cfg` branches.
 
 Update user-facing documentation when behavior changes. Commit validated work,
 close the Bead with the commit and validation evidence, and follow the active
