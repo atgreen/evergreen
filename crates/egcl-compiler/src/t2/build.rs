@@ -3471,7 +3471,7 @@ mod tests {
     }
 
     #[test]
-    fn folded_builtin_retains_binding_deopt_on_every_backend() {
+    fn folded_mutable_builtin_retains_binding_deopt_on_every_backend() {
         use crate::t2::{emit, emit_a64, emit_ppc64le, emit_riscv64, emit_s390x};
         use crate::t2::pass::PassManager;
         let plus = egcl_rt::symbols::intern("+");
@@ -3480,6 +3480,18 @@ mod tests {
         ], vec![EgclVal::from_fixnum(10), EgclVal::from_fixnum(20)], 0, 0, 2);
         let mut function = build_from_bytecode(&input).unwrap();
         assert_eq!(crate::t2::speculate::speculate(&mut function, &|_| None), 1);
+        // Standard CL arithmetic is fixed. Add an independent mutable binding
+        // dependency explicitly: this fixture tests folding and backend deopt
+        // preservation, not whether canonical arithmetic needs a binding guard.
+        let mutable = egcl_rt::symbols::intern("FOLDING-MUTABLE-BINDING-FIXTURE");
+        let binding = crate::t2::builtin_binding::snapshot(mutable).unwrap();
+        assert!(matches!(binding, crate::t2::builtin_binding::Binding::Guarded { .. }));
+        let block = function.entry();
+        let position = function.block(block).insts.iter().position(|&inst|
+            function.inst(inst).opcode == Opcode::FixnumAdd).unwrap();
+        let arithmetic = function.block(block).insts[position];
+        let state = function.inst(arithmetic).frame_state.unwrap();
+        crate::t2::builtin_binding::insert(&mut function, block, position, state, binding);
         let mut passes = PassManager::new();
         passes.add(Box::new(crate::t2::opt_fold::ConstFold))
             .add(Box::new(crate::t2::opt_clear_mv::ClearMvElim))
