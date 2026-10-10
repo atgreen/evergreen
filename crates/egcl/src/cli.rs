@@ -8540,7 +8540,10 @@ impl Env {
     }
 
     fn new_impl(sandbox: bool, reset_clos: bool, for_macro_expansion: bool) -> Self {
-        #[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+        #[cfg(any(
+            all(target_arch = "x86_64", any(target_os = "linux", windows)),
+            all(target_arch = "aarch64", unix)
+        ))]
         bytecode::initialize_native_callable_entries();
         compiler_macroexpand::set_local_macro_evaluator(eval_compiler_local_macro);
         compiler_macroexpand::set_macroexpand_hook(invoke_lisp_macroexpand_hook);
@@ -35386,7 +35389,7 @@ fn apply_function(
     }
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     {
-        #[cfg(all(target_arch = "x86_64", windows))]
+        #[cfg(any(all(target_arch = "x86_64", windows), all(target_arch = "aarch64", unix)))]
         if bytecode::native_callable_enabled() {
             return bytecode::invoke_native_callable(fn_val, args, env);
         }
