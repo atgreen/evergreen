@@ -220,6 +220,13 @@ fn native_v2_mapped_child_reenters_through_rust_and_retires_in_order() {
         &mut env,
     )
     .unwrap();
+    // These source wrappers make the private test hooks lowerable. Keep only
+    // the observation helpers at T0 so warming them cannot add mapped frames
+    // between the marker and the protected code whose identity it observes.
+    let helpers = ["REENTRY-MARK", "REENTRY-COLLECT"].map(egcl_rt::symbols::intern);
+    for symbol in helpers {
+        profile_pin(symbol);
+    }
     let (inner_symbol, inner) = prepare_mapped("REENTRY-INNER", "(x fail)", inner_forms, &env);
     let inner = install(inner_symbol, inner);
     let (child_symbol, child) = prepare_mapped("REENTRY-CHILD", "(form)", child_forms, &env);
@@ -312,5 +319,8 @@ fn native_v2_mapped_child_reenters_through_rust_and_retires_in_order() {
                 );
             });
         }
+    }
+    for symbol in helpers {
+        profile_unpin(symbol);
     }
 }

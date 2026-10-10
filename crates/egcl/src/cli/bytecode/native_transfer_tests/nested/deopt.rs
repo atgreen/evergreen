@@ -87,6 +87,7 @@ fn install_guarded_child(name: &str, params: &str, forms: &str, env: &Env) -> Rc
     assert!(code.has_deopt, "{:?}", body.code);
     let installed =
         super::super::super::native_transfer_entry::install_baseline_code(symbol, code).unwrap();
+    mark_fresh_promotion(symbol);
     publish_native(
         symbol,
         egcl_rt::symbols::symbol_function(symbol),
@@ -367,6 +368,7 @@ fn native_v2_retired_installed_guard_does_not_decay_new_version_profile() {
         TransferCode::compile(Arc::clone(&body)).unwrap(),
     )
     .unwrap();
+    mark_fresh_promotion(symbol);
     publish_native(
         symbol,
         egcl_rt::symbols::symbol_function(symbol),

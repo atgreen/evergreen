@@ -51,9 +51,31 @@ impl Drop for RestoreNativeFrame {
 }
 
 fn note_segment_deopt(code: &TransferCode) {
-    DEOPT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let count = code.deopts.get().saturating_add(1);
     code.deopts.set(count);
+    let installed = code.installed_symbol.and_then(|symbol| {
+        NATIVE_REGISTRY.with(|registry| {
+            registry
+                .borrow()
+                .get(&symbol)
+                .filter(|native| {
+                    matches!(&native._storage, NativeCodeStorage::Mapped(mapped)
+                    if std::ptr::eq(mapped.as_ref(), code))
+                })
+                .cloned()
+                .map(|native| (symbol, native))
+        })
+    });
+    // Ordinary T1 keeps its existing per-function backoff policy, including
+    // T0 blacklisting for unsupported domains. Retain this exact version and
+    // release the registry borrow before policy code retires or replaces it.
+    if let Some((symbol, native)) = &installed {
+        if !native.is_t2 {
+            note_native_deopt(*symbol, Some(native));
+            return;
+        }
+    }
+    DEOPT_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let key = Arc::as_ptr(&code.body) as usize;
     let current = SEGMENT_CACHE.with(|cache| {
         cache
@@ -62,15 +84,7 @@ fn note_segment_deopt(code: &TransferCode) {
             .and_then(|entry| entry.code.as_ref())
             .is_some_and(|entry| std::ptr::eq(entry.as_ref(), code))
     });
-    let installed = code.installed_symbol.is_some_and(|symbol| {
-        NATIVE_REGISTRY.with(|registry| {
-            registry.borrow().get(&symbol).is_some_and(|native| {
-                matches!(&native._storage, NativeCodeStorage::Mapped(mapped)
-                if std::ptr::eq(mapped.as_ref(), code))
-            })
-        })
-    });
-    if !(current || installed || call_table::owns_mapped(code)) {
+    if !(current || installed.is_some() || call_table::owns_mapped(code)) {
         return;
     }
     if count == 1 {
@@ -95,9 +109,7 @@ pub(super) unsafe extern "C" fn resume_guard(
     out: *mut NativeOutcome,
     image: *mut egcl_compiler::t2::native_transfer::SysvTransferCapture,
 ) {
-    unsafe {
-        super::root_publication::published(image, || resume_guard_unpublished(request, out))
-    }
+    unsafe { super::root_publication::published(image, || resume_guard_unpublished(request, out)) }
 }
 
 unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
@@ -138,7 +150,9 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         // Materialized T0 locals no longer follow native debugger recipes.
         // T0 scans every tagged slot; the guard restores native metadata when
         // its exact frame extent is recreated after the continuation returns.
-        unsafe { (*frame).code_info = std::ptr::null(); }
+        unsafe {
+            (*frame).code_info = std::ptr::null();
+        }
         let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
         let env = NATIVE_ENV.with(Cell::get);
         if env.is_null() {

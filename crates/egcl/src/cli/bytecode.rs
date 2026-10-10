@@ -22190,6 +22190,13 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     if native_would_lose_captured_control(&bf) {
         return None;
     }
+    // Prefer the published native ABI for the shapes whose exact frame and
+    // transfer maps the baseline emitter supports. Unsupported shapes retain
+    // the checked emitter below during the remaining caller migration.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(mapped) = native_transfer_entry::install_t1(sym, Arc::clone(&bf), allow_speculation) {
+        return Some(mapped);
+    }
     // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
     // another user function crosses c2i into `apply_function`, which runs the
     // callee in the interpreter (NOT via `run_native`), so the native call path
@@ -22210,16 +22217,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         bcp_offsets,
         has_deopt,
         direct_calls,
-    } = match emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false) {
-        Some(emission) => emission,
-        None => {
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            if native_transfer_entry::installation_enabled() {
-                return native_transfer_entry::install_baseline(sym, bf);
-            }
-            return None;
-        }
-    };
+    } = emit_native_t1(&bf, allow_speculation, sym, backedge_counter, false)?;
     let num_slots = bf.num_slots();
     // Install-time GC contract (bliss-jtc.4, R4.46): a validated stack map for
     // the activation's safepoint must exist, or the code is not installed.
