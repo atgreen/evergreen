@@ -78,7 +78,7 @@ fn spec_image_round_trip_restores_heap_and_entry_state() {
     save_image(path.to_str().unwrap(), &image_opts()).expect("save_image");
     let header = validate_image_header(path.to_str().unwrap()).expect("validate header");
     assert_eq!(header.entry_continuation, entry.to_raw());
-    assert_eq!(header.format_version, 7);
+    assert_eq!(header.format_version, 8);
     assert!(header.heap_size >= 4096);
     assert_eq!(header.heap_size % 4096, 0);
 
@@ -364,16 +364,24 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
-        7,
-        "immutable function definition identities require image format version 7"
+        8,
+        "binding-preserving bytecode requires image format version 8"
     );
-    let mut old_layout = bytes.clone();
-    old_layout[8..12].copy_from_slice(&6_u32.to_ne_bytes());
-    let old_layout_path = temp_path("header-old-function-padding.bimg");
-    fs::write(&old_layout_path, &old_layout).unwrap();
-    let error = validate_image_header(old_layout_path.to_str().unwrap()).err()
-        .expect("old function padding must not become definition metadata");
-    assert!(format!("{error}").contains("unsupported format version"));
+    for version in [1u32, 6, 7, 9] {
+        let mut incompatible = bytes.clone();
+        incompatible[8..12].copy_from_slice(&version.to_ne_bytes());
+        let incompatible_path = temp_path(&format!("header-version-{version}.bimg"));
+        fs::write(&incompatible_path, &incompatible).unwrap();
+        for result in [
+            validate_image_header(incompatible_path.to_str().unwrap()).map(|_| ()),
+            load_image(incompatible_path.to_str().unwrap()).map(|_| ()),
+        ] {
+            let error = result.expect_err("incompatible saved definitions must be rejected");
+            let message = format!("{error}");
+            assert!(message.contains("unsupported format version"), "{message}");
+            assert!(message.contains("rebuild"), "{message}");
+        }
+    }
     bytes[0] ^= 0xFF;
     let bad_magic = temp_path("header-bad-magic.bimg");
     fs::write(&bad_magic, &bytes).expect("write mutated image");

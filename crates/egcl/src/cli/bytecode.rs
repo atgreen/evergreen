@@ -803,23 +803,6 @@ impl egcl_rt::gc::TraceHostRoots for ActiveBytecodeRoot {
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
-fn literal_memory_fence(rest: EgclVal) -> Option<MemoryFenceKind> {
-    if !rest.is_cons() {
-        return None;
-    }
-    let (kind, tail) = cp(rest);
-    if !tail.is_nil() || !kind.is_symbol() {
-        return None;
-    }
-    match egcl_rt::symbols::registry_key(kind.as_symbol_index()).as_deref() {
-        Some("KEYWORD:READ" | "KEYWORD:DATA-DEPENDENCY") => Some(MemoryFenceKind::Read),
-        Some("KEYWORD:WRITE") => Some(MemoryFenceKind::Write),
-        Some("KEYWORD:FULL") => Some(MemoryFenceKind::Full),
-        _ => None,
-    }
-}
-
 /// Execute an inline [`Instr::TypeP`] check of `v` against `class`, using the
 /// *exact* predicates the TYPEP builtin uses (`super::typep_matches`) so the T0
 /// inline and a c2i TYPEP call always agree. `stringp`/`packagep` are NOT used:
@@ -3366,21 +3349,7 @@ impl<'e> Lowerer<'e> {
         if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv) {
             return self.lower_expr(expanded);
         }
-        // Only on targets whose T1 and T2 emitters compile the opcode; the
-        // others keep the generic %MEMORY-FENCE call, since an unsupported
-        // bytecode would cost a function its native tiers.
-        #[cfg(any(target_arch = "x86_64", target_arch = "s390x"))]
-        {
-            if name == "EGCL::%MEMORY-FENCE"
-                && let Some(kind) = literal_memory_fence(rest)
-            {
-                self.emit(Instr::ClearMv);
-                self.emit(Instr::MemoryFence(kind));
-                self.push_n(1);
-                return Ok(());
-            }
-        }
-        // Keep function calls intact here: source-level LDB/BYTE and TYPEP
+        // Keep function calls intact here: source-level builtin and accessor
         // substitutions erased bindings that can change after compilation.
         // Native builtin specialization must carry a live binding guard.
         // An unhandled special operator is not a call.
@@ -3418,37 +3387,6 @@ impl<'e> Lowerer<'e> {
         let nargs = args.len();
         if nargs > u16::MAX as usize {
             return Err(Bail);
-        }
-        // `(accessor obj)` for a DEFCLASS :accessor/:reader or a DEFSTRUCT
-        // accessor -> EGCL::GET-ACCESSOR-SLOT (instance, accessor-symbol), the
-        // mirror of the SET-ACCESSOR-SLOT store arm. Accessors are installed as
-        // real generic methods so that #'reader, funcall and mapcar work
-        // (bliss-aid), which meant a plain `(ball-x b)` paid full generic dispatch
-        // in compiled code: 4.06us, against 1.26us for the `(slot-value b 'x)` it
-        // amounts to (bliss-fskhm).
-        //
-        // Placed HERE, immediately before the generic CallNamed and after the
-        // flet/labels lookup returned early, so it can only ever replace a generic
-        // dispatch — never a lexical binding, a macro or a special operator. The
-        // existence of the mapping is the only thing decided at compile time; WHICH
-        // slot, and whether the shortcut applies to the actual argument at all, is
-        // the primitive's business at run time, and it defers to real dispatch when
-        // the object's own class does not declare the accessor.
-        if nargs == 1
-            && super::accessor_slot_name(self.env, name).is_some()
-            && let Some(getter) = resolve_sym("EGCL::GET-ACCESSOR-SLOT")
-        {
-            self.lower_expr(args[0])?;
-            let c = self.add_const(op);
-            self.emit(Instr::Const(c));
-            self.push_n(1);
-            self.emit(Instr::CallNamed {
-                sym: getter.as_symbol_index(),
-                nargs: 2,
-            });
-            self.pop_n(2);
-            self.push_n(1);
-            return Ok(());
         }
         for i in 0..nargs {
             self.lower_expr(args[i])?;
@@ -8817,7 +8755,10 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x010d: source-independent multidimensional-array constants (tag 19).
 // 0x010e: forward and cyclic references in aggregate constants.
 // 0x010f: native memory-fence bytecode (opcode 0x44).
-const BBU_BYTECODE_VERSION: u16 = 0x010f;
+// 0x0200: callable-preserving source lowering. Version-1 units may have erased
+// LDB/BYTE, TYPEP, accessor, or memory-fence bindings. Their original callees
+// cannot be reconstructed, so a new major rejects them before installation.
+const BBU_BYTECODE_VERSION: u16 = 0x0200;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -13415,7 +13356,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
         || (bytecode_version & 0xff) > (BBU_BYTECODE_VERSION & 0xff)
     {
         return Err(bbu_error(format!(
-            "unsupported bytecode version {bytecode_version:#06x}"
+            "unsupported bytecode version {bytecode_version:#06x}; recompile the source with this EGCL runtime"
         )));
     }
     let verifier_version = cursor.u16()?;
@@ -21081,6 +21022,33 @@ fn emit_native(
                 if is_always_signalling(*sym) {
                     let l = *deopt_labels.entry(bcp).or_insert_with(|| c.label());
                     c.jmp(l);
+                    continue;
+                }
+                // Retain the source CallNamed for deopt and persisted code.
+                // A literal fence may specialize only while its binding and
+                // evaluated argument still match. The argument guard also
+                // protects an entry edge that bypasses the preceding Const.
+                if allow_speculation && *nargs == 1
+                    && egcl_rt::symbols::registry_key(*sym).as_deref() == Some("EGCL::%MEMORY-FENCE")
+                    && let Some(Instr::Const(index)) = bcp_idx.checked_sub(1).map(|i| &bf.code[i])
+                    && let Some(argument) = bf.constants.get(*index as usize).copied()
+                    && let Some(kind) = argument.symbol_index()
+                        .and_then(egcl_compiler::t2::speculate::literal_memory_fence_kind)
+                    && emit_builtin_binding_guard(&mut c, &mut deopt_labels, *sym, bcp)
+                {
+                    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, expected argument
+                    c.extend_from_slice(&argument.0.to_le_bytes());
+                    c.extend_from_slice(&[0x49, 0x39, 0x47, 0xF8]); // cmp [r15-8], rax
+                    jcc_deopt(&mut c, &mut deopt_labels, Cc::Ne, bcp);
+                    c.extend_from_slice(match kind {
+                        MemoryFenceKind::Read => &[0x0f, 0xae, 0xe8],
+                        MemoryFenceKind::Write => &[0x0f, 0xae, 0xf8],
+                        MemoryFenceKind::Full => &[0x0f, 0xae, 0xf0],
+                    });
+                    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, NIL
+                    c.extend_from_slice(&NIL.0.to_le_bytes());
+                    c.extend_from_slice(&[0x49, 0x89, 0x47, 0xF8]); // result replaces argument
+                    emit_clear_mv(&mut c);
                     continue;
                 }
                 // Inlined primitives still denote the live function binding.

@@ -1,12 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! `EGCL-EXT:MEMORY-BARRIER` and its load/store variants lower to the
-//! `MemoryFence` bytecode on the targets whose native emitters compile it,
-//! and a function using them must reach T1 and T2 there with the same answer
-//! the interpreter gives. A full native test run on s390x found the lowering
-//! gated to x86-64, so the bfasl persistence test failed and the barrier was
-//! a generic call in native code.
+//! Memory barriers must remain callable at every tier, with the same result
+//! as the interpreter. Their source-level calls retain live function bindings;
+//! direct native fence expansions guard those bindings first.
 
 use std::process::Command;
 

@@ -128,6 +128,16 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
+The current bytecode version is **2.0** (`0x0200`). Version-1 writers could
+replace calls to `LDB`, `BYTE`, `TYPEP`, class/structure readers, and literal
+memory fences with instructions that no longer identify the original callable.
+Those bodies cannot honor later replacement of that callable. All version-1
+units are therefore rejected before constants, definitions, or load actions are
+installed, even if legacy source sections are present. Recompile the original
+source with the current runtime; changing the stored version number is not a
+conversion. This compatibility boundary does not change the outer BFASL
+container version or the independent verifier version.
+
 `expanded_hash` is the reproducibility key for the macroexpanded input to the
 bytecode compiler.  It is distinct from the outer `content_hash`: `content_hash`
 answers "is this cache entry stale for this source and dependency graph?",
