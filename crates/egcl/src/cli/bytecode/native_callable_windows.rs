@@ -286,9 +286,10 @@ unsafe extern "win64" fn slice() {
         "add rsp, 72", "ret",
         // dispatch and its Rust root guards have returned. Only assembly frames
         // remain above the segment landing, so a transfer cannot skip Drop.
+        // REX.W JMP [rax] remains recognizable when unwinding at the tail PC.
         "2:", "mov r10, [rsp + 56]", "mov rcx, [r10 + {request}]",
-        "mov rdx, rax", "mov r8, [rsp + 48]", "lea r11, [r10 + {capture}]",
-        "add rsp, 72", "jmp qword ptr [r11]", ".seh_endproc",
+        "mov rdx, rax", "mov r8, [rsp + 48]", "lea rax, [r10 + {capture}]",
+        "add rsp, 72", ".byte 0x48", "jmp qword ptr [rax]", ".seh_endproc",
         this = sym slice,
         dispatch = sym dispatch,
         request = const std::mem::offset_of!(NativeCallContext, request),

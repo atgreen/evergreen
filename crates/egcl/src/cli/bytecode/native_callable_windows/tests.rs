@@ -4,6 +4,41 @@
 use super::*;
 use crate::cli::{heap_test_lock, read_eval_all_env};
 
+fn mitigation_policy_diagnostic() -> String {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessMitigationPolicy, ProcessControlFlowGuardPolicy,
+        ProcessUserShadowStackPolicy,
+    };
+    [
+        ("CFG", ProcessControlFlowGuardPolicy),
+        ("UserShadowStack", ProcessUserShadowStackPolicy),
+    ]
+    .into_iter()
+    .map(|(name, policy)| {
+        let mut flags = u32::MAX;
+        let ok = unsafe {
+            GetProcessMitigationPolicy(
+                GetCurrentProcess(),
+                policy,
+                (&mut flags as *mut u32).cast(),
+                std::mem::size_of_val(&flags),
+            )
+        };
+        let error = if ok == 0 {
+            Some(unsafe { GetLastError() })
+        } else {
+            None
+        };
+        format!(
+            "{name}: query_ok={}, flags={flags:#010x}, GetLastError={error:?}",
+            ok != 0
+        )
+    })
+    .collect::<Vec<_>>()
+    .join("; ")
+}
+
 fn require_native_windows() {
     assert!(
         enabled(),
@@ -11,7 +46,8 @@ fn require_native_windows() {
     );
     assert!(
         egcl_rt::native_transfer::is_supported(),
-        "Win64 callable execution gate requires supported mitigation policy; refusal is not execution coverage"
+        "Win64 callable execution gate requires supported mitigation policy; refusal is not execution coverage; {}",
+        mitigation_policy_diagnostic()
     );
 }
 
@@ -156,12 +192,12 @@ fn win64_published_callable_unwind_metadata_covers_body_and_epilogs() {
                 .collect();
             assert_eq!(epilogs.len(), epilog_count);
             // Probe the body and both sides of each stack adjustment. The
-            // transfer epilog ends in JMP [r11], a ModRM mod=00 tail exit that
+            // transfer epilog ends in REX.W JMP [rax], a ModRM mod=00 tail exit that
             // Windows recognizes; the ordinary epilog ends in RET.
             let mut points = vec![(body_offset, 0)];
             for offset in epilogs {
                 assert!(
-                    code[offset + 4] == 0xc3 || code[offset + 4..].starts_with(&[0x41, 0xff, 0x23])
+                    code[offset + 4] == 0xc3 || code[offset + 4..].starts_with(&[0x48, 0xff, 0x20])
                 );
                 points.extend([(offset, 0), (offset + 4, frame_bytes)]);
             }
