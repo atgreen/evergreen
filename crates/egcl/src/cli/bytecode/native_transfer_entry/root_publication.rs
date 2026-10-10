@@ -264,6 +264,85 @@ unsafe fn mapped_cursor(
     }
 }
 
+/// Verify, mutator-side, that every value recorded in more than one home has
+/// the SAME word in all of them. Returns (values checked, dual-homed values
+/// checked, mismatches).
+///
+/// This is an oracle on the walk's address arithmetic. The shadow activation
+/// slot is written by generated code from the value's own home immediately
+/// before the safepoint, so if `body_sp + offset`, an inherited register save
+/// word, or the activation pointer were computed wrongly, the words would
+/// disagree. It deliberately runs in the mutator rather than in the collector:
+/// during the relocate pass the EgclStack scan forwards the shadow before the
+/// external scanners run, so a scanner-side comparison would report spurious
+/// mismatches. It compares two homes at ONE instant, never a word before
+/// against after.
+///
+/// # Safety
+/// Call only from a published helper on the publishing execution, with the
+/// chain live -- e.g. from inside a published poll.
+#[cfg(test)]
+pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
+    let mut checked = 0;
+    let mut dual = 0;
+    let mut mismatches = 0;
+    let mut boundary = ACTIVE.with(Cell::get);
+    while !boundary.is_null() {
+        let published = unsafe { &*boundary };
+        if published.owner.is_null() || published.segment.is_null() || published.stack.is_null() {
+            boundary = published.previous;
+            continue;
+        }
+        let code = unsafe { &*published.owner };
+        let base = code.code.as_ptr() as usize;
+        let segment = unsafe { &*published.segment };
+        let walk = Walk { bounds: published.bounds.clone(), stack: unsafe { &*published.stack } };
+        let mut cursor = published.cursor;
+        loop {
+            let Some(offset) =
+                cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
+            else {
+                break;
+            };
+            let Some(step) = code._native_calls.unwind(base, &cursor, walk.bounds.clone(), |a| {
+                walk.word(a)
+            }) else {
+                break;
+            };
+            if let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) {
+                let layout = map.layout();
+                let activation = unsafe { frame_activation(map, step.body_sp, &walk) };
+                for value in map.values().iter().filter(|v| v.may_reference_heap()) {
+                    let words: Vec<_> = value
+                        .locations()
+                        .iter()
+                        .filter_map(|location| unsafe {
+                            resolve_location(
+                                *location, &cursor, step.body_sp, activation,
+                                layout.activation_slots, &walk,
+                            )
+                        })
+                        .map(|slot| unsafe { slot.read() })
+                        .collect();
+                    checked += 1;
+                    if words.len() > 1 {
+                        dual += 1;
+                        if words.iter().any(|w| *w != words[0]) {
+                            mismatches += 1;
+                        }
+                    }
+                }
+            }
+            if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
+                break;
+            }
+            cursor = step.caller;
+        }
+        boundary = published.previous;
+    }
+    (checked, dual, mismatches)
+}
+
 /// Walk every execution's chain under stop-the-world. Each boundary unwinds
 /// through its owner's exact recipes until the segment entry; frames whose
 /// roots T0 already owns (deoptimizing or retired) are skipped, and a malformed
@@ -387,6 +466,58 @@ unsafe fn walk_boundary(
 /// inherited save-word addresses; stack copies are body-RSP relative;
 /// activation copies are the managed shadow slots the stack scan also visits,
 /// so relocation stays idempotent.
+/// Resolve one recorded location to the writable word that holds the value,
+/// or `None` when this publication cannot prove it owns that word.
+///
+/// Shared by the walk and the dual-home verifier on purpose: a verifier with
+/// its own copy of this arithmetic would validate itself rather than the walk.
+unsafe fn resolve_location(
+    location: NativeValueLocation,
+    cursor: &NativeFrameCursor,
+    body_sp: Option<usize>,
+    activation: Option<*mut EgclVal>,
+    activation_slots: u16,
+    walk: &Walk<'_>,
+) -> Option<*mut EgclVal> {
+    match location {
+        NativeValueLocation::Activation(slot) => match activation {
+            Some(activation) if slot < activation_slots => {
+                Some(unsafe { activation.add(slot as usize) })
+            }
+            _ => None,
+        },
+        NativeValueLocation::Stack(offset) => body_sp
+            .map(|body_sp| body_sp.wrapping_add_signed(offset as isize))
+            .and_then(|address| walk.slot(address))
+            .map(|address| address as *mut EgclVal),
+        NativeValueLocation::Register(register) => SYSV_PRESERVED_REGISTERS
+            .iter()
+            .position(|&r| r == register)
+            .and_then(|index| cursor.registers[index])
+            .and_then(|address| walk.slot(address))
+            .map(|address| address as *mut EgclVal),
+        NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => None,
+    }
+}
+
+/// The activation pointer for a frame, read from an owned native stack word and
+/// accepted only if it names a real frame of the publishing execution.
+unsafe fn frame_activation(
+    map: &NativeFrameValues,
+    body_sp: Option<usize>,
+    walk: &Walk<'_>,
+) -> Option<*mut EgclVal> {
+    let layout = map.layout();
+    match (layout.activation_base_slot, body_sp) {
+        (Some(slot), Some(body_sp)) => walk
+            .word(body_sp.wrapping_add(slot as usize * 8))
+            .and_then(|activation| {
+                validated_activation(activation as *mut EgclVal, layout.activation_slots, walk.stack)
+            }),
+        _ => None,
+    }
+}
+
 unsafe fn visit_frame(
     map: &NativeFrameValues,
     cursor: &NativeFrameCursor,
@@ -395,44 +526,13 @@ unsafe fn visit_frame(
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
     let layout = map.layout();
-    // The activation pointer itself lives in an owned native stack word, and
-    // only names a frame this execution really owns.
-    let activation = match (layout.activation_base_slot, body_sp) {
-        (Some(slot), Some(body_sp)) => walk
-            .word(body_sp.wrapping_add(slot as usize * 8))
-            .and_then(|activation| {
-                validated_activation(activation as *mut EgclVal, layout.activation_slots, walk.stack)
-            }),
-        _ => None,
-    };
+    let activation = unsafe { frame_activation(map, body_sp, walk) };
     let mut visited = 0;
     for location in map.gc_locations() {
-        let slot = match *location {
-            NativeValueLocation::Activation(slot) => match activation {
-                Some(activation) if slot < layout.activation_slots => {
-                    unsafe { activation.add(slot as usize) }
-                }
-                _ => continue,
-            },
-            NativeValueLocation::Stack(offset) => match body_sp
-                .map(|body_sp| body_sp.wrapping_add_signed(offset as isize))
-                .and_then(|address| walk.slot(address))
-            {
-                Some(address) => address as *mut EgclVal,
-                None => continue,
-            },
-            NativeValueLocation::Register(register) => {
-                let Some(index) = SYSV_PRESERVED_REGISTERS.iter().position(|&r| r == register)
-                else {
-                    continue;
-                };
-                match cursor.registers[index].and_then(|address| walk.slot(address)) {
-                    Some(address) => address as *mut EgclVal,
-                    None => continue,
-                }
-            }
-            NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => continue,
+        let resolved = unsafe {
+            resolve_location(*location, cursor, body_sp, activation, layout.activation_slots, walk)
         };
+        let Some(slot) = resolved else { continue };
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering::Relaxed;
@@ -525,6 +625,12 @@ mod tests {
         assert_ne!(publication.segment, unsafe { (*publication.previous).segment });
         let probe = probe();
         let before = unsafe { (&*probe.args)[0] };
+        // Oracle on the walk's address arithmetic: a value's shadow slot and
+        // its native home must agree before anything collects.
+        let (checked, dual, mismatches) = unsafe { verify_dual_homes() };
+        eprintln!("  dual-home check: values={checked} dual-homed={dual} mismatches={mismatches}");
+        assert_eq!(mismatches, 0, "a value's shadow and native home disagree");
+        assert!(dual > 0, "the fixture must exercise at least one dual-homed value");
         take_visits_by_kind();
         force_minor_gc();
         let (activation, stack, register) = take_visits_by_kind();
