@@ -114,6 +114,26 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing"):
                 runner.archive_files(root, path)
 
+    def test_archive_keeps_local_shared_library_alias_and_runtime_search_path(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness = self.fixture(root)
+            library = root / "target" / "deps" / "libfixture.so.1"
+            library.parent.mkdir(parents=True)
+            library.write_bytes(b"shared-library-fixture")
+            alias = library.with_name("libfixture.so")
+            alias.symlink_to(library.name)
+            path = root / "target" / "manifest.json"
+            path.write_text(json.dumps({"target": "x86_64-unknown-linux-gnu",
+                "artifacts": {harness["executable"]: runner.fingerprint(root / harness["executable"])}}))
+            with patch.object(runner, "dynamic_elf", return_value=True), patch.object(
+                    runner, "checked", return_value=f"libfixture.so => {alias} (0x123)\n"):
+                files = runner.archive_files(root, path)
+            self.assertIn("target/deps/libfixture.so", files)
+            self.assertIn("target/deps/libfixture.so.1", files)
+            self.assertEqual(json.loads(path.read_text())["library_dirs"], ["target/deps"])
+
     def test_nested_regressions_receive_only_unambiguous_manifest_executables(self):
         runner = self.load()
         case = {"name": "egcl-compiler:lib:egcl_compiler", "executable": "target/compiler-test"}
