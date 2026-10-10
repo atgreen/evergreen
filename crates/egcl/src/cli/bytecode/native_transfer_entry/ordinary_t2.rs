@@ -85,6 +85,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         Some(Arc::clone(&metadata)),
         &prepared.call_cells,
         true,
+        CompilationTier::T2,
     ) else {
         t2_log_write(format_args!(
             "{}: mapped T2 emission declined; keep mapped T1 or interpreter",
@@ -93,7 +94,6 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         return None;
     };
     code.installed_symbol = Some(symbol);
-    code.is_t2 = true;
     let code = Rc::new(code);
     let entry = code.code.as_ptr();
     // Report the actual mapped bytes and positions, never the checked fallback.

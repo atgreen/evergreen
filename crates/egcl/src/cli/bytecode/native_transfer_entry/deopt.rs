@@ -676,18 +676,24 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
+        // Keep a long independent integer chain after the changing float site.
+        // It retains optimized straight-line polls after baseline refresh; no
+        // loop-header heat poll can mask an incorrectly selected T2 helper.
+        let chain = "(setq y (+ y 1)) ".repeat(80);
+        let source = format!(
+            "((segment-phase-touch x)
+            (let ((answer (+ x 1))) {chain} (+ answer y)))"
+        );
         super::super::super::super::read_eval_all_env(
-            "(defun segment-phase-touch (x) nil)
-             (defun segment-phase (x) (segment-phase-touch x) (+ x 1))",
+            &format!(
+                "(defun segment-phase-touch (x) nil)
+                (defun segment-phase (x y) (progn . {source}))"
+            ),
             &mut env,
         )
         .unwrap();
-        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
-        egcl_rt::rooted!(
-            forms = reader::read_from_string("((segment-phase-touch x) (+ x 1))")
-                .unwrap()
-                .0
-        );
+        egcl_rt::rooted!(params = reader::read_from_string("(x y)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(&source).unwrap().0);
         let symbol = super::super::super::super::resolve_sym("SEGMENT-PHASE")
             .unwrap()
             .as_symbol_index();
@@ -706,8 +712,9 @@ mod tests {
         let argument = EgclVal::from_single_float(1.5);
         for _ in 0..deopt_blacklist_threshold() {
             assert_eq!(
-                old.run(&[argument], &mut env).unwrap(),
-                EgclVal::from_single_float(2.5)
+                old.run(&[argument, EgclVal::from_fixnum(1)], &mut env)
+                    .unwrap(),
+                EgclVal::from_single_float(83.5)
             );
         }
         assert!(old.recompile.get());
@@ -715,20 +722,42 @@ mod tests {
         // the process-wide opt-in environment in this test.
         let replacement = cached_code(&body).unwrap();
         assert!(!Rc::ptr_eq(&old, &replacement));
+        assert!(
+            !replacement.is_t2,
+            "cache refresh must remain baseline code"
+        );
+        assert!(
+            replacement.has_deopt,
+            "the unchanged integer chain must retain speculative optimization"
+        );
+        assert!(
+            root_publication::OBSERVE.with(|hook| hook.get().is_none()),
+            "observer-forced publication cannot prove baseline poll selection"
+        );
+        reset_poll_paths_for_test();
         for _ in 0..12 {
             assert_eq!(
-                replacement.run(&[argument], &mut env).unwrap(),
-                EgclVal::from_single_float(2.5)
+                replacement
+                    .run(&[argument, EgclVal::from_fixnum(1)], &mut env)
+                    .unwrap(),
+                EgclVal::from_single_float(83.5)
             );
         }
+        let (idle, published) = take_poll_paths_for_test();
+        assert_eq!(idle, 0, "refreshed optimized baseline polls must publish");
+        assert!(
+            published >= 12,
+            "each refreshed call must execute a real straight-line poll: {published}"
+        );
         assert_eq!(
             replacement.deopt_count(),
             0,
             "new numeric phase must stop failing old guards"
         );
         assert_eq!(
-            old.run(&[argument], &mut env).unwrap(),
-            EgclVal::from_single_float(2.5)
+            old.run(&[argument, EgclVal::from_fixnum(1)], &mut env)
+                .unwrap(),
+            EgclVal::from_single_float(83.5)
         );
         assert!(
             !replacement.recompile.get(),

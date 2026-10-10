@@ -189,6 +189,12 @@ fn retain_native_body(body: &Arc<BytecodeFunction>) -> Arc<ActiveBytecodeRoot> {
     root
 }
 
+#[derive(Clone, Copy)]
+enum CompilationTier {
+    T1,
+    T2,
+}
+
 /// Only constructible through the host-specific emitter. Retaining this value
 /// retains every embedded code address and the original bytecode definition.
 pub(super) struct TransferCode {
@@ -587,7 +593,7 @@ impl TransferCode {
             let Instr::CallNamed { sym, .. } = instruction else { return None };
             call_table::resolve(*sym).map(|cell| (*sym, cell))
         }).collect();
-        Self::emit_prepared(body, roots, &ir, deopt_metadata, &call_cells, allow_recursion)
+        Self::emit_prepared(body, roots, &ir, deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
     }
 
     /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
@@ -599,6 +605,7 @@ impl TransferCode {
         deopt_metadata: Option<Arc<T2InstalledMetadata>>,
         call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
         allow_recursion: bool,
+        tier: CompilationTier,
     ) -> Option<Self> {
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
         let deopt_capture = if deopt_metadata.is_some() {
@@ -627,7 +634,13 @@ impl TransferCode {
         let named_veneers: Vec<_> = call_entries.iter()
             .map(|(symbol, _, adapter)| (*symbol, adapter.as_ptr() as u64))
             .collect();
-        let poll = JitBuffer::new(&emit_published_helper_veneer(poll_or_transfer, capture.as_ptr()))?;
+        // Optimized baseline code still needs T1 heat and OSR handling. The
+        // construction tier, not IR optimization or deopt metadata, selects this.
+        let poll_helper = match tier {
+            CompilationTier::T1 => poll_or_transfer,
+            CompilationTier::T2 => poll_t2_or_transfer,
+        };
+        let poll = JitBuffer::new(&emit_published_helper_veneer(poll_helper, capture.as_ptr()))?;
         let base_slots = body.n_locals.checked_add(body.max_stack)?;
         let completion = JitBuffer::new(&emit_published_helper_veneer(complete_cleanup, capture.as_ptr()))?;
         let landing = JitBuffer::new(&emit_native_landing_stub())?;
@@ -745,7 +758,7 @@ impl TransferCode {
         }).collect();
         Some(Self {
             installed_symbol: None,
-            is_t2: false,
+            is_t2: matches!(tier, CompilationTier::T2),
             #[cfg(test)]
             unavailable_catch: None,
             #[cfg(test)]
@@ -2238,9 +2251,10 @@ unsafe fn call_or_throw_unpublished(
 /// returns a successful outcome; the veneer never performs a status check in
 /// generated code. A nonzero result enters the existing capture/landing path.
 ///
-/// Published entry for the generated poll veneer. Direct Rust callers that are
-/// already published use `poll_or_transfer_unpublished`.
-unsafe extern "C" fn poll_or_transfer(
+/// T2 entry may return before publication when there is no pending work.
+/// Baseline code uses `poll_or_transfer`; already-published Rust callers use
+/// `poll_or_transfer_unpublished`.
+unsafe extern "C" fn poll_t2_or_transfer(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
     image: *mut SysvTransferCapture,
@@ -2254,6 +2268,14 @@ unsafe extern "C" fn poll_or_transfer(
         unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }) };
         return;
     }
+    unsafe { poll_or_transfer(request, out, image) };
+}
+
+unsafe extern "C" fn poll_or_transfer(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
     #[cfg(test)]
     POLL_PATHS.with(|counts| {
         let (idle, published) = counts.get();
@@ -2281,10 +2303,6 @@ fn idle_t2_poll(request: *mut u8) -> bool {
     }
     #[cfg(test)]
     if root_publication::OBSERVE.with(|hook| hook.get().is_some()) {
-        return false;
-    }
-    let context = CAPTURE.with(Cell::get);
-    if context.is_null() || !unsafe { (*(*context).owner).is_t2 } {
         return false;
     }
     // These queries neither initialize a carrier nor consume a notification.
