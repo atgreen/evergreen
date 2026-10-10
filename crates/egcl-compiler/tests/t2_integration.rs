@@ -1627,7 +1627,8 @@ fn branching_if_speculates_and_runs() {
     assert_eq!(n, 2, "both the comparison and the multiply are speculated");
     verify(&f).expect("speculated branching IR verifies");
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit branching function");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
+        clear_intrinsic_values as *const () as usize as u64, None).expect("emit branching function");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
 
@@ -1875,7 +1876,8 @@ fn bitwise_logand_speculates_and_runs() {
             .any(|&i| f.inst(i).opcode == Opcode::LogAnd)),
         "a LogAnd op must be present"
     );
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit bitwise");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
+        clear_intrinsic_values as *const () as usize as u64, None).expect("emit bitwise");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let mut frame = [EgclVal::from_fixnum(0x3E7).0, 0u64, 0u64];
@@ -1986,7 +1988,8 @@ fn backedge_to_bytecode_zero_preserves_parameters_and_osr_entry() {
     verify(&function).unwrap();
     assert_eq!(function.osr_entries.len(), 1);
     assert_ne!(function.osr_entries[0].block, function.entry());
-    let framed = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0, 0, None).unwrap();
+    let framed = emit_framed(&function, 0, 0, 0, 0, 0, 0, 0,
+        clear_intrinsic_values as *const () as usize as u64, None).unwrap();
     assert_eq!(framed.osr_entries.len(), 1, "OSR entry must be emitted");
     assert_eq!(framed.osr_entries[0].0, 0);
     let code = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();

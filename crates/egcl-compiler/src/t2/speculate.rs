@@ -41,8 +41,8 @@
 //! * `+ - *` with two arguments → `Fixnum{Add,Sub,Mul}` / `Float{Add,Sub,Mul}`;
 //!   unary `-` → `FixnumNeg` (fixnum only); other arities stay generic.
 //! * `1+` / `1-` (fixnum) → binary op with a materialised `ConstFixnum 1`.
-//! * `< > <= >= =` → typed compare. Fixnum has all five; single-float has
-//!   only `Lt` and `Eq` encoders, so the rest stay generic.
+//! * `< > <= >= =` → typed fixnum compare. Float comparisons stay generic
+//!   because their typed comparison opcodes have no native emitter.
 //! * `LOGAND LOGIOR LOGXOR LOGNOT` (fixnum) → `Log*`; exact on the tagged
 //!   representation, so no overflow and no untag/retag.
 //! * `MOD` by a constant positive power of two (fixnum) → `LogAnd` with the
@@ -62,6 +62,8 @@
 //! the site, flags set to `guard + effectful` (a deopt point, ordered; no
 //! longer a call or safepoint) with `aux` and `frame_state` retained. The
 //! `GenericEq` rewrite instead clears flags and `frame_state` entirely.
+//! Every rewrite retains the builtin's single-value return effect in a
+//! separate `ClearMv` after the successful operation and its guards.
 //!
 //! Three guard-materialisation steps then run (bliss-x5y.25). Inference
 //! assigns each SSA value one fact from its definition onward, so a raw
@@ -91,7 +93,7 @@
 //! * Two speculation types, fixnum and single-float; no double-float, no
 //!   bignum fallback.
 //! * Variadic arithmetic (`(+ a b c)`) and unary `+`/`*` stay generic.
-//! * `FloatNeg` and float `Gt`/`Le`/`Ge` have no opcode or encoder yet.
+//! * Float negation and comparisons have no native encoder yet.
 //! * Constant operands are recognised from `ConstFixnum` definitions only;
 //!   this runs before folding, so `(mod x (* 2 4))` is not a mask.
 
@@ -241,8 +243,8 @@ fn cmp_of(sym: u32) -> Option<Cmp> {
 }
 
 /// The typed comparison opcode for `(kind, speculated-type)`. Fixnum supports all
-/// five; single-float has only Eq/Lt encoders, so Gt/Le/Ge on floats return
-/// `None` (left as a generic call) for now.
+/// five. Float comparison opcodes have no emitter, so keep their ordinary calls
+/// rather than producing IR that would force the entire function out of T2.
 fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
     use Opcode::*;
     Some(match (c, s) {
@@ -251,8 +253,6 @@ fn typed_cmp_opcode(c: Cmp, s: SpecType) -> Option<Opcode> {
         (Cmp::Le, SpecType::Fixnum) => FixnumCmpLe,
         (Cmp::Ge, SpecType::Fixnum) => FixnumCmpGe,
         (Cmp::Eq, SpecType::Fixnum) => FixnumCmpEq,
-        (Cmp::Lt, SpecType::SingleFloat) => FloatCmpLt,
-        (Cmp::Eq, SpecType::SingleFloat) => FloatCmpEq,
         (_, SpecType::SingleFloat) => return None,
     })
 }
@@ -499,7 +499,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
             }
             if opcode == Opcode::GenericEq {
                 // (eq x nil) is PURE and total: no guard, no deopt state, no
-                // safepoint — the call's roots and FrameState liveness vanish.
+                // safepoint. The separate return effect retains its own state.
                 data.flags = InstFlags::default();
                 data.frame_state = None;
             } else {
@@ -517,6 +517,37 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         for r in results {
             f.refine_type(r, ty);
         }
+        // A successful builtin call replaces the thread's multiple values
+        // even when its pure result is folded or discarded. Keep this after
+        // binding/type/overflow guards so a miss preserves fallback values.
+        // Give it private state: operand-guard rewriting may narrow values
+        // here, but the operation's own guard must retain pre-guard operands.
+        let return_state = f.frame_states.add(f.frame_states.get(state).clone());
+        let (clear, _) = f.push_inst(
+            block,
+            crate::t2::ir::InstData {
+                opcode: Opcode::ClearMv,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: Some(return_state),
+                source_pos: f.inst(inst).source_pos,
+            },
+            &[],
+        );
+        let insts = &mut f.block_mut(block).insts;
+        let appended = insts.pop();
+        debug_assert_eq!(appended, Some(clear));
+        let position = insts.iter().position(|&candidate| candidate == inst)
+            .expect("speculation site remains in its block");
+        insts.insert(position + 1, clear);
         if fixnum_family(opcode) {
             fixnum_sites.push(inst);
         }

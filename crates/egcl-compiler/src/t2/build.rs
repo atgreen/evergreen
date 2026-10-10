@@ -3439,12 +3439,16 @@ mod tests {
         assert!(function.block_order().iter().all(|&block| function.block(block).insts.iter()
             .all(|&inst| function.inst(inst).opcode != Opcode::FixnumAdd)),
             "the arithmetic result must actually fold");
+        // These artifacts are inspected, not executed. Supply the return-effect
+        // adapter as well as the deopt address now that folding retains ClearMv.
+        let runtime = emit_s390x::RuntimeCalls { multiple_values: 1, ..Default::default() };
         for (name, code) in [
-            ("x86", emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 0, None)),
-            ("aarch64", emit_a64::emit_framed(&function, 1, 1)),
-            ("s390x", emit_s390x::emit_framed(&function, 1, 1)),
-            ("ppc64le", emit_ppc64le::emit_framed(&function, 1, 1)),
-            ("riscv64", emit_riscv64::emit_framed(&function, 1, 1)),
+            ("x86", emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 1, None)),
+            ("aarch64", emit_a64::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime.clone())),
+            ("s390x", emit_s390x::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime.clone())),
+            ("ppc64le", emit_ppc64le::emit_framed_with_runtime(&function, 1, input.num_slots(), runtime)),
+            ("riscv64", emit_riscv64::emit_framed_with_runtime(&function, 1, input.num_slots(),
+                emit_riscv64::RuntimeCalls { multiple_values: 1, ..Default::default() })),
         ] {
             assert!(code.unwrap_or_else(|error| panic!("{name}: {error:?}")).has_deopt,
                 "{name} must preserve a real deopt exit");

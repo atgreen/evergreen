@@ -26,8 +26,8 @@ fn check_values_in_tiers(
     expected: &str,
     tiers: &[(&str, &str, u8)],
 ) {
-    let operand_call = call.replace("x", &format!("(values {argument} :extra)"));
-    let constant_call = call.replace("x", argument);
+    let operand_call = call.replace(" x", &format!(" (values {argument} :extra)"));
+    let constant_call = call.replace(" x", &format!(" {argument}"));
     for &(tier, native, expected_tier) in tiers {
         if tier == "t2" && !cfg!(all(target_arch = "x86_64", unix)) {
             continue;
@@ -150,6 +150,84 @@ fn cons_accessors_preserve_heap_results_and_nil() {
             "nil",
             "nil",
             &[("interp", "0", 0), ("t0", "0", 0), ("t1", "0", 1)],
+        );
+    }
+}
+
+#[test]
+fn t2_speculated_arithmetic_returns_one_value() {
+    for (name, call, expected) in [
+        ("+", "(+ x 2)", "5"),
+        ("-", "(- x 2)", "1"),
+        ("*", "(* x 2)", "6"),
+    ] {
+        check_values(name, call, "3", expected);
+    }
+}
+
+#[test]
+fn t2_speculated_unary_arithmetic_returns_one_value() {
+    for (name, call, expected) in [
+        ("1+", "(1+ x)", "4"),
+        ("1-", "(1- x)", "2"),
+        ("-", "(- x)", "-3"),
+    ] {
+        check_values(name, call, "3", expected);
+    }
+}
+
+#[test]
+fn t2_speculated_comparisons_return_one_value() {
+    for (name, call) in [
+        ("<", "(< x 4)"),
+        (">", "(> x 2)"),
+        ("<=", "(<= x 3)"),
+        (">=", "(>= x 3)"),
+        ("=", "(= x 3)"),
+    ] {
+        check_values(name, call, "3", "t");
+    }
+}
+
+#[test]
+fn t2_speculated_bitwise_calls_return_one_value() {
+    for (name, call, expected) in [
+        ("LOGAND", "(logand x 6)", "2"),
+        ("LOGIOR", "(logior x 6)", "7"),
+        ("LOGXOR", "(logxor x 6)", "5"),
+        ("LOGNOT", "(lognot x)", "-4"),
+    ] {
+        check_values(name, call, "3", expected);
+    }
+}
+
+#[test]
+fn t2_speculated_constant_operand_calls_return_one_value() {
+    check_values("MOD", "(mod x 4)", "7", "3");
+    check_values("ASH", "(ash x 2)", "3", "12");
+}
+
+#[test]
+fn t2_speculated_not_returns_one_value() {
+    check_values("NOT", "(not x)", "nil", "t");
+}
+
+#[test]
+fn t2_speculated_single_float_calls_return_one_value() {
+    for (name, call, argument, expected) in [
+        ("+", "(+ x 2.0)", "3.0", "5.0"),
+        ("-", "(- x 2.0)", "3.0", "1.0"),
+        ("*", "(* x 2.0)", "3.0", "6.0"),
+        ("<", "(< x 4.0)", "3.0", "t"),
+        ("=", "(= x 3.0)", "3.0", "t"),
+        ("+", "(+ x 2)", "3.0", "5.0"),
+    ] {
+        check_values_in_tiers(
+            name,
+            call,
+            argument,
+            expected,
+            &[("interp", "0", 0), ("t2", "0", 2), ("t2", "1", 2)],
         );
     }
 }

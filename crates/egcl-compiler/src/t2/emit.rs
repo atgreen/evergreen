@@ -7139,17 +7139,30 @@ mod tests {
     #[test]
     fn framed_fixnum_mul_runs_and_deopts() {
         use egcl_rt::value::EgclVal;
+        use std::sync::atomic::AtomicUsize;
+        static CLEARS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn clear_values(_: u64, _: *mut EgclVal, count: u64) {
+            assert_eq!(count, 0);
+            CLEARS.fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn precise_deopt(scopes: u64, words: u64, values: *const u64) -> u64 {
+            assert_eq!(scopes, 1);
+            assert!(words >= 4);
+            assert!(!values.is_null());
+            mock_c2i_deopt();
+            egcl_rt::value::NIL.0
+        }
         let f = speculated_mul5();
         let framed = emit_framed(
             &f,
             mock_c2i_deopt as *const () as usize as u64,
+            precise_deopt as *const () as usize as u64,
             0,
             0,
             0,
             0,
             0,
-            0,
-            0,
+            clear_values as *const () as usize as u64,
             None,
         )
         .expect("emit_framed");
@@ -7168,6 +7181,7 @@ mod tests {
         let r = func(frame.as_mut_ptr());
         assert!(!DEOPTED.load(Ordering::SeqCst), "fixnum arg must not deopt");
         assert_eq!(EgclVal(r).as_fixnum(), 35, "T2 must compute 7*5 = 35");
+        assert_eq!(CLEARS.load(Ordering::SeqCst), 1);
 
         // Float arg → guard fails → deopt routine called.
         let mut frame = [EgclVal::from_single_float(2.0).0, 0u64, 0u64];
@@ -7177,6 +7191,7 @@ mod tests {
             DEOPTED.load(Ordering::SeqCst),
             "a float operand must deopt to the interpreter"
         );
+        assert_eq!(CLEARS.load(Ordering::SeqCst), 1, "failed guards must not clear values");
     }
 
     /// Build post-speculation IR for `(x) -> x * c` where the param `x` carries
