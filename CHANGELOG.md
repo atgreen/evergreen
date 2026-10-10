@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve single-value returns from T2 speculated arithmetic, comparisons,
+  and bit operations after multiple-valued expressions, while retaining values
+  from replacement functions. Keep single-float comparisons eligible for T2
+  compilation ([#199](https://github.com/atgreen/evergreen/pull/199)).
+
 - Return the correct single value from T1 inlined primitives and T2 predicate
   and cons-accessor expansions after multiple-valued expressions, while
   preserving multiple values from replacement functions
