@@ -1420,9 +1420,19 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
 /// embeds, so it can never drift from reality.
 #[cfg(not(egcl_no_disassembly))]
 fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
+    runtime_symbol_table()
+        .iter()
+        .find(|(a, _)| *a == addr)
+        .map(|(_, n)| *n)
+}
+
+/// Every `(address, name)` pair of [`runtime_symbol_name`], for a decoder that
+/// wants to resolve addresses itself (the Lisp ppc64le listing does).
+#[cfg(not(egcl_no_disassembly))]
+fn runtime_symbol_table() -> &'static [(u64, &'static str)] {
     use std::sync::OnceLock;
     static MAP: OnceLock<Vec<(u64, &'static str)>> = OnceLock::new();
-    let map = MAP.get_or_init(|| {
+    MAP.get_or_init(|| {
         macro_rules! e {
             ($f:path as $ty:ty, $name:literal) => {
                 ($f as $ty as usize as u64, $name)
@@ -1495,9 +1505,25 @@ fn runtime_symbol_name(addr: u64) -> Option<&'static str> {
                 c2i_set_native_sigsegv_recovery as extern "C" fn(u64),
                 "set SIGSEGV recovery IP"
             ),
+            e!(
+                c2i_call_builtin as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64,
+                "call builtin (direct)"
+            ),
+            e!(
+                c2i_load_function as extern "C" fn(u64) -> u64,
+                "load function cell"
+            ),
+            e!(c2i_alloc_cons as extern "C" fn(u64, u64) -> u64, "cons"),
+            e!(
+                c2i_typep_class as extern "C" fn(u64, u64) -> u64,
+                "typep (class)"
+            ),
+            e!(
+                c2i_transfer_pending as extern "C" fn() -> u64,
+                "check pending non-local transfer"
+            ),
         ]
-    });
-    map.iter().find(|(a, _)| *a == addr).map(|(_, n)| *n)
+    })
 }
 
 /// The first immediate operand of a decoded instruction, if any.
@@ -1680,8 +1706,10 @@ fn lisp_native_listing(_: &[u8], _: &mut super::Env) -> Option<String> {
 /// compilation strategy and OSR entries. Offsets are relative to the code
 /// entry. Reads the R+X mapping, so the owner must remain alive (tier snapshots
 /// are captured at compile time — see [`capture_tier_disasm`]).
+/// The tier banner, OSR entries and byte count that open every native listing,
+/// whichever decoder renders the instructions after it.
 #[cfg(not(egcl_no_disassembly))]
-fn format_native_listing(nc: &NativeCode, env: Option<&mut super::Env>) -> String {
+fn native_listing_preamble(nc: &NativeCode) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let mapped_baseline = match &nc._storage {
@@ -1709,6 +1737,13 @@ fn format_native_listing(nc: &NativeCode, env: Option<&mut super::Env>) -> Strin
         std::env::consts::ARCH
     };
     let _ = writeln!(out, "; {} bytes of {architecture}:", nc.code_len);
+    out
+}
+
+#[cfg(not(egcl_no_disassembly))]
+fn format_native_listing(nc: &NativeCode, env: Option<&mut super::Env>) -> String {
+    use std::fmt::Write;
+    let mut out = native_listing_preamble(nc);
     let base = nc.entry as u64;
     let len = nc.code_len as u64;
     let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
@@ -1894,32 +1929,117 @@ pub fn tier_disasm(sym: u32) -> Option<TierDisasm> {
     })
 }
 
-/// `disassemble` (spec §6, CL:DISASSEMBLE): render a function's *current tier* —
-/// the annotated bytecode listing when it runs in the T0 interpreter, or the
-/// decoded x86-64 machine instructions when it has been promoted to native.
-/// Returns `None` if `sym` names no compiled EGCL function (e.g. a builtin or a
-/// tree-walked closure), so the caller can fall back.
-/// DISASSEMBLE by FUNCTION OBJECT. CLHS takes an *extended function designator*,
-/// so `(disassemble #'f)` is as valid as `(disassemble 'f)` -- but only the
-/// symbol form was handled, and the object form reported "not a compiled EGCL
-/// function (a builtin or interpreted closure)" for a function that plainly was
-/// one. That is the spelling a caller reaches for first when inspecting a value
-/// they already hold.
-///
-/// The listing is keyed by symbol, so recover the symbol by matching the object
-/// against the function cell of each symbol that has bytecode registered. The
-/// registry holds only compiled functions, so this is a short scan, and
-/// DISASSEMBLE is a debug path. Allocation-free: no EGCL object is created, so
-/// there is nothing for a GC to relocate mid-scan.
+
+/// `(egcl::%native-code 'name)`: the installed native code of `name` as Lisp
+/// data, or NIL when it has none. The list is
+/// `(is-t2 entry-address (word ...) ((bcp . offset) ...) (offset ...)
+///   ((helper-address . "name") ...) nil-bits)`:
+/// the 32-bit instruction words in order, the OSR entry offsets, the
+/// bytecode→native offset map (-1 where a bcp emitted no code), the
+/// runtime-helper table a listing names calls with, and NIL's tagged bits so a
+/// decoder can recognise it in an immediate. Everything is a fixnum, a cons or a
+/// string, so the Lisp disassembler (lib/disassembler.lisp) needs nothing else.
 #[cfg(not(egcl_no_disassembly))]
-pub fn disassemble_by_function(f: EgclVal, env: Option<&mut super::Env>) -> Option<String> {
+pub fn native_code_description(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let Some(&name) = args.first() else {
+        return Ok(NIL);
+    };
+    if !name.is_symbol() || name == NIL || name == T {
+        return Ok(NIL);
+    }
+    let sym = name.as_symbol_index();
+    let Some(nc) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) else {
+        return Ok(NIL);
+    };
+    // SAFETY: the registry entry keeps its R+X mapping alive while `nc` is held.
+    let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+    let word_vals: Vec<EgclVal> = bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = [0u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            EgclVal::from_fixnum(i64::from(u32::from_le_bytes(word)))
+        })
+        .collect();
+    // Fixnums are immediate, so only the lists built from them need rooting
+    // across the allocations that follow.
+    egcl_rt::rooted!(words = vec_to_list(&word_vals));
+    let mut entries: Vec<(u32, usize)> = nc.osr_entries.iter().map(|(&b, &o)| (b, o)).collect();
+    entries.sort_unstable();
+    let mut osr = super::RootedVals::new(Vec::new());
+    for (bcp, offset) in entries {
+        osr.push(arena_cons(
+            EgclVal::from_fixnum(i64::from(bcp)),
+            EgclVal::from_fixnum(offset as i64),
+        ));
+    }
+    egcl_rt::rooted!(osr_list = vec_to_list(&osr));
+    let bcp_vals: Vec<EgclVal> = nc
+        .bcp_offsets
+        .iter()
+        .map(|&o| EgclVal::from_fixnum(if o == u32::MAX { -1 } else { i64::from(o) }))
+        .collect();
+    egcl_rt::rooted!(bcps = vec_to_list(&bcp_vals));
+    let mut helpers = super::RootedVals::new(Vec::new());
+    for &(addr, name) in runtime_symbol_table() {
+        egcl_rt::rooted!(text = arena_str(name));
+        helpers.push(arena_cons(EgclVal::from_fixnum(addr as i64), *text));
+    }
+    egcl_rt::rooted!(helper_list = vec_to_list(&helpers));
+    let items = [
+        if nc.is_t2 { T } else { NIL },
+        EgclVal::from_fixnum(nc.entry as usize as i64),
+        *words,
+        *osr_list,
+        *bcps,
+        *helper_list,
+        EgclVal::from_fixnum(NIL.0 as i64),
+    ];
+    Ok(vec_to_list(&items))
+}
+
+/// DISASSEMBLE for a symbol, rendering the native instructions through the Lisp
+/// decoder on little-endian POWER. The header and the tier
+/// preamble stay in Rust; `EGCL-DISASM:NATIVE-LISTING` (lib/disassembler.lisp)
+/// supplies the instruction lines, and anything that stops it — the function not
+/// loaded, an error while decoding — falls back to the raw-word listing.
+#[cfg(not(egcl_no_disassembly))]
+pub fn disassemble_symbol_with_lisp(sym: u32, env: &mut Env) -> Option<String> {
+    if !cfg!(all(target_arch = "powerpc64", target_endian = "little")) {
+        return disassemble_by_symbol(sym, Some(env));
+    }
+    let bf = registry_get(sym)?;
+    let Some(nc) = NATIVE_REGISTRY.with(|r| r.borrow().get(&sym).cloned()) else {
+        return disassemble_by_symbol(sym, Some(env));
+    };
+    let hook = super::find_symbol_in_package(env, "EGCL-DISASM", "NATIVE-LISTING")
+        .and_then(|(symbol, _)| egcl_rt::symbols::symbol_function(symbol.as_symbol_index()));
+    let Some(hook) = hook else {
+        return disassemble_by_symbol(sym, Some(env));
+    };
+    let mut out = disasm_header(sym, &bf);
+    out.push_str(&native_listing_preamble(&nc));
+    match apply_function(hook, &[EgclVal::from_symbol_index(sym)], env) {
+        Ok(text) if text != NIL => out.push_str(&super::val_as_str(text)),
+        _ => {
+            // SAFETY: as in format_native_listing — `nc` keeps the mapping alive.
+            let bytes = unsafe { std::slice::from_raw_parts(nc.entry, nc.code_len) };
+            out.push_str(&format_native_bytes(bytes));
+        }
+    }
+    Some(out)
+}
+
+/// [`disassemble_symbol_with_lisp`] for an extended function designator that is
+/// a function object: find the symbol whose definition it is.
+#[cfg(not(egcl_no_disassembly))]
+pub fn disassemble_function_with_lisp(f: EgclVal, env: &mut Env) -> Option<String> {
     install_bytecode_root_scanner();
-    // Collect the keys before probing so the registry borrow is not held across
-    // the lookups below.
     let syms: Vec<u32> = REGISTRY.with(|r| r.borrow().keys().copied().collect());
-    syms.into_iter()
-        .find(|&sym| egcl_rt::symbols::symbol_function(sym) == Some(f))
-        .and_then(|sym| disassemble_by_symbol(sym, env))
+    let sym = syms
+        .into_iter()
+        .find(|&sym| egcl_rt::symbols::symbol_function(sym) == Some(f))?;
+    disassemble_symbol_with_lisp(sym, env)
 }
 
 #[cfg(not(egcl_no_disassembly))]

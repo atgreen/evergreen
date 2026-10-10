@@ -57,6 +57,9 @@
 - Decode RISC-V native instructions in process for `DISASSEMBLE`, including
   compressed instructions, ABI register names and branch targets
   ([#136](https://github.com/atgreen/evergreen/pull/136)).
+- Decode POWER native instructions in process for `DISASSEMBLE`, with
+  branch targets, OSR entries, runtime helper names and tagged constants
+  ([#139](https://github.com/atgreen/evergreen/pull/139)).
 - Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
   Eligible ordinary T1 and T2 functions now use mapped native calls without
   checking exceptional status after successful returns, preserving moving

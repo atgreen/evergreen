@@ -17679,6 +17679,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 env.clear_mv();
                 return apply_builtin(&name, &args, env);
             }
+            "EGCL::%NATIVE-CODE" => {
+                let args = eval_args(cdr, env)?;
+                env.clear_mv();
+                return apply_builtin(&name, &args, env);
+            }
             "EGCL::%POSIX"
             | "EGCL::%TEXT-CODEC"
             | "EGCL::%MEMORY-FENCE"
@@ -24890,12 +24895,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // as_symbol_index() aborts on them (recurring NIL/T guard bug). Exclude
         // them: neither names a disassemblable function.
         let listing = if arg.is_symbol() && arg != NIL && arg != T {
-            bytecode::disassemble_by_symbol(arg.as_symbol_index(), Some(env))
+            bytecode::disassemble_symbol_with_lisp(arg.as_symbol_index(), env)
         } else if arg != NIL && arg != T {
             // CLHS takes an extended function designator, so a FUNCTION OBJECT
             // is as valid as a symbol: `(disassemble #'f)` must work, and used
             // to report `#'f` as "not a compiled EGCL function" (bliss-3jkz).
-            bytecode::disassemble_by_function(arg, Some(env))
+            bytecode::disassemble_function_with_lisp(arg, env)
         } else {
             None
         };
@@ -35941,6 +35946,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL::%ATOMIC-UPDATE-SVREF"
             | "EGCL::%ATOMIC-UPDATE-ACCESSOR"
             | "EGCL::%NATIVE-FIBER"
+            | "EGCL::%NATIVE-CODE"
             | "EGCL::%FOREIGN-MEMORY"
             | "EGCL::%FOREIGN-LIBRARY"
             | "EGCL::%FOREIGN-CALLBACK"
@@ -36901,6 +36907,8 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
             egcl_stdlib::ffi::buffered_call(args)
         }
         "EGCL::%NATIVE-CONDITION" => egcl_stdlib::synchronization::condition_call(args),
+        #[cfg(not(egcl_no_disassembly))]
+        "EGCL::%NATIVE-CODE" => bytecode::native_code_description(args),
         "EGCL::%NATIVE-FIBER" => {
             if _env.sandbox {
                 return Err(EgclError::SandboxViolation(
@@ -36918,9 +36926,11 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
         #[cfg(not(egcl_no_disassembly))]
         "DISASSEMBLE" => {
-            let listing = args.first().and_then(|a| {
-                if a.is_symbol() {
-                    bytecode::disassemble_by_symbol(a.as_symbol_index(), Some(_env))
+            let listing = args.first().copied().and_then(|a| {
+                if a.is_symbol() && a != NIL && a != T {
+                    bytecode::disassemble_symbol_with_lisp(a.as_symbol_index(), _env)
+                } else if a != NIL && a != T {
+                    bytecode::disassemble_function_with_lisp(a, _env)
                 } else {
                     None
                 }
@@ -39124,6 +39134,14 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     if !ca.no_bootstrap && !core_loaded {
         read_eval_all_env(include_str!("../../../lib/pprint.lisp"), &mut env)?;
         read_eval_all_env(include_str!("../../../lib/fibers.lisp"), &mut env)?;
+        // The POWER decoder has its own instruction set and shares the
+        // EGCL-DISASM package name with the separately loaded System Z decoder.
+        #[cfg(all(
+            target_arch = "powerpc64",
+            target_endian = "little",
+            not(egcl_no_disassembly)
+        ))]
+        read_eval_all_env(include_str!("../../../lib/disassembler.lisp"), &mut env)?;
     }
 
     if core_loaded {
