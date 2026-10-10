@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- Preserve required type guards when optimized loops are entered through OSR,
-  preventing use of values defined by skipped guards
-  ([#215](https://github.com/atgreen/evergreen/pull/215)).
+- Preserve required type guards when optimized loops are entered through OSR
+  and reject entries with missing live values, preventing invalid accesses
+  caused by skipped definitions
+  ([#215](https://github.com/atgreen/evergreen/pull/215),
+  [#216](https://github.com/atgreen/evergreen/pull/216)).
 
 - Add an x86-64 Fedora package for building standalone RISC-V Linux
   executables with the static RV64GC musl runtime and QEMU launcher
