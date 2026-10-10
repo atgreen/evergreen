@@ -21,6 +21,10 @@ fn allocating_fiber() -> EgclVal {
         let allocated = egcl_rt::gc::alloc_double_float(17.0);
         let after = syscall::cached_tid();
         let actual = syscall::gettid();
+        // Allocation may migrate this fiber; both fresh lookups must agree.
+        if thread::current_thread().id() != thread::current_thread_id() {
+            wrong |= 8;
+        }
         if actual != before {
             MIGRATIONS.fetch_add(1, Ordering::Relaxed);
         }
