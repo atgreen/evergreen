@@ -821,6 +821,16 @@ pub fn mark_process_signal_activity() {
     PROCESS_SIGNAL_ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Check this carrier's signal epoch without acknowledging or draining it.
+/// An unavailable TLS slot conservatively requires the ordinary signal path.
+#[inline(never)]
+pub fn process_signal_activity_pending() -> bool {
+    let current = PROCESS_SIGNAL_ACTIVITY.load(std::sync::atomic::Ordering::Acquire);
+    SEEN_SIGNAL_ACTIVITY
+        .try_with(|seen| seen.get() != current)
+        .unwrap_or(true)
+}
+
 /// True if any process signal flag may be set, clearing the summary so a later
 /// arrival re-arms it.
 ///

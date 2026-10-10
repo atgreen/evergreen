@@ -2890,6 +2890,34 @@ pub fn current_fiber() -> Option<&'static Fiber> {
         .flatten()
 }
 
+/// Inspect the mounted execution without registering, parking, or consuming
+/// its request. Missing or inaccessible TLS requires a published slow path.
+// Resolve carrier TLS afresh after any possible fiber migration.
+#[inline(never)]
+pub(crate) fn current_yield_requested() -> bool {
+    let fiber = ACTIVE_FIBER
+        .try_with(|slot| {
+            let Ok(current) = slot.try_borrow() else {
+                return Some(true);
+            };
+            current.as_ref().map(|fiber| fiber.execution().yield_requested())
+        })
+        .unwrap_or(Some(true));
+    if let Some(requested) = fiber {
+        return requested;
+    }
+    CURRENT_NATIVE_THREAD
+        .try_with(|slot| {
+            let Ok(current) = slot.try_borrow() else {
+                return true;
+            };
+            current
+                .as_ref()
+                .is_none_or(|current| current.thread.execution().yield_requested())
+        })
+        .unwrap_or(true)
+}
+
 pub fn current_fiber_id() -> Option<FiberId> {
     current_fiber().map(Fiber::id)
 }
