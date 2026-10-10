@@ -215,14 +215,9 @@ fn opted_in() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
 }
-pub(super) fn installation_enabled() -> bool {
-    opted_in()
-        && super::super::BOOT_COMPLETE.with(|ready| ready.get())
-        && native_transfer::is_supported()
-}
-
 /// Install a baseline representation with its actual transfer ABI. Legacy
 /// direct-call sites reject its version and enter through run_native instead.
+#[cfg(test)]
 pub(super) fn install_baseline(symbol: u32, body: Arc<BytecodeFunction>) -> Option<Rc<NativeCode>> {
     if !native_transfer::is_supported() || !fixed_tagged_parameters(&body) {
         return None;
@@ -230,11 +225,34 @@ pub(super) fn install_baseline(symbol: u32, body: Arc<BytecodeFunction>) -> Opti
     install_baseline_code(symbol, TransferCode::compile_variant(body, false, false)?)
 }
 
+/// Ordinary T1 keeps speculative arithmetic and direct mapped recursion when
+/// their existing admission checks succeed. Compilation stays synchronous and
+/// publication remains T1; ordinary worker optimization still belongs to T2.
+pub(super) fn install_t1(
+    symbol: u32,
+    body: Arc<BytecodeFunction>,
+    allow_speculation: bool,
+) -> Option<Rc<NativeCode>> {
+    if !native_transfer::is_supported() || !fixed_tagged_parameters(&body) {
+        return None;
+    }
+    let code = TransferCode::compile_variant(Arc::clone(&body), allow_speculation, true)
+        .or_else(|| TransferCode::compile_variant(body, false, true))?;
+    install_baseline_code(symbol, code)
+}
+
 pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Option<Rc<NativeCode>> {
     code.installed_symbol = Some(symbol);
     let body = Arc::clone(&code.body);
     let code = Rc::new(code);
     let code_info = code.code_info;
+    let bcp_offsets = code.bcp_offsets.clone();
+    let has_deopt = code.has_deopt;
+    let metadata = code.deopt_metadata.clone();
+    let entry = code.code.as_ptr();
+    let bytes = unsafe { std::slice::from_raw_parts(entry, code.code_len) };
+    maybe_write_perf_map(entry as usize, code.code_len, symbol);
+    maybe_write_jitdump_code_load("T1", entry as usize, bytes, symbol);
     let native = Rc::new(NativeCode {
         _env_names: NativeEnvNames::new(&body),
         _call_cells: Vec::new(),
@@ -250,10 +268,10 @@ pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Opti
         compiled_entry: 0,
         code_id: 0,
         osr_entries: HashMap::new(),
-        bcp_offsets: Vec::new(),
+        bcp_offsets,
         code_info,
-        has_deopt: false,
-        t2_metadata: None,
+        has_deopt,
+        t2_metadata: metadata,
     });
     NATIVE_REGISTRY.with(|registry| registry.borrow_mut().insert(symbol, Rc::clone(&native)));
     Some(native)
@@ -287,8 +305,8 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     // Ordinary T2 versions retire to an honest non-speculating mapped baseline.
     // The next dispatch can queue optimized worker compilation again; this
     // local baseline frontend must not replace it under a T2 tier label.
-    let replacement = TransferCode::compile_variant(Arc::clone(&body), !expected.is_t2, false)
-        .or_else(|| TransferCode::compile_variant(Arc::clone(&body), false, false))?;
+    let replacement = TransferCode::compile_variant(Arc::clone(&body), !expected.is_t2, !expected.is_t2)
+        .or_else(|| TransferCode::compile_variant(Arc::clone(&body), false, !expected.is_t2))?;
     // Compilation can collect and reenter runtime services. Never let a stale
     // invocation replace code published for a newer version or callable.
     if !current() || egcl_rt::symbols::symbol_function(symbol) != Some(*function) {

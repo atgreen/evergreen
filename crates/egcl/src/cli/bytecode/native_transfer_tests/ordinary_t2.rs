@@ -36,12 +36,16 @@ pub(crate) fn ordinary_t2_entry_for_test() -> EgclVal {
     NIL
 }
 
-fn expect_entry(code: &NativeCode) {
+pub(super) fn expect_entry(code: &NativeCode) {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         panic!("mapped caller")
     };
     EXPECTED_OWNER.with(|entry| entry.set(Rc::as_ptr(mapped) as usize));
     OBSERVED_ENTRY.with(|observed| observed.set(false));
+}
+
+pub(super) fn observed_entry() -> bool {
+    OBSERVED_ENTRY.with(Cell::get)
 }
 
 fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
