@@ -88,6 +88,69 @@ static FOREIGN_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 #[cfg(test)]
 static FOREIGN_VISITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Why a walk stopped short of a segment's end, or failed to resolve a
+/// location the map said was addressable. Every one of these is harmless only
+/// while the activation shadows still cover the roots: once a value's sole
+/// home is published, each becomes a silently dropped live root.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Bail {
+    NullOwner = 0,
+    NullSegment = 1,
+    NullStack = 2,
+    PcOutsideOwner = 3,
+    UnwindRefused = 4,
+    MapUnavailable = 5,
+    MapMissing = 6,
+    LocationUnresolved = 7,
+}
+
+#[cfg(test)]
+const BAIL_KINDS: usize = 8;
+#[cfg(test)]
+static BAILS: [std::sync::atomic::AtomicUsize; BAIL_KINDS] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; BAIL_KINDS];
+
+#[cfg(test)]
+fn note_bail(bail: Bail) {
+    BAILS[bail as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Locations the maps said were addressable, and how many the walk actually
+/// resolved. These must be equal: a shortfall is a root the walk would have
+/// dropped if the shadows were not still covering it.
+#[cfg(test)]
+static EXPECTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static RESOLVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (expected, resolved, bails per kind) since the last call.
+#[cfg(test)]
+pub(super) fn take_completeness() -> (usize, usize, [usize; BAIL_KINDS]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        EXPECTED.swap(0, Relaxed),
+        RESOLVED.swap(0, Relaxed),
+        std::array::from_fn(|i| BAILS[i].swap(0, Relaxed)),
+    )
+}
+
+/// Describe any nonzero bail counts, for a test failure message.
+#[cfg(test)]
+pub(super) fn describe_bails(bails: [usize; BAIL_KINDS]) -> String {
+    const NAMES: [&str; BAIL_KINDS] = [
+        "NullOwner", "NullSegment", "NullStack", "PcOutsideOwner",
+        "UnwindRefused", "MapUnavailable", "MapMissing", "LocationUnresolved",
+    ];
+    let mut parts = Vec::new();
+    for (name, count) in NAMES.iter().zip(bails) {
+        if count > 0 {
+            parts.push(format!("{name}={count}"));
+        }
+    }
+    if parts.is_empty() { "none".into() } else { parts.join(" ") }
+}
+
 /// Root slots the walk actually visited, split by home kind. Only the
 /// non-activation kinds are words the EgclStack scan does not already visit,
 /// so a nonzero stack/register count is the mechanical statement that the
@@ -421,6 +484,14 @@ unsafe fn walk_boundary(
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
     if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
+        #[cfg(test)]
+        note_bail(if boundary.owner.is_null() {
+            Bail::NullOwner
+        } else if boundary.segment.is_null() {
+            Bail::NullSegment
+        } else {
+            Bail::NullStack
+        });
         return 0;
     }
     let code = unsafe { &*boundary.owner };
@@ -435,12 +506,16 @@ unsafe fn walk_boundary(
     loop {
         let Some(offset) = cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
         else {
+            #[cfg(test)]
+            note_bail(Bail::PcOutsideOwner);
             return total;
         };
         let Some(step) =
             code._native_calls
                 .unwind(base, &cursor, walk.bounds.clone(), |address| walk.word(address))
         else {
+            #[cfg(test)]
+            note_bail(Bail::UnwindRefused);
             return total;
         };
         match code._native_calls.value_map(offset) {
@@ -452,7 +527,16 @@ unsafe fn walk_boundary(
             }
             // T0 owns these roots while the native frame is being replaced.
             Some(NativeCallValues::Deoptimizing { .. } | NativeCallValues::Retired) => {}
-            Some(NativeCallValues::Unavailable) | None => return total,
+            Some(NativeCallValues::Unavailable) => {
+                #[cfg(test)]
+                note_bail(Bail::MapUnavailable);
+                return total;
+            }
+            None => {
+                #[cfg(test)]
+                note_bail(Bail::MapMissing);
+                return total;
+            }
         }
         if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
             return total;
@@ -532,6 +616,21 @@ unsafe fn visit_frame(
         let resolved = unsafe {
             resolve_location(*location, cursor, body_sp, activation, layout.activation_slots, walk)
         };
+        // Constant and Unavailable are legitimately not addressable; every
+        // other kind the map records is one the walk is obliged to reach.
+        #[cfg(test)]
+        if !matches!(
+            location,
+            NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable
+        ) {
+            use std::sync::atomic::Ordering::Relaxed;
+            EXPECTED.fetch_add(1, Relaxed);
+            if resolved.is_some() {
+                RESOLVED.fetch_add(1, Relaxed);
+            } else {
+                note_bail(Bail::LocationUnresolved);
+            }
+        }
         let Some(slot) = resolved else { continue };
         #[cfg(test)]
         {
@@ -632,8 +731,20 @@ mod tests {
         assert_eq!(mismatches, 0, "a value's shadow and native home disagree");
         assert!(dual > 0, "the fixture must exercise at least one dual-homed value");
         take_visits_by_kind();
+        take_completeness();
         force_minor_gc();
         let (activation, stack, register) = take_visits_by_kind();
+        // Every location the maps declared addressable must have been reached.
+        // A shortfall here is a root the walk would have dropped silently if
+        // the activation shadows were not still covering it.
+        let (expected, resolved, bails) = take_completeness();
+        eprintln!("  completeness: expected={expected} resolved={resolved} bails=[{}]",
+                  describe_bails(bails));
+        assert!(expected > 0, "the collection must reach addressable locations");
+        assert_eq!(expected, resolved,
+                   "the walk failed to resolve a location its own map declared addressable");
+        assert_eq!(bails.iter().sum::<usize>(), 0,
+                   "the walk bailed: [{}]", describe_bails(bails));
         probe.visited += chain_visited(current);
         probe.native_visits += stack + register;
         eprintln!(
@@ -1030,9 +1141,19 @@ mod tests {
         ];
         for (label, boundary) in &mut cases {
             ACTIVE.with(|slot| slot.set(boundary));
+            take_completeness();
             force_minor_gc();
+            // Positive control for the accounting itself: a malformed
+            // publication must not merely visit nothing, it must RECORD why it
+            // declined. Silence here would mean the bail counters cannot see
+            // the very paths that become dropped roots after a shadow is
+            // dropped.
+            let (_, _, bails) = take_completeness();
             ACTIVE.with(|slot| slot.set(real));
             assert_eq!(boundary.visited.get(), 0, "{label}: the walk must stop without guessing");
+            assert!(bails.iter().sum::<usize>() > 0,
+                    "{label}: the walk declined without recording a reason");
+            eprintln!("  {label}: bails=[{}]", describe_bails(bails));
         }
         force_minor_gc();
         assert!(published.visited.get() > 0, "the real publication still reaches its roots");
