@@ -2469,11 +2469,6 @@ fn emit_type_check(
         return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
     }
     let x = data.args[0];
-    // A constant operand should have been folded to T/NIL upstream; decline.
-    if const_tagged.contains_key(&x) {
-        return Err(EmitError::UnsupportedOp(op_tag(Opcode::TypeCheck)));
-    }
-    let xr = *reg.get(&x).ok_or(EmitError::UnsupportedOp(0xF2))?;
     let (bits, class) = match &data.aux {
         AuxData::TypeTag(t) => (t.bits, None),
         AuxData::TypepClass(class) => (TypeBits::BOTTOM, Some(*class)),
@@ -2483,6 +2478,13 @@ fn emit_type_check(
     const AND: u8 = 4;
     const CMP: u8 = 7;
     let dst = framed_alloc(reg, pool, data.results[0])?;
+    let xr = if let Some(&tagged) = const_tagged.get(&x) {
+        // The result overwrites the operand only after all predicate tests.
+        mov_imm64(a, dst, tagged as i64);
+        dst
+    } else {
+        *reg.get(&x).ok_or(EmitError::UnsupportedOp(0xF2))?
+    };
     let found = a.label();
     let not_found = a.label();
     let end = a.label();
