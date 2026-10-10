@@ -84,7 +84,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         &prepared.ir,
         Some(Arc::clone(&metadata)),
         &prepared.call_cells,
-        false,
+        true,
     ) else {
         t2_log_write(format_args!(
             "{}: mapped T2 emission declined; keep mapped T1 or interpreter",
