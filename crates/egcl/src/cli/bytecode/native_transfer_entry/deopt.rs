@@ -121,9 +121,9 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
             return Err(invalid_capture());
         }
         let header = unsafe { std::ptr::read(frame) };
-        // T0 must scan all tagged slots. A child header retains the exact
-        // heap callable, rooted independently while T0 owns/pops its frame.
-        if !header.code_info.is_null() || !header.return_pc.is_null() {
+        // Accept only this retained code's native metadata. A child header
+        // also retains the exact heap callable while T0 owns/pops its frame.
+        if !std::ptr::eq(header.code_info, code.code_info) || !header.return_pc.is_null() {
             return Err(invalid_capture());
         }
         // Resumed Lisp owns the frame; it must not borrow the abandoned
@@ -135,6 +135,10 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
             sp: egcl_rt::current_stack().sp(),
         };
         egcl_rt::rooted_ref!(_restore_root = &mut restore);
+        // Materialized T0 locals no longer follow native debugger recipes.
+        // T0 scans every tagged slot; the guard restores native metadata when
+        // its exact frame extent is recreated after the continuation returns.
+        unsafe { (*frame).code_info = std::ptr::null(); }
         let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
         let env = NATIVE_ENV.with(Cell::get);
         if env.is_null() {

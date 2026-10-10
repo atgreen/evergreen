@@ -3597,6 +3597,7 @@ fn emit_transfer_function(
                     | Opcode::ConstT
                     | Opcode::ConstSymbol
                     | Opcode::ConstChar
+                    | Opcode::ConstHeapObj
                     | Opcode::GenericEq
                     | Opcode::TypeCheck
                     | Opcode::MemoryFence

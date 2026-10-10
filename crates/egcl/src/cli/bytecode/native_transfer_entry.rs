@@ -179,6 +179,7 @@ pub(super) struct TransferCode {
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
+    code_info: &'static CodeInfo,
     // Retired definitions retain their exact value recipes as long as code lives.
     _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
     code_len: usize,
@@ -231,7 +232,7 @@ pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Opti
     code.installed_symbol = Some(symbol);
     let body = Arc::clone(&code.body);
     let code = Rc::new(code);
-    let code_info = install_stack_map(code.slots, std::sync::Weak::new())?;
+    let code_info = code.code_info;
     let native = Rc::new(NativeCode {
         _env_names: NativeEnvNames::new(&body),
         _call_cells: Vec::new(),
@@ -658,7 +659,14 @@ impl TransferCode {
             }
         }
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
-        let code = JitBuffer::new(&emitted.code)?;
+        let mut code = JitBuffer::new(&emitted.code)?;
+        // Segment entries receive the same managed slot address as checked
+        // entries. Publish proven original argument homes with their code.
+        let arguments = native_debug::arguments(&body, false);
+        let debug_info = code
+            .install_debug_info_with_arguments(&body.name, arguments.as_ref())
+            .ok()?;
+        let code_info = install_stack_map(slots, debug_info)?;
         Some(Self {
             installed_symbol: None,
             #[cfg(test)]
@@ -668,6 +676,7 @@ impl TransferCode {
             body,
             _body_roots: roots,
             code,
+            code_info,
             code_len: emitted.code.len(),
             _native_calls: Arc::new(emitted.native_calls?),
             #[cfg(test)]
@@ -717,7 +726,7 @@ impl TransferCode {
             .map(EgclVal::from_symbol_index)
             .unwrap_or(NIL);
         let frame = stack
-            .push_frame(function, std::ptr::null(), self.slots, FLAG_CALL)
+            .push_frame(function, self.code_info, self.slots, FLAG_CALL)
             .ok_or_else(|| {
                 EgclError::StackOverflow(
                     egcl_rt::current_fiber_id()
@@ -867,6 +876,10 @@ impl TransferCode {
                     )
             })
             .ok_or_else(invalid_capture)?;
+        // Reconstructed locals can omit dead arguments, so discard native
+        // original-argument recipes before installing bytecode state. T0
+        // scans all tagged slots without a native stack map.
+        unsafe { (*frame).code_info = std::ptr::null(); }
         for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
             unsafe { slot_set(frame, index as u16, *value) };
         }
@@ -1141,7 +1154,7 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
     let stack = egcl_rt::current_stack();
     let Some(frame) = stack.push_frame(
         EgclVal::from_symbol_index(request.call.symbol as u32),
-        std::ptr::null(),
+        unsafe { (*context.frame).code_info },
         context.slots as u16,
         FLAG_CALL,
     ) else {

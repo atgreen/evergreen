@@ -247,7 +247,7 @@ unsafe fn prepare_child(
     let stack = egcl_rt::current_stack();
     let Some(frame) = stack.push_frame(
         target.function,
-        std::ptr::null(),
+        child.code.code_info,
         child.code.slots,
         FLAG_CALL,
     ) else {
