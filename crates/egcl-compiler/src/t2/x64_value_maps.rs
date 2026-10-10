@@ -148,6 +148,39 @@ impl NativeFrameValues {
                 FrameValueLocation::Home(ValueHome::Reg(_)) => NativeValueLocation::Unavailable,
             };
             let mut locations = vec![location];
+            // Record the value's real native home ALONGSIDE its shadow slot.
+            //
+            // The `Home(_) if shadow.is_some()` arm above MASKS the Stack and
+            // Register arms, and a moving value is required to have a shadow, so
+            // until this a map could not describe a non-activation home at all
+            // and the precise walk could reach nothing the managed-stack scan
+            // already reached (bliss-shih7.2.7.3). Appending rather than
+            // reordering keeps the primary location, and the poll-spill arm's
+            // `raw_slot` counter, exactly as they were: that arm rejects a
+            // Tagged value and is unreachable only because the shadow arm
+            // precedes it.
+            //
+            // Only a home that SURVIVES the helper call may be added. A
+            // caller-saved register's contents are destroyed by the call, which
+            // is what the shadow store and restore exist to preserve; the
+            // Register arm is already restricted to the callee-saved set, whose
+            // save words the published capture image makes writable.
+            if moving {
+                let native_home = match entry.location {
+                    FrameValueLocation::Home(ValueHome::Stack(slot)) => {
+                        Some(NativeValueLocation::Stack(stack_offset(slot)?))
+                    }
+                    FrameValueLocation::Home(ValueHome::Reg(reg)) if matches!(reg, 3 | 12..=15) => {
+                        Some(NativeValueLocation::Register(reg))
+                    }
+                    _ => None,
+                };
+                if let Some(home) = native_home
+                    && !locations.contains(&home)
+                {
+                    locations.push(home);
+                }
+            }
             if let Some(base) = outgoing_base {
                 for (index, &arg) in outgoing.iter().enumerate() {
                     if arg == entry.value {

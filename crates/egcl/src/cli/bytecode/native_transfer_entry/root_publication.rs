@@ -88,6 +88,28 @@ static FOREIGN_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 #[cfg(test)]
 static FOREIGN_VISITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Root slots the walk actually visited, split by home kind. Only the
+/// non-activation kinds are words the EgclStack scan does not already visit,
+/// so a nonzero stack/register count is the mechanical statement that the
+/// published walk is load-bearing rather than redundant.
+#[cfg(test)]
+static VISIT_ACTIVATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static VISIT_STACK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static VISIT_REGISTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// (activation, stack, register) visits since the last call.
+#[cfg(test)]
+pub(super) fn take_visits_by_kind() -> (usize, usize, usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        VISIT_ACTIVATION.swap(0, Relaxed),
+        VISIT_STACK.swap(0, Relaxed),
+        VISIT_REGISTER.swap(0, Relaxed),
+    )
+}
+
 #[cfg(test)]
 pub(super) fn take_foreign_walk_counts() -> (usize, usize) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -411,6 +433,17 @@ unsafe fn visit_frame(
             }
             NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable => continue,
         };
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            match *location {
+                NativeValueLocation::Activation(_) => &VISIT_ACTIVATION,
+                NativeValueLocation::Stack(_) => &VISIT_STACK,
+                NativeValueLocation::Register(_) => &VISIT_REGISTER,
+                _ => unreachable!("filtered above"),
+            }
+            .fetch_add(1, Relaxed);
+        }
         visited += 1;
         visit(slot);
     }
@@ -430,6 +463,9 @@ mod tests {
         moved: bool,
         /// Root slots reached through the published chain by the nested collection.
         visited: usize,
+        /// Of those, ones in a native stack slot or register save word -- i.e.
+        /// words the EgclStack activation scan does not visit at all.
+        native_visits: usize,
         /// Same-owner native frames the walk crossed before the segment entry.
         frames: usize,
     }
@@ -489,8 +525,14 @@ mod tests {
         assert_ne!(publication.segment, unsafe { (*publication.previous).segment });
         let probe = probe();
         let before = unsafe { (&*probe.args)[0] };
+        take_visits_by_kind();
         force_minor_gc();
+        let (activation, stack, register) = take_visits_by_kind();
         probe.visited += chain_visited(current);
+        probe.native_visits += stack + register;
+        eprintln!(
+            "  nested collection visits: activation={activation} stack={stack} register={register}"
+        );
         let after = unsafe { (&*probe.args)[0] };
         probe.moved |= before != after;
     }
@@ -508,7 +550,7 @@ mod tests {
         let body = Arc::new(compile_function("PUBLICATION-REENTRY", *params, *forms, &env, false, false).unwrap());
         let code = TransferCode::compile(body).unwrap();
         egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
         PROBE.with(|slot| slot.set(&mut probe));
         assert!(ACTIVE.with(Cell::get).is_null());
         OBSERVE.with(|slot| slot.set(Some(observe)));
@@ -519,6 +561,12 @@ mod tests {
         assert!(probe.calls > 0, "the compiled loop must enter a published poll");
         assert!(probe.moved, "the nested collection must relocate a live input");
         assert!(probe.visited > 0, "the collection must reach roots through the published chain");
+        assert!(
+            probe.native_visits > 0,
+            "the walk must relocate through at least one native stack slot or register save \
+             word -- a word the EgclStack activation scan never visits. Zero here means the \
+             walk is redundant with that scan and proves nothing (bliss-shih7.2.7.3)."
+        );
         assert_eq!(value, args[0]);
     }
 
@@ -581,7 +629,7 @@ mod tests {
             crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL),
         ]);
         let old_pointer = args[1].to_raw();
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
         PROBE.with(|slot| slot.set(&mut probe));
         take_recursive_entries();
         OBSERVE.with(|slot| slot.set(Some(observe_recursion)));
@@ -731,22 +779,24 @@ mod tests {
         assert_eq!(group.finish().unwrap(), vec![EgclVal::from_fixnum(1); FIBERS]);
     }
 
-    /// Every relocatable value is recorded in an activation slot, so the
-    /// published walk currently reaches no root the EgclStack scan does not.
+    /// Every relocatable value records its real native home alongside its
+    /// shadow slot, so the published walk can reach a word the EgclStack scan
+    /// does not.
     ///
-    /// This is forced by the lowerer, not incidental: `for_call` rejects a
-    /// moving value with no shadow (`MissingRoot`), and whenever a shadow
-    /// exists the location is `Activation`, making the `Register`/`Stack`
-    /// arms unreachable for anything that can move.
+    /// This did not hold before the home was unmasked: `for_call`'s
+    /// `Home(_) if shadow.is_some()` arm masked the `Stack`/`Register` arms and
+    /// a moving value is required to have a shadow, so every heap location was
+    /// an `Activation` slot the managed-stack scan already visited and the walk
+    /// was redundant by construction. A drop back to zero means the masking has
+    /// returned and the walk has gone redundant again, which would make the
+    /// crossing's negative control unwritable (bliss-shih7.2.7.3.2.1) and
+    /// shadow removal unjustifiable (bliss-shih7.2.7.3).
     ///
-    /// The walk is therefore additive-by-construction today, which is exactly
-    /// why shadow synchronization cannot yet be removed (bliss-shih7.2.7.3),
-    /// and why a crossing's negative control is unwritable
-    /// (bliss-shih7.2.7.3.2.1). When the lowerer stops shadowing every moving
-    /// value, this test flips and the walk becomes load-bearing — so a failure
-    /// here is news, not a regression.
+    /// This does NOT by itself license dropping a shadow: both words are live
+    /// and must agree, and the completeness accounting that would let the walk
+    /// be the sole mechanism is still missing.
     #[test]
-    fn relocatable_values_live_only_in_activation_slots_for_now() {
+    fn relocatable_values_record_their_real_native_home() {
         let _lock = crate::cli::heap_test_lock()
             .lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
@@ -806,11 +856,11 @@ mod tests {
             }
         }
         assert!(frames > 0, "the shapes must produce real value maps");
-        assert_eq!(
-            non_activation, 0,
-            "a relocatable value now has a non-activation home: the published walk has become \
-             load-bearing, so revisit shadow removal (bliss-shih7.2.7.3) and the crossing's \
-             negative control (bliss-shih7.2.7.3.2.1)"
+        assert!(
+            non_activation > 0,
+            "every heap location is an activation slot again: for_call has gone back to masking \
+             the real home, so the published walk is redundant with the EgclStack scan and \
+             nothing it does can be proven (bliss-shih7.2.7.3)"
         );
     }
 
@@ -897,7 +947,7 @@ mod tests {
         let body = Arc::new(compile_function("PUBLICATION-MALFORMED", *params, *forms, &env, false, false).unwrap());
         let code = TransferCode::compile(body).unwrap();
         egcl_rt::rooted!(args = vec![crate::cli::arena_cons(T, NIL)]);
-        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, frames: 0 };
+        let mut probe = Probe { code: &code, env: &mut env, args: &*args, calls: 0, moved: false, visited: 0, native_visits: 0, frames: 0 };
         PROBE.with(|slot| slot.set(&mut probe));
         OBSERVE.with(|slot| slot.set(Some(observe_malformed)));
         let value = code.run(&args, &mut env).unwrap();
