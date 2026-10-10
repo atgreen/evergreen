@@ -145,7 +145,6 @@ fn inherited_cleanup_cannot_be_entered_as_a_local_native_cleanup() {
 #[test]
 fn crossing_dynamic_state_requires_explicit_restoration() {
     for kind in [
-        ScopeKind::SpecialBinding { symbol: 1 },
         ScopeKind::LexicalEnvironment,
         ScopeKind::HandlerBind { table_index: 0 },
         ScopeKind::RestartCase {
@@ -171,6 +170,64 @@ fn crossing_dynamic_state_requires_explicit_restoration() {
             NativeUnwindStep::Fallback
         );
     }
+}
+
+#[test]
+fn special_bindings_retire_between_inner_and_outer_cleanup() {
+    let mut scopes = [
+        scope(1, ScopeKind::Catch { resume_bcp: 90 }),
+        scope(2, ScopeKind::Unwind { cleanup_bcp: 80 }),
+        scope(3, ScopeKind::SpecialBinding { symbol: 1 }),
+        scope(4, ScopeKind::Unwind { cleanup_bcp: 70 }),
+    ];
+    let target = SelectedTarget::Scope { push_bcp: 1 };
+    assert_eq!(
+        next_unwind_step(&scopes, target),
+        NativeUnwindStep::RunCleanup {
+            scope_index: 3,
+            handler_depth: 2,
+        }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..3], target),
+        NativeUnwindStep::RetireSpecial { scope_index: 2 }
+    );
+    assert_eq!(
+        next_unwind_step(&scopes[..2], target),
+        NativeUnwindStep::RunCleanup {
+            scope_index: 1,
+            handler_depth: 1,
+        }
+    );
+    scopes[2].ownership = Ownership::Inherited;
+    assert_eq!(
+        next_unwind_step(&scopes[..3], target),
+        NativeUnwindStep::Fallback
+    );
+}
+
+#[test]
+fn repeated_special_bindings_require_individual_retirement() {
+    let scopes = [
+        scope(1, ScopeKind::SpecialBinding { symbol: 7 }),
+        scope(2, ScopeKind::SpecialBinding { symbol: 7 }),
+    ];
+    for len in (1..=2).rev() {
+        assert_eq!(
+            next_unwind_step(&scopes[..len], SelectedTarget::OutsideFrame),
+            NativeUnwindStep::RetireSpecial {
+                scope_index: len - 1
+            }
+        );
+    }
+    assert_eq!(
+        next_unwind_step(&[], SelectedTarget::OutsideFrame),
+        NativeUnwindStep::LeaveFrame
+    );
+    assert_eq!(
+        next_unwind_step(&scopes, SelectedTarget::Scope { push_bcp: 2 }),
+        NativeUnwindStep::Fallback
+    );
 }
 
 #[test]

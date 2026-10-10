@@ -45,7 +45,9 @@
 //!   boundary.
 //! * A `Block` with `register: false` or a `Cleanup` record needs no dynamic
 //!   unregistration and is passed over.
-//! * Anything else that is registered or binds state (`SpecialBinding`,
+//! * A local `SpecialBinding` → `RetireSpecial`, requiring the caller to
+//!   validate and restore its original binding before entering an outer scope.
+//! * Anything else that is registered or binds state (
 //!   `LexicalEnvironment`, registered `Block`, `Tagbody`, `HandlerBind`,
 //!   `RestartCase`, `PendingCleanup`) → `Fallback`, because native support
 //!   must not silently erase such a record and tagbody metadata cannot tell a
@@ -78,6 +80,11 @@ pub enum NativeUnwindStep {
     },
     /// Retire a crossed local HANDLER-CASE cluster after validating the landing.
     RetireHandler {
+        scope_index: usize,
+    },
+    /// Restore a crossed local special binding. Planning this step alone must
+    /// not mutate the binding: validate the final landing and ledger first.
+    RetireSpecial {
         scope_index: usize,
     },
     RunCleanup {
@@ -134,6 +141,9 @@ pub fn next_unwind_step(scopes: &[ControlScope], target: SelectedTarget) -> Nati
             return NativeUnwindStep::EnterTarget { scope_index: index };
         }
         match scope.kind {
+            ScopeKind::SpecialBinding { .. } => {
+                return NativeUnwindStep::RetireSpecial { scope_index: index };
+            }
             ScopeKind::HandlerCase { .. } => {
                 return NativeUnwindStep::RetireHandler { scope_index: index };
             }
