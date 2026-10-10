@@ -14,7 +14,8 @@
   **Temporary limitation:** current-frame OSR is disabled on Linux x86-64,
   so unsupported bodies and long loops in cold functions may run slower
   ([#204](https://github.com/atgreen/evergreen/pull/204),
-  [#207](https://github.com/atgreen/evergreen/pull/207)).
+  [#207](https://github.com/atgreen/evergreen/pull/207),
+  [#210](https://github.com/atgreen/evergreen/pull/210)).
 - Optimize named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
   captured-variable access, simple-string access and missed hash-table lookups
   on supported compiled paths.
