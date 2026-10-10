@@ -24296,7 +24296,7 @@ mod direct_call_invalidation_tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
-    fn native_caller_handles_callee_osr_deoptimization() {
+    fn native_caller_preserves_its_frame_through_callee_guard_recovery() {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -24338,10 +24338,17 @@ mod direct_call_invalidation_tests {
             "caller embeds T1 callee: {direct}; callee.has_deopt={}",
             callee.has_deopt
         );
-        assert_eq!(
-            direct, !callee.has_deopt,
-            "must exercise the native eligibility decision"
-        );
+        if checked_native_installation_allowed() {
+            assert_eq!(direct, !callee.has_deopt,
+                "must exercise checked direct-call eligibility");
+        } else {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            {
+                assert!(matches!(caller._storage, NativeCodeStorage::Mapped(_)));
+                assert!(matches!(callee._storage, NativeCodeStorage::Mapped(_)));
+            }
+            assert!(!direct, "mapped callers must use live cells, not embedded checked entries");
+        }
 
         let input = snapshot_t2_input(callee_symbol, 0).expect("snapshot callee");
         let generation = input.generation;
@@ -24357,7 +24364,15 @@ mod direct_call_invalidation_tests {
         })
         .expect("install callee T2 after caller emission");
         assert!(!replacement.osr_entries.is_empty());
-        assert!(replacement.num_slots <= callee.num_slots);
+        if checked_native_installation_allowed() {
+            assert!(replacement.num_slots <= callee.num_slots);
+        } else {
+            // The mapped caller resolves the newly installed T2 callee at entry.
+            // Current-frame child OSR has its own mid-activation publication fixture.
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            assert!(matches!(replacement._storage, NativeCodeStorage::Mapped(_)));
+            assert!(replacement.has_deopt);
+        }
         let before = deopt_count();
         egcl_rt::rooted!(
             answer = run_native(&caller, caller_symbol, &[], &mut env)
@@ -24444,7 +24459,7 @@ mod direct_call_invalidation_tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
-    fn t2_captured_value_moves_while_live_only_in_native_code() {
+    fn captured_value_moves_while_live_only_in_selected_execution() {
         let _lock = super::super::heap_test_lock()
             .lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
@@ -24474,26 +24489,41 @@ mod direct_call_invalidation_tests {
             Instr::Return,
         ];
         let symbol = egcl_rt::symbols::intern("T2-CAPTURE-MOVING");
-        registry_put(symbol, Arc::new(body.clone()));
+        let selected_body = Arc::new(body.clone());
+        egcl_rt::rooted!(_selected_root = ActiveBytecodeRoot::new(&selected_body));
+        registry_put(symbol, Arc::clone(&selected_body));
         let input = snapshot_t2_input(symbol, 0).unwrap();
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
-        let artifact = input.with_gc_stable(compile_t2_artifact).expect("compile lexical GC probe");
-        let native = install_t2_completion(T2Completion {
-            sym: symbol, generation, artifact: Some(artifact), input,
-        }).unwrap();
-        assert!(native.is_t2);
+        let artifact = input.with_gc_stable(compile_t2_artifact);
+        let native = if checked_native_installation_allowed() {
+            let native = install_t2_completion(T2Completion {
+                sym: symbol, generation,
+                artifact: Some(artifact.expect("compile lexical GC probe")), input,
+            }).unwrap();
+            assert!(native.is_t2);
+            Some(native)
+        } else {
+            assert!(artifact.is_none(), "captured code requires the Linux interpreter adapter");
+            assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
+            None
+        };
         // Redefinition gives the same indexes different meanings. The retained
         // code must still use its own snapshot, including after registry removal.
         body.names.swap(0, 1);
         registry_put(symbol, Arc::new(body));
         registry_remove(symbol);
+        egcl_rt::gc::collect_t0_minor().unwrap();
         egcl_rt::rooted!(value = super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
         let original_address = value.to_raw();
         env.define_local_symbol(source, *value);
         drop(value); // only the source binding owns it when native execution begins
-        egcl_rt::rooted!(result = run_native(&native, symbol, &[], &mut env).unwrap());
-        assert_ne!(result.to_raw(), original_address, "the native-only root must actually move");
+        egcl_rt::rooted!(result = if let Some(native) = native {
+            run_native(&native, symbol, &[], &mut env).unwrap()
+        } else {
+            run_with_sym(Arc::clone(&selected_body), &[], NIL, symbol, &mut env).unwrap()
+        });
+        assert_ne!(result.to_raw(), original_address, "the selected activation's only root must move");
         assert_eq!(super::super::cp(*result), (EgclVal::from_fixnum(71), NIL));
         assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-SOURCE"), Some(NIL));
         assert_eq!(Env::lookup_frame(&env.frame, "T2-CAPTURE-DESTINATION"), Some(*result));
@@ -24544,7 +24574,7 @@ mod direct_call_invalidation_tests {
 
     #[cfg(all(any(target_arch = "x86_64", target_arch = "s390x"), unix))]
     #[test]
-    fn selected_native_code_uses_its_original_environment_names() {
+    fn selected_code_uses_its_original_environment_names() {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -24571,22 +24601,35 @@ mod direct_call_invalidation_tests {
         let mut replacement = body.clone();
         replacement.names = vec!["NATIVE-ENV-NEW".into()];
         let symbol = egcl_rt::symbols::intern("NATIVE-ENV-VERSION");
-        registry_put(symbol, Arc::new(body));
-        let original = try_promote_to_t1_with_speculation(symbol, false).unwrap();
-        registry_put(symbol, Arc::new(replacement));
-        let replacement = try_promote_to_t1_with_speculation(symbol, false).unwrap();
+        let original_body = Arc::new(body);
+        let replacement_body = Arc::new(replacement);
+        egcl_rt::rooted!(_original_root = ActiveBytecodeRoot::new(&original_body));
+        egcl_rt::rooted!(_replacement_root = ActiveBytecodeRoot::new(&replacement_body));
+        registry_put(symbol, Arc::clone(&original_body));
+        let original = try_promote_to_t1_with_speculation(symbol, false);
+        registry_put(symbol, Arc::clone(&replacement_body));
+        let replacement = try_promote_to_t1_with_speculation(symbol, false);
+        assert_eq!(original.is_some(), checked_native_installation_allowed());
+        assert_eq!(replacement.is_some(), checked_native_installation_allowed());
+        let execute = |code: &Option<Rc<NativeCode>>, body: &Arc<BytecodeFunction>, env: &mut Env| {
+            if let Some(code) = code {
+                run_native(code, symbol, &[], env)
+            } else {
+                run_with_sym(Arc::clone(body), &[], NIL, symbol, env)
+            }
+        };
         assert_eq!(
-            run_native(&replacement, symbol, &[], &mut env).unwrap(),
+            execute(&replacement, &replacement_body, &mut env).unwrap(),
             EgclVal::from_fixnum(29)
         );
         assert_eq!(
-            run_native(&original, symbol, &[], &mut env).unwrap(),
+            execute(&original, &original_body, &mut env).unwrap(),
             EgclVal::from_fixnum(11),
             "an old activation must not resolve its indexes through replacement metadata"
         );
         registry_remove(symbol);
         assert_eq!(
-            run_native(&original, symbol, &[], &mut env).unwrap(),
+            execute(&original, &original_body, &mut env).unwrap(),
             EgclVal::from_fixnum(11)
         );
     }
@@ -24684,12 +24727,13 @@ mod direct_call_invalidation_tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
-    fn direct_native_caller_retains_its_embedded_callee() {
+    fn selected_native_callee_remains_owned_until_its_last_user_retires() {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
+        super::super::read_eval_all_env("(defun direct-body-leaf () 11)", &mut env).unwrap();
         egcl_rt::rooted!(form = reader::read_from_string("(11)").unwrap().0);
         let leaf = compile_function("DIRECT-BODY-LEAF", NIL, *form, &env, false, false)
             .expect("compile native leaf");
@@ -24711,6 +24755,41 @@ mod direct_call_invalidation_tests {
         registry_put(caller_symbol, Arc::new(caller));
         let caller = try_promote_to_t1_with_speculation(caller_symbol, false)
             .expect("compile direct caller");
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if !checked_native_installation_allowed() {
+            assert!(matches!(caller._storage, NativeCodeStorage::Mapped(_)));
+            let NativeCodeStorage::Mapped(mapped_callee) = &callee._storage else {
+                panic!("Linux must install a mapped callee");
+            };
+            assert_eq!(run_native(&caller, caller_symbol, &[], &mut env).unwrap(), EgclVal::from_fixnum(11));
+            let cell = call_table::resolve(callee_symbol).unwrap();
+            let addresses = [callee.entry as usize, caller.entry as usize];
+            let weak_selected = {
+                egcl_rt::rooted!(selected = unsafe {
+                    call_table::mapped_callee(Arc::as_ptr(&cell) as u64)
+                }.expect("the mapped caller must warm a real mapped callee"));
+                assert!(Rc::ptr_eq(&selected.code, mapped_callee));
+                let weak_selected = Rc::downgrade(&selected.code);
+                drop(callee);
+                registry_remove(callee_symbol);
+                registry_remove(caller_symbol);
+                egcl_rt::gc::collect_t0_minor().unwrap();
+                assert!(weak_selected.upgrade().is_some(), "an admitted call owns its exact selected code");
+                for address in addresses {
+                    assert!(has_executable_mapping(address), "live selected code must remain mapped");
+                }
+                assert_eq!(selected.code.run_callable(selected.function, &[], &mut env).unwrap(), EgclVal::from_fixnum(11));
+                weak_selected
+            }; // End both the root guard and its owned selected-code storage.
+            drop(caller);
+            egcl_rt::gc::collect_t0_minor().unwrap();
+            assert!(weak_selected.upgrade().is_none(), "selected code must retire after its last owner");
+            assert!(weak_callee.upgrade().is_none());
+            for address in addresses {
+                assert!(!has_executable_mapping(address), "retired mapped code must be unmapped");
+            }
+            return;
+        }
         let bytes = unsafe { std::slice::from_raw_parts(caller.entry, caller.code_len) };
         assert!(
             bytes
@@ -25056,12 +25135,11 @@ mod jtc4_stack_map_tests {
                 input,
             })
             .unwrap();
-            let NativeCodeStorage::Checked {
-                _native_calls: Some(maps),
-                ..
-            } = &native._storage
-            else {
-                panic!("installed T2 code lost its native maps");
+            let maps = match &native._storage {
+                NativeCodeStorage::Checked { _native_calls: Some(maps), .. } => maps,
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                NativeCodeStorage::Mapped(code) => code.value_maps_for_test(),
+                _ => panic!("installed T2 code lost its native maps"),
             };
             assert!(
                 maps.iter().next().is_some(),
@@ -25901,7 +25979,7 @@ mod active_bytecode_root_tests {
     }
 
     #[test]
-    fn selected_native_definition_keeps_its_original_capture_after_rebinding() {
+    fn selected_definition_keeps_its_original_capture_after_rebinding() {
         let _lock = super::super::heap_test_lock()
             .lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
@@ -25911,12 +25989,17 @@ mod active_bytecode_root_tests {
              (dotimes (i 40) (native-capture-version))", &mut env).unwrap();
         egcl_rt::rooted!(old = super::super::global_fn("NATIVE-CAPTURE-VERSION").unwrap());
         let symbol = egcl_rt::function::name(*old).as_symbol_index();
-        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
-            .expect("probe must select actual native code before replacement");
+        let code = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned());
+        assert_eq!(code.is_some(), checked_native_installation_allowed(),
+            "captured bodies must use the platform's admitted execution route");
         super::super::read_eval_all_env(
             "(let ((held 99)) (defun native-capture-version () held))", &mut env).unwrap();
-        assert_eq!(run_native_callable(&code, symbol, *old, &[], &mut env).unwrap(),
-            EgclVal::from_fixnum(42));
+        let answer = if let Some(code) = code {
+            run_native_callable(&code, symbol, *old, &[], &mut env).unwrap()
+        } else {
+            super::super::apply_function(*old, &[], &mut env).unwrap()
+        };
+        assert_eq!(answer, EgclVal::from_fixnum(42));
         assert_eq!(super::super::read_eval_all_env("(native-capture-version)", &mut env).unwrap(),
             EgclVal::from_fixnum(99));
     }
