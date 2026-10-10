@@ -1307,6 +1307,7 @@ mod tests {
             remat: vec![],
         });
         f.osr_entries.push(crate::t2::ir::OsrEntry {
+            control_scopes: Vec::new(),
             block: header,
             bcp: 12,
             frame_state: state,
@@ -1793,6 +1794,7 @@ mod tests {
             remat: vec![],
         });
         f.osr_entries.push(OsrEntry {
+            control_scopes: Vec::new(),
             bcp: 0,
             block: entry,
             frame_state,

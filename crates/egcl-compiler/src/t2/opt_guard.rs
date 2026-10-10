@@ -882,6 +882,7 @@ mod tests {
             remat: vec![],
         });
         f.osr_entries.push(crate::t2::ir::OsrEntry {
+            control_scopes: Vec::new(),
             bcp: 5,
             block: header,
             frame_state: state,
@@ -1016,6 +1017,7 @@ mod tests {
                 remat: vec![],
             });
             f.osr_entries.push(crate::t2::ir::OsrEntry {
+                control_scopes: Vec::new(),
                 bcp,
                 block,
                 frame_state,
@@ -1396,6 +1398,7 @@ mod tests {
         f.set_terminator(entry, jump(header));
         if osr {
             f.osr_entries.push(crate::t2::ir::OsrEntry {
+                control_scopes: Vec::new(),
                 bcp: 7,
                 block: header,
                 frame_state: header_state,

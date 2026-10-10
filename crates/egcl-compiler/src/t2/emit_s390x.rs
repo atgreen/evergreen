@@ -2161,6 +2161,7 @@ mod tests {
             remat: vec![],
         });
         f.osr_entries.push(crate::t2::ir::OsrEntry {
+            control_scopes: Vec::new(),
             block: header,
             bcp: 12,
             frame_state: state,
