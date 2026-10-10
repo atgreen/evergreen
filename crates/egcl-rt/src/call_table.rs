@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 ///
 /// SysV register calls pass this pointer in R9, slice calls in RCX. Win64
 /// register calls pass it as argument six (after target/count/a0/a1/a2),
-/// slice calls in R9. A Rust reentry must establish its own segment and must
-/// not forward this context.
+/// slice calls in R9. AAPCS64 register calls pass it in x5, slice calls in x3.
+/// A Rust reentry must establish its own segment and must not forward this context.
 #[repr(C)]
 pub struct NativeCallContext {
     pub request: *mut u8,

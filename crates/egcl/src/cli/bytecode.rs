@@ -83,9 +83,15 @@ mod native_callable;
 #[cfg(all(target_arch = "x86_64", windows))]
 #[path = "bytecode/native_callable_windows.rs"]
 mod native_callable;
-#[cfg(all(target_arch = "x86_64", windows))]
+#[cfg(all(target_arch = "aarch64", unix))]
+#[path = "bytecode/native_callable_aarch64.rs"]
+mod native_callable;
+#[cfg(any(all(target_arch = "x86_64", windows), all(target_arch = "aarch64", unix)))]
 pub(super) use native_callable::{enabled as native_callable_enabled, invoke as invoke_native_callable};
-#[cfg(all(target_arch = "x86_64", any(target_os = "linux", windows)))]
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(target_arch = "aarch64", unix)
+))]
 pub(super) fn initialize_native_callable_entries() {
     let _ = native_callable::entries();
 }
