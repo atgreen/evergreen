@@ -817,6 +817,10 @@ fn verify_frame_aliases(
 }
 
 #[cfg(test)]
+#[path = "root_publication_matrix_tests.rs"]
+mod matrix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use egcl_rt::Collector;
@@ -881,7 +885,7 @@ mod tests {
         total
     }
 
-    fn force_minor_gc() {
+    pub(super) fn force_minor_gc() {
         egcl_rt::HeapCollector::new().minor_gc().unwrap();
     }
 
@@ -1009,17 +1013,25 @@ mod tests {
         static NATIVE_ONLY_PROBE: Cell<*mut NativeOnlyProbe> = const { Cell::new(std::ptr::null_mut()) };
     }
 
-    fn native_only_slot(published: &PublishedBoundary) -> Option<*mut EgclVal> {
+    pub(super) fn native_only_slot_for(
+        published: &PublishedBoundary,
+        marker: i64,
+    ) -> Option<*mut EgclVal> {
         let mut native = None;
-        // Use the production walker, including mapped adapter crossings. Any
-        // managed alias would be caught by the complete stack scan below.
-        unsafe { walk_boundary(published, &mut |slot| {
-            if !published.bounds.contains(&(slot as usize)) { return; }
-            let value = slot.read();
-            if value.is_cons() && crate::cli::cp(value) == (EgclVal::from_fixnum(314159), NIL) {
-                native = Some(slot);
-            }
-        }); }
+        // Include older publications when Rust/checked code reenters Lisp.
+        // Each boundary retains the bounds and exact owner for its own frames.
+        let mut boundary = published as *const PublishedBoundary;
+        while !boundary.is_null() {
+            let current = unsafe { &*boundary };
+            unsafe { walk_boundary(current, &mut |slot| {
+                if !current.bounds.contains(&(slot as usize)) { return; }
+                let value = slot.read();
+                if value.is_cons() && crate::cli::cp(value) == (EgclVal::from_fixnum(marker), NIL) {
+                    native = Some(slot);
+                }
+            }); }
+            boundary = current.previous;
+        }
         let native = native?;
         let before = unsafe { native.read() }.to_raw();
         let mut managed_copies = 0;
@@ -1031,6 +1043,10 @@ mod tests {
         assert!(!unsafe { &*env }.mv.iter().any(|value| value.to_raw() == before),
             "the current native environment must not retain the target");
         Some(native)
+    }
+
+    fn native_only_slot(published: &PublishedBoundary) -> Option<*mut EgclVal> {
+        native_only_slot_for(published, 314159)
     }
 
     fn observe_native_only() {

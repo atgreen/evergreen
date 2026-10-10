@@ -22821,6 +22821,13 @@ static ANON_BACK_EDGES: egcl_rt::execution_local::ExecutionLocal<
 static OSR_ENTRY_COUNTS: egcl_rt::execution_local::ExecutionLocal<RefCell<HashMap<u32, u32>>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(HashMap::new())) };
 
+/// Test oracle for the actual machine-call extent, including helpers called
+/// from OSR code. An entry count alone cannot distinguish a collection during
+/// OSR from one after an early deoptimization has already resumed T0.
+#[cfg(test)]
+static NATIVE_OSR_ACTIVE: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
+
 /// The number of OSR native entries recorded for `sym` on this thread
 /// (`egcl-ext:function-osr-count`).
 pub(super) fn osr_entry_count(sym: u32) -> u32 {
@@ -23054,10 +23061,14 @@ fn run_native_osr(
     // rsi = *mut EgclStack for the reserved r12 (bliss-zhvn Stage 1); the OSR
     // stub shares emit_prologue, so it expects the two-arg ABI.
     let f: extern "C" fn(*mut u64, *const u8) -> u64 = unsafe { std::mem::transmute(entry_addr) };
+    #[cfg(test)]
+    let previous_osr = NATIVE_OSR_ACTIVE.with(|active| active.replace(true));
     let ret = f(
         slots,
         std::ptr::from_ref(egcl_rt::current_stack()) as *const u8,
     );
+    #[cfg(test)]
+    NATIVE_OSR_ACTIVE.with(|active| active.set(previous_osr));
     egcl_rt::runtime::set_sigsegv_recovery_ips(saved_null_recovery, saved_stack_recovery);
     NATIVE_ENV.with(|e| e.set(saved));
     // Native code can enter a lexical child before deoptimizing. Preserve
