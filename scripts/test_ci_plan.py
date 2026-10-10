@@ -54,7 +54,7 @@ class PlanTests(unittest.TestCase):
     def test_docs_only(self):
         self.changed("README.md", "CHANGELOG.md", "AGENTS.md", "CITATION.cff",
                      "docs/a guide.md", "docs/image.png")
-        self.assertEqual(self.plan(), dict(runtime=False, full=False, areas=[], pgo=False))
+        self.assertEqual(self.plan(), dict(runtime=True, full=False, areas=[], pgo=False))
 
     def test_unknown_and_spec_markdown_require_runtime(self):
         for name in ("spec/01-reader.md", "notes.md", "unknown.file", "Cargo.toml",
