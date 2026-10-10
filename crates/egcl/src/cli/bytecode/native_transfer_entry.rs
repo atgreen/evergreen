@@ -216,7 +216,7 @@ pub(super) struct TransferCode {
     deopt_metadata: Option<Arc<T2InstalledMetadata>>,
     deopts: Cell<u32>,
     recompile: Cell<bool>,
-    recursive: bool,
+    recursive_symbol: Option<u32>,
     recursive_generation: u64,
     landing: JitBuffer,
     sites: SysvTransferTable,
@@ -771,7 +771,7 @@ impl TransferCode {
             deopt_metadata,
             deopts: Cell::new(0),
             recompile: Cell::new(false),
-            recursive: recursion.is_some(),
+            recursive_symbol,
             recursive_generation,
             landing,
             sites,
@@ -783,7 +783,17 @@ impl TransferCode {
     }
 
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
-        self.run_activation(args, env, None)
+        // Diagnostic/cached entries resolve once. Ordinary dispatch supplies its
+        // already selected callable through run_callable instead.
+        let function = self.installed_symbol.or(self.recursive_symbol)
+            .filter(|symbol| recursive_definition_matches(*symbol, Arc::as_ptr(&self.body)))
+            .and_then(egcl_rt::symbols::symbol_function)
+            .unwrap_or(NIL);
+        self.run_callable(function, args, env)
+    }
+
+    pub(super) fn run_callable(&self, function: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+        self.run_activation(args, env, None, function)
     }
 
     fn run_activation(
@@ -791,7 +801,9 @@ impl TransferCode {
         args: &[EgclVal],
         env: &mut Env,
         osr: Option<OsrResume>,
+        function: EgclVal,
     ) -> Result<EgclVal, EgclError> {
+        egcl_rt::rooted!(function = function);
         let osr_offset = osr.as_ref().map(|resume| resume.offset);
         // Claim both inherited owners before preparation can fail or collect.
         // Tags remain in the rooted Env; the payload owns their exact tokens.
@@ -823,13 +835,15 @@ impl TransferCode {
         // preparation only copies words; no native frame survives into fallback.
         let stack = egcl_rt::current_stack();
         // Optimized metadata currently owns exactly one logical definition.
-        let function = self
-            .deopt_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
-            .or(self.installed_symbol)
-            .map(EgclVal::from_symbol_index)
-            .unwrap_or(NIL);
+        let frame_function = if egcl_rt::function::is_interpreted_function(*function) {
+            *function
+        } else {
+            self.deopt_metadata.as_ref()
+                .and_then(|metadata| metadata.deopt_bodies.keys().next().copied())
+                .or(self.installed_symbol)
+                .map(EgclVal::from_symbol_index)
+                .unwrap_or(NIL)
+        };
         let frame = if osr_offset.is_some() {
             let frame = frame_guard.0.expect("committed OSR owns its managed frame");
             // Source preparation already reserved the space and retained its
@@ -840,7 +854,7 @@ impl TransferCode {
             unsafe { (*frame).code_info = self.code_info; }
             frame
         } else { stack
-            .push_frame(function, self.code_info, self.slots, FLAG_CALL)
+            .push_frame(frame_function, self.code_info, self.slots, FLAG_CALL)
             .ok_or_else(|| {
                 EgclError::StackOverflow(
                     egcl_rt::current_fiber_id()
@@ -935,7 +949,7 @@ impl TransferCode {
             };
             // This suspended source's catch guard remains an error backstop.
             // It can only truncate again after the destination has returned.
-            return code.run_activation(&[], env, Some(resume));
+            return code.run_activation(&[], env, Some(resume), NIL);
         }
         match outcome.exit {
             NativeExit::Returned
@@ -1279,6 +1293,55 @@ unsafe extern "C" fn prepare_recursive(
     }
 }
 
+/// Recheck only on invalidation. An alias to another callable must use ordinary
+/// dispatch even when its retained bytecode happens to have the same body.
+unsafe fn recursive_target_matches(context: *mut CaptureContext, symbol: u32) -> bool {
+    let generation = direct_call_gen();
+    if generation == unsafe { (*context).recursive_generation } {
+        return true;
+    }
+    egcl_rt::rooted!(function = unsafe { (*(*context).frame).function });
+    if !recursive_definition_matches(symbol, unsafe { (*context).body })
+        || (egcl_rt::function::is_interpreted_function(*function)
+            && egcl_rt::symbols::symbol_function(symbol) != Some(*function))
+    {
+        return false;
+    }
+    unsafe { (*context).recursive_generation = generation; }
+    true
+}
+
+/// Cold, sampled scheduling runs while the suspended caller is precisely
+/// published and before a child frame exists. The actual admission is counted
+/// later; a cap, changed definition or failed frame push counts via fallback.
+unsafe fn schedule_recursive_promotion(context: *mut CaptureContext, symbol: u32, count: u32) -> Result<EgclVal, EgclError> {
+    let function = unsafe { (*(*context).frame).function };
+    if !t2_enabled() || egcl_rt::function::tier(function) == 2 {
+        return Ok(NIL);
+    }
+    egcl_rt::rooted!(function = function);
+    // A fresh snapshot must describe this exact callable/body, never an older
+    // recursive chain's replacement. Do not retain registry borrows across work.
+    if egcl_rt::symbols::symbol_function(symbol) != Some(*function)
+        || !recursive_definition_matches(symbol, unsafe { (*context).body })
+    {
+        return Ok(NIL);
+    }
+    poll_t2_completions();
+    let needs_t2 = NATIVE_REGISTRY.with(|registry| {
+        registry.borrow().get(&symbol).is_some_and(|installed| {
+            !installed.is_t2 && installed.body.as_ref().is_some_and(|body|
+                std::ptr::eq(Arc::as_ptr(body), unsafe { (*context).body }))
+        })
+    });
+    if needs_t2 {
+        let priority = (u64::from(egcl_rt::function::back_edge_count(*function)) << 32) | u64::from(count);
+        request_t2_compilation(symbol, priority);
+        poll_t2_completions();
+    }
+    Ok(NIL)
+}
+
 unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcome) {
     let request = unsafe { &mut *request.cast::<RecursiveCallRequest>() };
     request.activation = RecursiveActivation {
@@ -1289,75 +1352,67 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
     request.reserved = 0;
     // Entry polling also covers recursion without a loop back-edge. This is
     // root-safe because no argument exists only in an unscanned register.
-    unsafe {
-        poll_or_transfer_unpublished(std::ptr::null_mut(), out);
-    }
-    if unsafe { (*out).exit } != NativeExit::Returned {
+    unsafe { poll_or_transfer_unpublished(std::ptr::null_mut(), out); }
+    if unsafe { (*out).exit } != NativeExit::Returned { return; }
+    let context = CAPTURE.with(Cell::get);
+    let symbol = request.call.symbol as u32;
+    if !unsafe { recursive_target_matches(context, symbol) } {
+        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
         return;
-    }
-    let context = unsafe { &mut *CAPTURE.with(Cell::get) };
-    let generation = direct_call_gen();
-    if generation != context.recursive_generation {
-        // Most calls need only the generation comparison. On invalidation,
-        // compare the retained body with the current definition before updating
-        // the stamp; unrelated definition changes must not disable recursion.
-        if !recursive_definition_matches(request.call.symbol as u32, context.body) {
-            unsafe {
-                c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
-            }
-            return;
-        }
-        context.recursive_generation = generation;
     }
     let here = std::ptr::from_ref(&request) as usize as u64;
     let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
     if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
-        // A completed fallback keeps frame null. Its value returns straight to
-        // the suspended native caller; exceptional status takes the mapped edge.
-        unsafe {
-            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
-        }
+        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
         return;
     }
+    if unsafe { (*context).recursive_profile && !(*(*context).owner).is_t2 } {
+        let function = unsafe { (*(*context).frame).function };
+        let count = egcl_rt::function::invoke_count(function).saturating_add(1);
+        if count % t2_invoke_threshold().max(1) == 0 {
+            if let Err(error) = guard_c2i(|| unsafe { schedule_recursive_promotion(context, symbol, count) }) {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+                unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Transfer }); }
+                return;
+            }
+        }
+    }
+    // Publication may change linkage or collect. Reload the traced callable
+    // from the owning frame and revalidate before committing any child state.
+    if !unsafe { recursive_target_matches(context, symbol) } {
+        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
+        return;
+    }
+    let context = unsafe { &mut *context };
+    let function = unsafe { (*context.frame).function };
     let stack = egcl_rt::current_stack();
     let Some(frame) = stack.push_frame(
-        EgclVal::from_symbol_index(request.call.symbol as u32),
+        function,
         unsafe { (*context.frame).code_info },
         context.slots as u16,
         FLAG_CALL,
     ) else {
-        unsafe {
-            c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out);
-        }
+        unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
         return;
     };
     let body = unsafe { &*context.body };
     for (index, (_, location)) in body.param_layout.iter().enumerate() {
-        let VarLoc::Slot(slot) = location else {
-            unreachable!("admitted slot parameter")
-        };
-        unsafe {
-            slot_set(frame, *slot, request.call.args.add(index).read());
-        }
+        let VarLoc::Slot(slot) = location else { unreachable!("admitted slot parameter") };
+        unsafe { slot_set(frame, *slot, request.call.args.add(index).read()); }
     }
-    request.activation = RecursiveActivation {
-        previous: context.recursive,
-        frame,
-        stack,
-    };
+    request.activation = RecursiveActivation { previous: context.recursive, frame, stack };
     context.recursive = std::ptr::from_mut(&mut request.activation);
     #[cfg(test)]
     RECURSIVE_ENTRIES.with(|count| count.set(count.get() + 1));
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
-    c2i_clear_mv();
-    // This helper's success value is an untagged activation address, consumed
-    // immediately as RDI by the emitted call, never exposed as a Lisp value.
-    unsafe {
-        out.write(NativeOutcome {
-            value: EgclVal(frame.add(1) as u64),
-            exit: NativeExit::Returned,
-        });
+    if context.recursive_profile {
+        egcl_rt::function::record_invocation(function);
     }
+    c2i_clear_mv();
+    // The untagged activation address goes straight to the generated entry.
+    unsafe { out.write(NativeOutcome {
+        value: EgclVal(frame.add(1) as u64), exit: NativeExit::Returned,
+    }); }
 }
 
 /// Nonallocating retirement shared by normal returns and cold chain exits.
@@ -2533,6 +2588,7 @@ struct CaptureContext {
     owner: *const TransferCode,
     completed_deopt: bool,
     recursive_enabled: bool,
+    recursive_profile: bool,
     recursive_generation: u64,
     recursive: *mut RecursiveActivation,
     recursive_escape: bool,

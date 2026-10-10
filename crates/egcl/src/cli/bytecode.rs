@@ -20368,7 +20368,7 @@ fn run_native_callable(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let NativeCodeStorage::Mapped(code) = &nc._storage {
         if !code.needs_recompile() {
-            return code.run(args, env);
+            return code.run_callable(*function, args, env);
         }
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
@@ -20379,7 +20379,7 @@ fn run_native_callable(
             };
             code
         });
-        return code.run(&args, env);
+        return code.run_callable(*function, &args, env);
     }
     // The segment ABI carries exceptional exits out-of-band through its cold
     // landing path, so it does not need the legacy post-call transfer poll.
