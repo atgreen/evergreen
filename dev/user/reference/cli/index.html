@@ -1867,10 +1867,10 @@
 <a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>  --eval, -e EXPR      Evaluate EXPR and exit
 <a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>  --load FILE          Load FILE and exit
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>  --image FILE         Path to the boot image
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>  --deliver SPEC       Deliver the saved --image using SPEC
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>  --output FILE        Delivered executable (with FILE.manifest report)
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>  --dry-run            Report delivery retention without writing files
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>  --runtime-source DIR Matching EGCL sources for specialized delivery
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>  --shake SPEC         Shake the saved --image using SPEC
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>  --output FILE        Shaken executable (with FILE.manifest report)
+<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>  --dry-run            Report what the shake would keep, without writing files
+<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>  --runtime-source DIR Matching EGCL sources for a specialized runtime
 <a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>  --runtime-info       Print native runtime compatibility contract
 <a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>  --no-image           Start without loading an image
 <a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>  --bootstrap          Deprecated; the prelude now loads by default
@@ -1918,15 +1918,15 @@
 <td>Restore a core image</td>
 </tr>
 <tr>
-<td><code>egcl --image FILE --deliver SPEC --output APP</code></td>
-<td>Deliver an executable from a saved core and retention specification</td>
+<td><code>egcl --image FILE --shake SPEC --output APP</code></td>
+<td>Shake a saved core into an executable under a retention specification</td>
 </tr>
 </tbody>
 </table>
-<p>Delivery is a separate execution mode: it cannot be combined with <code>--eval</code>,
+<p>The shaker is a separate execution mode: it cannot be combined with <code>--eval</code>,
 <code>--load</code>, a script, or application arguments. <code>--dry-run</code> prints its retention
 report without producing files. See the
-<a href="../../how-to/save-executable/#deliver-an-application-from-a-saved-image">delivery guide</a>
+<a href="../../how-to/save-executable/#shake-an-application-from-a-saved-image">shaker guide</a>
 for the specification format and dynamic-entry retention contract.</p>
 <p>The prelude loads by default. <code>--no-bootstrap</code> selects the raw evaluator.
 For the REPL, <code>EGCL_INIT_FILE</code> selects an initialization file; its default is

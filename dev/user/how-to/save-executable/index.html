@@ -1284,6 +1284,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#carry-files-in-the-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Carry files in the image
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#save-a-separate-core-file" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1295,13 +1306,30 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#deliver-an-application-from-a-saved-image" class="md-nav__link">
+  <a href="#shake-an-application-from-a-saved-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Deliver an application from a saved image
+        Shake an application from a saved image
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Shake an application from a saved image">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#describe-the-shake-in-a-system-definition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Describe the shake in a system definition
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1880,6 +1908,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#carry-files-in-the-image" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Carry files in the image
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#save-a-separate-core-file" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1891,13 +1930,30 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#deliver-an-application-from-a-saved-image" class="md-nav__link">
+  <a href="#shake-an-application-from-a-saved-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Deliver an application from a saved image
+        Shake an application from a saved image
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Shake an application from a saved image">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#describe-the-shake-in-a-system-definition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Describe the shake in a system definition
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1978,39 +2034,61 @@ follow <a href="../cross-build/">Build for another platform</a>.</p>
 </code></pre></div>
 <p>After the saving process exits, run <code>./session</code> and evaluate <code>(square 9)</code>.
 The result is <code>81</code>.</p>
+<h2 id="carry-files-in-the-image">Carry files in the image<a class="headerlink" href="#carry-files-in-the-image" title="Permanent link">&para;</a></h2>
+<p>A library such as local-time reads host files (<code>/usr/share/zoneinfo/...</code>)
+through Lisp streams, and an image cross-built or copied to another host lands
+where those files do not exist. <code>egcl-ext:embed-file</code> reads a file on the build
+host, now, and carries its bytes in the image under the path the application
+will open:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nv">egcl-ext:embed-file</span><span class="w"> </span><span class="s">"/usr/share/zoneinfo/UTC"</span><span class="p">)</span><span class="w">                     </span><span class="c1">; same path on both hosts</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="p">(</span><span class="nv">egcl-ext:embed-file</span><span class="w"> </span><span class="s">"/etc/my-app/config.sexp"</span><span class="w"> </span><span class="s">"deploy/config.sexp"</span><span class="p">)</span><span class="w"> </span><span class="c1">; a different source</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="p">(</span><span class="nv">egcl-ext:embedded-file-p</span><span class="w"> </span><span class="s">"/usr/share/zoneinfo/UTC"</span><span class="p">)</span><span class="w">               </span><span class="c1">; =&gt; T</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">(</span><span class="nv">egcl-ext:embedded-files</span><span class="p">)</span><span class="w">                                           </span><span class="c1">; =&gt; the paths</span>
+</code></pre></div>
+<p><code>open</code> for input, <code>probe-file</code>, <code>truename</code>, <code>file-length</code>, <code>file-write-date</code>,
+<code>directory</code> and <code>load</code> find embedded files; an embedded file shadows a real
+one at the same path, so behaviour does not depend on the host; and they are
+read-only, so opening one for output, renaming or deleting it signals
+<code>file-error</code>. Only the Lisp image sees them: the operating system, foreign code
+called through the FFI and child processes do not. Saved images, shaken
+executables and cores carry them; contents cost one byte per octet.</p>
+<p>An application can list the files it needs in its own <code>.asd</code> with the
+<code>egcl-embed-asdf</code> extension, as <code>(:embedded-file ...)</code> and <code>(:embedded-tree
+... :only ...)</code> components that embed when the system loads; see
+<code>lib/egcl-embed/README.md</code>.</p>
 <h2 id="save-a-separate-core-file">Save a separate core file<a class="headerlink" href="#save-a-separate-core-file" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"session.core"</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"session.core"</span><span class="p">)</span>
 </code></pre></div>
 <p>Restart it with a compatible runtime:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>session.core
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>session.core
 </code></pre></div>
 <p>Use <code>--image</code> for a core file, not <code>load</code>. See the
 <a href="../../reference/images/">image reference</a> for format and compatibility limits.</p>
-<h2 id="deliver-an-application-from-a-saved-image">Deliver an application from a saved image<a class="headerlink" href="#deliver-an-application-from-a-saved-image" title="Permanent link">&para;</a></h2>
-<p>Delivery takes a saved core and a separate specification. It restores the core
-in the delivery process, selects an entry point, removes unreachable named
+<h2 id="shake-an-application-from-a-saved-image">Shake an application from a saved image<a class="headerlink" href="#shake-an-application-from-a-saved-image" title="Permanent link">&para;</a></h2>
+<p>The shaker takes a saved core and a separate specification. It restores the core
+in its own process, selects an entry point, removes unreachable named
 functions in packages you explicitly select, and writes a standalone executable.
 The input core is unchanged. Its old entry point and your init file are not run.</p>
 <p>For example, save this application as <code>app.core</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nb">defpackage</span><span class="w"> </span><span class="ss">:my-app</span><span class="w"> </span><span class="p">(</span><span class="ss">:use</span><span class="w"> </span><span class="ss">:cl</span><span class="p">))</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="p">(</span><span class="nb">in-package</span><span class="w"> </span><span class="ss">:my-app</span><span class="p">)</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">greeting</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Hello from a delivered image!"</span><span class="p">)</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">unused-helper</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Development only"</span><span class="p">)</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"~A~%"</span><span class="w"> </span><span class="p">(</span><span class="nv">greeting</span><span class="p">)))</span>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"app.core"</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="p">(</span><span class="nb">defpackage</span><span class="w"> </span><span class="ss">:my-app</span><span class="w"> </span><span class="p">(</span><span class="ss">:use</span><span class="w"> </span><span class="ss">:cl</span><span class="p">))</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="p">(</span><span class="nb">in-package</span><span class="w"> </span><span class="ss">:my-app</span><span class="p">)</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">greeting</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Hello from a shaken image!"</span><span class="p">)</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">unused-helper</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="s">"Development only"</span><span class="p">)</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"~A~%"</span><span class="w"> </span><span class="p">(</span><span class="nv">greeting</span><span class="p">)))</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="s">"app.core"</span><span class="p">)</span>
 </code></pre></div>
-<p>Create <code>app.delivery</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>version = 1
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>entry = MY-APP::MAIN
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>prune-package = MY-APP
-<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>dynamic = explicit
+<p>Create <code>app.shake</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>version = 1
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>entry = MY-APP::MAIN
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>prune-package = MY-APP
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>dynamic = explicit
 </code></pre></div>
-<p>Inspect the retention report, then deliver:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span>--dry-run
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>./hello
+<p>Inspect the retention report, then shake:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--shake<span class="w"> </span>app.shake<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span>--dry-run
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--shake<span class="w"> </span>app.shake<span class="w"> </span>--output<span class="w"> </span>hello
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>./hello
 </code></pre></div>
-<p>The dry run writes no output files. Delivery writes <code>hello</code> and a versioned
+<p>The dry run writes no output files. Shaking writes <code>hello</code> and a versioned
 text report, <code>hello.manifest</code>, listing retained and removed candidate functions,
 retention reasons, platform, runtime policy, and file sizes. Existing executables
 are replaced only after the new executable has been built. The executable and
@@ -2057,7 +2135,7 @@ singleton keys, missing functions, and unknown packages are errors.</p>
 </tr>
 <tr>
 <td><code>runtime = full</code></td>
-<td>Default: reuse the full delivery driver, without invoking Cargo</td>
+<td>Default: reuse the full runtime that runs the shake, without invoking Cargo</td>
 </tr>
 <tr>
 <td><code>runtime = specialized</code></td>
@@ -2080,8 +2158,41 @@ or leave <code>dynamic = preserve</code>. Reachable arbitrary-code entry points 
 <code>EVAL</code> and <code>LOAD</code> retain all candidate functions and native capabilities even
 with <code>dynamic = explicit</code>: the retention policy cannot override that dependency.
 Plugins, foreign callbacks, and method redefinition also need explicit roots
-when their targets cannot be inferred. This is a delivery policy, not a security
+when their targets cannot be inferred. This is a retention policy, not a security
 boundary.</p>
+<h3 id="describe-the-shake-in-a-system-definition">Describe the shake in a system definition<a class="headerlink" href="#describe-the-shake-in-a-system-definition" title="Permanent link">&para;</a></h3>
+<p>An application can carry its shake policy in its own <code>.asd</code> and be
+shaken by <code>asdf:make</code>, with no spec file to write and no core to save by
+hand. Name <code>egcl-shake-asdf</code> in <code>:defsystem-depends-on</code> and give a secondary
+system the shake class and build operation; the initargs mirror the
+specification keys above one for one:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="p">(</span><span class="nv">asdf:defsystem</span><span class="w"> </span><span class="s">"my-app"</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span><span class="ss">:components</span><span class="w"> </span><span class="p">((</span><span class="ss">:file</span><span class="w"> </span><span class="s">"my-app"</span><span class="p">)))</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="p">(</span><span class="nv">asdf:defsystem</span><span class="w"> </span><span class="s">"my-app/shake"</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="w">  </span><span class="ss">:defsystem-depends-on</span><span class="w"> </span><span class="p">(</span><span class="s">"egcl-shake-asdf"</span><span class="p">)</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6" href="#__codelineno-9-6"></a><span class="w">  </span><span class="ss">:class</span><span class="w"> </span><span class="s">"egcl-shake-asdf:shaken-application"</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7" href="#__codelineno-9-7"></a><span class="w">  </span><span class="ss">:build-operation</span><span class="w"> </span><span class="s">"egcl-shake-asdf:shake-op"</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8" href="#__codelineno-9-8"></a><span class="w">  </span><span class="ss">:depends-on</span><span class="w"> </span><span class="p">(</span><span class="s">"my-app"</span><span class="p">)</span>
+<a id="__codelineno-9-9" name="__codelineno-9-9" href="#__codelineno-9-9"></a><span class="w">  </span><span class="ss">:shake-entry</span><span class="w"> </span><span class="s">"my-app::main"</span>
+<a id="__codelineno-9-10" name="__codelineno-9-10" href="#__codelineno-9-10"></a><span class="w">  </span><span class="ss">:shake-prune-packages</span><span class="w"> </span><span class="p">(</span><span class="s">"MY-APP"</span><span class="p">)</span>
+<a id="__codelineno-9-11" name="__codelineno-9-11" href="#__codelineno-9-11"></a><span class="w">  </span><span class="ss">:shake-dynamic</span><span class="w"> </span><span class="ss">:explicit</span><span class="p">)</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>egcl<span class="w"> </span>--eval<span class="w"> </span><span class="s1">'(require :asdf)'</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">     </span>--eval<span class="w"> </span><span class="s1">'(asdf:load-asd (truename "my-app.asd"))'</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">     </span>--eval<span class="w"> </span><span class="s1">'(asdf:make "my-app/shake")'</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>./build/my-app
+</code></pre></div>
+<p><code>asdf:make</code> loads the application, writes <code>build/my-app.shake</code> from the
+slots, saves <code>build/my-app.core</code> in a child process, shakes it in another,
+and leaves the executable and <code>build/my-app.manifest</code> beside them. The
+remaining initargs are <code>:shake-keep</code>, <code>:shake-runtime</code> (<code>:full</code> or
+<code>:specialized</code>), <code>:shake-max-tier</code>, <code>:shake-runtime-keep</code>,
+<code>:shake-runtime-source</code>, <code>:shake-system</code>, and <code>:shake-output</code>; ASDF's
+own <code>:entry-point</code> stands in for <code>:shake-entry</code>. The extension is installed
+with <code>egcl</code> under <code>/usr/share/common-lisp/source/</code>, where ASDF already looks;
+from a source checkout, add <code>lib/egcl-shake/</code> to <code>CL_SOURCE_REGISTRY</code>. See
+<code>lib/egcl-shake/README.md</code> for the child processes' registry.</p>
 <p>The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
 references through saved data and source/bytecode, including nested functions
@@ -2102,7 +2213,7 @@ generic and method set. Class accessor names also retain their functions.
 Unreachable generic functions and their owned method records are removed from
 both evaluator and CLOS registries before saving. A generic can be an <code>entry</code>
 or an explicit <code>keep</code> root.</p>
-<p>For methods with saved bytecode, delivery discards the redundant source body
+<p>For methods with saved bytecode, the shaker discards the redundant source body
 and follows the compiled callable. Macros used only to compile such a method
 do not stay alive through its old source. Uncompiled methods retain their
 source and its dependencies.</p>
@@ -2115,16 +2226,16 @@ known macro owner follow that macro's reachability. Unreachable registrations
 are released before saving. SETF expanders, compiler macros, and registrations
 without a known owner remain conservative roots.</p>
 <p>User-defined SETF writers in selected packages follow the reachability of their
-accessor names and saved writer functions. Delivery removes an unreachable
+accessor names and saved writer functions. Shaking removes an unreachable
 writer's private function cell and source record. Use <code>keep = PACKAGE::ACCESSOR</code>
 to retain a dynamically invoked writer, even if the accessor has no getter.
-New BFASLs preserve the accessor symbol so delivery can identify its owning
+New BFASLs preserve the accessor symbol so the shaker can identify its owning
 package. Older artifacts with missing or ambiguous ownership remain
 conservatively retained.</p>
 <p>Private compiled closures and source closure handles are traced from reachable
 objects and code, including their captured environments. An unreachable
 closure does not retain its callees or native capabilities just because it
-remains in a runtime registry. Delivery removes its private code and captures
+remains in a runtime registry. Shaking removes its private code and captures
 before saving; <code>private-code-removed</code> reports removed compiled entries and
 <code>source-closures-removed</code> reports removed source closure entries.
 Escaped closures and shared captured environments remain live when reachable.</p>
@@ -2135,21 +2246,21 @@ Saved object identities let the loader rebuild pointers with an old-to-new
 address map. Symbol identities and other retained data can therefore survive
 after a function's implementation is removed. The original input file is never
 modified.</p>
-<p>With the default <code>runtime = full</code>, delivery reduces the saved image and keeps
+<p>With the default <code>runtime = full</code>, the shaker reduces the saved image and keeps
 the full Rust runtime. Re-saving an executable replaces its embedded image
 instead of stacking another copy of the previous core into the runtime prefix.</p>
 <h2 id="specialize-the-native-runtime">Specialize the native runtime<a class="headerlink" href="#specialize-the-native-runtime" title="Permanent link">&para;</a></h2>
-<p>Add this to the same delivery specification:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>runtime = specialized
+<p>Add this to the same shake specification:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>runtime = specialized
 </code></pre></div>
-<p>Then run delivery with a matching source checkout:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--deliver<span class="w"> </span>app.delivery<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">  </span>--runtime-source<span class="w"> </span>/path/to/egcl
+<p>Then shake with a matching source checkout:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>egcl<span class="w"> </span>--image<span class="w"> </span>app.core<span class="w"> </span>--shake<span class="w"> </span>app.shake<span class="w"> </span>--output<span class="w"> </span>hello<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span>--runtime-source<span class="w"> </span>/path/to/egcl
 </code></pre></div>
 <p>The source checkout defaults to the location recorded when the driver was built.
 You need Cargo, the matching Rust toolchain, its target libraries, and the target
-linker. The new runtime must execute on the delivery machine so its compatibility
-contract can be checked; this command does not cross-deliver images.</p>
+linker. The new runtime must execute on the machine running the shake so its compatibility
+contract can be checked; this command does not shake images for another platform.</p>
 <p>Native capabilities are selected by the reachability graph. A retained
 <code>DISASSEMBLE</code> reference keeps disassembly. A retained <code>EVAL</code>, <code>COMPILE</code>, <code>LOAD</code>,
 <code>COMPILE-FILE</code>, <code>REQUIRE</code>, or reader operation supporting <code>#.</code> keeps
@@ -2165,7 +2276,7 @@ data, retain <code>tree-walker</code> and the definitions referenced by their bo
 A fixed lambda does not by itself retain every function or native capability;
 an <code>EVAL</code> inside its body does. Applications that construct arbitrary lambda
 bodies dynamically must retain <code>dynamic-code</code>.</p>
-<p>The GC and T0 bytecode interpreter remain available. Delivery includes both
+<p>The GC and T0 bytecode interpreter remain available. A shake includes both
 native compilers by default. With <code>runtime = specialized</code>, choose the highest
 included tier using <code>max-tier = t2</code> (default), <code>max-tier = t1</code> (omit the T2
 optimizing compiler), or <code>max-tier = t0</code> (omit both native compilers).
@@ -2175,12 +2286,12 @@ bytecode. Native promotion and OSR cannot exceed the selected tier;
 <code>EGCL_FORCE_TIER</code> requests above it are clamped to the available tier.</p>
 <p>For example, a specification that selects the whole saved world and omits both
 native compilers is:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>version = 1
-<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>entry = MY-APP::MAIN
-<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>prune-package = *
-<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>dynamic = explicit
-<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>runtime = specialized
-<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>max-tier = t0
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>version = 1
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>entry = MY-APP::MAIN
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>prune-package = *
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>dynamic = explicit
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>runtime = specialized
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>max-tier = t0
 </code></pre></div>
 <p>Add <code>keep</code> entries for dynamically selected callbacks. Tier selection is
 independent of source evaluation: reachable <code>EVAL</code> still retains its evaluator
@@ -2194,11 +2305,11 @@ when retained functions have restorable bytecode and their reachable operations
 do not require source evaluation. Native linking then removes the tree-walking
 operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
 and any selected native compilation tiers.</p>
-<p>Specialized delivery attempts to compile reachable named source functions that
+<p>A specialized shake attempts to compile reachable named source functions that
 have no captured lexical environment. It discards their source only after
 confirming that the bytecode can be saved and restored independently, then
 recomputes reachability. This also runs during <code>--dry-run</code>: compilation may
-invoke macro expanders, but delivery does not call the application entry point.
+invoke macro expanders, but the shaker does not call the application entry point.
 The input image is unchanged.</p>
 <p>Unsupported source functions and closures, source handler forms, variadic
 argument binders, uncompiled generic methods, and builtin paths that still
@@ -2206,7 +2317,7 @@ require the evaluator retain <code>tree-walker</code>. The report identifies the
 dependencies. The initial audited builtin set covers arithmetic, basic list operations, multiple values,
 function application, and <code>WRITE-LINE</code>; other builtin paths conservatively
 retain the walker. BFASL input already provides compiled function bodies;
-supported cold source definitions can now be compiled during delivery too.
+supported cold source definitions can now be compiled during the shake too.
 Simply omitting <code>EVAL</code> is insufficient if other reachable operations still
 require source evaluation.</p>
 <p>Bootstrap definitions outside the selected packages are retained. Selecting
@@ -2215,7 +2326,7 @@ from an ordinary bootstrapped image. Conservative registry dependencies can
 still retain all native capabilities even when its application
 entry point comes from BFASL. The source-free native-removal tests use images
 built with <code>--no-bootstrap</code>.</p>
-<p>When the walker is unnecessary, delivery also selects native builtin dispatch
+<p>When the walker is unnecessary, the shaker also selects native builtin dispatch
 arms from the reachable symbols. Unselected arms are removed before Rust code
 generation, allowing LTO and linker garbage collection to discard their helpers
 and library implementations. Aliases sharing an arm retain that implementation
@@ -2223,8 +2334,8 @@ together. Builtin slot numbers remain stable across runtimes. Images requiring
 the walker currently retain the full builtin dispatcher until its implicit
 calls are represented in the dependency graph. Reachable dynamic-code
 operations always retain every builtin.</p>
-<p>Delivery generates a versioned native contract, builds through Cargo in
-<code>target/delivery/</code> under the source checkout, checks the resulting executable,
+<p>The shaker generates a versioned native contract, builds through Cargo in
+<code>target/shake/</code> under the source checkout, checks the resulting executable,
 and appends the reduced image. Compile-time selection removes references to the
 instruction decoder; release LTO and linker garbage collection can then remove
 its implementation. The cache separates source versions, targets, capabilities,
@@ -2241,13 +2352,13 @@ names as UTF-8 hex strings; <code>builtins=*</code> denotes the complete set. Th
 fingerprint is a compatibility identifier, not a cryptographic signature.
 Full runtimes can still read older images; specialized runtimes require the new
 metadata. A reduced driver cannot be used for
-<code>runtime = full</code> delivery.</p>
-<p>The delivery report separates <code>native-bytes</code> and <code>image-bytes</code>. Compare native
+<code>runtime = full</code> shake.</p>
+<p>The shake report separates <code>native-bytes</code> and <code>image-bytes</code>. Compare native
 sizes from the same release profile and stripping settings; a debug driver is
 not a useful size baseline for a specialized release build. Strip an executable
-<strong>before</strong> appending an image: stripping the delivered file may discard its core.</p>
+<strong>before</strong> appending an image: stripping the shaken file may discard its core.</p>
 <h3 id="measured-size-example">Measured size example<a class="headerlink" href="#measured-size-example" title="Permanent link">&para;</a></h3>
-<p>At commit <code>c25f245f</code>, the source-free native delivery regression on x86-64 Linux
+<p>At commit <code>c25f245f</code>, the source-free native shake regression on x86-64 Linux
 musl produced the following sizes. All three builds used Rust 1.94.1, the same
 release profile (Thin LTO), the same application, and no additional stripping.
 The application exercises arithmetic, loops, output, and condition handlers;

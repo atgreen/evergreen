@@ -1947,6 +1947,14 @@
 core images. Legacy source-transcript and BFASL startup images are unsupported;
 rebuild old executables. Ordinary library FASLs remain loadable with <code>LOAD</code> or
 <code>--load</code>.</p>
+<p>The current core format is 9. Format-8 and older cores must be rebuilt from
+source with the current runtime because they omit closures' captured local
+function scopes. Format-7 and older cores can also contain compiled calls that
+lost the identity of their original function. Recompile older FASLs first,
+load the rebuilt program, and save a new core or executable. Updating a version
+field by hand cannot repair the saved code or missing lexical scopes. Current
+images retain shared local-function scopes, captured declarations, and saved
+function objects independently of later global redefinitions.</p>
 <h2 id="save-image"><code>save-image</code><a class="headerlink" href="#save-image" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="nv">egcl-ext:save-image</span><span class="w"> </span><span class="nb">pathname</span><span class="p">)</span>
 </code></pre></div>

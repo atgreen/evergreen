@@ -1922,18 +1922,39 @@ and leave the lowerer untested.</p>
 with stress/poison output. Passing without a crash does not prove the values
 are correct.</p>
 <h2 id="validate-the-change">Validate the change<a class="headerlink" href="#validate-the-change" title="Permanent link">&para;</a></h2>
-<p>Run the affected tests and their direct callers. For a broad runtime change,
-run the wider workspace gates with the project's memory cap:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>--workspace
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>cargo<span class="w"> </span>check<span class="w"> </span>--workspace
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>cargo<span class="w"> </span>fmt<span class="w"> </span>--all<span class="w"> </span>--<span class="w"> </span>--check
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>bash<span class="w"> </span>scripts/gc-root-lint.sh
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>python3<span class="w"> </span>scripts/spec-coverage.py<span class="w"> </span>--gate
+<p>Run the changed behavior and its direct callers first. GitHub Actions uses the
+same tiered runner locally and on hosted machines:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">EGCL_MEM_MAX</span><span class="o">=</span>8G<span class="w"> </span><span class="nv">EGCL_TIMEOUT</span><span class="o">=</span><span class="m">1200</span><span class="w"> </span>scripts/egcl-limited.sh<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>python3<span class="w"> </span>scripts/ci-tests.py<span class="w"> </span>build<span class="w"> </span>--suite<span class="w"> </span>fast<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--target<span class="w"> </span>x86_64-unknown-linux-musl<span class="w"> </span>--shards<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>--manifest<span class="w"> </span>target/ci-tests/manifest.json
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>scripts/egcl-limited.sh<span class="w"> </span>python3<span class="w"> </span>scripts/ci-tests.py<span class="w"> </span>run<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">  </span>--manifest<span class="w"> </span>target/ci-tests/manifest.json<span class="w"> </span>--shard<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span>--results<span class="w"> </span>target/ci-tests/results-0.json
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>bash<span class="w"> </span>scripts/ci-lint.sh
 </code></pre></div>
-<p>The normal lint gate is <code>cargo clippy --workspace --all-targets -- -D warnings</code>.
-If an existing failure blocks a gate, record the precise failure instead of
-calling the tree green. Cross-target changes need checks on the affected target;
-a host build cannot validate target-specific <code>cfg</code> branches.</p>
+<p>PRs and pushes to main run smoke, fast regression, and relevant additional
+checks. Documentation-only changes run the CI contract checks and skip Rust
+builds; unknown paths or an unavailable change range select runtime validation.
+The stable <code>ci-required</code> check verifies the expected jobs, including intentional
+skips. It does not turn a failed or canceled test into success. Required branch
+protection should use this check only after its hosted reliability is established.</p>
+<p>Full musl and GNU/FFI regression runs nightly, on a manual <code>full</code> dispatch,
+for a merge-group event where supported, and before future release publication.
+Each configuration builds once. Eight deterministic shards reuse that exact
+artifact and split large harnesses by named tests, using recorded duration
+estimates rather than balancing by test count alone. Results and timings are
+uploaded even when tests fail. The archived binaries require the same absolute
+checkout path as the build because existing tests embed executable paths.</p>
+<p>GC stress and cross-platform matrices run nightly or when explicitly requested.
+Manual GC runs select either <code>full</code> or <code>subset</code>, avoiding duplicate execution.
+Superseded PR and main validation runs cancel; explicit release/manual runs are
+preserved. Merge-group support is present, but GitHub does not currently offer
+merge queues for this personal-account repository.</p>
+<p>Targeted tests do not replace comprehensive coverage. Existing full-suite
+failures remain failures and must be tracked in Beads, not hidden by ignores or
+weakened assertions. Cross-target code still needs execution on the affected
+platform; a host build cannot validate another platform's <code>cfg</code> branches.</p>
 <p>Update user-facing documentation when behavior changes. Commit validated work,
 close the Bead with the commit and validation evidence, and follow the active
 session's push policy. An explicit instruction not to push takes precedence.</p>
