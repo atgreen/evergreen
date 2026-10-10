@@ -228,8 +228,11 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
         return Some(Target::Function(function));
     }
     if egcl_rt::function::is_interpreted_function(function)
-        && let Some(body) = registry_get(symbol)
+        && let Some((owner, body)) = bytecode_for_callable(symbol, function)
     {
+        if owner != symbol {
+            return Some(Target::Function(function));
+        }
         if let Some(code) = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())
         {
             if code
@@ -353,7 +356,7 @@ pub(super) fn mapped_callable(function: EgclVal, nargs: usize) -> Option<MappedC
     }
     let symbol = egcl_rt::function::name(*function).symbol_index()?;
     if egcl_rt::symbols::symbol_function(symbol) != Some(*function)
-        || !registered_function_matches(symbol, *function)
+        || bytecode_for_callable(symbol, *function).is_none_or(|(owner, _)| owner != symbol)
     {
         return None;
     }

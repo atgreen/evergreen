@@ -994,18 +994,6 @@ fn replacement_function_value(sym: u32, function: EgclVal) -> Option<EgclVal> {
     (name.symbol_index().is_some_and(|own| own != sym)).then_some(function)
 }
 
-/// The registry follows DEFUN publication, while a function-cell alias can
-/// change independently. A saved callable may use only the body it owns.
-fn registered_function_matches(sym: u32, function: EgclVal) -> bool {
-    if !egcl_rt::function::is_interpreted_function(function)
-        || egcl_rt::symbols::is_uninterned(sym)
-    {
-        return true;
-    }
-    named_definitions().borrow().get(&sym)
-        .is_some_and(|definition| definition.function == function)
-}
-
 fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
     #[cfg(test)]
     call_table::record_target_lookup();
@@ -1024,6 +1012,32 @@ fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
     let body = closure_bodies().borrow().get(&sym).cloned()?;
     registry_put(sym, Arc::clone(&body));
     Some(body)
+}
+
+/// Select bytecode owned by an already selected callable. The public cell and
+/// registry are published separately: a setter may be paused between them.
+/// Read the body and its owner from one immutable registry snapshot; if that
+/// owner differs, use the callable's retained private definition instead.
+fn bytecode_for_callable(sym: u32, function: EgclVal) -> Option<(u32, Arc<BytecodeFunction>)> {
+    if egcl_rt::symbols::is_uninterned(sym) {
+        return registry_get(sym).map(|body| (sym, body));
+    }
+    install_bytecode_root_scanner();
+    let definition = named_definitions().borrow().get(&sym).cloned();
+    if let Some(definition) = definition
+        && definition.function == function
+    {
+        let local_generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied());
+        if local_generation != Some(definition.generation) {
+            install_local_definition(sym, definition.body.clone(), definition.generation);
+        }
+        return definition.body.map(|body| (sym, body));
+    }
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let private = egcl_rt::function::definition_index(function);
+    registry_get(private).map(|body| (private, body))
 }
 
 /// Live entry counts for the process-wide bytecode registries, for leak
@@ -1338,6 +1352,7 @@ pub fn call_registered(
     fn_val: EgclVal,
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
+    egcl_rt::rooted!(fn_val = fn_val);
     if debug_dispatch_enabled() {
         eprintln!(
             "[disp] call_registered sym={} registered={}",
@@ -1347,12 +1362,7 @@ pub fn call_registered(
     }
     // Retired objects resolve their immutable body, never the replacement
     // installed under their public name. Source-free objects have no fallback.
-    let sym = if !registered_function_matches(sym, fn_val) {
-        egcl_rt::function::definition_index(fn_val)
-    } else {
-        sym
-    };
-    let callee = registry_get(sym)?;
+    let (sym, callee) = bytecode_for_callable(sym, *fn_val)?;
     if !arity_accepts(&callee, args.len()) {
         if cfg!(egcl_no_tree_walker) {
             return Some(Err(EgclError::ProgramError(format!(
@@ -1363,7 +1373,7 @@ pub fn call_registered(
         }
         return None; // arg count outside the lambda list's range: tree-walker binds it
     }
-    let fn_obj = egcl_rt::function::is_interpreted_function(fn_val).then_some(fn_val);
+    let fn_obj = egcl_rt::function::is_interpreted_function(*fn_val).then_some(*fn_val);
     // The tree-walker already bumped named function objects in `callable_body`.
     // Anonymous/gensym bytecode functions have no FnMeta, so maintain their
     // fallback counter here on every call (including calls after T1 installs).
@@ -1376,7 +1386,7 @@ pub fn call_registered(
         "[T1] {}: dispatch at invocation {count}",
         sym_label(sym)
     );
-    let native = native_for_dispatch(sym, fn_obj, count);
+    let native = native_for_dispatch(sym, fn_obj, count, &callee);
     // Dispatch: native if promoted and under the depth cap, else run the callee
     // as BYTECODE — the profiling warmup tier. This is what gathers the operand
     // -type profile a function needs before it can be speculated at T2, even when
@@ -1385,9 +1395,9 @@ pub fn call_registered(
     // on entry, and is equivalent to the tree-walker for a compiled function.
     match native {
         Some(nc) if NATIVE_DEPTH.with(|d| d.get()) < native_depth_cap() => {
-            Some(run_native_callable(&nc, sym, fn_val, args, env))
+            Some(run_native_callable(&nc, sym, *fn_val, args, env))
         }
-        _ => Some(run_with_sym(callee, args, fn_val, sym, env)),
+        _ => Some(run_with_sym(callee, args, *fn_val, sym, env)),
     }
 }
 
@@ -15474,21 +15484,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // genuine producers re-establish it while executing.
                 env.clear_mv();
 
-                if let Some(function) = replacement_function(sym) {
-                    match apply_function(function, args, env) {
-                        Ok(result) => acts[top_idx].push_op(result),
-                        Err(error) => {
-                            let pending = error_to_pending(error, env);
-                            initiate_unwind(acts, stack, env, pending)?;
-                        }
-                    }
-                    continue;
-                }
-
-                // Only saved bytecode callees are body-inlining candidates.
-                // Reuse this lookup for dispatch below and avoid profiling the
-                // much larger population of builtin calls.
-                let registered_callee = registry_get(sym);
+                egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym)
+                    .unwrap_or_else(|| EgclVal::from_symbol_index(sym)));
+                let registered_callee = bytecode_for_callable(sym, *function);
 
                 // Profile every call site's execution frequency.  Type details
                 // remain restricted to speculatable arithmetic sites. `bcp` was
@@ -15505,8 +15503,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
                 // unified tiering substrate) so the function object reflects real
                 // invocations from the bytecode path, not just the tree-walker.
-                egcl_rt::rooted!(fn_obj = egcl_rt::symbols::symbol_function(sym)
-                    .filter(|&cell| egcl_rt::function::is_interpreted_function(cell)));
+                egcl_rt::rooted!(fn_obj = egcl_rt::function::is_interpreted_function(*function)
+                    .then_some(*function));
                 if !profiling_disabled()
                     && let Some(cell) = *fn_obj
                 {
@@ -15514,7 +15512,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
 
                 // Bytecode callee → native frame on the EgclStack.
-                if let Some(callee) = registered_callee {
+                if let Some((callee_sym, callee)) = registered_callee {
                     if arity_accepts(&callee, nargs as usize) {
                         // Installed native code → call via the i2c adapter.
                         // Unified tiering (bliss-jtc.3): the function object's
@@ -15524,8 +15522,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // counter and, on success, tier + entry are recorded on
                         // the object. Anonymous compiled lambdas (gensyms) have no
                         // function object, so they keep the INVOKE_COUNTS fallback.
-                        let count = dispatch_invoke_count(sym, *fn_obj);
-                        let native = native_for_dispatch(sym, *fn_obj, count);
+                        let count = dispatch_invoke_count(callee_sym, *fn_obj);
+                        let native = native_for_dispatch(callee_sym, *fn_obj, count, &callee);
                         // Run native only while under the depth cap (bliss-x5y.4);
                         // once the native call stack is deep, dispatch the callee
                         // through the flat T0 path below instead of pushing yet
@@ -15533,7 +15531,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         let over_cap = NATIVE_DEPTH.with(|d| d.get()) >= native_depth_cap();
                         if let Some(nc) = native {
                             if !over_cap {
-                                match run_native_callable(&nc, sym,
+                                match run_native_callable(&nc, callee_sym,
                                     fn_obj.unwrap_or_else(|| EgclVal::from_symbol_index(sym)), args, env) {
                                     Ok(v) => {
                                         acts[top_idx].push_op(v);
@@ -15609,7 +15607,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             cleanup_conts: Vec::new(),
                             dyn_binds: Vec::new(),
                             fn_obj: *fn_obj,
-                            sym,
+                            sym: callee_sym,
                         });
                         continue;
                     }
@@ -15617,7 +15615,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
 
                 // Fallback: tree-walker apply (builtins, generics, functions).
-                let fn_val = EgclVal::from_symbol_index(sym);
+                let fn_val = if egcl_rt::function::is_interpreted_function(*function) {
+                    *function
+                } else {
+                    EgclVal::from_symbol_index(sym)
+                };
                 // Direct builtin dispatch (bliss-x5y.27). When this site names
                 // an unshadowed leaf builtin, run its kernel on the
                 // already-evaluated arguments instead of handing a SYMBOL to
@@ -15627,7 +15629,8 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // stops being a plain builtin stops being dispatched as one.
                 // `None` from either step falls through to the general path,
                 // which is always correct.
-                let direct = match super::direct_builtin_slot_memoized(sym, nargs as usize) {
+                let direct = match (!egcl_rt::function::is_interpreted_function(*function))
+                    .then(|| super::direct_builtin_slot_memoized(sym, nargs as usize)).flatten() {
                     Some(slot) => super::call_direct_builtin(slot, args, env),
                     None => None,
                 };
@@ -17410,18 +17413,12 @@ fn c2i_call_result(
     let n = args.len();
     let sym32 = sym as u32;
     let fn_val = EgclVal::from_symbol_index(sym32);
-    let current_function = || egcl_rt::symbols::symbol_function(sym32);
     // Guard the interpreter reentry so a panic deep in the callee (e.g. a GC
     // root-scan RefCell reentrancy, bliss-011) is caught and re-raised as a
     // catchable condition rather than aborting across this `extern "C"` frame.
     guard_c2i(|| {
         let env = unsafe { &mut *env_ptr };
-        if let Some(function) = current_function()
-            .and_then(|function| replacement_function_value(sym32, function))
-        {
-            egcl_rt::rooted!(function = function);
-            return apply_function(*function, args, env);
-        }
+        egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym32).unwrap_or(fn_val));
         // Dispatch a compiled (bytecode) callee through the T0 path `run()`, whose
         // run_loop dispatches ITS calls flatly on the EgclStack (bliss-x5y.4). This
         // is what keeps recursion through a native caller bounded: without it, a
@@ -17431,13 +17428,12 @@ fn c2i_call_result(
         // way to flat Activations, so a runaway recursion raises a catchable
         // STORAGE-CONDITION instead of a native stack overflow. Non-bytecode callees
         // (builtins, generics, closures, arity mismatches) still go via apply_function.
-        match registry_get(sym32) {
-            Some(callee) if arity_accepts(&callee, n) => {
+        match bytecode_for_callable(sym32, *function) {
+            Some((callee_sym, callee)) if arity_accepts(&callee, n) => {
                 // Calls emitted by native T1/T2 code do not pass through the
                 // interpreter's CallNamed arm, so this adapter owns the callee's
                 // invocation bump and tier transition. Without it, a callee reached
                 // only from a native caller would stop warming up permanently.
-                egcl_rt::rooted!(function = current_function().unwrap_or(NIL));
                 let fn_obj = egcl_rt::function::is_interpreted_function(*function)
                     .then_some(*function);
                 if !profiling_disabled()
@@ -17445,8 +17441,8 @@ fn c2i_call_result(
                 {
                     egcl_rt::function::record_invocation(cell);
                 }
-                let count = dispatch_invoke_count(sym32, fn_obj);
-                let selected = native_for_dispatch(sym32, fn_obj, count);
+                let count = dispatch_invoke_count(callee_sym, fn_obj);
+                let selected = native_for_dispatch(callee_sym, fn_obj, count, &callee);
                 // bliss-x5y.8: if the callee is itself installed as native code and
                 // we are under the native depth cap, call its native entry directly
                 // (native → native) instead of rebuilding a full T0 `run()`
@@ -17461,11 +17457,13 @@ fn c2i_call_result(
                     selected
                 };
                 match native {
-                    Some(nc) => run_native_callable(&nc, sym32, fn_obj.unwrap_or(fn_val), args, env),
-                    None => run_with_sym(callee, args, fn_obj.unwrap_or(fn_val), sym32, env),
+                    Some(nc) => run_native_callable(&nc, callee_sym, *function, args, env),
+                    None => run_with_sym(callee, args, *function, callee_sym, env),
                 }
             }
-            _ => apply_function(fn_val, args, env),
+            _ => apply_function(if egcl_rt::function::is_interpreted_function(*function) {
+                *function
+            } else { fn_val }, args, env),
         }
     })
 }
@@ -19508,7 +19506,15 @@ fn publish_native(sym: u32, fn_obj: Option<EgclVal>, nc: &NativeCode) {
     if is_profile_pinned(sym) {
         return;
     }
-    if let Some(f) = fn_obj {
+    if let Some(f) = fn_obj
+        && nc.body.as_ref().is_some_and(|body| {
+            closure_bodies().borrow()
+                .get(&egcl_rt::function::definition_index(f))
+                .is_some_and(|owned| Arc::ptr_eq(owned, body))
+        })
+    {
+        // Background completion may observe a replaced function cell after
+        // validating its job. Publish tier metadata only on the body's owner.
         egcl_rt::function::set_tier(f, if nc.is_t2 { 2 } else { 1 });
     }
     // JFR-style event stream (bliss-ai8n): a function reached native code. The
@@ -20117,15 +20123,19 @@ fn native_for_dispatch(
     sym: u32,
     fn_obj: Option<EgclVal>,
     invoke_count: u32,
+    body: &Arc<BytecodeFunction>,
 ) -> Option<Rc<NativeCode>> {
     #[cfg(test)]
     call_table::record_target_lookup();
     if profiling_disabled() || is_profile_pinned(sym) {
         return None;
     }
+    egcl_rt::rooted!(fn_obj = fn_obj);
     let (owner, invoke_count) = closure_compilation_owner(sym, invoke_count);
     // A private representative has no public function cell to publish into.
-    let fn_obj = if owner == sym { fn_obj } else { None };
+    if owner != sym {
+        *fn_obj = None;
+    }
     let sym = owner;
     // Publication is deliberately performed by the owning mutator: workers
     // compile relocatable bytes only and never touch thread-local registries or
@@ -20149,10 +20159,19 @@ fn native_for_dispatch(
             }
             return None;
         };
+        // Compilation can refresh the registry after dispatch selected its
+        // callable. Never run or publish the replacement on the old object.
+        if nc.body.as_ref().is_none_or(|selected| !Arc::ptr_eq(selected, body)) {
+            return None;
+        }
         mark_fresh_promotion(sym);
-        publish_native(sym, fn_obj, &nc);
+        publish_native(sym, *fn_obj, &nc);
         return Some(nc);
     };
+
+    if current.body.as_ref().is_none_or(|selected| !Arc::ptr_eq(selected, body)) {
+        return None;
+    }
 
     if current.is_t2 || !t2_enabled() {
         return Some(current);
@@ -20169,7 +20188,8 @@ fn native_for_dispatch(
     if (egcl_t2_forced() || forced_tier() == Some(ForcedTier::T2))
         && (requested || T2_QUEUED.with(|queued| queued.borrow().contains_key(&sym)))
     {
-        return wait_for_t2(sym).or(Some(current));
+        return wait_for_t2(sym).filter(|selected| selected.body.as_ref()
+            .is_some_and(|selected| Arc::ptr_eq(selected, body))).or(Some(current));
     }
     Some(current)
 }
@@ -23606,6 +23626,9 @@ fn symbol_index_of(name: &str) -> Option<u32> {
 mod multiple_value_prog1_tests;
 
 #[cfg(test)]
+mod definition_dispatch_tests;
+
+#[cfg(test)]
 mod direct_call_invalidation_tests {
     use super::*;
 
@@ -25536,17 +25559,17 @@ mod active_bytecode_root_tests {
         egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
         let a = egcl_rt::function::name(*first).as_symbol_index();
         let b = egcl_rt::function::name(*second).as_symbol_index();
-        let old = native_for_dispatch(a, None, t1_threshold()).unwrap();
-        let shared = native_for_dispatch(b, None, 1).unwrap();
+        let old = native_for_dispatch(a, None, t1_threshold(), &body).unwrap();
+        let shared = native_for_dispatch(b, None, 1, &body).unwrap();
         assert!(Rc::ptr_eq(&old, &shared));
         profile_pin(b);
-        assert!(native_for_dispatch(b, None, 1).is_none());
-        assert!(Rc::ptr_eq(&old, &native_for_dispatch(a, None, 1).unwrap()));
+        assert!(native_for_dispatch(b, None, 1, &body).is_none());
+        assert!(Rc::ptr_eq(&old, &native_for_dispatch(a, None, 1, &body).unwrap()));
         profile_pin(a);
         profile_unpin(b);
-        let replacement = native_for_dispatch(b, None, t1_threshold()).unwrap();
+        let replacement = native_for_dispatch(b, None, t1_threshold(), &body).unwrap();
         assert!(!Rc::ptr_eq(&old, &replacement));
-        assert!(native_for_dispatch(a, None, u32::MAX).is_none());
+        assert!(native_for_dispatch(a, None, u32::MAX, &body).is_none());
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)));
         note_native_deopt(b, Some(&old));
         assert!(PROMOTED_FRESH.with(|set| set.borrow().contains(&b)),
@@ -25554,7 +25577,7 @@ mod active_bytecode_root_tests {
         assert_eq!(DEOPT_COUNTS.with(|counts| counts.borrow().get(&b).copied()), Some(0));
         assert!(NATIVE_REGISTRY.with(|codes| Rc::ptr_eq(&replacement, &codes.borrow()[&b])));
         profile_unpin(a);
-        assert!(Rc::ptr_eq(&replacement, &native_for_dispatch(a, None, 1).unwrap()));
+        assert!(Rc::ptr_eq(&replacement, &native_for_dispatch(a, None, 1, &body).unwrap()));
     }
 
     #[test]

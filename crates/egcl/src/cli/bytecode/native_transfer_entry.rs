@@ -1076,9 +1076,9 @@ fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> b
         return false;
     };
     egcl_rt::function::is_interpreted_function(function)
-        && registered_function_matches(symbol, function)
         && replacement_function_value(symbol, function).is_none()
-        && registry_get(symbol).is_some_and(|current| std::ptr::eq(Arc::as_ptr(&current), body))
+        && bytecode_for_callable(symbol, function).is_some_and(|(owner, current)|
+            owner == symbol && std::ptr::eq(Arc::as_ptr(&current), body))
 }
 
 /// Prepare a distinct precise activation, then return before generated code

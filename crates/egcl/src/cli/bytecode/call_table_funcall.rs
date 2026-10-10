@@ -113,10 +113,10 @@ impl Cache {
         let Some(symbol) = egcl_rt::function::name(function).symbol_index() else {
             return false;
         };
-        if is_profile_pinned(symbol) || !registered_function_matches(symbol, function) {
+        if is_profile_pinned(symbol) {
             return false;
         }
-        let Some(body) = registry_get(symbol) else {
+        let Some((symbol, body)) = bytecode_for_callable(symbol, function) else {
             return false;
         };
         let owner = CLOSURE_COMPILATION
