@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Restore efficient direct recursive calls in eligible optimized native code
+  on Linux x86-64, avoiding the generic call setup that made recursive T2
+  functions slower than T1 ([#227](https://github.com/atgreen/evergreen/pull/227)).
+
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
   multiple values and inherited handlers. Mapped T1/T2 now supports local
