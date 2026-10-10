@@ -722,6 +722,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#function-redefinition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Function redefinition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#a-hot-function-is-different-from-a-hot-loop" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1852,6 +1863,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#function-redefinition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Function redefinition
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#a-hot-function-is-different-from-a-hot-loop" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1936,6 +1958,17 @@ collects information about calls and loop back edges.</p>
 tier. Native support is target-specific; see the
 <a href="../../reference/platforms/">platform table</a>. A function's semantics should not
 depend on whether it is interpreted or compiled.</p>
+<h2 id="function-redefinition">Function redefinition<a class="headerlink" href="#function-redefinition" title="Permanent link">&para;</a></h2>
+<p>User-defined functions remain redefinable, including after their callers have
+been compiled. Standard functions in the <code>COMMON-LISP</code> package are fixed:
+redefining or unbinding them is unsupported and has undefined behavior. The
+compiler may assume their original semantics and omit function-binding checks.
+The <code>CL</code> package nickname denotes the same symbols.</p>
+<p>This withdraws EGCL's earlier extension that honored rebinding standard builtin
+function cells. To define a function with the same name, use <code>SHADOW</code> in your own
+package and define the resulting distinct symbol. Such user-defined functions
+remain redefinable; importing the original <code>COMMON-LISP</code> symbol does not create
+a distinct binding.</p>
 <h2 id="a-hot-function-is-different-from-a-hot-loop">A hot function is different from a hot loop<a class="headerlink" href="#a-hot-function-is-different-from-a-hot-loop" title="Permanent link">&para;</a></h2>
 <p>A function called repeatedly may have its entry point replaced by native code.
 A long-running loop may instead enter compiled code during the current call.
