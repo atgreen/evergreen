@@ -554,3 +554,272 @@ mod execution {
         }
     }
 }
+
+#[test]
+fn native_catch_arithmetic_speculates_without_losing_residual_throw_route() {
+    use egcl_compiler::control_scope::{Ownership, ScopeKind};
+    use egcl_compiler::t2::speculate::{SpecType, speculate};
+
+    let plus = egcl_rt::symbols::intern("+");
+    let throwing = egcl_rt::symbols::intern("NATIVE-CATCH-SPECULATION-RESIDUAL-CALLEE");
+    let mut body = cleanup_body();
+    body.name = "native-catch-arithmetic".into();
+    body.n_locals = 3;
+    body.arity = 3;
+    body.min_args = 3;
+    body.max_args = Some(3);
+    body.max_stack = 2;
+    body.code = vec![
+        Instr::LoadLocal(0),
+        Instr::PushCatch {
+            resume_bcp: 7,
+            sp_restore: 0,
+        },
+        Instr::LoadLocal(1),
+        Instr::LoadLocal(2),
+        Instr::CallNamed {
+            sym: plus,
+            nargs: 2,
+        },
+        Instr::CallNamed {
+            sym: throwing,
+            nargs: 1,
+        },
+        Instr::PopHandler,
+        Instr::Return,
+    ];
+    let mut function = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&function).unwrap();
+    let find_call = |symbol| {
+        function
+            .block_order()
+            .iter()
+            .find_map(|&block| {
+                function.block(block).insts.iter().copied().find_map(|inst| {
+                matches!(function.inst(inst).aux, AuxData::CallTarget(target) if target == symbol)
+                    .then_some((block, inst))
+            })
+            })
+            .unwrap()
+    };
+    let (arithmetic_block, arithmetic) = find_call(plus);
+    let (_, residual) = find_call(throwing);
+    assert_eq!(function.inst(arithmetic).opcode, Opcode::Invoke);
+    assert_eq!(function.inst(residual).opcode, Opcode::Invoke);
+    let normal = function.inst(arithmetic).targets[0].clone();
+    let arithmetic_result = function.inst(arithmetic).results.clone();
+    let residual_cold = function.inst(residual).targets[1].block;
+
+    assert_eq!(
+        speculate(&mut function, &|bcp| (bcp == 4).then_some(SpecType::Fixnum)),
+        1,
+        "the native-cleanup Invoke must participate in genuine numeric specialization"
+    );
+    verify::verify(&function).expect("specializing an Invoke must preserve a valid whole CFG");
+    let numeric = function.inst(arithmetic);
+    assert_eq!(numeric.opcode, Opcode::FixnumAdd);
+    assert_eq!(numeric.results, arithmetic_result);
+    assert!(
+        numeric.targets.is_empty(),
+        "the typed operation is not a CFG terminator"
+    );
+    assert!(numeric.flags.guard && numeric.flags.effectful);
+    assert!(!numeric.flags.call && !numeric.flags.terminator);
+    let state = function.frame_states.get(numeric.frame_state.unwrap());
+    assert_eq!(state.scopes.len(), 1);
+    assert_eq!(state.scopes[0].bcp, 4);
+    assert_eq!(
+        state.scopes[0].stack.len(),
+        2,
+        "guard recovery retains both original operands"
+    );
+
+    let instructions = &function.block(arithmetic_block).insts;
+    let numeric_position = instructions
+        .iter()
+        .position(|&inst| inst == arithmetic)
+        .unwrap();
+    assert!(
+        instructions[..numeric_position].iter().any(|&inst| {
+            let data = function.inst(inst);
+            data.opcode == Opcode::Guard
+                && matches!(data.aux, AuxData::BuiltinBinding { .. })
+                && data
+                    .frame_state
+                    .is_some_and(|state| function.frame_states.get(state).scopes[0].bcp == 4)
+        }),
+        "binding changes must deopt at the original protected call"
+    );
+    assert_eq!(
+        function.inst(instructions[numeric_position + 1]).opcode,
+        Opcode::ClearMv
+    );
+    let jump = function.inst(function.terminator(arithmetic_block).unwrap());
+    assert_eq!(jump.opcode, Opcode::Jump);
+    assert_eq!(jump.targets.len(), 1);
+    assert_eq!(jump.targets[0].block, normal.block);
+    assert_eq!(
+        jump.targets[0].args, normal.args,
+        "preserve the normal result projection"
+    );
+
+    let invoke = function.inst(residual);
+    assert_eq!(invoke.opcode, Opcode::Invoke);
+    assert_eq!(invoke.targets[1].block, residual_cold);
+    let cold = function.inst(function.terminator(residual_cold).unwrap());
+    assert_eq!(cold.opcode, Opcode::NlxTransfer);
+    let AuxData::TransferSite { origin_bcp, scopes } = &cold.aux else {
+        panic!("residual throwing call must retain its capture metadata")
+    };
+    assert_eq!(*origin_bcp, 5);
+    assert!(matches!(scopes.as_slice(), [scope]
+        if scope.push_bcp == 1 && scope.ownership == Ownership::Local
+        && matches!(scope.kind, ScopeKind::Catch { resume_bcp: 7 })));
+    assert!(
+        cold.targets.iter().any(|edge| {
+            function.block(edge.block).insts.iter().any(|&inst| {
+                let data = function.inst(inst);
+                data.opcode == Opcode::CatchLanding
+                    && matches!(
+                        data.aux,
+                        AuxData::CatchDestination {
+                            push_bcp: 1,
+                            resume_bcp: 7
+                        }
+                    )
+            })
+        }),
+        "the remaining call must still reach its native catch landing"
+    );
+}
+
+#[test]
+fn native_invoke_speculation_preserves_cold_only_osr_header_and_imports() {
+    use egcl_compiler::t2::frame_state::ValueSource;
+    use egcl_compiler::t2::ir::{Block, Function, Inst, ValueDef};
+    use egcl_compiler::t2::speculate::{SpecType, speculate};
+    use std::collections::HashSet;
+
+    fn reachable(function: &Function, normal_only: Option<Inst>) -> HashSet<Block> {
+        let mut seen = HashSet::new();
+        let mut work = vec![function.entry()];
+        while let Some(block) = work.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            let term = function.terminator(block).unwrap();
+            let targets = &function.inst(term).targets;
+            let count = if normal_only == Some(term) {
+                1
+            } else {
+                targets.len()
+            };
+            work.extend(targets[..count].iter().map(|edge| edge.block));
+        }
+        seen
+    }
+
+    let plus = egcl_rt::symbols::intern("+");
+    let mut body = cleanup_body();
+    body.name = "cold-only-osr-header".into();
+    body.n_locals = 4;
+    body.arity = 3;
+    body.min_args = 3;
+    body.max_args = Some(3);
+    body.max_stack = 2;
+    // The normal path exits the activation. Only a selected catch transfer
+    // reaches the loop. Its caught value defines local 3 in the cold preheader.
+    body.code = vec![
+        Instr::LoadLocal(0),
+        Instr::PushCatch {
+            resume_bcp: 6,
+            sp_restore: 0,
+        },
+        Instr::LoadLocal(1),
+        Instr::LoadLocal(2),
+        Instr::CallNamed {
+            sym: plus,
+            nargs: 2,
+        },
+        Instr::Return,
+        Instr::StoreLocal(3),
+        Instr::LoadLocal(3),
+        Instr::BrIfFalse(10),
+        Instr::Br(7),
+        Instr::LoadLocal(3),
+        Instr::Return,
+    ];
+    let mut function = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&function).unwrap();
+    let candidate = function
+        .block_order()
+        .iter()
+        .find_map(|&block| {
+            function.block(block).insts.iter().copied().find(|&inst| {
+            matches!(function.inst(inst).aux, AuxData::CallTarget(symbol) if symbol == plus)
+        })
+        })
+        .unwrap();
+    assert_eq!(function.inst(candidate).opcode, Opcode::Invoke);
+    assert_eq!(function.osr_entries.len(), 1);
+    let entry = function.osr_entries[0].clone();
+    assert_eq!(entry.bcp, 7);
+    assert!(reachable(&function, None).contains(&entry.block));
+    assert!(
+        !reachable(&function, Some(candidate)).contains(&entry.block),
+        "fixture must make this Invoke the only ordinary-entry route to the OSR header"
+    );
+    let state = function.frame_states.get(entry.frame_state);
+    let ValueSource::Value {
+        value: imported, ..
+    } = state.scopes[0].locals[3]
+    else {
+        panic!("the caught value must be a real OSR import, not a constant or dead slot")
+    };
+    let preheader = match function.value(imported).def {
+        ValueDef::Param { block, .. } => block,
+        ValueDef::Result { inst, .. } => function
+            .block_order()
+            .iter()
+            .copied()
+            .find(|&block| function.block(block).insts.contains(&inst))
+            .unwrap(),
+    };
+    assert_ne!(preheader, function.entry());
+    assert_ne!(preheader, entry.block);
+    assert!(function.dominators().dominates(preheader, entry.block));
+    let preheader_insts = function.block(preheader).insts.clone();
+    let candidate_targets = function.inst(candidate).targets.clone();
+
+    assert_eq!(
+        speculate(&mut function, &|bcp| (bcp == 4).then_some(SpecType::Fixnum)),
+        0,
+        "keep the Invoke when specialization would strand an OSR header and its imports"
+    );
+    verify::verify(&function).unwrap();
+    assert_eq!(function.inst(candidate).opcode, Opcode::Invoke);
+    assert_eq!(
+        function.inst(candidate).targets.len(),
+        candidate_targets.len()
+    );
+    for (actual, expected) in function
+        .inst(candidate)
+        .targets
+        .iter()
+        .zip(candidate_targets)
+    {
+        assert_eq!(actual.block, expected.block);
+        assert_eq!(actual.args, expected.args);
+    }
+    assert_eq!(function.osr_entries.len(), 1);
+    assert_eq!(function.osr_entries[0].block, entry.block);
+    assert_eq!(function.osr_entries[0].frame_state, entry.frame_state);
+    assert!(
+        matches!(function.frame_states.get(entry.frame_state).scopes[0].locals[3],
+        ValueSource::Value { value, .. } if value == imported)
+    );
+    assert_eq!(function.block(preheader).insts, preheader_insts);
+    assert!(reachable(&function, None).contains(&preheader));
+    assert!(reachable(&function, None).contains(&entry.block));
+    assert!(function.dominators().dominates(preheader, entry.block));
+}
