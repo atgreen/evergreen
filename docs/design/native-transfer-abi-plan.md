@@ -1570,3 +1570,40 @@ saved results across replacement, and eventual release of the retained body.
 This addresses `bliss-dm7tb`. Coherent concurrent selection of a named body and its
 owner remains separately tracked by `bliss-s751o`; retaining retired definitions
 does not by itself make that dispatch snapshot atomic.
+
+### Native root aliases and mapped-adapter crossings
+
+The SysV value maps now retain writable native stack and preserved-register
+homes alongside activation shadows. Tagged volatile registers still use their
+activation copies; raw poll spills retain their separate ordering. No shadow
+synchronization is removed by this increment.
+
+During debug GC marking, the published walker checks that every described copy
+of a heap-referencing SSA value agrees before relocation starts. Comparing during
+relocation would be invalid because another scanner may already have updated one
+copy. Tests deliberately corrupt a native copy to verify that the check fails,
+then require actual movement and agreement of native and activation copies after
+collection.
+
+Permanent named and callable adapters retain their exact child-call return PCs.
+When a child frame unwinds into one of these adapters, the walker recovers the
+retained parent code owner and replaces all six preserved-register locations with
+the adapter's saved words. Cold landing addresses are not ordinary return PCs.
+Scanner lookups use already-published descriptors without initializing or waiting
+on a registry while mutators are stopped. Protected-child tests exercise this
+crossing; omitting it leaves stale native copies and fails the alias check.
+
+This advances `bliss-shih7.2.7.3.3` and `bliss-shih7.2.7.3.2.1`. Activation
+validation also follows the publishing execution's actual managed-frame links:
+in-range bytes resembling a header are insufficient. Each uninterrupted native
+walk caches its last matched managed frame so outward traversal does not rescan
+the whole chain for every frame or alias (`bliss-shih7.2.7.3.2.3.1`).
+
+In test builds, every unexpected walker bailout fails immediately across the
+native corpus. The deliberately malformed-publication fixture allows only its
+specific reason during one collection and requires exactly that head's two
+failures, from marking and relocation (`bliss-shih7.2.7.3.4`). These checks retain
+every shadow. Removing redundant shadows still requires a common partition for
+synchronization, restoration and maps; tagged volatile registers continue to need
+shadows to preserve their values. The universal native ABI is not enabled by
+default by these changes.

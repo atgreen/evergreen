@@ -6,9 +6,11 @@ use super::*;
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
+    use super::super::super::native_transfer_entry::root_publication::{take_adapter_crossings, take_completeness, describe_bails};
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    take_adapter_crossings();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     for (local, fallback) in [(true, false), (false, false), (true, true)] {
@@ -78,7 +80,13 @@ fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
             let sp = stack.sp();
             egcl_rt::rooted!(args = vec![super::super::super::super::arena_cons(T, NIL), fail]);
             let before = args[0].to_raw();
+            take_completeness();
             egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
+            let (expected, resolved, bails) = take_completeness();
+            assert!(expected > 0, "cleanup GC must reach published roots");
+            assert_eq!(expected, resolved, "resolve every declared root across the child adapter");
+            assert_eq!(bails.iter().sum::<usize>(), 0,
+                "protected-child walk bailed: {}", describe_bails(bails));
             assert_eq!(*result, args[0]);
             assert_ne!(args[0].to_raw(), before);
             assert_eq!(env.mv.len(), 2);
@@ -107,6 +115,8 @@ fn native_v2_protected_child_catch_and_cleanup_preserve_values() {
             EgclVal::from_fixnum(3)
         );
     }
+    assert!(take_adapter_crossings() > 0,
+        "cleanup collection must cross a mapped child into its native caller");
 }
 
 #[test]

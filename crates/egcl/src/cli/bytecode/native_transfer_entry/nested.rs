@@ -168,6 +168,16 @@ fn prepare_call(
     record: *mut MappedCallRecord,
     prepare: impl FnOnce() -> Result<EgclVal, EgclError>,
 ) {
+    // Preparation polls, compiles and allocates on behalf of a caller that is
+    // suspended beneath this adapter frame. The record carries that caller's
+    // exact geometry, so publish it for the whole extent.
+    unsafe { super::root_publication::published_mapped(record, || prepare_call_published(record, prepare)) }
+}
+
+fn prepare_call_published(
+    record: *mut MappedCallRecord,
+    prepare: impl FnOnce() -> Result<EgclVal, EgclError>,
+) {
     unsafe {
         (*record).entry = std::ptr::null();
         (*record).activation = std::ptr::null_mut();
@@ -177,8 +187,7 @@ fn prepare_call(
             value: NIL,
             exit: NativeExit::Returned,
         };
-        // The mapped-call adapter owns no capture image yet; publishing its
-        // original caller is pending (bliss-shih7.2.7.3.2 mapped children).
+        // Already published by prepare_call from the adapter record.
         poll_or_transfer_unpublished(std::ptr::null_mut(), &mut (*record).outcome);
         if (*record).outcome.exit != NativeExit::Returned {
             drop(take_call_arguments(record));
@@ -312,9 +321,47 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut Map
     drop(retired);
 }
 
+/// Code owning the PC the adapter saved for this record's caller.
+///
+/// While a child is live, `CAPTURE` still names the CHILD's activation — the
+/// parent is only restored by `finish_nested`, which runs after the resuming
+/// Lisp. So a record-based publication must take its owner from the record's
+/// own child activation, or it would pair the caller's PC with the callee's
+/// code and the walk would reject its first frame.
+///
+/// # Safety
+/// Only valid once preparation has written `record.owner`. The adapter's
+/// prologue does not initialize that word, so calling this earlier reads
+/// uninitialized stack and may dereference garbage.
+pub(super) unsafe fn record_parent_owner(
+    record: *mut MappedCallRecord,
+) -> Option<*const TransferCode> {
+    let child = unsafe { (*record).owner.cast::<ChildActivation>() };
+    if child.is_null() {
+        return None; // no child selected yet: the caller is CAPTURE's own owner
+    }
+    let parent = unsafe { (*child).parent };
+    if parent.is_null() {
+        return None;
+    }
+    let owner = unsafe { (*parent).owner };
+    (!owner.is_null()).then_some(owner)
+}
+
 /// The child's machine frames are already gone. Resume its captured logical
 /// continuation through Rust before deciding whether the caller must unwind.
 pub(in crate::cli::bytecode) unsafe extern "C" fn resume_nested(record: *mut MappedCallRecord) {
+    // Cold resumption runs Lisp. The child's machine frames are gone, so the
+    // record's saved caller is the right publication for this extent — and the
+    // child is still live here, so the owner comes from the record, not CAPTURE.
+    unsafe {
+        super::root_publication::published_mapped_resuming(record, || {
+            resume_nested_published(record)
+        })
+    }
+}
+
+unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
     let owner = unsafe { (*record).owner.cast::<ChildActivation>() };
     egcl_rt::rooted!(
         result = guard_c2i(|| {

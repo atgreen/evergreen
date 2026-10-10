@@ -11,6 +11,8 @@ use crate::value::EgclVal;
 
 use std::alloc::Layout;
 use std::cell::RefCell;
+#[cfg(debug_assertions)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -1662,7 +1664,7 @@ impl HeapCollector {
             }
             mark_ref(v, &mut nursery_index, &mut mark_worklist);
         });
-        scan_external_roots(|slot| {
+        scan_external_mark_roots(|slot| {
             let v = unsafe { *slot };
             if tracing {
                 VERIFY_TRACE.with(|t| t.borrow_mut().mark.insert(slot as usize, v.0));
@@ -2457,7 +2459,7 @@ impl HeapCollector {
         });
         // External roots (bliss-jtc.8): EgclVals owned outside the GC heap, e.g.
         // hash-table entries in a Rust Vec.
-        scan_external_roots(|slot| {
+        scan_external_mark_roots(|slot| {
             let v = unsafe { *slot };
             mark_ref(v, &mut object_map, &mut scan_worklist);
         });
@@ -3230,6 +3232,34 @@ pub fn root_scan_pass() -> u64 {
 #[doc(hidden)]
 pub fn advance_root_scan_pass() -> u64 {
     SCAN_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+// Diagnostics must compare duplicate root homes before any relocation. This
+// marker is debug-only; production root scans keep their existing cost.
+#[cfg(debug_assertions)]
+thread_local! {
+    static MARKING_EXTERNAL_ROOTS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True only while this collector thread enumerates external roots for marking,
+/// before it rewrites any root. For read-only debug verification by scanners.
+#[cfg(debug_assertions)]
+pub fn marking_external_roots() -> bool {
+    MARKING_EXTERNAL_ROOTS.with(Cell::get)
+}
+
+fn scan_external_mark_roots(visit: impl FnMut(*mut EgclVal)) {
+    #[cfg(debug_assertions)]
+    struct Marking(bool);
+    #[cfg(debug_assertions)]
+    impl Drop for Marking {
+        fn drop(&mut self) {
+            MARKING_EXTERNAL_ROOTS.with(|slot| slot.set(self.0));
+        }
+    }
+    #[cfg(debug_assertions)]
+    let _marking = Marking(MARKING_EXTERNAL_ROOTS.with(|slot| slot.replace(true)));
+    scan_external_roots(visit);
 }
 
 /// Invoke every registered external root scanner with `visit`.

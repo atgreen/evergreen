@@ -23,7 +23,7 @@ use egcl_rt::native_transfer::{self, NativeExit, NativeOutcome};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
-mod root_publication;
+pub(super) mod root_publication;
 mod activation;
 use activation::ActivationState;
 mod deopt;
@@ -369,25 +369,53 @@ pub(super) fn take_segment_run_count() -> u64 {
 
 /// These mappings outlive every target and caller. Child retirement can drop
 /// the last target owner without releasing its own return/continuation PC.
+/// Publish the caller suspended beneath a mapped-call adapter frame. Exposed
+/// for the sibling callable adapter, whose checked callback also runs Lisp.
+///
+/// # Safety
+/// Same contract as `root_publication::published_mapped`.
+pub(in crate::cli::bytecode) unsafe fn published_mapped_record<R>(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+    body: impl FnOnce() -> R,
+) -> R {
+    unsafe { root_publication::published_mapped(record, body) }
+}
+
+/// The checked compatibility call runs Lisp through the runtime call table,
+/// which cannot reach this crate's publication; wrap it here instead.
+unsafe extern "C" fn checked_call_published(
+    target: u64,
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) {
+    unsafe {
+        root_publication::published_mapped(record, || call_table::checked_call(target, record))
+    }
+}
+
+static PUBLISHED_ENTRIES: OnceLock<Option<[root_publication::PublishedAdapter; 2]>> = OnceLock::new();
+
+fn mapped_adapter(pc: usize) -> Option<&'static root_publication::PublishedAdapter> {
+    PUBLISHED_ENTRIES.get()?.as_ref()?.iter().find(|entry| entry.contains_return(pc))
+}
+
 pub(super) fn published_entries() -> Option<[usize; 2]> {
-    static ENTRIES: OnceLock<Option<[JitBuffer; 2]>> = OnceLock::new();
-    ENTRIES
+    PUBLISHED_ENTRIES
         .get_or_init(|| {
             let entry = |slice| {
-                JitBuffer::new(
-                    &egcl_compiler::t2::native_transfer::emit_published_call_entry(
+                root_publication::PublishedAdapter::new(
+                    egcl_compiler::t2::native_transfer::emit_published_call_entry_descriptor(
                         slice,
                         prepare_nested,
                         finish_nested,
                         resume_nested,
-                        call_table::checked_call,
+                        checked_call_published,
                     ),
                 )
             };
             Some([entry(false)?, entry(true)?])
         })
         .as_ref()
-        .map(|entries| std::array::from_fn(|i| entries[i].as_ptr() as usize))
+        .map(|entries| std::array::from_fn(|i| entries[i].code.as_ptr() as usize))
 }
 
 #[cfg(test)]
@@ -1061,7 +1089,11 @@ unsafe extern "C" fn prepare_recursive(
     image: *mut SysvTransferCapture,
 ) {
     unsafe {
-        root_publication::published(image, || prepare_recursive_unpublished(request, out))
+        root_publication::published(image, || {
+            #[cfg(test)]
+            root_publication::observe();
+            prepare_recursive_unpublished(request, out)
+        })
     }
 }
 
@@ -2216,6 +2248,20 @@ fn prepare_escape(context: &mut CaptureContext) {
 // or reenter Lisp. Rust returns before the capture stub dispatches; assembly
 // only discards generated frames, never a Rust signaling or handler frame.
 unsafe extern "C" fn prepare(capture: *mut SysvTransferCapture) {
+    // The helper's publication ended with its Rust frame, but the capture stub
+    // built an equivalent image describing the same suspended caller, and
+    // preparation below signals and allocates. Publish for its whole extent;
+    // the guard unlinks before the stub discards this image.
+    unsafe {
+        root_publication::published(capture, || {
+            #[cfg(test)]
+            root_publication::observe_cold();
+            prepare_unpublished(capture)
+        })
+    }
+}
+
+unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
     prepare_escape(context);

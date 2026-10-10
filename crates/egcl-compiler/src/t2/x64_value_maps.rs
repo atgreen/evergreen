@@ -148,6 +148,39 @@ impl NativeFrameValues {
                 FrameValueLocation::Home(ValueHome::Reg(_)) => NativeValueLocation::Unavailable,
             };
             let mut locations = vec![location];
+            // Record the value's real native home ALONGSIDE its shadow slot.
+            //
+            // The `Home(_) if shadow.is_some()` arm above MASKS the Stack and
+            // Register arms, and a moving value is required to have a shadow, so
+            // until this a map could not describe a non-activation home at all
+            // and the precise walk could reach nothing the managed-stack scan
+            // already reached (bliss-shih7.2.7.3). Appending rather than
+            // reordering keeps the primary location, and the poll-spill arm's
+            // `raw_slot` counter, exactly as they were: that arm rejects a
+            // Tagged value and is unreachable only because the shadow arm
+            // precedes it.
+            //
+            // Only a home that SURVIVES the helper call may be added. A
+            // caller-saved register's contents are destroyed by the call, which
+            // is what the shadow store and restore exist to preserve; the
+            // Register arm is already restricted to the callee-saved set, whose
+            // save words the published capture image makes writable.
+            if moving {
+                let native_home = match entry.location {
+                    FrameValueLocation::Home(ValueHome::Stack(slot)) => {
+                        Some(NativeValueLocation::Stack(stack_offset(slot)?))
+                    }
+                    FrameValueLocation::Home(ValueHome::Reg(reg)) if matches!(reg, 3 | 12..=15) => {
+                        Some(NativeValueLocation::Register(reg))
+                    }
+                    _ => None,
+                };
+                if let Some(home) = native_home
+                    && !locations.contains(&home)
+                {
+                    locations.push(home);
+                }
+            }
             if let Some(base) = outgoing_base {
                 for (index, &arg) in outgoing.iter().enumerate() {
                     if arg == entry.value {
@@ -272,6 +305,36 @@ mod tests {
             native_slots: 8,
             activation_base_slot: Some(7),
             activation_slots: 12,
+        }
+    }
+
+    #[test]
+    fn native_roots_retain_stack_and_preserved_register_aliases() {
+        let values = [
+            home(0, Repr::Tagged, ValueHome::Stack(0)),
+            home(1, Repr::Tagged, ValueHome::Reg(12)),
+            home(2, Repr::Tagged, ValueHome::Reg(1)),
+            home(3, Repr::UnboxedFixnum, ValueHome::Reg(8)),
+        ];
+        for poll in [None, Some(2)] {
+            let map = NativeFrameValues::for_call(
+                &values, &[Value(0), Value(1), Value(2)], 4,
+                &[Value(0)], Some(8), layout(), poll, |_| false,
+            ).unwrap();
+            assert_eq!(map.ssa_value(Value(0)).unwrap().locations(), &[
+                NativeValueLocation::Activation(4), NativeValueLocation::Stack(0),
+                NativeValueLocation::Activation(8),
+            ]);
+            assert_eq!(map.ssa_value(Value(1)).unwrap().locations(), &[
+                NativeValueLocation::Activation(5), NativeValueLocation::Register(12),
+            ]);
+            assert_eq!(map.ssa_value(Value(2)).unwrap().locations(), &[
+                NativeValueLocation::Activation(6),
+            ]);
+            assert_eq!(map.ssa_value(Value(3)).unwrap().locations(), &[
+                if poll.is_some() { NativeValueLocation::Stack(16) }
+                else { NativeValueLocation::Unavailable },
+            ], "tagged poll registers must not consume raw spill positions");
         }
     }
 
