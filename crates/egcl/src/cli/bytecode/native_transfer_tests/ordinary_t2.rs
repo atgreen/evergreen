@@ -364,8 +364,9 @@ fn ordinary_t2_missing_mapped_artifact_preserves_mapped_t1() {
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("worker artifact");
     // Exercise the installer admission boundary independently of which source
-    // shapes the mapped emitter currently supports. Keep the real checked
-    // artifact but remove its optional mapped preparation.
+    // shapes the mapped emitter currently supports. The worker does not emit
+    // an unusable checked fallback; remove its mapped preparation as well.
+    assert!(artifact.checked.is_none(), "Linux workers emit only mapped code");
     assert!(artifact.mapped.take().is_some(), "worker prepares mapped IR");
     assert!(
         install_t2_completion(T2Completion {
@@ -375,7 +376,7 @@ fn ordinary_t2_missing_mapped_artifact_preserves_mapped_t1() {
             input,
         })
         .is_none(),
-        "missing mapped preparation must not publish the checked artifact"
+        "missing mapped preparation must not replace the mapped T1 owner"
     );
     let retained = NATIVE_REGISTRY
         .with(|registry| registry.borrow().get(&symbol).cloned())

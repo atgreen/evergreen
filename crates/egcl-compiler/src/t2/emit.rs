@@ -4251,11 +4251,32 @@ fn emit_framed_inner(
     fused.retain(|&inst| {
         !f.inst(inst).results.iter().any(|value| safepoint_values.contains(value))
     });
-    let layout = select_frame_homes(f, &machine, |value| {
+    let mut layout = select_frame_homes(f, &machine, |value| {
         const_tagged.contains_key(&value)
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
     })
     .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
+    // Inserted polls are not allocator calls. A value needed only for poll
+    // recovery may therefore keep a caller-saved register even though the
+    // transfer capture, and a later landing write-back, cannot access it.
+    // Give those recovery values preserved homes before deriving ANY maps;
+    // normal polls, OSR imports and exceptional captures must agree.
+    if transfer_mode {
+        for entry in f.osr_entries.iter().filter(|entry| loop_points.contains_key(&entry.block)) {
+            let state = f.frame_states.get(entry.frame_state);
+            let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+                .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
+            for source in sources {
+                let ValueSource::Value { value, .. } = source else { continue };
+                let Some(home) = layout.values.get_mut(value) else { continue };
+                if matches!(home, FramedHome::Reg(_)) && !home.survives_sysv_call() {
+                    *home = FramedHome::Stack(layout.stack_slots);
+                    layout.stack_slots = layout.stack_slots.checked_add(1)
+                        .ok_or(EmitError::UnsupportedOp(0xFD))?;
+                }
+            }
+        }
+    }
     let resolved = crate::t2::x64_frame::resolve_safepoint_maps(f, &machine, &layout, &const_tagged)
         .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4269,7 +4290,8 @@ fn emit_framed_inner(
     let local_osr_scopes = transfer_maps.iter().all(|map| map.control_scopes.iter().all(|scope| {
         scope.ownership == crate::control_scope::Ownership::Local
             && matches!(scope.kind, crate::control_scope::ScopeKind::Block { register: false, .. }
-                | crate::control_scope::ScopeKind::Tagbody { .. })
+                | crate::control_scope::ScopeKind::Tagbody { .. }
+                | crate::control_scope::ScopeKind::Catch { .. })
     }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)
