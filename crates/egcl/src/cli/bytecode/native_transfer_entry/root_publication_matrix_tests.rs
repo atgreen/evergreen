@@ -7,25 +7,88 @@ use super::*;
 struct Probe {
     env: *mut Env,
     markers: &'static [i64],
-    osr_after: Option<(u32, u32)>,
+    osr: Option<OsrRoute>,
     observed: bool,
     moved: usize,
 }
 thread_local! { static PROBE: Cell<*mut Probe> = const { Cell::new(std::ptr::null_mut()) }; }
 
+#[derive(Default)]
+struct OsrRoute {
+    symbol: u32,
+    replacement: Option<Rc<NativeCode>>,
+    first_owner: usize,
+    next_owner: usize,
+    parent_owner: usize,
+    parent_frame: usize,
+    child_frame: usize,
+    before: u32,
+    steps_at_handoff: i64,
+}
+
 fn observe() {
     let probe = unsafe { &mut *PROBE.with(Cell::get) };
-    if probe.observed
-        || probe
-            .osr_after
-            .is_some_and(|(symbol, before)| osr_entry_count(symbol) <= before)
-    {
+    if probe.observed {
         return;
     }
-    if probe.osr_after.is_some() {
+    if let Some(route) = &mut probe.osr {
+        let Some((owner, nested)) = child_capture_for_test() else {
+            return;
+        };
+        let frame = egcl_rt::current_stack().fp();
+        if owner == route.parent_owner {
+            assert!(!nested, "the caller owns the outer mapped activation");
+            route.parent_frame = frame as usize;
+            return;
+        }
+        if owner != route.first_owner && owner != route.next_owner {
+            return;
+        }
+        assert_ne!(route.parent_frame, 0, "observe the mapped parent first");
+        assert_eq!(
+            unsafe { (*frame).prev_fp } as usize,
+            route.parent_frame,
+            "OSR must retain the suspended caller"
+        );
+        if owner == route.first_owner {
+            assert!(nested, "T1 child must use the actual mapped call record");
+            if route.child_frame == 0 {
+                route.child_frame = frame as usize;
+            }
+            assert_eq!(frame as usize, route.child_frame);
+            let marker = unsafe { slot_get(frame.cast_mut(), 0) };
+            let steps = crate::cli::cp(marker).1.as_fixnum();
+            if steps == 4 {
+                if let Some(code) = route.replacement.take() {
+                    route.steps_at_handoff = steps;
+                    NATIVE_REGISTRY.with(|registry| {
+                        registry.borrow_mut().insert(route.symbol, Rc::clone(&code))
+                    });
+                    publish_native(
+                        route.symbol,
+                        egcl_rt::symbols::symbol_function(route.symbol),
+                        &code,
+                    );
+                }
+            }
+            return;
+        }
         assert!(
-            NATIVE_OSR_ACTIVE.with(Cell::get),
-            "collect while OSR machine code is still active"
+            route.replacement.is_none(),
+            "publish T2 from inside live T1"
+        );
+        assert_ne!(
+            route.child_frame, 0,
+            "observe the original child activation"
+        );
+        assert_eq!(
+            frame as usize, route.child_frame,
+            "T2 must replace the running child rather than start a new invocation"
+        );
+        assert_eq!(osr_entry_count(route.symbol), route.before + 1);
+        assert!(
+            !egcl_rt::native_transfer::current_segment().is_null(),
+            "collect while the exact worker-built mapped T2 owner is active"
         );
     }
     let published = unsafe { &*ACTIVE.with(Cell::get) };
@@ -99,16 +162,20 @@ fn run_probe(
     code: &TransferCode,
     env: &mut Env,
     markers: &'static [i64],
-    osr: Option<u32>,
+    mut osr: Option<OsrRoute>,
 ) -> EgclVal {
     code.run(&[], env).unwrap();
     env.mv.clear();
     force_minor_gc();
     take_nested_entries();
+    if let Some(route) = &mut osr {
+        route.parent_owner = code as *const TransferCode as usize;
+        route.before = osr_entry_count(route.symbol);
+    }
     let mut probe = Probe {
         env,
         markers,
-        osr_after: osr.map(|symbol| (symbol, osr_entry_count(symbol))),
+        osr,
         observed: false,
         moved: 0,
     };
@@ -127,10 +194,17 @@ fn run_probe(
         markers.len(),
         "every private native root must actually move"
     );
-    if let Some((symbol, before)) = probe.osr_after {
-        assert!(
-            osr_entry_count(symbol) > before,
-            "the measured invocation must really enter OSR"
+    if let Some(route) = probe.osr {
+        assert_eq!(route.steps_at_handoff, 4);
+        assert_eq!(
+            osr_entry_count(route.symbol),
+            route.before + 1,
+            "the measured invocation must enter mapped OSR exactly once"
+        );
+        assert_eq!(
+            take_nested_entries(),
+            1,
+            "enter the baseline child exactly once"
         );
     }
     value
@@ -317,8 +391,11 @@ fn native_private_root_survives_real_callee_osr() {
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "cli::bytecode::native_transfer_entry::root_publication::matrix_tests::native_private_root_survives_real_callee_osr", "--nocapture"])
-            .env(CHILD, "1").env("EGCL_OSR_THRESHOLD", "1")
+            .env(CHILD, "1")
             .env("EGCL_T0_T1_THRESHOLD", "4000000000")
+            .env("EGCL_T1_T2_THRESHOLD", "4000000000")
+            .env("EGCL_T1_T2_INVOKE_THRESHOLD", "4000000000")
+            .env_remove("EGCL_FORCE_TIER")
             .env_remove("EGCL_NATIVE_TRANSFER").output().unwrap();
         assert!(
             output.status.success(),
@@ -337,29 +414,85 @@ fn native_private_root_survives_real_callee_osr() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    install_collector(&mut env);
+    let source = "((setf (car marker) (1+ (car marker)))
+        (let ((sum 0))
+          (dotimes (i 40)
+            (setq sum (+ sum i))
+            (setf (cdr marker) (1+ (cdr marker))))
+          (values marker sum)))";
     crate::cli::read_eval_all_env(
-        "(defun publication-matrix-osr ()
-        (let ((n 0)) (tagbody again (setq n (+ n 1)) (publication-matrix-collect)
-            (if (< n 3) (go again)))))",
+        &format!("(defun publication-matrix-osr (marker) (progn . {source}))"),
         &mut env,
     )
     .unwrap();
     let symbol = crate::cli::resolve_sym("PUBLICATION-MATRIX-OSR")
         .unwrap()
         .as_symbol_index();
-    let code = TransferCode::compile(compile(
+    let body = compile("PUBLICATION-MATRIX-OSR", "(marker)", source, &env);
+    registry_put(symbol, Arc::clone(&body));
+    let first = try_promote_to_t1(symbol).expect("ordinary mapped T1 child");
+    let NativeCodeStorage::Mapped(first_mapped) = &first._storage else {
+        panic!("child must install mapped T1");
+    };
+    assert!(!first.is_t2);
+    let input = snapshot_t2_input(symbol, 0).expect("ordinary worker snapshot");
+    let generation = input.generation;
+    let input = egcl_rt::CrossThreadRoot::new(input);
+    let artifact = input
+        .with_gc_stable_mutator(compile_t2_artifact)
+        .expect("ordinary worker artifact");
+    let next = install_t2_completion(T2Completion {
+        sym: symbol,
+        generation,
+        artifact: Some(artifact),
+        input,
+    })
+    .expect("ordinary mapped T2 child");
+    let NativeCodeStorage::Mapped(next_mapped) = &next._storage else {
+        panic!("child must install mapped T2");
+    };
+    assert!(next.is_t2 && !next.osr_entries.is_empty());
+    assert!(Arc::ptr_eq(next.body.as_ref().unwrap(), &body));
+    let route = OsrRoute {
+        symbol,
+        first_owner: Rc::as_ptr(first_mapped) as usize,
+        next_owner: Rc::as_ptr(next_mapped) as usize,
+        replacement: Some(Rc::clone(&next)),
+        ..OsrRoute::default()
+    };
+    // Build through the real worker pipeline, then defer publication until
+    // the measured T1 child has already committed four loop iterations.
+    NATIVE_REGISTRY.with(|registry| registry.borrow_mut().insert(symbol, Rc::clone(&first)));
+    mark_fresh_promotion(symbol);
+    publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &first);
+    let code = TransferCode::compile_nested_protected(compile(
         "PUBLICATION-MATRIX-OSR-CALLER",
         "()",
-        "((let ((x (cons 314159 nil))) (values nil) (publication-matrix-osr) x))",
+        "((let ((n 0)) (tagbody again (setq n (+ n 1)) (if (< n 2) (go again))))
+          (let ((x (cons 314159 nil)) (marker (cons 0 0)))
+            (values nil)
+            (multiple-value-bind (answer sum) (publication-matrix-osr marker)
+              (values x answer sum))))",
         &env,
     ))
-    .expect("private-root OSR caller must compile");
-    let value = run_probe(&code, &mut env, &[314159], Some(symbol));
+    .expect("private-root mapped caller must compile");
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let value = run_probe(&code, &mut env, &[314159], Some(route));
     assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
-    assert!(
-        !NATIVE_OSR_ACTIVE.with(Cell::get),
-        "retire the OSR machine-call extent"
+    assert!(env.mv_active);
+    assert_eq!(env.mv.len(), 3);
+    assert_eq!(env.mv[0], value);
+    assert_eq!(
+        crate::cli::cp(env.mv[1]),
+        (EgclVal::from_fixnum(1), EgclVal::from_fixnum(40)),
+        "callee prefix and loop effects must not replay across OSR"
+    );
+    assert_eq!(env.mv[2], EgclVal::from_fixnum(780));
+    assert_eq!(
+        (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+        before,
+        "both frame owners must retire exactly once"
     );
     eprintln!("native-root OSR movement verified");
 }
