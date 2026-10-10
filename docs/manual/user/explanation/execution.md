@@ -25,6 +25,20 @@ tier. Native support is target-specific; see the
 [platform table](../reference/platforms.md). A function's semantics should not
 depend on whether it is interpreted or compiled.
 
+## Function redefinition
+
+User-defined functions remain redefinable, including after their callers have
+been compiled. Standard functions in the `COMMON-LISP` package are fixed:
+redefining or unbinding them is unsupported and has undefined behavior. The
+compiler may assume their original semantics and omit function-binding checks.
+The `CL` package nickname denotes the same symbols.
+
+This withdraws EGCL's earlier extension that honored rebinding standard builtin
+function cells. To define a function with the same name, use `SHADOW` in your own
+package and define the resulting distinct symbol. Such user-defined functions
+remain redefinable; importing the original `COMMON-LISP` symbol does not create
+a distinct binding.
+
 ## A hot function is different from a hot loop
 
 A function called repeatedly may have its entry point replaced by native code.

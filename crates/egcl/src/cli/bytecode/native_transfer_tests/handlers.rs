@@ -53,11 +53,12 @@ fn native_v2_rebound_error_keeps_native_normal_cleanup() {
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
         "(setq *native-error-effects* 0 *native-error-cleanups* 0)
+         (defun native-user-error (&rest args) (apply #'error args))
          (defun native-error-replacement (&rest args)
            (declare (ignore args)) (values 110 220))
          (defun native-error-arm (armed)
            (setq *native-error-effects* (1+ *native-error-effects*))
-           (if armed (egcl::set-symbol-function 'error #'native-error-replacement) nil))
+           (if armed (egcl::set-symbol-function 'native-user-error #'native-error-replacement) nil))
          (defun native-error-cleanup ()
            (%force-minor-gc-for-test)
            (setq *native-error-cleanups* (1+ *native-error-cleanups*)))",
@@ -67,7 +68,7 @@ fn native_v2_rebound_error_keeps_native_normal_cleanup() {
     egcl_rt::rooted!(forms = reader::read_from_string(
         "((handler-case
             (unwind-protect
-                (progn (native-error-arm armed) (error \"original\") (values 42 43))
+                (progn (native-error-arm armed) (native-user-error \"original\") (values 42 43))
               (native-error-cleanup))
             (error () (values 7 8))))"
     ).unwrap().0);
@@ -76,7 +77,7 @@ fn native_v2_rebound_error_keeps_native_normal_cleanup() {
     ).unwrap());
     let code = TransferCode::compile(Arc::clone(&body))
         .unwrap_or_else(|| panic!("compile real native protected entry: {:?}", body.code));
-    let error = egcl_rt::symbols::intern("ERROR");
+    let error = egcl_rt::symbols::intern("NATIVE-USER-ERROR");
     egcl_rt::rooted!(original = egcl_rt::symbols::symbol_function(error).unwrap());
     // The counter records exceptional landings. Normal cleanup follows the
     // native CFG directly; both paths must execute the cleanup exactly once.

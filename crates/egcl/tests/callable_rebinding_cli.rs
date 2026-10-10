@@ -3,8 +3,8 @@
 
 use std::process::Command;
 
-// ASSERT/SETF macro expansion itself calls CAR and APPLY. Capture results while
-// the builtin is replaced, then unbind the replacement before expanding checks.
+// Shadowed symbols are ordinary user functions, even when their initial value
+// is a standard function. CL bindings themselves remain fixed.
 fn check_rebinding(name: &str, call: &str, initial: &str) {
     let program = format!(
         r#"
@@ -45,7 +45,37 @@ fn check_rebinding(name: &str, call: &str, initial: &str) {
           (format t "CALLABLE-REBINDING-OK~%")
         "#
     );
-    run_tiers(name, &program);
+    if name == "ordinary-target" {
+        run_tiers(name, &program);
+    } else {
+        run_shadowed_tiers(name, &[name], &program);
+    }
+}
+
+// Keep standard function identities fixed while testing the same effects,
+// captures, multiple values and native redefinition through user symbols.
+fn run_shadowed_tiers(name: &str, symbols: &[&str], program: &str) {
+    let names = symbols.join(" ");
+    let canonical = symbols.iter().map(|name| format!("'cl:{name}")).collect::<Vec<_>>().join(" ");
+    let setup = symbols.iter().map(|name| format!(
+        "(assert (not (eq '{name} 'cl:{name}))) (setf (symbol-function '{name}) #'cl:{name})"
+    )).collect::<Vec<_>>().join("\n");
+    // The older fixtures used FMAKUNBOUND to restore an implicit builtin.
+    // User bindings have no such fallback, so restore their original callable.
+    let mut program = program.to_owned();
+    for symbol in symbols {
+        program = program.replace(&format!("(fmakunbound '{symbol})"),
+            &format!("(setf (symbol-function '{symbol}) #'cl:{symbol})"));
+    }
+    run_tiers(name, &format!(r#"
+      (defpackage :rebinding-user (:use :cl) (:shadow {names}))
+      (in-package :rebinding-user)
+      (defparameter *canonical-functions* (mapcar #'symbol-function (list {canonical})))
+      {setup}
+      {program}
+      (mapc (lambda (symbol original) (assert (eq (symbol-function symbol) original)))
+            (list {canonical}) *canonical-functions*)
+    "#));
 }
 
 fn run_tiers(name: &str, program: &str) {
@@ -83,30 +113,26 @@ fn run_tiers(name: &str, program: &str) {
 }
 
 #[test]
-fn lowered_call_ldb_observes_replacement() {
+fn shadowed_ldb_observes_replacement() {
     check_lowered_call_binding("LDB", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
         "(values 110 :replacement)", "'(110 :replacement)");
 }
 
 #[test]
-fn lowered_call_byte_observes_replacement() {
+fn shadowed_byte_observes_replacement() {
     check_lowered_call_binding("BYTE", "(ldb (byte 4 0) (progn (incf *effects*) 15))",
         "(cons 2 1)", "'(3)");
 }
 
 #[test]
-fn lowered_call_typep_observes_replacement() {
+fn shadowed_typep_observes_replacement() {
     check_lowered_call_binding("TYPEP", "(typep (progn (incf *effects*) :value) 'symbol)",
         "(values 110 :replacement)", "'(110 :replacement)");
 }
 
 fn check_lowered_call_binding(name: &str, call: &str, replacement: &str, expected: &str) {
-    let restore = if name == "TYPEP" {
-        "(fmakunbound 'typep)".to_owned()
-    } else {
-        format!("(setf (symbol-function '{name}) *saved-binding*)")
-    };
-    run_tiers(name, &format!(r#"
+    let restore = format!("(setf (symbol-function '{name}) *saved-binding*)");
+    run_shadowed_tiers(name, &[name], &format!(r#"
       (defparameter *effects* 0)
       (defparameter *replacement-calls* 0)
       (setq *saved-binding* (symbol-function '{name}))
@@ -131,7 +157,7 @@ fn check_lowered_call_binding(name: &str, call: &str, replacement: &str, expecte
 
 #[test]
 fn lowered_call_ldb_preserves_lexical_byte_functions() {
-    run_tiers("LDB lexical BYTE", r#"
+    run_shadowed_tiers("LDB lexical BYTE", &["BYTE"], r#"
       (defun local-byte-caller (x)
         (flet ((byte (size position) (declare (ignore size position)) (cons 2 1)))
           (ldb (byte 4 0) x)))
@@ -197,7 +223,7 @@ fn library_function_rebinding_preserves_effects_values_and_unbinding() {
 }
 
 #[test]
-fn interpreted_replacements_override_builtin_dispatch() {
+fn shadowed_standard_names_preserve_interpreted_replacements() {
     for (name, call) in [
         ("FORMAT", "(format nil \"original\")"),
         ("VALUES", "(values 7 8)"),
@@ -205,7 +231,7 @@ fn interpreted_replacements_override_builtin_dispatch() {
         ("LENGTH", "(length '(a b))"),
         ("FBOUNDP", "(fboundp 'format)"),
     ] {
-        run_tiers(name, &format!(r#"
+        run_shadowed_tiers(name, &[name], &format!(r#"
           (defun warmed-caller () {call})
           (dotimes (i 40) (warmed-caller))
           (assert (= (egcl-ext:function-tier 'warmed-caller) EXPECTED-TIER))
@@ -224,7 +250,7 @@ fn interpreted_replacements_override_builtin_dispatch() {
 
 #[test]
 fn values_replacements_preserve_captures_effects_and_multiple_values() {
-    run_tiers("VALUES replacement state", r#"
+    run_shadowed_tiers("VALUES replacement state", &["VALUES"], r#"
       (defparameter *calls* 0)
       (defun values-caller (x) (values (progn (incf *calls*) x) 8))
       (dotimes (i 40) (values-caller i))
@@ -234,20 +260,20 @@ fn values_replacements_preserve_captures_effects_and_multiple_values() {
           (lambda (&rest args) (values-list (list captured args)))))
       (setq *calls* 0)
       (setq *result* (multiple-value-list (values-caller (list :argument))))
-      (fmakunbound 'values)
+      (setf (symbol-function 'values) #'cl:values)
       (assert (= *calls* 1))
       (assert (equal *result* '((:captured) ((:argument) 8))))
       (setf (symbol-function 'values)
         (lambda (&rest args) (declare (ignore args)) (values-list nil)))
       (setq *result* (multiple-value-list (values-caller 42)))
-      (fmakunbound 'values)
+      (setf (symbol-function 'values) #'cl:values)
       (assert (null *result*))
       (setf (symbol-function 'values)
         (lambda (&rest args) (declare (ignore args)) (throw 'replacement-exit 120)))
       (setq *calls* 0 *cleanup* 0)
       (setq *result* (catch 'replacement-exit
         (unwind-protect (values-caller 42) (incf *cleanup*))))
-      (fmakunbound 'values)
+      (setf (symbol-function 'values) #'cl:values)
       (assert (= *result* 120))
       (assert (= *calls* 1))
       (assert (= *cleanup* 1))
@@ -260,8 +286,8 @@ fn values_replacements_preserve_captures_effects_and_multiple_values() {
 }
 
 #[test]
-fn values_rebinding_during_argument_evaluation_is_observed() {
-    run_tiers("VALUES argument-time replacement", r#"
+fn shadowed_values_keeps_coherent_selection_and_observes_the_next_binding() {
+    run_shadowed_tiers("VALUES argument-time replacement", &["VALUES"], r#"
       (defparameter *armed* nil)
       (defparameter *effects* 0)
       (defun values-argument ()
@@ -276,25 +302,28 @@ fn values_rebinding_during_argument_evaluation_is_observed() {
       (assert (= (egcl-ext:function-tier 'values-caller) EXPECTED-TIER))
       (setq *armed* t *effects* 0)
       (setq *result* (multiple-value-list (values-caller)))
-      (fmakunbound 'values)
-      (assert (equal *result* '(110)))
-      (assert (= *effects* 1))
+      (setq *next-result* (multiple-value-list (values-caller)))
+      (setf (symbol-function 'values) #'cl:values)
+      ;; CL permits selecting the callable before or after its arguments.
+      (assert (or (equal *result* '(7 8)) (equal *result* '(110))))
+      (assert (equal *next-result* '(110)))
+      (assert (= *effects* 2))
       (format t "CALLABLE-REBINDING-OK~%")
     "#);
 }
 
 #[test]
 fn callable_instance_replaces_funcall() {
-    check_rebinding("funcall", "(funcall #'original-callback 10)", "1010");
+    check_rebinding("funcall", "(funcall 'original-callback 10)", "1010");
 }
 
 #[test]
 fn callable_instance_replaces_apply() {
-    check_rebinding("apply", "(apply #'original-callback '(10))", "1010");
+    check_rebinding("apply", "(apply 'original-callback '(10))", "1010");
 }
 
 #[test]
-fn callable_instance_replaces_direct_builtin() {
+fn callable_instance_replaces_shadowed_car() {
     check_rebinding("car", "(car '(10))", "10");
 }
 
@@ -341,9 +370,9 @@ fn callable_instance_aliases_preserve_identity_and_multiple_values() {
 }
 
 #[test]
-fn builtin_rebinding_during_a_native_activation_does_not_replay_effects() {
-    run_tiers(
-        "live replacement",
+fn shadowed_function_rebinding_during_a_native_activation_does_not_replay_effects() {
+    run_shadowed_tiers(
+        "live replacement", &["CAR"],
         r#"
       (defclass live-callable () () (:metaclass egcl-ext:funcallable-standard-class))
       (defparameter *live-replacement* (make-instance 'live-callable))
@@ -360,7 +389,7 @@ fn builtin_rebinding_during_a_native_activation_does_not_replay_effects() {
       (assert (= (egcl-ext:function-tier 'changing-caller) EXPECTED-TIER))
       (setq *armed* t *effects* 0)
       (setq *actual* (changing-caller '(10)))
-      (fmakunbound 'car)
+      (setf (symbol-function 'car) #'cl:car)
       (assert (= *actual* 110))
       (assert (= *effects* 1))
       (format t "CALLABLE-REBINDING-OK~%")
@@ -369,24 +398,23 @@ fn builtin_rebinding_during_a_native_activation_does_not_replay_effects() {
 }
 
 #[test]
-fn callable_instance_replaces_constant_predicate() {
+fn callable_instance_replaces_shadowed_null() {
     check_rebinding("null", "(null nil)", "t");
 }
 
 #[test]
-fn callable_instance_replaces_speculated_arithmetic() {
+fn callable_instance_replaces_shadowed_arithmetic() {
     check_rebinding("+", "(+ 10 20)", "30");
 }
 
 #[test]
-fn legacy_self_symbol_binding_keeps_builtin_dispatch() {
+fn canonical_standard_function_designators_keep_builtin_dispatch() {
     run_tiers(
-        "self symbol",
+        "canonical CL function",
         r#"
-      (setf (symbol-function 'car) 'car)
+      (assert (eq 'car 'cl:car))
       (setq *direct* (car '(10))
             *indirect* (funcall 'car '(20)))
-      (fmakunbound 'car)
       (assert (= *direct* 10))
       (assert (= *indirect* 20))
       (format t "CALLABLE-REBINDING-OK~%")
@@ -396,8 +424,8 @@ fn legacy_self_symbol_binding_keeps_builtin_dispatch() {
 
 #[test]
 fn replaced_error_returns_to_a_warmed_caller() {
-    run_tiers(
-        "returning ERROR",
+    run_shadowed_tiers(
+        "returning ERROR", &["ERROR"],
         r#"
       (defun error-caller (fail)
         (if fail (progn (error "original") 42) 7))
@@ -406,7 +434,7 @@ fn replaced_error_returns_to_a_warmed_caller() {
       (setf (symbol-function 'error)
         (lambda (&rest args) (declare (ignore args)) 110))
       (setq *result* (error-caller t))
-      (fmakunbound 'error)
+      (setf (symbol-function 'error) #'cl:error)
       (assert (eql *result* 42))
       (format t "CALLABLE-REBINDING-OK~%")
     "#,
@@ -415,8 +443,8 @@ fn replaced_error_returns_to_a_warmed_caller() {
 
 #[test]
 fn error_replaced_before_compilation_preserves_normal_values() {
-    run_tiers(
-        "preinstalled ERROR",
+    run_shadowed_tiers(
+        "preinstalled ERROR", &["ERROR"],
         r#"
       (defclass returning-error () ()
         (:metaclass egcl-ext:funcallable-standard-class))
@@ -428,7 +456,7 @@ fn error_replaced_before_compilation_preserves_normal_values() {
       (dotimes (i 40) (error-caller))
       (setq *tier* (egcl-ext:function-tier 'error-caller)
             *result* (multiple-value-list (error-caller)))
-      (fmakunbound 'error)
+      (setf (symbol-function 'error) #'cl:error)
       (assert (= *tier* EXPECTED-TIER))
       (assert (equal *result* '(110 220)))
       (format t "CALLABLE-REBINDING-OK~%")
@@ -438,8 +466,8 @@ fn error_replaced_before_compilation_preserves_normal_values() {
 
 #[test]
 fn error_rebinding_inside_a_native_activation_preserves_effects_and_cleanup() {
-    run_tiers(
-        "live ERROR replacement",
+    run_shadowed_tiers(
+        "live ERROR replacement", &["ERROR"],
         r#"
       (defparameter *armed* nil)
       (defparameter *before* 0)
@@ -463,7 +491,7 @@ fn error_rebinding_inside_a_native_activation_preserves_effects_and_cleanup() {
       (setq *armed* t *before* 0 *after* 0 *cleanup* 0)
       (setq *result* (multiple-value-list
         (unwind-protect (error-caller t) (setq *cleanup* (1+ *cleanup*)))))
-      (fmakunbound 'error)
+      (setf (symbol-function 'error) #'cl:error)
       (assert (equal *result* '(42 43)))
       (assert (= *before* 1))
       (assert (= *after* 1))

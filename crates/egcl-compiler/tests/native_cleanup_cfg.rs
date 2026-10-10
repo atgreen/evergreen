@@ -640,7 +640,7 @@ fn native_catch_arithmetic_speculates_without_losing_residual_throw_route() {
         .position(|&inst| inst == arithmetic)
         .unwrap();
     assert!(
-        instructions[..numeric_position].iter().any(|&inst| {
+        !instructions[..numeric_position].iter().any(|&inst| {
             let data = function.inst(inst);
             data.opcode == Opcode::Guard
                 && matches!(data.aux, AuxData::BuiltinBinding { .. })
@@ -648,7 +648,7 @@ fn native_catch_arithmetic_speculates_without_losing_residual_throw_route() {
                     .frame_state
                     .is_some_and(|state| function.frame_states.get(state).scopes[0].bcp == 4)
         }),
-        "binding changes must deopt at the original protected call"
+        "canonical CL arithmetic has no binding guard; operand guards retain exact recovery"
     );
     assert_eq!(
         function.inst(instructions[numeric_position + 1]).opcode,

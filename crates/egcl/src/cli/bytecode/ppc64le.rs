@@ -564,15 +564,16 @@ fn emit_fixnum_template(
     let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
         || (nargs == 2 && inlinable_fixnum_op(sym).is_some_and(|op| !matches!(op, FixnumOp::Mul)));
     if !supported { return Some(false); }
-    let Some(egcl_compiler::t2::ir::AuxData::BuiltinBinding { address, expected }) =
-        egcl_compiler::t2::builtin_binding::snapshot(sym)
-    else { return Some(false); };
-    let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
-    c.imm64(ACC, address as u64);
-    c.load(ACC, ACC, 0)?;
-    c.imm64(4, expected);
-    c.compare(0, ACC, 4);
-    c.branch(Cc::Ne, 0, deopt);
+    use egcl_compiler::t2::builtin_binding::{self, Binding};
+    let Some(binding) = builtin_binding::snapshot(sym) else { return Some(false); };
+    if let Binding::Guarded { address, expected } = binding {
+        let deopt = *deopts.entry(bcp).or_insert_with(|| c.label());
+        c.imm64(ACC, address as u64);
+        c.load(ACC, ACC, 0)?;
+        c.imm64(4, expected);
+        c.compare(0, ACC, 4);
+        c.branch(Cc::Ne, 0, deopt);
+    }
     if nargs == 1 {
         let Some(op) = inlinable_unary_fixnum_op(sym) else {
             return Some(false);
