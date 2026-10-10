@@ -20,6 +20,7 @@
 %global egcl_s390x 0
 %global egcl_aarch64 0
 %global egcl_ppc64le 0
+%global egcl_riscv64 0
 %global egcl_windows 0
 %global egcl_android 0
 # The cross-target subpackages exist only on x86_64. They ship a foreign runtime
@@ -38,6 +39,9 @@
 %endif
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "ppc64le"
 %global egcl_ppc64le 1
+%endif
+%if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "riscv64"
+%global egcl_riscv64 1
 %endif
 %if "%{egcl_build_group}" == "all" || "%{egcl_build_group}" == "windows"
 %global egcl_windows 1
@@ -172,6 +176,16 @@ A statically linked musl ppc64le EGCL runtime and QEMU launcher. Produces
 standalone executables without a target sysroot or shared-library dependencies.
 %endif
 
+%if %{egcl_riscv64}
+%package target-riscv64-linux-static
+Summary: Static musl EGCL image-dumping tools for RISC-V Linux
+Requires: /usr/bin/qemu-riscv64
+
+%description target-riscv64-linux-static
+A statically linked musl RV64GC EGCL runtime and QEMU launcher. Produces
+standalone executables without a target sysroot or shared-library dependencies.
+%endif
+
 %if %{egcl_windows}
 %package target-windows
 Summary: EGCL image-dumping tools for Windows x86-64
@@ -243,6 +257,7 @@ rm -rf %{egcl_stage}/usr/share/doc/egcl
 %check
 python3 packaging/fedora/test-sbom.py
 python3 packaging/fedora/test-source-rpm.py
+python3 packaging/fedora/test-riscv-rpm.py
 python3 packaging/fedora/test-compare-rpms.py
 python3 packaging/fedora/test-repo.py
 python3 packaging/fedora/test-native-content.py
@@ -323,6 +338,13 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %{_bindir}/egcl-ppc64le-linux-static
 %dir %{_libexecdir}/egcl
 %{_libexecdir}/egcl/ppc64le-linux-static
+%endif
+
+%if %{egcl_riscv64}
+%files target-riscv64-linux-static
+%{_bindir}/egcl-riscv64-linux-static
+%dir %{_libexecdir}/egcl
+%{_libexecdir}/egcl/riscv64-linux-static
 %endif
 
 %if %{egcl_android}

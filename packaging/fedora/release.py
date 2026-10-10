@@ -33,7 +33,7 @@ PACKAGES_BY_ARCH = {
     'x86_64': {'egcl', 'egcl-static', 'egcl-target-s390x-linux', 'egcl-target-aarch64-linux',
                'egcl-target-ppc64le-linux', 'egcl-target-windows', 'egcl-target-android',
                'egcl-target-s390x-linux-static', 'egcl-target-aarch64-linux-static',
-               'egcl-target-ppc64le-linux-static'},
+               'egcl-target-ppc64le-linux-static', 'egcl-target-riscv64-linux-static'},
     'ppc64le': {'egcl', 'egcl-static'},
 }
 # Builders enabled in .github/workflows/release.yml. The regression test reads
@@ -44,6 +44,7 @@ RELEASE_BUILDERS = {
     ('s390x', 's390x', 'x86_64'),
     ('aarch64', 'aarch64', 'x86_64'),
     ('ppc64le', 'ppc64le', 'x86_64'),
+    ('riscv64', 'riscv64', 'x86_64'),
     ('windows', 'windows', 'x86_64'),
     ('android', 'android', 'x86_64'),
 }

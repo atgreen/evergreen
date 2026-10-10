@@ -218,6 +218,7 @@ class ExpectedPackageTests(unittest.TestCase):
     NAMES = {
         'native': ['egcl', 'egcl-static'],
         'windows': ['egcl-target-windows'],
+        'riscv64': ['egcl-target-riscv64-linux-static'],
         's390x': ['egcl-target-s390x-linux', 'egcl-target-s390x-linux-static'],
     }
 

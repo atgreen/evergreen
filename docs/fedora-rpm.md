@@ -24,6 +24,7 @@ The x86-64 packages:
 | `egcl-target-s390x-linux-static` | `egcl-s390x-linux-static` | Linux s390x, static musl | QEMU |
 | `egcl-target-aarch64-linux-static` | `egcl-aarch64-linux-static` | Linux AArch64, static musl | QEMU |
 | `egcl-target-ppc64le-linux-static` | `egcl-ppc64le-linux-static` | Linux ppc64le, static musl | QEMU |
+| `egcl-target-riscv64-linux-static` | `egcl-riscv64-linux-static` | Linux RV64GC, static musl | QEMU |
 | `egcl-target-windows` | `egcl-windows` | Windows x86-64 | Wine |
 | `egcl-target-android` | `egcl-android`, `egcl-android-new`, `egcl-apk-asdf` | ARM64 CLI; ARM64 and x86-64 APKs, API 28+ | QEMU for CLI; device/emulator for APK |
 
@@ -65,7 +66,7 @@ sudo dnf install gcc clang binutils rpm-build rpm cpio python3 curl unzip \
 rustup toolchain install 1.94.1 --profile minimal
 rustup target add --toolchain 1.94.1 x86_64-unknown-linux-gnu x86_64-unknown-linux-musl s390x-unknown-linux-gnu \
     aarch64-unknown-linux-gnu powerpc64le-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-linux-android x86_64-linux-android
-rustup target add --toolchain 1.94.1 aarch64-unknown-linux-musl powerpc64le-unknown-linux-musl
+rustup target add --toolchain 1.94.1 aarch64-unknown-linux-musl powerpc64le-unknown-linux-musl riscv64gc-unknown-linux-musl
 rustup component add --toolchain 1.94.1 rust-src
 bash packaging/fedora/prepare-tools.sh
 python3 packaging/fedora/build.py \
@@ -79,7 +80,10 @@ foreign RPMs in the host RPM database, require root, or invoke containers.
 Use `ANDROID_NDK_HOME` to supply an existing NDK and avoid that download; pass the
 same directory to `build.py --android-ndk`.
 
-Rust supplies prebuilt musl standard libraries for x86-64, AArch64 and POWER.
+Rust supplies prebuilt musl standard libraries for x86-64, AArch64, POWER and
+RISC-V. The RISC-V package uses RV64GC with the LP64D ABI and builds on x86-64;
+it needs no native RISC-V build host or Fedora target glibc sysroot. Only its
+static musl variant is packaged.
 For s390x, the preparation script builds checksum-pinned musl 1.2.5 and LLVM
 libunwind 21.1.8 using Fedora's cross GCC and Clang. The builder then uses
 `-Z build-std=std,panic_unwind` with `RUSTC_BOOTSTRAP=1` scoped to the s390x musl
@@ -147,10 +151,10 @@ packaging checks described above, with systemd memory limits inside its Fedora
 container. Runs finish independently when newer commits are pushed.
 A source job builds one SRPM containing EGCL source, vendored Rust dependencies,
 and the musl and LLVM unwinder sources, then uploads the `fedora44-srpm` artifact.
-Six parallel builder jobs download that exact SRPM and rebuild the native,
-s390x, AArch64, POWER, Windows and Android package groups. Each cross Linux group
-produces both glibc and musl RPMs. Each builder verifies its extracted RPMs and
-records the source RPM's SHA-256 checksum. A final collector requires matching
+Seven parallel builder jobs download that exact SRPM and rebuild the native,
+s390x, AArch64, POWER, RISC-V, Windows and Android package groups. RISC-V produces
+a static musl RPM; the other cross Linux groups produce both glibc and musl RPMs.
+Each builder verifies its extracted RPMs and records the source RPM's SHA-256 checksum. A final collector requires matching
 source/toolchain provenance and the complete published package set
 before publication: a build group that fails blocks the release rather than
 publishing a partial one.

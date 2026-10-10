@@ -13,6 +13,25 @@ import unittest
 HERE = Path(__file__).resolve().parent
 
 class CrossLauncherTests(unittest.TestCase):
+    def test_riscv_static_uses_qemu_without_a_sysroot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = root / 'egcl-riscv64-linux-static'
+            shutil.copy2(HERE / 'egcl-cross', command)
+            command.chmod(0o755)
+            runtime = root / 'runtimes/riscv64-linux-static/egcl'
+            runtime.parent.mkdir(parents=True)
+            runtime.touch()
+            qemu = root / 'qemu-riscv64'
+            qemu.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            qemu.chmod(0o755)
+            env = os.environ | {'PATH': str(root) + os.pathsep + os.environ['PATH'],
+                                'EGCL_CROSS_ROOT': str(root / 'runtimes')}
+            result = subprocess.run([str(command), '--eval', '(+ 19 23)'], env=env,
+                                    text=True, capture_output=True, check=True)
+            self.assertEqual(result.stdout.splitlines(),
+                             [str(runtime), '--eval', '(+ 19 23)'])
+
     def test_power_uses_little_endian_qemu_and_private_sysroot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

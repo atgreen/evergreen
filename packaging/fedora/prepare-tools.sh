@@ -9,8 +9,8 @@ root=${EGCL_RPM_TOOLS:-$PWD/target/fedora-rpm/tools}
 mkdir -p "$root/rpms"
 group=${1:-all}
 case "$group" in
-    all) arches=(s390x aarch64 ppc64le) ;;
-    s390x|aarch64|ppc64le) arches=("$group") ;;
+    all) arches=(s390x aarch64 ppc64le riscv64) ;;
+    s390x|aarch64|ppc64le|riscv64) arches=("$group") ;;
     native|windows|android|package) arches=() ;;
     *) echo "Unknown build group: $group" >&2; exit 2 ;;
 esac
@@ -18,11 +18,18 @@ esac
 for arch in "${arches[@]}"; do
     compiler_arch=$arch
     [[ $arch != ppc64le ]] || compiler_arch=powerpc64le
-    dnf --repo=fedora --repo=updates download --destdir="$root/rpms" \
-        "gcc-$compiler_arch-linux-gnu" "binutils-$compiler_arch-linux-gnu" \
-        "sysroot-$arch-fc44-glibc"
+    packages=("gcc-$compiler_arch-linux-gnu" "binutils-$compiler_arch-linux-gnu")
+    # RISC-V ships the self-contained Rust musl runtime only; it needs no
+    # Fedora target glibc sysroot or foreign libgcc package.
+    [[ $arch == riscv64 ]] || packages+=("sysroot-$arch-fc44-glibc")
+    dnf --repo=fedora --repo=updates download --destdir="$root/rpms" "${packages[@]}"
     for package in "$root"/rpms/gcc-"$compiler_arch"-*.rpm \
-                   "$root"/rpms/binutils-"$compiler_arch"-*.rpm "$root"/rpms/sysroot-"$arch"-*.rpm; do
+                   "$root"/rpms/binutils-"$compiler_arch"-*.rpm; do
+        rpmkeys --checksig "$package"
+        rpm2cpio "$package" | (cd "$root" && cpio -idmu --quiet)
+    done
+    [[ $arch != riscv64 ]] || continue
+    for package in "$root"/rpms/sysroot-"$arch"-*.rpm; do
         rpmkeys --checksig "$package"
         rpm2cpio "$package" | (cd "$root" && cpio -idmu --quiet)
     done

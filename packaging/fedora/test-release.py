@@ -123,6 +123,15 @@ def rpm_identity(source_rpm, version='0.0.1', rpm_release='0.test.123.1.fc44'):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_requires_riscv_payload_and_provenance(self):
+        package = 'egcl-target-riscv64-linux-static'
+        self.assertIn(package, release.PACKAGES)
+        self.assertIn('riscv64-linux-static', release.RUNTIMES)
+        self.assertIn(('riscv64', 'riscv64', 'x86_64'), release.RELEASE_BUILDERS)
+        records = [record for record in complete_records() if record[0] != package]
+        with self.assertRaisesRegex(ValueError, 'Expected all 11 x86_64 RPMs'):
+            release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc44')
+
     def test_release_metadata_matches_workspace_version(self):
         root = release.ROOT
         version = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['package']['version']
@@ -254,7 +263,7 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'empty'):
                     release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 (root / 'rpms/x86_64/egcl-static.x86_64.rpm').unlink()
-                with self.assertRaisesRegex(ValueError, '10 x86_64 RPMs'):
+                with self.assertRaisesRegex(ValueError, '11 x86_64 RPMs'):
                     release.collect(rpms, root / 'incomplete', plan, source_rpm, provenance.parent)
                 self.assertFalse((root / 'incomplete').exists())
 

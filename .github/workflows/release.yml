@@ -51,6 +51,7 @@ jobs:
           python3 packaging/fedora/test-release.py
           python3 packaging/fedora/test-sbom.py
           python3 packaging/fedora/test-source-rpm.py
+          python3 packaging/fedora/test-riscv-rpm.py
           python3 packaging/fedora/test-compare-rpms.py
           python3 packaging/fedora/test-repo.py
           python3 packaging/fedora/test-static-package.py
@@ -130,6 +131,7 @@ jobs:
           - { name: s390x,   group: s390x,   arch: x86_64, platform: '', timeout: 120 }
           - { name: aarch64, group: aarch64, arch: x86_64, platform: '', timeout: 120 }
           - { name: ppc64le, group: ppc64le, arch: x86_64, platform: '', timeout: 120 }
+          - { name: riscv64, group: riscv64, arch: x86_64, platform: '', timeout: 120 }
           - { name: windows, group: windows, arch: x86_64, platform: '', timeout: 120 }
           - { name: android, group: android, arch: x86_64, platform: '', timeout: 120 }
           # POWER-native packages remain supported by the SRPM, but this job is
