@@ -160,6 +160,12 @@ before publication: a build group that fails blocks the release rather than
 publishing a partial one.
 A failed matrix job does not cancel the other builds.
 
+To verify only the RISC-V RPM on a branch, dispatch the release workflow with
+`mode=build` and `build_group=riscv64`. This creates one source RPM and runs only
+its RISC-V cross builder, including QEMU dump/restart and GC checks. The verified
+RPM and provenance are workflow artifacts; partial runs cannot collect or
+publish a release. Tag releases and `mode=test` require `build_group=all`.
+
 ### POWER-native release status
 
 The source RPM supports native ppc64le `egcl` and `egcl-static` builds, but the

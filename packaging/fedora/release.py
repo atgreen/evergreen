@@ -36,9 +36,8 @@ PACKAGES_BY_ARCH = {
                'egcl-target-ppc64le-linux-static', 'egcl-target-riscv64-linux-static'},
     'ppc64le': {'egcl', 'egcl-static'},
 }
-# Builders enabled in .github/workflows/release.yml. The regression test reads
-# the active matrix entries so commenting out a builder cannot leave the
-# collector demanding artifacts that no job produces.
+# The release workflow consumes builder_matrix() from its validated plan.
+# This shared set keeps scheduled builders and expected release assets aligned.
 RELEASE_BUILDERS = {
     ('native', 'native', 'x86_64'),
     ('s390x', 's390x', 'x86_64'),
@@ -68,7 +67,20 @@ RUNTIMES = {'native', 'static'} | {name.removeprefix('egcl-target-')
             for name in ('native', 'static')}
 
 
-def make_plan(version, event, ref, run_id, attempt, mode):
+def builder_matrix(group):
+    """Select hosted cross builders; every entry retains its execution budget."""
+    if group not in ('all', 'riscv64'):
+        raise ValueError('Build group must be all or riscv64')
+    return {'include': [dict(name=name, group=build_group, arch=arch,
+                             platform='', timeout=120)
+                        for name, build_group, arch in sorted(RELEASE_BUILDERS)
+                        if group == 'all' or build_group == group]}
+
+
+def make_plan(version, event, ref, run_id, attempt, mode, build_group='all'):
+    builder_matrix(build_group)
+    if build_group != 'all' and (event != 'workflow_dispatch' or mode != 'build'):
+        raise ValueError('A partial package group requires manual build-only mode')
     if not re.fullmatch(r'\d+\.\d+\.\d+', version):
         raise ValueError('Workspace version must be major.minor.patch')
     if event == 'push':
@@ -333,13 +345,17 @@ def main():
         version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['workspace']['package']['version']
         plan = make_plan(version, os.environ['GITHUB_EVENT_NAME'], os.environ['GITHUB_REF'],
                          os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT'],
-                         os.environ.get('RELEASE_MODE', ''))
+                         os.environ.get('RELEASE_MODE', ''),
+                         os.environ.get('RELEASE_BUILD_GROUP') or 'all')
+        group = os.environ.get('RELEASE_BUILD_GROUP') or 'all'
+        plan['build_group'] = group
         release_notes((ROOT / 'CHANGELOG.md').read_text(encoding='utf-8'), plan)
         args.plan.parent.mkdir(parents=True, exist_ok=True)
         args.plan.write_text(json.dumps(plan, indent=2) + '\n')
         if output := os.environ.get('GITHUB_OUTPUT'):
             with open(output, 'a') as stream:
                 stream.write(f'plan_json={json.dumps(plan)}\n')
+                stream.write(f'builders_json={json.dumps(builder_matrix(group))}\n')
                 for key, value in plan.items():
                     stream.write(f'{key}={str(value).lower() if isinstance(value, bool) else value}\n')
         print(json.dumps(plan, indent=2))

@@ -149,20 +149,28 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(package['version'], version)
 
     def test_published_architectures_match_enabled_workflow_builders(self):
-        """Disabling a builder must also change what the collector requires."""
         workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
-        enabled = {
-            tuple(match.groups())
-            for match in re.finditer(
-                r'^\s+- \{ name: ([^,]+),\s+group: ([^,]+),\s+'
-                r'arch: ([^,]+),',
-                workflow,
-                re.MULTILINE,
-            )
-        }
-        self.assertEqual(enabled, release.RELEASE_BUILDERS)
-        self.assertEqual({arch for _, _, arch in enabled},
-                         set(release.RELEASE_PACKAGES_BY_ARCH))
+        self.assertIn('matrix: ${{ fromJSON(needs.plan.outputs.builders_json) }}', workflow)
+        self.assertIn("if: needs.plan.outputs.build_group == 'all'", workflow)
+        builders = release.builder_matrix('all')['include']
+        self.assertEqual({(b['name'], b['group'], b['arch']) for b in builders},
+                         release.RELEASE_BUILDERS)
+        self.assertEqual({b['arch'] for b in builders}, set(release.RELEASE_PACKAGES_BY_ARCH))
+        for builder in builders:
+            self.assertEqual(builder['timeout'], 120)
+            self.assertEqual(builder['platform'], '')
+
+    def test_partial_build_selects_only_riscv_and_cannot_publish(self):
+        self.assertEqual(release.builder_matrix('riscv64'), {'include': [
+            dict(name='riscv64', group='riscv64', arch='x86_64', platform='', timeout=120)]})
+        plan = release.make_plan('0.0.4', 'workflow_dispatch', 'refs/heads/main',
+                                 '123', '1', 'build', 'riscv64')
+        self.assertFalse(plan['publish'])
+        for event, mode, group in [('push', 'build', 'riscv64'),
+                                   ('workflow_dispatch', 'test', 'riscv64'),
+                                   ('workflow_dispatch', 'build', 'unknown')]:
+            with self.subTest(event=event, mode=mode, group=group), self.assertRaises(ValueError):
+                release.make_plan('0.0.4', event, 'refs/tags/v0.0.4', '123', '1', mode, group)
 
     def test_tag_must_match_workspace_version(self):
         version = release.RPM_RELEASE[0]

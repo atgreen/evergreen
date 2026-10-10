@@ -12,6 +12,13 @@ on:
         default: test
         required: true
 
+      build_group:
+        description: 'Select riscv64 only for a build-only verification run'
+        type: choice
+        options: [all, riscv64]
+        default: all
+        required: true
+
 permissions:
   contents: read
 
@@ -42,6 +49,8 @@ jobs:
       publish: ${{ steps.plan.outputs.publish }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
       plan_json: ${{ steps.plan.outputs.plan_json }}
+      builders_json: ${{ steps.plan.outputs.builders_json }}
+      build_group: ${{ steps.plan.outputs.build_group }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,6 +71,7 @@ jobs:
         id: plan
         env:
           RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_BUILD_GROUP: ${{ inputs.build_group }}
         run: python3 packaging/fedora/release.py plan
 
   source:
@@ -116,42 +126,14 @@ jobs:
           overwrite: true
 
   binaries:
-    needs: source
+    needs: [plan, source]
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
-      matrix:
-        # `name` is the job and artifact label, `group` what build.py builds,
-        # `arch` the RPMS/<arch>/ directory rpmbuild writes into. The two
-        # `native` entries differ only by the architecture they build FOR,
-        # which is why the label cannot just be the group.
-        include:
-          - { name: native,  group: native,  arch: x86_64, platform: '', timeout: 120 }
-          - { name: s390x,   group: s390x,   arch: x86_64, platform: '', timeout: 120 }
-          - { name: aarch64, group: aarch64, arch: x86_64, platform: '', timeout: 120 }
-          - { name: ppc64le, group: ppc64le, arch: x86_64, platform: '', timeout: 120 }
-          - { name: riscv64, group: riscv64, arch: x86_64, platform: '', timeout: 120 }
-          - { name: windows, group: windows, arch: x86_64, platform: '', timeout: 120 }
-          - { name: android, group: android, arch: x86_64, platform: '', timeout: 120 }
-          # POWER-native packages remain supported by the SRPM, but this job is
-          # disabled until the emulated build has a usable native OpenJDK.
-          # - { name: ppc64le-native, group: native, arch: ppc64le,
-          #     platform: linux/ppc64le, timeout: 300 }
-          # Native s390x and aarch64 are NOT here yet, and the reason is
-          # specific: they need contradictory qemu versions. aarch64 cannot
-          # extract the source tarball under qemu 9.2.2 (tar gets EINVAL on
-          # every mkdir), and under 10.2.2 -- which does extract it -- systemd's
-          # user@0.service never starts, on every architecture including this
-          # one. So the version that fixes tar breaks the container, and no
-          # single version works for both yet. The likely lever is the binfmt
-          # registration flags rather than the version: this image registers
-          # OCF, while Fedora's shipped conf uses only F, and C (credentials)
-          # is a plausible requirement of user@0.service. Everything else for
-          # those two arches is already in place -- ExclusiveArch, the pinned
-          # rustup digests, release.py's package sets and verify.py's
-          # HOST_FEATURES -- so re-adding them is two matrix entries and two
-          # --rpm-dir lines once that is settled.
+      # The planner validates partial build-only requests and supplies exactly
+      # those builders. Published releases always retain the complete matrix.
+      matrix: ${{ fromJSON(needs.plan.outputs.builders_json) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -234,6 +216,7 @@ jobs:
 
   collect:
     needs: [plan, source, binaries]
+    if: needs.plan.outputs.build_group == 'all'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
