@@ -1917,6 +1917,12 @@ impl<'a> Builder<'a> {
                                     super::builtin_binding::insert(
                                         &mut self.f, block, position, state, binding,
                                     );
+                                    // Every supported intrinsic returns one value.
+                                    // Keep that effect after its binding/type guards,
+                                    // even if its pure result is folded or discarded.
+                                    self.emit_effect(
+                                        block, Opcode::ClearMv, vec![], AuxData::None, Some(state),
+                                    );
                                     self.remaining_inline_budget -= metadata.cost;
                                     continue;
                                 }
@@ -2708,10 +2714,6 @@ impl<'a> Builder<'a> {
 
         if let Some(bits) = type_bits {
             if intrinsic == IntrinsicId::TypepConstant {
-                // The builtin returns one value even when its pure check is
-                // folded away. Keep that effect behind the binding guard.
-                let fs = self.build_frame_state(block, stack, bcp as u32);
-                self.emit_effect(block, Opcode::ClearMv, vec![], AuxData::None, Some(fs));
                 // Its ConstSymbol is now dead and the ordinary DCE pass removes it.
                 stack
                     .pop()

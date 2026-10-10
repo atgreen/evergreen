@@ -28,6 +28,11 @@ use egcl_rt::value::{NIL, EgclVal};
 #[cfg(all(target_arch = "x86_64", unix))]
 use egcl_rt::value::T;
 
+#[cfg(all(target_arch = "x86_64", unix))]
+extern "C" fn clear_intrinsic_values(_primary: u64, _dst: *mut EgclVal, count: u64) {
+    assert_eq!(count, 0);
+}
+
 fn bytecode_fn(
     name: &str,
     code: Vec<Instr>,
@@ -588,11 +593,14 @@ fn integerp_intrinsic_accepts_fixnums_and_bignums_without_a_call() {
             .any(|&i| typep_f.inst(i).opcode == Opcode::Call)
     }));
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, None).expect("emit INTEGERP intrinsic");
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
+        clear_intrinsic_values as *const () as usize as u64, None)
+        .expect("emit INTEGERP intrinsic");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let func: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
     let run = |value: EgclVal| {
-        let mut frame = [value.0, 0u64];
+        let mut frame = vec![NIL.0; usize::from(bf.num_slots() + framed.shadow_root_slots)];
+        frame[0] = value.0;
         EgclVal(func(frame.as_mut_ptr()))
     };
 
@@ -796,6 +804,15 @@ static CONS_ACCESS_DEOPTED: std::sync::atomic::AtomicBool =
 #[cfg(all(target_arch = "x86_64", unix))]
 extern "C" fn cons_access_deopt() {
     CONS_ACCESS_DEOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(target_arch = "x86_64", unix))]
+extern "C" fn cons_access_deopt_precise(scopes: u64, words: u64, values: *const u64) -> u64 {
+    assert_eq!(scopes, 1);
+    assert!(words >= 4);
+    assert!(!values.is_null());
+    cons_access_deopt();
+    NIL.0
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1126,19 +1143,20 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
         let framed = emit_framed(
             &f,
             cons_access_deopt as *const () as usize as u64,
+            cons_access_deopt_precise as *const () as usize as u64,
             0,
             0,
             0,
             0,
             0,
-            0,
-            0,
+            clear_intrinsic_values as *const () as usize as u64,
             None,
         )
         .expect("emit guarded cons accessor");
         let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
         let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-        let mut frame = [cons.0, 0];
+        let mut frame = vec![NIL.0; usize::from(bf.num_slots() + framed.shadow_root_slots)];
+        frame[0] = cons.0;
         CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
         assert_eq!(EgclVal(run(frame.as_mut_ptr())), expected);
         assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
@@ -1198,19 +1216,20 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     let framed = emit_framed(
         &f,
         cons_access_deopt as *const () as usize as u64,
+        cons_access_deopt_precise as *const () as usize as u64,
         0,
         0,
         0,
         0,
         0,
-        0,
-        0,
+        clear_intrinsic_values as *const () as usize as u64,
         None,
     )
     .expect("emit optimized CAR/CDR pair");
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-    let mut frame = [cons.0, 0];
+    let mut frame = vec![NIL.0; usize::from(both.num_slots() + framed.shadow_root_slots)];
+    frame[0] = cons.0;
     CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.cdr);
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
@@ -1373,7 +1392,8 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
         "the dominating proof eliminates the guard cloned by the second call"
     );
 
-    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, Some(caller))
+    let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
+        clear_intrinsic_values as *const () as usize as u64, Some(caller))
         .expect("emit caller after general guard elimination");
     let cell = Box::new(ConsCell {
         car: EgclVal::from_fixnum(17),
@@ -1382,7 +1402,8 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     let cons = unsafe { EgclVal::from_cons_ptr(&*cell as *const ConsCell as *mut u8) };
     let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-    let mut frame = [cons.0, 0, 0];
+    let mut frame = vec![NIL.0; usize::from(caller_body.num_slots() + framed.shadow_root_slots)];
+    frame[0] = cons.0;
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.car);
 }
 
