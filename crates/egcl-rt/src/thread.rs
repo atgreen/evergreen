@@ -1136,7 +1136,13 @@ pub(crate) mod registration_tests {
                     proceed.recv().unwrap();
                 }));
             });
-            current_thread_id()
+            // Exercise current_thread's cold lookup while admission is blocked.
+            let thread = current_thread();
+            assert_eq!(thread.state(), NativeThreadState::Running);
+            assert!(thread.gc_participates());
+            let id = thread.id();
+            assert_eq!(id, current_thread_id(), "owning and borrowed lookups agree");
+            id
         });
         let observation = observed.recv_timeout(std::time::Duration::from_secs(10));
         // Enumeration prunes inactive auto registrations. A published entrant
@@ -2481,7 +2487,20 @@ pub fn current_thread_id() -> NativeThreadId {
     ensure_current_native_thread().id()
 }
 
+// Resolve TLS afresh on each call: a fiber may have changed carriers since its
+// previous lookup. Do not let an inlined lookup be reused across a yield.
+#[inline(never)]
 pub fn current_thread() -> &'static NativeThread {
+    let registered = CURRENT_NATIVE_THREAD.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|current| Arc::as_ptr(&current.thread))
+    });
+    if let Some(thread) = registered {
+        // The TLS owner retains this allocation for the native thread's life.
+        // No borrow or temporary Arc needs to survive the lookup.
+        return unsafe { &*thread };
+    }
     let thread = ensure_current_native_thread();
     unsafe { &*Arc::as_ptr(&thread) }
 }
