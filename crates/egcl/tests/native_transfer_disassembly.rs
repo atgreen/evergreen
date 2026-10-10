@@ -6,13 +6,13 @@
 use std::process::Command;
 
 #[test]
-fn disassemble_labels_checked_code() {
+fn disassemble_labels_installed_mapped_code_with_cache_disabled() {
     check_listing(false);
 }
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn disassemble_distinguishes_segment_code_from_checked_code() {
+fn disassemble_labels_installed_mapped_code_with_cache_enabled() {
     assert!(
         egcl_rt::native_transfer::is_supported(),
         "segment execution gate"
@@ -38,19 +38,18 @@ fn check_listing(enabled: bool) {
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("Legacy checked ABI"), "{stdout}");
-    assert_eq!(stdout.contains("Native segment ABI"), enabled, "{stdout}");
-    if enabled {
-        let segment = stdout.split("Legacy checked ABI").next().unwrap();
-        assert!(
-            segment.contains("+0000:"),
-            "segment machine code must be shown: {stdout}"
-        );
-        assert!(
-            segment.contains("native precise deopt veneer"),
-            "guard continuation targets must be identifiable: {stdout}"
-        );
-        assert!(!segment.contains("native call veneer"),
-            "the arithmetic must compile rather than call the generic helper: {stdout}");
-    }
+    assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
+    assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
+    assert!(
+        stdout.contains("+0000:"),
+        "installed machine code must be shown: {stdout}"
+    );
+    assert!(
+        stdout.contains("native precise deopt veneer"),
+        "guard continuation targets must be identifiable: {stdout}"
+    );
+    assert!(
+        !stdout.contains("native call veneer"),
+        "the arithmetic must compile rather than call the generic helper: {stdout}"
+    );
 }

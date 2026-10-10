@@ -29,7 +29,7 @@ fn run(args: &[&str], marker: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(marker));
     if marker == "CALLABLE-RESTORE-OK" {
-        assert!(stdout.contains("Native segment ABI"), "{stdout}");
+        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
     }
 }
 

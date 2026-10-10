@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Ordinary optimizing-worker IR entering the existing mapped transfer emitter.
-//! Unsupported shapes retain their checked artifact during this migration.
+//! Unsupported shapes retain mapped T1, or remain interpreted when T1 declined.
 
 use super::*;
 use egcl_compiler::t2::ir::{Function, Value, ValueRepresentation};
@@ -18,7 +18,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
 ) -> Option<PreparedT2> {
     let decline = |reason| {
         t2_log_write(format_args!(
-            "{}: mapped T2 declined ({reason}); retain checked artifact",
+            "{}: mapped T2 declined ({reason}); keep mapped T1 or interpreter",
             display_fn_name(&input.body.name)
         ));
         None
@@ -61,7 +61,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     let prepared = artifact.mapped.take()?;
     if !native_transfer::is_supported() {
         t2_log_write(format_args!(
-            "{}: mapped T2 boundary unavailable; retain checked artifact",
+            "{}: mapped T2 boundary unavailable; keep mapped T1 or interpreter",
             display_fn_name(&body.name)
         ));
         return None;
@@ -90,7 +90,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         false,
     ) else {
         t2_log_write(format_args!(
-            "{}: mapped T2 emission declined; retain checked artifact",
+            "{}: mapped T2 emission declined; keep mapped T1 or interpreter",
             display_fn_name(&body.name)
         ));
         return None;

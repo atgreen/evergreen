@@ -335,3 +335,54 @@ fn ordinary_t2_guard_retirement_preserves_effects_and_actual_tier() {
         "pre-guard effects must not replay"
     );
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_decline_preserves_mapped_t1_instead_of_publishing_checked_code() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+    egcl_rt::rooted!(
+        forms =
+            reader::read_from_string("((let ((sum 0)) (dotimes (i n sum) (setq sum (+ sum i)))))")
+                .unwrap()
+                .0
+    );
+    let symbol = egcl_rt::symbols::intern("POLICY-T2-LOOP");
+    let body =
+        Arc::new(compile_function("POLICY-T2-LOOP", *params, *forms, &env, false, false).unwrap());
+    registry_put(symbol, body);
+    let baseline = try_promote_to_t1(symbol).expect("mapped T1 loop");
+    assert!(matches!(baseline._storage, NativeCodeStorage::Mapped(_)));
+    let input = snapshot_t2_input(symbol, 0).expect("ordinary T2 snapshot");
+    let generation = input.generation;
+    let input = egcl_rt::CrossThreadRoot::new(input);
+    let artifact = input
+        .with_gc_stable_mutator(compile_t2_artifact)
+        .expect("worker artifact");
+    assert!(artifact.mapped.is_none(), "loop OSR is not yet mapped");
+    assert!(
+        install_t2_completion(T2Completion {
+            sym: symbol,
+            generation,
+            artifact: Some(artifact),
+            input,
+        })
+        .is_none(),
+        "unsupported T2 must not publish the checked artifact"
+    );
+    let retained = NATIVE_REGISTRY
+        .with(|registry| registry.borrow().get(&symbol).cloned())
+        .unwrap();
+    assert!(
+        Rc::ptr_eq(&baseline, &retained),
+        "keep the exact running mapped T1 owner"
+    );
+    assert_eq!(
+        run_native(&retained, symbol, &[EgclVal::from_fixnum(10)], &mut env).unwrap(),
+        EgclVal::from_fixnum(45)
+    );
+}

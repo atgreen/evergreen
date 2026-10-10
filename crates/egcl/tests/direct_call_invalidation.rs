@@ -30,9 +30,19 @@ fn unchanged_builtin_revalidates_after_unrelated_definition() {
         "(assert (>= (egcl-ext:function-tier 'preserved-length) 1))",
         "(defun unrelated-epoch-change () 42)",
         "(dotimes (i 20) (assert (= 3 (preserved-length '(1 2 3)))))",
+        "(assert (>= (egcl-ext:function-tier 'preserved-length) 1))",
+        "(disassemble 'preserved-length)",
         "(format t \"REVALIDATED~%\")",
     ]);
     assert!(stdout.contains("REVALIDATED"), "{stdout}");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        // Published mapped calls replace the legacy c2i builtin helper whose
+        // counters are checked below. Observe the actual installed caller;
+        // the repeated results above and replacement test cover revalidation.
+        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
+        assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
+        return;
+    }
     let stats = stderr
         .lines()
         .find(|line| line.starts_with("[direct-builtin] native:"))

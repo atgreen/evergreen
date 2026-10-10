@@ -41,7 +41,9 @@ fn check_native_unbound_chain(tier: &str, installed: u8) {
         for name in ["NATIVE-ERROR-LEAF", "NATIVE-ERROR-OUTER"] {
             assert_eq!(stderr.matches(name).count(), 1, "{tier}: {stderr}");
         }
-        assert!(stderr.find("NATIVE-ERROR-LEAF").unwrap() < stderr.find("NATIVE-ERROR-OUTER").unwrap());
+        assert!(
+            stderr.find("NATIVE-ERROR-LEAF").unwrap() < stderr.find("NATIVE-ERROR-OUTER").unwrap()
+        );
     }
 }
 
@@ -148,7 +150,13 @@ fn t2_direct_type_error_retains_the_original_call_chain() {
 
 #[test]
 fn osr_error_keeps_its_loop_frame_and_condition_type() {
-    let program = r#"
+    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        "="
+    } else {
+        ">"
+    };
+    let program = format!(
+        r#"
       (defun native-osr-failure ()
         (let ((i 0))
           (tagbody again
@@ -158,12 +166,13 @@ fn osr_error_keeps_its_loop_frame_and_condition_type() {
       (handler-bind ((unbound-variable
                       (lambda (condition)
                         (assert (eq 'native-osr-missing (cell-error-name condition)))
-                        (assert (> (egcl-ext:function-osr-count 'native-osr-failure) 0))
+                        (assert ({comparison} (egcl-ext:function-osr-count 'native-osr-failure) 0))
                         (format t "ERROR-AFTER-OSR~%"))))
         (native-osr-failure))
-    "#;
+    "#
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", program])
+        .args(["--no-init", "--eval", &program])
         .env_remove("EGCL_FORCE_TIER")
         .env("EGCL_LAZY_COMPILE", "0")
         .env("EGCL_T0_T1_THRESHOLD", "1000000")

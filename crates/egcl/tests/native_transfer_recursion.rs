@@ -7,7 +7,7 @@ use std::process::Command;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn fibonacci_segment_uses_native_self_calls() {
+fn fibonacci_mapped_t1_uses_native_self_calls() {
     assert!(egcl_rt::native_transfer::is_supported());
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
         .args([
@@ -19,12 +19,13 @@ fn fibonacci_segment_uses_native_self_calls() {
                   (+ (segment-fib (- n 1)) (segment-fib (- n 2)))))
             (dotimes (i 30) (assert (= 55 (segment-fib 10))))
             (assert (= 6765 (segment-fib 20)))
+            (assert (= 1 (egcl-ext:function-tier 'segment-fib)))
             (disassemble 'segment-fib)
         "#,
         ])
         .env("EGCL_NATIVE_TRANSFER", "1")
         .env("EGCL_T0_T1_THRESHOLD", "1")
-        .env("EGCL_T2_THRESHOLD", "3")
+        .env("EGCL_DISABLE_T2", "1")
         .output()
         .expect("run native Fibonacci");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -34,12 +35,10 @@ fn fibonacci_segment_uses_native_self_calls() {
         String::from_utf8_lossy(&output.stderr)
     );
     let segment = stdout
-        .split("Native segment ABI")
+        .split("Mapped native transfer ABI")
         .nth(1)
-        .expect("Fibonacci must have a native segment entry")
-        .split("Legacy checked ABI")
-        .next()
-        .unwrap();
+        .expect("Fibonacci must have an installed mapped native entry");
+    // Keep T1 installed: T2 may use published indirect calls for the same body.
     // Relative CALL instructions decode with an immediate address. Compatibility
     // veneers are called through registers; they cannot satisfy this assertion.
     let direct_calls = segment

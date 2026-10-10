@@ -910,17 +910,19 @@ fn extended_loop_and_setf_place_bfasl_round_trip() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// R4.24 / R4.38: portable quasiquote allocation must not prevent either T1
-/// invocation promotion or OSR of a one-shot loop loaded from a FASL.
+/// R4.24 / R4.38: source-free quasiquote preserves values under each platform
+/// tier policy. Linux temporarily interprets this shape without OSR; an eligible
+/// companion from the same artifact must still promote and execute at T1.
 #[test]
-fn portable_quasiquote_runs_natively_after_fasl_load() {
+fn portable_quasiquote_preserves_tier_policy_after_fasl_load() {
     let dir = workdir("native-quasiquote");
     let src = dir.join("quasiquote.lisp");
     let out = dir.join("quasiquote.bfasl");
     fs::write(
         &src,
         "(defun qq-loop (n) (let ((result nil)) \
-          (dotimes (i n result) (setq result `(,i . ,result)))))",
+          (dotimes (i n result) (setq result `(,i . ,result)))))\n\
+         (defun qq-native-step (n) (+ n 1))",
     )
     .unwrap();
     let compiled = Command::new(BIN)
@@ -938,15 +940,21 @@ fn portable_quasiquote_runs_natively_after_fasl_load() {
         String::from_utf8_lossy(&compiled.stderr)
     );
     fs::remove_file(src).unwrap();
-    for (threshold, expected_tier, expected_osr) in [("1", 1, false), ("100000", 0, true)] {
+    let linux_native_policy = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+    for (threshold, expected_tier, expected_osr, expected_step_tier) in [
+        ("1", if linux_native_policy { 0 } else { 1 }, false, 1),
+        ("100000", 0, !linux_native_policy, 0),
+    ] {
         let loaded = Command::new(BIN)
             .args(["--no-bootstrap", "--no-init", "--eval"])
             .arg(format!(
-                "(progn (load \"{}\") (let ((v (qq-loop 100))) \
+                "(progn (load \"{}\") (let ((v (qq-loop 100)) (step (qq-native-step 100))) \
                  (format t \"NATIVE-QQ ~S~%\" \
                   (list (length v) (car v) (nth 99 v) \
                    (egcl-ext:function-tier 'qq-loop) \
-                   (> (egcl-ext:function-osr-count 'qq-loop) 0)))))",
+                   (> (egcl-ext:function-osr-count 'qq-loop) 0) \
+                   step (egcl-ext:function-tier 'qq-native-step))) \
+                 (assert (= 102 (qq-native-step 101)))))",
                 out.display()
             ))
             .env("EGCL_T0_T1_THRESHOLD", threshold)
@@ -962,7 +970,7 @@ fn portable_quasiquote_runs_natively_after_fasl_load() {
             String::from_utf8_lossy(&loaded.stderr)
         );
         let expected = format!(
-            "NATIVE-QQ (100 99 0 {expected_tier} {})",
+            "NATIVE-QQ (100 99 0 {expected_tier} {} 101 {expected_step_tier})",
             if expected_osr { "T" } else { "NIL" }
         );
         assert!(

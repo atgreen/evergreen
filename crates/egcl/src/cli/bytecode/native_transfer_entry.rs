@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Opt-in runtime entry for the tagged Invoke emitter. Normal installation is
-//! still gated on complete helper/poll/scope coverage. Own code and definitions,
+//! Default Linux runtime entry for the tagged Invoke emitter. Unsupported
+//! bodies stay interpreted while their exact maps are completed. Own code and definitions,
 //! capture into rooted snapshots, enter native cleanup for selected throws, and
 //! retain bytecode *unwinding* as the fallback.
 #![allow(dead_code)]
@@ -54,14 +54,23 @@ static SEGMENT_CACHE: egcl_rt::execution_local::ExecutionLocal<
 /// anything. An installed legacy NativeCode does not describe this mapping.
 #[cfg(not(egcl_no_disassembly))]
 pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
+    let key = Arc::as_ptr(body) as usize;
+    let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key)?.code.clone())?;
+    Some(format_listing(&code, "; Native segment ABI — cached entry.\n"))
+}
+
+/// Decode the actual installed owner, including its precise transfer veneers.
+#[cfg(not(egcl_no_disassembly))]
+pub(super) fn installed_listing(code: &TransferCode) -> String {
+    format_listing(code, "; Mapped native transfer ABI — installed native code.\n")
+}
+
+#[cfg(not(egcl_no_disassembly))]
+fn format_listing(code: &TransferCode, header: &str) -> String {
     use iced_x86::Formatter;
     use std::fmt::Write;
 
-    let key = Arc::as_ptr(body) as usize;
-    let code = SEGMENT_CACHE.with(|cache| cache.borrow().get(&key)?.code.clone())?;
-    let mut out = String::from(
-        "; Native segment ABI — cached entry; compatibility calls can still use the checked ABI.\n",
-    );
+    let mut out = String::from(header);
     let _ = writeln!(out, "; {} bytes of x86-64:", code.code_len);
     let base = code.code.as_ptr() as u64;
     // SAFETY: the cloned owner retains this immutable executable mapping.
@@ -89,7 +98,7 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
         }
         out.push('\n');
     }
-    Some(out)
+    out
 }
 
 #[cfg(test)]
@@ -210,10 +219,10 @@ pub(super) struct TransferCode {
     unavailable_handler: Option<(u32, u32)>,
 }
 
-fn opted_in() -> bool {
+fn cache_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() == Some("1".as_ref()))
+    *ON.get_or_init(|| std::env::var_os("EGCL_NATIVE_TRANSFER").as_deref() != Some("0".as_ref()))
 }
 /// Install a baseline representation with its actual transfer ABI. Legacy
 /// direct-call sites reject its version and enter through run_native instead.
@@ -317,10 +326,10 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     Some(replacement)
 }
 
-/// Try the new segment ABI for an ordinary native invocation. This remains an
-/// explicit rollout switch until the platform gates are complete; callers fall
-/// back to the legacy checked ABI when the machine transition or body shape is
-/// unavailable. The cache owns each compiled body through `TransferCode::body`.
+/// Try the mapped cache for an ordinary native invocation. The cache is enabled
+/// by default; EGCL_NATIVE_TRANSFER=0 disables only this diagnostic cache path,
+/// never restores checked installation. Published mapped entries remain active.
+/// The cache owns each compiled body through `TransferCode::body`.
 pub(super) fn try_run(
     body: Arc<BytecodeFunction>,
     args: &[EgclVal],
@@ -330,13 +339,13 @@ pub(super) fn try_run(
     // read here cost a getenv plus an OsString allocation per call -- 2.7% of a
     // SHA-256 profile, for a process-wide switch that cannot change. The same
     // OnceLock idiom as nn_direct_enabled and profiling_disabled.
-    if !opted_in() {
+    if !cache_enabled() {
         return None;
     }
     try_run_enabled(body, args, env)
 }
 
-/// Entry after the process-wide rollout gate. Unit tests use this seam rather
+/// Entry after the process-wide cache gate. Unit tests use this seam rather
 /// than mutating an environment switch whose value is cached for the process.
 pub(super) fn try_run_enabled(
     body: Arc<BytecodeFunction>,
