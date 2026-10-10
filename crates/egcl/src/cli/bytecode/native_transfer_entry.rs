@@ -1283,6 +1283,10 @@ fn recursive_definition_matches(symbol: u32, body: *const BytecodeFunction) -> b
     let Some(function) = egcl_rt::symbols::symbol_function(symbol) else {
         return false;
     };
+    callable_definition_matches(symbol, function, body)
+}
+
+fn callable_definition_matches(symbol: u32, function: EgclVal, body: *const BytecodeFunction) -> bool {
     egcl_rt::function::is_interpreted_function(function)
         && replacement_function_value(symbol, function).is_none()
         && bytecode_for_callable(symbol, function).is_some_and(|(owner, current)|
@@ -2511,6 +2515,11 @@ unsafe fn poll_or_transfer_unpublished(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_HEAT_VALIDATION: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
 /// Attribute sampled loop visits only to the exact installed definition.
 /// Publication may replace future entry points while this activation retains
 /// its code; it cannot turn the running mapped frame into a legacy OSR frame.
@@ -2522,17 +2531,26 @@ fn record_loop_heat() {
     if capture.is_null() {
         return;
     }
-    let (symbol, body) = unsafe {
+    let (symbol, body, function) = unsafe {
         let code = &*(*capture).owner;
-        (code.installed_symbol, Arc::as_ptr(&code.body))
+        (code.installed_symbol, Arc::as_ptr(&code.body), (*(*capture).frame).function)
     };
     let Some(symbol) = symbol else {
         return;
     };
-    if !recursive_definition_matches(symbol, body) {
+    // The published poll may have moved this callable. Retain its current
+    // frame value, then validate one binding snapshot; a concurrent setter
+    // cannot redirect this increment to a replacement or a nonfunction.
+    egcl_rt::rooted!(function = function);
+    if egcl_rt::symbols::symbol_function(symbol) != Some(*function)
+        || !callable_definition_matches(symbol, *function, body)
+    {
         return;
     }
-    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    #[cfg(test)]
+    AFTER_HEAT_VALIDATION.with(|hook| {
+        if let Some(observe) = hook.get() { observe(); }
+    });
     let count = egcl_rt::function::record_back_edges(*function, 1);
     let threshold = t2_backedge_threshold().max(1);
     if !t2_enabled() || count < threshold || count % threshold != 0 {
