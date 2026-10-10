@@ -48,6 +48,9 @@
 
 ### Native compilation and performance
 
+- Add opt-in published native callable entries for Rust-to-Lisp calls on
+  AArch64 Unix with `EGCL_NATIVE_TRANSFER=1`
+  ([#206](https://github.com/atgreen/evergreen/pull/206)).
 - Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
   Eligible ordinary T1 and T2 functions now use mapped native calls without
   checking exceptional status after successful returns, preserving moving
