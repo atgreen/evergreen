@@ -229,14 +229,16 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
     assert!(Arc::ptr_eq(next.body.as_ref().unwrap(), &next_body));
     assert_eq!(Arc::ptr_eq(&body, &next_body), !replace_definition);
     if replace_definition {
-        assert!(next.osr_entries.keys().any(|header| {
-            body.code.iter().enumerate().any(|(index, instruction)| {
-                matches!(instruction, Instr::Br(target) | Instr::BrIfFalse(target)
+        assert!(
+            next.osr_entries.keys().any(|header| {
+                body.code.iter().enumerate().any(|(index, instruction)| {
+                    matches!(instruction, Instr::Br(target) | Instr::BrIfFalse(target)
                     | Instr::BrIfTrue(target) | Instr::Go { target_bcp: target, .. }
                     if target == header && index > *header as usize)
-            })
-        }), "replacement has an OSR header at an original loop backedge");
-
+                })
+            }),
+            "replacement has an OSR header at an original loop backedge"
+        );
     }
 
     let next_owner = Rc::as_ptr(next_mapped) as usize;
@@ -443,4 +445,299 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
             "the inherited live handler must run before exactly-once cleanups; no call continuation"
         );
     }
+}
+
+#[derive(Default)]
+struct ChildOsrObservation {
+    symbol: u32,
+    replacement: Option<Rc<NativeCode>>,
+    parent_owner: usize,
+    first_owner: usize,
+    next_owner: usize,
+    parent_frame: usize,
+    child_frame: usize,
+    parent_segment: usize,
+    nested_entry_seen: bool,
+    entered: bool,
+    collected: bool,
+    steps_at_handoff: i64,
+}
+
+thread_local! {
+    static CHILD_OSR_OBSERVATION: RefCell<ChildOsrObservation> =
+        RefCell::new(ChildOsrObservation::default());
+}
+
+fn observe_child_osr() {
+    let Some((owner, nested)) = native_transfer_entry::child_capture_for_test() else {
+        return;
+    };
+    let frame = egcl_rt::current_stack().fp();
+    let segment = egcl_rt::native_transfer::current_segment() as usize;
+    let (publication, collect) = CHILD_OSR_OBSERVATION.with(|state| {
+        let mut state = state.borrow_mut();
+        if owner == state.parent_owner {
+            assert!(
+                !nested,
+                "the measured parent is the outer mapped activation"
+            );
+            state.parent_frame = frame as usize;
+            state.parent_segment = segment;
+            return (None, false);
+        }
+        if owner != state.first_owner && owner != state.next_owner {
+            return (None, false);
+        }
+        assert_ne!(
+            state.parent_frame, 0,
+            "the parent's native loop poll must execute first"
+        );
+        assert_eq!(
+            unsafe { (*frame).prev_fp } as usize,
+            state.parent_frame,
+            "child OSR must retain its suspended managed caller"
+        );
+        if owner == state.first_owner {
+            assert!(
+                nested,
+                "the baseline child must enter through the mapped call record"
+            );
+            assert_eq!(
+                segment, state.parent_segment,
+                "baseline parent and child must actually share the native segment"
+            );
+            state.nested_entry_seen = true;
+            if state.child_frame == 0 {
+                state.child_frame = frame as usize;
+            }
+            assert_eq!(frame as usize, state.child_frame);
+            let marker = unsafe { slot_get(frame.cast_mut(), 0) };
+            let steps = super::super::super::cp(marker).1.as_fixnum();
+            if steps == 4 && state.replacement.is_some() {
+                state.steps_at_handoff = steps;
+                let symbol = state.symbol;
+                return (state.replacement.take().map(|code| (symbol, code)), false);
+            }
+        } else {
+            assert_eq!(
+                frame as usize, state.child_frame,
+                "T2 must replace the running child, not bind another managed frame"
+            );
+            assert_ne!(segment, 0);
+            state.entered = true;
+            if !state.collected {
+                state.collected = true;
+                return (None, true);
+            }
+        }
+        (None, false)
+    });
+    if let Some((symbol, code)) = publication {
+        NATIVE_REGISTRY.with(|registry| registry.borrow_mut().insert(symbol, Rc::clone(&code)));
+        publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &code);
+    }
+    if collect {
+        // This observer is already inside the published native poll. Read
+        // scanned frame homes on both sides so movement is proved at THIS
+        // collection, while the parent's machine continuation is suspended.
+        let parent = unsafe { (*frame).prev_fp };
+        let child_before = unsafe { slot_get(frame.cast_mut(), 0) }.to_raw();
+        let parent_before = unsafe { slot_get(parent, 0) }.to_raw();
+        egcl_rt::collect_t0_minor().unwrap();
+        assert_ne!(
+            unsafe { slot_get(frame.cast_mut(), 0) }.to_raw(),
+            child_before
+        );
+        assert_ne!(unsafe { slot_get(parent, 0) }.to_raw(), parent_before);
+    }
+}
+
+struct ChildOsrObserveScope;
+impl Drop for ChildOsrObserveScope {
+    fn drop(&mut self) {
+        native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(None));
+        CHILD_OSR_OBSERVATION.with(|state| *state.borrow_mut() = ChildOsrObservation::default());
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_mapped_child_osr_retains_parent_and_current_child_activation() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let child_source = "((setf (car marker) (1+ (car marker)))
+        (let ((sum 0))
+          (dotimes (i n)
+            (setq sum (+ sum i))
+            (setf (cdr marker) (1+ (cdr marker))))
+          (values marker sum)))";
+    let parent_source = "((dotimes (j 1) (setf (car held) (1+ (car held))))
+        (multiple-value-bind (answer sum) (child-osr-loop marker n)
+          (setf (car held) (+ (car held) 10))
+          (values answer sum held)))";
+    super::super::super::read_eval_all_env(
+        &format!(
+            "(defun child-osr-loop (marker n) (progn . {child_source}))
+                  (defun child-osr-parent (held marker n) (progn . {parent_source}))"
+        ),
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(marker n)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(child_source).unwrap().0);
+    let symbol = egcl_rt::symbols::intern("CHILD-OSR-LOOP");
+    let body =
+        Arc::new(compile_function("CHILD-OSR-LOOP", *params, *forms, &env, false, false).unwrap());
+    registry_put(symbol, Arc::clone(&body));
+    let first = try_promote_to_t1(symbol).expect("mapped baseline child");
+    let NativeCodeStorage::Mapped(first_mapped) = &first._storage else {
+        panic!("child must install mapped T1");
+    };
+    assert!(!first.is_t2);
+    let input = snapshot_t2_input(symbol, 0).expect("ordinary child worker snapshot");
+    let generation = input.generation;
+    let input = egcl_rt::CrossThreadRoot::new(input);
+    let artifact = input
+        .with_gc_stable_mutator(compile_t2_artifact)
+        .expect("ordinary child worker artifact");
+    let next = install_t2_completion(T2Completion {
+        sym: symbol,
+        generation,
+        artifact: Some(artifact),
+        input,
+    })
+    .expect("mapped optimized child");
+    let NativeCodeStorage::Mapped(next_mapped) = &next._storage else {
+        panic!("child must install mapped T2 with OSR entries");
+    };
+    assert!(next.is_t2 && !next.osr_entries.is_empty());
+    assert!(Arc::ptr_eq(next.body.as_ref().unwrap(), &body));
+    let first_owner = Rc::as_ptr(first_mapped) as usize;
+    let next_owner = Rc::as_ptr(next_mapped) as usize;
+    NATIVE_REGISTRY.with(|registry| registry.borrow_mut().insert(symbol, Rc::clone(&first)));
+    mark_fresh_promotion(symbol);
+    publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &first);
+
+    egcl_rt::rooted!(parent_params = reader::read_from_string("(held marker n)").unwrap().0);
+    egcl_rt::rooted!(parent_forms = reader::read_from_string(parent_source).unwrap().0);
+    let parent_symbol = egcl_rt::symbols::intern("CHILD-OSR-PARENT");
+    let parent_body = Arc::new(
+        compile_function(
+            "CHILD-OSR-PARENT",
+            *parent_params,
+            *parent_forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    registry_put(parent_symbol, parent_body);
+    let parent = try_promote_to_t1(parent_symbol).expect("mapped baseline parent");
+    let NativeCodeStorage::Mapped(parent_mapped) = &parent._storage else {
+        panic!("parent must install mapped T1");
+    };
+    assert!(!parent.is_t2);
+    assert_eq!(first.transfer_abi_version, MAPPED_TRANSFER_ABI_VERSION);
+    assert_eq!(parent.transfer_abi_version, MAPPED_TRANSFER_ABI_VERSION);
+    assert_eq!(next.transfer_abi_version, MAPPED_TRANSFER_ABI_VERSION);
+    // Resolve the real child call cell without running a child loop or
+    // publishing its prepared T2 replacement during these unmeasured calls.
+    egcl_rt::rooted!(warm_held = super::super::super::arena_cons(EgclVal::from_fixnum(0), NIL));
+    egcl_rt::rooted!(
+        warm_marker =
+            super::super::super::arena_cons(EgclVal::from_fixnum(0), EgclVal::from_fixnum(0))
+    );
+    for _ in 0..2 {
+        run_native(
+            &parent,
+            parent_symbol,
+            &[*warm_held, *warm_marker, EgclVal::from_fixnum(0)],
+            &mut env,
+        )
+        .unwrap();
+    }
+    egcl_rt::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(held = super::super::super::arena_cons(EgclVal::from_fixnum(0), NIL));
+    egcl_rt::rooted!(
+        marker = super::super::super::arena_cons(EgclVal::from_fixnum(0), EgclVal::from_fixnum(0))
+    );
+    let held_before = held.to_raw();
+    let marker_before = marker.to_raw();
+    let stack = egcl_rt::current_stack();
+    let before = (
+        stack.fp(),
+        stack.sp(),
+        NATIVE_DEPTH.with(|depth| depth.get()),
+    );
+    let before_osr = osr_entry_count(symbol);
+    native_transfer_entry::take_nested_entries();
+    CHILD_OSR_OBSERVATION.with(|state| {
+        *state.borrow_mut() = ChildOsrObservation {
+            symbol,
+            replacement: Some(next),
+            parent_owner: Rc::as_ptr(parent_mapped) as usize,
+            first_owner,
+            next_owner,
+            ..ChildOsrObservation::default()
+        }
+    });
+    let _observation = ChildOsrObserveScope;
+    native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(Some(observe_child_osr)));
+    egcl_rt::rooted!(
+        result = run_native(
+            &parent,
+            parent_symbol,
+            &[*held, *marker, EgclVal::from_fixnum(40)],
+            &mut env
+        )
+        .unwrap()
+    );
+    assert!(CHILD_OSR_OBSERVATION.with(|state| state.borrow().nested_entry_seen));
+    assert!(
+        CHILD_OSR_OBSERVATION.with(|state| state.borrow().entered),
+        "the still-running mapped child must enter T2 before returning to its mapped parent"
+    );
+    assert!(CHILD_OSR_OBSERVATION.with(|state| state.borrow().collected));
+    assert_eq!(
+        CHILD_OSR_OBSERVATION.with(|state| state.borrow().steps_at_handoff),
+        4
+    );
+    assert_eq!(osr_entry_count(symbol), before_osr + 1);
+    assert!(native_transfer_entry::take_nested_entries() > 0);
+    assert_eq!(*result, *marker);
+    assert!(env.mv_active);
+    assert_eq!(env.mv, vec![*marker, EgclVal::from_fixnum(780), *held]);
+    assert_eq!(
+        super::super::super::cp(*marker),
+        (EgclVal::from_fixnum(1), EgclVal::from_fixnum(40)),
+        "child effects must not replay"
+    );
+    assert_eq!(
+        super::super::super::cp(*held),
+        (EgclVal::from_fixnum(11), NIL),
+        "the native parent must execute its pre-call and post-call effects once"
+    );
+    assert_ne!(
+        marker.to_raw(),
+        marker_before,
+        "the child root must actually relocate"
+    );
+    assert_ne!(
+        held.to_raw(),
+        held_before,
+        "the suspended parent's distinct root must relocate"
+    );
+    assert_eq!(
+        (
+            stack.fp(),
+            stack.sp(),
+            NATIVE_DEPTH.with(|depth| depth.get())
+        ),
+        before,
+        "both frame owners must retire exactly once"
+    );
 }
