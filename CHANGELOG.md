@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Correct T2 diagnostics to report the profile choices actually used and the
+  code actually installed; distinguish code emission from publication and
+  clarify baseline arithmetic optimization
+  ([#236](https://github.com/atgreen/evergreen/pull/236)).
+
 - Improve native execution performance on Linux x86-64: restore efficient
   direct recursive calls in eligible T2 code, and reduce thread-lookup and
   idle-safepoint overhead, including redundant polls in empty jump blocks.
