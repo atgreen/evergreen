@@ -194,7 +194,11 @@ fn remove_dominating_duplicates(f: &mut Function, dom: &crate::t2::ir::Dominator
         // path. Keep the leader so a refining guard's result can replace the
         // dominated result, preserving the explicit proof dependency.
         if let Some(g1) = guards.iter().enumerate().find_map(|(j, g1)| {
-            (j != i && equivalent(g1, g2) && guard_precedes(g1, g2, dom)).then_some(g1)
+            (j != i
+                && equivalent(g1, g2)
+                && guard_precedes(g1, g2, dom)
+                && !osr_bypasses_block(f, g1.block, g2.block))
+            .then_some(g1)
         }) {
             to_remove.push((g2.inst, g1.inst));
         }
@@ -248,6 +252,26 @@ fn guard_precedes(g1: &GuardInfo, g2: &GuardInfo, dom: &crate::t2::ir::Dominator
     }
 }
 
+/// Ordinary-entry dominance does not cover entry into a running loop. A
+/// refined guard result is not an interpreter local and cannot be assumed to
+/// exist when OSR bypasses its defining instruction. Keep the consumer's own
+/// proof unless every OSR path reaching it executes the leader's block first.
+/// Same-block instruction order is checked separately by `guard_precedes`.
+fn osr_bypasses_block(f: &Function, leader: Block, consumer: Block) -> bool {
+    let mut pending: Vec<_> = f.osr_entries.iter().map(|entry| entry.block).collect();
+    let mut seen = HashSet::new();
+    while let Some(block) = pending.pop() {
+        if block == leader || !seen.insert(block) {
+            continue;
+        }
+        if block == consumer {
+            return true;
+        }
+        pending.extend(f.succs(block));
+    }
+    false
+}
+
 // ── Transform 3: loop-invariant guard hoisting ──────────────────────
 
 /// Move loop-invariant guards to their loop's preheader.
@@ -296,6 +320,11 @@ fn hoist_loop_invariant(f: &mut Function, dom: &crate::t2::ir::DominatorTree) ->
                 // (c) FrameState stays valid: every value it names must dominate
                 //     the preheader (spec R4.63 — no source orphaned by the move).
                 if !frame_state_dominates(f, &inst_block, inst, ph, dom) {
+                    continue;
+                }
+                // (d) OSR must not skip the relocated proof. The explicit
+                // loop-phi split above has entry checks; this generic move does not.
+                if osr_bypasses_block(f, ph, b) {
                     continue;
                 }
                 moves.push((inst, b, ph));
@@ -1199,5 +1228,145 @@ mod tests {
             "guard must leave the loop body"
         );
         assert_eq!(count_guards(&f), 1, "hoisting preserves the guard");
+    }
+    /// Model CAR before a loop and repeated CDR/CAR inside it. The interpreter
+    /// header has MARKER, but no slot for a pre-loop guard's refined alias.
+    fn cons_loop(preloop_guard: bool, osr: bool) -> (Function, Block, Block, Inst, Inst, Inst) {
+        let mut f = Function::new("cons-osr-proof");
+        let entry = f.entry();
+        let marker = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let header = f.make_block();
+        let exit = f.make_block();
+        let state = |bcp| FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp,
+                locals: vec![ValueSource::Value {
+                    value: marker,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        };
+        let entry_state = f.frame_states.add(state(0));
+        let header_state = f.frame_states.add(state(7));
+        let cons = IRType::of(TypeBits::CONS);
+        let checked = |fs| InstData {
+            frame_state: Some(fs),
+            flags: InstFlags {
+                guard: true,
+                effectful: true,
+                ..InstFlags::default()
+            },
+            ..guard(marker, cons)
+        };
+        if preloop_guard {
+            let (_, refined) = f.push_inst(
+                entry,
+                checked(entry_state),
+                &[(cons, ValueRepresentation::Tagged)],
+            );
+            f.push_inst(
+                entry,
+                InstData {
+                    args: vec![refined[0]],
+                    ..base(Opcode::Car)
+                },
+                &[(IRType::TOP, ValueRepresentation::Tagged)],
+            );
+        }
+        f.set_terminator(entry, jump(header));
+        if osr {
+            f.osr_entries.push(crate::t2::ir::OsrEntry {
+                bcp: 7,
+                block: header,
+                frame_state: header_state,
+                checks: vec![],
+            });
+        }
+        let (loop_guard, refined) = f.push_inst(
+            header,
+            checked(header_state),
+            &[(cons, ValueRepresentation::Tagged)],
+        );
+        let (cdr, tail) = f.push_inst(
+            header,
+            InstData {
+                args: vec![refined[0]],
+                ..base(Opcode::Cdr)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, duplicate) = f.push_inst(
+            header,
+            checked(header_state),
+            &[(cons, ValueRepresentation::Tagged)],
+        );
+        let (car, head) = f.push_inst(
+            header,
+            InstData {
+                args: vec![duplicate[0]],
+                ..base(Opcode::Car)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(header, brif(tail[0], header, vec![], exit));
+        f.set_terminator(
+            exit,
+            InstData {
+                args: vec![head[0]],
+                ..ret()
+            },
+        );
+        (f, entry, header, loop_guard, cdr, car)
+    }
+
+    #[test]
+    fn duplicate_cons_guard_respects_osr_entry_and_keeps_local_elimination() {
+        for osr in [true, false] {
+            let (mut f, entry, header, loop_guard, cdr, car) = cons_loop(true, osr);
+            crate::t2::verify::verify(&f).unwrap();
+            run(&mut f);
+            crate::t2::verify::verify(&f).unwrap();
+            let refined = f.inst(cdr).args[0];
+            assert_eq!(
+                f.inst(car).args[0],
+                refined,
+                "same-block duplicate still eliminated"
+            );
+            let ValueDef::Result { inst: leader, .. } = f.value(refined).def else {
+                panic!("field load must retain an explicit guard proof");
+            };
+            if osr {
+                assert_eq!(leader, loop_guard, "OSR bypasses the pre-loop CAR guard");
+                assert!(f.block(header).insts.contains(&leader));
+                assert_eq!(count_guards(&f), 2);
+            } else {
+                assert!(f.block(entry).insts.contains(&leader));
+                assert_eq!(
+                    count_guards(&f),
+                    1,
+                    "ordinary dominance still removes loop guard"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invariant_cons_guard_stays_on_osr_path_but_hoists_without_osr() {
+        for osr in [true, false] {
+            let (mut f, entry, header, loop_guard, cdr, _) = cons_loop(false, osr);
+            crate::t2::verify::verify(&f).unwrap();
+            run(&mut f);
+            crate::t2::verify::verify(&f).unwrap();
+            assert_eq!(count_guards(&f), 1, "redundant in-loop proof still removed");
+            assert_eq!(f.inst(cdr).args[0], f.inst(loop_guard).results[0]);
+            let expected_block = if osr { header } else { entry };
+            assert!(
+                f.block(expected_block).insts.contains(&loop_guard),
+                "every entry must execute the invariant guard before using its result"
+            );
+        }
     }
 }
