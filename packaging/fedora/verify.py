@@ -21,8 +21,8 @@ HOST_FEATURES = {
     'aarch64': (':arm64', ':linux'),
 }
 # Linux/rpm architecture names to Rust's spelling, for the --runtime-info
-# triple check below. Only ppc64le actually differs; the rest pass through.
-RUST_ARCH = {'ppc64le': 'powerpc64le'}
+# triple check below. The remaining architecture names pass through.
+RUST_ARCH = {'ppc64le': 'powerpc64le', 'riscv64': 'riscv64gc'}
 HOST_MACHINE = platform.machine()
 TARGETS = {
     'native': HOST_FEATURES.get(HOST_MACHINE, (':linux',)),
@@ -33,6 +33,7 @@ TARGETS = {
     's390x-linux-static': (':s390x', ':big-endian', ':linux'),
     'aarch64-linux-static': (':arm64', ':linux'),
     'ppc64le-linux-static': (':ppc64le', ':little-endian', ':linux'),
+    'riscv64-linux-static': (':riscv64', ':little-endian', ':linux'),
     'windows': (':x86-64', ':windows'),
     'android': (':arm64', ':android'),
 }

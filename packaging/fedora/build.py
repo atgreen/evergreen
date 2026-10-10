@@ -37,6 +37,7 @@ TARGETS = {
     's390x-linux-static': 's390x-unknown-linux-musl',
     'aarch64-linux-static': 'aarch64-unknown-linux-musl',
     'ppc64le-linux-static': 'powerpc64le-unknown-linux-musl',
+    'riscv64-linux-static': 'riscv64gc-unknown-linux-musl',
     'windows': 'x86_64-pc-windows-gnu',
     'android': 'aarch64-linux-android',
 }
@@ -51,6 +52,7 @@ if HOST_MACHINE == 'x86_64':
         's390x': ['s390x-linux', 's390x-linux-static'],
         'aarch64': ['aarch64-linux', 'aarch64-linux-static'],
         'ppc64le': ['ppc64le-linux', 'ppc64le-linux-static'],
+        'riscv64': ['riscv64-linux-static'],
         'windows': ['windows'],
         'android': ['android'],
     })
@@ -233,6 +235,7 @@ def build(args):
             'android': ndk / 'toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip',
             'ppc64le-linux': tools / 'usr/bin/powerpc64le-linux-gnu-strip',
             's390x-linux': tools / 'usr/bin/s390x-linux-gnu-strip',
+            'riscv64-linux': tools / 'usr/bin/riscv64-linux-gnu-strip',
             'aarch64-linux': tools / 'usr/bin/aarch64-linux-gnu-strip',
         }
         strip = strip_tools[name.removesuffix('-static')]

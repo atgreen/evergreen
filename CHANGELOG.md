@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add an x86-64 Fedora package for building standalone RISC-V Linux
+  executables with the static RV64GC musl runtime and QEMU launcher
+  ([#211](https://github.com/atgreen/evergreen/pull/211)).
+
 ## 0.0.4 - 2026-10-10
 
 ### Performance and native compilation

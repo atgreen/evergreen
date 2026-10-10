@@ -13,6 +13,7 @@ case "$target" in
     s390x-linux-static) runner=(qemu-s390x) ;;
     ppc64le-linux-static) runner=(qemu-ppc64le) ;;
     aarch64-linux-static) runner=(qemu-aarch64) ;;
+    riscv64-linux-static) runner=(qemu-riscv64) ;;
     android) runner=(qemu-aarch64) ;;
     windows)
         runner=(wine)

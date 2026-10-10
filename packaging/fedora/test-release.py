@@ -123,6 +123,15 @@ def rpm_identity(source_rpm, version='0.0.1', rpm_release='0.test.123.1.fc44'):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_requires_riscv_payload_and_provenance(self):
+        package = 'egcl-target-riscv64-linux-static'
+        self.assertIn(package, release.PACKAGES)
+        self.assertIn('riscv64-linux-static', release.RUNTIMES)
+        self.assertIn(('riscv64', 'riscv64', 'x86_64'), release.RELEASE_BUILDERS)
+        records = [record for record in complete_records() if record[0] != package]
+        with self.assertRaisesRegex(ValueError, 'Expected all 11 x86_64 RPMs'):
+            release.validate_packages(records, '0.0.1', '0.test.123.1', '.fc44')
+
     def test_release_metadata_matches_workspace_version(self):
         root = release.ROOT
         version = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['package']['version']
@@ -140,20 +149,28 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(package['version'], version)
 
     def test_published_architectures_match_enabled_workflow_builders(self):
-        """Disabling a builder must also change what the collector requires."""
         workflow = (release.ROOT / '.github/workflows/release.yml').read_text()
-        enabled = {
-            tuple(match.groups())
-            for match in re.finditer(
-                r'^\s+- \{ name: ([^,]+),\s+group: ([^,]+),\s+'
-                r'arch: ([^,]+),',
-                workflow,
-                re.MULTILINE,
-            )
-        }
-        self.assertEqual(enabled, release.RELEASE_BUILDERS)
-        self.assertEqual({arch for _, _, arch in enabled},
-                         set(release.RELEASE_PACKAGES_BY_ARCH))
+        self.assertIn('matrix: ${{ fromJSON(needs.plan.outputs.builders_json) }}', workflow)
+        self.assertIn("if: needs.plan.outputs.build_group == 'all'", workflow)
+        builders = release.builder_matrix('all')['include']
+        self.assertEqual({(b['name'], b['group'], b['arch']) for b in builders},
+                         release.RELEASE_BUILDERS)
+        self.assertEqual({b['arch'] for b in builders}, set(release.RELEASE_PACKAGES_BY_ARCH))
+        for builder in builders:
+            self.assertEqual(builder['timeout'], 120)
+            self.assertEqual(builder['platform'], '')
+
+    def test_partial_build_selects_only_riscv_and_cannot_publish(self):
+        self.assertEqual(release.builder_matrix('riscv64'), {'include': [
+            dict(name='riscv64', group='riscv64', arch='x86_64', platform='', timeout=120)]})
+        plan = release.make_plan('0.0.4', 'workflow_dispatch', 'refs/heads/main',
+                                 '123', '1', 'build', 'riscv64')
+        self.assertFalse(plan['publish'])
+        for event, mode, group in [('push', 'build', 'riscv64'),
+                                   ('workflow_dispatch', 'test', 'riscv64'),
+                                   ('workflow_dispatch', 'build', 'unknown')]:
+            with self.subTest(event=event, mode=mode, group=group), self.assertRaises(ValueError):
+                release.make_plan('0.0.4', event, 'refs/tags/v0.0.4', '123', '1', mode, group)
 
     def test_tag_must_match_workspace_version(self):
         version = release.RPM_RELEASE[0]
@@ -254,7 +271,7 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'empty'):
                     release.collect(rpms, destination, plan, source_rpm, provenance.parent)
                 (root / 'rpms/x86_64/egcl-static.x86_64.rpm').unlink()
-                with self.assertRaisesRegex(ValueError, '10 x86_64 RPMs'):
+                with self.assertRaisesRegex(ValueError, '11 x86_64 RPMs'):
                     release.collect(rpms, root / 'incomplete', plan, source_rpm, provenance.parent)
                 self.assertFalse((root / 'incomplete').exists())
 
