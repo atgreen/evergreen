@@ -76,9 +76,9 @@ pub(super) static ACTIVE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut Pub
 /// Test hook fired inside a published poll, after linking and before the real
 /// safepoint, so a test can reenter Lisp or force a collection at that point.
 #[cfg(test)]
-type ObserveHook = Option<fn()>;
+pub(in super::super) type ObserveHook = Option<fn()>;
 #[cfg(test)]
-pub(super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
+pub(in super::super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 #[cfg(test)]

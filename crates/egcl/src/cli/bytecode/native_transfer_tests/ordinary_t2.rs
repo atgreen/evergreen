@@ -338,7 +338,7 @@ fn ordinary_t2_guard_retirement_preserves_effects_and_actual_tier() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn ordinary_t2_decline_preserves_mapped_t1_instead_of_publishing_checked_code() {
+fn ordinary_t2_missing_mapped_artifact_preserves_mapped_t1() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -347,23 +347,26 @@ fn ordinary_t2_decline_preserves_mapped_t1_instead_of_publishing_checked_code() 
     egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
     egcl_rt::rooted!(
         forms =
-            reader::read_from_string("((let ((sum 0)) (dotimes (i n sum) (setq sum (+ sum i)))))")
+            reader::read_from_string("((length (make-string n)))")
                 .unwrap()
                 .0
     );
-    let symbol = egcl_rt::symbols::intern("POLICY-T2-LOOP");
+    let symbol = egcl_rt::symbols::intern("POLICY-T2-STRING");
     let body =
-        Arc::new(compile_function("POLICY-T2-LOOP", *params, *forms, &env, false, false).unwrap());
+        Arc::new(compile_function("POLICY-T2-STRING", *params, *forms, &env, false, false).unwrap());
     registry_put(symbol, body);
-    let baseline = try_promote_to_t1(symbol).expect("mapped T1 loop");
+    let baseline = try_promote_to_t1(symbol).expect("mapped T1 string call");
     assert!(matches!(baseline._storage, NativeCodeStorage::Mapped(_)));
     let input = snapshot_t2_input(symbol, 0).expect("ordinary T2 snapshot");
     let generation = input.generation;
     let input = egcl_rt::CrossThreadRoot::new(input);
-    let artifact = input
+    let mut artifact = input
         .with_gc_stable_mutator(compile_t2_artifact)
         .expect("worker artifact");
-    assert!(artifact.mapped.is_none(), "loop OSR is not yet mapped");
+    // Exercise the installer admission boundary independently of which source
+    // shapes the mapped emitter currently supports. Keep the real checked
+    // artifact but remove its optional mapped preparation.
+    assert!(artifact.mapped.take().is_some(), "worker prepares mapped IR");
     assert!(
         install_t2_completion(T2Completion {
             sym: symbol,
@@ -372,7 +375,7 @@ fn ordinary_t2_decline_preserves_mapped_t1_instead_of_publishing_checked_code() 
             input,
         })
         .is_none(),
-        "unsupported T2 must not publish the checked artifact"
+        "missing mapped preparation must not publish the checked artifact"
     );
     let retained = NATIVE_REGISTRY
         .with(|registry| registry.borrow().get(&symbol).cloned())
@@ -383,6 +386,6 @@ fn ordinary_t2_decline_preserves_mapped_t1_instead_of_publishing_checked_code() 
     );
     assert_eq!(
         run_native(&retained, symbol, &[EgclVal::from_fixnum(10)], &mut env).unwrap(),
-        EgclVal::from_fixnum(45)
+        EgclVal::from_fixnum(10)
     );
 }

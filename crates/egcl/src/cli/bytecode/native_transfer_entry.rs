@@ -187,6 +187,7 @@ fn retain_native_body(body: &Arc<BytecodeFunction>) -> Arc<ActiveBytecodeRoot> {
 /// retains every embedded code address and the original bytecode definition.
 pub(super) struct TransferCode {
     installed_symbol: Option<u32>,
+    is_t2: bool,
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
     code: JitBuffer,
@@ -196,6 +197,8 @@ pub(super) struct TransferCode {
     code_len: usize,
     pub(super) has_deopt: bool,
     bcp_offsets: Vec<u32>,
+    osr_entries: HashMap<u32, usize>,
+    osr_polls: HashMap<usize, u32>,
     _veneer: JitBuffer,
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
     _capture: JitBuffer,
@@ -658,6 +661,7 @@ impl TransferCode {
             &named_veneers,
             egcl_compiler::t2::emit::NativeRootPublication::PublishedHomes,
         )
+        .inspect_err(|error| t2_log_write(format_args!("{}: mapped emitter: {error:?}", body.name)))
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
         // UNWIND-PROTECT cleanups from exact scope maps. Other records require the
@@ -714,8 +718,20 @@ impl TransferCode {
             .install_debug_info_with_arguments(&body.name, arguments.as_ref())
             .ok()?;
         let code_info = install_stack_map(slots, debug_info)?;
+        let osr_polls = emitted.native_calls.as_ref()?.iter().filter_map(|site| {
+            let egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(block) = site.origin else {
+                return None;
+            };
+            ir.osr_entries.iter().find(|entry| entry.block == block)
+                .filter(|entry| {
+                    let state = ir.frame_states.get(entry.frame_state);
+                    state.scopes.len() == 1 && state.scopes[0].stack.is_empty()
+                })
+                .map(|entry| (site.return_offset, entry.bcp))
+        }).collect();
         Some(Self {
             installed_symbol: None,
+            is_t2: false,
             #[cfg(test)]
             unavailable_catch: None,
             #[cfg(test)]
@@ -728,6 +744,8 @@ impl TransferCode {
             _native_calls: Arc::new(emitted.native_calls?),
             has_deopt: emitted.has_deopt,
             bcp_offsets: emitted.bcp_offsets,
+            osr_entries: emitted.osr_entries.into_iter().collect(),
+            osr_polls,
             _veneer: veneer,
             _call_entries: call_entries,
             _capture: capture,
@@ -749,18 +767,33 @@ impl TransferCode {
     }
 
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
+        self.run_activation(args, env, None)
+    }
+
+    fn run_activation(
+        &self,
+        args: &[EgclVal],
+        env: &mut Env,
+        osr: Option<(*mut Frame, usize)>,
+    ) -> Result<EgclVal, EgclError> {
+        // Claim an inherited frame before any preparation can fail or collect.
+        let mut frame_guard = FrameGuard(osr.map(|(frame, _)| frame));
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
-        if args.len() != usize::from(self.body.arity) {
+        if osr.is_none() && args.len() != usize::from(self.body.arity) {
             return Err(EgclError::ProgramError(
                 "native transfer entry: wrong argument count".into(),
             ));
         }
-        validate_declared_args(&self.body, &args)?;
+        if osr.is_none() {
+            validate_declared_args(&self.body, &args)?;
+        }
         let mut state = ActivationState::prepare(self, env)?;
         egcl_rt::rooted_ref!(_state = &mut state);
-        NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
-        let _depth = NativeDepthGuard;
+        let _depth = osr.is_none().then(|| {
+            NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            NativeDepthGuard
+        });
         // Every snapshot is reserved and rooted before machine entry. Cold
         // preparation only copies words; no native frame survives into fallback.
         let stack = egcl_rt::current_stack();
@@ -772,16 +805,25 @@ impl TransferCode {
             .or(self.installed_symbol)
             .map(EgclVal::from_symbol_index)
             .unwrap_or(NIL);
-        let frame = stack
+        let frame = if let Some((frame, _)) = osr {
+            if stack.fp() != frame
+                || stack.grow_top_frame(self.slots.max(unsafe { (*frame).num_locals }), self.code_info).is_none()
+            {
+                return Err(invalid_capture());
+            }
+            frame
+        } else { stack
             .push_frame(function, self.code_info, self.slots, FLAG_CALL)
             .ok_or_else(|| {
                 EgclError::StackOverflow(
                     egcl_rt::current_fiber_id()
                         .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
                 )
-            })?;
-        let mut frame_guard = FrameGuard(Some(frame));
-        bind_params(&self.body, frame, &args, None);
+            })? };
+        frame_guard.0 = Some(frame);
+        if osr.is_none() {
+            bind_params(&self.body, frame, &args, None);
+        }
         let _catch_guard = CatchScopeGuard {
             env,
             base: state.catch_base,
@@ -798,7 +840,9 @@ impl TransferCode {
             blocks: std::mem::take(&mut env.block_stack),
             tags: std::mem::take(&mut env.tag_stack),
         };
-        env.clear_mv();
+        if osr.is_none() {
+            env.clear_mv();
+        }
         // Nested legacy callees and other executions must not overwrite this
         // invocation's capture pointer or an enclosing pending error.
         let mut entry = EntryGuard {
@@ -824,7 +868,7 @@ impl TransferCode {
         }
         let outcome = unsafe {
             native_transfer::invoke_native_segment(
-                self.code.as_ptr(),
+                self.code.as_ptr().add(osr.map_or(0, |(_, offset)| offset)),
                 context.activation.cast(),
                 stack,
             )
@@ -836,6 +880,22 @@ impl TransferCode {
         egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
         if context.failure.is_some() {
             return Err(invalid_capture());
+        }
+        if let Some((next, offset)) = context.osr.take() {
+            if outcome.exit != NativeExit::Transfer || error.is_some() || !state.is_quiescent() {
+                return Err(invalid_capture());
+            }
+            let NativeCodeStorage::Mapped(code) = &next._storage else {
+                return Err(invalid_capture());
+            };
+            if let Some(symbol) = code.installed_symbol {
+                OSR_ENTRY_COUNTS.with(|counts| {
+                    let mut counts = counts.borrow_mut();
+                    let count = counts.entry(symbol).or_insert(0);
+                    *count = count.saturating_add(1);
+                });
+            }
+            return code.run_activation(&[], env, Some((frame_guard.0.take().unwrap(), offset)));
         }
         match outcome.exit {
             NativeExit::Returned
@@ -1097,6 +1157,10 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
+    local_control_native_body(body, allow_values, false)
+}
+
+fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_tags: bool) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -1108,7 +1172,9 @@ fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
         && body.code.iter().all(|op| {
             // Nested tagged callees support MV; optimized/direct-recursive
             // admission retains its existing restriction.
-            (allow_values && matches!(op, Instr::SetValues(_))) || matches!(
+            (allow_values && matches!(op, Instr::SetValues(_)))
+            || (allow_tags && matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
+            || matches!(
                 op,
                 Instr::Const(_)
                     | Instr::LoadLocal(_)
@@ -2043,9 +2109,69 @@ unsafe extern "C" fn poll_or_transfer(
         root_publication::published(image, || {
             #[cfg(test)]
             root_publication::observe();
-            poll_or_transfer_unpublished(request, out)
+            poll_or_transfer_unpublished(request, out);
+            if (*out).exit == NativeExit::Returned && prepare_osr(image) {
+                (*out).exit = NativeExit::Transfer;
+            }
         })
     }
+}
+
+/// Select only an exact, published mapped replacement at a mapped loop header.
+/// Reconstruct only on this cold route, through the poll's exact native homes.
+unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
+    let context = CAPTURE.with(Cell::get);
+    let Some(context) = (unsafe { context.as_mut() }) else { return false };
+    let code = unsafe { &*context.owner };
+    if code.is_t2 || !context.nested.is_null() || !context.recursive.is_null()
+        || egcl_rt::current_stack().fp() != context.frame
+    {
+        return false;
+    }
+    let Some(symbol) = code.installed_symbol else { return false };
+    let Some(offset) = (unsafe { (*image).return_pc as usize }).checked_sub(context.code_base) else {
+        return false;
+    };
+    let Some(header) = code.osr_polls.get(&offset) else { return false };
+    let Some(next) = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned()) else {
+        return false;
+    };
+    if !next.is_t2 || next.body.as_ref().is_none_or(|body| !Arc::ptr_eq(body, &code.body))
+        || !recursive_definition_matches(symbol, Arc::as_ptr(&code.body))
+        || !matches!(&next._storage, NativeCodeStorage::Mapped(_))
+    {
+        return false;
+    }
+    let Some(entry) = next.osr_entries.get(header).copied() else { return false };
+    // Scan body admission only once a replacement is ready, not on every
+    // baseline loop poll while the optimizing worker is still compiling.
+    if !local_control_native_body(&code.body, true, true) {
+        return false;
+    }
+    let Some(index) = code.sites.sites().position(|site| site.return_offset() as usize == offset) else {
+        return false;
+    };
+    let snapshot = unsafe { &mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index) };
+    if unsafe { snapshot.capture_from_activation(context.code_base, &*image,
+        std::slice::from_raw_parts(context.activation, context.slots)) }.is_err()
+    {
+        return false;
+    }
+    let Ok(frames) = snapshot.reconstruct(|_| unreachable!("tagged mapped OSR")) else {
+        return false;
+    };
+    egcl_rt::rooted!(frames = frames);
+    let [frame] = frames.as_slice() else { return false };
+    if frame.resume_pc != *header || frame.locals.len() != usize::from(code.body.n_locals)
+        || !frame.stack.is_empty()
+    {
+        return false;
+    }
+    for (slot, value) in frame.locals.iter().enumerate() {
+        unsafe { slot_set(context.frame, slot as u16, *value) };
+    }
+    context.osr = Some((next, entry));
+    true
 }
 
 unsafe fn poll_or_transfer_unpublished(
@@ -2217,6 +2343,7 @@ pub(super) fn take_native_handler_count() -> usize {
 }
 
 struct CaptureContext {
+    osr: Option<(Rc<NativeCode>, usize)>,
     children: *mut SegmentActivations,
     nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     owner: *const TransferCode,
@@ -2359,6 +2486,12 @@ unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     let capture = unsafe { &mut *capture };
     prepare_escape(context);
+    if context.osr.is_some() {
+        // The poll's exact state is in scanned canonical slots. Its Rust scope
+        // has returned; retire this outer machine frame before entering T2.
+        capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
+        return;
+    }
     #[cfg(test)]
     if !context.nested.is_null() && nested::take_capture_failure() {
         context.failure = Some(TransferSiteError::InvalidLandingCapture);
