@@ -21,8 +21,14 @@ fn check_saved_values_move(native: bool) {
             .expect("MULTIPLE-VALUE-PROG1 must lower"),
     );
     registry_put(symbol, Arc::clone(&body));
-    let code = native
-        .then(|| try_promote_to_t1_with_speculation(symbol, false).expect("must compile at T1"));
+    let code = if native {
+        let code = try_promote_to_t1_with_speculation(symbol, false);
+        assert_eq!(code.is_some(), checked_native_installation_allowed(),
+            "ValuesToList currently requires the Linux interpreter adapter");
+        code
+    } else {
+        None
+    };
     egcl_rt::gc::collect_t0_minor().unwrap();
     egcl_rt::rooted!(args = vec![arena_cons(EgclVal::from_fixnum(37), NIL)]);
     let before = args[0];
@@ -46,6 +52,6 @@ fn bytecode_saved_values_survive_relocation() {
 
 #[test]
 #[cfg(target_arch = "x86_64")]
-fn native_saved_values_survive_relocation() {
+fn selected_execution_preserves_saved_values_through_relocation() {
     check_saved_values_move(true);
 }

@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn warmed_native_slot_does_not_reenter_target_resolution() {
+    fn warmed_checked_slot_preserves_installed_target_results() {
         check_native_slot("SLOT-LOOKUP-LEAF", "()", "42", &[], 42);
         check_native_slot(
             "SLOT-LOOKUP-THREE",
@@ -708,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn supplied_optional_arguments_use_the_native_slot_entry() {
+    fn supplied_optional_arguments_preserve_checked_slot_results() {
         check_native_slot(
             "SLOT-LOOKUP-OPTIONAL",
             "(a &optional (b 20) (c 30) (d 40))",
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_optional_defaults_use_the_native_slot_entry() {
+    fn literal_optional_defaults_preserve_checked_slot_results() {
         check_native_slot(
             "SLOT-LOOKUP-DEFAULTS",
             "(a &optional (b 20) (c 30) (d 40))",
@@ -744,9 +744,9 @@ mod tests {
     }
 
     #[test]
-    fn large_native_depth_caps_keep_native_calls() {
+    fn large_depth_caps_preserve_checked_slot_calls() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "cli::bytecode::call_table::tests::warmed_native_slot_does_not_reenter_target_resolution",
+            .args(["--exact", "cli::bytecode::call_table::tests::warmed_checked_slot_preserves_installed_target_results",
                 "--test-threads=1"])
             .env("EGCL_NATIVE_DEPTH_CAP", "4000000000")
             .output().unwrap();
@@ -894,17 +894,17 @@ mod tests {
     }
 
     #[test]
-    fn native_funcall_does_not_resolve_the_callback_on_warm_calls() {
+    fn checked_funcall_preserves_warm_callback_results() {
         check_native_funcall(false);
     }
 
     #[test]
-    fn captured_native_funcall_does_not_resolve_the_callback_on_warm_calls() {
+    fn captured_checked_funcall_preserves_warm_callback_results() {
         check_native_funcall(true);
     }
 
     #[test]
-    fn nested_native_funcall_keeps_all_warmed_callback_identities() {
+    fn nested_funcall_preserves_callback_identity_under_the_installed_abi() {
         let _lock = super::super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -922,14 +922,37 @@ mod tests {
             let symbol = egcl_rt::symbols::intern(name);
             egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
             egcl_rt::rooted!(form = reader::read_from_string(&format!("({expression})")).unwrap().0);
-            registry_put(symbol, Arc::new(compile_function(name, *params, *form, &env, false, false).unwrap()));
+            let body = Arc::new(compile_function(name, *params, *form, &env, false, false).unwrap());
+            let needs_function_lookup = matches!(name, "PIC-MIDDLE" | "PIC-OUTER");
+            assert_eq!(body.code.iter().any(|op| matches!(op, Instr::LoadFunction(_))), needs_function_lookup);
+            registry_put(symbol, body);
             let input = snapshot_t2_input(symbol, 0).unwrap();
             let generation = input.generation;
             let input = egcl_rt::CrossThreadRoot::new(input);
-            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
-            assert!(install_t2_completion(T2Completion {
-                sym: symbol, generation, artifact: Some(artifact), input,
-            }).unwrap().is_t2);
+            let artifact = input.with_gc_stable(compile_t2_artifact);
+            if needs_function_lookup && !checked_native_installation_allowed() {
+                assert!(artifact.is_none(), "ordinary worker T2 does not yet support LoadFunction");
+                let baseline = try_promote_to_t1_with_speculation(symbol, false)
+                    .expect("LoadFunction retains its supported baseline route");
+                assert!(!baseline.is_t2);
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                assert!(matches!(baseline._storage, NativeCodeStorage::Mapped(_)));
+                assert_eq!(run_native(&baseline, symbol, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
+                    EgclVal::from_fixnum(42));
+            } else {
+                let code = install_t2_completion(T2Completion {
+                    sym: symbol, generation,
+                    artifact: Some(artifact.expect("compile admitted callback")), input,
+                }).unwrap();
+                assert!(code.is_t2);
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                {
+                    assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
+                    let expected = if name == "PIC-INDEPENDENT" { 43 } else { 42 };
+                    assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
+                        EgclVal::from_fixnum(expected));
+                }
+            }
         }
         let cell = resolve(egcl_rt::symbols::intern("FUNCALL")).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
@@ -947,8 +970,15 @@ mod tests {
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
             assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
         }
-        assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
-            "nested callbacks must not evict each other's warmed native identity");
+        if checked_native_installation_allowed() {
+            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
+                "nested callbacks must not evict each other's warmed native identity");
+        } else {
+            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "Linux calls through checked_entry_address must retain bridge dispatch");
+            assert!(!state.funcall.borrow_mut().as_mut().unwrap().select(*function),
+                "the checked native PIC must reject a mapped T1 callback");
+        }
         let symbol = egcl_rt::symbols::intern("PIC-LEAF");
         let input = snapshot_t2_input(symbol, 0).unwrap();
         let generation = input.generation;
@@ -975,8 +1005,39 @@ mod tests {
             let entry = unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
             let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
             assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0), EgclVal::from_fixnum(42).0);
-            assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0,
-                "GC must clear every weak callable identity: {name}");
+            assert!(TARGET_LOOKUPS.with(|count| count.get()) > 0);
+            if !checked_native_installation_allowed() {
+                // Linux has no checked-native PIC identity to invalidate. It
+                // must still refuse that ABI and execute the current callback.
+                assert!(!state.funcall.borrow_mut().as_mut().unwrap().select(args[0]));
+            }
+        }
+        if !checked_native_installation_allowed() {
+            egcl_rt::rooted!(selected_leaf = egcl_rt::symbols::symbol_function(
+                egcl_rt::symbols::intern("PIC-LEAF")).unwrap());
+            super::super::super::read_eval_all_env(
+                "(defun pic-leaf (x) (+ x 10))", &mut env,
+            ).unwrap();
+            // The selected leaf is an old callable; the selected OUTER performs
+            // FUNCTION lookup inside its unchanged body and sees the new leaf.
+            for collect in [false, true] {
+                if collect { egcl_rt::gc::full_gc().unwrap(); }
+                egcl_rt::rooted!(callbacks = vec![
+                    *selected_leaf,
+                    *function,
+                    egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-INDEPENDENT")).unwrap(),
+                    egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("PIC-LEAF")).unwrap(),
+                ]);
+                for (index, expected) in [42, 51, 43, 51].into_iter().enumerate() {
+                    args[0] = callbacks[index];
+                    let entry = unsafe { &*cell.checked_entry_address(false) }
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let call: extern "C" fn(u64, u64, u64, u64, u64, u64) -> u64 =
+                        unsafe { std::mem::transmute(entry) };
+                    assert_eq!(call(Arc::as_ptr(&cell) as u64, 2, args[0].0, args[1].0, NIL.0, 0),
+                        EgclVal::from_fixnum(expected).0);
+                }
+            }
         }
     }
 
@@ -1046,17 +1107,16 @@ mod tests {
             let input = snapshot_t2_input(symbol, 0).unwrap();
             let generation = input.generation;
             let input = egcl_rt::CrossThreadRoot::new(input);
-            let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
-            assert!(
-                install_t2_completion(T2Completion {
-                    sym: symbol,
-                    generation,
-                    artifact: Some(artifact),
-                    input,
-                })
-                .unwrap()
-                .is_t2
-            );
+            let artifact = input.with_gc_stable(compile_t2_artifact);
+            if checked_native_installation_allowed() {
+                assert!(install_t2_completion(T2Completion {
+                    sym: symbol, generation,
+                    artifact: Some(artifact.expect("compile checked captured callback")), input,
+                }).unwrap().is_t2);
+            } else {
+                assert!(artifact.is_none(), "captured callbacks require the Linux interpreter adapter");
+                assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
+            }
         }
         egcl_rt::rooted!(args = [*function, EgclVal::from_fixnum(41)]);
         let cell = resolve(egcl_rt::symbols::intern("OBJECT-CALL-CALLER")).unwrap();
@@ -1082,26 +1142,29 @@ mod tests {
                 EgclVal::from_fixnum(42).0
             );
         }
-        assert_eq!(
-            TARGET_LOOKUPS.with(|count| count.get()),
-            0,
-            "native FUNCALL must bypass target lookup and Rust run_native frame setup"
-        );
+        if checked_native_installation_allowed() {
+            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
+                "native FUNCALL must bypass target lookup and Rust frame setup");
+        } else {
+            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "checked FUNCALL entries must use the Linux bridge");
+        }
         let symbol = egcl_rt::function::name(*function).as_symbol_index();
         let input = snapshot_t2_input(symbol, 0).unwrap();
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
-        let artifact = input.with_gc_stable(compile_t2_artifact).unwrap();
-        assert!(
-            install_t2_completion(T2Completion {
-                sym: symbol,
-                generation,
-                artifact: Some(artifact),
-                input,
-            })
-            .unwrap()
-            .is_t2
-        );
+        let artifact = input.with_gc_stable(compile_t2_artifact);
+        if captured && !checked_native_installation_allowed() {
+            assert!(artifact.is_none());
+            // Republish the exact bytecode body to exercise invalidation without
+            // pretending an unsupported captured body has acquired native code.
+            registry_put(symbol, registry_get(symbol).unwrap());
+        } else {
+            assert!(install_t2_completion(T2Completion {
+                sym: symbol, generation,
+                artifact: Some(artifact.expect("recompile callback")), input,
+            }).unwrap().is_t2);
+        }
         TARGET_LOOKUPS.with(|count| count.set(0));
         let entry =
             unsafe { &*cell.checked_entry_address(false) }.load(std::sync::atomic::Ordering::Acquire);
@@ -1156,21 +1219,25 @@ mod tests {
             .expect("compile native slot body");
         let args: Vec<EgclVal> = args.iter().copied().map(EgclVal::from_fixnum).collect();
         egcl_rt::rooted!(args = args);
+        let interpreter_only = !checked_native_installation_allowed()
+            && (body.variadic || body.min_args != body.arity || body.max_args != Some(body.arity));
         registry_put(symbol, Arc::new(body));
         let input = snapshot_t2_input(symbol, 0).expect("snapshot leaf");
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
-        let artifact = input
-            .with_gc_stable(compile_t2_artifact)
-            .expect("compile T2 leaf");
-        let code = install_t2_completion(T2Completion {
-            sym: symbol,
-            generation,
-            artifact: Some(artifact),
-            input,
-        })
-        .expect("install T2 leaf");
-        assert!(code.is_t2);
+        let artifact = input.with_gc_stable(compile_t2_artifact);
+        if interpreter_only {
+            assert!(artifact.is_none(), "optional arguments require the Linux interpreter adapter");
+            assert!(try_promote_to_t1_with_speculation(symbol, false).is_none());
+        } else {
+            let code = install_t2_completion(T2Completion {
+                sym: symbol, generation,
+                artifact: Some(artifact.expect("compile T2 leaf")), input,
+            }).expect("install T2 leaf");
+            assert!(code.is_t2);
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            assert!(matches!(code._storage, NativeCodeStorage::Mapped(_)));
+        }
         let cell = resolve(symbol).unwrap();
         let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
         struct RestoreEnv(*mut Env);
@@ -1187,10 +1254,11 @@ mod tests {
             "cold-call probe must be live"
         );
         assert!(!cell.is_cold());
-        assert!(matches!(
-            *state.target.borrow(),
-            Some(Target::Native { .. })
-        ));
+        if interpreter_only {
+            assert!(matches!(*state.target.borrow(), Some(Target::Bytecode { .. })));
+        } else {
+            assert!(matches!(*state.target.borrow(), Some(Target::Native { .. })));
+        }
         TARGET_LOOKUPS.with(|count| count.set(0));
         for _ in 0..100 {
             let entry = unsafe { &*cell.checked_entry_address(args.len() > 3) }
@@ -1219,11 +1287,15 @@ mod tests {
             };
             assert_eq!(result, EgclVal::from_fixnum(expected).0);
         }
-        assert_eq!(
-            TARGET_LOOKUPS.with(|count| count.get()),
-            0,
-            "warm native calls must bypass target resolution and Rust run_native frame setup"
-        );
+        if checked_native_installation_allowed() {
+            assert_eq!(TARGET_LOOKUPS.with(|count| count.get()), 0,
+                "warm checked-native calls bypass target resolution");
+        } else {
+            // This probe deliberately enters checked_entry_address. Mapped
+            // callers use the separate published cell entry tested by linkage.
+            assert!(TARGET_LOOKUPS.with(|count| count.get()) >= 100,
+                "checked bridge calls must resolve their Linux mapped/interpreter target");
+        }
         registry_remove(symbol);
     }
 }

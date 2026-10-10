@@ -330,7 +330,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alternating_callback_bodies_reuse_native_adapters() {
+    fn alternating_callback_bodies_respect_the_installed_abi() {
         let _lock = super::super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -364,13 +364,24 @@ mod tests {
         }
         let mut cache = Cache::new([0, 0]).unwrap();
         for _ in 0..10 {
-            assert!(cache.select(functions[0]));
-            assert!(cache.select(functions[1]));
-            assert!(
-                cache.versions.iter().any(|entry| entry.owns(&codes[0])),
-                "switching callbacks must not discard and regenerate the previous adapter"
-            );
-            assert_eq!(cache.versions.len(), 2);
+            if checked_native_installation_allowed() {
+                assert!(cache.select(functions[0]));
+                assert!(cache.select(functions[1]));
+                assert!(cache.versions.iter().any(|entry| entry.owns(&codes[0])),
+                    "switching callbacks must retain the previous checked adapter");
+                assert_eq!(cache.versions.len(), 2);
+            } else {
+                assert!(!cache.select(functions[0]));
+                assert!(!cache.select(functions[1]));
+                assert!(cache.versions.is_empty(), "checked adapters must reject mapped code");
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                for (index, expected) in [17, 23].into_iter().enumerate() {
+                    assert!(matches!(codes[index]._storage, NativeCodeStorage::Mapped(_)));
+                    let symbol = egcl_rt::function::name(functions[index]).as_symbol_index();
+                    assert_eq!(run_native_callable(&codes[index], symbol, functions[index], &[], &mut env).unwrap(),
+                        EgclVal::from_fixnum(expected));
+                }
+            }
         }
     }
 
