@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Return the correct single value from T1 inlined primitives and T2 predicate
+  and cons-accessor expansions after multiple-valued expressions, while
+  preserving multiple values from replacement functions
+  ([#198](https://github.com/atgreen/evergreen/pull/198)).
+
 - Preserve replaced `LDB`, `BYTE`, and `TYPEP` functions in newly compiled calls,
   including lexical `BYTE` definitions and multiple values from replacements.
   Keep eligible constant `TYPEP` predicates native and preserve their single-value
