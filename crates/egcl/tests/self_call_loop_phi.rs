@@ -63,8 +63,8 @@ fn tak_reaches_t2_with_no_shadow_roots() {
     assert!(stdout.contains("RESULT 7 TIER 2"), "{stdout}\n{log}");
     let installed = log
         .lines()
-        .find(|line| line.contains("TAK: T2 INSTALLED"))
-        .unwrap_or_else(|| panic!("no T2 install line for TAK:\n{log}"));
+        .find(|line| line.contains("TAK: T2 EMITTED"))
+        .unwrap_or_else(|| panic!("no T2 emission metadata for TAK:\n{log}"));
     assert!(
         installed.contains("gc_shadow_slots=0"),
         "tak must need no GC shadow slots once its loop-header phis and self-call \

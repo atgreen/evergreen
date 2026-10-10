@@ -1731,9 +1731,10 @@ fn native_listing_preamble(nc: &NativeCode) -> String {
     };
     if mapped_baseline && !nc.is_t2 {
         out.push_str("; T1 — tagged baseline native with mapped exceptional transfers.\n");
+        out.push_str("; Eligible arithmetic also receives guarded baseline optimization.\n");
     } else if nc.is_t2 {
-        out.push_str("; T2 — profile-guided native: speculates the dominant observed operand\n");
-        out.push_str("; types and monomorphic dispatch; a failed guard deoptimises to T0.\n");
+        out.push_str("; T2 — profile-guided native using static proofs and guarded type choices\n");
+        out.push_str("; from observed profiles or cold-site guesses; failed guards deoptimise to T0.\n");
     } else {
         out.push_str("; T1 — baseline native: optimistic FIXNUM arithmetic templates with\n");
         out.push_str("; overflow/type guards; a failed guard deoptimises to T0.\n");
@@ -18454,7 +18455,7 @@ impl TypeProfile {
     }
     /// The dominant speculatable type, if the site is overwhelmingly consistent
     /// (≥90% one type over ≥`MIN` samples). `None` means "not enough data" or
-    /// "polymorphic" — in which case that op is left generic (no speculation).
+    /// "polymorphic". `speculation` also accepts sparse monomorphic evidence.
     pub fn dominant(&self) -> Option<SpecType> {
         // Low floor so speculation can fire by the T1 promotion threshold (the
         // function only warms up in bytecode until it promotes).
@@ -19930,6 +19931,11 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
             .filter(|&value| egcl_rt::function::is_interpreted_function(value));
         mark_fresh_promotion(done.sym);
         publish_native(done.sym, function, &native);
+        t2_log_write(format_args!(
+            "{}: optimized worker result installed with mapped T2 ABI; bytes={}, entry={:p}, activation_slots={}, osr_entries={}",
+            display_fn_name(&bf.name), native.code_len, native.entry,
+            native.num_slots, native.osr_entries.len()
+        ));
         return Some(native);
     }
     // A declined mapped artifact must not publish the old calling convention.
@@ -20044,8 +20050,8 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     mark_fresh_promotion(done.sym);
     publish_native(done.sym, fn_obj, &nc);
     t2_log_write(format_args!(
-        "{}: background T2 result published",
-        display_fn_name(&bf.name)
+        "{}: background T2 result published; bytes={}, entry={:p}, activation_slots={}, osr_entries={}",
+        display_fn_name(&bf.name), nc.code_len, nc.entry, nc.num_slots, nc.osr_entries.len()
     ));
     Some(nc)
 }
@@ -22623,12 +22629,12 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     if t2_log_target().is_some() {
         for (bcp, p) in &input.type_profiles {
             t2_log!(
-                "{name}: site bcp={bcp} profile fix={} float={} bignum={} other={} => {:?}",
+                "{name}: site bcp={bcp} T0 samples fix={} float={} bignum={} other={} profile_choice={:?}",
                 p.fixnum,
                 p.single_float,
                 p.bignum,
                 p.other,
-                p.dominant()
+                p.speculation()
             );
         }
         for (generic, entries) in &input.receiver_profiles {
@@ -22645,8 +22651,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
 
     // The profile closure the speculative-lowering pass consumes: this function's
     // observed operand type at each call-site bcp, mapped to the compiler's type.
-    // A site with a clear dominant type speculates that type. A site with samples
-    // but no dominant type is genuinely polymorphic → left generic. A COLD site
+    // The selector also accepts sparse monomorphic samples, before dominant()
+    // has enough evidence. Mixed or bignum observations can remain generic.
+    // Static SSA proofs may specialize independently of this profile. A COLD site
     // (no samples — e.g. a branch not taken during the brief profiling window)
     // optimistically guesses fixnum: the guard makes it safe (a wrong guess just
     // deopts), and it stops one cold branch from declining the whole function.
@@ -22899,7 +22906,7 @@ fn compile_checked_t2_artifact(
     };
     let code = framed.code;
     t2_log!(
-        "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}, osr_entries={}",
+        "{name}: T2 EMITTED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}, osr_entries={}",
         code.len(),
         framed.compiled_entry,
         framed.native_spill_slots,

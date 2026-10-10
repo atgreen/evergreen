@@ -113,7 +113,7 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
                 let log = std::fs::read_to_string(&t2_log).unwrap();
                 let installed = log
                     .lines()
-                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: T2 INSTALLED"))
+                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: T2 EMITTED"))
                     .expect("leaf must have native emission evidence");
                 assert_eq!(
                     !installed.contains("compiled_entry=+0,"),

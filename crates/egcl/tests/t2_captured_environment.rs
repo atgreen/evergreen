@@ -5,6 +5,11 @@
 
 use std::process::Command;
 
+fn is_closure_t2_publication(line: &str) -> bool {
+    line.contains("<flet-closure>: background T2 result published")
+        || line.contains("<flet-closure>: optimized worker result installed with mapped T2 ABI")
+}
+
 #[test]
 fn captured_callbacks_promote_preserve_shared_state_and_survive_gc() {
     let program = r#"
@@ -73,7 +78,7 @@ fn captured_callbacks_promote_preserve_shared_state_and_survive_gc() {
             assert!(
                 warmup
                     .lines()
-                    .any(|line| line.contains("<flet-closure>: T2 INSTALLED")),
+                    .any(is_closure_t2_publication),
                 "{warmup}"
             );
             assert!(
@@ -129,10 +134,18 @@ fn instances_of_one_lambda_reuse_native_compilation() {
         .unwrap();
     let installations = trace
         .lines()
-        .filter(|line| line.contains("<flet-closure>: T2 INSTALLED"))
+        .filter(|line| is_closure_t2_publication(line))
         .count();
     assert_eq!(
         installations, 1,
+        "one lambda template should publish once: {trace}"
+    );
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.contains("<flet-closure>: T2 EMITTED"))
+            .count(),
+        1,
         "one lambda template should compile once: {trace}"
     );
 }
@@ -238,7 +251,7 @@ fn active_shared_code_survives_owner_collection_and_replacement() {
     assert_eq!(
         trace
             .lines()
-            .filter(|line| line.contains("<flet-closure>: T2 INSTALLED"))
+            .filter(|line| is_closure_t2_publication(line))
             .count(),
         2,
         "the collected owner must be replaced while its code is active: {trace}"
@@ -309,7 +322,7 @@ fn shared_t1_loop_enters_t2_and_deopts_into_the_calling_capture() {
     assert_eq!(
         trace
             .lines()
-            .filter(|line| line.contains("<flet-closure>: T2 INSTALLED"))
+            .filter(|line| is_closure_t2_publication(line))
             .count(),
         1,
         "loop heat must install one shared T2 version: {trace}"

@@ -120,9 +120,5 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         t2_metadata: Some(metadata),
         _storage: NativeCodeStorage::Mapped(code),
     });
-    t2_log_write(format_args!(
-        "{}: optimized worker result installed with mapped T2 ABI",
-        display_fn_name(&body.name)
-    ));
     Some(native)
 }

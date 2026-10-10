@@ -881,3 +881,164 @@ fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
         before
     );
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication() {
+    const CHILD: &str = "EGCL_TEST_T2_DIAGNOSTICS_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // EGCL_T2_LOG is process-wide OnceLock state. A separate process also
+        // keeps unrelated compiler messages out of this publication oracle.
+        let path =
+            std::env::temp_dir().join(format!("egcl-t2-diagnostics-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::bytecode::native_transfer_tests::ordinary_t2::ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("EGCL_T2_LOG", &path)
+            .env("EGCL_T2_NO_QUEUE", "1")
+            .env_remove("EGCL_PROFILING_DISABLED")
+            .env_remove("EGCL_T2_DISCARD")
+            .output()
+            .unwrap();
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(path);
+        assert!(
+            output.status.success(),
+            "diagnostics child failed: {:?}\n{}\n{}\n{log}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "T2-DIAGNOSTIC-SPARSE";
+    super::super::super::read_eval_all_env("(defun t2-diagnostic-sparse (x) (+ x 1))", &mut env)
+        .unwrap();
+    let symbol = egcl_rt::symbols::intern(name);
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("((+ x 1))").unwrap().0);
+    let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+    registry_put(symbol, Arc::clone(&body));
+    for _ in 0..2 {
+        assert_eq!(
+            run(
+                Arc::clone(&body),
+                &[EgclVal::from_fixnum(41)],
+                *function,
+                &mut env
+            )
+            .unwrap(),
+            EgclVal::from_fixnum(42)
+        );
+    }
+    let make_completion = || {
+        let input = snapshot_t2_input(symbol, 0).expect("real profiled worker snapshot");
+        assert_eq!(input.type_profiles.len(), 1);
+        let (&bcp, profile) = input.type_profiles.iter().next().unwrap();
+        assert_eq!(
+            (
+                profile.fixnum,
+                profile.single_float,
+                profile.bignum,
+                profile.other
+            ),
+            (2, 0, 0, 0)
+        );
+        assert_eq!(profile.dominant(), None, "below the dominant-sample floor");
+        let generation = input.generation;
+        let input = egcl_rt::CrossThreadRoot::new(input);
+        let artifact = input
+            .with_gc_stable_mutator(compile_t2_artifact)
+            .expect("real worker output");
+        assert_eq!(artifact.speculations, vec![(bcp, SpecType::Fixnum)]);
+        (
+            bcp,
+            T2Completion {
+                sym: symbol,
+                generation,
+                artifact: Some(artifact),
+                input,
+            },
+        )
+    };
+    let log_path = std::env::var_os("EGCL_T2_LOG").unwrap();
+    let read_log = || std::fs::read_to_string(&log_path).unwrap();
+    let success = format!("[T2] {name}: optimized worker result installed with mapped T2 ABI");
+    let (bcp, mut unpublished) = make_completion();
+    assert!(read_log().contains(&format!(
+        "[T2] {name}: site bcp={bcp} T0 samples fix=2 float=0 bignum=0 other=0 profile_choice=Some(Fixnum)"
+    )), "sparse monomorphic samples must report the actual worker choice");
+    assert!(
+        !read_log().contains(&success),
+        "worker compilation is not publication"
+    );
+    // Mapped allocation/emission can succeed without entering either registry
+    // or publishing a tier. This boundary must not announce an installed tier.
+    let emitted = native_transfer_entry::install_ordinary_t2(
+        symbol,
+        &body,
+        unpublished.artifact.as_mut().unwrap(),
+    )
+    .expect("unpublished mapped emission");
+    assert_mapped_t2(&emitted);
+    assert!(NATIVE_REGISTRY.with(|registry| !registry.borrow().contains_key(&symbol)));
+    assert!(
+        !read_log().contains(&success),
+        "emission must not claim publication"
+    );
+    drop(emitted);
+    drop(unpublished);
+
+    let (_, completion) = make_completion();
+    let (_, stale) = make_completion();
+    let installed = install_t2_completion(completion).expect("current completion publishes");
+    assert_mapped_t2(&installed);
+    assert!(
+        NATIVE_REGISTRY
+            .with(|registry| Rc::ptr_eq(registry.borrow().get(&symbol).unwrap(), &installed))
+    );
+    assert_eq!(egcl_rt::function::tier(*function), 2);
+    let expected = format!(
+        "{success}; bytes={}, entry={:p}, activation_slots={}, osr_entries={}",
+        installed.code_len,
+        installed.entry,
+        installed.num_slots,
+        installed.osr_entries.len()
+    );
+    let published_log = read_log();
+    assert_eq!(
+        published_log
+            .lines()
+            .filter(|line| line.starts_with(&success))
+            .collect::<Vec<_>>(),
+        vec![expected.as_str()],
+        "one success record must describe the actual published owner"
+    );
+    assert_eq!(
+        run_native(&installed, symbol, &[EgclVal::from_fixnum(42)], &mut env).unwrap(),
+        EgclVal::from_fixnum(43)
+    );
+
+    // Re-publishing the bytecode advances its real generation. The already
+    // compiled completion must be rejected before announcing any new install.
+    registry_put(symbol, Arc::clone(&body));
+    assert!(install_t2_completion(stale).is_none());
+    assert_eq!(
+        read_log(),
+        published_log,
+        "stale completion must not announce success"
+    );
+}

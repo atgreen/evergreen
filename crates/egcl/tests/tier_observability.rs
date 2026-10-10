@@ -2365,8 +2365,8 @@ fn t2_elides_unobservable_multiple_value_resets() {
     );
     let installed = stderr
         .lines()
-        .find(|l| l.contains("MV-LOOP: T2 INSTALLED"))
-        .unwrap_or_else(|| panic!("no T2 install record for MV-LOOP:\n{stderr}"));
+        .find(|l| l.contains("MV-LOOP: T2 EMITTED"))
+        .unwrap_or_else(|| panic!("no T2 emission metadata for MV-LOOP:\n{stderr}"));
     // Both loop-body resets (after `(setq x ...)` and after the DOTIMES step)
     // are dead: every path from them reaches another reset before a reader.
     // The only safepoint-carrying instructions left are outside the loop.

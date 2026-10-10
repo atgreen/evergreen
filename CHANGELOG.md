@@ -18,6 +18,11 @@
   [#234](https://github.com/atgreen/evergreen/pull/234),
   [#235](https://github.com/atgreen/evergreen/pull/235)).
 
+- Correct T2 diagnostics to report the profile choices actually used and the
+  code actually installed; distinguish code emission from publication and
+  clarify baseline arithmetic optimization
+  ([#236](https://github.com/atgreen/evergreen/pull/236)).
+
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
   multiple values and inherited handlers. Mapped T1/T2 now supports local

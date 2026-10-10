@@ -61,7 +61,8 @@ fn run(program: &str, extra: &[(&str, &str)]) -> (String, String) {
 
 fn assert_reached_t2(stdout: &str, stderr: &str) {
     assert!(
-        stderr.contains("CONSING-LOOP: T2 INSTALLED"),
+        stderr.contains("CONSING-LOOP: background T2 result published")
+            || stderr.contains("CONSING-LOOP: optimized worker result installed with mapped T2 ABI"),
         "the loop never reached T2:\n{stdout}\n{stderr}"
     );
     assert!(
