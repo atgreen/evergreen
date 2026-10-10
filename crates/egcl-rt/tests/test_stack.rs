@@ -2,7 +2,183 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 use egcl_rt::stack::*;
-use egcl_rt::value::{NIL, EgclVal};
+use egcl_rt::value::{EgclVal, NIL};
+
+#[test]
+fn growing_frame_moves_special_suffix_and_preserves_roots_and_links() {
+    let stack = EgclStack::new(4096);
+    let caller = stack.push_frame(NIL, std::ptr::null(), 1, 0).unwrap();
+    let frame = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let lower = stack
+        .push_frame(NIL, std::ptr::null(), 3, FrameType::Special as u32)
+        .unwrap();
+    let upper = stack
+        .push_frame(NIL, std::ptr::null(), 2, FrameType::Special as u32)
+        .unwrap();
+    let info = CodeInfo::new(&[], &[]);
+    let used = stack.used();
+    unsafe {
+        EgclStack::frame_slots_mut(caller)[0] = EgclVal::from_fixnum(91);
+        EgclStack::frame_slots_mut(frame)
+            .copy_from_slice(&[EgclVal::from_fixnum(11), EgclVal::from_fixnum(12)]);
+        EgclStack::frame_slots_mut(lower).copy_from_slice(&[
+            EgclVal(0x1001),
+            EgclVal::from_fixnum(22),
+            EgclVal::from_fixnum(23),
+        ]);
+        EgclStack::frame_slots_mut(upper)
+            .copy_from_slice(&[EgclVal(0x2001), EgclVal::from_fixnum(32)]);
+        // One slot of growth is smaller than the suffix: this requires memmove.
+        let delta = stack
+            .grow_frame_with_special_suffix(frame, 3, info)
+            .unwrap();
+        assert_eq!(delta, std::mem::size_of::<EgclVal>());
+        let lower = lower.cast::<u8>().add(delta).cast::<Frame>();
+        let upper = upper.cast::<u8>().add(delta).cast::<Frame>();
+        assert_eq!(stack.fp(), upper);
+        assert_eq!(stack.used(), used + delta);
+        assert_eq!((*upper).prev_fp, lower);
+        assert_eq!((*lower).prev_fp, frame);
+        assert_eq!((*frame).prev_fp, caller);
+        assert_eq!((*frame).code_info, info as *const CodeInfo);
+        assert_eq!(
+            EgclStack::frame_slots_mut(frame),
+            &[EgclVal::from_fixnum(11), EgclVal::from_fixnum(12), NIL]
+        );
+        assert_eq!(
+            EgclStack::frame_slots_mut(lower),
+            &[
+                EgclVal(0x1001),
+                EgclVal::from_fixnum(22),
+                EgclVal::from_fixnum(23)
+            ]
+        );
+        assert_eq!(
+            EgclStack::frame_slots_mut(upper),
+            &[EgclVal(0x2001), EgclVal::from_fixnum(32)]
+        );
+        assert_eq!((*lower).frame_type(), FrameType::Special);
+        assert_eq!((*upper).frame_type(), FrameType::Special);
+        // The repaired chain must still let the precise walker rewrite cluster roots.
+        visit_stack_refs(upper, |value| value.0 += 0x10000);
+        assert_eq!(EgclStack::frame_slots_mut(lower)[0], EgclVal(0x11001));
+        assert_eq!(EgclStack::frame_slots_mut(upper)[0], EgclVal(0x12001));
+        assert_eq!(
+            EgclStack::frame_slots_mut(caller)[0],
+            EgclVal::from_fixnum(91)
+        );
+        stack.pop_frame();
+        assert_eq!(stack.fp(), lower);
+        assert_eq!(stack.sp(), upper.cast::<u8>());
+        stack.pop_frame();
+        assert_eq!(stack.fp(), frame);
+        assert_eq!(
+            stack.sp(),
+            frame.add(1).cast::<EgclVal>().add(3).cast::<u8>()
+        );
+        stack.pop_frame();
+        assert_eq!(stack.fp(), caller);
+        assert_eq!(stack.sp(), frame.cast::<u8>());
+    }
+}
+
+#[test]
+fn zero_growth_keeps_special_addresses_and_installs_map() {
+    let stack = EgclStack::new(4096);
+    let frame = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let special = stack
+        .push_frame(NIL, std::ptr::null(), 1, FrameType::Special as u32)
+        .unwrap();
+    let info = CodeInfo::new(&[], &[]);
+    let sp = stack.sp();
+    unsafe {
+        EgclStack::frame_slots_mut(special)[0] = EgclVal::from_fixnum(42);
+        assert_eq!(
+            stack.grow_frame_with_special_suffix(frame, 2, info),
+            Some(0)
+        );
+        assert_eq!(stack.fp(), special);
+        assert_eq!(stack.sp(), sp);
+        assert_eq!((*special).prev_fp, frame);
+        assert_eq!(
+            EgclStack::frame_slots_mut(special)[0],
+            EgclVal::from_fixnum(42)
+        );
+        assert_eq!((*frame).code_info, info as *const CodeInfo);
+        stack.pop_frame();
+        // The same helper also accepts an empty Special suffix.
+        assert_eq!(
+            stack.grow_frame_with_special_suffix(frame, 3, info),
+            Some(std::mem::size_of::<EgclVal>())
+        );
+        assert_eq!(stack.fp(), frame);
+        assert_eq!(EgclStack::frame_slots_mut(frame)[2], NIL);
+    }
+}
+
+#[test]
+fn rejected_special_suffix_growth_leaves_entire_stack_unchanged() {
+    // Exactly full, with two clusters; one extra slot must fail atomically.
+    let capacity = 3 * std::mem::size_of::<Frame>() + 6 * std::mem::size_of::<EgclVal>();
+    let stack = EgclStack::new(capacity);
+    let frame = stack.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let lower = stack
+        .push_frame(NIL, std::ptr::null(), 2, FrameType::Special as u32)
+        .unwrap();
+    let upper = stack
+        .push_frame(NIL, std::ptr::null(), 2, FrameType::Special as u32)
+        .unwrap();
+    let other = EgclStack::new(4096);
+    let foreign = other.push_frame(NIL, std::ptr::null(), 2, 0).unwrap();
+    let info = CodeInfo::new(&[], &[]);
+    unsafe {
+        for (index, pointer) in [frame, lower, upper].into_iter().enumerate() {
+            EgclStack::frame_slots_mut(pointer).fill(EgclVal::from_fixnum(index as i64 + 17));
+        }
+        stack.publish_top();
+        let unchanged = |target, slots| {
+            let before = std::slice::from_raw_parts(stack.base(), stack.used()).to_vec();
+            let state = (
+                stack.fp(),
+                stack.sp(),
+                stack.published_fp(),
+                stack.published_sp(),
+            );
+            assert_eq!(
+                stack.grow_frame_with_special_suffix(target, slots, info),
+                None
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(stack.base(), stack.used()),
+                before
+            );
+            assert_eq!(
+                (
+                    stack.fp(),
+                    stack.sp(),
+                    stack.published_fp(),
+                    stack.published_sp()
+                ),
+                state
+            );
+        };
+        unchanged(frame, 3);
+        unchanged(frame, u16::MAX);
+        unchanged(frame, 1);
+        unchanged(foreign, 2);
+        unchanged(std::ptr::null_mut(), 2);
+        unchanged(frame.cast::<u8>().add(1).cast::<Frame>(), 2);
+        unchanged(lower, 2); // A Special frame is not a callable target.
+        (*upper).flags = FrameType::Call as u32;
+        unchanged(frame, 2); // Never move a younger callable, even for zero growth.
+        (*upper).flags = FrameType::Special as u32;
+        (*upper).prev_fp = frame;
+        unchanged(frame, 2); // A skipped physical frame is not a contiguous suffix.
+        (*upper).prev_fp = lower;
+        (*frame).flags = 1 << 2; // FOREIGN_CALL outbound boundary.
+        unchanged(frame, 2);
+    }
+}
 
 #[test]
 fn growing_top_frame_preserves_addresses_and_scans_new_roots() {

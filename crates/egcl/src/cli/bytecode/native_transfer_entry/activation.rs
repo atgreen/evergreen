@@ -174,18 +174,39 @@ impl ActivationState {
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.catches.is_empty() && self.cleanups.is_empty() && self.can_osr()
+        self.catches.is_empty() && self.cleanups.is_empty()
+            && self.handlers.is_empty() && self.handler_binds.is_empty()
+            && self.restart_cases.is_empty() && self.dynamic_scopes.is_empty()
+            && self.can_osr()
     }
 
-    /// Exact CATCH registrations and saved cleanup continuations move unchanged.
+    /// Exact registrations and saved cleanup continuations move unchanged.
     /// The OSR selector validates their order against the destination scope map.
     pub(super) fn can_osr(&self) -> bool {
-        self.handlers.is_empty()
-            && self.handler_binds.is_empty()
-            && self.restart_cases.is_empty()
-            && self.dynamic_scopes.is_empty()
-            && self.prepared_handler.is_none()
-            && self.prepared_catch.is_none()
+        self.prepared_handler.is_none() && self.prepared_catch.is_none()
+    }
+
+    /// Commit scope ownership while the prepared destination is still traced
+    /// through this source owner. No allocation separates the take and entry.
+    pub(super) fn take_osr_state(&mut self) -> Box<Self> {
+        let ready = self.ready_osr.as_mut().expect("OSR was prepared before commit");
+        ready.catches = std::mem::take(&mut self.catches);
+        ready.cleanups = std::mem::take(&mut self.cleanups);
+        ready.handlers = std::mem::take(&mut self.handlers);
+        ready.handler_binds = std::mem::take(&mut self.handler_binds);
+        ready.restart_cases = std::mem::take(&mut self.restart_cases);
+        ready.dynamic_scopes = std::mem::take(&mut self.dynamic_scopes);
+        ready.catch_base = self.catch_base;
+        self.ready_osr.take().unwrap()
+    }
+
+    pub(super) fn top_frame(&self, frame: *mut Frame) -> *mut Frame {
+        match self.dynamic_scopes.last() {
+            Some(DynamicScope::HandlerCase { cluster_frame, .. }
+                | DynamicScope::HandlerBind { cluster_frame, .. }
+                | DynamicScope::RestartCase { cluster_frame, .. }) => *cluster_frame,
+            None => frame,
+        }
     }
 
     pub(super) fn context(

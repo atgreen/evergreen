@@ -78,6 +78,9 @@ pub(super) use native_transfer_tests::ordinary_catch_osr::local_catch_osr_observ
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::ordinary_cleanup_osr::ordinary_cleanup_osr_observe_for_test;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::ordinary_condition_osr::ordinary_condition_osr_observe_for_test;
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;
@@ -22654,7 +22657,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
-        && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }))
+        && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
+            | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else {

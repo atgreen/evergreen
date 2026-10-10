@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 
 pub(super) mod root_publication;
 mod activation;
+mod condition_osr;
+use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
 #[cfg(test)]
 pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
@@ -830,7 +832,7 @@ impl TransferCode {
             // Source preparation already reserved the space and retained its
             // own map until machine retirement. This commit cannot allocate,
             // collect, or fail: only switch the now-inactive frame's map.
-            assert_eq!(stack.fp(), frame);
+            assert_eq!(stack.fp(), state.top_frame(frame));
             assert!(unsafe { (*frame).num_locals } >= self.slots);
             unsafe { (*frame).code_info = self.code_info; }
             frame
@@ -922,14 +924,11 @@ impl TransferCode {
             }
             // Move live payloads while the destination is still traced by the
             // source state. No allocating operation separates take and entry.
-            let ready = state.ready_osr.as_mut().expect("OSR was prepared before commit");
-            ready.catches = std::mem::take(&mut state.catches);
-            ready.cleanups = std::mem::take(&mut state.cleanups);
-            ready.catch_base = state.catch_base;
+            let ready = state.take_osr_state();
             let resume = OsrResume {
                 frame: frame_guard.0.take().unwrap(),
                 offset,
-                state: state.ready_osr.take().unwrap(),
+                state: ready,
             };
             // This suspended source's catch guard remains an error backstop.
             // It can only truncate again after the destination has returned.
@@ -1213,7 +1212,10 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
             (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
             || (allow_local_scopes && matches!(op,
                 Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
-                    | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn))
+                    | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
+                    | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
+                    | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
+                    | Instr::PushRestartCase { .. } | Instr::PopRestartCase))
             || matches!(
                 op,
                 Instr::Const(_)
@@ -2168,6 +2170,7 @@ unsafe extern "C" fn poll_or_transfer(
 #[cfg(test)]
 thread_local! {
     static FAIL_OSR_PREPARATION: Cell<bool> = const { Cell::new(false) };
+    static FORCE_OSR_FRAME_GROWTH: Cell<u16> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2180,15 +2183,18 @@ pub(super) fn osr_preparation_failure_pending_for_test() -> bool {
     FAIL_OSR_PREPARATION.with(Cell::get)
 }
 
+#[cfg(test)]
+pub(super) fn force_next_osr_frame_growth_for_test(extra: u16) {
+    FORCE_OSR_FRAME_GROWTH.with(|slots| slots.set(extra));
+}
+
 /// Select only an exact, published mapped replacement at a mapped loop header.
 /// Reconstruct only on this cold route, through the poll's exact native homes.
 unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let context = CAPTURE.with(Cell::get);
     let Some(context) = (unsafe { context.as_mut() }) else { return false };
     let code = unsafe { &*context.owner };
-    if code.is_t2 || !context.recursive.is_null()
-        || egcl_rt::current_stack().fp() != context.frame
-    {
+    if code.is_t2 || !context.recursive.is_null() {
         return false;
     }
     let Some(symbol) = code.installed_symbol else { return false };
@@ -2212,17 +2218,19 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
         return false;
     }
     // An OSR jump keeps this activation's registrations, not new copies.
-    // Validate exact lexical provenance against both live runtime ledgers.
-    use egcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
-    let Ok(scopes) = ScopeMap::analyze_function(&code.body) else { return false };
-    let Some(scopes) = scopes.before(*header) else { return false };
+    // Validate exact lexical provenance against every live runtime ledger.
+    let Some(scopes) = code.control_scopes.before(*header) else { return false };
     if scopes.iter().any(|scope| scope.ownership != Ownership::Local
         || !matches!(scope.kind, ScopeKind::Block { register: false, .. }
             | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
-            | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }))
+            | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
+            | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
+            | ScopeKind::RestartCase { .. }))
     {
         return false;
     }
+    let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
+    if !unsafe { validate_condition_clusters(context, scopes, env) } { return false; }
     let cleanups = unsafe { &*context.cleanups };
     let mut saved_cleanups = cleanups.iter();
     let mut handler_depth = 0;
@@ -2280,17 +2288,27 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let mut prepared = Box::new(prepared);
     egcl_rt::rooted_ref!(_prepared = &mut *prepared);
     let stack = egcl_rt::current_stack();
-    if stack.fp() != context.frame || !native_transfer::is_supported() {
+    if !native_transfer::is_supported() {
         return false;
     }
     let slots = destination.slots.max(unsafe { (*context.frame).num_locals });
+    #[cfg(test)]
+    let slots = {
+        let extra = FORCE_OSR_FRAME_GROWTH.with(|slots| slots.replace(0));
+        let Some(forced) = (unsafe { (*context.frame).num_locals }).checked_add(extra) else {
+            return false;
+        };
+        slots.max(forced)
+    };
     // Preserve the SOURCE CodeInfo through the remaining cold publication.
-    // Growth only appends NIL; existing frame/slot addresses never change.
+    // Callable homes keep their addresses; owned Special frames move as one
+    // suffix and every ledger pointer is repaired before a safepoint.
     // Failure changes neither stack bounds nor its map. After success there
     // is no allocation, safepoint, or fallible step before the commit below.
-    if stack.grow_top_frame(slots, code.code_info).is_none() {
+    let Some(delta) = (unsafe { stack.grow_frame_with_special_suffix(context.frame, slots, code.code_info) }) else {
         return false;
-    }
+    };
+    unsafe { relocate_condition_clusters(context, delta); }
     for (slot, value) in frame.locals.iter().enumerate() {
         unsafe { slot_set(context.frame, slot as u16, *value) };
     }
@@ -2514,6 +2532,12 @@ struct CaptureContext {
 }
 static CAPTURE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut CaptureContext>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(std::ptr::null_mut())) };
+#[cfg(test)]
+pub(super) fn condition_capture_for_test() -> Option<(usize, bool, *mut Frame)> {
+    let context = unsafe { CAPTURE.with(Cell::get).as_ref() }?;
+    Some((context.owner as usize, !context.nested.is_null(), context.frame))
+}
+
 #[cfg(test)]
 pub(super) fn child_capture_for_test() -> Option<(usize, bool)> {
     let capture = CAPTURE.with(Cell::get);
