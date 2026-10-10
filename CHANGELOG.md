@@ -49,10 +49,11 @@
 ### Native compilation and performance
 
 - Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
-  Eligible ordinary T2 functions now use mapped native calls without checking
-  exceptional status after successful returns, preserving moving roots,
-  multiple values and guard recovery
-  ([#204](https://github.com/atgreen/evergreen/pull/204)).
+  Eligible ordinary T1 and T2 functions now use mapped native calls without
+  checking exceptional status after successful returns, preserving moving
+  roots, multiple values, speculative arithmetic, recursion and guard recovery
+  ([#204](https://github.com/atgreen/evergreen/pull/204),
+  [#207](https://github.com/atgreen/evergreen/pull/207)).
 - Speed up named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
   captured-variable access, simple-string access and missed hash-table lookups.
   Retain replacement checks, multiple values, GC safety and error recovery
