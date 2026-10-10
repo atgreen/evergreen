@@ -155,6 +155,68 @@ def merge_provenance(records, srpm_sha256):
     return merged
 
 
+def unwrap_release_prose(body):
+    """Remove source wrapping from prose; leave Markdown blocks and hard breaks."""
+    output = []
+    paragraph_indent = None
+    list_indent = 0
+    fence = None
+    fence_indent = 0
+    literal_block = False
+    for line in body.splitlines():
+        expanded = line.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(' '))
+        marker = re.match(r'^ *(`{3,}|~{3,})(.*)$', expanded)
+        if fence:
+            output.append(line)
+            if (marker and indent <= fence_indent + 3 and marker[1][0] == fence[0] and len(marker[1]) >= len(fence)
+                    and not marker[2].strip()):
+                fence = None
+            continue
+        if not line.strip():
+            output.append(line)
+            paragraph_indent = None
+            literal_block = False
+            continue
+        if indent < list_indent:
+            list_indent = indent
+        # Four spaces beyond the surrounding list content is indented code.
+        # Keep ambiguous blocks (quotes, tables, HTML, link definitions) intact.
+        if literal_block or indent >= list_indent + 4:
+            output.append(line)
+            paragraph_indent = None
+            continue
+        if marker:
+            output.append(line)
+            paragraph_indent = None
+            fence = marker[1]
+            fence_indent = list_indent
+            continue
+        if '|' in line or re.match(r'^ *(?:>|<|\[[^]]+\]:)', expanded):
+            output.append(line)
+            paragraph_indent = None
+            literal_block = True
+            continue
+        if re.match(r'^ *(?:#{1,6}(?:\s|$)|(?:[-*_]\s*){3,}$|(?:=+|-+)\s*$)', expanded):
+            output.append(line)
+            paragraph_indent = None
+            continue
+        if item := re.match(r'^ *(?:[-+*]|[0-9]+[.)])[ \t]+', expanded):
+            output.append(line)
+            list_indent = paragraph_indent = item.end()
+            continue
+        previous = output[-1] if output else ''
+        hard_break = (previous.endswith('  ')
+                      or (len(previous) - len(previous.rstrip('\\'))) % 2 == 1)
+        if (paragraph_indent is not None and not hard_break
+                and paragraph_indent <= indent < paragraph_indent + 4):
+            output[-1] = previous.rstrip(' \t') + ' ' + line.lstrip(' \t')
+        else:
+            output.append(line)
+            paragraph_indent = indent
+    return '\n'.join(output)
+
+
 def release_notes(changelog, plan):
     """Select one level-two changelog section, ignoring headings in fenced examples."""
     wanted = 'Unreleased' if plan['prerelease'] else plan['version']
@@ -177,16 +239,16 @@ def release_notes(changelog, plan):
     for offset, (start, title) in enumerate(headings):
         if re.fullmatch(re.escape(wanted) + r'(?: - \d{4}-\d{2}-\d{2})?', title):
             end = headings[offset + 1][0] if offset + 1 < len(headings) else len(lines)
-            matches.append((lines[start].rstrip(), ''.join(lines[start + 1:end]).strip()))
+            matches.append((lines[start].rstrip(), ''.join(lines[start + 1:end]).strip('\r\n')))
     if len(matches) != 1:
         raise ValueError(f'CHANGELOG.md must contain exactly one ## {wanted} section '
                          f'(found {len(matches)})')
     heading, body = matches[0]
-    if not body:
+    if not body.strip():
         if not plan['prerelease']:
             raise ValueError(f'CHANGELOG.md section {wanted} must not be empty')
         body = 'No unreleased changes recorded.'
-    return f'{heading}\n\n{body}\n'
+    return f'{heading}\n\n{unwrap_release_prose(body)}\n'
 
 
 def collect(rpm_dirs, destination, plan, source_rpm, provenance_dir, sbom=None):
