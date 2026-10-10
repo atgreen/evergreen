@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve the installed definition of `UIOP/UTILITY:FIRST-CHAR` in optimized
+  calls, including redefinition, multiple return values, and nonlocal exits
+  ([#196](https://github.com/atgreen/evergreen/pull/196)).
+
 - Honor interpreted replacements of builtins across evaluation tiers, including
   lexical and global `VALUES` replacements, multiple return values, and cleanup
   ([#195](https://github.com/atgreen/evergreen/pull/195)).
