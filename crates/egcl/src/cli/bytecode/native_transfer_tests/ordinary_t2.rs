@@ -53,6 +53,10 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<Nat
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let symbol = egcl_rt::symbols::intern(name);
     let body = Arc::new(compile_function(name, *params, *forms, env, false, false).unwrap());
+    install_body(symbol, body)
+}
+
+fn install_body(symbol: u32, body: Arc<BytecodeFunction>) -> (u32, Rc<NativeCode>) {
     registry_put(symbol, body);
     let input = snapshot_t2_input(symbol, 0).expect("ordinary T2 snapshot");
     let generation = input.generation;
@@ -531,5 +535,260 @@ fn ordinary_mv_zero_binding_preserves_the_existing_tuple() {
         assert_eq!(primary, EgclVal::from_fixnum(71));
         assert!(env.mv_active, "zero binding must not invoke the ClearMv operation");
         assert_eq!(env.mv, vec![EgclVal::from_fixnum(71), EgclVal::from_fixnum(72)]);
+    }
+}
+
+struct RecursiveFixturePins(Vec<u32>);
+impl RecursiveFixturePins {
+    fn new(names: &[&str]) -> Self {
+        Self(
+            names
+                .iter()
+                .map(|name| {
+                    let symbol = egcl_rt::symbols::intern(name);
+                    profile_pin(symbol);
+                    symbol
+                })
+                .collect(),
+        )
+    }
+}
+impl Drop for RecursiveFixturePins {
+    fn drop(&mut self) {
+        for &symbol in &self.0 {
+            profile_unpin(symbol);
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_recursive_calls_move_roots_and_recover_deepest_guard_once() {
+    use native_transfer_entry::take_recursive_entries;
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    for fail in [false, true] {
+        let name = if fail {
+            "ORDINARY-T2-RECURSIVE-ERROR"
+        } else {
+            "ORDINARY-T2-RECURSIVE-ROOT"
+        };
+        let finish = if fail { "(car 1)" } else { "x" };
+        let form = format!(
+            "(progn (ordinary-t2-recursive-tick)
+               (if (= n 0)
+                   (progn (+ v 1) (ordinary-t2-recursive-finish x))
+                   (progn ({name} (- n 1) v x) (ordinary-t2-recursive-car x))))"
+        );
+        super::super::super::read_eval_all_env(
+            &format!(
+                "(setq *ordinary-t2-recursive-ticks* 0)
+                 (defun ordinary-t2-recursive-tick ()
+                   (setq *ordinary-t2-recursive-ticks* (+ *ordinary-t2-recursive-ticks* 1)))
+                 (defun ordinary-t2-recursive-finish (x) (%force-minor-gc-for-test) {finish})
+                 (defun ordinary-t2-recursive-car (x) (values (car x) x))
+                 (defun {name} (n v x) {form})"
+            ),
+            &mut env,
+        )
+        .unwrap();
+        let _pins = RecursiveFixturePins::new(&[
+            "ORDINARY-T2-RECURSIVE-TICK",
+            "ORDINARY-T2-RECURSIVE-FINISH",
+            "ORDINARY-T2-RECURSIVE-CAR",
+        ]);
+        let (symbol, code) = install(name, "(n v x)", &format!("({form})"), &mut env);
+        assert_mapped_t2(&code);
+        assert!(code.has_deopt, "worker T2 retains arithmetic guards");
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            unreachable!()
+        };
+        #[cfg(not(egcl_no_disassembly))]
+        assert!(
+            native_transfer_entry::installed_listing(mapped)
+                .contains("native recursive entry veneer"),
+            "ordinary worker T2 must emit the precise direct recursive path"
+        );
+        let plus = egcl_rt::symbols::intern("+");
+        let body = code.body.as_ref().unwrap();
+        let add_bcp = body
+            .code
+            .iter()
+            .position(|op| matches!(op, Instr::CallNamed { sym, nargs: 2 } if *sym == plus))
+            .expect("deepest overflow operation");
+        assert!(
+            code.t2_metadata
+                .as_ref()
+                .unwrap()
+                .speculations
+                .iter()
+                .any(|(bcp, kind)| { *bcp == add_bcp as u32 && matches!(kind, SpecType::Fixnum) }),
+            "real worker must speculate the operation whose guard will fail"
+        );
+
+        // Drain old parser/compiler allocations before creating the nursery
+        // argument whose relocation must be observed through suspended callers.
+        egcl_rt::collect_t0_minor().unwrap();
+        egcl_rt::rooted!(
+            args = vec![
+                EgclVal::from_fixnum(8),
+                EgclVal::from_fixnum((1_i64 << 60) - 1),
+                super::super::super::arena_cons(EgclVal::from_fixnum(42), NIL),
+            ]
+        );
+        let address = args[2].to_raw();
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+        take_recursive_entries();
+        let deopts = mapped.deopt_count();
+        egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env));
+        assert_eq!(
+            take_recursive_entries(),
+            8,
+            "all eight selfcalls use native recursive entries"
+        );
+        assert_eq!(
+            mapped.deopt_count() - deopts,
+            1,
+            "only the deepest guard resumes T0"
+        );
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
+        assert_ne!(
+            args[2].to_raw(),
+            address,
+            "the suspended caller argument must actually move"
+        );
+        assert_eq!(
+            super::super::super::cp(args[2]),
+            (EgclVal::from_fixnum(42), NIL)
+        );
+        if fail {
+            let Err(EgclError::Signalled(details)) = &*result else {
+                panic!("expected selected type error, got {:?}", &*result);
+            };
+            assert!(super::super::super::condition_matches_handler(
+                &env,
+                details.condition,
+                "TYPE-ERROR"
+            ));
+            assert_eq!(
+                details
+                    .backtrace
+                    .iter()
+                    .filter(|frame| {
+                        frame
+                            .function
+                            .as_deref()
+                            .is_some_and(|function| function.ends_with(name))
+                    })
+                    .count(),
+                9,
+                "one logical frame per recursive activation"
+            );
+        } else {
+            assert_eq!(result.as_ref().unwrap(), &EgclVal::from_fixnum(42));
+            assert_eq!(env.mv.as_slice(), &[EgclVal::from_fixnum(42), args[2]]);
+        }
+        assert_eq!(
+            super::super::super::read_eval_all_env("*ordinary-t2-recursive-ticks*", &mut env)
+                .unwrap(),
+            EgclVal::from_fixnum(9),
+            "entry effects must not replay during deepest guard recovery"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_recursive_calls_preserve_redefinition_and_unbinding() {
+    use native_transfer_entry::take_recursive_entries;
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    for unbind in [false, true] {
+        let name = if unbind {
+            "ORDINARY-T2-RECURSIVE-UNBOUND"
+        } else {
+            "ORDINARY-T2-RECURSIVE-REPLACED"
+        };
+        let change = if unbind {
+            format!("(fmakunbound '{name})")
+        } else {
+            format!("(defun {name} (n) (values 99 100))")
+        };
+        let form = format!(
+            "(if (= n 0) 0
+               (progn (ordinary-t2-recursive-change) ({name} (- n 1))))"
+        );
+        super::super::super::read_eval_all_env(
+            &format!(
+                "(setq *ordinary-t2-recursive-changes* 0)
+                 (defun ordinary-t2-recursive-change ()
+                   (setq *ordinary-t2-recursive-changes* (+ *ordinary-t2-recursive-changes* 1))
+                   {change})
+                 (defun {name} (n) {form})"
+            ),
+            &mut env,
+        )
+        .unwrap();
+        let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-RECURSIVE-CHANGE"]);
+        // Preserve the named selfcall: compiling under NAME would eliminate
+        // this tail call before the native redefinition guard could see it.
+        egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(&format!("({form})")).unwrap().0);
+        let symbol = egcl_rt::symbols::intern(name);
+        let mut body = compile_function("<lambda>", *params, *forms, &env, false, false).unwrap();
+        body.name = name.into();
+        assert!(body.code.iter().any(|op| {
+            matches!(op, Instr::CallNamed { sym, .. } if *sym == symbol)
+        }), "fixture must retain the named recursive call");
+        let (symbol, code) = install_body(symbol, Arc::new(body));
+        assert_mapped_t2(&code);
+        egcl_rt::rooted!(original = egcl_rt::symbols::symbol_function(symbol).unwrap());
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+        take_recursive_entries();
+        egcl_rt::rooted!(result = run_native(&code, symbol, &[EgclVal::from_fixnum(1)], &mut env));
+        assert_ne!(egcl_rt::symbols::symbol_function(symbol), Some(*original));
+        assert_eq!(
+            take_recursive_entries(),
+            0,
+            "never enter the replaced definition"
+        );
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
+        if unbind {
+            assert!(
+                matches!(&*result, Err(EgclError::UndefinedFunction(_)))
+                    || matches!(&*result, Err(EgclError::Signalled(details))
+                    if super::super::super::condition_matches_handler(&env, details.condition, "UNDEFINED-FUNCTION")),
+                "{:?}",
+                &*result
+            );
+        } else {
+            assert_eq!(result.as_ref().unwrap(), &EgclVal::from_fixnum(99));
+            assert_eq!(
+                env.mv.as_slice(),
+                &[EgclVal::from_fixnum(99), EgclVal::from_fixnum(100)]
+            );
+        }
+        assert_eq!(
+            super::super::super::read_eval_all_env("*ordinary-t2-recursive-changes*", &mut env)
+                .unwrap(),
+            EgclVal::from_fixnum(1),
+            "the definition-changing effect executes once"
+        );
     }
 }
