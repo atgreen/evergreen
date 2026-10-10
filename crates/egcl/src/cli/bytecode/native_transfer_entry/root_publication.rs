@@ -212,9 +212,17 @@ pub(super) unsafe fn published_mapped_resuming<R>(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     body: impl FnOnce() -> R,
 ) -> R {
+    // Fail CLOSED. Passing None here would let publish_with fall back to
+    // CAPTURE's owner, which during a live child is the CHILD's code while this
+    // cursor is the parent's PC. In release, where the owner identity check is
+    // only a debug_assert, that misattribution would index the wrong value map
+    // and hand the collector an arbitrary machine word -- an unboxed double in
+    // r13, say -- as a heap reference. A null owner makes the walk decline the
+    // boundary instead, which costs coverage the shadows still provide.
     let owner = unsafe { super::nested::record_parent_owner(record) };
     debug_assert!(owner.is_some(), "a live child must yield its parent's owner");
-    unsafe { publish_with(mapped_cursor(record), owner, record as usize, body) }
+    let owner = owner.unwrap_or(std::ptr::null());
+    unsafe { publish_with(mapped_cursor(record), Some(owner), record as usize, body) }
 }
 
 /// The suspended caller's exact geometry, read out of the adapter frame.
