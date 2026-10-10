@@ -1022,6 +1022,8 @@ fn bytecode_for_callable(sym: u32, function: EgclVal) -> Option<(u32, Arc<Byteco
     if egcl_rt::symbols::is_uninterned(sym) {
         return registry_get(sym).map(|body| (sym, body));
     }
+    #[cfg(test)]
+    call_table::record_target_lookup();
     install_bytecode_root_scanner();
     let definition = named_definitions().borrow().get(&sym).cloned();
     if let Some(definition) = definition
