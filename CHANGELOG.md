@@ -48,6 +48,9 @@
 
 ### Native compilation and performance
 
+- Restore RISC-V loop promotion into T2 by checking imported fixnum values
+  when entering optimized loops, with recovery for failed checks
+  ([#140](https://github.com/atgreen/evergreen/pull/140)).
 - Add opt-in published native callable entries for Rust-to-Lisp calls on
   AArch64 Unix with `EGCL_NATIVE_TRANSFER=1`
   ([#206](https://github.com/atgreen/evergreen/pull/206)).
