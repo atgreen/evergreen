@@ -63,6 +63,72 @@ class ReleaseNotesTests(unittest.TestCase):
             self.assertEqual(release.release_notes(text, self.stable),
                              f'## 0.0.2\n\n{body}')
 
+    def test_export_joins_prose_and_list_soft_wraps(self):
+        body = ('### Faster calls\n\n'
+                'A wrapped paragraph\ncontinues here.\n\n'
+                '- Reduce call overhead\n  while keeping multiple values\n'
+                '  ([#210](https://github.com/atgreen/evergreen/pull/210)).\n'
+                '- Another item.\n'
+                '  - A nested item\n    continues here.\n'
+                '  - A sibling.\n'
+                '- Back outside.\n\n'
+                '1. First numbered item\n   continues here.\n'
+                '2. Next item.\n')
+        expected = ('### Faster calls\n\n'
+                    'A wrapped paragraph continues here.\n\n'
+                    '- Reduce call overhead while keeping multiple values '
+                    '([#210](https://github.com/atgreen/evergreen/pull/210)).\n'
+                    '- Another item.\n'
+                    '  - A nested item continues here.\n'
+                    '  - A sibling.\n'
+                    '- Back outside.\n\n'
+                    '1. First numbered item continues here.\n'
+                    '2. Next item.\n')
+        notes = release.release_notes('## 0.0.2\n\n' + body, self.stable)
+        self.assertEqual(notes, '## 0.0.2\n\n' + expected)
+
+    def test_export_preserves_markdown_blocks_and_explicit_breaks(self):
+        body = ('### Examples\n\n'
+                '- Example:\n\n'
+                '  ```lisp\n  (+ 19\n     23)\n  ```\n\n'
+                'Text.\n\n'
+                '    (print "indented")\n    (print "code")\n\n'
+                '~~~text\nfirst\nsecond\n~~~\n\n'
+                'Intentional break  \nnext line\\\nlast line\n\n'
+                '> Quoted text\n> remains quoted.\n\n'
+                'Heading\n-------\n\n'
+                '| Name | Value |\n| ---- | ----- |\n| a | b |\n\n'
+                '[link]: https://example.invalid\n'
+                '    "Link title"\n')
+        notes = release.release_notes('## 0.0.2\n\n' + body, self.stable)
+        self.assertEqual(notes, '## 0.0.2\n\n' + body)
+
+    def test_export_preserves_short_headings_tables_and_indented_fence_text(self):
+        for body in ('Heading\n--\n',
+                     'Name | Value\n---- | -----\na | b\n',
+                     '```text\n    ```\nstill inside\nthe fence\n```\n'):
+            with self.subTest(body=body):
+                self.assertEqual(release.release_notes('## 0.0.2\n\n' + body, self.stable),
+                                 '## 0.0.2\n\n' + body)
+
+    def test_export_preserves_fences_opened_on_list_items(self):
+        for prefix, indent in (('- ', '  '), ('  - ', '    ')):
+            body = f'{prefix}```text\n{indent}one\n{indent}two\n{indent}```\n'
+            text = '## 0.0.2\n\n' + body + '\n## 0.0.1\n\n- Old.\n'
+            with self.subTest(prefix=prefix):
+                self.assertEqual(release.release_notes(text, self.stable),
+                                 '## 0.0.2\n\n' + body)
+
+    def test_export_conservatively_preserves_raw_html(self):
+        body = '<script>\n// before\n\n// comment\nalert(1)\n</script>\n'
+        self.assertEqual(release.release_notes('## 0.0.2\n\n' + body, self.stable),
+                         '## 0.0.2\n\n' + body)
+
+    def test_export_preserves_code_at_section_edges(self):
+        body = '    first code line\n    second code line\n'
+        self.assertEqual(release.release_notes('## 0.0.2\n\n' + body, self.stable),
+                         '## 0.0.2\n\n' + body)
+
     def test_plan_rejects_missing_notes_before_writing_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
