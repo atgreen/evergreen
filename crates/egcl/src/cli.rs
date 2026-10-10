@@ -37859,6 +37859,7 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(condition = condition);
     egcl_rt::rooted!(backtrace = egcl_rt::debug_stack::capture_current(usize::MAX));
     let base_len = env.restarts.len();
+    let continue_id = next_restart_id();
     env.restarts.push(RestartEntry {
         captured_blocks: env.block_stack.clone(),
         captured_tags: env.tag_stack.clone(),
@@ -37868,7 +37869,7 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         test_function: None,
         unwind_on_invoke: true,
         group_base: base_len,
-        id: next_restart_id(),
+        id: continue_id,
         restart_obj: NIL,
         report: NIL,
     });
@@ -37878,7 +37879,9 @@ fn eval_cerror(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     match result {
         Ok(_) => Err(EgclError::signalled(*condition, message, std::mem::take(&mut *backtrace))),
         Err(error) => {
-            if restart_invoked_name(&error).as_deref() == Some("CONTINUE") {
+            // A handler can invoke an outer restart object with the same name.
+            // Only this CERROR's selected restart resumes the signaling call.
+            if restart_invoked_id(&error) == Some(continue_id) {
                 return Ok(NIL);
             }
             Err(error)
