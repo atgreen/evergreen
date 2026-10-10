@@ -467,6 +467,17 @@ impl<'a> Builder<'a> {
         }
     }
 
+    fn special_or_global_access(&self, bcp: usize) -> Option<AuxData> {
+        if !self.native_cleanups { return None; }
+        match self.bf.code.get(bcp)? {
+            Instr::BindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: true }),
+            Instr::UnbindSpecial(_) => Some(AuxData::SpecialBinding { bcp: bcp as u32, enter: false }),
+            Instr::LoadGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: false }),
+            Instr::StoreGlobal(symbol) => Some(AuxData::GlobalValue { symbol: *symbol, store: true }),
+            _ => None,
+        }
+    }
+
     fn handler_bind_transition(&self, bcp: usize) -> Option<(u32, bool)> {
         if !self.native_cleanups {
             return None;
@@ -755,6 +766,7 @@ impl<'a> Builder<'a> {
             if (self.catch_transition(i).is_some()
                 || self.handler_transition(i).is_some()
                 || self.handler_bind_transition(i).is_some()
+                || self.special_or_global_access(i).is_some()
                 || self.restart_case_transition(i).is_some())
                 && i + 1 < code.len()
             {
@@ -850,6 +862,7 @@ impl<'a> Builder<'a> {
                 && (self.catch_transition(i).is_some()
                     || self.handler_transition(i).is_some()
                     || self.handler_bind_transition(i).is_some()
+                    || self.special_or_global_access(i).is_some()
                     || self.restart_case_transition(i).is_some()
                     || matches!(
                         code[i],
@@ -884,6 +897,13 @@ impl<'a> Builder<'a> {
             match &code[i] {
                 Instr::EvalHost(_) if self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
+                }
+                Instr::BindSpecial(_) if self.native_cleanups => {
+                    if d < 1 { return Err(BuildError::Unsupported("special binding without value")); }
+                    push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::UnbindSpecial(_) if self.native_cleanups => {
+                    push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::PushHandlerBind { hb } if self.native_cleanups => {
                     let count = self
@@ -1056,6 +1076,7 @@ impl<'a> Builder<'a> {
                 && (self.catch_transition(i).is_some()
                     || self.handler_transition(i).is_some()
                     || self.handler_bind_transition(i).is_some()
+                    || self.special_or_global_access(i).is_some()
                     || self.restart_case_transition(i).is_some()
                     || matches!(
                         code[i],
@@ -1280,6 +1301,7 @@ impl<'a> Builder<'a> {
             if self.catch_transition(start + offset).is_some()
                 || self.handler_transition(start + offset).is_some()
                 || self.handler_bind_transition(start + offset).is_some()
+                || self.special_or_global_access(start + offset).is_some()
                 || self.restart_case_transition(start + offset).is_some()
             {
                 let mut successors = vec![blk(end)?];
@@ -1504,6 +1526,21 @@ impl<'a> Builder<'a> {
         let code = &self.bf.code;
         for (offset, instruction) in code[start..end].iter().enumerate() {
             let i = start + offset;
+            if let Some(aux) = self.special_or_global_access(i) {
+                // The cold state is BEFORE consuming a binding/store operand.
+                // The runtime commits only after all fallible preparation.
+                let fs = self.build_frame_state(block, &stack, i as u32);
+                let args = if matches!(aux, AuxData::SpecialBinding { enter: true, .. }
+                    | AuxData::GlobalValue { store: true, .. }) {
+                    vec![stack.pop().ok_or(BuildError::Unsupported("special operation without value"))?]
+                } else { vec![] };
+                let (inst, results) = self.f.push_inst(block, InstData {
+                    opcode: Opcode::Call, args, results: vec![], aux,
+                    flags: runtime_call_flags(), targets: vec![], frame_state: Some(fs), source_pos: 0,
+                }, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+                self.finish_native_invoke(block, inst, stack, results[0], i as u32, Some(end))?;
+                return Ok(());
+            }
             if self.native_cleanups
                 && matches!(instruction, Instr::EvalHost(_) | Instr::LoadFunction(_))
             {
@@ -2235,6 +2272,8 @@ impl<'a> Builder<'a> {
                 | AuxData::HandlerScope { .. }
                 | AuxData::HandlerBindScope { .. }
                 | AuxData::RestartCaseScope { .. }
+                | AuxData::SpecialBinding { .. }
+                | AuxData::GlobalValue { store: true, .. }
         ) {
             stack.push(projected);
         }

@@ -395,6 +395,11 @@ pub enum AuxData {
     HostEval(u16),
     /// Read a function designator through the native-transfer bridge.
     FunctionLookup(u32),
+    /// Binding operation identified by its exact retained bytecode PC. Exit
+    /// decodes UnbindSpecial's count there; entry consumes one rooted value.
+    SpecialBinding { bcp: u32, enter: bool },
+    /// Execution-local symbol value access through the published bridge.
+    GlobalValue { symbol: u32, store: bool },
     /// Invoke a THROW with rooted tag and primary arguments; no normal result.
     TransferThrow,
     /// Establish/retire a dynamic CATCH binding in the owning activation.
