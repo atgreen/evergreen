@@ -14,8 +14,8 @@
 //! * **Intrinsics.** A fixed table ([`InlineMetadata`] entries in `KNOWN`)
 //!   of functions with a hand-written IR template, identified by
 //!   [`IntrinsicId`]: `EQ`, `NULL`, `CAR`, `CDR`, `SYMBOLP`, `INTEGERP`,
-//!   `TYPEP` with a constant type specifier, `STRINGP`, and
-//!   `UIOP/UTILITY:FIRST-CHAR`. The builder owns the templates.
+//!   `TYPEP` with a constant type specifier, and `STRINGP`. The builder
+//!   guards the builtin binding before using a template.
 //! * **Saved bytecode bodies.** A callee whose bytecode was registered with
 //!   [`InlineOptions::with_body`] can be built to SSA and cloned as a CFG at
 //!   the call site. `body_cost` decides eligibility and estimates growth.
@@ -24,9 +24,8 @@
 //!
 //! * [`metadata_for_symbol`] resolves an interned symbol to its `KNOWN` entry.
 //!   An unqualified name denotes an inherited `COMMON-LISP` symbol; explicit
-//!   `CL:`/`COMMON-LISP:` qualification is accepted; a non-CL helper must
-//!   match its owning package exactly. A same-spelling symbol in another
-//!   package is a normal call.
+//!   `CL:`/`COMMON-LISP:` qualification is accepted. Library functions use
+//!   their actual saved bodies or normal calls, regardless of their names.
 //! * [`InlineOptions`] carries per-compilation state: lexical
 //!   `INLINE`/`NOTINLINE` declarations keyed by bytecode call-site PC
 //!   ([`InlinePolicy`]), registered bodies, per-site [`CallSiteProfile`]
@@ -87,7 +86,6 @@ pub enum KnownFunction {
     Integerp,
     Typep,
     Stringp,
-    FirstChar,
 }
 
 /// Expansion hook understood by the T2 builder.
@@ -104,17 +102,6 @@ pub enum IntrinsicId {
     Integerp,
     TypepConstant,
     Stringp,
-    /// Metadata-owned inline template for UIOP/UTILITY:FIRST-CHAR.  It expands
-    /// to the low-level string layout IR; the emitter has no FIRST-CHAR case.
-    FirstChar,
-}
-
-/// Namespace owning the function identity.  Unqualified names denote inherited
-/// COMMON-LISP symbols, while non-CL helpers must match their package exactly.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FunctionNamespace {
-    CommonLisp,
-    Package(&'static str),
 }
 
 /// Effects of the expansion itself, rather than of an arbitrary generic call
@@ -138,7 +125,6 @@ impl EffectSummary {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InlineMetadata {
     pub function: KnownFunction,
-    pub namespace: FunctionNamespace,
     pub name: &'static str,
     pub fixed_arity: u16,
     pub effects: EffectSummary,
@@ -150,7 +136,6 @@ pub struct InlineMetadata {
 const KNOWN: &[InlineMetadata] = &[
     InlineMetadata {
         function: KnownFunction::Eq,
-        namespace: FunctionNamespace::CommonLisp,
         name: "EQ",
         fixed_arity: 2,
         effects: EffectSummary::PURE_TOTAL,
@@ -159,7 +144,6 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Null,
-        namespace: FunctionNamespace::CommonLisp,
         name: "NULL",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -168,7 +152,6 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Car,
-        namespace: FunctionNamespace::CommonLisp,
         name: "CAR",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -177,7 +160,6 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Cdr,
-        namespace: FunctionNamespace::CommonLisp,
         name: "CDR",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -186,7 +168,6 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Symbolp,
-        namespace: FunctionNamespace::CommonLisp,
         name: "SYMBOLP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -195,7 +176,6 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Integerp,
-        namespace: FunctionNamespace::CommonLisp,
         name: "INTEGERP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
@@ -207,7 +187,6 @@ const KNOWN: &[InlineMetadata] = &[
     // a malformed type specifier.
     InlineMetadata {
         function: KnownFunction::Typep,
-        namespace: FunctionNamespace::CommonLisp,
         name: "TYPEP",
         fixed_arity: 2,
         effects: EffectSummary::PURE_TOTAL,
@@ -216,21 +195,11 @@ const KNOWN: &[InlineMetadata] = &[
     },
     InlineMetadata {
         function: KnownFunction::Stringp,
-        namespace: FunctionNamespace::CommonLisp,
         name: "STRINGP",
         fixed_arity: 1,
         effects: EffectSummary::PURE_TOTAL,
         cost: 1,
         expansion: IntrinsicId::Stringp,
-    },
-    InlineMetadata {
-        function: KnownFunction::FirstChar,
-        namespace: FunctionNamespace::Package("UIOP/UTILITY"),
-        name: "FIRST-CHAR",
-        fixed_arity: 1,
-        effects: EffectSummary::PURE_TOTAL,
-        cost: 3,
-        expansion: IntrinsicId::FirstChar,
     },
 ];
 
@@ -244,17 +213,10 @@ pub fn metadata_for_symbol(sym: u32) -> Option<&'static InlineMetadata> {
         None => (None, name.as_str()),
         Some((package, bare)) => (Some(package), bare),
     };
-    KNOWN.iter().find(|m| {
-        if m.name != bare {
-            return false;
-        }
-        match m.namespace {
-            FunctionNamespace::CommonLisp => {
-                package.is_none() || matches!(package, Some("CL" | "COMMON-LISP"))
-            }
-            FunctionNamespace::Package(owner) => package == Some(owner),
-        }
-    })
+    if package.is_some() && !matches!(package, Some("CL" | "COMMON-LISP")) {
+        return None;
+    }
+    KNOWN.iter().find(|m| m.name == bare)
 }
 
 /// Lexical declaration in force at an individual call site.
@@ -626,10 +588,7 @@ mod tests {
         }
 
         let first_char = egcl_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
-        assert_eq!(
-            metadata_for_symbol(first_char).map(|m| m.function),
-            Some(KnownFunction::FirstChar)
-        );
+        assert_eq!(metadata_for_symbol(first_char), None);
         assert_eq!(
             metadata_for_symbol(egcl_rt::symbols::intern("FIRST-CHAR")),
             None

@@ -83,6 +83,54 @@ fn run_tiers(name: &str, program: &str) {
 }
 
 #[test]
+fn library_function_name_preserves_the_installed_definition() {
+    run_tiers("FIRST-CHAR custom definition", r#"
+      (defpackage :uiop/utility (:use :cl) (:export :first-char))
+      (defun uiop/utility:first-char (text) (declare (ignore text)) 110)
+      (defun library-caller (text) (uiop/utility:first-char text))
+      (dotimes (i 40) (assert (= (library-caller "abc") 110)))
+      (assert (= (egcl-ext:function-tier 'library-caller) EXPECTED-TIER))
+      (setq *saved-first-char* #'uiop/utility:first-char)
+      (defun uiop/utility:first-char (text) (declare (ignore text)) 210)
+      (assert (= (library-caller "abc") 210))
+      (assert (= (funcall *saved-first-char* "abc") 110))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#);
+}
+
+#[test]
+fn library_function_rebinding_preserves_effects_values_and_unbinding() {
+    run_tiers("FIRST-CHAR live replacement", r#"
+      (defpackage :uiop/utility (:use :cl) (:export :first-char))
+      (defun uiop/utility:first-char (text)
+        (if (plusp (length text)) (char text 0)))
+      (defparameter *effects* 0)
+      (defun library-caller (text)
+        (uiop/utility:first-char (progn (incf *effects*) text)))
+      (dotimes (i 40) (assert (eql (library-caller "abc") #\a)))
+      (assert (= (egcl-ext:function-tier 'library-caller) EXPECTED-TIER))
+      (let ((captured (list :replacement)))
+        (setf (symbol-function 'uiop/utility:first-char)
+          (lambda (text) (values captured text))))
+      (setq *effects* 0)
+      (assert (equal (multiple-value-list (library-caller "abc"))
+                     '((:replacement) "abc")))
+      (assert (= *effects* 1))
+      (setf (symbol-function 'uiop/utility:first-char)
+        (lambda (text) (declare (ignore text)) (throw 'library-exit 310)))
+      (setq *effects* 0 *cleanups* 0)
+      (assert (= (catch 'library-exit
+        (unwind-protect (library-caller "abc") (incf *cleanups*))) 310))
+      (assert (= *effects* 1))
+      (assert (= *cleanups* 1))
+      (fmakunbound 'uiop/utility:first-char)
+      (assert (handler-case (progn (library-caller "abc") nil)
+                (undefined-function () t)))
+      (format t "CALLABLE-REBINDING-OK~%")
+    "#);
+}
+
+#[test]
 fn interpreted_replacements_override_builtin_dispatch() {
     for (name, call) in [
         ("FORMAT", "(format nil \"original\")"),
