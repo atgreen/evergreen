@@ -26,6 +26,8 @@ use std::sync::OnceLock;
 pub(super) mod root_publication;
 mod activation;
 mod condition_osr;
+mod special_bindings;
+use special_bindings::{SavedSpecial, validate_special_bindings, special_request};
 use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
 #[cfg(test)]
 pub(super) use activation::fail_next_guard_reservation_for_test;
@@ -687,6 +689,7 @@ impl TransferCode {
                             | ScopeKind::HandlerCase { .. }
                             | ScopeKind::HandlerBind { .. }
                             | ScopeKind::RestartCase { .. }
+                            | ScopeKind::SpecialBinding { .. }
                     )
             }) {
                 return None;
@@ -696,7 +699,7 @@ impl TransferCode {
         let guard_handler_capacity = (0..body.code.len()).filter_map(|bcp| {
             scopes.before(bcp as u32)
         }).map(|active| active.iter().filter(|scope| !matches!(scope.kind,
-            ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. }
+            ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. } | ScopeKind::SpecialBinding { .. }
         )).count()).max().unwrap_or(0);
         let mut cleanup_depths = std::collections::HashMap::new();
         for instruction in &body.code {
@@ -1016,17 +1019,14 @@ impl TransferCode {
                                 | Instr::PopHandlerBind
                                 | Instr::PushRestartCase { .. }
                                 | Instr::PopRestartCase
+                                | Instr::BindSpecial(_)
+                                | Instr::UnbindSpecial(_)
+                                | Instr::LoadGlobal(_)
+                                | Instr::StoreGlobal(_)
                         )
                     )
             })
             .ok_or_else(invalid_capture)?;
-        // Reconstructed locals can omit dead arguments, so discard native
-        // original-argument recipes before installing bytecode state. T0
-        // scans all tagged slots without a native stack map.
-        unsafe { (*frame).code_info = std::ptr::null(); }
-        for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
-            unsafe { slot_set(frame, index as u16, *value) };
-        }
         let running = site.map().control_scopes.iter().filter_map(|scope| {
             if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
                 (Some(cleanup_bcp) != context.completed_cleanup).then_some(cleanup_bcp)
@@ -1061,11 +1061,22 @@ impl TransferCode {
         if !live_restart_cases.eq(restart_cases.iter().map(|saved| saved.push_bcp)) {
             return Err(invalid_capture());
         }
+        if !unsafe { validate_special_bindings(context, &site.map().control_scopes) } {
+            return Err(invalid_capture());
+        }
+        // Reconstructed locals can omit dead arguments, so discard native
+        // original-argument recipes before installing bytecode state. T0
+        // scans all tagged slots without a native stack map.
+        unsafe { (*frame).code_info = std::ptr::null(); }
+        for (index, value) in saved.locals.iter().chain(&saved.stack).enumerate() {
+            unsafe { slot_set(frame, index as u16, *value) };
+        }
+        let specials = unsafe { &mut *context.specials };
         let restored_handlers = site
             .map()
             .control_scopes
             .iter()
-            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. }))
+            .filter(|scope| !matches!(scope.kind, ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. }))
             .map(|scope| match scope.kind {
                 ScopeKind::Block {
                     id,
@@ -1149,7 +1160,7 @@ impl TransferCode {
             n_locals: self.body.n_locals,
             handlers: restored_handlers,
             cleanup_conts: cleanups.drain(..).map(|saved| saved.continuation).collect(),
-            dyn_binds: Vec::new(),
+            dyn_binds: specials.drain(..).map(|saved| saved.binding).collect(),
             env_frame: None,
             fn_obj: None,
             sym: u32::MAX,
@@ -1215,12 +1226,14 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
                     | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
                     | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
                     | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
-                    | Instr::PushRestartCase { .. } | Instr::PopRestartCase))
+                    | Instr::PushRestartCase { .. } | Instr::PopRestartCase
+                    | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
             || matches!(
                 op,
                 Instr::Const(_)
                     | Instr::LoadLocal(_)
                     | Instr::StoreLocal(_)
+                    | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)
                     | Instr::Pop
                     | Instr::Dup
                     | Instr::ClearMv
@@ -1683,6 +1696,28 @@ unsafe fn call_or_throw_unpublished(
     use egcl_rt::native_transfer::NativeOutcome;
     let call = unsafe { &*request.cast::<TransferCallRequest>() };
     let request_kind = call.symbol & !u64::from(u32::MAX);
+    use egcl_compiler::t2::emit::{
+        TRANSFER_SPECIAL_BIND_REQUEST, TRANSFER_SPECIAL_UNBIND_REQUEST,
+        TRANSFER_GLOBAL_LOAD_REQUEST, TRANSFER_GLOBAL_STORE_REQUEST,
+    };
+    if matches!(request_kind, TRANSFER_SPECIAL_BIND_REQUEST | TRANSFER_SPECIAL_UNBIND_REQUEST
+        | TRANSFER_GLOBAL_LOAD_REQUEST | TRANSFER_GLOBAL_STORE_REQUEST) {
+        let result = if native_error_pending() { Ok(NIL) } else {
+            guard_c2i(|| unsafe { special_request(call) })
+        };
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                NATIVE_ERROR.with(|slot| slot.set_first(error));
+                NIL
+            }
+        };
+        unsafe { out.write(NativeOutcome {
+            value,
+            exit: if native_error_pending() { NativeExit::Transfer } else { NativeExit::Returned },
+        }); }
+        return;
+    }
     use egcl_compiler::t2::emit::{
         TRANSFER_HANDLER_BIND_ENTER_REQUEST, TRANSFER_HANDLER_BIND_LEAVE_REQUEST,
         TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
@@ -2225,12 +2260,13 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
             | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
             | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }
             | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
-            | ScopeKind::RestartCase { .. }))
+            | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }))
     {
         return false;
     }
     let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
-    if !unsafe { validate_condition_clusters(context, scopes, env) } { return false; }
+    if !unsafe { validate_condition_clusters(context, scopes, env)
+        && validate_special_bindings(context, scopes) } { return false; }
     let cleanups = unsafe { &*context.cleanups };
     let mut saved_cleanups = cleanups.iter();
     let mut handler_depth = 0;
@@ -2240,7 +2276,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
             if saved.cleanup_bcp != cleanup_bcp || saved.continuation.handler_depth != handler_depth {
                 return false;
             }
-        } else {
+        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. }) {
             handler_depth += 1;
         }
     }
@@ -2521,6 +2557,7 @@ struct CaptureContext {
     landing: SysvNativeLanding,
     dispatch: DispatchPacket,
     cleanups: *mut Vec<SavedCleanup>,
+    specials: *mut Vec<SavedSpecial>,
     cleanup_depths: *const std::collections::HashMap<u32, usize>,
     code_base: usize,
     sites: *const SysvTransferTable,
@@ -2839,11 +2876,15 @@ unsafe fn prepare_transfer(
     // If any subsequent step lacks a native destination, fallback still sees
     // the exact state described by this source site's reconstruction map.
     let scopes = &site.map().control_scopes;
+    if !unsafe { validate_special_bindings(context, scopes) } {
+        return Err(TransferSiteError::InvalidLandingCapture);
+    }
     let mut remaining = scopes.as_slice();
     let action = loop {
         match next_unwind_step(remaining, selected_target) {
             NativeUnwindStep::RetireCatch { scope_index }
-            | NativeUnwindStep::RetireHandler { scope_index } => {
+            | NativeUnwindStep::RetireHandler { scope_index }
+            | NativeUnwindStep::RetireSpecial { scope_index } => {
                 remaining = &remaining[..scope_index];
             }
             action => break action,
@@ -2975,6 +3016,13 @@ unsafe fn prepare_transfer(
         // even when both transfers name the same catch binding.
         cleanups.pop();
     }
+    // Live signaling above saw every binding. Only now, after selecting and
+    // validating a destination, restore the crossed lexical suffix before
+    // executing its cleanup or selected clause.
+    let keep_specials = scopes[..scope_index].iter()
+        .filter(|scope| matches!(scope.kind, ScopeKind::SpecialBinding { .. })).count();
+    let specials = unsafe { &mut *context.specials };
+    while specials.len() > keep_specials { specials.pop(); }
     match scopes[scope_index].kind {
         ScopeKind::Unwind { cleanup_bcp } => {
             assert!(cleanups.len() < cleanups.capacity());

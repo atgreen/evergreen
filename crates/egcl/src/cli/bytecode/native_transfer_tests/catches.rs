@@ -60,6 +60,17 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
         &mut env,
     )
     .unwrap();
+    // Global access now lets this helper promote. Pin only the signaling
+    // fixture so the fallback counter continues to measure the mapped catch.
+    struct HelperPin(u32);
+    impl Drop for HelperPin {
+        fn drop(&mut self) {
+            profile_unpin(self.0);
+        }
+    }
+    let helper = egcl_rt::symbols::intern("CATCH-EXIT");
+    profile_pin(helper);
+    let _helper_pin = HelperPin(helper);
     for (source, throws, native_cleanups) in [
         ("((catch tag (catch-answer x)))", 0, 0),
         ("((catch tag (catch-exit tag x)))", 1, 0),

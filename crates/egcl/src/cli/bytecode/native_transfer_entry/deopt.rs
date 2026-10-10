@@ -139,7 +139,7 @@ unsafe fn take_guard_resume_state(
                     | ScopeKind::Cleanup { .. }
                     | ScopeKind::HandlerCase { .. }
                     | ScopeKind::HandlerBind { .. }
-                    | ScopeKind::RestartCase { .. })
+                    | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. })
     }) {
         return Err(invalid_capture());
     }
@@ -157,13 +157,15 @@ unsafe fn take_guard_resume_state(
             {
                 return Err(invalid_capture());
             }
-        } else {
+        } else if !matches!(scope.kind, ScopeKind::SpecialBinding { .. }) {
             handler_depth += 1;
         }
     }
     if saved_cleanups.next().is_some() {
         return Err(invalid_capture());
     }
+    if !unsafe { validate_special_bindings(context, active) } { return Err(invalid_capture()); }
+    let specials = unsafe { &mut *context.specials };
     let catches = unsafe { &mut *context.catches };
     let expected_catches = active.iter().filter_map(|scope| {
         matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
@@ -180,9 +182,10 @@ unsafe fn take_guard_resume_state(
     let mut state = if context.recursive.is_null() {
         let reserved = unsafe { &mut *context.guard_resume };
         let state = reserved.as_ref().ok_or_else(invalid_capture)?;
-        if !state.handlers.is_empty() || !state.cleanup_conts.is_empty()
+        if !state.handlers.is_empty() || !state.cleanup_conts.is_empty() || !state.dyn_binds.is_empty()
             || state.handlers.capacity() < handler_depth
             || state.cleanup_conts.capacity() < cleanups.len()
+            || state.dyn_binds.capacity() < specials.len()
         {
             return Err(invalid_capture());
         }
@@ -190,7 +193,7 @@ unsafe fn take_guard_resume_state(
     } else {
         // Direct recursive frames share this context but remain scope-free.
         // Do not consume the outer activation's one-shot cleanup reservation.
-        if !cleanups.is_empty() || !catches.is_empty()
+        if !cleanups.is_empty() || !catches.is_empty() || !specials.is_empty()
             || unsafe { !(*context.handlers).is_empty()
                 || !(*context.handler_binds).is_empty()
                 || !(*context.restart_cases).is_empty()
@@ -198,16 +201,17 @@ unsafe fn take_guard_resume_state(
             || active.iter().any(|scope| matches!(scope.kind,
                 ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. } | ScopeKind::Catch { .. }
                     | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
-                    | ScopeKind::RestartCase { .. }))
+                    | ScopeKind::RestartCase { .. } | ScopeKind::SpecialBinding { .. }))
         {
             return Err(invalid_capture());
         }
         let mut handlers = Vec::new();
         handlers.try_reserve(handler_depth).map_err(|_| EgclError::Oom)?;
-        OuterResumeState { handlers, cleanup_conts: Vec::new() }
+        OuterResumeState { handlers, cleanup_conts: Vec::new(), dyn_binds: Vec::new() }
     };
     egcl_rt::rooted_ref!(_state_root = &mut state);
     state.cleanup_conts.extend(cleanups.drain(..).map(|saved| saved.continuation));
+    state.dyn_binds.extend(specials.drain(..).map(|saved| saved.binding));
     let mut saved_catches = catches.drain(..);
     // The shared validator checked each ledger against this lexical order
     // before any native metadata changed. Move registrations, never rebuild
@@ -233,7 +237,7 @@ unsafe fn take_guard_resume_state(
                 cleanup_bcp,
                 sp_restore: scope.sp_restore,
             },
-            ScopeKind::Cleanup { .. } => continue,
+            ScopeKind::Cleanup { .. } | ScopeKind::SpecialBinding { .. } => continue,
             ScopeKind::Catch { resume_bcp } => Handler::Catch {
                 token: saved_catches.next().expect("validated catch order").token,
                 resume_bcp,
@@ -350,7 +354,8 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         }
         if unsafe { (*context).recursive.is_null() } {
             let active = code.control_scopes.before(bcp).expect("validated guard bcp");
-            if !unsafe { validate_condition_clusters(&*context, active, &*env) } {
+            if !unsafe { validate_condition_clusters(&*context, active, &*env)
+                && validate_special_bindings(&*context, active) } {
                 return Err(invalid_capture());
             }
         }

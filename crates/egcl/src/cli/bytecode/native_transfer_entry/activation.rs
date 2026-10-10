@@ -14,6 +14,7 @@ pub(super) struct ActivationState {
     guard_resume: Option<OuterResumeState>,
     pub(super) snapshots: Vec<SysvSiteSnapshot>,
     pub(super) cleanups: Vec<SavedCleanup>,
+    pub(super) specials: Vec<SavedSpecial>,
     pub(super) catches: Vec<SavedCatch>,
     pub(super) handlers: Vec<SavedHandler>,
     pub(super) handler_binds: Vec<SavedHandlerBind>,
@@ -34,6 +35,7 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
         self.guard_resume.trace_host_roots(visit);
         self.snapshots.trace_host_roots(visit);
         self.cleanups.trace_host_roots(visit);
+        self.specials.trace_host_roots(visit);
         self.prepared_handler.trace_host_roots(visit);
         self.prepared_catch.trace_host_roots(visit);
         self.restart_templates.trace_host_roots(visit);
@@ -42,6 +44,10 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
 
 impl ActivationState {
     pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+        let special_capacity = code.body.code.iter()
+            .filter(|op| matches!(op, Instr::BindSpecial(_))).count();
+        let mut specials = Vec::new();
+        specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
         let guard_resume = if code.has_deopt {
             #[cfg(test)]
             if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
@@ -50,9 +56,11 @@ impl ActivationState {
             let mut state = OuterResumeState {
                 handlers: Vec::new(),
                 cleanup_conts: Vec::new(),
+                dyn_binds: Vec::new(),
             };
             state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
             state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
+            state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
             Some(state)
         } else {
             None
@@ -160,6 +168,7 @@ impl ActivationState {
             guard_resume,
             snapshots,
             cleanups,
+            specials,
             catches,
             handlers,
             handler_binds,
@@ -174,7 +183,7 @@ impl ActivationState {
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.catches.is_empty() && self.cleanups.is_empty()
+        self.catches.is_empty() && self.cleanups.is_empty() && self.specials.is_empty()
             && self.handlers.is_empty() && self.handler_binds.is_empty()
             && self.restart_cases.is_empty() && self.dynamic_scopes.is_empty()
             && self.can_osr()
@@ -192,6 +201,7 @@ impl ActivationState {
         let ready = self.ready_osr.as_mut().expect("OSR was prepared before commit");
         ready.catches = std::mem::take(&mut self.catches);
         ready.cleanups = std::mem::take(&mut self.cleanups);
+        ready.specials = std::mem::take(&mut self.specials);
         ready.handlers = std::mem::take(&mut self.handlers);
         ready.handler_binds = std::mem::take(&mut self.handler_binds);
         ready.restart_cases = std::mem::take(&mut self.restart_cases);
@@ -255,6 +265,7 @@ impl ActivationState {
                 request: std::ptr::null_mut(),
             },
             cleanups: &mut self.cleanups,
+            specials: &mut self.specials,
             cleanup_depths: &code.cleanup_depths,
             code_base: code.code.as_ptr() as usize,
             sites: &code.sites,
@@ -275,4 +286,11 @@ thread_local! {
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn fail_next_guard_reservation_for_test() {
     FAIL_GUARD_RESERVATION.with(|fail| fail.set(true));
+}
+
+impl Drop for ActivationState {
+    fn drop(&mut self) {
+        // Repeated bindings of one symbol must restore newest first.
+        while self.specials.pop().is_some() {}
+    }
 }
