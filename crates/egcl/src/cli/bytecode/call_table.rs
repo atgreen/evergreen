@@ -383,9 +383,7 @@ pub(super) unsafe fn is_builtin_funcall(cell: u64) -> bool {
 pub(super) unsafe fn is_builtin_apply(cell: u64) -> bool {
     let symbol = unsafe { state(cell) }.symbol;
     egcl_rt::symbols::find_index("APPLY") == Some(symbol)
-        && !egcl_rt::symbols::symbol_function(symbol)
-            .is_some_and(egcl_rt::function::is_interpreted_function)
-        && super::super::global_fn("APPLY").is_none()
+        && super::super::installed_function(symbol).is_none()
 }
 
 /// Feedback belongs only to the exact version still selected by a warm cell.

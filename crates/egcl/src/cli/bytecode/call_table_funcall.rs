@@ -207,9 +207,7 @@ impl Cache {
 
 pub(super) fn is_builtin(symbol: u32) -> bool {
     egcl_rt::symbols::find_index("FUNCALL") == Some(symbol)
-        && !egcl_rt::symbols::symbol_function(symbol)
-            .is_some_and(egcl_rt::function::is_interpreted_function)
-        && super::super::global_fn("FUNCALL").is_none()
+        && super::super::installed_function(symbol).is_none()
 }
 
 fn fallback_entries() -> Option<[usize; 2]> {

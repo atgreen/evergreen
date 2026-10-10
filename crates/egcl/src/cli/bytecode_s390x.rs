@@ -182,6 +182,18 @@ fn arithmetic(
     bcp: u32,
     deopts: &mut std::collections::BTreeMap<u32, ZLabel>,
 ) -> bool {
+    let supported = (nargs == 1 && inlinable_unary_fixnum_op(sym).is_some())
+        || (nargs == 2 && inlinable_fixnum_op(sym).is_some());
+    if !supported { return false; }
+    let Some(egcl_compiler::t2::ir::AuxData::BuiltinBinding { address, expected }) =
+        egcl_compiler::t2::builtin_binding::snapshot(sym)
+    else { return false; };
+    let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
+    a.imm64(1, address as u64);
+    a.load(2, 1, 0);
+    a.imm64(3, expected);
+    a.compare(2, 3);
+    a.branch(6, deopt);
     if nargs == 1 {
         if let Some(op) = inlinable_unary_fixnum_op(sym) {
             let deopt = *deopts.entry(bcp).or_insert_with(|| a.label());
