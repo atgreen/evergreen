@@ -12,6 +12,9 @@
   cleanups, preserving saved values and pending transfers without repeating
   cleanup. Local `HANDLER-BIND`, `HANDLER-CASE` and `RESTART-CASE` scopes
   retain their original registrations through optimization and guard recovery.
+  Special-variable bindings retain their original values across these tier
+  changes and restore correctly before outer cleanups, including nested
+  bindings of the same variable.
   Direct recursive activations and other unsupported local scopes remain
   outside this OSR route
   ([#218](https://github.com/atgreen/evergreen/pull/218),
@@ -19,7 +22,8 @@
   [#220](https://github.com/atgreen/evergreen/pull/220),
   [#223](https://github.com/atgreen/evergreen/pull/223),
   [#224](https://github.com/atgreen/evergreen/pull/224),
-  [#225](https://github.com/atgreen/evergreen/pull/225)).
+  [#225](https://github.com/atgreen/evergreen/pull/225),
+  [#226](https://github.com/atgreen/evergreen/pull/226)).
 
 - Preserve required type guards when optimized loops are entered through OSR
   (including nested loop entries) and reject entries with missing live values,
