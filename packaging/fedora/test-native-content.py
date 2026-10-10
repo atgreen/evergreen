@@ -35,6 +35,10 @@ class NativeContentTests(unittest.TestCase):
             shake.mkdir(parents=True)
             for name in ('egcl-shake-asdf.asd', 'asdf-integration.lisp', 'README.md'):
                 (shake / name).write_text(name)
+            embed = source / 'lib/egcl-embed'
+            embed.mkdir(parents=True)
+            for name in ('egcl-embed-asdf.asd', 'asdf-integration.lisp', 'README.md'):
+                (embed / name).write_text(name)
             manual = root / 'manual'
             (manual / 'java').mkdir(parents=True)
             (manual / 'assets').mkdir()
@@ -49,6 +53,8 @@ class NativeContentTests(unittest.TestCase):
             self.assertTrue((installed / 'libegcl_jvm.so').is_symlink())
             self.assertEqual({p.name for p in (stage / 'usr/share/common-lisp/source/egcl-shake').iterdir()},
                              {'egcl-shake-asdf.asd', 'asdf-integration.lisp', 'README.md'})
+            self.assertEqual({p.name for p in (stage / 'usr/share/common-lisp/source/egcl-embed').iterdir()},
+                             {'egcl-embed-asdf.asd', 'asdf-integration.lisp', 'README.md'})
             self.assertFalse((installed / 'libegcl_jvm.so').readlink().is_absolute())
             relocated = root / 'extracted'
             stage.rename(relocated)

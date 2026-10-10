@@ -17,6 +17,9 @@ pub(super) enum StreamHandle {
     File(File),
     Pipe(PipeHandle),
     Socket(TcpStream),
+    /// The contents of an image-embedded file: a copy taken when the stream
+    /// was opened, so the stream never holds a pointer into the moving heap.
+    Memory(io::Cursor<Vec<u8>>),
     Closed,
 }
 
@@ -57,7 +60,16 @@ impl StreamHandle {
                 closed: Arc::clone(&pipe.closed),
             })),
             Self::Socket(socket) => socket.try_clone().map(Self::Socket),
+            Self::Memory(cursor) => Ok(Self::Memory(cursor.clone())),
             Self::Closed => Err(io::Error::other("closed stream")),
+        }
+    }
+
+    /// The length of an in-memory transport; `None` for every OS-backed one.
+    pub(super) fn memory_len(&self) -> Option<u64> {
+        match self {
+            Self::Memory(cursor) => Some(cursor.get_ref().len() as u64),
+            _ => None,
         }
     }
 
@@ -70,6 +82,9 @@ impl StreamHandle {
 
     /// True when a read can complete, including EOF and connection errors.
     pub(super) fn wait_readable(&self, timeout_ms: Option<i32>) -> io::Result<bool> {
+        if matches!(self, Self::Memory(_)) {
+            return Ok(true);
+        }
         if let Self::Socket(socket) = self {
             let timeout = timeout_ms
                 .filter(|n| *n >= 0)
@@ -173,6 +188,7 @@ impl Read for StreamHandle {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::File(file) => file.read(buffer),
+            Self::Memory(cursor) => cursor.read(buffer),
             Self::Pipe(pipe) => {
                 if buffer.is_empty() {
                     return Ok(0);
@@ -232,6 +248,10 @@ impl Write for StreamHandle {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         match self {
             Self::File(file) => file.write(buffer),
+            Self::Memory(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "embedded files are read-only",
+            )),
             Self::Pipe(pipe) => {
                 if buffer.is_empty() {
                     return Ok(0);
@@ -252,7 +272,7 @@ impl Write for StreamHandle {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::File(file) => file.flush(),
-            Self::Pipe(_) => Ok(()),
+            Self::Pipe(_) | Self::Memory(_) => Ok(()),
             Self::Socket(socket) => socket.flush(),
             Self::Closed => Err(io::Error::other("closed stream")),
         }
@@ -318,7 +338,7 @@ impl AsRawFd for StreamHandle {
             Self::File(file) => file.as_raw_fd(),
             Self::Pipe(pipe) => pipe.file.as_raw_fd(),
             Self::Socket(socket) => socket.as_raw_fd(),
-            Self::Closed => -1,
+            Self::Memory(_) | Self::Closed => -1,
         }
     }
 }

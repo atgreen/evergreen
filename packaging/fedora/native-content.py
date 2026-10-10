@@ -34,6 +34,10 @@ def install(source, manual, stage, *, libdir, datadir, docdir):
     shake.mkdir(parents=True, exist_ok=True)
     for name in ('egcl-shake-asdf.asd', 'asdf-integration.lisp', 'README.md'):
         shutil.copy2(source / 'lib/egcl-shake' / name, shake / name)
+    embed = stage / datadir.lstrip('/') / 'common-lisp/source/egcl-embed'
+    embed.mkdir(parents=True, exist_ok=True)
+    for name in ('egcl-embed-asdf.asd', 'asdf-integration.lisp', 'README.md'):
+        shutil.copy2(source / 'lib/egcl-embed' / name, embed / name)
     destination = stage / docdir.lstrip('/') / 'egcl/manual'
     if destination.exists():
         shutil.rmtree(destination)
