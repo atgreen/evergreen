@@ -790,15 +790,6 @@ fn stringp_retains_semantic_call_instead_of_simple_string_typecheck() {
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
-static FIRST_CHAR_DEOPTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(all(target_arch = "x86_64", unix))]
-extern "C" fn first_char_deopt() {
-    FIRST_CHAR_DEOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
 static CONS_ACCESS_DEOPTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1225,146 +1216,40 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
 }
 
-#[cfg(all(target_arch = "x86_64", unix))]
-fn integration_string(bytes: &[u8]) -> EgclVal {
-    let total = (16 + bytes.len() + 7) & !7;
-    let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-    unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout);
-        *(ptr as *mut ObjectHeader) =
-            ObjectHeader::new(type_id::SIMPLE_BASE_STRING, (total / 8) as u16);
-        *((ptr as *mut u64).add(1)) = bytes.len() as u64;
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(16), bytes.len());
-        EgclVal::from_heap_ptr(ptr)
-    }
-}
-
-#[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn first_char_metadata_expands_to_guarded_string_layout_ir() {
-    use std::sync::atomic::Ordering;
-    use egcl_compiler::t2::emit::emit_framed;
-    use egcl_compiler::t2::ir::Opcode;
+fn library_function_name_retains_its_call_and_deopt_state() {
+    use egcl_compiler::t2::ir::{AuxData, Opcode};
 
     let first_char = egcl_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
     let bf = bytecode_fn(
         "first-char-caller",
         vec![
             Instr::LoadLocal(0),
-            Instr::CallNamed {
-                sym: first_char,
-                nargs: 1,
-            },
+            Instr::CallNamed { sym: first_char, nargs: 1 },
             Instr::Return,
         ],
-        vec![],
-        1,
-        1,
-        1,
+        vec![], 1, 1, 1,
     );
-    let mut f = build_from_bytecode(&bf).expect("build FIRST-CHAR inline template");
-    let insts: Vec<_> = f
-        .block_order()
-        .iter()
-        .flat_map(|&b| f.block(b).insts.iter().copied())
-        .map(|i| f.inst(i))
-        .collect();
-    assert_eq!(
-        insts
-            .iter()
-            .filter(|d| { matches!(&d.aux, egcl_compiler::t2::ir::AuxData::StringLayout) })
-            .count(),
-        1,
-        "the template expresses layout validation as one explicit guard"
-    );
-    assert!(
-        insts.iter().any(|d| d.opcode == Opcode::StringByteLength),
-        "the source LENGTH operation is present before ordinary DCE"
-    );
-    assert_eq!(
-        insts
-            .iter()
-            .filter(|d| d.opcode == Opcode::StringAsciiCharAt)
-            .count(),
-        1,
-        "FIRST-CHAR needs exactly one guarded string operation"
-    );
-    assert!(!insts.iter().any(|d| d.opcode == Opcode::Call));
-    for guard in insts.iter().filter(|d| d.flags.guard) {
-        assert!(guard.flags.guard && guard.flags.effectful);
-        let fs = f
-            .frame_states
-            .get(guard.frame_state.expect("layout guard FrameState"));
-        assert_eq!(fs.scopes.len(), 1);
-        assert_eq!(fs.scopes[0].bcp, 1, "resume at the original CallNamed");
-        assert_eq!(
-            fs.scopes[0].stack.len(),
-            1,
-            "the argument remains deopt-live"
-        );
-    }
-
+    let mut f = build_from_bytecode(&bf).expect("build ordinary library call");
     let mut pm = PassManager::new();
     pm.add(Box::new(GuardElim));
     pm.add(Box::new(Dce));
     pm.run(&mut f);
-    assert!(
-        !f.block_order().iter().any(|&b| {
-            f.block(b)
-                .insts
-                .iter()
-                .any(|&i| f.inst(i).opcode == Opcode::StringByteLength)
-        }),
-        "ordinary DCE removes the now-pure unused byte-length load"
-    );
-
-    let framed = emit_framed(
-        &f,
-        first_char_deopt as *const () as usize as u64,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        None,
-    )
-    .expect("emit FIRST-CHAR fast path");
-    let base_layout_cmp = [0x80, 0x7a, 0x07, type_id::SIMPLE_BASE_STRING];
-    let character_layout_cmp = [0x80, 0x7a, 0x07, type_id::SIMPLE_CHARACTER_STRING];
-    assert_eq!(
-        framed
-            .code
-            .windows(base_layout_cmp.len())
-            .filter(|window| *window == base_layout_cmp)
-            .count(),
-        1,
-        "the fast path must validate the base-string layout only once"
-    );
-    assert_eq!(
-        framed
-            .code
-            .windows(character_layout_cmp.len())
-            .filter(|window| *window == character_layout_cmp)
-            .count(),
-        1,
-        "the fast path must validate the character-string layout only once"
-    );
-    let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
-    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
-
-    let mut frame = [integration_string(b"abc").0, 0, 0];
-    FIRST_CHAR_DEOPTED.store(false, Ordering::SeqCst);
-    assert_eq!(EgclVal(run(frame.as_mut_ptr())).as_char(), 'a');
-    assert!(!FIRST_CHAR_DEOPTED.load(Ordering::SeqCst));
-
-    for value in [integration_string(b""), EgclVal::from_fixnum(7)] {
-        frame[0] = value.0;
-        FIRST_CHAR_DEOPTED.store(false, Ordering::SeqCst);
-        let _ = run(frame.as_mut_ptr());
-        assert!(FIRST_CHAR_DEOPTED.load(Ordering::SeqCst));
-    }
+    verify(&f).expect("library call retains valid SSA and deopt state");
+    let insts: Vec<_> = f.block_order().iter()
+        .flat_map(|&b| f.block(b).insts.iter().copied())
+        .map(|i| f.inst(i)).collect();
+    let calls: Vec<_> = insts.iter().filter(|d| d.opcode == Opcode::Call).collect();
+    assert_eq!(calls.len(), 1);
+    let call = calls[0];
+    assert!(matches!(call.aux, AuxData::CallTarget(sym) if sym == first_char));
+    assert_eq!(call.args.len(), 1);
+    assert!(call.flags.effectful && call.flags.safepoint);
+    let state = f.frame_states.get(call.frame_state.expect("call FrameState"));
+    assert_eq!(state.scopes[0].bcp, 1);
+    assert_eq!(state.scopes[0].stack.len(), 1);
+    assert!(!insts.iter().any(|d| matches!(d.opcode,
+        Opcode::StringByteLength | Opcode::StringAsciiCharAt)));
 }
 
 #[cfg(all(target_arch = "x86_64", unix))]
@@ -1374,9 +1259,9 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::inlining::InlineOptions;
-    use egcl_compiler::t2::ir::{AuxData, Opcode};
+    use egcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
 
-    let first_char = egcl_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
+    let car = egcl_rt::symbols::intern("CAR");
     let helper = egcl_rt::symbols::intern("GENERAL-GUARDED-LEAF");
     let caller = egcl_rt::symbols::intern("GENERAL-GUARDED-CALLER");
     let helper_body = Arc::new(bytecode_fn(
@@ -1384,7 +1269,7 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
         vec![
             Instr::LoadLocal(0),
             Instr::CallNamed {
-                sym: first_char,
+                sym: car,
                 nargs: 1,
             },
             Instr::Return,
@@ -1420,17 +1305,17 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
         .with_body(helper, helper_body);
     let mut f = build_from_bytecode_with_inline_options(&caller_body, options)
         .expect("inline two guarded callee bodies");
-    let layout_guard_count = |f: &egcl_compiler::t2::ir::Function| {
+    let cons_guard_count = |f: &egcl_compiler::t2::ir::Function| {
         f.block_order()
             .iter()
             .flat_map(|&b| f.block(b).insts.iter().copied())
             .filter(|&i| {
-                f.inst(i).opcode == Opcode::Guard && matches!(&f.inst(i).aux, AuxData::StringLayout)
+                f.inst(i).opcode == Opcode::Guard && matches!(&f.inst(i).aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
             })
             .count()
     };
     assert_eq!(
-        layout_guard_count(&f),
+        cons_guard_count(&f),
         2,
         "each independently built callee contributes its own proof"
     );
@@ -1441,23 +1326,22 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     pm.run(&mut f);
     verify(&f).expect("post-inline guard elimination preserves valid SSA/deopt state");
     assert_eq!(
-        layout_guard_count(&f),
+        cons_guard_count(&f),
         1,
         "the dominating proof eliminates the guard cloned by the second call"
     );
 
     let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0, 0, Some(caller))
         .expect("emit caller after general guard elimination");
-    let base_layout_cmp = [0x80, 0x7a, 0x07, type_id::SIMPLE_BASE_STRING];
-    assert_eq!(
-        framed
-            .code
-            .windows(base_layout_cmp.len())
-            .filter(|window| *window == base_layout_cmp)
-            .count(),
-        1,
-        "emitted caller contains one layout proof across both inlined bodies"
-    );
+    let cell = Box::new(ConsCell {
+        car: EgclVal::from_fixnum(17),
+        cdr: EgclVal::from_fixnum(29),
+    });
+    let cons = unsafe { EgclVal::from_cons_ptr(&*cell as *const ConsCell as *mut u8) };
+    let buf = egcl_rt::jit::JitBuffer::new(&framed.code).expect("mmap");
+    let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buf.as_ptr()) };
+    let mut frame = [cons.0, 0, 0];
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.car);
 }
 
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.

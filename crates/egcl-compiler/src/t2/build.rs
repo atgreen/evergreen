@@ -1910,16 +1910,13 @@ impl<'a> Builder<'a> {
                             self.inline_options.config,
                         );
                         if let InlineDecision::Expand(intrinsic) = decision {
-                            let builtin = metadata.namespace == super::inlining::FunctionNamespace::CommonLisp;
-                            let binding = super::builtin_binding::snapshot(*sym);
-                            if !builtin || binding.is_some() {
+                            if let Some(binding) = super::builtin_binding::snapshot(*sym) {
                                 let state = self.build_frame_state(block, &stack, i as u32);
                                 let position = self.f.block(block).insts.len();
                                 if self.expand_intrinsic(intrinsic, block, &mut stack, i, start)? {
-                                    if builtin {
-                                        super::builtin_binding::insert(&mut self.f, block, position,
-                                            state, binding.expect("builtin binding was captured"));
-                                    }
+                                    super::builtin_binding::insert(
+                                        &mut self.f, block, position, state, binding,
+                                    );
                                     self.remaining_inline_budget -= metadata.cost;
                                     continue;
                                 }
@@ -2644,73 +2641,6 @@ impl<'a> Builder<'a> {
             return Ok(true);
         }
 
-        if intrinsic == IntrinsicId::FirstChar {
-            // Inline the metadata-owned body below the CL function layer.  Keep
-            // layout validation as an explicit SSA guard so the post-inlining
-            // dominator pass can merge an equivalent guard cloned from another
-            // callee.  Both raw string operations consume the refined value and
-            // never revalidate its layout themselves.
-            let fs = self.build_frame_state(block, stack, bcp as u32);
-            let string = stack
-                .pop()
-                .ok_or(BuildError::Unsupported("stack underflow (FIRST-CHAR)"))?;
-            let guard_flags = InstFlags {
-                effectful: true,
-                guard: true,
-                ..InstFlags::default()
-            };
-            let checked_string = self
-                .emit(
-                    block,
-                    Opcode::Guard,
-                    vec![string],
-                    AuxData::StringLayout,
-                    guard_flags,
-                    Some(fs),
-                    IRType::of(TypeBits::STRING),
-                )
-                .ok_or(BuildError::Unsupported("StringLayout guard has a result"))?;
-            // This faithfully represents the source LENGTH operation.  Its
-            // result is unused because CHAR-at-zero's bounds guard subsumes the
-            // positive-length branch; ordinary deopt-aware DCE removes the pure
-            // load in the production pipeline.
-            let _byte_length = self
-                .emit(
-                    block,
-                    Opcode::StringByteLength,
-                    vec![checked_string],
-                    AuxData::None,
-                    InstFlags::default(),
-                    None,
-                    IRType::of(TypeBits::FIXNUM),
-                )
-                .ok_or(BuildError::Unsupported("StringByteLength has a result"))?;
-            let zero = self
-                .emit(
-                    block,
-                    Opcode::ConstFixnum,
-                    vec![],
-                    AuxData::FixnumImm(0),
-                    InstFlags::default(),
-                    None,
-                    IRType::of(TypeBits::FIXNUM),
-                )
-                .expect("ConstFixnum has a result");
-            let result = self
-                .emit(
-                    block,
-                    Opcode::StringAsciiCharAt,
-                    vec![checked_string, zero],
-                    AuxData::None,
-                    guard_flags,
-                    Some(fs),
-                    IRType::of(TypeBits::CHARACTER),
-                )
-                .ok_or(BuildError::Unsupported("StringAsciiCharAt has a result"))?;
-            stack.push(result);
-            return Ok(true);
-        }
-
         let type_bits = match intrinsic {
             // NOT inlinable (bliss-74rl).  A TypeBits::CONS test is a raw tag
             // test, but egcl represents a closure as the cons
@@ -2774,7 +2704,6 @@ impl<'a> Builder<'a> {
             IntrinsicId::Car | IntrinsicId::Cdr => {
                 unreachable!("handled as guarded field loads above")
             }
-            IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
 
         if let Some(bits) = type_bits {
@@ -2828,7 +2757,6 @@ impl<'a> Builder<'a> {
             IntrinsicId::Car | IntrinsicId::Cdr => {
                 unreachable!("handled as guarded field loads above")
             }
-            IntrinsicId::FirstChar => unreachable!("handled as an inline body above"),
         };
         let result = self
             .emit(
@@ -3753,15 +3681,15 @@ mod tests {
 
     #[test]
     fn cloned_guard_has_nested_scopes_and_chained_source_position() {
-        let helper = egcl_rt::symbols::intern("BODY-INLINE-FIRST-CHAR");
-        let caller = egcl_rt::symbols::intern("BODY-INLINE-FIRST-CHAR-CALLER");
-        let first_char = egcl_rt::symbols::intern("UIOP/UTILITY:FIRST-CHAR");
+        let helper = egcl_rt::symbols::intern("BODY-INLINE-CAR");
+        let caller = egcl_rt::symbols::intern("BODY-INLINE-CAR-CALLER");
+        let car = egcl_rt::symbols::intern("CAR");
         let body = Arc::new(bf(
-            "BODY-INLINE-FIRST-CHAR",
+            "BODY-INLINE-CAR",
             vec![
                 Instr::LoadLocal(0),
                 Instr::CallNamed {
-                    sym: first_char,
+                    sym: car,
                     nargs: 1,
                 },
                 Instr::Return,
@@ -3772,7 +3700,7 @@ mod tests {
             1,
         ));
         let input = bf(
-            "BODY-INLINE-FIRST-CHAR-CALLER",
+            "BODY-INLINE-CAR-CALLER",
             vec![
                 Instr::LoadLocal(0),
                 Instr::CallNamed {
@@ -3794,8 +3722,8 @@ mod tests {
             .block_order()
             .iter()
             .flat_map(|&b| f.block(b).insts.iter().copied())
-            .find(|&i| f.inst(i).flags.guard)
-            .expect("FIRST-CHAR guard cloned");
+            .find(|&i| matches!(f.inst(i).aux, AuxData::TypeTag(_)))
+            .expect("CAR type guard cloned");
         let data = f.inst(guard);
         let scopes = &f.frame_states.get(data.frame_state.unwrap()).scopes;
         assert_eq!(scopes.len(), 2);
