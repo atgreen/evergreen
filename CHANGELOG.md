@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve replaced `LDB`, `BYTE`, and `TYPEP` functions in newly compiled calls,
+  including lexical `BYTE` definitions and multiple values from replacements.
+  Keep eligible constant `TYPEP` predicates native and preserve their single-value
+  results ([#197](https://github.com/atgreen/evergreen/pull/197)).
+
 - Preserve the installed definition of `UIOP/UTILITY:FIRST-CHAR` in optimized
   calls, including redefinition, multiple return values, and nonlocal exits
   ([#196](https://github.com/atgreen/evergreen/pull/196)).
