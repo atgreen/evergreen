@@ -447,9 +447,18 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     }
 
     // Mutation phase: turn each into a guarded typed op.
-    let n = work.len();
+    let mut n = 0;
     let mut fixnum_sites: Vec<Inst> = Vec::new();
     for (inst, opcode, ty, extra) in work {
+        let AuxData::CallTarget(symbol) = f.inst(inst).aux else { continue };
+        let Some(binding) = super::builtin_binding::snapshot(symbol) else { continue };
+        let Some(state) = f.inst(inst).frame_state else { continue };
+        let (block, position) = f.block_order().iter().find_map(|&block| {
+            f.block(block).insts.iter().position(|&candidate| candidate == inst)
+                .map(|position| (block, position))
+        }).expect("speculation site belongs to a block");
+        super::builtin_binding::insert(f, block, position, state, binding);
+        n += 1;
         // Materialise the appended constant operand (1+/1- → const 1; NOT →
         // const NIL) as a const inst placed immediately before the site.
         let extra_value = match extra {

@@ -141,3 +141,51 @@ fn promotion_cannot_replace_the_selected_definition_with_a_newer_body() {
         );
     }
 }
+
+#[test]
+fn named_callable_instance_moves_during_argument_evaluation() {
+    let _lock = super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::read_eval_all_env(
+        "(defclass dispatch-moving-instance () ()
+           (:metaclass egcl-ext:funcallable-standard-class))
+         (defun dispatch-instance-function (x) (values (+ x 40) x))",
+        &mut env,
+    )
+    .unwrap();
+    let class_name = resolve_sym("DISPATCH-MOVING-INSTANCE").unwrap();
+    let class = egcl_stdlib::find_class(class_name).unwrap();
+    let function_slot = resolve_sym(super::super::FUNCALLABLE_FUNCTION_SLOT).unwrap();
+    egcl_rt::rooted!(function = super::super::global_fn("DISPATCH-INSTANCE-FUNCTION").unwrap());
+    let symbol = resolve_sym("DISPATCH-INSTANCE-ENTRY")
+        .unwrap()
+        .as_symbol_index();
+    egcl_rt::rooted!(
+        form = reader::read_from_string(
+            "(dispatch-instance-entry (progn (%force-minor-gc-for-test) 10))"
+        )
+        .unwrap()
+        .0
+    );
+    // Allocate last: the first collection after this must happen inside the
+    // argument evaluation, with the selected callable held by eval_list.
+    egcl_rt::rooted!(instance = egcl_stdlib::allocate_instance(class).unwrap());
+    egcl_stdlib::set_slot_value(*instance, function_slot, *function).unwrap();
+    egcl_rt::symbols::set_symbol_function(symbol, *instance);
+    let before = instance.to_raw();
+    egcl_rt::rooted!(result = super::super::eval_form(*form, &mut env).unwrap());
+    egcl_rt::symbols::set_symbol_function(symbol, NIL);
+    assert_ne!(
+        instance.to_raw(),
+        before,
+        "the selected callable must actually move"
+    );
+    assert_eq!(*result, EgclVal::from_fixnum(50));
+    assert_eq!(
+        env.mv,
+        vec![EgclVal::from_fixnum(50), EgclVal::from_fixnum(10)]
+    );
+}

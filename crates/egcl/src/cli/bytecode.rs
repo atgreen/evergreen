@@ -988,7 +988,8 @@ fn replacement_function(sym: u32) -> Option<EgclVal> {
 
 fn replacement_function_value(sym: u32, function: EgclVal) -> Option<EgclVal> {
     if !egcl_rt::function::is_interpreted_function(function) {
-        return None;
+        return (function != NIL && function != egcl_rt::value::UNBOUND
+            && function != EgclVal::from_symbol_index(sym)).then_some(function);
     }
     let name = egcl_rt::function::name(function);
     (name.symbol_index().is_some_and(|own| own != sym)).then_some(function)
@@ -1019,6 +1020,11 @@ fn registry_get(sym: u32) -> Option<Arc<BytecodeFunction>> {
 /// Read the body and its owner from one immutable registry snapshot; if that
 /// owner differs, use the callable's retained private definition instead.
 fn bytecode_for_callable(sym: u32, function: EgclVal) -> Option<(u32, Arc<BytecodeFunction>)> {
+    if !egcl_rt::function::is_interpreted_function(function)
+        && replacement_function_value(sym, function).is_some()
+    {
+        return None;
+    }
     if egcl_rt::symbols::is_uninterned(sym) {
         return registry_get(sym).map(|body| (sym, body));
     }
@@ -15486,6 +15492,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // genuine producers re-establish it while executing.
                 env.clear_mv();
 
+                // Internal FLET/LABELS bodies can have an absent public cell.
+                // Keep that exact owner for registry selection; only translate
+                // it to a symbol when falling back to ordinary dispatch.
                 egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym)
                     .unwrap_or_else(|| EgclVal::from_symbol_index(sym)));
                 let registered_callee = bytecode_for_callable(sym, *function);
@@ -15617,10 +15626,10 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
 
                 // Fallback: tree-walker apply (builtins, generics, functions).
-                let fn_val = if egcl_rt::function::is_interpreted_function(*function) {
-                    *function
-                } else {
+                let fn_val = if *function == NIL || *function == egcl_rt::value::UNBOUND {
                     EgclVal::from_symbol_index(sym)
+                } else {
+                    *function
                 };
                 // Direct builtin dispatch (bliss-x5y.27). When this site names
                 // an unshadowed leaf builtin, run its kernel on the
@@ -15631,7 +15640,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // stops being a plain builtin stops being dispatched as one.
                 // `None` from either step falls through to the general path,
                 // which is always correct.
-                let direct = match (!egcl_rt::function::is_interpreted_function(*function))
+                let direct = match (fn_val == EgclVal::from_symbol_index(sym))
                     .then(|| super::direct_builtin_slot_memoized(sym, nargs as usize)).flatten() {
                     Some(slot) => super::call_direct_builtin(slot, args, env),
                     None => None,
@@ -17351,8 +17360,7 @@ extern "C" fn c2i_call_builtin(
     // live function cell, including direct SYMBOL-FUNCTION replacement; the
     // stale path also verifies the resolved slot and accepted arity.
     let still_builtin = if direct_call_gen() == baked_gen {
-        !egcl_rt::symbols::symbol_function(sym as u32)
-            .is_some_and(egcl_rt::function::is_interpreted_function)
+        super::installed_function(sym as u32).is_none()
     } else {
         super::direct_builtin_slot_memoized(sym as u32, n as usize) == Some(slot)
     };
@@ -17463,9 +17471,9 @@ fn c2i_call_result(
                     None => run_with_sym(callee, args, *function, callee_sym, env),
                 }
             }
-            _ => apply_function(if egcl_rt::function::is_interpreted_function(*function) {
-                *function
-            } else { fn_val }, args, env),
+            _ => apply_function(if *function == NIL || *function == egcl_rt::value::UNBOUND {
+                fn_val
+            } else { *function }, args, env),
         }
     })
 }
@@ -21214,12 +21222,25 @@ fn emit_native(
                     c.jmp(l);
                     continue;
                 }
+                // Inlined primitives still denote the live function binding.
+                // Check the pinned symbol cell at the operation (not just at
+                // entry): an earlier callback may replace it in this activation.
+                let primitive_shape = (*nargs == 1
+                    && (inlinable_unary_fixnum_op(*sym).is_some()
+                        || inlinable_fixnum_pred(*sym).is_some()
+                        || inlinable_cons_accessor(*sym).is_some()
+                        || inlinable_total_unary(*sym).is_some()))
+                    || (*nargs == 2
+                        && (is_inlinable_eq(*sym) || inlinable_fixnum_op(*sym).is_some()));
+                let speculate_call = allow_speculation && primitive_shape
+                    && emit_builtin_binding_guard(&mut c, &mut deopt_labels, *sym, bcp);
+
                 // Unary speculative fast path (bliss-jtc.27): 1+, 1-, and unary -
                 // saturate loop bodies. Guard the operand is a fixnum, then work
                 // on the tagged value directly: +1<<3 / -1<<3 / two's-complement
                 // negate, each with `jo` for the fixnum-overflow edge (negating
                 // the most-negative fixnum sets OF → correct deopt).
-                if allow_speculation && *nargs == 1 {
+                if speculate_call && *nargs == 1 {
                     if let Some(op) = inlinable_unary_fixnum_op(*sym) {
                         // PEEK-guard-commit (bliss-izt.2): read x without moving
                         // r15, so a failed guard leaves the operand in its slot for
@@ -21333,7 +21354,7 @@ fn emit_native(
                 // guard records this bytecode position and operand depth;
                 // run_native resumes the interpreter at that operation,
                 // yielding the correct value without replaying prior effects.
-                if allow_speculation && *nargs == 2 {
+                if speculate_call && *nargs == 2 {
                     if is_inlinable_eq(*sym) {
                         // EQ: bit-identity → total, no guard, no deopt.
                         pop_into(&mut c, 1, false); // a1 -> rcx
@@ -22148,6 +22169,31 @@ fn inlinable_fixnum_pred_uncached(sym: u32) -> Option<FixnumPred> {
         Some("ODDP") => Some(FixnumPred::Oddp),
         _ => None,
     }
+}
+
+/// Emit an exact binding guard before a speculative builtin operation. Only
+/// absent definitions admit builtin lowering. Symbols are pinned, so their
+/// atomic function-cell address remains valid for the native code's lifetime.
+#[cfg(all(target_arch = "x86_64", any(unix, windows)))]
+fn emit_builtin_binding_guard(
+    code: &mut Asm,
+    deopts: &mut std::collections::BTreeMap<u32, Label>,
+    symbol: u32,
+    bcp: u32,
+) -> bool {
+    let Some(egcl_compiler::t2::ir::AuxData::BuiltinBinding { address, expected }) =
+        egcl_compiler::t2::builtin_binding::snapshot(symbol)
+    else {
+        return false;
+    };
+    code.extend_from_slice(&[0x48, 0xB8]); // mov rax, &symbol.function
+    code.extend_from_slice(&(address as u64).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, selected absent binding
+    code.extend_from_slice(&expected.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x39, 0x08]); // cmp [rax], rcx (acquire on x86)
+    let slow = *deopts.entry(bcp).or_insert_with(|| code.label());
+    code.jcc(Cc::Ne, slow);
+    true
 }
 
 /// car (offset 0) or cdr (offset 8) — the cons-cell field an inlined accessor

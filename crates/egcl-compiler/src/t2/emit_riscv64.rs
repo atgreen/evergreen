@@ -424,6 +424,16 @@ impl Emitter<'_> {
         {
             return Ok(());
         }
+        if data.opcode == Guard
+            && let AuxData::BuiltinBinding { address, expected } = data.aux
+        {
+            let deopt = self.deopt_label(data)?;
+            self.asm.imm64(A0, address as u64);
+            self.asm.load(A0, A0, 0);
+            self.asm.imm64(A1, expected);
+            self.asm.branch(Cond::Ne, A0, A1, deopt);
+            return Ok(());
+        }
         match data.opcode {
             Return => {
                 if let Some(&value) = data.args.first() {

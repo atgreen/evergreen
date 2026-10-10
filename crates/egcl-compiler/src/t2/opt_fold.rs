@@ -17,9 +17,9 @@
 //! **Input:** a well-formed `Function`. Only the `Fixnum*`, `Log*` and
 //! `FixnumCmp*` opcodes are considered; generic (numeric-tower) and float
 //! arithmetic are never folded. An instruction flagged `effectful` or `call`
-//! is skipped. The `guard` flag on its own does not exclude an instruction,
-//! but note that speculated typed ops are flagged both `guard` and
-//! `effectful`, so sites produced by `speculate` are not folded here.
+//! is skipped unless it is a guard with wholly constant operands whose result
+//! can be proven in range. Independent binding guards remain ordered effects;
+//! identities involving dynamic operands do not remove a runtime type check.
 //!
 //! **Output:** rewritten instructions and rerouted uses; nothing is unlinked.
 //! Instructions that were value-substituted away, and constant operands no
@@ -154,7 +154,7 @@ impl Pass for ConstFold {
                 // Snapshot the fields we need as owned locals so the loop body
                 // can mutably borrow `f` (rewrite instructions, insert consts)
                 // without holding an immutable borrow across those calls.
-                let (op, args, results, effectful, call) = {
+                let (op, args, results, effectful, call, guard) = {
                     let d = f.inst(inst);
                     (
                         d.opcode,
@@ -162,14 +162,17 @@ impl Pass for ConstFold {
                         d.results.clone(),
                         d.flags.effectful,
                         d.flags.call,
+                        d.flags.guard,
                     )
                 };
 
-                // Only pure arithmetic/logic/compare opcodes are eligible. An
-                // effectful or calling instruction is never touched (folding it
-                // could drop an observable effect). Overflow guards (`guard`)
-                // are fine: a proven-in-range fold makes the guard vacuous.
-                if effectful || call {
+                // A guard on wholly constant operands can become vacuous.
+                // Dynamic identities (x+0, x*1) must not erase its type check.
+                // The opcode-specific folds below still reject overflow; other
+                // effects, including binding guards, have no folding rule.
+                let constant_guard = guard && args.iter()
+                    .all(|&value| cval(&consts, &replacement, value).is_some());
+                if call || (effectful && !constant_guard) {
                     continue;
                 }
 
@@ -613,6 +616,34 @@ mod tests {
         let dd = f.inst(def_of(&f, dn));
         assert_eq!(dd.opcode, Opcode::ConstFixnum);
         assert!(matches!(dd.aux, AuxData::FixnumImm(14)));
+    }
+
+    #[test]
+    fn guarded_constants_fold_without_erasing_overflow_or_dynamic_checks() {
+        for (left, expected) in [(3, Opcode::ConstFixnum), (FIXNUM_MAX, Opcode::FixnumAdd)] {
+            let mut f = Function::new("guarded-constant");
+            let e = f.entry();
+            let a = const_fixnum(&mut f, e, left);
+            let b = const_fixnum(&mut f, e, 1);
+            let (sum, _) = binop(&mut f, e, Opcode::FixnumAdd, vec![a, b]);
+            f.inst_mut(sum).flags.guard = true;
+            f.inst_mut(sum).flags.effectful = true;
+            ret(&mut f, e);
+            run(&mut f);
+            assert_eq!(f.inst(sum).opcode, expected);
+        }
+        let mut f = Function::new("guarded-dynamic-identity");
+        let e = f.entry();
+        let x = f.add_block_param(e, IRType::TOP, ValueRepresentation::Tagged);
+        let zero = const_fixnum(&mut f, e, 0);
+        let (sum, value) = binop(&mut f, e, Opcode::FixnumAdd, vec![x, zero]);
+        f.inst_mut(sum).flags.guard = true;
+        f.inst_mut(sum).flags.effectful = true;
+        ret(&mut f, e);
+        f.inst_mut(f.block(e).insts.last().copied().unwrap()).args = vec![value];
+        run(&mut f);
+        assert_eq!(f.inst(sum).opcode, Opcode::FixnumAdd);
+        assert_eq!(f.inst(*f.block(e).insts.last().unwrap()).args, vec![value]);
     }
 
     // A fold that would overflow the 61-bit fixnum range is left untouched.

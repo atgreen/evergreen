@@ -386,6 +386,10 @@ pub enum AuxData {
     FieldOffset(u32),
     /// Index in the retained root bytecode body's environment name table.
     EnvironmentName(u16),
+    /// Exact absent function-cell binding required by a builtin expansion.
+    /// The address points into a pinned symbol; comparison does not dereference
+    /// a movable callable. This guard stays ordered with calls and stores.
+    BuiltinBinding { address: usize, expected: u64 },
     CallTarget(u32),
     /// Evaluate an owned constant form through the native-transfer bridge.
     HostEval(u16),

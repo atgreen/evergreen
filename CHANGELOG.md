@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Honor callable-instance replacements of named functions and builtins across
+  interpreted and native calls, including warmed optimized operations, while
+  preserving callable identity and multiple values
+  ([#193](https://github.com/atgreen/evergreen/pull/193)).
+
 - Keep a function's bytecode, native code, and captured definition together
   during concurrent redefinition, including cached calls and tier promotion
   ([#192](https://github.com/atgreen/evergreen/pull/192)).

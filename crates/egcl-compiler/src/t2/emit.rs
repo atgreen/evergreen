@@ -5094,6 +5094,15 @@ fn emit_framed_inner(
             } else if d.opcode == Opcode::Guard {
                 let label = inst_deopt.get(&inst).copied().unwrap_or(deopt);
                 match d.aux {
+                    AuxData::BuiltinBinding { address, expected } => {
+                        // RDX is reserved scratch, never an SSA value register.
+                        // Both absent-binding sentinels fit a signed immediate.
+                        let expected = i8::try_from(expected)
+                            .map_err(|_| EmitError::UnsupportedOp(op_tag(Opcode::Guard)))?;
+                        mov_imm64(&mut a, SCRATCH, address as i64);
+                        a.extend_from_slice(&[0x48, 0x83, 0x3A, expected as u8]);
+                        a.jcc(Cc::Ne, label);
+                    }
                     AuxData::StringLayout => {
                         emit_string_layout_guard(&mut a, &d, &mut inst_reg, &mut inst_pool, label)?
                     }

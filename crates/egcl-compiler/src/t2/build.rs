@@ -1934,9 +1934,19 @@ impl<'a> Builder<'a> {
                             self.inline_options.config,
                         );
                         if let InlineDecision::Expand(intrinsic) = decision {
-                            if self.expand_intrinsic(intrinsic, block, &mut stack, i, start)? {
-                                self.remaining_inline_budget -= metadata.cost;
-                                continue;
+                            let builtin = metadata.namespace == super::inlining::FunctionNamespace::CommonLisp;
+                            let binding = super::builtin_binding::snapshot(*sym);
+                            if !builtin || binding.is_some() {
+                                let state = self.build_frame_state(block, &stack, i as u32);
+                                let position = self.f.block(block).insts.len();
+                                if self.expand_intrinsic(intrinsic, block, &mut stack, i, start)? {
+                                    if builtin {
+                                        super::builtin_binding::insert(&mut self.f, block, position,
+                                            state, binding.expect("builtin binding was captured"));
+                                    }
+                                    self.remaining_inline_budget -= metadata.cost;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -3470,6 +3480,44 @@ mod tests {
         assert!(call.frame_state.is_some(), "call must carry a FrameState");
         assert_eq!(call.args.len(), 1, "one argument popped for the call");
         assert!(!f.frame_states.is_empty(), "frame-state table populated");
+    }
+
+    #[test]
+    fn folded_builtin_retains_binding_deopt_on_every_backend() {
+        use crate::t2::{emit, emit_a64, emit_ppc64le, emit_riscv64, emit_s390x};
+        use crate::t2::pass::PassManager;
+        let plus = egcl_rt::symbols::intern("+");
+        let input = bf("binding-fold", vec![
+            Instr::Const(0), Instr::Const(1), Instr::CallNamed { sym: plus, nargs: 2 }, Instr::Return,
+        ], vec![EgclVal::from_fixnum(10), EgclVal::from_fixnum(20)], 0, 0, 2);
+        let mut function = build_from_bytecode(&input).unwrap();
+        assert_eq!(crate::t2::speculate::speculate(&mut function, &|_| None), 1);
+        let mut passes = PassManager::new();
+        passes.add(Box::new(crate::t2::opt_fold::ConstFold))
+            .add(Box::new(crate::t2::opt_clear_mv::ClearMvElim))
+            .add(Box::new(crate::t2::opt_dce::Dce));
+        passes.run(&mut function);
+        crate::t2::verify::verify(&function).unwrap();
+        let guards: Vec<_> = function.block_order().iter().flat_map(|&block|
+            function.block(block).insts.iter().map(|&inst| function.inst(inst)))
+            .filter(|data| matches!(data.aux, AuxData::BuiltinBinding { .. })).collect();
+        assert_eq!(guards.len(), 1, "folding must not erase binding sensitivity");
+        let state = function.frame_states.get(guards[0].frame_state.unwrap());
+        assert_eq!(state.scopes[0].bcp, 2);
+        assert_eq!(state.scopes[0].stack.len(), 2, "resume with the original arguments");
+        assert!(function.block_order().iter().all(|&block| function.block(block).insts.iter()
+            .all(|&inst| function.inst(inst).opcode != Opcode::FixnumAdd)),
+            "the arithmetic result must actually fold");
+        for (name, code) in [
+            ("x86", emit::emit_framed(&function, 1, 1, 0, 0, 0, 0, 0, 0, None)),
+            ("aarch64", emit_a64::emit_framed(&function, 1, 1)),
+            ("s390x", emit_s390x::emit_framed(&function, 1, 1)),
+            ("ppc64le", emit_ppc64le::emit_framed(&function, 1, 1)),
+            ("riscv64", emit_riscv64::emit_framed(&function, 1, 1)),
+        ] {
+            assert!(code.unwrap_or_else(|error| panic!("{name}: {error:?}")).has_deopt,
+                "{name} must preserve a real deopt exit");
+        }
     }
 
     #[test]

@@ -1182,6 +1182,19 @@ fn global_fn(name: &str) -> Option<EgclVal> {
     egcl_rt::function::is_interpreted_function(cell).then_some(cell)
 }
 
+/// A definition installed in the symbol's function cell, regardless of its
+/// callable representation. Builtins normally have an UNBOUND cell and are
+/// resolved by name; their reified wrappers live in a separate cache.
+/// A legacy self-symbol cell also means dispatch by name, not a replacement.
+/// This lookup does not allocate. Callers must root its result across evaluation.
+fn installed_function(symbol: u32) -> Option<EgclVal> {
+    egcl_rt::symbols::symbol_function(symbol).filter(|&function| {
+        function != egcl_rt::value::UNBOUND
+            && function != NIL
+            && function != EgclVal::from_symbol_index(symbol)
+    })
+}
+
 /// Resolve a global function NAME to the `(registry index, fn_val)` pair used to
 /// dispatch a call through the promoting bytecode/native path. When `name` names
 /// a global function object, the registry is keyed on the OBJECT's own name (so
@@ -1245,16 +1258,16 @@ fn dispatch_target(name: &str) -> (Option<u32>, EgclVal) {
 /// Coerce a value being installed into a symbol's global function cell (via
 /// `(setf (symbol-function s) v)` / `(setf (fdefinition s) v)` and the
 /// bytecode-lowered `EGCL::SET-SYMBOL-FUNCTION` primitive) into the canonical
-/// stored representation — an interpreted-function object.
+/// stored representation. Existing callable objects, including callable
+/// instances, keep their identity; legacy tree closures are reified.
 ///
-/// The cell is only honoured by `global_fn`/`fn_bound`/`fboundp`/`callable_body`
-/// when it holds an interpreted-function object. But `(setf (symbol-function s)
-/// v)` accepts any function designator, and two common designators are NOT
+/// `(setf (symbol-function s) v)` also accepts function designators, and two
+/// common designators are NOT
 /// interpreted-function objects: `#'foo` (which the FUNCTION form evaluates to
 /// the bare *symbol* FOO when foo is a global) and `(lambda …)` (which evaluates
 /// to the interpreter closure cons `(EGCL::CLOSURE . id)`). Storing either
-/// verbatim left the installed name "undefined" (bliss-57m). Resolve them to a
-/// real function object here:
+/// verbatim previously left the installed name "undefined" (bliss-57m).
+/// Resolve them to a real function object here:
 ///   * an interpreted-function object → stored as-is;
 ///   * a symbol designator → the current global definition it names (CL captures
 ///     the function, not the name — CLHS 5.1.2.7);
@@ -1275,7 +1288,7 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
     if val.is_symbol() {
         // `#'foo` / a symbol function designator: install foo's current global
         // definition, not a by-name alias.
-        return global_fn(&sym_name(val)).unwrap_or(val);
+        return val.symbol_index().and_then(installed_function).unwrap_or(val);
     }
     if val.is_cons() {
         let (h, t) = cp(val);
@@ -1340,7 +1353,8 @@ fn profiled_index_of(d: EgclVal) -> Option<u32> {
 /// True if `name` names a function — lexically (FLET/LABELS or `(setf f)` in
 /// `Env.funs`) or globally (a bound function cell).
 fn fn_bound(env: &Env, name: &str) -> bool {
-    env.funs.borrow().contains_key(name) || global_fn(name).is_some()
+    env.funs.borrow().contains_key(name)
+        || egcl_rt::symbols::find_index(name).and_then(installed_function).is_some()
 }
 
 /// Resolve `name` to a callable `(params_form, body)` — lexical `Env.funs` first,
@@ -15945,8 +15959,8 @@ fn eval_form(form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     let uninterned_fn = car
                         .symbol_index()
                         .filter(|idx| reader::is_uninterned(*idx))
-                        .and_then(egcl_rt::symbols::symbol_function)
-                        .is_some_and(egcl_rt::function::is_interpreted_function);
+                        .and_then(installed_function)
+                        .is_some();
                     uninterned_fn
                         || setf_stores_into_values_place(form)
                         || mv_form_preserves_values(&sym_name_rc(car), env)
@@ -16508,21 +16522,10 @@ fn symbol_function_object_ex(
     {
         return Some(function);
     }
-    // An UNINTERNED symbol's function cell is keyed only by its registry index
-    // (its name is not in the name→index map, so `global_fn` by name misses it):
-    // read it directly, so `(symbol-function (gensym-with-installed-fn))` returns
-    // the function object rather than the bare symbol (symbol-function.1).
-    if let Some(idx) = name_sym.symbol_index() {
-        if reader::is_uninterned(idx) {
-            if let Some(cell) = egcl_rt::symbols::symbol_function(idx) {
-                if egcl_rt::function::is_interpreted_function(cell) {
-                    return Some(cell);
-                }
-            }
-        }
-    }
-    if let Some(f) = global_fn(&fn_name) {
-        return Some(f);
+    // Use the symbol's identity for both interned and uninterned names, and
+    // preserve callable instances rather than manufacturing a builtin wrapper.
+    if let Some(function) = name_sym.symbol_index().and_then(installed_function) {
+        return Some(function);
     }
     if is_builtin_function(&fn_name) {
         // Cached bare name too, and only on the branch that needs it.
@@ -17058,6 +17061,18 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         if !shadowed_by_lexical_function && let Some(mdef) = lookup_macro(env, &name) {
             egcl_rt::rooted!(expanded = expand_macro(&mdef, cdr, env, form)?);
             return eval_form(*expanded, env);
+        }
+
+        // A callable instance (or other non-body callable) installed in the
+        // function cell takes precedence over builtin dispatch and its arity.
+        // Lexical functions and special operators retain their own semantics.
+        if !shadowed_by_lexical_function && !is_special_operator_name(&name)
+            && let Some(function) = car.symbol_index().and_then(installed_function)
+            && !egcl_rt::function::is_interpreted_function(function)
+        {
+            egcl_rt::rooted!(function = function);
+            let args = eval_args(cdr, env)?;
+            return apply_function(*function, &args, env);
         }
 
         // Fixed-arity builtin arg-count check: calling a function with the wrong
@@ -35100,8 +35115,7 @@ fn direct_builtin_table() -> &'static [&'static str] {
 /// user has taken the name over. A later redefinition is caught separately, by
 /// the generation guard the call site bakes.
 fn direct_builtin_slot(sym: u32, nargs: usize) -> Option<u32> {
-    if egcl_rt::symbols::symbol_function(sym)
-        .is_some_and(egcl_rt::function::is_interpreted_function)
+    if installed_function(sym).is_some()
     {
         return None;
     }
@@ -35151,13 +35165,9 @@ fn direct_builtin_slot_memoized(sym: u32, nargs: usize) -> Option<u32> {
     if egcl_rt::symbols::is_uninterned(sym) {
         return None;
     }
-    // Per-call re-check, one index lookup: a user function installed on the
-    // symbol wins over the builtin. Builtins carry a function object of their
-    // own so `#'aref` works, so the discriminator is the SAME one
-    // `global_fn` applies — is the cell an INTERPRETED function — not merely
-    // whether a cell exists.
-    if egcl_rt::symbols::symbol_function(sym)
-        .is_some_and(egcl_rt::function::is_interpreted_function)
+    // Per-call re-check: any installed callable wins over the builtin.
+    // Builtin wrapper objects are cached separately from the function cell.
+    if installed_function(sym).is_some()
     {
         return None;
     }
@@ -35212,6 +35222,9 @@ pub(super) fn direct_builtin_report() -> Vec<String> {
 
 /// The arity-independent half of `direct_builtin_slot`, for the memo.
 fn direct_builtin_resolve(sym: u32) -> BuiltinMemo {
+    if installed_function(sym).is_some() {
+        return BuiltinMemo::No;
+    }
     let full = sym_name_uncached(EgclVal::from_symbol_index(sym));
     let bare = symbol_bare_name(&full);
     let Some(slot) = direct_builtin_table().iter().position(|&n| n == bare) else {
@@ -35376,6 +35389,12 @@ fn apply_function(
     // Function could be a lambda form, a symbol naming a function, or a closure
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);
+        // Symbol designators denote the global cell, independent of FLET.
+        if let Some(function) = fn_val.symbol_index().and_then(installed_function)
+            && !egcl_rt::function::is_interpreted_function(function)
+        {
+            return apply_function(function, args, env);
+        }
         if let Some((mut params_form, mut body)) =
             global_callable_body_of_symbol(env, fn_val, &name)
         {
@@ -35633,8 +35652,8 @@ fn apply_function(
             //
             // Dispatch straight to the builtin instead. This PRESERVES the
             // wrapper's dispatch-by-name semantics: direct_builtin_slot_memoized
-            // re-checks per call that the symbol still has no interpreted
-            // function cell and that the invalidation generation is unchanged,
+            // re-checks per call that the symbol still has no installed
+            // definition and that the invalidation generation is unchanged,
             // so a redefinition still takes effect -- and anything it declines
             // (a generic's wrapper, a shadowed name, an arity the kernel does
             // not take) falls through to the trampoline below, which is always
