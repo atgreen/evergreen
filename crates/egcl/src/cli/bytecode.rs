@@ -15467,24 +15467,24 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                     record_type_profile(func_ptr, call_bcp, args);
                 }
 
-                // bliss-jtc.6.8: bump the callee's FnMeta invoke counter (the
-                // unified tiering substrate) so the function object reflects real
-                // invocations from the bytecode path, not just the tree-walker.
+                // Retain the selected callable for either dispatch owner.
                 egcl_rt::rooted!(fn_obj = egcl_rt::function::is_interpreted_function(*function)
                     .then_some(*function));
-                if !profiling_disabled()
-                    && let Some(cell) = *fn_obj
-                {
-                    egcl_rt::function::record_invocation(cell);
-                }
-
                 // Bytecode callee → native frame on the EgclStack.
                 if let Some((callee_sym, callee)) = registered_callee {
                     if arity_accepts(&callee, nargs as usize) {
+                        // Only this dispatch owns the count for an admitted
+                        // bytecode/native call. Cold and arity-mismatch fallbacks
+                        // are counted by apply_function below.
+                        if !profiling_disabled()
+                            && let Some(cell) = *fn_obj
+                        {
+                            egcl_rt::function::record_invocation(cell);
+                        }
                         // Installed native code → call via the i2c adapter.
                         // Unified tiering (bliss-jtc.3): the function object's
                         // FnMeta is the single tiering record — invoke counter
-                        // (bumped at the top of CallNamed), current tier, and the
+                        // (bumped for this dispatch), current tier, and the
                         // active compiled entry. Promotion is driven by that
                         // counter and, on success, tier + entry are recorded on
                         // the object. Anonymous compiled lambdas (gensyms) have no
