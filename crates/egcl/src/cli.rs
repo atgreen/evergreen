@@ -17242,6 +17242,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return bytecode::ordinary_cleanup_osr_observe_for_test(env);
             }
             #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+            "%ORDINARY-CONDITION-OSR-OBSERVE-FOR-TEST" => {
+                return bytecode::ordinary_condition_osr_observe_for_test(env);
+            }
+            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
             "%ORDINARY-T2-ENTRY-FOR-TEST" => {
                 return Ok(bytecode::ordinary_t2_entry_for_test());
             }

@@ -123,10 +123,6 @@ unsafe fn take_guard_resume_state(
     let context = unsafe { &*context };
     if unsafe {
         context.completed_cleanup.is_some()
-            || !(*context.handlers).is_empty()
-            || !(*context.handler_binds).is_empty()
-            || !(*context.restart_cases).is_empty()
-            || !(*context.dynamic_scopes).is_empty()
             || (*context.prepared_handler).is_some()
             || (*context.prepared_catch).is_some()
     } {
@@ -140,7 +136,10 @@ unsafe fn take_guard_resume_state(
                     | ScopeKind::Tagbody { .. }
                     | ScopeKind::Catch { .. }
                     | ScopeKind::Unwind { .. }
-                    | ScopeKind::Cleanup { .. })
+                    | ScopeKind::Cleanup { .. }
+                    | ScopeKind::HandlerCase { .. }
+                    | ScopeKind::HandlerBind { .. }
+                    | ScopeKind::RestartCase { .. })
     }) {
         return Err(invalid_capture());
     }
@@ -192,8 +191,14 @@ unsafe fn take_guard_resume_state(
         // Direct recursive frames share this context but remain scope-free.
         // Do not consume the outer activation's one-shot cleanup reservation.
         if !cleanups.is_empty() || !catches.is_empty()
+            || unsafe { !(*context.handlers).is_empty()
+                || !(*context.handler_binds).is_empty()
+                || !(*context.restart_cases).is_empty()
+                || !(*context.dynamic_scopes).is_empty() }
             || active.iter().any(|scope| matches!(scope.kind,
-                ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. } | ScopeKind::Catch { .. }))
+                ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. } | ScopeKind::Catch { .. }
+                    | ScopeKind::HandlerCase { .. } | ScopeKind::HandlerBind { .. }
+                    | ScopeKind::RestartCase { .. }))
         {
             return Err(invalid_capture());
         }
@@ -204,6 +209,12 @@ unsafe fn take_guard_resume_state(
     egcl_rt::rooted_ref!(_state_root = &mut state);
     state.cleanup_conts.extend(cleanups.drain(..).map(|saved| saved.continuation));
     let mut saved_catches = catches.drain(..);
+    // The shared validator checked each ledger against this lexical order
+    // before any native metadata changed. Move registrations, never rebuild
+    // them: tokens, restart binding IDs and captured handler functions stay live.
+    let mut saved_handlers = unsafe { &mut *context.handlers }.drain(..);
+    let mut saved_binds = unsafe { &mut *context.handler_binds }.drain(..);
+    let mut saved_restarts = unsafe { &mut *context.restart_cases }.drain(..);
     for scope in active {
         let handler = match scope.kind {
             ScopeKind::Block { id, resume_bcp, register: false } => Handler::Block {
@@ -228,10 +239,38 @@ unsafe fn take_guard_resume_state(
                 resume_bcp,
                 sp_restore: scope.sp_restore,
             },
+            ScopeKind::HandlerCase { .. } => {
+                let saved = saved_handlers.next().expect("validated handler-case order");
+                Handler::HandlerCase {
+                    clauses: saved.clauses,
+                    sp_restore: scope.sp_restore,
+                    cluster_base: saved.cluster_base,
+                    cluster_frame: saved.cluster_frame,
+                }
+            }
+            ScopeKind::HandlerBind { .. } => {
+                let saved = saved_binds.next().expect("validated handler-bind order");
+                Handler::HandlerBind {
+                    cluster_base: saved.cluster_base,
+                    cluster_frame: saved.cluster_frame,
+                }
+            }
+            ScopeKind::RestartCase { resume_bcp, .. } => {
+                let saved = saved_restarts.next().expect("validated restart-case order");
+                Handler::RestartCase {
+                    restart_base: saved.restart_base,
+                    resume_bcp,
+                    sp_restore: scope.sp_restore,
+                    cluster_frame: saved.cluster_frame,
+                }
+            }
             _ => unreachable!("validated local guard scopes"),
         };
         state.handlers.push(handler);
     }
+    // T0 now owns the cluster frames and Env registrations. Source native
+    // scope guards must not retire them again when this continuation returns.
+    unsafe { &mut *context.dynamic_scopes }.clear();
     Ok(state)
 }
 
@@ -243,7 +282,7 @@ unsafe fn validate_guard_stream(
     code: &TransferCode,
     header: &Frame,
     metadata: &T2InstalledMetadata,
-) -> Result<(), EgclError> {
+) -> Result<u32, EgclError> {
     if request.n_scopes != 1 || request.words.is_null() || request.n_words < 4
         || request.n_words > 4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack)
     {
@@ -264,7 +303,7 @@ unsafe fn validate_guard_stream(
     {
         return Err(invalid_capture());
     }
-    Ok(())
+    Ok(bcp)
 }
 
 pub(super) unsafe extern "C" fn resume_guard(
@@ -280,8 +319,9 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
     let context = CAPTURE.with(Cell::get);
     let owner = unsafe { (*context).owner };
     let code = unsafe { &*owner };
-    let frame = egcl_rt::current_stack().fp() as *mut Frame;
-    let expected = unsafe {
+    // Live condition clusters are younger Special frames. The retained
+    // callable, not stack.fp(), owns the guard's activation slots.
+    let frame = unsafe {
         if (*context).recursive.is_null() {
             (*context).frame
         } else {
@@ -290,7 +330,8 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
     };
     let result = guard_c2i(|| {
         if frame.is_null()
-            || frame != expected
+            || (unsafe { !(*context).recursive.is_null() }
+                && egcl_rt::current_stack().fp() != frame)
             || unsafe { frame.add(1).cast::<EgclVal>() } != request.activation
         {
             return Err(invalid_capture());
@@ -302,18 +343,30 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
             return Err(invalid_capture());
         }
         let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
-        unsafe { validate_guard_stream(request, code, &header, &metadata) }?;
+        let bcp = unsafe { validate_guard_stream(request, code, &header, &metadata) }?;
         let env = NATIVE_ENV.with(Cell::get);
         if env.is_null() {
             return Err(invalid_capture());
         }
+        if unsafe { (*context).recursive.is_null() } {
+            let active = code.control_scopes.before(bcp).expect("validated guard bcp");
+            if !unsafe { validate_condition_clusters(&*context, active, &*env) } {
+                return Err(invalid_capture());
+            }
+        }
         // Resumed Lisp owns the frame; it must not borrow the abandoned
         // native capture. Restore that capture only after restoring the frame.
         let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
+        // T0 consumes the condition-cluster suffix together with its exact
+        // handlers. Restore only the native callable shell after it returns;
+        // rebuilding those retired clusters would duplicate dynamic scopes.
+        let callable_end = unsafe {
+            frame.add(1).cast::<EgclVal>().add(usize::from(header.num_locals)).cast::<u8>()
+        };
         let mut restore = RestoreNativeFrame {
             frame,
             header,
-            sp: egcl_rt::current_stack().sp(),
+            sp: callable_end,
         };
         egcl_rt::rooted_ref!(_restore_root = &mut restore);
         // Materialized T0 locals no longer follow native debugger recipes.

@@ -4293,7 +4293,10 @@ fn emit_framed_inner(
                 | crate::control_scope::ScopeKind::Tagbody { .. }
                 | crate::control_scope::ScopeKind::Catch { .. }
                 | crate::control_scope::ScopeKind::Unwind { .. }
-                | crate::control_scope::ScopeKind::Cleanup { .. })
+                | crate::control_scope::ScopeKind::Cleanup { .. }
+                | crate::control_scope::ScopeKind::HandlerCase { .. }
+                | crate::control_scope::ScopeKind::HandlerBind { .. }
+                | crate::control_scope::ScopeKind::RestartCase { .. })
     }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)

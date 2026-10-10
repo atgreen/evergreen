@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crate::value::{TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT, EgclVal};
+use crate::value::{EgclVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
 /// CL stack for a green thread.
 /// Default usable size: 512 KiB (configurable via EGCL_STACK_SIZE).
@@ -220,8 +220,7 @@ impl EgclStack {
         }
         // SAFETY: the current frame is owned by this stack's sole mutator.
         let old_slots = unsafe { (*frame).num_locals };
-        let extra =
-            usize::from(num_slots.checked_sub(old_slots)?) * std::mem::size_of::<EgclVal>();
+        let extra = usize::from(num_slots.checked_sub(old_slots)?) * std::mem::size_of::<EgclVal>();
         let end = self.sp_offset.get().checked_add(extra)?;
         if end > self.capacity {
             return None;
@@ -238,6 +237,108 @@ impl EgclStack {
         }
         self.sp_offset.set(end);
         Some(frame)
+    }
+
+    /// Grow a callable frame beneath a contiguous suffix of Special frames.
+    /// Returns the byte displacement of every frame and slot in that suffix.
+    /// The callable's address and existing slots remain unchanged; newly added
+    /// slots are NIL. The supplied map is installed on the callable. No
+    /// allocation or safepoint occurs, and failure leaves all state unchanged.
+    ///
+    /// # Safety
+    /// The caller must have exclusive mutator access to the stack, with no
+    /// outstanding references into the moved suffix and no concurrent reader
+    /// of a published snapshot. Before accessing any external pointer into the
+    /// Special suffix, or reaching a safepoint, the caller must remap all such
+    /// pointers (including condition-cluster ledgers and slot pointers) by the
+    /// returned displacement and publish the updated stack as appropriate.
+    /// `code_info` must describe the callable's live tagged roots. This method
+    /// does not update external pointers or the published stack snapshot.
+    pub unsafe fn grow_frame_with_special_suffix(
+        &self,
+        frame: *mut Frame,
+        num_slots: u16,
+        code_info: &'static CodeInfo,
+    ) -> Option<usize> {
+        let base = self.base as usize;
+        let used = self.sp_offset.get();
+        let alignment = std::mem::align_of::<Frame>();
+        let header = std::mem::size_of::<Frame>();
+        let slot_bytes = std::mem::size_of::<EgclVal>();
+        if frame.is_null() || used > self.capacity {
+            return None;
+        }
+        let target = (frame as usize).checked_sub(base)?;
+        if target.checked_add(header)? > used || (frame as usize) % alignment != 0 {
+            return None;
+        }
+        // Walk from the actual top, checking each extent before dereferencing
+        // it. Exact adjacency rejects skipped frames, cycles and bogus links.
+        let mut cursor = self.fp.get();
+        let mut expected_end = used;
+        let (old_slots, suffix_start) = loop {
+            let start = (cursor as usize).checked_sub(base)?;
+            if start < target
+                || start.checked_add(header)? > expected_end
+                || (cursor as usize) % alignment != 0
+            {
+                return None;
+            }
+            // SAFETY: the complete aligned header lies in this stack's used
+            // region. Derive its pointer from the backing allocation.
+            let current = unsafe { &*self.base.add(start).cast::<Frame>() };
+            let end = start
+                .checked_add(header)?
+                .checked_add(usize::from(current.num_locals).checked_mul(slot_bytes)?)?;
+            if end != expected_end || current.flags & FOREIGN_CALL != 0 {
+                return None;
+            }
+            if start == target {
+                if current.frame_type() != FrameType::Call {
+                    return None;
+                }
+                break (current.num_locals, end);
+            }
+            if current.frame_type() != FrameType::Special {
+                return None;
+            }
+            cursor = current.prev_fp;
+            expected_end = start;
+        };
+        let delta = usize::from(num_slots.checked_sub(old_slots)?).checked_mul(slot_bytes)?;
+        let new_end = used.checked_add(delta)?;
+        if new_end > self.capacity || delta % alignment != 0 {
+            return None;
+        }
+        // All rejection paths precede the move. No fallible operation, external
+        // access or safepoint may occur until the chain and new slots agree.
+        unsafe {
+            let suffix = self.base.add(suffix_start);
+            std::ptr::copy(suffix, suffix.add(delta), used - suffix_start);
+            let mut moved = self.fp.get();
+            if moved != frame {
+                moved = moved.cast::<u8>().add(delta).cast::<Frame>();
+                self.fp.set(moved);
+                while moved != frame {
+                    let previous = (*moved).prev_fp;
+                    let relocated = if previous == frame {
+                        frame
+                    } else {
+                        previous.cast::<u8>().add(delta).cast::<Frame>()
+                    };
+                    (*moved).prev_fp = relocated;
+                    moved = relocated;
+                }
+            }
+            let slots = frame.add(1).cast::<EgclVal>();
+            for index in old_slots..num_slots {
+                slots.add(usize::from(index)).write(crate::value::NIL);
+            }
+            (*frame).num_locals = num_slots;
+            (*frame).code_info = code_info;
+        }
+        self.sp_offset.set(new_end);
+        Some(delta)
     }
 
     /// Pop the current frame, restoring `fp` to its `prev_fp` and rewinding

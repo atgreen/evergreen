@@ -17,6 +17,7 @@ mod nested;
 mod ordinary_osr;
 pub(super) mod ordinary_catch_osr;
 pub(super) mod ordinary_cleanup_osr;
+pub(super) mod ordinary_condition_osr;
 mod ordinary_t1;
 pub(super) mod ordinary_t2;
 mod payloads;
