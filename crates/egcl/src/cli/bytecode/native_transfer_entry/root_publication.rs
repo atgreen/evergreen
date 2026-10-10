@@ -23,6 +23,29 @@ use egcl_rt::native_transfer::NativeSegment;
 use std::ops::Range;
 use std::sync::Once;
 
+/// Permanent adapter code and the exact PC reached by an ordinary child return.
+/// Retain the descriptor with the mapping; scanners must never initialize or
+/// wait for a registry while the thread performing initialization is stopped.
+pub(in crate::cli::bytecode) struct PublishedAdapter {
+    pub(in crate::cli::bytecode) code: JitBuffer,
+    child_return_pc: usize,
+    frame_bytes: usize,
+}
+
+impl PublishedAdapter {
+    pub(in crate::cli::bytecode) fn new(
+        entry: egcl_compiler::t2::native_transfer::PublishedCallEntry,
+    ) -> Option<Self> {
+        let code = JitBuffer::new(&entry.code)?;
+        let child_return_pc = code.as_ptr() as usize + entry.child_return_offset;
+        Some(Self { code, child_return_pc, frame_bytes: entry.frame_bytes })
+    }
+
+    pub(in crate::cli::bytecode) fn contains_return(&self, pc: usize) -> bool {
+        self.child_return_pc == pc
+    }
+}
+
 /// One suspended native caller, valid for the dynamic extent of the helper
 /// that published it. `owner` is frozen at machine-helper entry, before the
 /// logical CAPTURE context can change; `segment` is the active native anchor
@@ -103,10 +126,13 @@ pub(super) enum Bail {
     MapUnavailable = 5,
     MapMissing = 6,
     LocationUnresolved = 7,
+    AdapterRecordUnowned = 8,
+    AdapterOwnerMissing = 9,
+    AdapterCallerUnmapped = 10,
 }
 
 #[cfg(test)]
-const BAIL_KINDS: usize = 8;
+const BAIL_KINDS: usize = 11;
 #[cfg(test)]
 static BAILS: [std::sync::atomic::AtomicUsize; BAIL_KINDS] =
     [const { std::sync::atomic::AtomicUsize::new(0) }; BAIL_KINDS];
@@ -126,7 +152,7 @@ static RESOLVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 
 /// (expected, resolved, bails per kind) since the last call.
 #[cfg(test)]
-pub(super) fn take_completeness() -> (usize, usize, [usize; BAIL_KINDS]) {
+pub(in crate::cli::bytecode) fn take_completeness() -> (usize, usize, [usize; BAIL_KINDS]) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         EXPECTED.swap(0, Relaxed),
@@ -137,10 +163,11 @@ pub(super) fn take_completeness() -> (usize, usize, [usize; BAIL_KINDS]) {
 
 /// Describe any nonzero bail counts, for a test failure message.
 #[cfg(test)]
-pub(super) fn describe_bails(bails: [usize; BAIL_KINDS]) -> String {
+pub(in crate::cli::bytecode) fn describe_bails(bails: [usize; BAIL_KINDS]) -> String {
     const NAMES: [&str; BAIL_KINDS] = [
         "NullOwner", "NullSegment", "NullStack", "PcOutsideOwner",
         "UnwindRefused", "MapUnavailable", "MapMissing", "LocationUnresolved",
+        "AdapterRecordUnowned", "AdapterOwnerMissing", "AdapterCallerUnmapped",
     ];
     let mut parts = Vec::new();
     for (name, count) in NAMES.iter().zip(bails) {
@@ -171,6 +198,17 @@ pub(super) fn take_visits_by_kind() -> (usize, usize, usize) {
         VISIT_STACK.swap(0, Relaxed),
         VISIT_REGISTER.swap(0, Relaxed),
     )
+}
+
+#[cfg(all(test, debug_assertions))]
+static VERIFIED_ALIASES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static ADAPTER_CROSSINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_adapter_crossings() -> usize {
+    ADAPTER_CROSSINGS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -494,8 +532,7 @@ unsafe fn walk_boundary(
         });
         return 0;
     }
-    let code = unsafe { &*boundary.owner };
-    let base = code.code.as_ptr() as usize;
+    let mut code = unsafe { &*boundary.owner };
     let segment = unsafe { &*boundary.segment };
     let walk = Walk {
         bounds: boundary.bounds.clone(),
@@ -504,11 +541,50 @@ unsafe fn walk_boundary(
     let mut cursor = boundary.cursor;
     let mut total = 0;
     loop {
+        let base = code.code.as_ptr() as usize;
         let Some(offset) = cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
         else {
+            let adapter = super::mapped_adapter(cursor.pc)
+                .or_else(|| super::super::native_callable::mapped_adapter(cursor.pc));
+            let Some(adapter) = adapter else {
+                #[cfg(test)]
+                note_bail(Bail::PcOutsideOwner);
+                return total;
+            };
+            let record = cursor.call_sp;
+            // Validate the whole adapter record and its caller return slot
+            // before reading its initialized child owner or any saved word.
+            if walk.slot(record).is_none()
+                || record.checked_add(adapter.frame_bytes).and_then(|p| walk.slot(p)).is_none() {
+                #[cfg(test)]
+                note_bail(Bail::AdapterRecordUnowned);
+                return total;
+            }
+            let record = record as *mut egcl_compiler::t2::native_transfer::MappedCallRecord;
+            let Some(owner) = (unsafe { super::nested::record_parent_owner(record) }) else {
+                #[cfg(test)]
+                note_bail(Bail::AdapterOwnerMissing);
+                return total;
+            };
+            let caller = unsafe { mapped_cursor(record) };
+            let parent = unsafe { &*owner };
+            let Some(offset) = caller.pc.checked_sub(parent.code.as_ptr() as usize) else {
+                #[cfg(test)]
+                note_bail(Bail::AdapterCallerUnmapped);
+                return total;
+            };
+            if offset >= parent.code_len || parent._native_calls.value_map(offset).is_none() {
+                #[cfg(test)]
+                note_bail(Bail::AdapterCallerUnmapped);
+                return total;
+            }
+            // The adapter restores ALL preserved words, even registers the
+            // child never saved. Replace every inherited register location.
+            cursor = caller;
+            code = parent;
             #[cfg(test)]
-            note_bail(Bail::PcOutsideOwner);
-            return total;
+            ADAPTER_CROSSINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
         };
         let Some(step) =
             code._native_calls
@@ -571,7 +647,7 @@ unsafe fn resolve_location(
             _ => None,
         },
         NativeValueLocation::Stack(offset) => body_sp
-            .map(|body_sp| body_sp.wrapping_add_signed(offset as isize))
+            .and_then(|body_sp| body_sp.checked_add_signed(offset as isize))
             .and_then(|address| walk.slot(address))
             .map(|address| address as *mut EgclVal),
         NativeValueLocation::Register(register) => SYSV_PRESERVED_REGISTERS
@@ -594,7 +670,7 @@ unsafe fn frame_activation(
     let layout = map.layout();
     match (layout.activation_base_slot, body_sp) {
         (Some(slot), Some(body_sp)) => walk
-            .word(body_sp.wrapping_add(slot as usize * 8))
+            .word(body_sp.checked_add(slot as usize * 8)?)
             .and_then(|activation| {
                 validated_activation(activation as *mut EgclVal, layout.activation_slots, walk.stack)
             }),
@@ -609,20 +685,24 @@ unsafe fn visit_frame(
     walk: &Walk<'_>,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
+    #[cfg(debug_assertions)]
+    if egcl_rt::gc::marking_external_roots() {
+        let compared = verify_frame_aliases(map, cursor, body_sp, walk)
+            .unwrap_or_else(|error| panic!("native root aliases at PC {:#x}: {error:?}", cursor.pc));
+        #[cfg(test)]
+        VERIFIED_ALIASES.fetch_add(compared, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = compared;
+    }
     let layout = map.layout();
     let activation = unsafe { frame_activation(map, body_sp, walk) };
     let mut visited = 0;
-    for location in map.gc_locations() {
+    for &location in map.gc_locations() {
         let resolved = unsafe {
-            resolve_location(*location, cursor, body_sp, activation, layout.activation_slots, walk)
+            resolve_location(location, cursor, body_sp, activation, layout.activation_slots, walk)
         };
-        // Constant and Unavailable are legitimately not addressable; every
-        // other kind the map records is one the walk is obliged to reach.
         #[cfg(test)]
-        if !matches!(
-            location,
-            NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable
-        ) {
+        if !matches!(location, NativeValueLocation::Constant(_) | NativeValueLocation::Unavailable) {
             use std::sync::atomic::Ordering::Relaxed;
             EXPECTED.fetch_add(1, Relaxed);
             if resolved.is_some() {
@@ -635,7 +715,7 @@ unsafe fn visit_frame(
         #[cfg(test)]
         {
             use std::sync::atomic::Ordering::Relaxed;
-            match *location {
+            match location {
                 NativeValueLocation::Activation(_) => &VISIT_ACTIVATION,
                 NativeValueLocation::Stack(_) => &VISIT_STACK,
                 NativeValueLocation::Register(_) => &VISIT_REGISTER,
@@ -647,6 +727,39 @@ unsafe fn visit_frame(
         visit(slot);
     }
     visited
+}
+
+/// Compare before the collector changes ANY root. During relocation another
+/// scanner may already have updated a shadow while the native copy is still
+/// old; comparing then would incorrectly reject a valid relocation in progress.
+#[cfg(any(debug_assertions, test))]
+fn verify_frame_aliases(
+    map: &NativeFrameValues,
+    cursor: &NativeFrameCursor,
+    body_sp: Option<usize>,
+    walk: &Walk<'_>,
+) -> Result<usize, String> {
+    let activation = unsafe { frame_activation(map, body_sp, walk) };
+    let mut compared = 0;
+    for value in map.values().iter().filter(|value| value.may_reference_heap()) {
+        let mut first = None;
+        for &location in value.locations() {
+            let slot = unsafe { resolve_location(location, cursor, body_sp, activation,
+                map.layout().activation_slots, walk) }
+                .ok_or_else(|| format!("unresolved {:?} at {location:?}", value.value))?;
+            let bits = unsafe { slot.read() };
+            if let Some((original_slot, original)) = first {
+                if original != bits {
+                    return Err(format!("{:?}: {original_slot:p} holds {original:?}, \
+                        {slot:p} ({location:?}) holds {bits:?}", value.value));
+                }
+                compared += 1;
+            } else {
+                first = Some((slot, bits));
+            }
+        }
+    }
+    Ok(compared)
 }
 
 #[cfg(test)]
@@ -730,6 +843,30 @@ mod tests {
         eprintln!("  dual-home check: values={checked} dual-homed={dual} mismatches={mismatches}");
         assert_eq!(mismatches, 0, "a value's shadow and native home disagree");
         assert!(dual > 0, "the fixture must exercise at least one dual-homed value");
+        let code = unsafe { &*publication.owner };
+        let offset = publication.cursor.pc - code.code.as_ptr() as usize;
+        let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) else {
+            panic!("inner poll needs a frame map");
+        };
+        let step = code._native_calls.unwind(code.code.as_ptr() as usize,
+            &publication.cursor, publication.bounds.clone(), read_stack_word).unwrap();
+        let walk = Walk { bounds: publication.bounds.clone(), stack: unsafe { &*publication.stack } };
+        let aliases = verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).unwrap();
+        assert!(aliases > 0, "compare at least one native/shadow pair before collection");
+        let native = map.gc_locations().find_map(|location| match location {
+            NativeValueLocation::Stack(_) | NativeValueLocation::Register(_) =>
+                unsafe { resolve_location(*location, &publication.cursor, step.body_sp,
+                    frame_activation(map, step.body_sp, &walk), map.layout().activation_slots, &walk) }
+                    .filter(|slot| unsafe { **slot == before }),
+            _ => None,
+        }).expect("a real native home");
+        let original = unsafe { native.read() };
+        unsafe { native.write(NIL) };
+        assert!(verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).is_err(),
+            "a wrong native home must fail the alias oracle");
+        unsafe { native.write(original) };
+        #[cfg(debug_assertions)]
+        let checked = VERIFIED_ALIASES.load(std::sync::atomic::Ordering::Relaxed);
         take_visits_by_kind();
         take_completeness();
         force_minor_gc();
@@ -745,6 +882,13 @@ mod tests {
                    "the walk failed to resolve a location its own map declared addressable");
         assert_eq!(bails.iter().sum::<usize>(), 0,
                    "the walk bailed: [{}]", describe_bails(bails));
+        #[cfg(debug_assertions)]
+        assert!(VERIFIED_ALIASES.load(std::sync::atomic::Ordering::Relaxed) > checked,
+            "the collector must compare aliases in its mark pass");
+        assert!(verify_frame_aliases(map, &publication.cursor, step.body_sp, &walk).is_ok(),
+            "relocate native homes and shadows alike");
+        assert_eq!(unsafe { native.read() }, unsafe { (&*probe.args)[0] },
+            "the native home must contain the relocated input");
         probe.visited += chain_visited(current);
         probe.native_visits += stack + register;
         eprintln!(
@@ -1042,14 +1186,17 @@ mod tests {
             else {
                 panic!("{name}: fixture must compile");
             };
-            let Some(code) = TransferCode::compile(Arc::new(body)) else {
-                eprintln!("  {name}: not admitted for native transfer, skipped");
-                continue;
-            };
+            let code = TransferCode::compile(Arc::new(body))
+                .unwrap_or_else(|| panic!("{name}: fixture must retain native admission"));
             for site in code._native_calls.iter() {
                 let described = match code._native_calls.value_map(site.return_offset) {
                     Some(NativeCallValues::Frame(map)) => {
                         frames += 1;
+                        for value in map.values().iter().filter(|v| v.may_reference_heap()) {
+                            assert!(value.locations().iter().any(|location|
+                                matches!(location, NativeValueLocation::Activation(_))),
+                                "this phase must preserve every shadow");
+                        }
                         let mut act = 0;
                         let mut stk = 0;
                         let mut reg = 0;
@@ -1125,7 +1272,10 @@ mod tests {
             bounds,
             segment: published.segment,
             stack,
-            previous: std::ptr::null_mut(),
+            // Keep the genuine publication live: the malformed head must
+            // visit nothing, but GC must still relocate the native aliases
+            // this test's executing frame will compare and reload later.
+            previous: real,
             visited: Cell::new(0),
         };
         let past_the_code = code.code.as_ptr() as usize + code.code_len;

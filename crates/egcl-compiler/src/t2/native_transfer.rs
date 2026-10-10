@@ -74,7 +74,8 @@
 
 mod mapped_call;
 pub use mapped_call::{
-    ADAPTER_FRAME_BYTES, MappedCallRecord, emit_published_call_entry, emit_published_call_veneer,
+    ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry, emit_published_call_entry,
+    emit_published_call_entry_descriptor, emit_published_call_veneer,
 };
 
 use egcl_rt::asm::{Asm, Cc};

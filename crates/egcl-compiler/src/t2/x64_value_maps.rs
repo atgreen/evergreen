@@ -309,6 +309,36 @@ mod tests {
     }
 
     #[test]
+    fn native_roots_retain_stack_and_preserved_register_aliases() {
+        let values = [
+            home(0, Repr::Tagged, ValueHome::Stack(0)),
+            home(1, Repr::Tagged, ValueHome::Reg(12)),
+            home(2, Repr::Tagged, ValueHome::Reg(1)),
+            home(3, Repr::UnboxedFixnum, ValueHome::Reg(8)),
+        ];
+        for poll in [None, Some(2)] {
+            let map = NativeFrameValues::for_call(
+                &values, &[Value(0), Value(1), Value(2)], 4,
+                &[Value(0)], Some(8), layout(), poll, |_| false,
+            ).unwrap();
+            assert_eq!(map.ssa_value(Value(0)).unwrap().locations(), &[
+                NativeValueLocation::Activation(4), NativeValueLocation::Stack(0),
+                NativeValueLocation::Activation(8),
+            ]);
+            assert_eq!(map.ssa_value(Value(1)).unwrap().locations(), &[
+                NativeValueLocation::Activation(5), NativeValueLocation::Register(12),
+            ]);
+            assert_eq!(map.ssa_value(Value(2)).unwrap().locations(), &[
+                NativeValueLocation::Activation(6),
+            ]);
+            assert_eq!(map.ssa_value(Value(3)).unwrap().locations(), &[
+                if poll.is_some() { NativeValueLocation::Stack(16) }
+                else { NativeValueLocation::Unavailable },
+            ], "tagged poll registers must not consume raw spill positions");
+        }
+    }
+
+    #[test]
     fn calls_use_updated_shadows_and_every_outgoing_argument_copy() {
         let values = [
             home(0, Repr::Tagged, ValueHome::Reg(1)),

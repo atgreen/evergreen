@@ -5,14 +5,14 @@
 //! slots, never unrooted callable bits or execution-owned code descriptors.
 
 use super::*;
-use egcl_compiler::t2::native_transfer::{MappedCallRecord, emit_published_call_entry};
+use egcl_compiler::t2::native_transfer::{MappedCallRecord, emit_published_call_entry_descriptor};
 use egcl_rt::function::NativeCallableEntries;
-use egcl_rt::jit::JitBuffer;
+use super::native_transfer_entry::root_publication::PublishedAdapter;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 
 struct Entries {
     published: NativeCallableEntries,
-    _code: [JitBuffer; 2],
+    code: [PublishedAdapter; 2],
 }
 
 #[cfg(test)]
@@ -61,12 +61,17 @@ pub(super) unsafe fn collect_at_entry(target: u64) -> Result<(), EgclError> {
     Ok(())
 }
 
+static ENTRIES: std::sync::OnceLock<Option<Entries>> = std::sync::OnceLock::new();
+
+pub(super) fn mapped_adapter(pc: usize) -> Option<&'static PublishedAdapter> {
+    ENTRIES.get()?.as_ref()?.code.iter().find(|entry| entry.contains_return(pc))
+}
+
 pub(super) fn entries() -> Option<&'static NativeCallableEntries> {
-    static ENTRIES: std::sync::OnceLock<Option<Entries>> = std::sync::OnceLock::new();
     let entries = ENTRIES
         .get_or_init(|| {
             let entry = |slice| {
-                JitBuffer::new(&emit_published_call_entry(
+                PublishedAdapter::new(emit_published_call_entry_descriptor(
                     slice,
                     native_transfer_entry::prepare_callable,
                     native_transfer_entry::finish_callable,
@@ -77,10 +82,10 @@ pub(super) fn entries() -> Option<&'static NativeCallableEntries> {
             let code = [entry(false)?, entry(true)?];
             Some(Entries {
                 published: NativeCallableEntries {
-                    registers: code[0].as_ptr() as usize,
-                    slice: code[1].as_ptr() as usize,
+                    registers: code[0].code.as_ptr() as usize,
+                    slice: code[1].code.as_ptr() as usize,
                 },
-                _code: code,
+                code,
             })
         })
         .as_ref()?;
