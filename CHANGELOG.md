@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.4 - 2026-10-10
+
+### Applications and deployment
+
 - Embed read-only build-host files into saved images with `egcl-ext:embed-file`
   and ASDF components from `egcl-embed-asdf`, so applications can read them
   after deployment without the original files
@@ -62,18 +66,6 @@
 
 ### Native compilation and performance
 
-- Restore RISC-V loop promotion into T2 by checking imported fixnum values
-  when entering optimized loops, with recovery for failed checks
-  ([#140](https://github.com/atgreen/evergreen/pull/140)).
-- Add opt-in published native callable entries for Rust-to-Lisp calls on
-  AArch64 Unix with `EGCL_NATIVE_TRANSFER=1`
-  ([#206](https://github.com/atgreen/evergreen/pull/206)).
-- Decode RISC-V native instructions in process for `DISASSEMBLE`, including
-  compressed instructions, ABI register names and branch targets
-  ([#136](https://github.com/atgreen/evergreen/pull/136)).
-- Decode POWER native instructions in process for `DISASSEMBLE`, with
-  branch targets, OSR entries, runtime helper names and tagged constants
-  ([#139](https://github.com/atgreen/evergreen/pull/139)).
 - Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
   Eligible ordinary T1 and T2 functions now use mapped native calls without
   checking exceptional status after successful returns, preserving moving
@@ -147,6 +139,18 @@ remain opt-in.
 
 ### Platform support
 
+- Restore RISC-V loop promotion into T2 by checking imported fixnum values
+  when entering optimized loops, with recovery for failed checks
+  ([#140](https://github.com/atgreen/evergreen/pull/140)).
+- Add opt-in published native callable entries for Rust-to-Lisp calls on
+  AArch64 Unix with `EGCL_NATIVE_TRANSFER=1`
+  ([#206](https://github.com/atgreen/evergreen/pull/206)).
+- Decode RISC-V native instructions in process for `DISASSEMBLE`, including
+  compressed instructions, ABI register names and branch targets
+  ([#136](https://github.com/atgreen/evergreen/pull/136)).
+- Decode POWER native instructions in process for `DISASSEMBLE`, with
+  branch targets, OSR entries, runtime helper names and tagged constants
+  ([#139](https://github.com/atgreen/evergreen/pull/139)).
 - **Windows x86-64:** add opt-in native callable entry boundaries with rooted
   arguments and Windows unwind metadata. Enable with `EGCL_NATIVE_TRANSFER=1`;
   unsupported process mitigation policies produce an explicit error. Compiled
