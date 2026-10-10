@@ -149,7 +149,9 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // padding. Older padding cannot safely be interpreted as a symbol identity.
 // Version 8 rejects embedded version-1 bytecode that may have erased callable
 // bindings. Loading those bodies cannot recover the original named calls.
-const FORMAT_VERSION: u32 = 8;
+// Version 9 retains the shared local-function scopes of source closures.
+// Older images discarded that lexical namespace and cannot reconstruct it.
+const FORMAT_VERSION: u32 = 9;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

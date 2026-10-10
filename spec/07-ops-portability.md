@@ -574,8 +574,11 @@ a major version (R7.14).
 The `format_version` field in the header (D7.01) is independent of the
 release version:
 
-The current format is **8**. It requires compiled bodies whose bytecode
-preserves callable identities (BBU 2.0). Format-7 and older images may embed
+The current format is **9**. It retains closures' shared local-function scopes
+and their definition environments in the host-registry `CFUN` graph. Format-8
+and older images omit this metadata and cannot reconstruct it during restore.
+It also requires compiled bodies whose bytecode preserves callable identities
+(BBU 2.0). Format-7 and older images may embed
 instructions produced by lowering that erased named calls; their original
 callee identities cannot be recovered during restore. Rebuild such images from
 source with the current runtime. The version check runs before heap restoration
@@ -584,7 +587,8 @@ or host-registry installation.
 Earlier format changes introduced compiled-method associations (3), opaque
 condition-variable handles (4), native runtime requirements (5), aligned heap
 spans with precise pointer fixups (6), and immutable function definition indices
-(7). These older formats are deliberately unsupported.
+(7), and callable-preserving bytecode (8). These older formats are deliberately
+unsupported.
 
 | Compat Rule | Behaviour |
 |-------------|-----------|

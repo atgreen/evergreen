@@ -9,19 +9,71 @@ use std::cell::RefCell;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Position {
     segment: usize,
+    segment_chain: Vec<usize>,
     capture: Option<(usize, bool)>,
+    adapter_callers: Option<super::super::super::native_callable::outer::SuspendedCallers>,
     frame: usize,
     stack: usize,
     depth: u32,
 }
 impl Position {
     fn here() -> Self {
+        let mut segment = egcl_rt::native_transfer::current_segment();
+        let mut segment_chain = Vec::new();
+        while !segment.is_null() {
+            segment_chain.push(segment as usize);
+            segment = unsafe { (*segment).previous() };
+        }
         Self {
             segment: egcl_rt::native_transfer::current_segment() as usize,
+            segment_chain,
             capture: super::super::super::native_transfer_entry::child_capture_for_test(),
+            adapter_callers:
+                super::super::super::native_callable::outer::suspended_callers_for_test(),
             frame: egcl_rt::current_stack().fp() as usize,
             stack: egcl_rt::current_stack().sp() as usize,
             depth: NATIVE_DEPTH.with(|depth| depth.get()),
+        }
+    }
+
+    // Marker and EVAL callbacks can cross several published Rust adapters.
+    // Require every intermediate physical segment link and the nearest real
+    // mapped capture, recorded before each adapter hid its caller's CAPTURE.
+    fn mapped_caller(&self) -> (usize, Option<(usize, bool)>) {
+        if let Some(callers) = &self.adapter_callers {
+            assert!(
+                self.capture.is_none(),
+                "adapter must hide its caller capture: {self:?}"
+            );
+            assert_eq!(self.segment_chain.first(), Some(&self.segment));
+            assert!(
+                !callers.is_empty(),
+                "adapter must retain its caller: {self:?}"
+            );
+            for (index, &(segment, capture)) in callers.iter().enumerate() {
+                assert_eq!(self.segment_chain.get(index + 1), Some(&segment));
+                assert_ne!(self.segment_chain[index], segment);
+                assert_ne!(segment, 0);
+                if index + 1 < callers.len() {
+                    assert!(
+                        capture.is_none(),
+                        "intermediate adapter must hide CAPTURE: {self:?}"
+                    );
+                } else {
+                    assert!(
+                        capture.is_some(),
+                        "this fixture needs a real mapped caller: {self:?}"
+                    );
+                    return (segment, capture);
+                }
+            }
+            unreachable!("nonempty caller chain returns its final mapped capture")
+        } else {
+            assert!(
+                self.capture.is_some(),
+                "marker must execute above mapped code: {self:?}"
+            );
+            (self.segment, self.capture)
         }
     }
 }
@@ -231,23 +283,32 @@ fn native_v2_mapped_child_reenters_through_rust_and_retires_in_order() {
                 let outer = &state.events[0].1;
                 let inner_position = &state.events[1].1;
                 assert_ne!(outer.segment, 0);
-                assert_eq!(outer.capture, Some((Rc::as_ptr(&child) as usize, true)));
+                let (outer_mapped_segment, outer_capture) = outer.mapped_caller();
+                let (inner_mapped_segment, inner_capture) = inner_position.mapped_caller();
+                assert_eq!(outer_capture, Some((Rc::as_ptr(&child) as usize, true)));
                 assert_ne!(
-                    inner_position.segment, outer.segment,
+                    inner_mapped_segment, outer_mapped_segment,
                     "EVAL must create a separate native segment"
                 );
-                assert_eq!(
-                    inner_position.capture,
-                    Some((Rc::as_ptr(&inner) as usize, false))
+                assert!(
+                    inner_position.segment_chain.contains(&outer.segment),
+                    "inner execution must retain the real EVAL segment: {inner_position:?}"
                 );
-                assert_eq!(state.events[2].1.segment, inner_position.segment);
-                assert_eq!(state.events[2].1.capture, inner_position.capture);
-                assert_eq!(state.events[4].1.segment, outer.segment);
-                assert_eq!(state.events[4].1.capture, outer.capture);
-                assert_eq!(state.events[5].1.segment, outer.segment);
+                assert_eq!(inner_capture, Some((Rc::as_ptr(&inner) as usize, false)));
                 assert_eq!(
-                    state.events[5].1.capture,
-                    Some((std::ptr::from_ref(&caller) as usize, false))
+                    state.events[2].1.mapped_caller(),
+                    (inner_mapped_segment, inner_capture)
+                );
+                assert_eq!(
+                    state.events[4].1.mapped_caller(),
+                    (outer_mapped_segment, outer_capture)
+                );
+                assert_eq!(
+                    state.events[5].1.mapped_caller(),
+                    (
+                        outer_mapped_segment,
+                        Some((std::ptr::from_ref(&caller) as usize, false))
+                    )
                 );
             });
         }

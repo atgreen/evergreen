@@ -4,20 +4,24 @@
 
 ### Compatibility
 
-- Saved bytecode now uses version 2.0 and core images use format 8. Recompile
+- Saved bytecode now uses version 2.0 and core images use format 9. Recompile
   older FASLs and rebuild older images. Saved functions retain their definitions
   and lexical captures across redefinition, aliases, unbinding and restoration
   ([#174](https://github.com/atgreen/evergreen/pull/174),
-  [#202](https://github.com/atgreen/evergreen/pull/202)).
+  [#202](https://github.com/atgreen/evergreen/pull/202),
+  [#204](https://github.com/atgreen/evergreen/pull/204)).
 
 ### Calling and control-flow correctness
 
 - Keep each function's selected definition, captures and compiled code together
   across concurrent redefinition and tier promotion, including callable-instance
-  replacements and saved source-backed functions
+  replacements and saved source-backed functions. Preserve closure function and
+  control scopes through installation and image restoration, and resolve symbol
+  `FUNCALL`/`APPLY` targets in the global function namespace
   ([#148](https://github.com/atgreen/evergreen/pull/148),
   [#192](https://github.com/atgreen/evergreen/pull/192),
-  [#193](https://github.com/atgreen/evergreen/pull/193)).
+  [#193](https://github.com/atgreen/evergreen/pull/193),
+  [#204](https://github.com/atgreen/evergreen/pull/204)).
 - Honor replacement builtins, readers and memory fences in interpreted, compiled
   and saved code, including lexical `VALUES` and `BYTE`, `LDB`, `TYPEP`,
   `FIRST-CHAR` and returning `ERROR` replacements. Preserve replacement functions'
@@ -44,6 +48,11 @@
 
 ### Native compilation and performance
 
+- Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
+  Eligible ordinary T2 functions now use mapped native calls without checking
+  exceptional status after successful returns, preserving moving roots,
+  multiple values and guard recovery
+  ([#204](https://github.com/atgreen/evergreen/pull/204)).
 - Speed up named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
   captured-variable access, simple-string access and missed hash-table lookups.
   Retain replacement checks, multiple values, GC safety and error recovery
@@ -77,7 +86,8 @@
 
 ### Opt-in native exceptional transfers
 
-The new native transfer path remains opt-in; it is not yet the default ABI.
+The full native ABI rollout remains incomplete. Additional transfer paths below
+remain opt-in.
 
 - Keep eligible recursive calls, calls between T2 definitions, `FUNCALL`, `APPLY`
   and protected functions in native segments. Preserve live linkage, callable

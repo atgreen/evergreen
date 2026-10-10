@@ -27,6 +27,8 @@ pub(super) mod root_publication;
 mod activation;
 use activation::ActivationState;
 mod deopt;
+mod ordinary_t2;
+pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
 use nested::{SegmentActivations, finish_nested, prepare_nested, resume_nested};
 pub(super) use nested::{
@@ -183,8 +185,8 @@ pub(super) struct TransferCode {
     // Retired definitions retain their exact value recipes as long as code lives.
     _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
     code_len: usize,
-    #[cfg(test)]
     pub(super) has_deopt: bool,
+    bcp_offsets: Vec<u32>,
     _veneer: JitBuffer,
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
     _capture: JitBuffer,
@@ -282,7 +284,10 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
         return None;
     }
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol)?);
-    let replacement = TransferCode::compile_variant(Arc::clone(&body), true, false)
+    // Ordinary T2 versions retire to an honest non-speculating mapped baseline.
+    // The next dispatch can queue optimized worker compilation again; this
+    // local baseline frontend must not replace it under a T2 tier label.
+    let replacement = TransferCode::compile_variant(Arc::clone(&body), !expected.is_t2, false)
         .or_else(|| TransferCode::compile_variant(Arc::clone(&body), false, false))?;
     // Compilation can collect and reenter runtime services. Never let a stale
     // invocation replace code published for a newer version or callable.
@@ -540,8 +545,25 @@ impl TransferCode {
         } else {
             (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None)
         };
+        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
+            let Instr::CallNamed { sym, .. } = instruction else { return None };
+            call_table::resolve(*sym).map(|cell| (*sym, cell))
+        }).collect();
+        Self::emit_prepared(body, roots, &ir, deopt_metadata, &call_cells, allow_recursion)
+    }
+
+    /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
+    /// supplies its optimized IR and rooted constant owners through this seam.
+    fn emit_prepared(
+        body: Arc<BytecodeFunction>,
+        roots: Arc<ActiveBytecodeRoot>,
+        ir: &egcl_compiler::t2::ir::Function,
+        deopt_metadata: Option<Arc<T2InstalledMetadata>>,
+        call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
+        allow_recursion: bool,
+    ) -> Option<Self> {
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
-        let deopt_capture = if optimize {
+        let deopt_capture = if deopt_metadata.is_some() {
             Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
         } else { None };
         let deopt_veneer = match &deopt_capture {
@@ -550,21 +572,19 @@ impl TransferCode {
         };
         let veneer = JitBuffer::new(&emit_published_helper_veneer(call_or_throw, capture.as_ptr()))?;
         let mut call_entries = Vec::new();
-        for instruction in &body.code {
-            let Instr::CallNamed { sym, .. } = instruction else { continue };
+        for (sym, cell) in call_cells {
             if call_entries.iter().any(|(symbol, _, _)| symbol == sym) {
                 continue;
             }
-            let Some(cell) = call_table::resolve(*sym) else { continue };
             let mapped = JitBuffer::new(
                 &egcl_compiler::t2::native_transfer::emit_published_call_veneer(
-                    Arc::as_ptr(&cell) as u64,
+                    Arc::as_ptr(cell) as u64,
                     cell.entry_address(false) as u64,
                     cell.entry_address(true) as u64,
                     capture.as_ptr(),
                 ),
             )?;
-            call_entries.push((*sym, cell, mapped));
+            call_entries.push((*sym, Arc::clone(cell), mapped));
         }
         let named_veneers: Vec<_> = call_entries.iter()
             .map(|(symbol, _, adapter)| (*symbol, adapter.as_ptr() as u64))
@@ -597,7 +617,7 @@ impl TransferCode {
             finish: finish_recursive as *const () as u64,
         });
         let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries(
-            &ir,
+            ir,
             veneer.as_ptr() as u64,
             base_slots,
             save_cleanup as *const () as u64,
@@ -679,8 +699,8 @@ impl TransferCode {
             code_info,
             code_len: emitted.code.len(),
             _native_calls: Arc::new(emitted.native_calls?),
-            #[cfg(test)]
             has_deopt: emitted.has_deopt,
+            bcp_offsets: emitted.bcp_offsets,
             _veneer: veneer,
             _call_entries: call_entries,
             _capture: capture,
@@ -2223,6 +2243,39 @@ struct EntryGuard {
     env: *mut Env,
     capture: *mut CaptureContext,
     error: Option<EgclError>,
+}
+
+/// Enter a published callable from a Rust caller. The outer shim owns no Lisp
+/// activation; its selected callable and argument buffer are host roots. Every
+/// callback establishes a fresh segment and temporarily hides the enclosing
+/// capture, so a selected transfer cannot jump across live Rust scopes.
+pub(super) unsafe fn invoke_outer_callable(
+    code: *const u8,
+    invocation: *mut u64,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_env = &mut *env);
+    let mut entry = EntryGuard {
+        env: NATIVE_ENV.with(|slot| slot.replace(env)),
+        capture: CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())),
+        error: NATIVE_ERROR.with(|slot| slot.take()),
+    };
+    egcl_rt::rooted_ref!(_entry = &mut entry);
+    let _recovery = FaultRecoveryGuard {
+        null: egcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+        stack: egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+    };
+    egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+    let outcome = unsafe {
+        native_transfer::invoke_native_segment(code, invocation, egcl_rt::current_stack())
+    }.map_err(|_| EgclError::Internal("published native callable boundary is unavailable".into()))?;
+    egcl_rt::rooted!(primary = outcome.value);
+    egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
+    match outcome.exit {
+        NativeExit::Returned if error.is_none() => Ok(*primary),
+        NativeExit::Transfer => Err(error.take().ok_or_else(invalid_capture)?),
+        _ => Err(invalid_capture()),
+    }
 }
 impl egcl_rt::gc::TraceHostRoots for EntryGuard {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {

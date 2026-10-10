@@ -29,6 +29,7 @@ mod evaluated_builtins;
 pub mod events;
 mod native_runtime;
 mod python;
+mod reified_metadata;
 pub mod sprof;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
@@ -1272,12 +1273,9 @@ fn dispatch_target(name: &str) -> (Option<u32>, EgclVal) {
 ///   * a symbol designator → the current global definition it names (CL captures
 ///     the function, not the name — CLHS 5.1.2.7);
 ///   * a closure `(EGCL::CLOSURE . id)` → reified into an interpreted-function
-///     object carrying its lambda list and body; if it captures enclosing
-///     lexicals, its captured frame is recorded in `CLOSURE_ENV` (keyed by the
-///     object's fresh private name) so the tree-walker call sites reparent the
-///     body against that frame — a captured `n` in `(setf (symbol-function 's)
-///     (let ((n …)) (lambda …)))` stays visible when `s` is later called
-///     (bliss-jtc.23.3).
+///     object retaining the original closure in its traced environment cell.
+///     Its complete lexical environment stays owned by that closure, including
+///     local functions, declarations, and lexical control targets.
 ///
 /// Designators this can't resolve (e.g. `#'car`, a builtin) are returned
 /// unchanged.
@@ -1296,6 +1294,7 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
             let id = t.as_fixnum() as u64;
             let closure = { env.closures.borrow().get(&id).cloned() };
             if let Some(closure) = closure {
+                egcl_rt::rooted!(original = val);
                 egcl_rt::rooted!(closure = closure);
                 // Give the object a fresh private name and record the closure's
                 // captured frame under it, mirroring the bytecode MakeClosure
@@ -1313,13 +1312,58 @@ fn coerce_installed_function(env: &Env, val: EgclVal) -> EgclVal {
                 return egcl_rt::function::alloc_interpreted(
                     closure.params_form,
                     closure.body,
-                    NIL,
+                    *original,
                     fresh,
                 );
             }
         }
     }
     val
+}
+
+/// The source closure retained by a reified callable. Reading the object-owned
+/// identity avoids reconstructing only part of its lexical invocation context.
+fn reified_closure(function: EgclVal) -> Option<EgclVal> {
+    if !egcl_rt::function::is_interpreted_function(function) {
+        return None;
+    }
+    let original = egcl_rt::function::env(function);
+    is_closure_cons(original).then_some(original)
+}
+
+#[cfg(test)]
+mod reified_closure_rooting_tests {
+    use super::*;
+
+    #[test]
+    fn reified_function_retains_its_moving_closure_identity() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(body = reader::read_from_string("(held)").unwrap().0);
+        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        captured.borrow_mut().vars.insert("HELD".into(), EgclVal::from_fixnum(42));
+        egcl_rt::rooted!(source = register_tree_closure(Closure {
+            params_form: NIL,
+            body: *body,
+            captured_frame: captured,
+            captured_specials: Vec::new(),
+            captured_blocks: Vec::new(),
+            captured_tags: Vec::new(),
+            captured_funs: Some(Arc::clone(&env.funs)),
+        }));
+        egcl_rt::rooted!(function = coerce_installed_function(&env, *source));
+        let before = reified_closure(*function).expect("retain source closure").to_raw();
+        drop(source);
+        // The function's environment field is now the only heap owner of the
+        // closure cons. The host registry owns its metadata, not that cons.
+        egcl_rt::gc::collect_t0_minor().unwrap();
+        let retained = reified_closure(*function).expect("retain relocated identity");
+        assert_ne!(retained.to_raw(), before, "the closure identity must actually move");
+        let id = cp(retained).1.as_fixnum() as u64;
+        prune_closure_registry();
+        assert!(env.closures.borrow().contains_key(&id), "saved callable owns its metadata");
+    }
 }
 
 /// Resolve a function designator to its tiered function object (FnMeta), for the
@@ -1692,23 +1736,7 @@ fn callable_body(env: &Env, name: &str) -> Option<(EgclVal, EgclVal)> {
 }
 
 /// [`callable_body`] for a call whose callee is a SYMBOL: identical resolution
-/// order, but the global-function step is reached from the symbol's registry
-/// INDEX instead of re-hashing its name.
-/// [`callable_body_of_symbol`] for a symbol used as a FUNCTION DESIGNATOR rather
-/// than in operator position. CLHS 3.1.2.1.2.2: a symbol designator denotes the
-/// symbol's GLOBAL function, so an enclosing FLET/LABELS binding of that name is
-/// NOT consulted — `(flet ((f …)) (funcall 'f …))` calls the global f, while
-/// `(flet ((f …)) (f …))` and `#'f` call the local one (ansi FUNCALL.7;
-/// bliss-c1dr).
-fn global_callable_body_of_symbol(
-    env: &Env,
-    sym: EgclVal,
-    name: &str,
-) -> Option<(EgclVal, EgclVal)> {
-    let sym_idx = (sym.is_symbol() && sym != NIL && sym != T).then(|| sym.as_symbol_index());
-    callable_body_inner_ex(env, name, sym_idx, true)
-}
-
+/// order, but the global-function step uses the symbol's registry index.
 fn callable_body_of_symbol(env: &Env, sym: EgclVal, name: &str) -> Option<(EgclVal, EgclVal)> {
     // NIL and T report is_symbol() true but carry the SPECIAL tag, not TAG_SYMBOL,
     // so as_symbol_index() would panic; they never name an interpreted function,
@@ -1741,18 +1769,34 @@ fn callable_body_inner(
     callable_body_inner_ex(env, name, sym_idx, false)
 }
 
-fn callable_body_inner_ex(
+/// A named source call retains either a lexical/SETF body or one immutable
+/// global callable object. Body and environment are never read from different
+/// versions of a public function cell.
+enum NamedCallTarget {
+    Body {
+        params: EgclVal,
+        body: EgclVal,
+        is_local: bool,
+    },
+    Function(EgclVal),
+}
+
+fn named_call_target(
     env: &Env,
     name: &str,
     sym_idx: Option<u32>,
     skip_lexical: bool,
-) -> Option<(EgclVal, EgclVal)> {
+) -> Option<NamedCallTarget> {
     // `skip_lexical` is the function-DESIGNATOR lookup: `env.funs` holds only
     // lexical FLET/LABELS locals, and a symbol designator must not see them
     // (bliss-c1dr). Globals live in the symbol table and GLOBAL_SETF_FNS below,
     // so skipping this map loses nothing else.
     if !skip_lexical && let Some(fdef) = env.funs.borrow().get(name) {
-        return Some((fdef.params_form, fdef.body));
+        return Some(NamedCallTarget::Body {
+            params: fdef.params_form,
+            body: fdef.body,
+            is_local: true,
+        });
     }
     // Global `(setf place)` writers registered by a top-level defun (any file).
     if let Some(pb) = with_global_setf_fns(|m| {
@@ -1760,7 +1804,11 @@ fn callable_body_inner_ex(
             .get(name)
             .map(|fdef| (fdef.params_form, fdef.body))
     }) {
-        return Some(pb);
+        return Some(NamedCallTarget::Body {
+            params: pb.0,
+            body: pb.1,
+            is_local: false,
+        });
     }
     let f = match sym_idx {
         Some(idx) => {
@@ -1770,13 +1818,27 @@ fn callable_body_inner_ex(
         }
         None => global_fn(name)?,
     };
-    if !bytecode::profiling_disabled() {
-        egcl_rt::function::record_invocation(f);
+    Some(NamedCallTarget::Function(f))
+}
+
+fn callable_body_inner_ex(
+    env: &Env,
+    name: &str,
+    sym_idx: Option<u32>,
+    skip_lexical: bool,
+) -> Option<(EgclVal, EgclVal)> {
+    match named_call_target(env, name, sym_idx, skip_lexical)? {
+        NamedCallTarget::Body { params, body, .. } => Some((params, body)),
+        NamedCallTarget::Function(function) => {
+            if !bytecode::profiling_disabled() {
+                egcl_rt::function::record_invocation(function);
+            }
+            Some((
+                egcl_rt::function::lambda_list(function),
+                egcl_rt::function::body(function),
+            ))
+        }
     }
-    Some((
-        egcl_rt::function::lambda_list(f),
-        egcl_rt::function::body(f),
-    ))
 }
 
 /// Lazy-compile trigger (bliss-x5y): in lazy mode a global DEFUN is compiled to
@@ -1792,6 +1854,11 @@ fn maybe_lazy_compile(name: &str, params: EgclVal, body: EgclVal, env: &Env) {
     let Some(f) = global_fn(name) else {
         return;
     };
+    // Compiling only params/body in the caller's environment loses the retained
+    // closure's local functions, declarations and control targets.
+    if reified_closure(f).is_some() {
+        return;
+    }
     if !egcl_rt::function::is_interpreted_function(f)
         || egcl_rt::function::invoke_count(f) < bytecode::lazy_compile_threshold()
     {
@@ -2016,11 +2083,8 @@ struct Closure {
     ///
     /// `Arc` because `Env::funs_mut` is copy-on-write: a later mutation in any
     /// descendant env forks its own map rather than disturbing this snapshot.
-    /// `None` means "inherit the caller's namespace", which is right for a
-    /// lambda written outside any FLET/LABELS — and is what a core-restored
-    /// closure gets, since this is deliberately not serialized (the image format
-    /// is unversioned; restoring one loses its local-function scope exactly as
-    /// it did before this field existed).
+    /// `None` means "inherit the caller's namespace". Image persistence retains
+    /// both this distinction and shared namespace identity through CFUN.
     captured_funs: Option<Arc<SharedCell<HashMap<String, FunDef>>>>,
 }
 
@@ -3150,6 +3214,7 @@ fn host_serialize_registries() -> Vec<u8> {
     let setf_expanders = SAVE_SETF_EXPANDERS.with(|s| {
         s.borrow().as_ref().map(|table| table.borrow().clone()).unwrap_or_default()
     });
+    let function_scopes = reified_metadata::FunctionScopes::collect();
     let (frame_ids, clsr_frames) = {
         let reg = closure_registry();
         let reg = reg.borrow();
@@ -3170,6 +3235,7 @@ fn host_serialize_registries() -> Vec<u8> {
             .map(|c| Arc::clone(&c.captured_frame))
             .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
             .chain(method_frames)
+            .chain(function_scopes.frames())
             .chain(setf_expanders.values().filter_map(|expander| match expander {
                 SetfExpander::Expander(def) => Some(Arc::clone(&def.captured_frame)),
                 SetfExpander::LongUpdate { captured_frame, .. } => Some(Arc::clone(captured_frame)),
@@ -3438,6 +3504,7 @@ fn host_serialize_registries() -> Vec<u8> {
             }
         }
     }
+    function_scopes.write(&mut out, &frame_ids);
     // Bytecode registry (bliss-zz6w): the compiled code behind source-free
     // stub function objects (everything installed from `.bfasl` fasls during
     // an ASDF load), as a synthetic BYTECODE_UNIT executed by the ordinary
@@ -3814,7 +3881,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
     // thread-local CLOSURE_REGISTRY (every Env on this thread shares it by Rc).
     // Restored ids overwrite pre-load ids — those closures' conses lived in the
     // discarded pre-load heap. Rust allocation + map inserts only — GC-safe.
-    if off + 4 <= data.len() && &data[off..off + 4] == b"CLSR" {
+    let mut restored_closure_ids = HashSet::new();
+    let has_closure_registry = off + 4 <= data.len() && &data[off..off + 4] == b"CLSR";
+    if has_closure_registry {
         off += 4;
         let bad = || EgclError::InvalidImage("host registry: truncated (closures)".into());
         let saved_next = hr_get_u64(data, &mut off).ok_or_else(bad)?;
@@ -3860,6 +3929,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         let registry = closure_registry();
         for _ in 0..n_closures {
             let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            if !restored_closure_ids.insert(id) {
+                return Err(bad());
+            }
             let params = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let body = hr_get_u64(data, &mut off).ok_or_else(bad)?;
             let fid = hr_get_u32(data, &mut off).ok_or_else(bad)?;
@@ -3891,9 +3963,7 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                     body: EgclVal::from_raw(remap(body)),
                     captured_frame,
                     captured_specials: Vec::new(),
-                    // Not serialized (see the field's comment): a restored
-                    // closure inherits the caller's function namespace, exactly
-                    // as it did before the field existed.
+                    // Filled from the shared function-scope graph below.
                     captured_funs: None,
                     captured_blocks,
                     captured_tags,
@@ -3946,6 +4016,16 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
                 closure.captured_specials = declarations;
             }
         }
+    }
+    if off + 4 <= data.len() && &data[off..off + 4] == b"CFUN" {
+        off += 4;
+        PENDING_CLSR_FRAMES.with(|frames| {
+            reified_metadata::restore(data, &mut off, &remap, &frames.borrow(), &restored_closure_ids)
+        })?;
+    } else if has_closure_registry {
+        return Err(EgclError::InvalidImage(
+            "host registry: missing closure function scopes; rebuild the image from source".into(),
+        ));
     }
     // Bytecode-registry unit (bliss-zz6w): stash for the post-Env drain — the
     // BBU loader needs the Env, which this hook does not have.
@@ -17131,6 +17211,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::collect_t0_minor()?;
                 return Ok(NIL);
             }
+            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+            "%ORDINARY-T2-ROOT-FOR-TEST" => {
+                return Ok(bytecode::ordinary_t2_root_for_test());
+            }
+            #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+            "%ORDINARY-T2-ENTRY-FOR-TEST" => {
+                return Ok(bytecode::ordinary_t2_entry_for_test());
+            }
             "QUOTE" => {
                 let (q, _) = cp(cdr);
                 return Ok(q);
@@ -24615,123 +24703,38 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
         }
 
-        // An UNINTERNED operator symbol (a gensym whose function cell was set with
-        // `(setf (symbol-function (gensym)) …)`) has no name→index entry, so the
-        // name-keyed global-call path below cannot find it. Route it through the
-        // function-object apply path, which reads the cell by index and preserves
-        // multiple values (symbol-function.1).
-        if let Some(idx) = car.symbol_index() {
-            if reader::is_uninterned(idx) {
-                if let Some(cell) = egcl_rt::symbols::symbol_function(idx) {
-                    if egcl_rt::function::is_interpreted_function(cell) {
-                        egcl_rt::rooted!(cell = cell);
-                        let args = eval_args(cdr, env)?;
-                        return apply_function(*cell, &args, env);
+        // Lexical functions and SETF writers retain their existing precedence.
+        // Global calls snapshot one function object before arguments can change
+        // its public binding. The shared apply path owns its exact bytecode,
+        // captures, invocation accounting, and lazy compilation.
+        if let Some(target) = named_call_target(env, &name, car.symbol_index(), false) {
+            match target {
+                NamedCallTarget::Function(function) => {
+                    egcl_rt::rooted!(function = function);
+                    let args = eval_args(cdr, env)?;
+                    return apply_function(*function, &args, env);
+                }
+                NamedCallTarget::Body { params, body, is_local } => {
+                    egcl_rt::rooted!(params = params);
+                    egcl_rt::rooted!(body = body);
+                    let args = eval_args(cdr, env)?;
+                    let (parent, control) = if is_local {
+                        (Arc::clone(&env.frame), LexicalControl::Inherit)
+                    } else {
+                        (
+                            Arc::new(SharedCell::new(EnvFrame::default())),
+                            LexicalControl::Fresh,
+                        )
+                    };
+                    let result = eval_named_call_ex(
+                        env, &name, is_local, *params, *body, &args, parent, control,
+                    );
+                    if let Err(error) = &result {
+                        calltrace_note(&name, error);
                     }
+                    return result;
                 }
             }
-        }
-
-        // Check user-defined functions: lexical (FLET/LABELS/`(setf f)`) then the
-        // global function cell (bliss-jtc.6.8). Resolve via the operator symbol's
-        // registry INDEX (not just its name) so an UNINTERNED symbol whose function
-        // cell was installed with `(setf (symbol-function (gensym)) …)` is callable
-        // (symbol-function.1) — its name is not in the name→index map.
-        if let Some((params_form, body)) = callable_body_of_symbol(env, car, &name) {
-            // Root the callee's params/body BEFORE evaluating arguments (which
-            // allocates and can trigger a relocating minor GC). Held as bare
-            // locals, these copies would go stale when the GC moves the callee's
-            // body tree — the local still points at the pre-move location — and
-            // eval_lambda_call would then walk a freed body (bliss-6b2 #2).
-            egcl_rt::rooted!(params_form = params_form);
-            egcl_rt::rooted!(body = body);
-            egcl_rt::rooted!(forms = cdr);
-            egcl_rt::rooted!(rooted_args = Vec::<EgclVal>::new());
-            while forms.is_cons() {
-                let (af, r) = cp(*forms);
-                // Advance the rooted cursor first so the rest of the list stays
-                // rooted across the argument's evaluation.
-                *forms = r;
-                let value = eval_form(af, env)?;
-                rooted_args.push(value);
-            }
-            // T0→T1 tiering: run a GLOBAL compiled callee through the promoting
-            // bytecode/native path so hot functions promote even when called from
-            // tree-walked code (e.g. a `loop`, which never compiles to bytecode).
-            // Guard on no lexical shadow — never redirect an FLET/LABELS binding
-            // to the global registry entry of the same name.
-            let is_local_fn = env.funs.borrow().contains_key(&name);
-            let mut call_parent = Arc::clone(&env.frame);
-            if std::env::var_os("EGCL_DEBUG_DISPATCH").is_some() && name.contains("MK-CLOSURE") {
-                eprintln!(
-                    "[disp] operator path name={name} local={is_local_fn} body_nil={}",
-                    body.is_nil()
-                );
-            }
-            if !is_local_fn {
-                maybe_lazy_compile(&name, *params_form, *body, env);
-                // Dispatch through the resolved function OBJECT, mirroring the
-                // funcall-object path: key the registry on its OWN name (so an
-                // aliased installation — `(setf (symbol-function 'p) (symbol-
-                // function 'q))`, `… #'q`, or a source-free `(lambda …)` whose
-                // real code is registered under a fresh gensym — routes to that
-                // code rather than the alias `p`, which carries no registry entry
-                // and whose interpreted body is an empty shell), and pass the
-                // object as `fn_val` so a captured closure's environment (keyed on
-                // the object in CLOSURE_ENV) is installed when its body runs.
-                // Fall back to the called name when no global object resolves
-                // (e.g. a GLOBAL_SETF_FNS writer). bliss-57m / bliss-jtc.23.3.
-                let (dispatch_idx, fn_val) = dispatch_target_of_symbol(car, &name);
-                if let Some(idx) = dispatch_idx {
-                    if let Some(res) = bytecode::call_registered(idx, &rooted_args, fn_val, env) {
-                        return res;
-                    }
-                }
-                // Registered bytecode did not consume the call. If the resolved
-                // object is a reified capturing closure, run its interpreted body
-                // against the captured environment, not the caller's frame
-                // (bliss-jtc.23.3).
-                if let Some(frame) = bytecode::closure_captured_env(fn_val) {
-                    call_parent = frame;
-                } else {
-                    // Non-closure GLOBAL defun: its definition environment is the
-                    // null lexical environment (top level), NOT the caller's
-                    // frame. Free-variable lookup must see only the callee's own
-                    // params plus globals/specials (resolved via the symbol value
-                    // cell in lookup_var), never the caller's lexical locals —
-                    // otherwise a callee dynamically scopes the caller's LET, and
-                    // the cold tree-walked result diverges from the lexical
-                    // bytecode backend (a tier inconsistency). bliss-20o.
-                    call_parent = Arc::new(SharedCell::new(EnvFrame::default()));
-                }
-            }
-            // A GLOBAL named function has no lexically-enclosing BLOCK/TAGBODY
-            // (its own implicit block is inside its body), so it runs in a FRESH
-            // exit scope — not the caller's dynamic one (bliss-4u5u). A local
-            // FLET/LABELS name is lexically nested in the caller, so it inherits.
-            let control = if is_local_fn {
-                LexicalControl::Inherit
-            } else {
-                LexicalControl::Fresh
-            };
-            // The rooted argument vector is rewritten in place by any collection
-            // (call_registered may have collected), so it is always current.
-            // eval_named_call_ex swaps in a FLET function's captured scope
-            // (bliss-ayq8) when this is a local FLET name.
-            let res = eval_named_call_ex(
-                env,
-                &name,
-                is_local_fn,
-                *params_form,
-                *body,
-                &rooted_args,
-                call_parent,
-                control,
-            );
-            if let Err(e) = &res {
-                calltrace_note(&name, e);
-            }
-            return res;
         }
 
         // Installed reader methods participate in ordinary generic dispatch,
@@ -34959,7 +34962,7 @@ fn apply_intlen_or_logcount(name: &str, v: EgclVal) -> Result<EgclVal, EgclError
 //
 // A native (T1) call to a builtin goes out through `c2i_call_slice` into
 // `apply_function`, which RESOLVES THE CALLEE BY NAME on every single call:
-// `sym_name_rc`, `global_callable_body_of_symbol`, `sym_bare_name_rc`,
+// `sym_name_rc`, `named_call_target`, `sym_bare_name_rc`,
 // `fixed_arity_builtin`, then three shadowing lookups — `global_fn` (which
 // round-trips the name back to an index through the package system),
 // `env.funs`, `local_fn_closure` — before any work happens. Profiling a loop
@@ -35373,6 +35376,25 @@ impl Drop for CallDepthGuard {
 }
 
 fn apply_function(
+    fn_val: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    {
+        bytecode::invoke_native_callable(fn_val, args, env)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    {
+        apply_function_impl(fn_val, args, env)
+    }
+}
+
+// The published adapter has already selected this callable. Calling the public
+// wrapper here would redispatch the same invocation indefinitely; callbacks
+// made while this implementation runs still use apply_function and own a new
+// segment across their Rust boundary.
+fn apply_function_impl(
     mut fn_val: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
@@ -35380,84 +35402,51 @@ fn apply_function(
     let _call_depth = CallDepthGuard::enter()?;
     egcl_rt::rooted_ref!(_fn_val_root = &mut fn_val);
     rooted_args!(args = args);
-    // Function could be a lambda form, a symbol naming a function, or a closure
+    // A symbol designator selects only its global function. Keep that object
+    // in the rooted slot and continue through the ordinary object dispatch;
+    // caller FLET/LABELS metadata must never be paired with its global body.
     if fn_val.is_symbol() {
         let name = sym_name_rc(fn_val);
-        // Symbol designators denote the global cell, independent of FLET.
-        if let Some(function) = fn_val.symbol_index().and_then(installed_function)
-            && !egcl_rt::function::is_interpreted_function(function)
-        {
-            return apply_function(function, args, env);
-        }
-        if let Some((mut params_form, mut body)) =
-            global_callable_body_of_symbol(env, fn_val, &name)
-        {
-            // Root across a possible lazy compile below (compile_function
-            // allocates/GCs), since these locals feed eval_lambda_call later.
-            egcl_rt::rooted_ref!(_params_form_root = &mut params_form);
-            egcl_rt::rooted_ref!(_body_root = &mut body);
-            // Mirror the operator-position path: a GLOBAL function with a
-            // registered bytecode body (e.g. one installed from a `.bfasl`, whose
-            // interpreted-function object carries a NIL body) must dispatch
-            // through the promoting bytecode/native path, not run its empty
-            // fallback body. Dispatch through the resolved OBJECT — key the
-            // registry on its own name so an aliased installation routes to the
-            // real bytecode, and pass the object as `fn_val` so a captured
-            // closure's environment is installed when its body runs (bliss-57m /
-            // bliss-jtc.23.3). Guard on no lexical FLET/LABELS shadow so a local
-            // binding is never redirected to the global registry entry.
-            let is_local_fn = env.funs.borrow().contains_key(&*name);
-            let mut call_parent = Arc::clone(&env.frame);
-            if !is_local_fn {
-                // Lazy compile when hot (bliss-x5y) — this path handles a global
-                // function reached through funcall/apply or the c2i fallback from
-                // compiled code (e.g. a call inside a compiled top-level thunk).
-                if !cfg!(egcl_no_tree_walker) {
-                    maybe_lazy_compile(&name, params_form, body, env);
-                }
-                let (dispatch_idx, fn_val) = dispatch_target_of_symbol(fn_val, &name);
-                if let Some(idx) = dispatch_idx {
-                    if let Some(res) = bytecode::call_registered(idx, args, fn_val, env) {
-                        return res;
+        if let Some(function) = fn_val.symbol_index().and_then(installed_function) {
+            fn_val = function;
+        } else if let Some(target) = named_call_target(env, &name, fn_val.symbol_index(), true) {
+            match target {
+                NamedCallTarget::Function(function) => fn_val = function,
+                NamedCallTarget::Body { params, body, .. } => {
+                    // Legacy source SETF writers have no ordinary function cell.
+                    // Preserve their registered dispatch and global source fallback.
+                    egcl_rt::rooted!(params = params);
+                    egcl_rt::rooted!(body = body);
+                    let (index, function) = dispatch_target_of_symbol(fn_val, &name);
+                    if let Some(index) = index {
+                        if let Some(result) = bytecode::call_registered(index, args, function, env) {
+                            return result;
+                        }
                     }
-                }
-                // A reified capturing closure runs its interpreted body against
-                // the captured environment, not the caller's frame (jtc.23.3).
-                if let Some(frame) = bytecode::closure_captured_env(fn_val) {
-                    call_parent = frame;
-                } else {
-                    // Non-closure GLOBAL defun reached through funcall/apply/c2i:
-                    // its definition environment is the null lexical environment,
-                    // NOT the caller's frame, so free vars resolve to params +
-                    // globals/specials only (bliss-20o; see operator-position
-                    // path for the full rationale).
-                    call_parent = Arc::new(SharedCell::new(EnvFrame::default()));
+                    let result = eval_named_call_ex(
+                        env, &name, false, *params, *body, args,
+                        Arc::new(SharedCell::new(EnvFrame::default())),
+                        LexicalControl::Fresh,
+                    );
+                    if let Err(error) = &result {
+                        calltrace_note(&name, error);
+                    }
+                    return result;
                 }
             }
-            // Fresh BLOCK/TAGBODY exit scope for a global named function; a local
-            // FLET/LABELS name is lexically nested and inherits (bliss-4u5u).
-            let control = if is_local_fn {
-                LexicalControl::Inherit
-            } else {
-                LexicalControl::Fresh
-            };
-            // eval_named_call_ex swaps in a FLET function's captured scope
-            // (bliss-ayq8) when this is a local FLET name; otherwise identical.
-            let res = eval_named_call_ex(
-                env,
-                &name,
-                is_local_fn,
-                params_form,
-                body,
-                args,
-                call_parent,
-                control,
-            );
-            if let Err(e) = &res {
-                calltrace_note(&name, e);
-            }
-            return res;
         }
+    }
+    // Restore metadata from the selected object, after resolving a symbol only
+    // once. Re-reading its public cell could pair a replacement with this call.
+    if let Some(closure) = reified_closure(fn_val) {
+        if !bytecode::profiling_disabled() {
+            egcl_rt::function::record_invocation(fn_val);
+        }
+        return apply_function_impl(closure, args, env);
+    }
+    // Uninstalled builtin/generic symbols retain their existing dispatch.
+    if fn_val.is_symbol() {
+        let name = sym_name_rc(fn_val);
         if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
             return invoke_generic_function(&name, args, env);
         }
@@ -35767,9 +35756,14 @@ fn apply_function(
         // BLOCK/TAGBODY exit scope is fresh: a heap interpreted-function is a
         // top-level defun or a reified closure whose own implicit block lives in
         // its body — it must not inherit the caller's dynamic exits (bliss-4u5u).
-        let parent =
-            bytecode::closure_captured_env(fn_val).unwrap_or_else(|| Arc::clone(&env.frame));
-        return eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh);
+        // Ordinary global definitions have no enclosing caller lexicals. A
+        // named function created inside a lexical binding has an explicit
+        // captured environment; otherwise use the null lexical environment.
+        let parent = bytecode::closure_captured_env(fn_val)
+            .unwrap_or_else(|| Arc::new(SharedCell::new(EnvFrame::default())));
+        return with_special_declarations(env, Vec::new(), |env| {
+            eval_lambda_call_ex(env, params_form, body, args, parent, LexicalControl::Fresh)
+        });
     }
     // A funcallable instance applies the function installed in its hidden cell
     // (bliss-cr53). This sits at the END of the dispatch, so an ordinary

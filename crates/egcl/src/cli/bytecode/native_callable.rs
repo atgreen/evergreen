@@ -10,6 +10,33 @@ use egcl_rt::function::NativeCallableEntries;
 use super::native_transfer_entry::root_publication::PublishedAdapter;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 
+pub(super) mod outer;
+
+pub(in crate::cli) fn invoke(
+    function: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    outer::invoke(function, args, env)
+}
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+static ENTRY_COUNTS: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<(usize, usize)>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new((0, 0))) };
+
+#[cfg(test)]
+pub(super) fn observe_entry() {
+    let segment = egcl_rt::native_transfer::current_segment();
+    assert!(!segment.is_null(), "published callable must execute inside a segment");
+    ENTRY_COUNTS.with(|counts| {
+        let (entries, nested) = counts.get();
+        counts.set((entries + 1, nested + usize::from(unsafe { !(*segment).previous().is_null() })));
+    });
+}
+
 struct Entries {
     published: NativeCallableEntries,
     code: [PublishedAdapter; 2],
@@ -134,7 +161,7 @@ unsafe fn interpreted_published(target: u64, record: *mut MappedCallRecord) {
         }
         // Every native reentry reached through this Rust adapter creates its
         // own segment. It must never inherit the caller's capture context.
-        apply_function(*function, args, unsafe { &mut *env })
+        super::super::apply_function_impl(*function, args, unsafe { &mut *env })
     });
     let outcome = match result {
         Ok(value) => NativeOutcome {

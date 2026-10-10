@@ -150,10 +150,18 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn prepare_callable(
     record: *mut MappedCallRecord,
 ) {
     #[cfg(test)]
+    super::super::native_callable::observe_entry();
+    #[cfg(test)]
     super::super::native_callable::inject_entry_poll_error();
     prepare_call(record, || unsafe {
         #[cfg(test)]
         super::super::native_callable::collect_at_entry(target)?;
+        if super::super::native_callable::outer::owns_record(record) {
+            // An outer Rust boundary has no mapped caller activation. Its
+            // permanent adapter dispatches the selected callable; a compiled
+            // body reached from that Rust dispatcher owns a separate segment.
+            return Ok(NIL);
+        }
         let invocation = &*(*record).context;
         // The target word is a stable address into caller-scanned storage.
         // Read after polling, then root while code selection may allocate.
