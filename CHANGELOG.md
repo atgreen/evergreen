@@ -121,6 +121,11 @@ remain opt-in.
 
 ### Platform support
 
+- **Windows x86-64:** add opt-in native callable entry boundaries with rooted
+  arguments and Windows unwind metadata. Enable with `EGCL_NATIVE_TRANSFER=1`;
+  unsupported process mitigation policies produce an explicit error. Compiled
+  bodies retain their existing ABI behind the boundary
+  ([#205](https://github.com/atgreen/evergreen/pull/205)).
 - **s390x:** support ELF-ABI foreign calls and Lisp callbacks, including floating
   point, narrow integers, large argument lists and supported variadic calls
   ([#119](https://github.com/atgreen/evergreen/pull/119),

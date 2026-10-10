@@ -23,7 +23,8 @@ use crate::value::EgclVal;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Process-lifetime callable dispatchers, independent of the execution-owned
-/// code version. RDI identifies a caller-scanned callable slot; the remaining
+/// code version. The first platform argument register (RDI on SysV x86-64,
+/// RCX on Win64) identifies a caller-scanned callable slot; the remaining
 /// register/slice arguments use the native call contract.
 #[repr(C)]
 pub struct NativeCallableEntries {
