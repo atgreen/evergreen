@@ -403,11 +403,17 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
                         *count = count.saturating_add(1);
                     });
                 }
+                // The source state roots both ledgers until the prepared
+                // destination takes ownership, immediately before entry.
+                let state = unsafe { &mut (*owner).state };
+                let ready = state.ready_osr.as_mut().expect("OSR was prepared before commit");
+                ready.catches = std::mem::take(&mut state.catches);
+                ready.cleanups = std::mem::take(&mut state.cleanups);
+                ready.catch_base = state.catch_base;
                 let resume = OsrResume {
                     frame: unsafe { (*owner).frame.take() }.ok_or_else(invalid_capture)?,
                     offset,
-                    catches: unsafe { std::mem::take(&mut (*owner).state.catches) },
-                    catch_base: unsafe { (*owner).state.catch_base },
+                    state: state.ready_osr.take().unwrap(),
                 };
                 return next_code.run_activation(
                     &[],

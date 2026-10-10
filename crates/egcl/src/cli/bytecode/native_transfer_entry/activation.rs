@@ -6,6 +6,12 @@ use super::*;
 /// Reserved roots and scope ledgers shared by outer and child activations.
 /// Root this owner before publishing pointers into it or running Lisp.
 pub(super) struct ActivationState {
+    // Prepared while the source machine frame is still published. Trace it
+    // through this existing owner until the handoff moves it to the next entry.
+    pub(super) ready_osr: Option<Box<ActivationState>>,
+    // A nonrecursive guard consumes its activation exactly once. Reserve its
+    // handler and cleanup buffers before executing any protected form.
+    guard_resume: Option<OuterResumeState>,
     pub(super) snapshots: Vec<SysvSiteSnapshot>,
     pub(super) cleanups: Vec<SavedCleanup>,
     pub(super) catches: Vec<SavedCatch>,
@@ -22,6 +28,10 @@ pub(super) struct ActivationState {
 
 impl egcl_rt::gc::TraceHostRoots for ActivationState {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if let Some(ready) = &mut self.ready_osr {
+            ready.trace_host_roots(visit);
+        }
+        self.guard_resume.trace_host_roots(visit);
         self.snapshots.trace_host_roots(visit);
         self.cleanups.trace_host_roots(visit);
         self.prepared_handler.trace_host_roots(visit);
@@ -32,6 +42,21 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
 
 impl ActivationState {
     pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+        let guard_resume = if code.has_deopt {
+            #[cfg(test)]
+            if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
+                return Err(EgclError::Oom);
+            }
+            let mut state = OuterResumeState {
+                handlers: Vec::new(),
+                cleanup_conts: Vec::new(),
+            };
+            state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
+            state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
+            Some(state)
+        } else {
+            None
+        };
         // Reserve the control-value map while the caller can still report an
         // ordinary storage condition. Once generated code is running, payload
         // retirement and restoration must not discover a rehash allocation in
@@ -131,6 +156,8 @@ impl ActivationState {
         let prepared_catch = None::<PreparedCatch>;
 
         Ok(Self {
+            ready_osr: None,
+            guard_resume,
             snapshots,
             cleanups,
             catches,
@@ -147,14 +174,13 @@ impl ActivationState {
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
-        self.catches.is_empty() && self.can_osr()
+        self.catches.is_empty() && self.cleanups.is_empty() && self.can_osr()
     }
 
-    /// CATCH registrations can move unchanged to the next machine version.
-    /// Other dynamic scopes and selected payloads still block this handoff.
+    /// Exact CATCH registrations and saved cleanup continuations move unchanged.
+    /// The OSR selector validates their order against the destination scope map.
     pub(super) fn can_osr(&self) -> bool {
-        self.cleanups.is_empty()
-            && self.handlers.is_empty()
+        self.handlers.is_empty()
             && self.handler_binds.is_empty()
             && self.restart_cases.is_empty()
             && self.dynamic_scopes.is_empty()
@@ -171,6 +197,8 @@ impl ActivationState {
     ) -> CaptureContext {
         CaptureContext {
             osr: None,
+            ready_osr: &mut self.ready_osr,
+            guard_resume: &mut self.guard_resume,
             children,
             nested,
             owner: code,
@@ -216,4 +244,14 @@ impl ActivationState {
             failure: None,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_GUARD_RESERVATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn fail_next_guard_reservation_for_test() {
+    FAIL_GUARD_RESERVATION.with(|fail| fail.set(true));
 }

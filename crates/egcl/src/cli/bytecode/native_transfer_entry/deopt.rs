@@ -106,23 +106,23 @@ fn note_segment_deopt(code: &TransferCode) {
 
 /// Rebuild one retained activation's local handler order without creating new
 /// registrations. Catch tags remain rooted in Env throughout this handoff.
-unsafe fn take_guard_resume_handlers(
+unsafe fn take_guard_resume_state(
     context: *mut CaptureContext,
     code: &TransferCode,
     scopes: &[InlinedResumeScope],
     env: &Env,
-) -> Result<Vec<Handler>, EgclError> {
+) -> Result<OuterResumeState, EgclError> {
     let [scope] = scopes else {
         return Err(invalid_capture());
     };
     if !Arc::ptr_eq(&scope.body, &code.body) {
         return Err(invalid_capture());
     }
-    // Only catches have a token-preserving handoff here. In particular, a
-    // prepared target or running cleanup cannot be replaced by lexical state.
+    // Prepared transfers cannot be replaced by lexical state. Running
+    // cleanup continuations are validated below and moved with their payloads.
     let context = unsafe { &*context };
     if unsafe {
-        !(*context.cleanups).is_empty()
+        context.completed_cleanup.is_some()
             || !(*context.handlers).is_empty()
             || !(*context.handler_binds).is_empty()
             || !(*context.restart_cases).is_empty()
@@ -132,16 +132,37 @@ unsafe fn take_guard_resume_handlers(
     } {
         return Err(invalid_capture());
     }
-    let scope_map = egcl_compiler::control_scope::ScopeMap::analyze_function(&code.body)
-        .map_err(|_| invalid_capture())?;
-    let active = scope_map.before(scope.bcp).ok_or_else(invalid_capture)?;
+    let active = code.control_scopes.before(scope.bcp).ok_or_else(invalid_capture)?;
     if active.iter().any(|scope| {
         scope.ownership != Ownership::Local
             || !matches!(scope.kind,
                 ScopeKind::Block { register: false, .. }
                     | ScopeKind::Tagbody { .. }
-                    | ScopeKind::Catch { .. })
+                    | ScopeKind::Catch { .. }
+                    | ScopeKind::Unwind { .. }
+                    | ScopeKind::Cleanup { .. })
     }) {
+        return Err(invalid_capture());
+    }
+    // PendingCleanup is deliberately excluded: its unwind handler has been
+    // popped, but EnterCleanupNormal has not yet saved a continuation. Neither
+    // reconstructing an Unwind nor inventing a CleanupCont represents it.
+    let cleanups = unsafe { &mut *context.cleanups };
+    let mut saved_cleanups = cleanups.iter();
+    let mut handler_depth = 0;
+    for scope in active {
+        if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+            let saved = saved_cleanups.next().ok_or_else(invalid_capture)?;
+            if saved.cleanup_bcp != cleanup_bcp
+                || saved.continuation.handler_depth != handler_depth
+            {
+                return Err(invalid_capture());
+            }
+        } else {
+            handler_depth += 1;
+        }
+    }
+    if saved_cleanups.next().is_some() {
         return Err(invalid_capture());
     }
     let catches = unsafe { &mut *context.catches };
@@ -157,8 +178,31 @@ unsafe fn take_guard_resume_handlers(
     }
     // Complete every fallible step before taking the native ledger. The
     // remaining moves neither allocate Lisp objects nor change Env's tags.
-    let mut handlers = Vec::new();
-    handlers.try_reserve(active.len()).map_err(|_| EgclError::Oom)?;
+    let mut state = if context.recursive.is_null() {
+        let reserved = unsafe { &mut *context.guard_resume };
+        let state = reserved.as_ref().ok_or_else(invalid_capture)?;
+        if !state.handlers.is_empty() || !state.cleanup_conts.is_empty()
+            || state.handlers.capacity() < handler_depth
+            || state.cleanup_conts.capacity() < cleanups.len()
+        {
+            return Err(invalid_capture());
+        }
+        reserved.take().expect("validated guard recovery reservation")
+    } else {
+        // Direct recursive frames share this context but remain scope-free.
+        // Do not consume the outer activation's one-shot cleanup reservation.
+        if !cleanups.is_empty() || !catches.is_empty()
+            || active.iter().any(|scope| matches!(scope.kind,
+                ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. } | ScopeKind::Catch { .. }))
+        {
+            return Err(invalid_capture());
+        }
+        let mut handlers = Vec::new();
+        handlers.try_reserve(handler_depth).map_err(|_| EgclError::Oom)?;
+        OuterResumeState { handlers, cleanup_conts: Vec::new() }
+    };
+    egcl_rt::rooted_ref!(_state_root = &mut state);
+    state.cleanup_conts.extend(cleanups.drain(..).map(|saved| saved.continuation));
     let mut saved_catches = catches.drain(..);
     for scope in active {
         let handler = match scope.kind {
@@ -174,6 +218,11 @@ unsafe fn take_guard_resume_handlers(
                 token: None,
                 tag_bcps: Vec::new(),
             },
+            ScopeKind::Unwind { cleanup_bcp } => Handler::Unwind {
+                cleanup_bcp,
+                sp_restore: scope.sp_restore,
+            },
+            ScopeKind::Cleanup { .. } => continue,
             ScopeKind::Catch { resume_bcp } => Handler::Catch {
                 token: saved_catches.next().expect("validated catch order").token,
                 resume_bcp,
@@ -181,9 +230,41 @@ unsafe fn take_guard_resume_handlers(
             },
             _ => unreachable!("validated local guard scopes"),
         };
-        handlers.push(handler);
+        state.handlers.push(handler);
     }
-    Ok(handlers)
+    Ok(state)
+}
+
+/// Mapped guards materialize exactly one retained frame. Validate its complete
+/// stream before changing native metadata or any activation slot; unlike the
+/// general inline materializer, this path never needs to grow EgclStack.
+unsafe fn validate_guard_stream(
+    request: &TransferDeoptRequest,
+    code: &TransferCode,
+    header: &Frame,
+    metadata: &T2InstalledMetadata,
+) -> Result<(), EgclError> {
+    if request.n_scopes != 1 || request.words.is_null() || request.n_words < 4
+        || request.n_words > 4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack)
+    {
+        return Err(invalid_capture());
+    }
+    let words = unsafe { std::slice::from_raw_parts(request.words, request.n_words as usize) };
+    let function = u32::try_from(words[0]).map_err(|_| invalid_capture())?;
+    let bcp = u32::try_from(words[1]).map_err(|_| invalid_capture())?;
+    let Some(body) = metadata.deopt_bodies.get(&function) else {
+        return Err(invalid_capture());
+    };
+    if !Arc::ptr_eq(body, &code.body)
+        || words[2] != u64::from(code.body.n_locals)
+        || words[3] > u64::from(code.body.max_stack)
+        || words[2] + words[3] + 4 != request.n_words
+        || words[2] + words[3] > u64::from(header.num_locals)
+        || code.control_scopes.before(bcp).is_none()
+    {
+        return Err(invalid_capture());
+    }
+    Ok(())
 }
 
 pub(super) unsafe extern "C" fn resume_guard(
@@ -220,6 +301,12 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         if !std::ptr::eq(header.code_info, code.code_info) || !header.return_pc.is_null() {
             return Err(invalid_capture());
         }
+        let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
+        unsafe { validate_guard_stream(request, code, &header, &metadata) }?;
+        let env = NATIVE_ENV.with(Cell::get);
+        if env.is_null() {
+            return Err(invalid_capture());
+        }
         // Resumed Lisp owns the frame; it must not borrow the abandoned
         // native capture. Restore that capture only after restoring the frame.
         let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
@@ -235,11 +322,6 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         unsafe {
             (*frame).code_info = std::ptr::null();
         }
-        let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
-        let env = NATIVE_ENV.with(Cell::get);
-        if env.is_null() {
-            return Err(invalid_capture());
-        }
         let (scopes, metadata) = materialize_t2_deopt_scopes(
             request.n_scopes,
             request.n_words,
@@ -251,8 +333,10 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         note_segment_deopt(code);
         // Every stream word is now in scanned slots. There is no mutable
         // CaptureContext reference or RefCell borrow across resumed Lisp.
-        let handlers = unsafe { take_guard_resume_handlers(context, code, &scopes, &*env) }?;
-        resume_inlined_in_t0_with_handlers(scopes, metadata, None, Some(handlers), unsafe { &mut *env })
+        egcl_rt::rooted!(state = Some(unsafe {
+            take_guard_resume_state(context, code, &scopes, &*env)
+        }?));
+        resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
     });
     // Fiber mounting establishes carrier compatibility before resumed Lisp or
     // Rust executes. Publish the value/transfer without another capability test.

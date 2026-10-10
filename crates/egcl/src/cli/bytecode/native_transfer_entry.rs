@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 
 pub(super) mod root_publication;
 mod activation;
+#[cfg(test)]
+pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
 mod ordinary_t2;
@@ -216,6 +218,8 @@ pub(super) struct TransferCode {
     sites: SysvTransferTable,
     slots: u16,
     cleanup_depths: std::collections::HashMap<u32, usize>,
+    control_scopes: egcl_compiler::control_scope::ScopeMap,
+    guard_handler_capacity: usize,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
@@ -687,6 +691,11 @@ impl TransferCode {
             }
         }
         let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+        let guard_handler_capacity = (0..body.code.len()).filter_map(|bcp| {
+            scopes.before(bcp as u32)
+        }).map(|active| active.iter().filter(|scope| !matches!(scope.kind,
+            ScopeKind::Cleanup { .. } | ScopeKind::PendingCleanup { .. }
+        )).count()).max().unwrap_or(0);
         let mut cleanup_depths = std::collections::HashMap::new();
         for instruction in &body.code {
             if let Instr::PushUnwind { cleanup_bcp, .. } = instruction {
@@ -763,6 +772,8 @@ impl TransferCode {
             sites,
             slots,
             cleanup_depths,
+            control_scopes: scopes,
+            guard_handler_capacity,
         })
     }
 
@@ -774,32 +785,32 @@ impl TransferCode {
         &self,
         args: &[EgclVal],
         env: &mut Env,
-        mut osr: Option<OsrResume>,
+        osr: Option<OsrResume>,
     ) -> Result<EgclVal, EgclError> {
+        let osr_offset = osr.as_ref().map(|resume| resume.offset);
         // Claim both inherited owners before preparation can fail or collect.
         // Tags remain in the rooted Env; the payload owns their exact tokens.
         let mut frame_guard = FrameGuard(osr.as_ref().map(|resume| resume.frame));
         let _catch_guard = CatchScopeGuard {
-            base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.catch_base),
+            base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.state.catch_base),
             env,
         };
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
-        if osr.is_none() && args.len() != usize::from(self.body.arity) {
+        if osr_offset.is_none() && args.len() != usize::from(self.body.arity) {
             return Err(EgclError::ProgramError(
                 "native transfer entry: wrong argument count".into(),
             ));
         }
-        if osr.is_none() {
+        if osr_offset.is_none() {
             validate_declared_args(&self.body, &args)?;
         }
-        let mut state = ActivationState::prepare(self, env)?;
-        if let Some(resume) = &mut osr {
-            state.catches = std::mem::take(&mut resume.catches);
-            state.catch_base = resume.catch_base;
-        }
+        let mut state = match osr {
+            Some(resume) => *resume.state,
+            None => ActivationState::prepare(self, env)?,
+        };
         egcl_rt::rooted_ref!(_state = &mut state);
-        let _depth = osr.is_none().then(|| {
+        let _depth = osr_offset.is_none().then(|| {
             NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
             NativeDepthGuard
         });
@@ -814,13 +825,14 @@ impl TransferCode {
             .or(self.installed_symbol)
             .map(EgclVal::from_symbol_index)
             .unwrap_or(NIL);
-        let frame = if let Some(resume) = &osr {
-            let frame = resume.frame;
-            if stack.fp() != frame
-                || stack.grow_top_frame(self.slots.max(unsafe { (*frame).num_locals }), self.code_info).is_none()
-            {
-                return Err(invalid_capture());
-            }
+        let frame = if osr_offset.is_some() {
+            let frame = frame_guard.0.expect("committed OSR owns its managed frame");
+            // Source preparation already reserved the space and retained its
+            // own map until machine retirement. This commit cannot allocate,
+            // collect, or fail: only switch the now-inactive frame's map.
+            assert_eq!(stack.fp(), frame);
+            assert!(unsafe { (*frame).num_locals } >= self.slots);
+            unsafe { (*frame).code_info = self.code_info; }
             frame
         } else { stack
             .push_frame(function, self.code_info, self.slots, FLAG_CALL)
@@ -831,7 +843,7 @@ impl TransferCode {
                 )
             })? };
         frame_guard.0 = Some(frame);
-        if osr.is_none() {
+        if osr_offset.is_none() {
             bind_params(&self.body, frame, &args, None);
         }
         let _dynamic_scope_guard = DynamicScopeGuard {
@@ -846,7 +858,7 @@ impl TransferCode {
             blocks: std::mem::take(&mut env.block_stack),
             tags: std::mem::take(&mut env.tag_stack),
         };
-        if osr.is_none() {
+        if osr_offset.is_none() {
             env.clear_mv();
         }
         // Nested legacy callees and other executions must not overwrite this
@@ -868,13 +880,18 @@ impl TransferCode {
         // execution state at this point, so this is a safe entry poll: a
         // moving GC may park and scan before generated code starts. Native
         // loop/back-edge polling remains a separate emitter gate.
-        egcl_rt::safepoint::poll_safepoint();
-        if let Some(error) = pending_signal_error_for_current_execution() {
-            return Err(error);
+        if osr_offset.is_none() {
+            egcl_rt::safepoint::poll_safepoint();
+            if let Some(error) = pending_signal_error_for_current_execution() {
+                return Err(error);
+            }
         }
+        // An OSR source has already polled. Its destination header polls again
+        // with the inherited scopes installed; deliver pending errors there,
+        // through normal transfer handling, rather than skipping their cleanup.
         let outcome = unsafe {
             native_transfer::invoke_native_segment(
-                self.code.as_ptr().add(osr.as_ref().map_or(0, |resume| resume.offset)),
+                self.code.as_ptr().add(osr_offset.unwrap_or(0)),
                 context.activation.cast(),
                 stack,
             )
@@ -903,11 +920,16 @@ impl TransferCode {
                     *count = count.saturating_add(1);
                 });
             }
+            // Move live payloads while the destination is still traced by the
+            // source state. No allocating operation separates take and entry.
+            let ready = state.ready_osr.as_mut().expect("OSR was prepared before commit");
+            ready.catches = std::mem::take(&mut state.catches);
+            ready.cleanups = std::mem::take(&mut state.cleanups);
+            ready.catch_base = state.catch_base;
             let resume = OsrResume {
                 frame: frame_guard.0.take().unwrap(),
                 offset,
-                catches: std::mem::take(&mut state.catches),
-                catch_base: state.catch_base,
+                state: state.ready_osr.take().unwrap(),
             };
             // This suspended source's catch guard remains an error backstop.
             // It can only truncate again after the destination has returned.
@@ -1173,10 +1195,10 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
-    local_control_native_body(body, allow_values, false, false)
+    local_control_native_body(body, allow_values, false)
 }
 
-fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_tags: bool, allow_catches: bool) -> bool {
+fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -1189,8 +1211,9 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
             // Nested tagged callees support MV; optimized/direct-recursive
             // admission retains its existing restriction.
             (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
-            || (allow_tags && matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
-            || (allow_catches && matches!(op, Instr::PushCatch { .. } | Instr::Throw))
+            || (allow_local_scopes && matches!(op,
+                Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
+                    | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn))
             || matches!(
                 op,
                 Instr::Const(_)
@@ -1528,8 +1551,7 @@ unsafe extern "C" fn deliver_handler(
 struct OsrResume {
     frame: *mut Frame,
     offset: usize,
-    catches: Vec<SavedCatch>,
-    catch_base: usize,
+    state: Box<ActivationState>,
 }
 
 struct SavedCatch {
@@ -2143,6 +2165,21 @@ unsafe extern "C" fn poll_or_transfer(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_OSR_PREPARATION: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn fail_next_osr_preparation_for_test() {
+    FAIL_OSR_PREPARATION.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn osr_preparation_failure_pending_for_test() -> bool {
+    FAIL_OSR_PREPARATION.with(Cell::get)
+}
+
 /// Select only an exact, published mapped replacement at a mapped loop header.
 /// Reconstruct only on this cold route, through the poll's exact native homes.
 unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
@@ -2171,7 +2208,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let Some(entry) = next.osr_entries.get(header).copied() else { return false };
     // Scan body admission only once a replacement is ready, not on every
     // baseline loop poll while the optimizing worker is still compiling.
-    if !local_control_native_body(&code.body, true, true, true) {
+    if !local_control_native_body(&code.body, true, true) {
         return false;
     }
     // An OSR jump keeps this activation's registrations, not new copies.
@@ -2181,8 +2218,25 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let Some(scopes) = scopes.before(*header) else { return false };
     if scopes.iter().any(|scope| scope.ownership != Ownership::Local
         || !matches!(scope.kind, ScopeKind::Block { register: false, .. }
-            | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }))
+            | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }
+            | ScopeKind::Unwind { .. } | ScopeKind::Cleanup { .. }))
     {
+        return false;
+    }
+    let cleanups = unsafe { &*context.cleanups };
+    let mut saved_cleanups = cleanups.iter();
+    let mut handler_depth = 0;
+    for scope in scopes {
+        if let ScopeKind::Cleanup { cleanup_bcp } = scope.kind {
+            let Some(saved) = saved_cleanups.next() else { return false };
+            if saved.cleanup_bcp != cleanup_bcp || saved.continuation.handler_depth != handler_depth {
+                return false;
+            }
+        } else {
+            handler_depth += 1;
+        }
+    }
+    if saved_cleanups.next().is_some() || context.completed_cleanup.is_some() {
         return false;
     }
     let catches = unsafe { &*context.catches };
@@ -2214,9 +2268,36 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     {
         return false;
     }
+    // All destination allocation remains on the source's published side. A
+    // failed reservation simply leaves this T1 loop and its cleanups running.
+    #[cfg(test)]
+    if FAIL_OSR_PREPARATION.with(|fail| fail.replace(false)) {
+        return false;
+    }
+    let NativeCodeStorage::Mapped(destination) = &next._storage else { return false };
+    let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+    let Ok(prepared) = ActivationState::prepare(destination, env) else { return false };
+    let mut prepared = Box::new(prepared);
+    egcl_rt::rooted_ref!(_prepared = &mut *prepared);
+    let stack = egcl_rt::current_stack();
+    if stack.fp() != context.frame || !native_transfer::is_supported() {
+        return false;
+    }
+    let slots = destination.slots.max(unsafe { (*context.frame).num_locals });
+    // Preserve the SOURCE CodeInfo through the remaining cold publication.
+    // Growth only appends NIL; existing frame/slot addresses never change.
+    // Failure changes neither stack bounds nor its map. After success there
+    // is no allocation, safepoint, or fallible step before the commit below.
+    if stack.grow_top_frame(slots, code.code_info).is_none() {
+        return false;
+    }
     for (slot, value) in frame.locals.iter().enumerate() {
         unsafe { slot_set(context.frame, slot as u16, *value) };
     }
+    // End the local root before moving the box; the source activation now
+    // owns and traces the prepared state's exact payload slots.
+    drop(_prepared);
+    unsafe { *context.ready_osr = Some(prepared); }
     context.osr = Some((next, entry));
     true
 }
@@ -2391,6 +2472,8 @@ pub(super) fn take_native_handler_count() -> usize {
 
 struct CaptureContext {
     osr: Option<(Rc<NativeCode>, usize)>,
+    ready_osr: *mut Option<Box<ActivationState>>,
+    guard_resume: *mut Option<OuterResumeState>,
     children: *mut SegmentActivations,
     nested: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
     owner: *const TransferCode,
