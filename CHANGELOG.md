@@ -10,7 +10,8 @@
   [#228](https://github.com/atgreen/evergreen/pull/228),
   [#230](https://github.com/atgreen/evergreen/pull/230),
   [#231](https://github.com/atgreen/evergreen/pull/231),
-  [#232](https://github.com/atgreen/evergreen/pull/232)).
+  [#232](https://github.com/atgreen/evergreen/pull/232),
+  [#233](https://github.com/atgreen/evergreen/pull/233)).
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
