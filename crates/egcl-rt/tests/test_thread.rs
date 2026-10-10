@@ -23,7 +23,19 @@ fn inspect_mounted_fiber() -> EgclVal {
     if fiber.can_yield() || fiber_yield().is_ok() {
         return NIL;
     }
+    // Initialize the poll page through the real path while this fiber is
+    // mounted; the read-only predicate must not do that itself.
+    egcl_rt::poll_safepoint();
+    // Read-only preflight must leave this fiber's yield request available for
+    // the real scheduler poll.
+    fiber.request_yield();
+    let pending = egcl_rt::safepoint::poll_work_pending()
+        && egcl_rt::safepoint::poll_work_pending();
+    let retained = fiber.check_and_clear_yield();
     fiber.unpin().unwrap();
+    if !pending || !retained {
+        return NIL;
+    }
     fiber.continuation().save(10, 20, 30);
     if fiber.can_yield() && fiber.continuation().snapshot() == (10, 20, 30) {
         T

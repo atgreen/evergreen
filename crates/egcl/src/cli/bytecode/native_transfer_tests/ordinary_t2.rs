@@ -792,3 +792,92 @@ fn ordinary_t2_recursive_calls_preserve_redefinition_and_unbinding() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    assert!(
+        !profiling_disabled(),
+        "this regression must exercise real T1 heat"
+    );
+    assert!(
+        native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.get().is_none()),
+        "an observer would force publication and invalidate the idle-path measurement"
+    );
+    let name = "ORDINARY-IDLE-POLL-LOOP";
+    // More than 64 nonconstant arithmetic operations make the compiler emit
+    // straight-line polls as well as the always-slow loop-header heat poll.
+    let additions = "(setq sum (+ sum i)) ".repeat(80);
+    let source = format!("((let ((sum 0)) (dotimes (i n) {additions}) (values sum n)))");
+    super::super::super::read_eval_all_env(
+        &format!("(defun {name} (n) (progn . {source}))"),
+        &mut env,
+    )
+    .unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string(&source).unwrap().0);
+    let symbol = egcl_rt::symbols::intern(name);
+    let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+    registry_put(symbol, Arc::clone(&body));
+    let baseline = try_promote_to_t1(symbol).expect("ordinary mapped T1 loop");
+    assert!(!baseline.is_t2);
+    assert!(matches!(baseline._storage, NativeCodeStorage::Mapped(_)));
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    let heat_before = egcl_rt::function::back_edge_count(*function);
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    native_transfer_entry::reset_poll_paths_for_test();
+    assert_eq!(
+        run_native(&baseline, symbol, &[EgclVal::from_fixnum(8)], &mut env).unwrap(),
+        EgclVal::from_fixnum(2240)
+    );
+    let (fast, slow) = native_transfer_entry::take_poll_paths_for_test();
+    assert_eq!(
+        fast, 0,
+        "T1 must retain publication, heat accounting, and OSR checks"
+    );
+    assert!(slow >= 8, "every loop visit retains a real poll: {slow}");
+    assert!(
+        egcl_rt::function::back_edge_count(*function) > heat_before,
+        "baseline loop heat must still reach the installed function"
+    );
+    assert_eq!(
+        env.mv,
+        vec![EgclVal::from_fixnum(2240), EgclVal::from_fixnum(8)]
+    );
+
+    // This helper runs snapshot -> compile_t2_artifact -> install_t2_completion.
+    // Never turn a baseline owner into T2 by changing its is_t2 flag.
+    let (_, optimized) = install_body(symbol, body);
+    assert_mapped_t2(&optimized);
+    assert!(native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.get().is_none()));
+    native_transfer_entry::reset_poll_paths_for_test();
+    assert_eq!(
+        run_native(&optimized, symbol, &[EgclVal::from_fixnum(8)], &mut env).unwrap(),
+        EgclVal::from_fixnum(2240)
+    );
+    let (fast, slow) = native_transfer_entry::take_poll_paths_for_test();
+    assert!(fast > 0,
+        "the executed worker T2 loop must take the real unpublished idle path; fast={fast}, slow={slow}");
+    assert!(
+        slow >= 8,
+        "T2 loop-header heat polls must still take the slow path: {slow}"
+    );
+    assert!(
+        fast + slow >= 8,
+        "preflight must preserve loop polls rather than sample them away"
+    );
+    assert_eq!(
+        env.mv,
+        vec![EgclVal::from_fixnum(2240), EgclVal::from_fixnum(8)]
+    );
+    assert_eq!(
+        (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+        before
+    );
+}

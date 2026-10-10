@@ -2245,6 +2245,20 @@ unsafe extern "C" fn poll_or_transfer(
     out: *mut egcl_rt::native_transfer::NativeOutcome,
     image: *mut SysvTransferCapture,
 ) {
+    if idle_t2_poll(request) {
+        #[cfg(test)]
+        POLL_PATHS.with(|counts| {
+            let (idle, published) = counts.get();
+            counts.set((idle + 1, published));
+        });
+        unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }) };
+        return;
+    }
+    #[cfg(test)]
+    POLL_PATHS.with(|counts| {
+        let (idle, published) = counts.get();
+        counts.set((idle, published + 1));
+    });
     unsafe {
         root_publication::published(image, || {
             #[cfg(test)]
@@ -2255,6 +2269,47 @@ unsafe extern "C" fn poll_or_transfer(
             }
         })
     }
+}
+
+/// A read-only preflight: all work that can park, yield, allocate, deliver a
+/// signal, or prepare OSR stays behind the existing root publication.
+fn idle_t2_poll(request: *mut u8) -> bool {
+    // Preserve loop heat and every T1 OSR opportunity, including test hooks
+    // that deliberately collect only after the native homes are published.
+    if request as usize & 1 != 0 {
+        return false;
+    }
+    #[cfg(test)]
+    if root_publication::OBSERVE.with(|hook| hook.get().is_some()) {
+        return false;
+    }
+    let context = CAPTURE.with(Cell::get);
+    if context.is_null() || !unsafe { (*(*context).owner).is_t2 } {
+        return false;
+    }
+    // These queries neither initialize a carrier nor consume a notification.
+    // A concurrent request after an idle read remains pending at the next
+    // unchanged poll site, just as when it races an ordinary poll's read.
+    !egcl_rt::safepoint::poll_work_pending()
+        && PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0
+        && !egcl_rt::runtime::process_signal_activity_pending()
+        && !egcl_rt::any_posted_pending_signal()
+        && !egcl_rt::sandbox_cpu_deadline_armed()
+}
+
+#[cfg(test)]
+thread_local! {
+    static POLL_PATHS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_poll_paths_for_test() {
+    POLL_PATHS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(super) fn take_poll_paths_for_test() -> (usize, usize) {
+    POLL_PATHS.with(|counts| counts.replace((0, 0)))
 }
 
 #[cfg(test)]

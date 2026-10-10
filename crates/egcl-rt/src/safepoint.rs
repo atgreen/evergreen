@@ -203,10 +203,24 @@ fn coordinator() -> &'static SafepointCoordinator {
     })
 }
 
+static PAGE: OnceLock<SafepointPage> = OnceLock::new();
+
 /// Access the global safepoint page (lazily initialized).
 fn global_safepoint_page() -> &'static SafepointPage {
-    static PAGE: OnceLock<SafepointPage> = OnceLock::new();
     PAGE.get_or_init(|| SafepointPage::init().expect("failed to allocate global safepoint page"))
+}
+
+/// Whether a safepoint poll needs its published runtime path. This only reads
+/// state: it cannot allocate, register a thread, park, yield, or consume work.
+/// A request arriving after an idle observation remains pending for the next
+/// poll; callers must preserve their existing poll cadence.
+pub fn poll_work_pending() -> bool {
+    let Some(page) = PAGE.get() else {
+        return true;
+    };
+    page.is_requested()
+        || SIGUSR1_PENDING.load(Ordering::Relaxed)
+        || crate::thread::current_yield_requested()
 }
 
 // ── Public coordination functions ────────────────────────────────────
@@ -992,5 +1006,71 @@ mod gc_pause_tests {
             !global_safepoint_page().is_requested(),
             "must resume on return"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_work_tests {
+    use super::*;
+
+    #[test]
+    fn pending_work_peeks_preserve_requests_until_the_real_poll() {
+        const CHILD: &str = "EGCL_TEST_PENDING_WORK_PEEK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "safepoint::pending_work_tests::pending_work_peeks_preserve_requests_until_the_real_poll",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // Preflight cannot initialize a page or register an unseen thread.
+        assert!(PAGE.get().is_none());
+        assert!(poll_work_pending());
+        assert!(PAGE.get().is_none());
+        assert!(crate::thread::current_yield_requested());
+        let thread = crate::thread::current_thread();
+        let page = global_safepoint_page();
+        assert!(!poll_work_pending());
+
+        crate::runtime::take_process_signal_activity();
+        assert!(!crate::runtime::process_signal_activity_pending());
+        crate::runtime::mark_process_signal_activity();
+        assert!(crate::runtime::process_signal_activity_pending());
+        assert!(crate::runtime::process_signal_activity_pending());
+        assert!(crate::runtime::take_process_signal_activity());
+        assert!(!crate::runtime::process_signal_activity_pending());
+
+        thread.execution().request_yield();
+        assert!(poll_work_pending());
+        assert!(poll_work_pending());
+        assert!(thread.check_and_clear_yield());
+        assert!(!poll_work_pending());
+
+        page.request_safepoint().unwrap();
+        assert!(poll_work_pending());
+        assert!(poll_work_pending());
+        assert!(page.is_requested());
+        page.resume().unwrap();
+        assert!(!poll_work_pending());
+
+        SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+        assert!(poll_work_pending());
+        assert!(poll_work_pending());
+        assert!(SIGUSR1_PENDING.load(Ordering::Relaxed));
+        poll_safepoint();
+        assert!(!SIGUSR1_PENDING.load(Ordering::Relaxed));
+        assert!(!poll_work_pending());
     }
 }
