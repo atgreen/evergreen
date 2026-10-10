@@ -117,19 +117,36 @@ fn captured_nonlocal_exit_keeps_safe_fallback() {
 
 #[test]
 fn closure_creation_survives_osr_entry() {
-    let out = run_case("osr", r#"
+    let comparison = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        "="
+    } else {
+        ">"
+    };
+    let checks = format!(
+        r#"
+      (let ((before (egcl-ext:deopt-count)))
+        (assert (= (closure-loop 1000000) 499999500000))
+        (assert ({comparison} (egcl-ext:deopt-count) before)))
+      (assert ({comparison} (egcl-ext:function-osr-count 'closure-loop) 0))
+      (format t "CLOSURE-OSR-OK~%")
+    "#
+    );
+    let out = run_case(
+        "osr",
+        r#"
       (defun closure-loop (n)
         (let ((sum 0))
           (dotimes (i n sum)
             (incf sum (funcall (lambda () i))))))
-    "#, r#"
-      (let ((before (egcl-ext:deopt-count)))
-        (assert (= (closure-loop 1000000) 499999500000))
-        (assert (> (egcl-ext:deopt-count) before)))
-      (assert (> (egcl-ext:function-osr-count 'closure-loop) 0))
-      (format t "CLOSURE-OSR-OK~%")
-    "#, &[("EGCL_LAZY_COMPILE", "0"), ("EGCL_T0_T1_THRESHOLD", "10000000"),
-          ("EGCL_OSR_THRESHOLD", "100"), ("EGCL_DISABLE_T2", "1")]);
+    "#,
+        &checks,
+        &[
+            ("EGCL_LAZY_COMPILE", "0"),
+            ("EGCL_T0_T1_THRESHOLD", "10000000"),
+            ("EGCL_OSR_THRESHOLD", "100"),
+            ("EGCL_DISABLE_T2", "1"),
+        ],
+    );
     assert!(out.contains("CLOSURE-OSR-OK"), "{out}");
 }
 

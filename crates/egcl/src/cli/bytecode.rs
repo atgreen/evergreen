@@ -1717,7 +1717,7 @@ fn native_listing_preamble(nc: &NativeCode) -> String {
         NativeCodeStorage::Mapped(_) => true,
         NativeCodeStorage::Checked { .. } => false,
     };
-    if mapped_baseline {
+    if mapped_baseline && !nc.is_t2 {
         out.push_str("; T1 — tagged baseline native with mapped exceptional transfers.\n");
     } else if nc.is_t2 {
         out.push_str("; T2 — profile-guided native: speculates the dominant observed operand\n");
@@ -2049,6 +2049,12 @@ pub fn disassemble_by_symbol(sym: u32, env: Option<&mut super::Env>) -> Option<S
     let mut out = disasm_header(sym, &bf);
     match native {
         Some(nc) => {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            if let NativeCodeStorage::Mapped(code) = &nc._storage {
+                out.push_str(&native_listing_preamble(&nc));
+                out.push_str(&native_transfer_entry::installed_listing(code));
+                return Some(out);
+            }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if let Some(segment) = nc.body.as_ref().and_then(native_transfer_entry::cached_listing) {
                 out.push_str(&segment);
@@ -17665,6 +17671,7 @@ extern "C" fn c2i_t1_backedge(
         return 0;
     };
     if !t2.is_t2
+        || t2.transfer_abi_version != NATIVE_TRANSFER_ABI_VERSION
         || t2
             .body
             .as_ref()
@@ -19908,6 +19915,12 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         mark_fresh_promotion(done.sym);
         publish_native(done.sym, function, &native);
         return Some(native);
+    }
+    // A declined mapped artifact must not publish the old calling convention.
+    // Keep any existing mapped T1 owner; otherwise execution stays interpreted.
+    if !checked_native_installation_allowed() {
+        T2_DECLINED.with(|declined| declined.borrow_mut().insert(done.sym));
+        return None;
     }
     let metadata = if artifact.rooted_bodies.is_empty() {
         None
@@ -22306,6 +22319,12 @@ fn emit_native(
     None
 }
 
+/// Linux publishes only mapped entries. Unsupported bodies keep the interpreter
+/// adapter until their exact native frame and transfer maps are implemented.
+fn checked_native_installation_allowed() -> bool {
+    !cfg!(all(target_arch = "x86_64", target_os = "linux"))
+}
+
 /// Try to promote `sym`'s bytecode function to T1 native code (install into
 /// executable memory). Returns the installed code, or `None` if it can't be
 /// compiled to native.
@@ -22339,11 +22358,14 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         return None;
     }
     // Prefer the published native ABI for the shapes whose exact frame and
-    // transfer maps the baseline emitter supports. Unsupported shapes retain
-    // the checked emitter below during the remaining caller migration.
+    // transfer maps the baseline emitter supports. Linux declines unsupported
+    // shapes to the interpreter; other platforms retain their existing emitter.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(mapped) = native_transfer_entry::install_t1(sym, Arc::clone(&bf), allow_speculation) {
         return Some(mapped);
+    }
+    if !checked_native_installation_allowed() {
+        return None;
     }
     // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
     // another user function crosses c2i into `apply_function`, which runs the
@@ -23195,6 +23217,11 @@ fn maybe_osr(
     target_bcp: u32,
     env: &mut Env,
 ) -> Option<Result<OsrOutcome, EgclError>> {
+    // Legacy OSR stubs use the checked ABI independently of ordinary install.
+    // Keep this activation interpreted until mapped current-frame OSR exists.
+    if !checked_native_installation_allowed() {
+        return None;
+    }
     // Backward edge into an empty-operand-stack header, in a named function.
     // EGCL_OSR_DEBUG=1 traces why edges are rejected (bliss-j1o7 was found
     // this way: every activation ran with sym == u32::MAX). Cached: this runs

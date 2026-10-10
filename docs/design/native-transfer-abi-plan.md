@@ -8,6 +8,21 @@ Baseline: `2c84d2e1` (the counted pending-error fast path, `bliss-5fzra`).
 That completed mitigation retained return checks; this work replaces the protocol
 on top of it. Do not remove checks until the new boundary contract is verified.
 
+## v0.0.4 scope
+
+The release defaults to the native calling ABI on x86-64 Linux. Eligible T1
+and T2 bodies compile to mapped native entries. Unsupported body shapes use
+the published interpreter adapter; a declined T2 compilation retains an
+existing mapped T1 body. Legacy checked-ABI code is not installed on Linux.
+Current-frame OSR remains disabled there until mapped OSR is implemented, so
+cold functions containing long loops and unsupported bodies can run slower.
+
+`EGCL_NATIVE_TRANSFER=0` disables only the opportunistic segment cache on
+Linux; it does not restore checked-ABI installation or disable published
+mapped entries. Other platforms retain their existing rollout policy and do
+not gate this release. Full compiled-shape coverage and mapped current-frame
+OSR remain tracked by the open universal ABI epic and `bliss-shih7.17.4`.
+
 ## Objective and decision
 
 Every callable exposes the native calling ABI by default. A caller may bypass it

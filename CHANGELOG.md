@@ -4,21 +4,49 @@
 
 ## 0.0.4 - 2026-10-10
 
-### Applications and deployment
+### Performance and native compilation
 
-- Embed read-only build-host files into saved images with `egcl-ext:embed-file`
-  and ASDF components from `egcl-embed-asdf`, so applications can read them
-  after deployment without the original files
-  ([#173](https://github.com/atgreen/evergreen/pull/173)).
-
-- Rename the tree-shaking command to `--shake`, its manifest to
-  `egcl-shake-manifest`, and its ASDF extension to `egcl-shake-asdf`
-  ([#163](https://github.com/atgreen/evergreen/pull/163)).
-
-- Describe shaken executables in ASDF system definitions with
-  `egcl-shake-asdf`; `asdf:make` writes the specification, saves the core
-  and runs the tree shaker to produce the executable
-  ([#161](https://github.com/atgreen/evergreen/pull/161)).
+- Reduce native call overhead on Linux x86-64: eligible T1 and T2 functions
+  use the new native ABI by default, removing exceptional-status checks after
+  successful returns while preserving moving GC roots, multiple values,
+  speculative arithmetic, recursion and guard recovery. Unsupported bodies
+  use an interpreter adapter; existing native T1 code remains when T2 declines.
+  **Temporary limitation:** current-frame OSR is disabled on Linux x86-64,
+  so unsupported bodies and long loops in cold functions may run slower
+  ([#204](https://github.com/atgreen/evergreen/pull/204),
+  [#207](https://github.com/atgreen/evergreen/pull/207)).
+- Optimize named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
+  captured-variable access, simple-string access and missed hash-table lookups
+  on supported compiled paths.
+  Retain replacement checks, multiple values, GC safety and error recovery
+  ([#142](https://github.com/atgreen/evergreen/pull/142),
+  [#145](https://github.com/atgreen/evergreen/pull/145),
+  [#149](https://github.com/atgreen/evergreen/pull/149),
+  [#150](https://github.com/atgreen/evergreen/pull/150),
+  [#151](https://github.com/atgreen/evergreen/pull/151),
+  [#152](https://github.com/atgreen/evergreen/pull/152),
+  [#153](https://github.com/atgreen/evergreen/pull/153),
+  [#155](https://github.com/atgreen/evergreen/pull/155)).
+- Extend compiler support for captured lexical reads and writes, shared
+  compilation across closures, nested callbacks and retained-body leaf
+  inlining, preserving lexical `RETURN-FROM` and captured state during
+  deoptimization. Some of these paths still require the legacy compiler;
+  Linux x86-64 uses interpreter fallback where mapped native support is absent
+  ([#146](https://github.com/atgreen/evergreen/pull/146),
+  [#147](https://github.com/atgreen/evergreen/pull/147),
+  [#148](https://github.com/atgreen/evergreen/pull/148),
+  [#175](https://github.com/atgreen/evergreen/pull/175)).
+- Improve numeric guards and recovery on supported compiled paths, including
+  nullable values and bignums. Remove redundant multiple-value resets and loop
+  tag checks, retain only live deoptimization locals, and preserve pending
+  recursive operands. Repair x86-64 OSR recovery metadata for future use;
+  Linux x86-64 OSR remains disabled in this release. Decline unsupported
+  checked RISC-V OSR entries safely ([#100](https://github.com/atgreen/evergreen/pull/100),
+  [#103](https://github.com/atgreen/evergreen/pull/103),
+  [#106](https://github.com/atgreen/evergreen/pull/106),
+  [#131](https://github.com/atgreen/evergreen/pull/131),
+  [#135](https://github.com/atgreen/evergreen/pull/135),
+  [#144](https://github.com/atgreen/evergreen/pull/144)).
 
 ### Compatibility
 
@@ -64,49 +92,10 @@
   ([#89](https://github.com/atgreen/evergreen/pull/89),
   [#154](https://github.com/atgreen/evergreen/pull/154)).
 
-### Native compilation and performance
+### Native exceptional transfers
 
-- Use published native callable entries for Rust-to-Lisp calls on Linux x86-64.
-  Eligible ordinary T1 and T2 functions now use mapped native calls without
-  checking exceptional status after successful returns, preserving moving
-  roots, multiple values, speculative arithmetic, recursion and guard recovery
-  ([#204](https://github.com/atgreen/evergreen/pull/204),
-  [#207](https://github.com/atgreen/evergreen/pull/207)).
-- Speed up named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
-  captured-variable access, simple-string access and missed hash-table lookups.
-  Retain replacement checks, multiple values, GC safety and error recovery
-  ([#142](https://github.com/atgreen/evergreen/pull/142),
-  [#145](https://github.com/atgreen/evergreen/pull/145),
-  [#149](https://github.com/atgreen/evergreen/pull/149),
-  [#150](https://github.com/atgreen/evergreen/pull/150),
-  [#151](https://github.com/atgreen/evergreen/pull/151),
-  [#152](https://github.com/atgreen/evergreen/pull/152),
-  [#153](https://github.com/atgreen/evergreen/pull/153),
-  [#155](https://github.com/atgreen/evergreen/pull/155)).
-- Compile captured lexical reads and writes at x86-64 T2, share compilation
-  across closures with independent captures, and compile supported nested
-  callbacks on x86-64 and s390x. Restore retained-body leaf inlining while
-  preserving lexical `RETURN-FROM` and captured state during deoptimization
-  ([#146](https://github.com/atgreen/evergreen/pull/146),
-  [#147](https://github.com/atgreen/evergreen/pull/147),
-  [#148](https://github.com/atgreen/evergreen/pull/148),
-  [#175](https://github.com/atgreen/evergreen/pull/175)).
-- Keep nullable numeric paths native and recover to native code when operand
-  types change, including bignums. Remove redundant multiple-value resets and
-  repeated loop tag checks, and retain only live locals in deoptimization state.
-  Preserve pending recursive operands and
-  x86-64 OSR-entry recovery metadata; decline unsupported checked RISC-V OSR
-  entries safely ([#100](https://github.com/atgreen/evergreen/pull/100),
-  [#103](https://github.com/atgreen/evergreen/pull/103),
-  [#106](https://github.com/atgreen/evergreen/pull/106),
-  [#131](https://github.com/atgreen/evergreen/pull/131),
-  [#135](https://github.com/atgreen/evergreen/pull/135),
-  [#144](https://github.com/atgreen/evergreen/pull/144)).
-
-### Opt-in native exceptional transfers
-
-The full native ABI rollout remains incomplete. Additional transfer paths below
-remain opt-in.
+These transfers are enabled by default on x86-64 Linux. Full compiled-shape
+coverage and the rollout on other platforms remain incomplete.
 
 - Keep eligible recursive calls, calls between T2 definitions, `FUNCALL`, `APPLY`
   and protected functions in native segments. Preserve live linkage, callable
@@ -131,11 +120,27 @@ remain opt-in.
 - Preserve continuations and roots across fiber suspension and migration,
   validate destination-worker compatibility, and release retained execution
   state when it stops. Preserve all ordinary and interactive restart return
-  values. `DISASSEMBLE` distinguishes cached transfer code from installed legacy
-  code ([#156](https://github.com/atgreen/evergreen/pull/156),
+  values. `DISASSEMBLE` distinguishes cached transfer code and the actual ABI
+  of installed code ([#156](https://github.com/atgreen/evergreen/pull/156),
   [#159](https://github.com/atgreen/evergreen/pull/159),
   [#160](https://github.com/atgreen/evergreen/pull/160),
   [#168](https://github.com/atgreen/evergreen/pull/168)).
+
+### Applications and deployment
+
+- Embed read-only build-host files into saved images with `egcl-ext:embed-file`
+  and ASDF components from `egcl-embed-asdf`, so applications can read them
+  after deployment without the original files
+  ([#173](https://github.com/atgreen/evergreen/pull/173)).
+
+- Rename the tree-shaking command to `--shake`, its manifest to
+  `egcl-shake-manifest`, and its ASDF extension to `egcl-shake-asdf`
+  ([#163](https://github.com/atgreen/evergreen/pull/163)).
+
+- Describe shaken executables in ASDF system definitions with
+  `egcl-shake-asdf`; `asdf:make` writes the specification, saves the core
+  and runs the tree shaker to produce the executable
+  ([#161](https://github.com/atgreen/evergreen/pull/161)).
 
 ### Platform support
 

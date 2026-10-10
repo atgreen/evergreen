@@ -225,7 +225,37 @@ fn native_v2_apply_releases_arguments_before_parent_continues() {
     )
     .unwrap();
     install_t2("APPLY-ZERO", "()", "(42)", &env);
-    install_t2("APPLY-FIXNUM", "(x)", "((declare (type fixnum x)) x)", &env);
+    // Declared parameter representations are not admitted by the mapped ABI
+    // yet. Keep this type-error case in T0 while APPLY-ZERO exercises mapped T2.
+    let typed_symbol = egcl_rt::symbols::intern("APPLY-FIXNUM");
+    egcl_rt::rooted!(typed_params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(
+        typed_forms = reader::read_from_string("((declare (type fixnum x)) x)")
+            .unwrap()
+            .0
+    );
+    let typed_body = Arc::new(
+        compile_function(
+            "APPLY-FIXNUM",
+            *typed_params,
+            *typed_forms,
+            &env,
+            false,
+            false,
+        )
+        .unwrap(),
+    );
+    registry_put(typed_symbol, Arc::clone(&typed_body));
+    egcl_rt::rooted!(typed_function = egcl_rt::symbols::symbol_function(typed_symbol).unwrap());
+    assert!(
+        native_for_dispatch(
+            typed_symbol,
+            Some(*typed_function),
+            t1_threshold(),
+            &typed_body
+        )
+        .is_none()
+    );
     egcl_rt::rooted!(
         zero = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("APPLY-ZERO")).unwrap()
     );

@@ -106,7 +106,13 @@ fn impure_osr_loop_resumes_after_effect_on_numeric_guard_failure() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("OSR-EFFECTS (200 200 T T)"),
+        String::from_utf8_lossy(&output.stdout).contains(
+            if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+                "OSR-EFFECTS (200 200 NIL NIL)"
+            } else {
+                "OSR-EFFECTS (200 200 T T)"
+            }
+        ),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -263,29 +269,40 @@ fn non_fixnum_operands_deoptimize() {
     }
 }
 
-/// A hot loop whose accumulator is a single-float DEOPTS under T1's fixnum-only
-/// speculation — with no profile, T1 guesses fixnum and a float operand abandons
-/// the native path to the interpreter — yet still returns the interpreter's exact
-/// result. This float-hot case is precisely what the profiler observes so the
-/// optimising tier can later commit to *float*; T1 itself never speculates both.
+/// The literal-float loop remains interpreted when mapped compilation declines
+/// it on Linux. Platforms retaining the checked emitter still exercise its
+/// speculative deoptimization; both paths must preserve the exact float result.
 #[test]
-fn single_float_loop_deopts_but_stays_correct() {
+fn single_float_loop_obeys_native_admission_and_stays_correct() {
     let program = "\
         (defun fsum (n) (let ((s 0.0) (i 0)) \
           (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) \
           s)) \
         (fsum 5) (fsum 5) (fsum 5) \
-        (format t \"~a ~a~%\" \
+        (format t \"~a ~a ~a~%\" \
                 (egcl-ext:deopt-count) \
-                (fsum 100))";
+                (fsum 100) \
+                (egcl-ext:function-tier 'fsum))";
     let out = eval(program, &[("EGCL_T1_THRESHOLD", "2")]);
     let fields: Vec<&str> = out.split_whitespace().collect();
     let deopts: u32 = fields.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    assert!(
-        deopts >= 1,
-        "single-float loop must deopt under fixnum-only T1: {out:?}"
-    );
-    // 1.5 added 100 times = 150.0 — correct despite the deopt to the interpreter.
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(
+            deopts, 0,
+            "unsupported mapped loop must remain interpreted: {out:?}"
+        );
+        assert_eq!(
+            fields.get(2).copied(),
+            Some("0"),
+            "checked code must not be installed: {out:?}"
+        );
+    } else {
+        assert!(
+            deopts >= 1,
+            "single-float loop must deopt under checked T1: {out:?}"
+        );
+    }
+    // 1.5 added 100 times must remain exactly 150.0 on either admitted path.
     let tw_val = eval(
         "(defun fsum (n) (let ((s 0.0) (i 0)) \
            (tagbody top (when (< i n) (setq s (+ s 1.5)) (setq i (+ i 1)) (go top))) s)) \
@@ -295,7 +312,7 @@ fn single_float_loop_deopts_but_stays_correct() {
     assert_eq!(
         fields.get(1).copied(),
         Some(tw_val.as_str()),
-        "result matches interpretation despite deopt"
+        "result matches interpretation under native admission policy"
     );
 }
 
