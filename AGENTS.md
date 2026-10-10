@@ -171,6 +171,38 @@ ln -sfn ../../.agents/skills/grind .claude/skills/grind   # from the repo root
 Then invoke it with `/grind`. Editing `.agents/skills/grind/SKILL.md` updates the
 skill for everyone (the symlink points at the tracked file).
 
+## Targeted validation and parallel work
+
+Optimize for the time to a trustworthy result. During implementation, run the
+checks for the changed behavior and its immediate neighbors; use a focused
+regression to diagnose a failure before repeating a large suite. Preserve
+semantic assertions and execution evidence. Investigate real failures rather
+than ignoring them or weakening tests to obtain a pass.
+
+Use tiered validation: a fast smoke/PR suite plus checks selected for the change,
+with comprehensive validation scheduled separately for main, nightly runs, or a
+release. Targeted checks supplement the fast suite; neither replaces broader
+confidence. Build one artifact for deterministic, independent test shards, and
+balance shards by measured duration where possible. Report exactly which checks
+ran and any remaining coverage limits. Keep unreliable checks out of required
+branch protection until `bliss-hn1cc` establishes their reliability; v0.0.4's
+release platform gate is x86-64 Linux.
+
+Parallelize independent reads, reviews, and tests when it shortens elapsed time.
+Use subagents for bounded work with clear ownership. Give concurrent writers
+separate branches/worktrees and disjoint files or agreed hunks; preserve other
+sessions' edits and coordinate before changing shared code. Assign one build
+owner per working tree and target cache, batch compatible changes into a build,
+and do not edit its inputs or start competing builds while it runs. Share the
+exact source revision, artifact, commands, and results so other agents can reuse
+valid evidence.
+
+A documentation-only change does not invalidate runtime evidence for unchanged
+code. Review its diff and relevant documentation checks instead of rebuilding;
+rerun affected checks when code, dependencies, configuration, or a new failure
+makes prior evidence inapplicable. Continue to use `scripts/egcl-limited.sh` for
+ad-hoc egcl commands and memory-hungry tests, including parallel work.
+
 ## Architecture Principles
 
 - **The interpreter MUST NOT duplicate functionality that belongs in the
