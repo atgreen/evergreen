@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-use egcl_delivery_macros::builtin_dispatch;
+use egcl_shake_macros::builtin_dispatch;
 
 #[cfg(not(egcl_specialized_builtins))]
 fn omitted_implementation() -> i32 {

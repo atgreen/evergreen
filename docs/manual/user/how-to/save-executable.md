@@ -51,10 +51,10 @@ egcl --image session.core
 Use `--image` for a core file, not `load`. See the
 [image reference](../reference/images.md) for format and compatibility limits.
 
-## Deliver an application from a saved image
+## Shake an application from a saved image
 
-Delivery takes a saved core and a separate specification. It restores the core
-in the delivery process, selects an entry point, removes unreachable named
+The shaker takes a saved core and a separate specification. It restores the core
+in its own process, selects an entry point, removes unreachable named
 functions in packages you explicitly select, and writes a standalone executable.
 The input core is unchanged. Its old entry point and your init file are not run.
 
@@ -63,13 +63,13 @@ For example, save this application as `app.core`:
 ```lisp
 (defpackage :my-app (:use :cl))
 (in-package :my-app)
-(defun greeting () "Hello from a delivered image!")
+(defun greeting () "Hello from a shaken image!")
 (defun unused-helper () "Development only")
 (defun main () (format t "~A~%" (greeting)))
 (save-lisp-and-die "app.core")
 ```
 
-Create `app.delivery`:
+Create `app.shake`:
 
 ```text
 version = 1
@@ -78,15 +78,15 @@ prune-package = MY-APP
 dynamic = explicit
 ```
 
-Inspect the retention report, then deliver:
+Inspect the retention report, then shake:
 
 ```sh
-egcl --image app.core --deliver app.delivery --output hello --dry-run
-egcl --image app.core --deliver app.delivery --output hello
+egcl --image app.core --shake app.shake --output hello --dry-run
+egcl --image app.core --shake app.shake --output hello
 ./hello
 ```
 
-The dry run writes no output files. Delivery writes `hello` and a versioned
+The dry run writes no output files. Shaking writes `hello` and a versioned
 text report, `hello.manifest`, listing retained and removed candidate functions,
 retention reasons, platform, runtime policy, and file sizes. Existing executables
 are replaced only after the new executable has been built. The executable and
@@ -106,7 +106,7 @@ singleton keys, missing functions, and unknown packages are errors.
 | `keep = PACKAGE::FUNCTION` | Additional root, such as a dynamically selected callback; repeat as needed |
 | `dynamic = preserve` | Default: retain all candidate functions to preserve unknown dynamic targets |
 | `dynamic = explicit` | Opt in to pruning; declare every additional dynamic entry with `keep` |
-| `runtime = full` | Default: reuse the full delivery driver, without invoking Cargo |
+| `runtime = full` | Default: reuse the full runtime that runs the shake, without invoking Cargo |
 | `runtime = specialized` | Build a matching release runtime with only the required optional native capabilities |
 | `max-tier = t2` | Default: include both native compilers; `t1` omits T2 and `t0` omits both, requiring `runtime = specialized` |
 | `runtime-keep = disassembly` | Additional native capability root; supported names are `disassembly`, `dynamic-code`, and `tree-walker` |
@@ -118,48 +118,48 @@ or leave `dynamic = preserve`. Reachable arbitrary-code entry points such as
 `EVAL` and `LOAD` retain all candidate functions and native capabilities even
 with `dynamic = explicit`: the retention policy cannot override that dependency.
 Plugins, foreign callbacks, and method redefinition also need explicit roots
-when their targets cannot be inferred. This is a delivery policy, not a security
+when their targets cannot be inferred. This is a retention policy, not a security
 boundary.
 
-### Describe delivery in a system definition
+### Describe the shake in a system definition
 
-An application can carry its delivery policy in its own `.asd` and be
-delivered by `asdf:make`, with no spec file to write and no core to save by
-hand. Name `egcl-deliver-asdf` in `:defsystem-depends-on` and give a secondary
-system the delivery class and build operation; the initargs mirror the
+An application can carry its shake policy in its own `.asd` and be
+shaken by `asdf:make`, with no spec file to write and no core to save by
+hand. Name `egcl-shake-asdf` in `:defsystem-depends-on` and give a secondary
+system the shake class and build operation; the initargs mirror the
 specification keys above one for one:
 
 ```lisp
 (asdf:defsystem "my-app"
   :components ((:file "my-app")))
 
-(asdf:defsystem "my-app/deliver"
-  :defsystem-depends-on ("egcl-deliver-asdf")
-  :class "egcl-deliver-asdf:delivered-application"
-  :build-operation "egcl-deliver-asdf:deliver-op"
+(asdf:defsystem "my-app/shake"
+  :defsystem-depends-on ("egcl-shake-asdf")
+  :class "egcl-shake-asdf:shaken-application"
+  :build-operation "egcl-shake-asdf:shake-op"
   :depends-on ("my-app")
-  :deliver-entry "my-app::main"
-  :deliver-prune-packages ("MY-APP")
-  :deliver-dynamic :explicit)
+  :shake-entry "my-app::main"
+  :shake-prune-packages ("MY-APP")
+  :shake-dynamic :explicit)
 ```
 
 ```sh
 egcl --eval '(require :asdf)' \
      --eval '(asdf:load-asd (truename "my-app.asd"))' \
-     --eval '(asdf:make "my-app/deliver")'
+     --eval '(asdf:make "my-app/shake")'
 ./build/my-app
 ```
 
-`asdf:make` loads the application, writes `build/my-app.delivery` from the
-slots, saves `build/my-app.core` in a child process, delivers it in another,
+`asdf:make` loads the application, writes `build/my-app.shake` from the
+slots, saves `build/my-app.core` in a child process, shakes it in another,
 and leaves the executable and `build/my-app.manifest` beside them. The
-remaining initargs are `:deliver-keep`, `:deliver-runtime` (`:full` or
-`:specialized`), `:deliver-max-tier`, `:deliver-runtime-keep`,
-`:deliver-runtime-source`, `:deliver-system`, and `:deliver-output`; ASDF's
-own `:entry-point` stands in for `:deliver-entry`. The extension is installed
+remaining initargs are `:shake-keep`, `:shake-runtime` (`:full` or
+`:specialized`), `:shake-max-tier`, `:shake-runtime-keep`,
+`:shake-runtime-source`, `:shake-system`, and `:shake-output`; ASDF's
+own `:entry-point` stands in for `:shake-entry`. The extension is installed
 with `egcl` under `/usr/share/common-lisp/source/`, where ASDF already looks;
-from a source checkout, add `lib/egcl-deliver/` to `CL_SOURCE_REGISTRY`. See
-`lib/egcl-deliver/README.md` for the child processes' registry.
+from a source checkout, add `lib/egcl-shake/` to `CL_SOURCE_REGISTRY`. See
+`lib/egcl-shake/README.md` for the child processes' registry.
 
 The current pass retains all global data, symbol identities, packages,
 classes, and functions outside the selected packages. It follows
@@ -184,7 +184,7 @@ Unreachable generic functions and their owned method records are removed from
 both evaluator and CLOS registries before saving. A generic can be an `entry`
 or an explicit `keep` root.
 
-For methods with saved bytecode, delivery discards the redundant source body
+For methods with saved bytecode, the shaker discards the redundant source body
 and follows the compiled callable. Macros used only to compile such a method
 do not stay alive through its old source. Uncompiled methods retain their
 source and its dependencies.
@@ -199,17 +199,17 @@ are released before saving. SETF expanders, compiler macros, and registrations
 without a known owner remain conservative roots.
 
 User-defined SETF writers in selected packages follow the reachability of their
-accessor names and saved writer functions. Delivery removes an unreachable
+accessor names and saved writer functions. Shaking removes an unreachable
 writer's private function cell and source record. Use `keep = PACKAGE::ACCESSOR`
 to retain a dynamically invoked writer, even if the accessor has no getter.
-New BFASLs preserve the accessor symbol so delivery can identify its owning
+New BFASLs preserve the accessor symbol so the shaker can identify its owning
 package. Older artifacts with missing or ambiguous ownership remain
 conservatively retained.
 
 Private compiled closures and source closure handles are traced from reachable
 objects and code, including their captured environments. An unreachable
 closure does not retain its callees or native capabilities just because it
-remains in a runtime registry. Delivery removes its private code and captures
+remains in a runtime registry. Shaking removes its private code and captures
 before saving; `private-code-removed` reports removed compiled entries and
 `source-closures-removed` reports removed source closure entries.
 Escaped closures and shared captured environments remain live when reachable.
@@ -222,29 +222,29 @@ address map. Symbol identities and other retained data can therefore survive
 after a function's implementation is removed. The original input file is never
 modified.
 
-With the default `runtime = full`, delivery reduces the saved image and keeps
+With the default `runtime = full`, the shaker reduces the saved image and keeps
 the full Rust runtime. Re-saving an executable replaces its embedded image
 instead of stacking another copy of the previous core into the runtime prefix.
 
 ## Specialize the native runtime
 
-Add this to the same delivery specification:
+Add this to the same shake specification:
 
 ```text
 runtime = specialized
 ```
 
-Then run delivery with a matching source checkout:
+Then shake with a matching source checkout:
 
 ```sh
-egcl --image app.core --deliver app.delivery --output hello \
+egcl --image app.core --shake app.shake --output hello \
   --runtime-source /path/to/egcl
 ```
 
 The source checkout defaults to the location recorded when the driver was built.
 You need Cargo, the matching Rust toolchain, its target libraries, and the target
-linker. The new runtime must execute on the delivery machine so its compatibility
-contract can be checked; this command does not cross-deliver images.
+linker. The new runtime must execute on the machine running the shake so its compatibility
+contract can be checked; this command does not shake images for another platform.
 
 Native capabilities are selected by the reachability graph. A retained
 `DISASSEMBLE` reference keeps disassembly. A retained `EVAL`, `COMPILE`, `LOAD`,
@@ -263,7 +263,7 @@ A fixed lambda does not by itself retain every function or native capability;
 an `EVAL` inside its body does. Applications that construct arbitrary lambda
 bodies dynamically must retain `dynamic-code`.
 
-The GC and T0 bytecode interpreter remain available. Delivery includes both
+The GC and T0 bytecode interpreter remain available. A shake includes both
 native compilers by default. With `runtime = specialized`, choose the highest
 included tier using `max-tier = t2` (default), `max-tier = t1` (omit the T2
 optimizing compiler), or `max-tier = t0` (omit both native compilers).
@@ -298,11 +298,11 @@ do not require source evaluation. Native linking then removes the tree-walking
 operator dispatcher and source-to-bytecode compiler while retaining T0 bytecode
 and any selected native compilation tiers.
 
-Specialized delivery attempts to compile reachable named source functions that
+A specialized shake attempts to compile reachable named source functions that
 have no captured lexical environment. It discards their source only after
 confirming that the bytecode can be saved and restored independently, then
 recomputes reachability. This also runs during `--dry-run`: compilation may
-invoke macro expanders, but delivery does not call the application entry point.
+invoke macro expanders, but the shaker does not call the application entry point.
 The input image is unchanged.
 
 Unsupported source functions and closures, source handler forms, variadic
@@ -311,7 +311,7 @@ require the evaluator retain `tree-walker`. The report identifies these
 dependencies. The initial audited builtin set covers arithmetic, basic list operations, multiple values,
 function application, and `WRITE-LINE`; other builtin paths conservatively
 retain the walker. BFASL input already provides compiled function bodies;
-supported cold source definitions can now be compiled during delivery too.
+supported cold source definitions can now be compiled during the shake too.
 Simply omitting `EVAL` is insufficient if other reachable operations still
 require source evaluation.
 
@@ -322,7 +322,7 @@ still retain all native capabilities even when its application
 entry point comes from BFASL. The source-free native-removal tests use images
 built with `--no-bootstrap`.
 
-When the walker is unnecessary, delivery also selects native builtin dispatch
+When the walker is unnecessary, the shaker also selects native builtin dispatch
 arms from the reachable symbols. Unselected arms are removed before Rust code
 generation, allowing LTO and linker garbage collection to discard their helpers
 and library implementations. Aliases sharing an arm retain that implementation
@@ -331,8 +331,8 @@ the walker currently retain the full builtin dispatcher until its implicit
 calls are represented in the dependency graph. Reachable dynamic-code
 operations always retain every builtin.
 
-Delivery generates a versioned native contract, builds through Cargo in
-`target/delivery/` under the source checkout, checks the resulting executable,
+The shaker generates a versioned native contract, builds through Cargo in
+`target/shake/` under the source checkout, checks the resulting executable,
 and appends the reduced image. Compile-time selection removes references to the
 instruction decoder; release LTO and linker garbage collection can then remove
 its implementation. The cache separates source versions, targets, capabilities,
@@ -350,16 +350,16 @@ names as UTF-8 hex strings; `builtins=*` denotes the complete set. The source
 fingerprint is a compatibility identifier, not a cryptographic signature.
 Full runtimes can still read older images; specialized runtimes require the new
 metadata. A reduced driver cannot be used for
-`runtime = full` delivery.
+`runtime = full` shake.
 
-The delivery report separates `native-bytes` and `image-bytes`. Compare native
+The shake report separates `native-bytes` and `image-bytes`. Compare native
 sizes from the same release profile and stripping settings; a debug driver is
 not a useful size baseline for a specialized release build. Strip an executable
-**before** appending an image: stripping the delivered file may discard its core.
+**before** appending an image: stripping the shaken file may discard its core.
 
 ### Measured size example
 
-At commit `c25f245f`, the source-free native delivery regression on x86-64 Linux
+At commit `c25f245f`, the source-free native shake regression on x86-64 Linux
 musl produced the following sizes. All three builds used Rust 1.94.1, the same
 release profile (Thin LTO), the same application, and no additional stripping.
 The application exercises arithmetic, loops, output, and condition handlers;

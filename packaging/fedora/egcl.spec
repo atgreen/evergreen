@@ -265,7 +265,7 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %dir %{_datadir}/common-lisp
 %dir %{_datadir}/common-lisp/source
 %{_datadir}/common-lisp/source/egcl-jvm
-%{_datadir}/common-lisp/source/egcl-deliver
+%{_datadir}/common-lisp/source/egcl-shake
 %dir %{_libexecdir}/egcl
 %doc %{_docdir}/egcl
 %endif

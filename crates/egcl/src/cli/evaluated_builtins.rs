@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 //! Builtin operations on evaluated arguments. Source-form evaluation belongs
-//! to the caller; keeping it outside this dispatch lets delivery select native
+//! to the caller; keeping it outside this dispatch lets shake select native
 //! implementations without retaining the tree-walking operator dispatcher.
 use super::*;
 
@@ -38,7 +38,7 @@ pub(super) fn call(
     Some(result)
 }
 
-#[egcl_delivery_macros::builtin_dispatch(name)]
+#[egcl_shake_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
         "EGCL::%PPRINT-CIRCLE" => Some(|_operator, args, _env| {

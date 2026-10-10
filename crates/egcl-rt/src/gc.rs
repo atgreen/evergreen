@@ -3271,14 +3271,14 @@ fn scan_external_roots(mut visit: impl FnMut(*mut EgclVal)) {
     }
 }
 
-/// Inspect host roots for application delivery, replacing registry scanners
+/// Inspect host roots for application shake, replacing registry scanners
 /// with the caller's semantic dependency graph.
 ///
 /// # Safety
 /// Call only inside `with_heap_snapshot`, without allocating Lisp objects.
-/// `excluded` must be covered by the delivery analyzer (including captures).
+/// `excluded` must be covered by the shake analyzer (including captures).
 /// The callback must not mutate slots or let unrooted values escape the snapshot.
-pub unsafe fn visit_delivery_host_roots(
+pub unsafe fn visit_shake_host_roots(
     excluded: &[RootScanner],
     visit: &mut dyn FnMut(*mut EgclVal),
 ) {
@@ -3296,12 +3296,12 @@ pub unsafe fn visit_delivery_host_roots(
 
 /// Inspect a live object's reference fields using the same layouts as the GC.
 /// Symbol/package identity does not imply retention of all their definitions;
-/// delivery handles symbol cells separately.
+/// shake handles symbol cells separately.
 ///
 /// # Safety
 /// `value` must be live, and the call must be inside `with_heap_snapshot`.
 /// The callback must neither allocate Lisp objects nor mutate reference slots.
-pub unsafe fn visit_delivery_references(value: EgclVal, visit: &mut dyn FnMut(EgclVal)) {
+pub unsafe fn visit_shake_references(value: EgclVal, visit: &mut dyn FnMut(EgclVal)) {
     if !is_heap_ref(value) {
         return;
     }
@@ -6522,7 +6522,7 @@ unsafe fn reachable_heap_objects() -> Result<std::collections::HashSet<usize>, E
     let weak_roots = RefCell::new(Vec::new());
     process_weak_containers(&|slot| {
         // Weak referents are not ordinary roots, but preserving them in the
-        // delivered snapshot is conservative and keeps serialized slots valid.
+        // shaken snapshot is conservative and keeps serialized slots valid.
         let value = unsafe { *slot };
         if is_heap_ref(value) {
             weak_roots

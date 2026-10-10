@@ -2,7 +2,7 @@
 
 Evergreen Common Lisp (EGCL) is experimental software under active development.
 It includes a moving garbage collector, native-code generation, foreign-function
-interfaces, saved images, and application delivery. Bugs in these areas can have
+interfaces, saved images, and application shaking. Bugs in these areas can have
 security consequences even when they first appear to be ordinary crashes or
 incorrect results.
 
@@ -34,7 +34,7 @@ Include, when available:
 - the operating system, architecture, and build configuration;
 - a minimal reproducer or malformed input;
 - the observed impact and why it crosses a security boundary;
-- whether the behavior involves FFI, image loading, delivered executables,
+- whether the behavior involves FFI, image loading, shaken executables,
   sandboxing, native code, or untrusted Lisp input; and
 - any proposed disclosure date or other coordination constraints.
 

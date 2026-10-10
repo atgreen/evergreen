@@ -17,7 +17,7 @@
 
 This manual describes EGCL's implementation of Common Lisp and its extensions.
 It concentrates on behavior specific to EGCL: startup, compilation, debugging,
-memory, foreign calls, Java integration, concurrency, and application delivery.
+memory, foreign calls, Java integration, concurrency, and the application shaker.
 
 The manual follows the development checkout. For differences between targets,
 consult [Platform support](user/reference/platforms.md). For a particular
@@ -47,7 +47,7 @@ operator, use the [Symbol index](symbol-index.md); for a topic, use the
    current directory, subprocesses, and process arguments.
 10. [Profiling and efficiency](profiling.md) — engine reports, exact counts,
    event recording, sampling, and measurement effects.
-11. [Application delivery](user/explanation/images.md) — core images,
+11. [Shaking an application](user/explanation/images.md) — core images,
     executables, cross-target creation, and Android's application lifecycle.
 
 ## Recipes and supplementary reference

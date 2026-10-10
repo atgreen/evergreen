@@ -37,7 +37,7 @@ python = ["egcl-rt/python", "egcl-stdlib/python"]
 thread-cache-alloc = []
 
 [dependencies]
-egcl-delivery-macros = { path = "../egcl-delivery-macros" }
+egcl-shake-macros = { path = "../egcl-shake-macros" }
 egcl-rt.workspace = true
 egcl-compiler.workspace = true
 egcl-stdlib.workspace = true

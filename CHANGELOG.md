@@ -2,8 +2,12 @@
 
 ## Unreleased
 
-- Describe delivered executables in ASDF system definitions with
-  `egcl-deliver-asdf`; `asdf:make` writes the specification, saves the core
+- Rename the tree-shaking command to `--shake`, its manifest to
+  `egcl-shake-manifest`, and its ASDF extension to `egcl-shake-asdf`
+  ([#163](https://github.com/atgreen/evergreen/pull/163)).
+
+- Describe shaken executables in ASDF system definitions with
+  `egcl-shake-asdf`; `asdf:make` writes the specification, saves the core
   and runs the tree shaker to produce the executable
   ([#161](https://github.com/atgreen/evergreen/pull/161)).
 

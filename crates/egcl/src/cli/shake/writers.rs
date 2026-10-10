@@ -102,10 +102,14 @@ impl WriterDefinitions {
         let definitions = with_global_setf_fns(|functions| functions.borrow().clone());
         for (name, mut definition) in definitions {
             let mut references = Vec::new();
-            visit_fun_def_roots(&mut definition, &mut EnvRootVisitState::default(), &mut |slot| {
-                // The caller holds a nonallocating stopped-world snapshot.
-                references.push(unsafe { *slot });
-            });
+            visit_fun_def_roots(
+                &mut definition,
+                &mut EnvRootVisitState::default(),
+                &mut |slot| {
+                    // The caller holds a nonallocating stopped-world snapshot.
+                    references.push(unsafe { *slot });
+                },
+            );
             if let Some(writers) = result.names.get(&name) {
                 for &writer in writers {
                     result.edges.entry(writer).or_default().extend(&references);
