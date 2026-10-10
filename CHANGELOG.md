@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep a function's bytecode, native code, and captured definition together
+  during concurrent redefinition, including cached calls and tier promotion
+  ([#192](https://github.com/atgreen/evergreen/pull/192)).
+
 - Reduce garbage-collection bookkeeping in opt-in native calls by tracing
   stable native stack and register roots directly
   ([#189](https://github.com/atgreen/evergreen/pull/189)).
