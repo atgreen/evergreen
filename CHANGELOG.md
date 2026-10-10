@@ -5,6 +5,7 @@
 - Improve native execution performance on Linux x86-64: restore efficient
   direct recursive calls in eligible T2 code, and reduce thread-lookup and
   idle-safepoint overhead, including redundant polls in empty jump blocks.
+  Remove per-operation function-binding checks for standard CL primitives.
   Recursive calls now count toward automatic T2
   promotion; cold or wrong-arity interpreter fallbacks count only once.
   Keep loop counters attached to the running function during redefinition or
@@ -16,7 +17,15 @@
   [#232](https://github.com/atgreen/evergreen/pull/232),
   [#233](https://github.com/atgreen/evergreen/pull/233),
   [#234](https://github.com/atgreen/evergreen/pull/234),
-  [#235](https://github.com/atgreen/evergreen/pull/235)).
+  [#235](https://github.com/atgreen/evergreen/pull/235),
+  [#237](https://github.com/atgreen/evergreen/pull/237)).
+
+- **Compatibility:** Standard `COMMON-LISP` functions now have fixed semantics,
+  following the Common Lisp standard and SBCL policy. Redefining or unbinding
+  them is unsupported; this withdraws the earlier builtin-rebinding extension.
+  User-defined functions, including distinct symbols created with `SHADOW`,
+  remain redefinable
+  ([#237](https://github.com/atgreen/evergreen/pull/237)).
 
 - Correct T2 diagnostics to report the profile choices actually used and the
   code actually installed; distinguish code emission from publication and
