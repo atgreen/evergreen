@@ -48,7 +48,9 @@ fn single_float_add_matches_t0_once_t2_installed() {
       (print (list (fa 1.5 2.25) (fa 10.0 5.0) (fa -0.125 0.125)))
       (print (eval '(fa 1.5 2.25)))"#);
     assert!(out.contains("(3.75 15.0 0.0)"), "{out}");
-    if out.contains("FA: T2 INSTALLED") {
+    if out.contains("FA: background T2 result published")
+        || out.contains("FA: optimized worker result installed with mapped T2 ABI")
+    {
         // Only meaningful where the backend installed T2; everywhere it did, the
         // result above came from native single-float code.
         assert!(!out.contains("2.2578125"), "{out}");

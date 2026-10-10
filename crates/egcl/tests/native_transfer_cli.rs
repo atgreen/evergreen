@@ -203,8 +203,8 @@ fn t2_calls_stop_before_later_side_effects() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let self_entry = stderr
         .lines()
-        .find(|line| line.contains("T2-SELF: T2 INSTALLED"))
-        .unwrap_or_else(|| panic!("recursive function must install T2 code:\n{stderr}"));
+        .find(|line| line.contains("T2-SELF: T2 EMITTED"))
+        .unwrap_or_else(|| panic!("recursive function must emit register-entry metadata:\n{stderr}"));
     assert!(
         !self_entry.contains("compiled_entry=+0,"),
         "recursive test must exercise the direct register entry: {self_entry}"

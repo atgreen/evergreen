@@ -62,8 +62,8 @@ fn body_with_other_calls_keeps_its_register_entry() {
     assert_eq!(line, "RESULT 10100 2");
     let install = stderr
         .lines()
-        .find(|l| l.contains("WALK: T2 INSTALLED"))
-        .unwrap_or_else(|| panic!("WALK must install T2 code:\n{stderr}"));
+        .find(|l| l.contains("WALK: T2 EMITTED"))
+        .unwrap_or_else(|| panic!("WALK must emit register-entry metadata:\n{stderr}"));
     assert!(
         !install.contains("compiled_entry=+0,"),
         "WALK must keep its register entry despite calling HELPER: {install}"
