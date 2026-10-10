@@ -684,3 +684,49 @@ fn resolved_frame_maps_refuse_missing_live_values() {
         "the final-home map must reject a missing live set"
     );
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn full_register_pool_preserves_optimized_transfer_guards() {
+    use egcl_compiler::t2::{build, emit, pass, speculate};
+    if std::env::var("EGCL_TRANSFER_FULL_POOL_CHILD").as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "full_register_pool_preserves_optimized_transfer_guards", "--nocapture"])
+            .env("EGCL_TRANSFER_FULL_POOL_CHILD", "1")
+            .env("EGCL_T2_FRAME_ENV", "full")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let plus = egcl_rt::symbols::intern("+");
+    let symbol = egcl_rt::symbols::intern("full-pool-transfer-guards");
+    let mut source = body();
+    source.constants = vec![egcl_rt::value::EgclVal::from_fixnum(1)];
+    source.n_locals = 3;
+    source.max_stack = 4;
+    source.arity = 3;
+    source.min_args = 3;
+    source.max_args = Some(3);
+    source.code = vec![
+        Instr::CallNamed { sym: 123456, nargs: 0 }, Instr::Pop,
+        Instr::LoadLocal(0), Instr::LoadLocal(1), Instr::Const(0),
+        Instr::CallNamed { sym: plus, nargs: 2 },
+        Instr::LoadLocal(2), Instr::CallNamed { sym: 123457, nargs: 3 }, Instr::Return,
+    ];
+    let mut ir = build::build_for_transfer_optimization(&source, symbol).unwrap();
+    assert!(speculate::speculate(&mut ir, &|_| Some(speculate::SpecType::Fixnum)) > 0);
+    let mut passes = pass::PassManager::new();
+    passes.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
+    passes.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
+    passes.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
+    passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
+    passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
+    passes.run(&mut ir);
+    build::legalize_transfer_calls(&mut ir,
+        &egcl_compiler::control_scope::ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    let (emitted, _) = emit::emit_framed_native_handlers_with_recursion(
+        &ir, 1, source.num_slots(), 1, 1, 1, 1, 1, 1, None, Some(1),
+    ).expect("the full register pool must retain optimized native admission");
+    assert!(emitted.has_deopt, "do not silently replace the guarded body with baseline code");
+}

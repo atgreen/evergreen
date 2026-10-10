@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Avoid unnecessary baseline fallbacks in opt-in native transfer code when a
+  register is reused for an immediate value
+  ([#187](https://github.com/atgreen/evergreen/pull/187)).
+
 - Restore T2 leaf inlining and inlined-frame deoptimization for retained
   function bodies, while preserving implicit `RETURN-FROM` semantics
   ([#175](https://github.com/atgreen/evergreen/pull/175)).

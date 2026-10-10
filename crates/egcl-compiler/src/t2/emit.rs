@@ -4888,17 +4888,22 @@ fn emit_framed_inner(
                             shadow_roots.push((location, slot));
                         }
                     }
-                    // A mapped tagged value may lack a shadow only if every
-                    // value assigned this home is provably non-moving. Never
-                    // let a liveness gap silently select a stale native root.
+                    // Only values live at THIS call justify an unshadowed
+                    // immediate. A register can hold a moving value elsewhere
+                    // in the function after its previous occupant dies.
+                    let point = resolved_by_source
+                        .get(&inst)
+                        .ok_or(EmitError::UnsupportedOp(0xFD))?;
                     for root in &map.roots {
                         if shadow_roots.iter().any(|(location, _)| location == root) {
                             continue;
                         }
-                        let values: Vec<_> = homes
+                        let values: Vec<_> = point
+                            .values()
                             .iter()
-                            .filter(|(_, home)| home.location() == Some(*root))
-                            .map(|(&value, _)| value)
+                            .filter(|entry| entry.gc_home()
+                                .is_some_and(|home| home.location() == Some(*root)))
+                            .map(|entry| entry.value)
                             .collect();
                         if values.is_empty() || !values.into_iter().all(proven_immediate) {
                             return Err(EmitError::UnsupportedOp(0xFD));
