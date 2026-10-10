@@ -14204,6 +14204,14 @@ impl egcl_rt::gc::TraceHostRoots for CleanupCont {
     }
 }
 
+/// A binding belongs inside every handler already present when it was made.
+/// Unwinding to one of those handlers must retire the binding first; handlers
+/// established inside the binding retain it while running their cleanups.
+struct ScopedDynBind {
+    guard: DynBind,
+    handler_depth: usize,
+}
+
 /// One live bytecode activation. `frame` owns the value slots on the
 /// `EgclStack`; `bcp`/`sp_top` are the interpreter cursor (D2.03 keeps these
 /// per-`bcp` for OSR/deopt — slice 1 keeps them Rust-side; nmq.3 moves them
@@ -14222,7 +14230,7 @@ struct Activation {
     /// Pending cleanup continuations (for `unwind-protect`).
     cleanup_conts: Vec<CleanupCont>,
     /// RAII guards for special-variable bindings established by this frame.
-    dyn_binds: Vec<DynBind>,
+    dyn_binds: Vec<ScopedDynBind>,
     /// Heap `EnvFrame` chain holding this activation's captured (boxed) locals,
     /// shared with any closure it creates. `None` when the function has no
     /// captured locals (the common, fast, slot-only case).
@@ -14250,7 +14258,7 @@ impl egcl_rt::gc::TraceHostRoots for Activation {
             cleanup.trace_host_roots(visit);
         }
         for binding in &mut self.dyn_binds {
-            binding.trace_host_roots(visit);
+            binding.guard.trace_host_roots(visit);
         }
         if let Some(env_frame) = &self.env_frame {
             // Shared per-pass visit state (bliss-s56e): activations deep in a
@@ -14259,6 +14267,14 @@ impl egcl_rt::gc::TraceHostRoots for Activation {
                 super::visit_env_frame_roots(env_frame, state, visit);
             });
         }
+    }
+}
+
+impl Drop for Activation {
+    fn drop(&mut self) {
+        // Vec drops elements from first to last. Rebinding the same special
+        // needs stack order, including when an entire activation is abandoned.
+        while self.dyn_binds.pop().is_some() {}
     }
 }
 
@@ -15055,10 +15071,12 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 acts[top_idx].push_op(v);
             }
             Instr::BindSpecial(sym) => {
-                let value = acts[top_idx].pop_op();
-                acts[top_idx]
-                    .dyn_binds
-                    .push(DynBind::establish(EgclVal::from_symbol_index(sym), value));
+                let act = &mut acts[top_idx];
+                let value = act.pop_op();
+                act.dyn_binds.push(ScopedDynBind {
+                    guard: DynBind::establish(EgclVal::from_symbol_index(sym), value),
+                    handler_depth: act.handlers.len(),
+                });
             }
             Instr::UnbindSpecial(count) => {
                 for _ in 0..count {
@@ -16078,6 +16096,16 @@ fn initiate_unwind(
     loop {
         let top = acts.len() - 1;
         let act = &mut acts[top];
+        // Live handlers have already selected the transfer. Restore only the
+        // bindings crossed on the way to this boundary, before its cleanup or
+        // selected clause runs. This also applies to the local GO fast path.
+        while act
+            .dyn_binds
+            .last()
+            .is_some_and(|binding| binding.handler_depth >= act.handlers.len())
+        {
+            act.dyn_binds.pop();
+        }
         // A transfer can exit an inner cleanup while retaining an outer one.
         // Discard only continuations whose enclosing handler boundary is being
         // crossed. Otherwise a later CleanupReturn resumes an abandoned inner

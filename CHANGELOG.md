@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserve the selected restart when a `CERROR` handler invokes an outer
+  restart also named `CONTINUE`. Restore special-variable bindings before
+  cleanup and destination clauses during nonlocal exits, including nested
+  cleanup transfers ([#201](https://github.com/atgreen/evergreen/pull/201)).
+
 - Preserve single-value returns from T2 speculated arithmetic, comparisons,
   and bit operations after multiple-valued expressions, while retaining values
   from replacement functions. Keep single-float comparisons eligible for T2
