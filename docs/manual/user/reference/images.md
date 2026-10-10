@@ -5,6 +5,12 @@ core images. Legacy source-transcript and BFASL startup images are unsupported;
 rebuild old executables. Ordinary library FASLs remain loadable with `LOAD` or
 `--load`.
 
+The current core format is 8. Format-7 and older cores must be rebuilt from
+source with the current runtime because they may contain compiled calls that
+lost the identity of their original function. Recompile older FASLs first,
+load the rebuilt program, and save a new core or executable. Updating a version
+field by hand cannot repair the saved code.
+
 ## `save-image`
 
 ```lisp

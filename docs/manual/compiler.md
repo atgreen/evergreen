@@ -82,6 +82,15 @@ ASDF uses compilation and loading to build systems. The
 registration. Compiled files should be rebuilt when changing incompatible
 runtime versions; they are not a promise of indefinite binary compatibility.
 
+Current compiled files use bytecode version 2.0. Files containing version-1
+bytecode must be recompiled from source: those older compilers could erase a
+call's identity when lowering bit operations, type predicates, accessors, or
+memory fences. Loading them would bypass later function replacements. The
+loader rejects these files before running their load forms and does not fall
+back to any source stored inside the artifact. Recompile affected libraries
+and their callers with `compile-file` or your ASDF build, then rebuild saved
+images that contain them.
+
 ## Declarations and optimization
 
 Common Lisp declarations describe the program, but accepted declarations are

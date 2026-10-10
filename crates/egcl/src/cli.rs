@@ -7325,6 +7325,14 @@ fn invoke_generic_function_inner(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    // Reader calls share this path with FUNCALL/APPLY and compiled callers.
+    // Reject wrong arity before method applicability can turn a missing
+    // receiver into NO-APPLICABLE-METHOD instead of PROGRAM-ERROR.
+    if args.len() != 1 && generic_is_slot_reader(env, name) {
+        return Err(EgclError::ProgramError(format!(
+            "{name}: accessor requires exactly one argument, got {}", args.len()
+        )));
+    }
     if let Some(receiver) = args.first() {
         let receiver_class = egcl_stdlib::class_of(*receiver);
         bytecode::record_generic_receiver_profile(name, receiver_class.0);
@@ -24726,6 +24734,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             return res;
         }
 
+        // Installed reader methods participate in ordinary generic dispatch,
+        // including around methods and later method redefinitions. A slot-name
+        // mapping alone cannot justify bypassing the applicable methods.
+        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+            let args = eval_args(cdr, env)?;
+            return invoke_generic_function(&name, &args, env);
+        }
+
         // Check DEFCLASS accessors by their complete symbol registry key.
         let mut accessor_slot_name: Option<String> = None;
         for class in env.classes.borrow().values() {
@@ -24812,12 +24828,6 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     resolve_sym(&n).unwrap_or(NIL)
                 });
             return slot_value_or_signal(*inst, slot_sym, env);
-        }
-
-        // Check methods
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
-            let args = eval_args(cdr, env)?;
-            return invoke_generic_function(&name, &args, env);
         }
 
         // Check for package-qualified symbols (e.g., TEST-PKG:HELLO)

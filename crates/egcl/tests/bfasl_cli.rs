@@ -132,10 +132,6 @@ fn bbu_action_start(bbu: &[u8]) -> usize {
     bbu_layout(bbu).1
 }
 
-fn bbu_function_codes(bbu: &[u8]) -> Vec<&[u8]> {
-    bbu_layout(bbu).0
-}
-
 #[test]
 fn multiple_value_prog1_persists_without_source_fallback() {
     let dir = workdir("multiple-value-prog1");
@@ -247,7 +243,7 @@ fn extension_cas_macro_persists_without_bootstrap_or_source() {
 }
 
 #[test]
-fn memory_fence_bytecode_persists_without_source_fallback() {
+fn memory_fence_call_persists_without_source_fallback() {
     let dir = workdir("memory-fence");
     let src = dir.join("memory-fence.lisp");
     let out = dir.join("memory-fence.bfasl");
@@ -268,25 +264,12 @@ fn memory_fence_bytecode_persists_without_source_fallback() {
         "must not embed legacy source"
     );
     let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
-    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x010f);
-    let codes = bbu_function_codes(bbu);
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0200);
     let start = bbu_action_start(bbu);
     let (_, _, count) = bbu_counts(&bytes);
     for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
         assert_ne!(action[0], 9, "memory fence fell back to EvalSource");
     }
-    assert!(
-        codes.iter().any(|&code| {
-            // Skip complete implicit BLOCK headers, then match instructions
-            // at their boundary rather than searching inside operands.
-            let mut body = code;
-            while matches!(body.first(), Some(0x1e | 0x43)) {
-                body = body.get(15..).expect("complete BLOCK instruction");
-            }
-            body.starts_with(&[0x14, 0x44, 3]) // ClearMv; MemoryFence(:full)
-        }),
-        "serialized function has no full MemoryFence opcode"
-    );
     let loaded = Command::new(BIN)
         .args(["--no-init", "--no-bootstrap", "--load"])
         .arg(&out)
@@ -298,6 +281,17 @@ fn memory_fence_bytecode_persists_without_source_fallback() {
         String::from_utf8_lossy(&loaded.stderr)
     );
     assert!(String::from_utf8_lossy(&loaded.stdout).contains("FENCE-FASL NIL"));
+    // A persisted call must retain the function binding. Erasing it into a
+    // MemoryFence opcode made an artifact ignore replacements after loading.
+    let rebound = run(&format!(r#"(progn
+        (load {out:?})
+        (dotimes (i 40) (persisted-fence))
+        (setf (symbol-function 'egcl::%memory-fence)
+          (lambda (kind) (declare (ignore kind)) (values 330 :fence)))
+        (format t "FENCE-REBOUND ~S~%" (multiple-value-list (persisted-fence))))"#));
+    assert!(rebound.status.success(), "{}", String::from_utf8_lossy(&rebound.stderr));
+    assert!(String::from_utf8_lossy(&rebound.stdout)
+        .lines().any(|line| line == "FENCE-REBOUND (330 :FENCE)"));
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3578,6 +3572,160 @@ fn version_mismatch_is_rejected() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
+    let dir = workdir("bytecode-version-barrier");
+    let source = dir.join("version.lisp");
+    let good = dir.join("version.bfasl");
+    fs::write(
+        &source,
+        "(defparameter *artifact-load-effect* t) (defun artifact-version-function () :installed)",
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {source:?} :output-file {good:?})"));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&good).unwrap();
+    let image = egcl_rt::bfasl::load(&bytes).unwrap();
+    for version in [0x0100u16, 0x010e, 0x010f, 0x0201, 0x0300] {
+        let bad = dir.join(format!("version-{version:04x}.bfasl"));
+        let mut builder = egcl_rt::bfasl::BfaslBuilder::new();
+        for (kind, section) in image.sections() {
+            let mut section = section.to_vec();
+            if kind == egcl_rt::bfasl::section::BYTECODE_UNIT {
+                section[4..6].copy_from_slice(&version.to_le_bytes());
+            }
+            builder = builder.section(kind, section);
+        }
+        // Even recoverable source cannot repair a BBU whose callable identities
+        // were erased. The authoritative bytecode must fail before either runs.
+        builder = builder.section(
+            egcl_rt::bfasl::section::TOPLEVEL_FORMS,
+            b"(setq *artifact-load-effect* :source-fallback)".to_vec(),
+        );
+        fs::write(&bad, builder.build()).unwrap();
+        let loaded = run(&format!(
+            r#"
+          (defparameter *artifact-load-effect* nil)
+          (handler-case (load {bad:?}) (error (e) (format t "REJECTED ~A~%" e)))
+          (format t "STATE ~S ~S~%" *artifact-load-effect* (fboundp 'artifact-version-function))
+        "#
+        ));
+        let stdout = String::from_utf8_lossy(&loaded.stdout);
+        assert!(
+            loaded.status.success(),
+            "{version:#06x}: {stdout}\n{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        assert!(
+            stdout.contains(&format!("unsupported bytecode version {version:#06x}")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("recompile"), "{stdout}");
+        assert!(stdout.contains("STATE NIL NIL"), "{stdout}");
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn source_free_accessor_callers_observe_replaced_bindings() {
+    let dir = workdir("accessor-binding-version");
+    let source = dir.join("accessors.lisp");
+    let fasl = dir.join("accessors.bfasl");
+    let setup = r#"
+      (defclass artifact-class () ((value :initarg :value :accessor artifact-class-value)))
+      (defstruct artifact-struct value)
+    "#;
+    fs::write(
+        &source,
+        r#"
+      (defun artifact-class-caller (x) (artifact-class-value x))
+      (defun artifact-struct-caller (x) (artifact-struct-value x))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!(
+        "{setup} (compile-file {source:?} :output-file {fasl:?})"
+    ));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let bytes = fs::read(&fasl).unwrap();
+    assert!(
+        bfasl_section(&bytes, 11).is_none(),
+        "callers must have no source fallback"
+    );
+    bbu_counts(&bytes);
+    fs::remove_file(source).unwrap();
+    for (tier, native, installed) in [("t0", "0", 0), ("t2", "0", 2), ("t2", "1", 2)] {
+        // The accessor T2 emission path is validated on x86-64 Unix hosts.
+        // Other platforms still exercise portable bytecode and exact identity.
+        if tier == "t2" && !cfg!(all(target_arch = "x86_64", unix)) {
+            continue;
+        }
+        let program = format!(
+            r#"
+          {setup}
+          (load {fasl:?})
+          (defparameter *artifact-class-object* (make-instance 'artifact-class :value 7))
+          (defparameter *artifact-struct-object* (make-artifact-struct :value 9))
+          (defparameter *saved-class-caller* #'artifact-class-caller)
+          (defparameter *saved-struct-caller* #'artifact-struct-caller)
+          (assert (null (egcl::%fn-body *saved-class-caller*)))
+          (assert (null (egcl::%fn-body *saved-struct-caller*)))
+          (dotimes (i 40)
+            (assert (= 7 (artifact-class-caller *artifact-class-object*)))
+            (assert (= 9 (artifact-struct-caller *artifact-struct-object*))))
+          (format t "ACCESSOR-TIERS ~D ~D~%"
+            (egcl-ext:function-tier 'artifact-class-caller)
+            (egcl-ext:function-tier 'artifact-struct-caller))
+          (setf (symbol-function 'artifact-class-value) (lambda (x) (declare (ignore x)) (values 110 :class)))
+          (setf (symbol-function 'artifact-struct-value) (lambda (x) (declare (ignore x)) (values 220 :struct)))
+          (defun artifact-class-caller (x) (declare (ignore x)) :new-class)
+          (defun artifact-struct-caller (x) (declare (ignore x)) :new-struct)
+          (dotimes (i 40)
+            (assert (equal '(110 :class) (multiple-value-list (funcall *saved-class-caller* *artifact-class-object*))))
+            (assert (equal '(220 :struct) (multiple-value-list (funcall *saved-struct-caller* *artifact-struct-object*)))))
+          (format t "SAVED-ACCESSOR-VALUES ~S ~S~%"
+            (multiple-value-list (funcall *saved-class-caller* *artifact-class-object*))
+            (multiple-value-list (funcall *saved-struct-caller* *artifact-struct-object*)))
+        "#
+        );
+        let loaded = Command::new(BIN)
+            .args(["--no-init", "--eval", &program])
+            .env("EGCL_NATIVE_TRANSFER", native)
+            .env("EGCL_FORCE_TIER", tier)
+            .env("EGCL_LAZY_COMPILE", "0")
+            .output()
+            .unwrap();
+        assert!(
+            loaded.status.success(),
+            "tier={tier}, native={native}: {}\n{}",
+            String::from_utf8_lossy(&loaded.stdout),
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&loaded.stdout);
+        let tiers = format!("ACCESSOR-TIERS {installed} {installed}");
+        assert!(
+            stdout.lines().any(|line| line == tiers),
+            "tier={tier}, native={native}: {stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "SAVED-ACCESSOR-VALUES (110 :CLASS) (220 :STRUCT)"),
+            "tier={tier}, native={native}: {stdout}"
+        );
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
 
 #[test]
 fn present_bbu_is_authoritative_and_never_falls_back_to_legacy_source() {

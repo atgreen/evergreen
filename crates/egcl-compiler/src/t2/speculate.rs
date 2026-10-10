@@ -54,6 +54,8 @@
 //!   constant shift amount and handles right shifts.
 //! * `NOT` / `NULL` → pure `GenericEq(x, NIL)`, no profile, no guard, no
 //!   safepoint; correct for every argument type.
+//! * `EGCL::%MEMORY-FENCE` with a constant fence keyword → effectful
+//!   `MemoryFence` on x86-64 and s390x, after guarding the builtin binding.
 //!
 //! # Mutation
 //!
@@ -196,6 +198,20 @@ enum ExtraArg {
     /// (see `mod_mask_of`), so the divisor operand is not merely unused — it
     /// must go, or the rewritten `LogAnd` would AND against the divisor.
     ReplaceSecondWithFixnum(i64),
+    /// Replace a literal keyword argument with an ordered native fence.
+    Fence(egcl_rt::bytecode::MemoryFenceKind),
+}
+
+/// Literal keyword accepted by the native fence specialization. The caller
+/// must separately guard the builtin binding before emitting the operation.
+pub fn literal_memory_fence_kind(symbol: u32) -> Option<egcl_rt::bytecode::MemoryFenceKind> {
+    use egcl_rt::bytecode::MemoryFenceKind;
+    match egcl_rt::symbols::registry_key(symbol).as_deref() {
+        Some("KEYWORD:READ" | "KEYWORD:DATA-DEPENDENCY") => Some(MemoryFenceKind::Read),
+        Some("KEYWORD:WRITE") => Some(MemoryFenceKind::Write),
+        Some("KEYWORD:FULL") => Some(MemoryFenceKind::Full),
+        _ => None,
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -333,8 +349,16 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
     // when `opt` is set, so a rewrite that needed folding afterwards would go
     // unlowered in the unoptimised path.
     let mut consts: HashMap<Value, i64> = HashMap::new();
+    let mut fences = HashMap::new();
     for i in 0..f.num_insts() {
         let d = f.inst(Inst(i as u32));
+        if d.opcode == Opcode::ConstSymbol
+            && let AuxData::SymbolRef(symbol) = d.aux
+            && let Some(kind) = literal_memory_fence_kind(symbol)
+            && let Some(&result) = d.results.first()
+        {
+            fences.insert(result, kind);
+        }
         if d.opcode == Opcode::ConstFixnum {
             if let AuxData::FixnumImm(k) = d.aux {
                 if let Some(&r) = d.results.first() {
@@ -354,6 +378,14 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                 _ => continue,
             };
             let argc = data.args.len();
+            if cfg!(any(target_arch = "x86_64", target_arch = "s390x"))
+                && argc == 1
+                && egcl_rt::symbols::registry_key(sym).as_deref() == Some("EGCL::%MEMORY-FENCE")
+                && let Some(&kind) = fences.get(&data.args[0])
+            {
+                work.push((inst, Opcode::MemoryFence, IRType::of(TypeBits::NULL), ExtraArg::Fence(kind)));
+                continue;
+            }
             // NOT/NULL rewrite first: profile-free (correct for every type).
             if is_not_of(sym) && argc == 1 {
                 work.push((inst, Opcode::GenericEq, boolean_type(), ExtraArg::Nil));
@@ -462,7 +494,7 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
         // Materialise the appended constant operand (1+/1- → const 1; NOT →
         // const NIL) as a const inst placed immediately before the site.
         let extra_value = match extra {
-            ExtraArg::None => None,
+            ExtraArg::None | ExtraArg::Fence(_) => None,
             ExtraArg::FixnumOne => Some(push_const_before(
                 f,
                 inst,
@@ -512,6 +544,12 @@ pub fn speculate(f: &mut Function, profile: &impl Fn(u32) -> Option<SpecType>) -
                     effectful: true,
                     ..InstFlags::default()
                 };
+            }
+            if let ExtraArg::Fence(kind) = extra {
+                data.args.clear();
+                data.aux = AuxData::MemoryFence(kind);
+                data.flags.guard = false;
+                data.frame_state = None;
             }
         }
         for r in results {

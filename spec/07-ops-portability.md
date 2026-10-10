@@ -574,16 +574,17 @@ a major version (R7.14).
 The `format_version` field in the header (D7.01) is independent of the
 release version:
 
-The current format is **3**, which appends an `MCOD` block to the host registry:
-a u32 record count followed by pairs of u64 method-id bits and saved callable
-bits. Method ids are immediate meta-handles; callable pointers are relocated
-through the heap map and rooted before startup allocations. Compiled bodies
-are restored separately through the existing bytecode registry.
+The current format is **8**. It requires compiled bodies whose bytecode
+preserves callable identities (BBU 2.0). Format-7 and older images may embed
+instructions produced by lowering that erased named calls; their original
+callee identities cannot be recovered during restore. Rebuild such images from
+source with the current runtime. The version check runs before heap restoration
+or host-registry installation.
 
-Format-2 images added the opaque mutex heap type (`0x19`). Its process-local
-native pointer is cleared on save; see §13.9 for restart semantics. Format-1
-and format-2 images remain readable; absent compiled-method associations keep
-the prior interpreted-dispatch behavior.
+Earlier format changes introduced compiled-method associations (3), opaque
+condition-variable handles (4), native runtime requirements (5), aligned heap
+spans with precise pointer fixups (6), and immutable function definition indices
+(7). These older formats are deliberately unsupported.
 
 | Compat Rule | Behaviour |
 |-------------|-----------|
