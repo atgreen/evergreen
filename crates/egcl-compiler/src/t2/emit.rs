@@ -7558,7 +7558,7 @@ mod tests {
             egcl_rt::value::EgclVal::from_fixnum(71).0,
             egcl_rt::value::NIL.0,
         ];
-        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS as u64];
+        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS];
         assert_eq!(normal(slots.as_mut_ptr()), egcl_rt::value::T.0);
     }
 
@@ -7587,7 +7587,7 @@ mod tests {
             egcl_rt::value::EgclVal::from_fixnum(71).0,
             egcl_rt::value::NIL.0,
         ];
-        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS as u64];
+        let mut slots = [cons.as_ptr() as u64 | egcl_rt::value::TAG_CONS];
         assert_eq!(osr(slots.as_mut_ptr()), egcl_rt::value::T.0);
         slots[0] = egcl_rt::value::NIL.0;
         assert_eq!(

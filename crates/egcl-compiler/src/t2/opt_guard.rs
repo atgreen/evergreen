@@ -93,10 +93,31 @@ impl Pass for GuardElim {
         let dom = a.dominators(f).clone();
 
         let mut changed = false;
-        changed |= split_loop_entry_guards(f, &dom);
+        let split_phis = split_loop_entry_guards(f, &dom);
+        changed |= !split_phis.is_empty();
         changed |= remove_inference_proven(f);
         changed |= remove_dominating_duplicates(f, &dom);
         changed |= hoist_loop_invariant(f, &dom);
+
+        // A nested (or later) OSR entry can import an outer loop parameter
+        // without executing its preheader or header entry check. Establish
+        // every refinement introduced above at each direct import. Do this
+        // after all guard removal: forwarding a guard result may expose the
+        // parameter in a FrameState only during a later transform.
+        let fixnum = IRType::of(TypeBits::FIXNUM);
+        for osr in &mut f.osr_entries {
+            let state = f.frame_states.get(osr.frame_state);
+            for &phi in &split_phis {
+                let imports_phi = state.scopes.iter().any(|scope| {
+                    scope.locals.iter().chain(&scope.stack).any(|source| {
+                        matches!(source, ValueSource::Value { value, .. } if *value == phi)
+                    })
+                });
+                if imports_phi && !osr.checks.contains(&(phi, fixnum)) {
+                    osr.checks.push((phi, fixnum));
+                }
+            }
+        }
 
         if changed {
             // Value definitions moved / were forwarded; drop derived analyses.
@@ -446,7 +467,9 @@ fn is_plain_fixnum_guard(d: &crate::t2::ir::InstData) -> bool {
 /// before the first iteration, which is exactly where a failed entry guard
 /// leaves the program. Every source of the rewritten state must dominate the
 /// preheader, or the parameter is skipped.
-fn split_loop_entry_guards(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> bool {
+/// Return the refined parameters so the caller can propagate their entry
+/// checks after all guard-result aliases have been forwarded.
+fn split_loop_entry_guards(f: &mut Function, dom: &crate::t2::ir::DominatorTree) -> Vec<Value> {
     use crate::t2::frame_state::ValueSource;
     use crate::t2::ir::{InstData, InstFlags, ValueRepresentation};
 
@@ -460,7 +483,7 @@ fn split_loop_entry_guards(f: &mut Function, dom: &crate::t2::ir::DominatorTree)
         }
     }
     let fixnum = IRType::of(TypeBits::FIXNUM);
-    let mut changed = false;
+    let mut split_phis = Vec::new();
 
     for (&hidx, tails) in &latches {
         let header = Block(hidx as u32);
@@ -593,10 +616,10 @@ fn split_loop_entry_guards(f: &mut Function, dom: &crate::t2::ir::DominatorTree)
             for g in guards {
                 remove_guard(f, g);
             }
-            changed = true;
+            split_phis.push(phi);
         }
     }
-    changed
+    split_phis
 }
 
 // ── Shared mutation helpers ─────────────────────────────────────────
@@ -946,6 +969,100 @@ mod tests {
             "{:?}",
             crate::t2::verify::verify(&f)
         );
+    }
+
+    /// Both OSR roots can enter the same activation with the outer phi in a
+    /// local slot. The inner root bypasses the outer root's entry check.
+    #[test]
+    fn split_outer_phi_checks_every_nested_osr_import() {
+        let mut f = Function::new("nested-osr-split-proof");
+        let entry = f.entry();
+        let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, one) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::FixnumImm(1),
+                ..base(Opcode::ConstFixnum)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (_, condition) = f.push_inst(
+            entry,
+            base(Opcode::ConstNil),
+            &[(IRType::of(TypeBits::NULL), ValueRepresentation::Tagged)],
+        );
+        let outer = f.make_block();
+        let inner_preheader = f.make_block();
+        let inner = f.make_block();
+        let outer_latch = f.make_block();
+        let exit = f.make_block();
+        let phi = f.add_block_param(outer, IRType::TOP, ValueRepresentation::Tagged);
+        let mut enter = jump(outer);
+        enter.targets[0].args = vec![input];
+        f.set_terminator(entry, enter);
+        f.set_terminator(outer, jump(inner_preheader));
+        f.set_terminator(inner_preheader, jump(inner));
+        for (block, bcp) in [(outer, 5), (inner, 9)] {
+            let frame_state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope {
+                    function: 0,
+                    bcp,
+                    locals: vec![ValueSource::Value {
+                        value: phi,
+                        repr: ValueRepresentation::Tagged,
+                    }],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            f.osr_entries.push(crate::t2::ir::OsrEntry {
+                bcp,
+                block,
+                frame_state,
+                checks: vec![],
+            });
+        }
+        let inner_state = f.osr_entries[1].frame_state;
+        let (proof, refined) = f.push_inst(
+            inner,
+            InstData {
+                frame_state: Some(inner_state),
+                ..guard(phi, fixnum())
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (add, result) = f.push_inst(
+            inner,
+            InstData {
+                args: vec![refined[0], one[0]],
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                frame_state: Some(inner_state),
+                ..base(Opcode::FixnumAdd)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(inner, brif(condition[0], inner, vec![], outer_latch));
+        f.set_terminator(outer_latch, brif(condition[0], outer, vec![phi], exit));
+        f.set_terminator(exit, InstData { args: vec![result[0]], ..ret() });
+        crate::t2::verify::verify(&f).expect("valid nested loop before splitting");
+
+        run(&mut f);
+        crate::t2::verify::verify(&f).expect("valid nested loop after splitting");
+        assert_eq!(f.value(phi).ty.bits, TypeBits::FIXNUM);
+        assert!(!f.block(inner).insts.contains(&proof), "keep loop guard splitting");
+        assert_eq!(f.inst(add).args[0], phi, "arithmetic now trusts the outer phi");
+        for osr in &f.osr_entries {
+            let state = f.frame_states.get(osr.frame_state);
+            assert!(matches!(state.scopes[0].locals[0],
+                ValueSource::Value { value, .. } if value == phi),
+                "the value has an import; this is a missing proof, not a missing home");
+            assert_eq!(osr.checks, vec![(phi, fixnum())],
+                "each direct import must establish the refinement before arithmetic");
+        }
     }
 
     #[test]
