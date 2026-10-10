@@ -28,6 +28,55 @@ direct push to `main`. Until the comprehensive CI bead (`bliss-hn1cc`) is
 complete, run and report the relevant checks without making known-unreliable
 jobs required merge gates.
 
+## Targeted validation
+
+Keep the edit/test loop focused on the behavior being changed:
+
+- Start with the exact regression and neighboring tests for the affected path.
+  Use named test filters or a small integration target; confirm the intended
+  tests actually ran. Broaden only when a failure, shared invariant, or wider
+  change gives a concrete reason.
+- Build each source revision once when practical, then reuse its binaries for
+  focused checks. Combine compatible pending edits before an integration build.
+  Record which source revision and uncommitted changes produced the binary;
+  never validate new edits against an older executable.
+- Target GC stress at allocating paths touched by the change. Keep the moving
+  GC evidence requirements below: compare results, and prove relocation when
+  claiming a rooting fix. Native tests must demonstrate the intended native
+  path, not merely set a flag or pass through interpreter fallback.
+- Run the required integration and quality gates on the final combined patch
+  before landing. Do not repeat whole compiler, runtime, native, or BFASL suites
+  after every local edit. After further edits or rebasing, rerun the affected
+  checks; repeat broader checks only when their evidence has been invalidated.
+- For prose-only documentation changes, inspect the diff and check formatting
+  and links; do not rebuild the runtime or run unrelated test suites.
+- Preserve logs and distinguish passed, failed, interrupted, and unrun checks.
+  If a broad run is no longer useful, stop only this session's verified process
+  or process group and replace it with the relevant checks. An interrupted run
+  is not a pass. Keep all runtime runs within the memory limits below.
+
+## Parallel work with sub-agents
+
+When the current host/session permits delegation, use sub-agents for independent
+implementation slices, focused audits, and review while the main agent advances
+another part of the task. Avoid delegating work that immediately blocks on the
+main agent's unfinished changes.
+
+- Give each agent a bounded task, Bead, owned files or subsystem, expected
+  result, and validation scope. Record ownership and dependencies in Beads.
+- Give concurrent writers separate worktrees and branches. Preserve other
+  sessions' edits. Read-only reviewers can inspect an existing worktree.
+- Coordinate builds centrally. Check available memory, disk, and current load;
+  more simultaneous builds can make the work slower. Never let separate
+  worktrees build into the same Cargo target directory. Agents can audit,
+  prepare patches, or run focused probes against an identified existing binary
+  while a build is running.
+- Integrate completed patches as they become available, review their interaction,
+  and run the required combined validation once. Agent reports are evidence to
+  inspect, not substitutes for reviewing the diff and verifying the result.
+  Clean up an agent worktree only after its work is safely preserved and landed
+  or explicitly abandoned.
+
 ## Coverage debt policy
 
 The user approved an explicit known-debt ratchet on 2026-10-06. CI invokes
