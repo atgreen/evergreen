@@ -264,8 +264,9 @@ release metadata, the `RPM-GPG-KEY-egcl` public key, a CycloneDX SBOM, and
 `SHA256SUMS` with its detached signature `SHA256SUMS.asc`.
 Publication runs only after package identity, payload, and runtime checks pass.
 Write permission and the signing key are confined to the publish job, which runs
-in a protected `release` environment that only `main` and `v*` tags may deploy
-to, and which waits for maintainer approval.
+in a `release` environment restricted to `main` and `v*` tags. Publication
+proceeds automatically after successful checks; the environment does not require
+maintainer approval.
 
 Two runs for the same ref never publish concurrently. Test prereleases beyond
 the three most recent are pruned automatically.
