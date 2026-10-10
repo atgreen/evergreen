@@ -200,6 +200,18 @@ pub fn build_for_transfer_optimization(
     builder.run()
 }
 
+/// Build native registered-scope edges before SSA sealing while preserving
+/// the root definition identity used by optimization and deoptimization.
+pub fn build_for_native_scope_optimization(
+    bf: &BytecodeFunction,
+    symbol: u32,
+) -> Result<Function, BuildError> {
+    let mut builder = Builder::new(bf, InlineOptions::default().with_root_symbol(symbol));
+    builder.transfer_mode = true;
+    builder.native_cleanups = true;
+    builder.run()
+}
+
 /// Give every residual call an explicit exceptional successor after optimization.
 /// The supplied scope map must belong to the retained bytecode definition.
 pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<(), BuildError> {

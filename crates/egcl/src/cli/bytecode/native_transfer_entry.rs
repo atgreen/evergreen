@@ -774,10 +774,15 @@ impl TransferCode {
         &self,
         args: &[EgclVal],
         env: &mut Env,
-        osr: Option<(*mut Frame, usize)>,
+        mut osr: Option<OsrResume>,
     ) -> Result<EgclVal, EgclError> {
-        // Claim an inherited frame before any preparation can fail or collect.
-        let mut frame_guard = FrameGuard(osr.map(|(frame, _)| frame));
+        // Claim both inherited owners before preparation can fail or collect.
+        // Tags remain in the rooted Env; the payload owns their exact tokens.
+        let mut frame_guard = FrameGuard(osr.as_ref().map(|resume| resume.frame));
+        let _catch_guard = CatchScopeGuard {
+            base: osr.as_ref().map_or(env.catch_stack.len(), |resume| resume.catch_base),
+            env,
+        };
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
         if osr.is_none() && args.len() != usize::from(self.body.arity) {
@@ -789,6 +794,10 @@ impl TransferCode {
             validate_declared_args(&self.body, &args)?;
         }
         let mut state = ActivationState::prepare(self, env)?;
+        if let Some(resume) = &mut osr {
+            state.catches = std::mem::take(&mut resume.catches);
+            state.catch_base = resume.catch_base;
+        }
         egcl_rt::rooted_ref!(_state = &mut state);
         let _depth = osr.is_none().then(|| {
             NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -805,7 +814,8 @@ impl TransferCode {
             .or(self.installed_symbol)
             .map(EgclVal::from_symbol_index)
             .unwrap_or(NIL);
-        let frame = if let Some((frame, _)) = osr {
+        let frame = if let Some(resume) = &osr {
+            let frame = resume.frame;
             if stack.fp() != frame
                 || stack.grow_top_frame(self.slots.max(unsafe { (*frame).num_locals }), self.code_info).is_none()
             {
@@ -824,10 +834,6 @@ impl TransferCode {
         if osr.is_none() {
             bind_params(&self.body, frame, &args, None);
         }
-        let _catch_guard = CatchScopeGuard {
-            env,
-            base: state.catch_base,
-        };
         let _dynamic_scope_guard = DynamicScopeGuard {
             env,
             scopes: &mut state.dynamic_scopes,
@@ -868,7 +874,7 @@ impl TransferCode {
         }
         let outcome = unsafe {
             native_transfer::invoke_native_segment(
-                self.code.as_ptr().add(osr.map_or(0, |(_, offset)| offset)),
+                self.code.as_ptr().add(osr.as_ref().map_or(0, |resume| resume.offset)),
                 context.activation.cast(),
                 stack,
             )
@@ -882,7 +888,9 @@ impl TransferCode {
             return Err(invalid_capture());
         }
         if let Some((next, offset)) = context.osr.take() {
-            if outcome.exit != NativeExit::Transfer || error.is_some() || !state.is_quiescent() {
+            if outcome.exit != NativeExit::Transfer || error.is_some()
+                || context.selected.is_some() || !state.can_osr()
+            {
                 return Err(invalid_capture());
             }
             let NativeCodeStorage::Mapped(code) = &next._storage else {
@@ -895,7 +903,15 @@ impl TransferCode {
                     *count = count.saturating_add(1);
                 });
             }
-            return code.run_activation(&[], env, Some((frame_guard.0.take().unwrap(), offset)));
+            let resume = OsrResume {
+                frame: frame_guard.0.take().unwrap(),
+                offset,
+                catches: std::mem::take(&mut state.catches),
+                catch_base: state.catch_base,
+            };
+            // This suspended source's catch guard remains an error backstop.
+            // It can only truncate again after the destination has returned.
+            return code.run_activation(&[], env, Some(resume));
         }
         match outcome.exit {
             NativeExit::Returned
@@ -1157,10 +1173,10 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
-    local_control_native_body(body, allow_values, false)
+    local_control_native_body(body, allow_values, false, false)
 }
 
-fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_tags: bool) -> bool {
+fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_tags: bool, allow_catches: bool) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -1174,6 +1190,7 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
             // admission retains its existing restriction.
             (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
             || (allow_tags && matches!(op, Instr::PushTag { .. } | Instr::Go { .. }))
+            || (allow_catches && matches!(op, Instr::PushCatch { .. } | Instr::Throw))
             || matches!(
                 op,
                 Instr::Const(_)
@@ -1504,6 +1521,15 @@ unsafe extern "C" fn deliver_handler(
     #[cfg(test)]
     NATIVE_HANDLER_COUNT.with(|count| count.set(count.get() + 1));
     super::super::take_control_value(&prepared.token)
+}
+
+/// Ownership passed between machine versions of one managed activation.
+/// Catch tags stay in Env; their registration tokens are never regenerated.
+struct OsrResume {
+    frame: *mut Frame,
+    offset: usize,
+    catches: Vec<SavedCatch>,
+    catch_base: usize,
 }
 
 struct SavedCatch {
@@ -2145,7 +2171,28 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let Some(entry) = next.osr_entries.get(header).copied() else { return false };
     // Scan body admission only once a replacement is ready, not on every
     // baseline loop poll while the optimizing worker is still compiling.
-    if !local_control_native_body(&code.body, true, true) {
+    if !local_control_native_body(&code.body, true, true, true) {
+        return false;
+    }
+    // An OSR jump keeps this activation's registrations, not new copies.
+    // Validate exact lexical provenance against both live runtime ledgers.
+    use egcl_compiler::control_scope::{Ownership, ScopeKind, ScopeMap};
+    let Ok(scopes) = ScopeMap::analyze_function(&code.body) else { return false };
+    let Some(scopes) = scopes.before(*header) else { return false };
+    if scopes.iter().any(|scope| scope.ownership != Ownership::Local
+        || !matches!(scope.kind, ScopeKind::Block { register: false, .. }
+            | ScopeKind::Tagbody { .. } | ScopeKind::Catch { .. }))
+    {
+        return false;
+    }
+    let catches = unsafe { &*context.catches };
+    let env = unsafe { &*NATIVE_ENV.with(Cell::get) };
+    if !scopes.iter().filter(|scope| matches!(scope.kind, ScopeKind::Catch { .. }))
+        .map(|scope| scope.push_bcp).eq(catches.iter().map(|saved| saved.push_bcp))
+        || env.catch_stack.len() != context.catch_base + catches.len()
+        || !env.catch_stack[context.catch_base..].iter().map(|(_, token)| token)
+            .eq(catches.iter().map(|saved| &saved.token))
+    {
         return false;
     }
     let Some(index) = code.sites.sites().position(|site| site.return_offset() as usize == offset) else {
@@ -2367,6 +2414,7 @@ struct CaptureContext {
     frame: *mut Frame,
     body: *const BytecodeFunction,
     catches: *mut Vec<SavedCatch>,
+    catch_base: usize,
     completed_cleanup: Option<u32>,
     landing_stub: *const u8,
     landing: SysvNativeLanding,

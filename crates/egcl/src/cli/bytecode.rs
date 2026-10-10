@@ -72,6 +72,9 @@ pub(super) use native_transfer_tests::{NativeEvalProbe, native_reentry_event_for
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::ordinary_t2::{ordinary_t2_root_for_test, ordinary_t2_entry_for_test};
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::ordinary_catch_osr::local_catch_osr_observe_for_test;
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;
@@ -19132,9 +19135,19 @@ impl egcl_rt::gc::TraceHostRoots for T2InstalledBodies {
 struct T2Artifact {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mapped: Option<native_transfer_entry::PreparedT2>,
-    env_names: Box<NativeEnvNames>,
+    checked: Option<CheckedT2Artifact>,
     speculations: Vec<(u32, SpecType)>,
     call_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
+    rooted_bodies: Vec<Arc<BytecodeFunction>>,
+    deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
+    /// The id baked into the code's deopt stubs (s390x); see `CODE_BY_ID`.
+    code_id: u64,
+}
+
+/// Emitted bytes and metadata belonging only to the checked calling convention.
+/// Mapped workers need neither these bytes nor their shadow-root contract.
+struct CheckedT2Artifact {
+    env_names: Box<NativeEnvNames>,
     code: Vec<u8>,
     #[cfg(all(target_arch = "x86_64", windows))]
     windows_unwind: Vec<egcl_compiler::t2::emit::WindowsUnwindRange>,
@@ -19147,17 +19160,13 @@ struct T2Artifact {
     root_sync_sites: Vec<egcl_compiler::t2::emit::RootSyncSite>,
     native_calls: Option<egcl_compiler::t2::x64_calls::NativeCallSites>,
     has_deopt: bool,
-    rooted_bodies: Vec<std::sync::Arc<BytecodeFunction>>,
-    deopt_bodies: HashMap<u32, Arc<BytecodeFunction>>,
-    /// The id baked into the code's deopt stubs (s390x); see `CODE_BY_ID`.
-    code_id: u64,
 }
 
-/// Validate the emitter's native-root synchronization contract before any T2
-/// bytes become executable. A site count mismatch, out-of-range PC, oversized
+/// Validate the checked emitter's native-root synchronization contract before
+/// its bytes become executable. A site count mismatch, out-of-range PC, oversized
 /// root set, or register entry that could bypass the owning EgclStack frame is
 /// stale/missing GC metadata and rejects installation under R4.46.
-fn validate_t2_root_sync(activation_slots: u16, artifact: &T2Artifact) -> Option<u16> {
+fn validate_t2_root_sync(activation_slots: u16, artifact: &CheckedT2Artifact) -> Option<u16> {
     if artifact.emitted_safepoints != artifact.root_sync_sites.len()
         || (artifact.shadow_root_slots != 0 && artifact.compiled_entry != 0)
         || artifact.root_sync_sites.iter().any(|site| {
@@ -19893,7 +19902,6 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|s| s.borrow_mut().insert(done.sym));
         return None;
     }
-    let total_slots = validate_t2_root_sync(bf.num_slots(), &artifact)?;
     // Resume the root activation on its original definition, so T0 samples
     // after a guard failure update the profile used for recompilation. The
     // worker's deep snapshot has a different Arc identity; profiling that copy
@@ -19921,6 +19929,8 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         T2_DECLINED.with(|declined| declined.borrow_mut().insert(done.sym));
         return None;
     }
+    let checked = artifact.checked.take()?;
+    let total_slots = validate_t2_root_sync(bf.num_slots(), &checked)?;
     let metadata = if artifact.rooted_bodies.is_empty() {
         None
     } else {
@@ -19934,7 +19944,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
     };
     #[cfg(all(target_arch = "x86_64", windows))]
     let mut buf = {
-        let ranges: Vec<_> = artifact
+        let ranges: Vec<_> = checked
             .windows_unwind
             .iter()
             .map(|range| egcl_rt::jit::WindowsUnwindInfo {
@@ -19946,19 +19956,19 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         // Every T2 entry shares the emitter's fixed-RBP frame, but each
         // prologue has its own RUNTIME_FUNCTION range in this allocation.
         unsafe {
-            egcl_rt::jit::JitBuffer::new_with_windows_unwind_ranges(&artifact.code, &ranges)
+            egcl_rt::jit::JitBuffer::new_with_windows_unwind_ranges(&checked.code, &ranges)
         }?
     };
     #[cfg(not(all(target_arch = "x86_64", windows)))]
-    let mut buf = egcl_rt::jit::JitBuffer::new(&artifact.code)?;
-    let arguments = native_debug::arguments(&bf, artifact.compiled_entry != 0);
+    let mut buf = egcl_rt::jit::JitBuffer::new(&checked.code)?;
+    let arguments = native_debug::arguments(&bf, checked.compiled_entry != 0);
     let debug_info = buf
         .install_debug_info_with_arguments(&bf.name, arguments.as_ref())
         .ok()?;
     let code_info = install_stack_map(total_slots, debug_info)?;
     let entry = buf.as_ptr();
-    maybe_write_perf_map(entry as usize, artifact.code.len(), done.sym);
-    maybe_write_jitdump_code_load("T2", entry as usize, &artifact.code, done.sym);
+    maybe_write_perf_map(entry as usize, checked.code.len(), done.sym);
+    maybe_write_jitdump_code_load("T2", entry as usize, &checked.code, done.sym);
     // EGCL_T2_DISASM=<substring>: print the installed code of matching
     // functions to stderr at install time — the only way to inspect code that
     // crashes on its first execution (bliss-x5y.29 forensics).
@@ -19969,13 +19979,13 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
                 "; T2 code for {} at {:p} ({} bytes, compiled_entry=+{})",
                 bf.name,
                 entry,
-                artifact.code.len(),
-                artifact.compiled_entry
+                checked.code.len(),
+                checked.compiled_entry
             );
             if cfg!(target_arch = "x86_64") {
                 let mut dec = iced_x86::Decoder::with_ip(
                     64,
-                    &artifact.code,
+                    &checked.code,
                     entry as u64,
                     iced_x86::DecoderOptions::NONE,
                 );
@@ -19989,33 +19999,33 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
                     eprintln!("  {:#x}: {}", insn.ip(), line);
                 }
             } else {
-                eprint!("{}", format_native_bytes(&artifact.code));
+                eprint!("{}", format_native_bytes(&checked.code));
             }
         }
     }
     let nc = Rc::new(NativeCode {
-        _env_names: artifact.env_names,
+        _env_names: checked.env_names,
         _call_cells: artifact.call_cells,
         _storage: NativeCodeStorage::Checked {
             _buffer: buf,
-            _native_calls: artifact.native_calls.map(Arc::new),
+            _native_calls: checked.native_calls.map(Arc::new),
         },
         body: Some(Arc::clone(&bf)),
         transfer_abi_version: NATIVE_TRANSFER_ABI_VERSION,
         transfer_abi_arch: NATIVE_TRANSFER_ARCH,
         _direct_calls: direct_calls,
         entry,
-        code_len: artifact.code.len(),
+        code_len: checked.code.len(),
         is_t2: true,
         num_slots: total_slots,
-        compiled_entry: artifact.compiled_entry,
+        compiled_entry: checked.compiled_entry,
         code_id: artifact.code_id,
-        osr_entries: artifact.osr_entries.into_iter().collect(),
-        bcp_offsets: artifact.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
+        osr_entries: checked.osr_entries.into_iter().collect(),
+        bcp_offsets: checked.bcp_offsets, // sparse T2 bcp→native map (bliss-zmmb)
         code_info,
         // Real value from the T2 emitter: a non-deopting T2 function is eligible
         // for a direct native→native call (bliss-zhvn).
-        has_deopt: artifact.has_deopt,
+        has_deopt: checked.has_deopt,
         t2_metadata: metadata,
     });
     CODE_BY_ID.with(|m| m.borrow_mut().insert(nc.code_id, Rc::downgrade(&nc)));
@@ -20703,13 +20713,27 @@ fn resume_inlined_in_t0(
     outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    resume_inlined_in_t0_with_handlers(scopes, _metadata, outer_env_frame, None, env)
+}
+
+fn resume_inlined_in_t0_with_handlers(
+    scopes: Vec<InlinedResumeScope>,
+    _metadata: Arc<T2InstalledMetadata>,
+    outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
+    mut outer_handlers: Option<Vec<Handler>>,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
     let stack = egcl_rt::current_stack();
     egcl_rt::rooted!(outer_env_frame = outer_env_frame.map(super::SuspendedFrameRoot));
     let mut acts = Vec::with_capacity(scopes.len());
     egcl_rt::rooted_ref!(_acts_root = &mut acts);
     for (index, scope) in scopes.into_iter().enumerate() {
         let entry = scope.body;
-        let handlers = rebuild_resume_handlers(&entry, scope.bcp, env);
+        let handlers = if index == 0 {
+            outer_handlers.take().unwrap_or_else(|| rebuild_resume_handlers(&entry, scope.bcp, env))
+        } else {
+            rebuild_resume_handlers(&entry, scope.bcp, env)
+        };
         // A resumed child owns the callable in its original frame even when
         // pre-guard Lisp replaced the name. Loop heat must follow that object.
         let callable = unsafe { (*scope.frame).function };
@@ -20744,9 +20768,9 @@ fn resume_inlined_in_t0(
         });
     }
     let result = run_loop(&mut acts, env);
-    while !acts.is_empty() {
+    while let Some(mut act) = acts.pop() {
+        release_activation_handlers(&mut act, stack, env);
         stack.pop_frame();
-        acts.pop();
     }
     result
 }
@@ -22526,7 +22550,6 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
     let sym = input.sym;
     let bf = input.body.as_ref();
-    let env_names = NativeEnvNames::new(bf);
     // The shared native invoke path (run_native) calls bind_variadic BEFORE the
     // compiled body, filling every frame *slot* param — &optional/&rest/&key
     // included — so T2's entry (build.rs::seed_entry, now seeding 0..slot-params)
@@ -22609,10 +22632,14 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                 inline_options.with_call_site_profile(saved.symbol, bcp, calls, saved.invocations);
         }
     }
-    let mut f = match egcl_compiler::t2::build::build_from_bytecode_with_inline_options(
-        bf,
-        inline_options,
-    ) {
+    let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. }))
+    {
+        egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
+    } else {
+        egcl_compiler::t2::build::build_from_bytecode_with_inline_options(bf, inline_options)
+    };
+    let mut f = match built {
         Ok(f) => f,
         Err(e) => {
             t2_log!("{name}: build_from_bytecode failed: {e:?} => stay T1");
@@ -22660,6 +22687,115 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mapped = native_transfer_entry::prepare_ordinary_t2(input, &f);
 
+    // Linux publishes only mapped code. Do not make a usable mapped worker
+    // artifact depend on an emitter for a calling convention we cannot install.
+    let (checked, mut heap_constant_slots) = if checked_native_installation_allowed() {
+        let (code, slots) = compile_checked_t2_artifact(input, &f, &name)?;
+        (Some(code), slots)
+    } else {
+        (None, Vec::new())
+    };
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let has_mapped = mapped.is_some();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let has_mapped = false;
+    if !has_mapped && checked.is_none() {
+        return None;
+    }
+    let mut rooted_bodies = Vec::new();
+    // Prepared IR can retain constant-slot addresses independently of the
+    // checked fallback emitter. Keep its immutable worker source alive too.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if mapped.is_some() {
+        rooted_bodies.push(Arc::clone(&input.body));
+    }
+    if bf.code.iter().any(|instruction| matches!(instruction,
+        Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
+        // Retain the source snapshot for lexical deoptimization metadata,
+        // including when there are no heap constants.
+        rooted_bodies.push(std::sync::Arc::clone(&input.body));
+    }
+    // The mapped emitter has not run yet, so derive constant-slot ownership
+    // from its optimized IR, independently of checked emission. Include the
+    // checked emitter's reported slots as well when it is the selected ABI.
+    if has_mapped {
+        for &block in f.block_order() {
+            for &instruction in &f.block(block).insts {
+                if let egcl_compiler::t2::ir::AuxData::HeapLiteral { slot } =
+                    &f.inst(instruction).aux
+                {
+                    heap_constant_slots.push(*slot);
+                }
+            }
+        }
+    }
+    for slot in heap_constant_slots {
+        let owner = std::iter::once(&input.body)
+            .chain(input.inline_bodies.iter().map(|saved| &saved.body))
+            .find(|body| bytecode_body_owns_constant_slot(body, slot));
+        let Some(owner) = owner else {
+            t2_log!("{name}: emitted heap constant has no rooted owner => stay T1");
+            return None;
+        };
+        if !rooted_bodies
+            .iter()
+            .any(|body| std::sync::Arc::ptr_eq(body, owner))
+        {
+            rooted_bodies.push(std::sync::Arc::clone(owner));
+        }
+    }
+    let mut deopt_bodies = HashMap::new();
+    if has_mapped || checked.as_ref().is_some_and(|code| code.has_deopt) {
+        for (_, state) in f.frame_states.iter() {
+            for scope in &state.scopes {
+                if deopt_bodies.contains_key(&scope.function) {
+                    continue;
+                }
+                let owner = if scope.function == sym {
+                    &input.body
+                } else {
+                    let Some(saved) = input
+                        .inline_bodies
+                        .iter()
+                        .find(|saved| saved.symbol == scope.function)
+                    else {
+                        t2_log!("{name}: deopt scope has no source snapshot => stay T1");
+                        return None;
+                    };
+                    &saved.body
+                };
+                if !rooted_bodies.iter().any(|body| Arc::ptr_eq(body, owner)) {
+                    rooted_bodies.push(Arc::clone(owner));
+                }
+                deopt_bodies.insert(scope.function, Arc::clone(owner));
+            }
+        }
+    }
+    Some(T2Artifact {
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        mapped,
+        checked,
+        speculations,
+        call_cells: input
+            .call_cells
+            .iter()
+            .map(|(_, cell)| Arc::clone(cell))
+            .collect(),
+        rooted_bodies,
+        deopt_bodies,
+        code_id: input.code_id,
+    })
+}
+
+#[cfg(not(egcl_no_t2))]
+fn compile_checked_t2_artifact(
+    input: &T2CompileInput,
+    f: &egcl_compiler::t2::ir::Function,
+    name: &str,
+) -> Option<(CheckedT2Artifact, Vec<usize>)> {
+    let sym = input.sym;
+    let bf = input.body.as_ref();
+    let env_names = NativeEnvNames::new(bf);
     let deopt_addr = c2i_deopt as extern "C" fn() as usize as u64;
     // These emitters resume the precise callee locally and return its result,
     // so a direct native caller need not re-enter run_native to deoptimize.
@@ -22688,7 +22824,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         })
         .collect();
     let framed = match egcl_compiler::t2::emit::emit_framed_with_direct_natives(
-        &f,
+        f,
         deopt_addr,
         deopt_t2_addr,
         call_addr,
@@ -22720,61 +22856,6 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
-    let mut rooted_bodies = Vec::new();
-    // Prepared IR can retain constant-slot addresses independently of the
-    // checked fallback emitter. Keep its immutable worker source alive too.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if mapped.is_some() {
-        rooted_bodies.push(Arc::clone(&input.body));
-    }
-    if bf.code.iter().any(|instruction| matches!(instruction,
-        Instr::LoadEnvVar(_) | Instr::StoreEnvVar(_))) {
-        // Retain the source snapshot for lexical deoptimization metadata,
-        // including when there are no heap constants.
-        rooted_bodies.push(std::sync::Arc::clone(&input.body));
-    }
-    for &slot in &framed.heap_constant_slots {
-        let owner = std::iter::once(&input.body)
-            .chain(input.inline_bodies.iter().map(|saved| &saved.body))
-            .find(|body| bytecode_body_owns_constant_slot(body, slot));
-        let Some(owner) = owner else {
-            t2_log!("{name}: emitted heap constant has no rooted owner => stay T1");
-            return None;
-        };
-        if !rooted_bodies
-            .iter()
-            .any(|body| std::sync::Arc::ptr_eq(body, owner))
-        {
-            rooted_bodies.push(std::sync::Arc::clone(owner));
-        }
-    }
-    let mut deopt_bodies = HashMap::new();
-    if framed.has_deopt {
-        for (_, state) in f.frame_states.iter() {
-            for scope in &state.scopes {
-                if deopt_bodies.contains_key(&scope.function) {
-                    continue;
-                }
-                let owner = if scope.function == sym {
-                    &input.body
-                } else {
-                    let Some(saved) = input
-                        .inline_bodies
-                        .iter()
-                        .find(|saved| saved.symbol == scope.function)
-                    else {
-                        t2_log!("{name}: deopt scope has no source snapshot => stay T1");
-                        return None;
-                    };
-                    &saved.body
-                };
-                if !rooted_bodies.iter().any(|body| Arc::ptr_eq(body, owner)) {
-                    rooted_bodies.push(Arc::clone(owner));
-                }
-                deopt_bodies.insert(scope.function, Arc::clone(owner));
-            }
-        }
-    }
     let code = framed.code;
     t2_log!(
         "{name}: T2 INSTALLED — {} bytes, compiled_entry=+{}, spill_slots={} (regalloc2={}), edits={}, gc_shadow_slots={}, safepoints={}, osr_entries={}",
@@ -22791,31 +22872,23 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         framed.osr_entries.len(),
     );
 
-    Some(T2Artifact {
-        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        mapped,
-        env_names,
-        speculations,
-        call_cells: input
-            .call_cells
-            .iter()
-            .map(|(_, cell)| Arc::clone(cell))
-            .collect(),
-        code,
-        #[cfg(all(target_arch = "x86_64", windows))]
-        windows_unwind: framed.windows_unwind,
-        compiled_entry: framed.compiled_entry,
-        osr_entries: framed.osr_entries,
-        bcp_offsets: framed.bcp_offsets,
-        shadow_root_slots: framed.shadow_root_slots,
-        emitted_safepoints: framed.emitted_safepoints,
-        root_sync_sites: framed.root_sync_sites,
-        native_calls: framed.native_calls,
-        has_deopt: framed.has_deopt,
-        rooted_bodies,
-        deopt_bodies,
-        code_id: input.code_id,
-    })
+    Some((
+        CheckedT2Artifact {
+            env_names,
+            code,
+            #[cfg(all(target_arch = "x86_64", windows))]
+            windows_unwind: framed.windows_unwind,
+            compiled_entry: framed.compiled_entry,
+            osr_entries: framed.osr_entries,
+            bcp_offsets: framed.bcp_offsets,
+            shadow_root_slots: framed.shadow_root_slots,
+            emitted_safepoints: framed.emitted_safepoints,
+            root_sync_sites: framed.root_sync_sites,
+            native_calls: framed.native_calls,
+            has_deopt: framed.has_deopt,
+        },
+        framed.heap_constant_slots,
+    ))
 }
 
 /// Numeric assumptions belong to an installed version. A sibling closure can
@@ -24973,12 +25046,8 @@ mod jtc4_stack_map_tests {
 
     #[test]
     fn t2_install_rejects_missing_or_stale_native_root_sync_metadata() {
-        let valid = T2Artifact {
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            mapped: None,
+        let valid = CheckedT2Artifact {
             env_names: Box::default(),
-            speculations: vec![],
-            call_cells: Vec::new(),
             code: vec![0x90; 8],
             #[cfg(all(target_arch = "x86_64", windows))]
             windows_unwind: vec![],
@@ -24995,9 +25064,6 @@ mod jtc4_stack_map_tests {
                 spill_roots: 1,
             }],
             has_deopt: false,
-            rooted_bodies: vec![],
-            deopt_bodies: HashMap::new(),
-            code_id: 0,
         };
         assert_eq!(validate_t2_root_sync(3, &valid), Some(5));
 

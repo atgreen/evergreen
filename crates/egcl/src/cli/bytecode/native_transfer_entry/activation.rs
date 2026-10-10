@@ -147,8 +147,13 @@ impl ActivationState {
     }
 
     pub(super) fn is_quiescent(&self) -> bool {
+        self.catches.is_empty() && self.can_osr()
+    }
+
+    /// CATCH registrations can move unchanged to the next machine version.
+    /// Other dynamic scopes and selected payloads still block this handoff.
+    pub(super) fn can_osr(&self) -> bool {
         self.cleanups.is_empty()
-            && self.catches.is_empty()
             && self.handlers.is_empty()
             && self.handler_binds.is_empty()
             && self.restart_cases.is_empty()
@@ -189,6 +194,7 @@ impl ActivationState {
             frame,
             body: code.body.as_ref(),
             catches: &mut self.catches,
+            catch_base: self.catch_base,
             completed_cleanup: None,
             landing_stub: code.landing.as_ptr(),
             landing: SysvNativeLanding {

@@ -104,6 +104,88 @@ fn note_segment_deopt(code: &TransferCode) {
     }
 }
 
+/// Rebuild one retained activation's local handler order without creating new
+/// registrations. Catch tags remain rooted in Env throughout this handoff.
+unsafe fn take_guard_resume_handlers(
+    context: *mut CaptureContext,
+    code: &TransferCode,
+    scopes: &[InlinedResumeScope],
+    env: &Env,
+) -> Result<Vec<Handler>, EgclError> {
+    let [scope] = scopes else {
+        return Err(invalid_capture());
+    };
+    if !Arc::ptr_eq(&scope.body, &code.body) {
+        return Err(invalid_capture());
+    }
+    // Only catches have a token-preserving handoff here. In particular, a
+    // prepared target or running cleanup cannot be replaced by lexical state.
+    let context = unsafe { &*context };
+    if unsafe {
+        !(*context.cleanups).is_empty()
+            || !(*context.handlers).is_empty()
+            || !(*context.handler_binds).is_empty()
+            || !(*context.restart_cases).is_empty()
+            || !(*context.dynamic_scopes).is_empty()
+            || (*context.prepared_handler).is_some()
+            || (*context.prepared_catch).is_some()
+    } {
+        return Err(invalid_capture());
+    }
+    let scope_map = egcl_compiler::control_scope::ScopeMap::analyze_function(&code.body)
+        .map_err(|_| invalid_capture())?;
+    let active = scope_map.before(scope.bcp).ok_or_else(invalid_capture)?;
+    if active.iter().any(|scope| {
+        scope.ownership != Ownership::Local
+            || !matches!(scope.kind,
+                ScopeKind::Block { register: false, .. }
+                    | ScopeKind::Tagbody { .. }
+                    | ScopeKind::Catch { .. })
+    }) {
+        return Err(invalid_capture());
+    }
+    let catches = unsafe { &mut *context.catches };
+    let expected_catches = active.iter().filter_map(|scope| {
+        matches!(scope.kind, ScopeKind::Catch { .. }).then_some(scope.push_bcp)
+    });
+    let tail = env.catch_stack.get(context.catch_base..).ok_or_else(invalid_capture)?;
+    if !expected_catches.eq(catches.iter().map(|saved| saved.push_bcp))
+        || tail.len() != catches.len()
+        || !tail.iter().zip(catches.iter()).all(|((_, token), saved)| *token == saved.token)
+    {
+        return Err(invalid_capture());
+    }
+    // Complete every fallible step before taking the native ledger. The
+    // remaining moves neither allocate Lisp objects nor change Env's tags.
+    let mut handlers = Vec::new();
+    handlers.try_reserve(active.len()).map_err(|_| EgclError::Oom)?;
+    let mut saved_catches = catches.drain(..);
+    for scope in active {
+        let handler = match scope.kind {
+            ScopeKind::Block { id, resume_bcp, register: false } => Handler::Block {
+                block_id: id,
+                token: String::new(),
+                resume_bcp,
+                sp_restore: scope.sp_restore,
+            },
+            ScopeKind::Tagbody { id } => Handler::Tag {
+                tagbody_id: id,
+                sp_restore: scope.sp_restore,
+                token: None,
+                tag_bcps: Vec::new(),
+            },
+            ScopeKind::Catch { resume_bcp } => Handler::Catch {
+                token: saved_catches.next().expect("validated catch order").token,
+                resume_bcp,
+                sp_restore: scope.sp_restore,
+            },
+            _ => unreachable!("validated local guard scopes"),
+        };
+        handlers.push(handler);
+    }
+    Ok(handlers)
+}
+
 pub(super) unsafe extern "C" fn resume_guard(
     request: *mut u8,
     out: *mut NativeOutcome,
@@ -169,7 +251,8 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         note_segment_deopt(code);
         // Every stream word is now in scanned slots. There is no mutable
         // CaptureContext reference or RefCell borrow across resumed Lisp.
-        resume_inlined_in_t0(scopes, metadata, None, unsafe { &mut *env })
+        let handlers = unsafe { take_guard_resume_handlers(context, code, &scopes, &*env) }?;
+        resume_inlined_in_t0_with_handlers(scopes, metadata, None, Some(handlers), unsafe { &mut *env })
     });
     // Fiber mounting establishes carrier compatibility before resumed Lisp or
     // Rust executes. Publish the value/transfer without another capability test.

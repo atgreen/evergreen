@@ -386,7 +386,7 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
             }
             if let Some((next, offset)) = unsafe { (*context).osr.take() } {
                 if NATIVE_ERROR.with(|slot| slot.is_some())
-                    || unsafe { (*context).selected.is_some() || !(*owner).state.is_quiescent() }
+                    || unsafe { (*context).selected.is_some() || !(*owner).state.can_osr() }
                 {
                     return Err(invalid_capture());
                 }
@@ -396,7 +396,6 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
                 // The parent stays published by the cold adapter. Transfer the
                 // child's managed frame exactly once; the new entry owns it
                 // even if preparation fails before machine execution begins.
-                let frame = unsafe { (*owner).frame.take() }.ok_or_else(invalid_capture)?;
                 if let Some(symbol) = next_code.installed_symbol {
                     OSR_ENTRY_COUNTS.with(|counts| {
                         let mut counts = counts.borrow_mut();
@@ -404,10 +403,16 @@ unsafe fn resume_nested_published(record: *mut MappedCallRecord) {
                         *count = count.saturating_add(1);
                     });
                 }
+                let resume = OsrResume {
+                    frame: unsafe { (*owner).frame.take() }.ok_or_else(invalid_capture)?,
+                    offset,
+                    catches: unsafe { std::mem::take(&mut (*owner).state.catches) },
+                    catch_base: unsafe { (*owner).state.catch_base },
+                };
                 return next_code.run_activation(
                     &[],
                     unsafe { &mut *NATIVE_ENV.with(Cell::get) },
-                    Some((frame, offset)),
+                    Some(resume),
                 );
             }
             let error = NATIVE_ERROR
