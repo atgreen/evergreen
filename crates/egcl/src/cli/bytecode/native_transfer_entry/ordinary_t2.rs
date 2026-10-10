@@ -23,7 +23,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         ));
         None
     };
-    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true, true) {
+    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true) {
         return decline("unsupported parameter or control-scope shape");
     }
     // Transfer capture currently reconstructs one logical frame. In particular,

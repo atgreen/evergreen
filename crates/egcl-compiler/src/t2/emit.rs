@@ -4291,7 +4291,9 @@ fn emit_framed_inner(
         scope.ownership == crate::control_scope::Ownership::Local
             && matches!(scope.kind, crate::control_scope::ScopeKind::Block { register: false, .. }
                 | crate::control_scope::ScopeKind::Tagbody { .. }
-                | crate::control_scope::ScopeKind::Catch { .. })
+                | crate::control_scope::ScopeKind::Catch { .. }
+                | crate::control_scope::ScopeKind::Unwind { .. }
+                | crate::control_scope::ScopeKind::Cleanup { .. })
     }));
     let resolve_poll = |point| {
         crate::t2::x64_frame::resolve_values_before(f, &machine, &layout, &const_tagged, point)

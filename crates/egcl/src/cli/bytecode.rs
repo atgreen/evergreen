@@ -75,6 +75,9 @@ pub(super) use native_transfer_tests::ordinary_t2::{ordinary_t2_root_for_test, o
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::ordinary_catch_osr::local_catch_osr_observe_for_test;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::ordinary_cleanup_osr::ordinary_cleanup_osr_observe_for_test;
+
 #[cfg(test)]
 mod native_env_tests;
 mod native_env;
@@ -20713,27 +20716,45 @@ fn resume_inlined_in_t0(
     outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    resume_inlined_in_t0_with_handlers(scopes, _metadata, outer_env_frame, None, env)
+    resume_inlined_in_t0_with_state(scopes, _metadata, outer_env_frame, None, env)
 }
 
-fn resume_inlined_in_t0_with_handlers(
+/// Exact execution-owned state handed from one native activation to T0.
+/// Handler tokens stay registered in Env; running cleanups retain their saved
+/// multiple values or private pending-transfer payload until T0 consumes them.
+struct OuterResumeState {
+    handlers: Vec<Handler>,
+    cleanup_conts: Vec<CleanupCont>,
+}
+
+impl egcl_rt::gc::TraceHostRoots for OuterResumeState {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for cleanup in &mut self.cleanup_conts {
+            egcl_rt::gc::TraceHostRoots::trace_host_roots(cleanup, visit);
+        }
+    }
+}
+
+fn resume_inlined_in_t0_with_state(
     scopes: Vec<InlinedResumeScope>,
     _metadata: Arc<T2InstalledMetadata>,
     outer_env_frame: Option<Arc<SharedCell<EnvFrame>>>,
-    mut outer_handlers: Option<Vec<Handler>>,
+    mut outer_state: Option<OuterResumeState>,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_outer_state_root = &mut outer_state);
     let stack = egcl_rt::current_stack();
     egcl_rt::rooted!(outer_env_frame = outer_env_frame.map(super::SuspendedFrameRoot));
     let mut acts = Vec::with_capacity(scopes.len());
     egcl_rt::rooted_ref!(_acts_root = &mut acts);
     for (index, scope) in scopes.into_iter().enumerate() {
         let entry = scope.body;
-        let handlers = if index == 0 {
-            outer_handlers.take().unwrap_or_else(|| rebuild_resume_handlers(&entry, scope.bcp, env))
-        } else {
-            rebuild_resume_handlers(&entry, scope.bcp, env)
-        };
+        let mut state = if index == 0 { outer_state.take() } else { None }
+            .unwrap_or_else(|| OuterResumeState {
+                handlers: rebuild_resume_handlers(&entry, scope.bcp, env),
+                cleanup_conts: Vec::new(),
+            });
+        egcl_rt::rooted_ref!(_state_root = &mut state);
         // A resumed child owns the callable in its original frame even when
         // pre-guard Lisp replaced the name. Loop heat must follow that object.
         let callable = unsafe { (*scope.frame).function };
@@ -20760,8 +20781,8 @@ fn resume_inlined_in_t0_with_handlers(
             func: entry,
             bcp: scope.bcp as usize,
             sp_top: scope.sp_top,
-            handlers,
-            cleanup_conts: Vec::new(),
+            handlers: std::mem::take(&mut state.handlers),
+            cleanup_conts: std::mem::take(&mut state.cleanup_conts),
             dyn_binds: Vec::new(),
             fn_obj,
             sym: scope.function,
@@ -22633,7 +22654,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         }
     }
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
-        && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. }))
+        && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else {
