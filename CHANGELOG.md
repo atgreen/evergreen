@@ -2,431 +2,176 @@
 
 ## Unreleased
 
-- Honor replaced class/structure readers and memory-fence functions in compiled
-  and saved code, including reader methods and replacement multiple values.
-  Saved bytecode now uses version 2.0 and core images use format 8; recompile
-  older FASLs and rebuild older images
-  ([#202](https://github.com/atgreen/evergreen/pull/202)).
-
-- Preserve the selected restart when a `CERROR` handler invokes an outer
-  restart also named `CONTINUE`. Restore special-variable bindings before
-  cleanup and destination clauses during nonlocal exits, including nested
-  cleanup transfers ([#201](https://github.com/atgreen/evergreen/pull/201)).
-
-- Preserve single-value returns from T2 speculated arithmetic, comparisons,
-  and bit operations after multiple-valued expressions, while retaining values
-  from replacement functions. Keep single-float comparisons eligible for T2
-  compilation ([#199](https://github.com/atgreen/evergreen/pull/199)).
-
-- Return the correct single value from T1 inlined primitives and T2 predicate
-  and cons-accessor expansions after multiple-valued expressions, while
-  preserving multiple values from replacement functions
-  ([#198](https://github.com/atgreen/evergreen/pull/198)).
-
-- Preserve replaced `LDB`, `BYTE`, and `TYPEP` functions in newly compiled calls,
-  including lexical `BYTE` definitions and multiple values from replacements.
-  Keep eligible constant `TYPEP` predicates native and preserve their single-value
-  results ([#197](https://github.com/atgreen/evergreen/pull/197)).
-
-- Preserve the installed definition of `UIOP/UTILITY:FIRST-CHAR` in optimized
-  calls, including redefinition, multiple return values, and nonlocal exits
-  ([#196](https://github.com/atgreen/evergreen/pull/196)).
-
-- Honor interpreted replacements of builtins across evaluation tiers, including
-  lexical and global `VALUES` replacements, multiple return values, and cleanup
-  ([#195](https://github.com/atgreen/evergreen/pull/195)).
-
-- Preserve normal return values and cleanup when `ERROR` is replaced, including
-  during an active native call. Allow rooted heap literals in native transfer
-  entries and retain debugger argument visibility across those entries
-  ([#194](https://github.com/atgreen/evergreen/pull/194)).
-
-- Honor callable-instance replacements of named functions and builtins across
-  interpreted and native calls, including warmed optimized operations, while
-  preserving callable identity and multiple values
-  ([#193](https://github.com/atgreen/evergreen/pull/193)).
-
-- Keep a function's bytecode, native code, and captured definition together
-  during concurrent redefinition, including cached calls and tier promotion
-  ([#192](https://github.com/atgreen/evergreen/pull/192)).
-
-- Reduce garbage-collection bookkeeping in opt-in native calls by tracing
-  stable native stack and register roots directly
-  ([#189](https://github.com/atgreen/evergreen/pull/189)).
-
-- Avoid unnecessary baseline fallbacks in opt-in native transfer code when a
-  register is reused for an immediate value
-  ([#187](https://github.com/atgreen/evergreen/pull/187)).
-
-- Restore T2 leaf inlining and inlined-frame deoptimization for retained
-  function bodies, while preserving implicit `RETURN-FROM` semantics
-  ([#175](https://github.com/atgreen/evergreen/pull/175)).
-
-- Preserve saved compiled functions and their lexical captures across `DEFUN`,
-  FASL reload, unbinding, and saved-image restoration. Saved images now use
-  format 7; rebuild images created by earlier versions
-  ([#174](https://github.com/atgreen/evergreen/pull/174)).
-
-- Keep eligible `APPLY` targets inside opt-in native transfer segments, with
-  expanded arguments rooted through moving GC and released before the caller
-  continues on normal return or transfer
-  ([#172](https://github.com/atgreen/evergreen/pull/172)).
-
-- Keep eligible `FUNCALL` targets inside opt-in native transfer segments,
-  preserving multiple values, cleanup and moving arguments. Publish callable
-  dispatchers that repair saved-image metadata and preserve exact function,
-  closure and funcallable-instance identity
-  ([#171](https://github.com/atgreen/evergreen/pull/171)).
-
-- Recover failed speculative guards in opt-in native child calls without losing
-  the caller, replaying effects, or attributing old code's feedback to a replacement.
-  Preserve live restarts, multiple values, and moving roots across fiber suspension
-  ([#168](https://github.com/atgreen/evergreen/pull/168)).
-
-- Install eligible protected functions in opt-in native transfer segments,
-  preserving cleanup, restarts, multiple values, and tiering when child calls
-  return through native code or bytecode recovery
-  ([#166](https://github.com/atgreen/evergreen/pull/166)).
-
-- Keep eligible calls between distinct T2 definitions inside opt-in native
-  transfer segments, preserving multiple values, moving GC roots, caller
-  handlers, and active function replacement
-  ([#165](https://github.com/atgreen/evergreen/pull/165)).
-
-- Route opt-in native segment calls through live linkage cells, preserving
-  warmed dispatch, function replacement, multiple values, and native cleanup
-  across legacy calls and Rust reentry
-  ([#164](https://github.com/atgreen/evergreen/pull/164)).
-
-- Prevent a replacement function from inheriting an earlier definition's native
-  segment compilation rejection when its memory address is reused
-  ([#162](https://github.com/atgreen/evergreen/pull/162)).
-
-- Keep native segment code and deoptimization feedback with each Lisp execution
-  across fiber migration, and release their retained roots when it stops
-  ([#160](https://github.com/atgreen/evergreen/pull/160)).
-
-- Validate suspended native continuations before a fiber resumes on another
-  worker, preserving live frames and GC roots when that worker is incompatible.
-  Preserve all values returned by ordinary and interactive restart invocation
-  ([#159](https://github.com/atgreen/evergreen/pull/159)).
-
-- Compile fixnum arithmetic inside opt-in native exceptional-transfer segments,
-  with precise guard fallback that preserves earlier effects, recursive callers,
-  multiple values, and the original function definition
-  ([#158](https://github.com/atgreen/evergreen/pull/158)).
-
-- Keep eligible recursive calls inside opt-in native exceptional-transfer
-  segments, with precise GC roots, bounded stack fallback, and function
-  redefinition checks
-  ([#157](https://github.com/atgreen/evergreen/pull/157)).
-
-- Show cached native exceptional-transfer code separately from installed
-  legacy code in `DISASSEMBLE`, including native helper veneer annotations
-  ([#156](https://github.com/atgreen/evergreen/pull/156)).
-
-- Speed up missed lookups in large hash tables with a compact membership
-  filter, preserving mutation, GC, and image-restoration behavior. This reduces
-  full Prechelt phone-encoding time by about 5% in the measured x86-64 workload
-  ([#155](https://github.com/atgreen/evergreen/pull/155)).
-
-- Fix `EQUALP` hash-table lookup, replacement, and removal across integer zero
-  and positive or negative single-float zero
-  ([#154](https://github.com/atgreen/evergreen/pull/154)).
-
-- Reduce name-resolution and allocation overhead when native closures access
-  captured variables, preserving shadowing, redefinition, and image restoration.
-  This reduces full Prechelt phone-encoding time by about 2% in the measured
-  x86-64 workload
-  ([#153](https://github.com/atgreen/evergreen/pull/153)).
-
-- Reduce native builtin-call return overhead by returning successful values
-  without copying error payloads, while preserving error and panic recovery.
-  This reduces full Prechelt phone-encoding time by about 4% in the measured
-  x86-64 workload
-  ([#152](https://github.com/atgreen/evergreen/pull/152)).
-
-- Read simple-string characters and lengths directly from their fixed-width
-  storage, avoiding registry lookups and temporary string copies on these
-  paths, including registered strings. This reduces full Prechelt
-  phone-encoding time by about 15% in the measured x86-64 workload
-  ([#151](https://github.com/atgreen/evergreen/pull/151)).
-
-- Reduce runtime setup for cached native builtin calls, preserving multiple
-  values, function replacement, and error handling. This reduces full Prechelt
-  phone-encoding time by about 6% in the measured x86-64 workload. Prevent
-  unused native argument registers from being scanned as GC roots
-  ([#150](https://github.com/atgreen/evergreen/pull/150)).
-
-- Retain multiple native `FUNCALL` targets on x86-64 so nested callbacks avoid
-  repeatedly resolving each other. Cached identities remain weak and are
-  invalidated together after GC or native code replacement. This reduces full
-  Prechelt phone-encoding time by about 30% in the measured x86-64 workload
-  ([#149](https://github.com/atgreen/evergreen/pull/149)).
-
-- Use native entries for eligible x86-64 T2 `FUNCALL` callbacks, including
-  captured closures, and reuse adapters when callback bodies alternate.
-  Preserve captured bindings and multiple values across GC and deoptimization.
-  This reduces full Prechelt phone-encoding time by about 8% in the measured
-  x86-64 workload ([#148](https://github.com/atgreen/evergreen/pull/148)).
-
-- Preserve the original behavior of saved source-backed function objects after
-  a new `DEFUN`. Saved FASL functions also remain callable when their function
-  cell is aliased to another function
-  ([#148](https://github.com/atgreen/evergreen/pull/148)).
-
-- Compile captured lexical reads and writes at x86-64 T2, preserving shared
-  bindings and captured state during deoptimization. Nested closures share
-  bytecode templates and native compilations while retaining independent
-  captures. Numeric phase changes recover even when sibling closures have
-  updated the shared feedback, and deoptimization preserves the calling
-  instance across code replacement. This reduces full Prechelt phone-encoding
-  time by about 12% in the measured x86-64 workload
-  ([#147](https://github.com/atgreen/evergreen/pull/147)).
-
-- Compile supported nested callbacks in eagerly compiled x86-64 and s390x
-  functions while preserving captured lexical state. This reduces full
-  Prechelt phone-encoding time by about 9% in the measured x86-64 workload
-  ([#146](https://github.com/atgreen/evergreen/pull/146)).
-
-- Cache compiled GETHASH call targets while preserving both return values and
-  function replacement. This reduces full Prechelt phone-encoding time by
-  about 15% in the measured workload
-  ([#145](https://github.com/atgreen/evergreen/pull/145)).
-
-- Keep hot arithmetic functions native when their operands change from fixnums
-  or single floats to bignums. Mixed integer loops now recover to generic T2
-  code without repeatedly deoptimizing, reducing full Prechelt phone-encoding
-  time by about 33% in the measured workload
-  ([#144](https://github.com/atgreen/evergreen/pull/144)).
-
-- Reduce x86-64 T2 named-call overhead and speed up runtime-state access for
-  native threads and fibers, while preserving function redefinition and GC
-  safety. Native callees recover from fixnum/single-float phase changes instead
-  of being incorrectly left in the interpreter
-  ([#142](https://github.com/atgreen/evergreen/pull/142)).
-
-- Foreign callbacks now work on s390x: `egcl-ffi` can hand a Lisp function to
-  C as a function pointer (a `qsort` comparator, an event handler), with
-  arguments and results following the ELF ABI and errors contained at the C
-  boundary exactly as on x86-64
-  ([#141](https://github.com/atgreen/evergreen/pull/141)).
-
-- Foreign calls on s390x now go through a generated System z ABI adapter:
-  floating-point arguments and results, narrow integers, more than five
-  integer or four floating-point arguments, and variadic tails all follow the
-  ELF ABI. Previously `(sqrt 16d0)` through the FFI answered 16.0 and `pow`
-  returned a denormal, with no error
-  ([#133](https://github.com/atgreen/evergreen/pull/133)).
-
-- T2 keeps nullable numeric paths native: testing an argument for NIL or
-  another sentinel no longer triggers a premature numeric guard and repeated
-  fallback to the interpreter. This also keeps the phone-encoding benchmark's
-  filtering helper at T2
-  ([#135](https://github.com/atgreen/evergreen/pull/135)).
-
-- Memory barriers return NIL correctly from x86-64 T2 code when their results
-  spill to the stack, preventing corrupted values and crashes while printing
-  a returned list ([#132](https://github.com/atgreen/evergreen/pull/132)).
-
-- T2 deoptimization now preserves pending operands after recursive calls and
-  retains frame reconstruction metadata when a guard exists only at an x86-64
-  OSR entry. RISC-V declines checked OSR entries it cannot validate, keeping
-  those loops on their existing tier
-  ([#131](https://github.com/atgreen/evergreen/pull/131)).
-
-- On s390x, eligible self-recursive functions now call their T2 native entry
-  directly, reducing recursive-call overhead while retaining stack-limit
-  checks ([#77](https://github.com/atgreen/evergreen/pull/77)).
-
-- T2 now propagates fixnum guards through tail-call loop parameters and
-  recursive results, allowing functions such as `TAK` to use direct native
-  self-calls on s390x ([#80](https://github.com/atgreen/evergreen/pull/80)).
-
-- On s390x, native code now calls eligible leaf builtins through cached
-  builtin slots instead of resolving each call by name, while retaining
-  redefinition checks ([#88](https://github.com/atgreen/evergreen/pull/88)).
-
-- GETF now signals TYPE-ERROR for improper property lists with a non-NIL
-  atomic tail instead of returning the default value
-  ([#89](https://github.com/atgreen/evergreen/pull/89)).
-
-- On s390x, T2 now compiles additional type predicates and names unsupported
-  opcodes in compilation diagnostics
-  ([#91](https://github.com/atgreen/evergreen/pull/91)).
-
-- riscv64 now has a T1 baseline native compiler with guarded fixnum
-  arithmetic, comparisons, live on-stack replacement, and deoptimization, so
-  hot functions run as RV64 machine code instead of bytecode.
-  ([#93](https://github.com/atgreen/evergreen/pull/93)).
-
-- On s390x, T1 native code now calls other native functions directly, pushing
-  the callee frame inline instead of dispatching through the generic adapter.
-  With T2 disabled on a z17: takl 196 to 149 ms, deriv 234 to 201, div2 460
-  to 290 ([#94](https://github.com/atgreen/evergreen/pull/94)).
-
-- Single-float arithmetic on ppc64le now returns correct values once a
-  function reaches the optimizing native tier; `(+ 1.5 2.25)` previously
-  returned `2.2578125` there while the interpreter and baseline tier were
-  right ([#95](https://github.com/atgreen/evergreen/pull/95)).
-
-- Fixnum `+`, `-`, `1+`, `1-`, unary `-` and the numeric comparisons
-  now compile inline with type and overflow guards in ppc64le baseline native
-  code instead of calling the runtime for every operation, taking a counted
-  loop from about 4,800 to 1,500 instructions per iteration at T1
-  ([#96](https://github.com/atgreen/evergreen/pull/96)).
-
-- On s390x, T2 native code calls other native functions directly as well,
-  with the callees resolved when the compile is queued. With T2 on, on a z17:
-  takl 119 to 106 ms, deriv 217 to 189, div2 375 to 330
-  ([#97](https://github.com/atgreen/evergreen/pull/97)).
-
-- Functions containing loops now reach T2 native code on ppc64le instead of
-  stopping at T1: the back-edge safepoint poll had no GC root set, which made
-  the optimizing tier decline every loop
-  ([#98](https://github.com/atgreen/evergreen/pull/98)).
-
-- On s390x, T2 now compiles uncommon traps and the simple-string fast paths
-  (`STRINGP`, `LENGTH`, ASCII `CHAR`), so shapes such as UIOP's `FIRST-CHAR`
-  and `REDUCE :FROM-END` reach T2 as on x86-64; the T2 log names the source
-  line of every s390x structural decline
-  ([#99](https://github.com/atgreen/evergreen/pull/99)).
-
-- T2 no longer emits a runtime call for every `SETQ` in a loop. Multiple-value
-  resets that cannot be observed before the next reset are removed, so a
-  call-free loop of assignments runs as straight-line native code; a ten-SETQ
-  loop went from 1.35 s to 0.02 s for two million iterations
-  ([#100](https://github.com/atgreen/evergreen/pull/100)).
-
-- s390x T2 compilation diagnostics now report the actual register entry offset
-  used by direct recursive calls
-  ([#101](https://github.com/atgreen/evergreen/pull/101)).
-
-- The default CL stack is 4 MiB on s390x (512 KiB elsewhere), so recursion
-  that computes on x86-64 computes there too: `(deep 50000)` no longer signals
-  `STORAGE-CONDITION` ([#102](https://github.com/atgreen/evergreen/pull/102)).
-
-- T2 deopt frame states name only the locals the interpreter can still read.
-  A `LET*` chain inside a loop no longer keeps every binding alive to the end
-  of the function, so its arithmetic stays in registers and the loop
-  back-edge carries only the loop variables
-  ([#103](https://github.com/atgreen/evergreen/pull/103)).
-
-- ppc64le baseline native code no longer brackets every runtime helper call
-  with the SIGSEGV-recovery toggle, which cannot resume on that target yet,
-  and resets multiple-values state with a bare leaf call; a counted loop
-  drops from about 1,500 to 1,000 instructions per iteration at T1
-  ([#104](https://github.com/atgreen/evergreen/pull/104)).
-
-- Functions using `CAR`, `CDR`, `EQ`, `NULL`, `NOT`, the logical bit
-  operations or `ASH` by a constant now reach T2 native code on ppc64le
-  instead of stopping at T1
-  ([#105](https://github.com/atgreen/evergreen/pull/105)).
-
-- T2 checks a loop-carried fixnum once on loop entry (and once when a loop
-  is entered through OSR) instead of re-testing its tag on every iteration
-  ([#106](https://github.com/atgreen/evergreen/pull/106)).
-
-- On s390x, a T2 deoptimization now resumes the interpreter in place, so a
-  guard failing deep inside a directly recursive call returns the right value:
-  `(pow2 70)` answers 2^70 instead of signalling TYPE-ERROR. A self-call with
-  the wrong number of arguments now signals PROGRAM-ERROR at T2 on every
-  target instead of binding whatever the argument registers held
-  ([#107](https://github.com/atgreen/evergreen/pull/107)).
-
-- On s390x, native code now calls T2 functions that may deoptimize directly
-  instead of through the generic adapter, since such a callee resumes the
-  interpreter in place and returns a finished value: div2 327 to 239 ms on a
-  z17 ([#108](https://github.com/atgreen/evergreen/pull/108)).
-
-- The sampled back-edge poll in ppc64le baseline native loops now fires at
-  the configured threshold instead of after about four billion iterations, so
-  a hot loop in a warm function requests T2 compilation and responds to
-  signals and GC safepoints ([#110](https://github.com/atgreen/evergreen/pull/110)).
-
-- On s390x, a self-recursive T2 function keeps its direct self-call entry
-  when its body also calls other functions, as long as no heap value is live
-  across a call; such functions no longer pay the generic adapter on every
-  recursive call ([#111](https://github.com/atgreen/evergreen/pull/111)).
-
-- riscv64 now has a T2 optimizing compiler with the s390x opcode coverage:
-  guarded fixnum and single-float arithmetic, `EQ`, `CAR`/`CDR`, bitwise
-  operations and constant shifts, GC-safe runtime calls, polled loops, live
-  T1-to-T2 OSR and precise deoptimization
-  ([#112](https://github.com/atgreen/evergreen/pull/112)).
-
-- s390x T2 code uses shorter native instruction sequences for small constants
-  and fixnum tag checks
-  ([#113](https://github.com/atgreen/evergreen/pull/113)).
-
-- A hot loop in a warm function on ppc64le now hands off from baseline
-  native code into its compiled T2 loop mid-flight instead of finishing at
-  the baseline tier; measured at 78 instead of 978 instructions per
-  iteration ([#114](https://github.com/atgreen/evergreen/pull/114)).
-
-- s390x T2 functions now save and restore only the callee-saved registers they
-  use, reducing native call overhead
-  ([#115](https://github.com/atgreen/evergreen/pull/115)).
-
-- On s390x, `EGCL-EXT:MEMORY-BARRIER`, `LOAD-BARRIER` and `STORE-BARRIER` now
-  compile to a native serialization instruction at every tier instead of a
-  generic call, and functions using them persist to bfasl as on x86-64
-  ([#118](https://github.com/atgreen/evergreen/pull/118)).
-
-- s390x foreign calls now accept variadic calls supported by the existing
-  fixed-arity integer dispatcher
-  ([#119](https://github.com/atgreen/evergreen/pull/119)).
-
-- Fibers on riscv64 now switch stacks natively instead of running on the
-  scheduler's no-context-switch fallback, so cooperative scheduling, parking,
-  and carrier migration behave as on the other Linux ports
-  ([#120](https://github.com/atgreen/evergreen/pull/120)).
-
-- Foreign calls on riscv64 now use the LP64D calling convention for every
-  scalar signature, including floats, doubles, mixed argument lists and
-  variadic functions, instead of the bootstrap dispatcher's fixed integer
-  shapes ([#121](https://github.com/atgreen/evergreen/pull/121)).
-
-- An inline s390x deoptimization now resumes on its owned Lisp frame when
-  available, preserving original arguments without duplicating the function in
-  backtraces ([#122](https://github.com/atgreen/evergreen/pull/122)).
-
-- Recoverable null-pointer and stack-guard faults on riscv64 now resume at
-  the runtime recovery handler instead of terminating the process
-  ([#123](https://github.com/atgreen/evergreen/pull/123)).
-
-- On s390x, functions that create closures (any LAMBDA in the body) now
-  compile at T1 instead of staying interpreted, including loops that create a
-  closure per iteration and factories whose parameters are captured
-  ([#126](https://github.com/atgreen/evergreen/pull/126)).
-
-- On s390x, T1 code now multiplies fixnums inline with a full-width overflow
-  check instead of calling the numeric runtime for every `*`, deoptimizing to
-  the interpreter for a bignum product or a non-fixnum operand
-  ([#127](https://github.com/atgreen/evergreen/pull/127)).
-
-- RISC-V now supports the opt-in native segment boundary, preserving callee-
-  saved integer and floating-point registers across native returns and
-  transfer exits ([#128](https://github.com/atgreen/evergreen/pull/128)).
-
-- Add an EGCL Quicklisp client port for x86-64 Linux, with native TCP and
-  filesystem adapters, pinned setup instructions, and verified fresh
-  distribution installation, dependent-system loading, and offline reload
-  ([#92](https://github.com/atgreen/evergreen/pull/92)).
-
-- Initialize `*MACROEXPAND-HOOK*` and honor custom hooks during macroexpansion
-  and compilation, including symbol macros. This enables Quicklisp's
-  compilation-progress wrapper when loading downloaded systems
-  ([#90](https://github.com/atgreen/evergreen/pull/90)).
-
-- `PROBE-FILE` now accepts file streams, including closed streams, allowing
-  Quicklisp to finish writing its local-project index
-  ([#87](https://github.com/atgreen/evergreen/pull/87)).
-
-- Fix `DIRECTORY` traversal of wildcard directory components, allowing
-  Quicklisp to discover installed distributions. Single `*` components match
-  exactly one level; `**` still searches recursively without duplicate scans
-  ([#86](https://github.com/atgreen/evergreen/pull/86)).
+### Compatibility
+
+- Saved bytecode now uses version 2.0 and core images use format 8. Recompile
+  older FASLs and rebuild older images. Saved functions retain their definitions
+  and lexical captures across redefinition, aliases, unbinding and restoration
+  ([#174](https://github.com/atgreen/evergreen/pull/174),
+  [#202](https://github.com/atgreen/evergreen/pull/202)).
+
+### Calling and control-flow correctness
+
+- Keep each function's selected definition, captures and compiled code together
+  across concurrent redefinition and tier promotion, including callable-instance
+  replacements and saved source-backed functions
+  ([#148](https://github.com/atgreen/evergreen/pull/148),
+  [#192](https://github.com/atgreen/evergreen/pull/192),
+  [#193](https://github.com/atgreen/evergreen/pull/193)).
+- Honor replacement builtins, readers and memory fences in interpreted, compiled
+  and saved code, including lexical `VALUES` and `BYTE`, `LDB`, `TYPEP`,
+  `FIRST-CHAR` and returning `ERROR` replacements. Preserve replacement functions'
+  multiple values and nonlocal exits
+  ([#194](https://github.com/atgreen/evergreen/pull/194),
+  [#195](https://github.com/atgreen/evergreen/pull/195),
+  [#196](https://github.com/atgreen/evergreen/pull/196),
+  [#197](https://github.com/atgreen/evergreen/pull/197),
+  [#202](https://github.com/atgreen/evergreen/pull/202)).
+- Prevent stale secondary values from leaking through optimized primitives,
+  predicates, accessors and numeric operations. Preserve single-float T2
+  comparisons and correct spilled memory-barrier results
+  ([#132](https://github.com/atgreen/evergreen/pull/132),
+  [#198](https://github.com/atgreen/evergreen/pull/198),
+  [#199](https://github.com/atgreen/evergreen/pull/199)).
+- Preserve the exact restart selected by `CERROR`, even when an outer restart
+  is also named `CONTINUE`; restore special bindings before cleanup and
+  destination clauses, including transfers that replace an earlier unwind
+  ([#201](https://github.com/atgreen/evergreen/pull/201)).
+- Fix `EQUALP` hash-table operations across integer and signed single-float zero,
+  and signal `TYPE-ERROR` for improper property lists passed to `GETF`
+  ([#89](https://github.com/atgreen/evergreen/pull/89),
+  [#154](https://github.com/atgreen/evergreen/pull/154)).
+
+### Native compilation and performance
+
+- Speed up named calls, builtin calls, `GETHASH`, nested `FUNCALL` callbacks,
+  captured-variable access, simple-string access and missed hash-table lookups.
+  Retain replacement checks, multiple values, GC safety and error recovery
+  ([#142](https://github.com/atgreen/evergreen/pull/142),
+  [#145](https://github.com/atgreen/evergreen/pull/145),
+  [#149](https://github.com/atgreen/evergreen/pull/149),
+  [#150](https://github.com/atgreen/evergreen/pull/150),
+  [#151](https://github.com/atgreen/evergreen/pull/151),
+  [#152](https://github.com/atgreen/evergreen/pull/152),
+  [#153](https://github.com/atgreen/evergreen/pull/153),
+  [#155](https://github.com/atgreen/evergreen/pull/155)).
+- Compile captured lexical reads and writes at x86-64 T2, share compilation
+  across closures with independent captures, and compile supported nested
+  callbacks on x86-64 and s390x. Restore retained-body leaf inlining while
+  preserving lexical `RETURN-FROM` and captured state during deoptimization
+  ([#146](https://github.com/atgreen/evergreen/pull/146),
+  [#147](https://github.com/atgreen/evergreen/pull/147),
+  [#148](https://github.com/atgreen/evergreen/pull/148),
+  [#175](https://github.com/atgreen/evergreen/pull/175)).
+- Keep nullable numeric paths native and recover to native code when operand
+  types change, including bignums. Remove redundant multiple-value resets and
+  repeated loop tag checks, and retain only live locals in deoptimization state.
+  Preserve pending recursive operands and
+  x86-64 OSR-entry recovery metadata; decline unsupported checked RISC-V OSR
+  entries safely ([#100](https://github.com/atgreen/evergreen/pull/100),
+  [#103](https://github.com/atgreen/evergreen/pull/103),
+  [#106](https://github.com/atgreen/evergreen/pull/106),
+  [#131](https://github.com/atgreen/evergreen/pull/131),
+  [#135](https://github.com/atgreen/evergreen/pull/135),
+  [#144](https://github.com/atgreen/evergreen/pull/144)).
+
+### Opt-in native exceptional transfers
+
+The new native transfer path remains opt-in; it is not yet the default ABI.
+
+- Keep eligible recursive calls, calls between T2 definitions, `FUNCALL`, `APPLY`
+  and protected functions in native segments. Preserve live linkage, callable
+  identity, cleanup, restarts, multiple values and moving arguments across
+  legacy calls, Rust reentry and fallback
+  ([#157](https://github.com/atgreen/evergreen/pull/157),
+  [#164](https://github.com/atgreen/evergreen/pull/164),
+  [#165](https://github.com/atgreen/evergreen/pull/165),
+  [#166](https://github.com/atgreen/evergreen/pull/166),
+  [#171](https://github.com/atgreen/evergreen/pull/171),
+  [#172](https://github.com/atgreen/evergreen/pull/172)).
+- Compile fixnum arithmetic and recover speculative guards without replaying
+  effects or losing callers. Reduce root bookkeeping and unnecessary fallback;
+  support rooted heap literals and debugger arguments. Keep rejection caches
+  and deoptimization feedback tied to the correct definition
+  ([#158](https://github.com/atgreen/evergreen/pull/158),
+  [#162](https://github.com/atgreen/evergreen/pull/162),
+  [#168](https://github.com/atgreen/evergreen/pull/168),
+  [#187](https://github.com/atgreen/evergreen/pull/187),
+  [#189](https://github.com/atgreen/evergreen/pull/189),
+  [#194](https://github.com/atgreen/evergreen/pull/194)).
+- Preserve continuations and roots across fiber suspension and migration,
+  validate destination-worker compatibility, and release retained execution
+  state when it stops. Preserve all ordinary and interactive restart return
+  values. `DISASSEMBLE` distinguishes cached transfer code from installed legacy
+  code ([#156](https://github.com/atgreen/evergreen/pull/156),
+  [#159](https://github.com/atgreen/evergreen/pull/159),
+  [#160](https://github.com/atgreen/evergreen/pull/160),
+  [#168](https://github.com/atgreen/evergreen/pull/168)).
+
+### Platform support
+
+- **s390x:** support ELF-ABI foreign calls and Lisp callbacks, including floating
+  point, narrow integers, large argument lists and supported variadic calls
+  ([#119](https://github.com/atgreen/evergreen/pull/119),
+  [#133](https://github.com/atgreen/evergreen/pull/133),
+  [#141](https://github.com/atgreen/evergreen/pull/141)).
+- **s390x:** reduce T1/T2 direct-call, recursive-call and builtin-call overhead;
+  improve fixnum guards, constants and register saving. Direct recursive
+  deoptimization preserves arguments and backtraces; wrong-arity T2 self-calls
+  signal `PROGRAM-ERROR` on every target
+  ([#77](https://github.com/atgreen/evergreen/pull/77),
+  [#80](https://github.com/atgreen/evergreen/pull/80),
+  [#88](https://github.com/atgreen/evergreen/pull/88),
+  [#94](https://github.com/atgreen/evergreen/pull/94),
+  [#97](https://github.com/atgreen/evergreen/pull/97),
+  [#107](https://github.com/atgreen/evergreen/pull/107),
+  [#108](https://github.com/atgreen/evergreen/pull/108),
+  [#111](https://github.com/atgreen/evergreen/pull/111),
+  [#113](https://github.com/atgreen/evergreen/pull/113),
+  [#115](https://github.com/atgreen/evergreen/pull/115),
+  [#122](https://github.com/atgreen/evergreen/pull/122)).
+- **s390x:** compile more predicates, simple-string operations, closure factories,
+  fixnum multiplication and memory barriers, including saved bytecode. Improve
+  compilation diagnostics and increase the default CL stack to 4 MiB
+  (512 KiB elsewhere)
+  ([#91](https://github.com/atgreen/evergreen/pull/91),
+  [#99](https://github.com/atgreen/evergreen/pull/99),
+  [#101](https://github.com/atgreen/evergreen/pull/101),
+  [#102](https://github.com/atgreen/evergreen/pull/102),
+  [#118](https://github.com/atgreen/evergreen/pull/118),
+  [#126](https://github.com/atgreen/evergreen/pull/126),
+  [#127](https://github.com/atgreen/evergreen/pull/127)).
+- **ppc64le:** correct T2 single-float arithmetic; inline more baseline numeric
+  operations and optimize helper calls. Enable T2 loops, more predicates and
+  bit operations, timely loop polling, and live T1-to-T2 loop replacement
+  ([#95](https://github.com/atgreen/evergreen/pull/95),
+  [#96](https://github.com/atgreen/evergreen/pull/96),
+  [#98](https://github.com/atgreen/evergreen/pull/98),
+  [#104](https://github.com/atgreen/evergreen/pull/104),
+  [#105](https://github.com/atgreen/evergreen/pull/105),
+  [#110](https://github.com/atgreen/evergreen/pull/110),
+  [#114](https://github.com/atgreen/evergreen/pull/114)).
+- **riscv64:** add baseline and optimizing native compilers with live OSR and
+  deoptimization, native fiber switching, scalar LP64D foreign calls including
+  variadics, recoverable null/stack-guard faults, and an opt-in native segment
+  boundary that preserves integer and floating-point registers
+  ([#93](https://github.com/atgreen/evergreen/pull/93),
+  [#112](https://github.com/atgreen/evergreen/pull/112),
+  [#120](https://github.com/atgreen/evergreen/pull/120),
+  [#121](https://github.com/atgreen/evergreen/pull/121),
+  [#123](https://github.com/atgreen/evergreen/pull/123),
+  [#128](https://github.com/atgreen/evergreen/pull/128)).
+
+### Quicklisp and library compatibility
+
+- Add an x86-64 Linux Quicklisp client port with pinned setup instructions,
+  native networking and filesystem adapters, fresh installation and offline
+  reload. Honor custom `*MACROEXPAND-HOOK*` functions, accept file streams in
+  `PROBE-FILE`, and fix wildcard-directory traversal for distribution discovery
+  ([#86](https://github.com/atgreen/evergreen/pull/86),
+  [#87](https://github.com/atgreen/evergreen/pull/87),
+  [#90](https://github.com/atgreen/evergreen/pull/90),
+  [#92](https://github.com/atgreen/evergreen/pull/92)).
 
 ## 0.0.3 - 2026-10-07
 
