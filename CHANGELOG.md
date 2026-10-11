@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reduce stack-lookup work when returning from native recursive calls
+  ([#248](https://github.com/atgreen/evergreen/pull/248)).
+
 ## 0.0.5 - 2026-10-10
 
 ### Performance and diagnostics
