@@ -67,6 +67,7 @@
     "04-10-t2-frame-state.md": 5,
     "03-memory-gc.md": 5,
     "13-concurrency.md": 5,
+    "04-07-x86-64-lisp-abi.md": 6,
     "06-devtools.md": 6,
     "07-ops-portability.md": 6,
     "08-security-robustness.md": 6,

@@ -39,12 +39,13 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `04-04-tiered.md` | §4.4 | Tiered Compilation | R4.23–R4.30 |
 | `04-05-optimisation.md` | §4.5 | Optimisation Passes | R4.31–R4.37 |
 | `04-06-osr.md` | §4.6 | OSR & Deoptimisation | R4.38–R4.41 |
-| `04-07-codegen.md` | §4.7 | Code Emission & Register Allocation | R4.42–R4.47 |
+| `04-07-codegen.md` | §4.7 | Code Emission & Register Allocation | R4.42–R4.47, R4.72–R4.73 |
+| `04-07-x86-64-lisp-abi.md` | §4.7 companion | x86-64 Native Lisp ABI (Stage 6 target) | R4.74–R4.93 |
 | `04-08-inline-caches.md` | §4.8 | Inline Caches | R4.48–R4.52 |
 | `04-09-profiling.md` | §4.9 | Profiling Infrastructure | R4.53–R4.58 |
 | `04-10-t2-frame-state.md` | §4.10 | T2 Frame State & Deopt-Preserving Optimisation | R4.59–R4.68 |
 
-The [proposed x86-64 native Lisp ABI](04-07-x86-64-lisp-abi.md) supplements
+The [Stage 6 x86-64 native Lisp ABI](04-07-x86-64-lisp-abi.md) supplements
 §4.7 with register assignments, stack layout, returns and runtime transitions.
 It is a target design, not a statement of current implementation coverage.
 
@@ -67,7 +68,7 @@ It is a target design, not a statement of current implementation coverage.
 | §1 Object Model | R1.01–R1.xx | ~20 |
 | §2 Runtime Core | R2.01–R2.xx | ~25 |
 | §3 Memory & GC | R3.01–R3.xx | ~20 |
-| §4 Compiler | R4.01–R4.68 | ~68 |
+| §4 Compiler | R4.01–R4.93 (R4.69–R4.71 unassigned) | ~90 |
 | §5 Standard Library | R5.01–R5.203 | ~60 |
 | §6 Developer Tools | R6.01–R6.09 | ~15 |
 | §7 Ops & Portability | R7.01–R7.18 | ~18 |
