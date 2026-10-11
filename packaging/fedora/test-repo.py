@@ -207,12 +207,27 @@ class WorkflowAgreementTests(unittest.TestCase):
     # runs this file on a full checkout, which is where the invariant is real.
     @unittest.skipUnless(WORKFLOW.is_file(), 'workflows are not shipped in the source RPM')
     def test_pages_publishers_preserve_pending_and_running_work(self):
-        for path in (REPOSITORY_WORKFLOW, WORKFLOW.with_name('docs.yml')):
+        for path, job in ((REPOSITORY_WORKFLOW, None),
+                          (WORKFLOW.with_name('docs.yml'), 'deploy')):
             with self.subTest(workflow=path.name):
-                policy = re.search(r'^concurrency:\n((?:[ \t]+[^\n]*\n|\n)+)',
-                                   path.read_text(), re.MULTILINE)
-                self.assertIsNotNone(policy, 'a workflow-level publication lock is required')
-                settings = dict(re.findall(r'^  ([a-z-]+):[ \t]+([^\n]+)$',
+                workflow = path.read_text()
+                publisher, indent = workflow, ''
+                if job is not None:
+                    # Documentation previews have a separate cancellable lock.
+                    # The deploy job owns the complete Pages publication instead.
+                    block = re.search(rf'^  {job}:\n((?: {{4}}[^\n]*\n|\n)+)',
+                                      workflow, re.MULTILINE)
+                    self.assertIsNotNone(block, 'the publication job is required')
+                    publisher, indent = block.group(1), '    '
+                    for operation in ('mike deploy --push', 'git archive gh-pages',
+                                      'uses: actions/deploy-pages@'):
+                        self.assertGreater(publisher.count(operation), 0)
+                        self.assertEqual(publisher.count(operation), workflow.count(operation),
+                                         'every publication operation must hold the Pages lock')
+                policy = re.search(rf'^{indent}concurrency:\n((?:{indent}  [^\n]*\n|\n)+)',
+                                   publisher, re.MULTILINE)
+                self.assertIsNotNone(policy, 'the publisher must hold the Pages lock')
+                settings = dict(re.findall(rf'^{indent}  ([a-z-]+):[ \t]+([^\n]+)$',
                                            policy.group(1), re.MULTILINE))
                 self.assertEqual(settings, {
                     'group': 'pages',
