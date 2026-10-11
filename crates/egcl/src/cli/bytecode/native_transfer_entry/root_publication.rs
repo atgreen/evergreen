@@ -1003,6 +1003,7 @@ mod tests {
     }
 
     fn observe() {
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
         let probe = probe();
         let publication = ACTIVE.with(Cell::get);
         assert!(!publication.is_null(), "publish before the helper can collect");
@@ -1024,10 +1025,12 @@ mod tests {
             OBSERVE.with(|slot| slot.set(previous_observer));
             assert_eq!(value, unsafe { (&*probe.args)[0] });
             assert_eq!(ACTIVE.with(Cell::get), publication, "restore outer publication after reentry");
+            assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
         }
     }
 
     fn observe_inner() {
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 2);
         let current = ACTIVE.with(Cell::get);
         let publication = unsafe { &*current };
         assert!(!publication.previous.is_null());
@@ -1105,6 +1108,7 @@ mod tests {
         OBSERVE.with(|slot| slot.set(None));
         PROBE.with(|slot| slot.set(std::ptr::null_mut()));
         assert!(ACTIVE.with(Cell::get).is_null(), "retire publication before machine storage disappears");
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
         assert!(probe.calls > 0, "the compiled loop must enter a published poll");
         assert!(probe.moved, "the nested collection must relocate a live input");
         assert!(probe.visited > 0, "the collection must reach roots through the published chain");
@@ -1115,6 +1119,22 @@ mod tests {
              walk is redundant with that scan and proves nothing (bliss-shih7.2.7.3)."
         );
         assert_eq!(value, args[0]);
+    }
+
+    #[test]
+    fn ordinary_segment_lease_retires_after_native_error() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(forms = reader::read_from_string(
+            "((error \"ordinary segment retirement\"))"
+        ).unwrap().0);
+        let body = Arc::new(compile_function("ORDINARY-SEGMENT-ERROR", NIL, *forms,
+            &env, false, false).unwrap());
+        let code = TransferCode::compile(body).expect("native error fixture must be admitted");
+        assert!(code.run(&[], &mut env).is_err());
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
     }
 
     struct NativeOnlyProbe {
@@ -1676,8 +1696,10 @@ mod tests {
         assert!(!publication.is_null(), "parked inside a publication");
         let slot = native_only_slot(unsafe { &*publication }).expect("park with a sole native root");
         let before = unsafe { slot.read() }.to_raw();
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
         SUSPENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         egcl_rt::sync::fiber_sleep(std::time::Duration::from_millis(400)).unwrap();
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 1);
         if unsafe { slot.read() }.to_raw() != before {
             PARKED_MOVED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
@@ -1702,6 +1724,7 @@ mod tests {
         let value = code.run(&[], &mut env).unwrap();
         OBSERVE.with(|slot| slot.set(None));
         assert!(ACTIVE.with(Cell::get).is_null(), "retire before the fiber returns");
+        assert_eq!(crate::cli::bytecode::call_table::ordinary_segment_depth_for_test(), 0);
         assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL), "the private value stayed intact");
         EgclVal::from_fixnum(1)
     }

@@ -34,6 +34,53 @@ pub struct NativeCallContext {
     pub nargs: usize,
 }
 
+/// Ordinary Lisp register entries are distinct from checked and mapped-transfer
+/// entries. The version describes this descriptor and the register/stack ABI.
+pub const ORDINARY_X64_LISP_KIND: u64 = 0x5836344c495350;
+pub const ORDINARY_X64_LISP_VERSION: u64 = 1;
+pub const ORDINARY_ENV_NONE: u64 = 0;
+pub const ORDINARY_ENV_CLOSURE: u64 = 1;
+
+/// Immutable execution-owned descriptor. Generated callers acquire its pointer
+/// from a dedicated CallCell slot, then validate signature before entering.
+/// `owner` identifies retained runtime metadata, not a movable Lisp value.
+/// The publishing execution retains both this allocation and its code owner
+/// through every active/suspended native segment that could have loaded it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrdinaryEntryDescriptor {
+    pub kind: u64,
+    pub version: u64,
+    pub revision: u64,
+    pub entry: usize,
+    pub code_start: usize,
+    pub code_len: usize,
+    pub arity: usize,
+    pub environment: u64,
+    pub owner: usize,
+}
+
+impl OrdinaryEntryDescriptor {
+    pub fn is_compatible(&self) -> bool {
+        self.kind == ORDINARY_X64_LISP_KIND
+            && self.version == ORDINARY_X64_LISP_VERSION
+            && matches!(self.environment, ORDINARY_ENV_NONE | ORDINARY_ENV_CLOSURE)
+            && self.owner != 0
+            && self.code_start != 0
+            && self.contains_pc(self.entry)
+    }
+
+    pub fn contains_pc(&self, pc: usize) -> bool {
+        self.code_start
+            .checked_add(self.code_len)
+            .is_some_and(|end| self.code_start <= pc && pc < end)
+    }
+
+    pub fn accepts(&self, nargs: usize, environment: u64) -> bool {
+        self.is_compatible() && self.arity == nargs && self.environment == environment
+    }
+}
+
 /// Stable executable slots and an opaque pointer to their owning execution's
 /// state. Generated code embeds a slot address computed from its fixed ordinal.
 #[repr(C)]
@@ -41,6 +88,7 @@ pub struct CallCell {
     // Permanent native-contract entries. The checked view below is temporary
     // compatibility linkage for callers that still poll after returning.
     native_entries: Option<[AtomicUsize; 2]>,
+    ordinary_entry: AtomicUsize,
     register_entry: AtomicUsize,
     slice_entry: AtomicUsize,
     state: AtomicUsize,
@@ -53,6 +101,7 @@ impl CallCell {
     pub fn new(ordinal: usize, cold_register: usize, cold_slice: usize) -> Self {
         Self {
             native_entries: None,
+            ordinary_entry: AtomicUsize::new(0),
             register_entry: AtomicUsize::new(cold_register),
             slice_entry: AtomicUsize::new(cold_slice),
             state: AtomicUsize::new(0),
@@ -99,6 +148,13 @@ impl CallCell {
         }
     }
 
+    /// Pointer to an OrdinaryEntryDescriptor, or zero for cold/ineligible targets.
+    /// Loading it does not retain it: callers must be inside an owning native
+    /// segment before loading or dereferencing the descriptor.
+    pub fn ordinary_entry_address(&self) -> *const AtomicUsize {
+        &self.ordinary_entry
+    }
+
     /// Explicit legacy return-and-poll contract. Never call these slots as a
     /// native-transfer entry, even when a native segment happens to be active.
     pub fn checked_entry_address(&self, slice: bool) -> *const AtomicUsize {
@@ -116,6 +172,7 @@ impl CallCell {
     }
 
     fn invalidate(&self) {
+        self.ordinary_entry.store(0, Ordering::Release);
         self.register_entry
             .store(self.cold_register, Ordering::Release);
         self.slice_entry.store(self.cold_slice, Ordering::Release);
@@ -156,6 +213,17 @@ impl Table {
                 false
             }
         });
+    }
+
+    fn publish_ordinary(&self, cell: &CallCell, descriptor: &OrdinaryEntryDescriptor) -> bool {
+        if !descriptor.is_compatible()
+            || self.bindings[cell.ordinal].revision != descriptor.revision
+        {
+            return false;
+        }
+        cell.ordinary_entry
+            .store(descriptor as *const _ as usize, Ordering::Release);
+        true
     }
 
     fn publish(&self, cell: &CallCell, revision: u64, registers: usize, slice: usize) -> bool {
@@ -218,6 +286,23 @@ pub fn publish(cell: &CallCell, revision: u64, registers: usize, slice: usize) -
         .publish(cell, revision, registers, slice)
 }
 
+/// Publish an already-retained ordinary descriptor under the same revision lock
+/// as legacy entries. A stale compilation cannot overwrite a newer binding.
+///
+/// # Safety
+/// The caller belongs to the cell's owning execution and must retain this exact
+/// immutable descriptor and its executable code/metadata while published and
+/// until every segment that could have loaded it has retired. Its entry address
+/// must implement the declared ABI and its metadata must have been validated.
+pub unsafe fn publish_ordinary(cell: &CallCell, descriptor: &OrdinaryEntryDescriptor) -> bool {
+    TABLE
+        .get()
+        .expect("registered cell")
+        .lock()
+        .unwrap()
+        .publish_ordinary(cell, descriptor)
+}
+
 pub fn invalidate(symbol: u32) {
     let Some(table) = TABLE.get() else { return };
     let mut table = table.lock().unwrap();
@@ -239,6 +324,82 @@ pub fn invalidate_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ordinary_descriptor(revision: u64) -> OrdinaryEntryDescriptor {
+        OrdinaryEntryDescriptor {
+            kind: ORDINARY_X64_LISP_KIND,
+            version: ORDINARY_X64_LISP_VERSION,
+            revision,
+            entry: 0x1010,
+            code_start: 0x1000,
+            code_len: 0x100,
+            arity: 4,
+            environment: ORDINARY_ENV_NONE,
+            owner: 0x2000,
+        }
+    }
+
+    #[test]
+    fn ordinary_publication_is_distinct_and_rejects_stale_revisions() {
+        let mut table = Table::default();
+        let ordinal = table.ordinal(42);
+        let cell = Arc::new(CallCell::with_native_entries(ordinal, [11, 12], [31, 32]));
+        table.bindings[ordinal].cells.push(Arc::downgrade(&cell));
+        let address = cell.ordinary_entry_address();
+        assert_eq!(unsafe { &*address }.load(Ordering::Acquire), 0);
+        let old = ordinary_descriptor(0);
+        assert!(table.publish_ordinary(&cell, &old));
+        assert_eq!(
+            unsafe { &*address }.load(Ordering::Acquire),
+            &old as *const _ as usize
+        );
+        assert_eq!(
+            unsafe { &*cell.entry_address(false) }.load(Ordering::Acquire),
+            31
+        );
+        assert_eq!(
+            unsafe { &*cell.checked_entry_address(false) }.load(Ordering::Acquire),
+            11
+        );
+        table.invalidate(ordinal);
+        assert_eq!(unsafe { &*address }.load(Ordering::Acquire), 0);
+        assert!(!table.publish_ordinary(&cell, &old));
+        let replacement = ordinary_descriptor(1);
+        assert!(table.publish_ordinary(&cell, &replacement));
+        assert_eq!(cell.ordinary_entry_address(), address);
+    }
+
+    #[test]
+    fn ordinary_publication_rejects_incompatible_or_malformed_descriptors() {
+        let mut table = Table::default();
+        let ordinal = table.ordinal(43);
+        let cell = CallCell::new(ordinal, 11, 12);
+        for mutation in 0..7 {
+            let mut entry = ordinary_descriptor(0);
+            match mutation {
+                0 => entry.kind ^= 1,
+                1 => entry.version += 1,
+                2 => entry.entry = entry.code_start + entry.code_len,
+                3 => entry.code_len = usize::MAX,
+                4 => entry.owner = 0,
+                5 => entry.environment = 99,
+                6 => entry.code_len = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                !table.publish_ordinary(&cell, &entry),
+                "mutation {mutation}"
+            );
+            assert_eq!(
+                unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+                0
+            );
+        }
+        let entry = ordinary_descriptor(0);
+        assert!(entry.accepts(4, ORDINARY_ENV_NONE));
+        assert!(!entry.accepts(3, ORDINARY_ENV_NONE));
+        assert!(!entry.accepts(4, ORDINARY_ENV_CLOSURE));
+    }
 
     #[test]
     fn native_contract_survives_checked_target_invalidation() {

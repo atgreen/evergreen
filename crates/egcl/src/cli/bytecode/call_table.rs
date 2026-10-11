@@ -9,6 +9,16 @@
 use super::*;
 use egcl_rt::call_table::{self as linkage, CallCell};
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "call_table_ordinary.rs"]
+mod ordinary;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::{
+    OrdinaryCodeDirectory, OrdinarySegmentGuard, enter_ordinary_segment, publish_ordinary,
+};
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::ordinary_segment_depth_for_test;
+
 #[derive(Clone)]
 enum Target {
     Native {
@@ -155,6 +165,10 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
 /// calls retain their exact code and root their callable independently. Cells themselves never own code, so
 /// mutually recursive compiled functions do not form Rc ownership cycles.
 pub(super) unsafe fn scan(visit: &mut dyn FnMut(*mut EgclVal)) {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    unsafe {
+        ordinary::sweep_all();
+    }
     unsafe {
         SLOTS.scan(|slots| {
             for state in slots.borrow().iter().flatten() {
