@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Visit overlapping native GC root slots once per scan while preserving distinct
+  copies of live values ([#274](https://github.com/atgreen/evergreen/pull/274)).
+
 ## 0.0.6 - 2026-10-11
 
 This release also includes the [0.0.5 changes](https://github.com/atgreen/evergreen/blob/v0.0.6/CHANGELOG.md#005---2026-10-10).
