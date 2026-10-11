@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve large rational-number numerators when denominator allocation
+  triggers moving garbage collection
+  ([#249](https://github.com/atgreen/evergreen/pull/249)).
+
 - Reduce stack-lookup work when returning from native recursive calls
   ([#248](https://github.com/atgreen/evergreen/pull/248)).
 
