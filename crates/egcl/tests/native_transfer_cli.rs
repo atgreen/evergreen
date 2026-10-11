@@ -207,7 +207,9 @@ fn t2_calls_stop_before_later_side_effects() {
         assert!(stderr.contains("T2-SELF: optimized worker result installed with mapped T2 ABI;"),
             "recursive function must publish mapped T2 code: {stderr}");
         assert!(stdout.contains("native recursive entry veneer"), "{stdout}");
-        assert!(stdout.contains("native recursive frame retirement"), "{stdout}");
+        // Machine-stack recursion retires depth inline; DEC preserves the
+        // carry flag that now reports the native multiple-value return status.
+        assert!(stdout.contains("dec dword [r11]"), "{stdout}");
     } else {
         let self_entry = stderr
             .lines()

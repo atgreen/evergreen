@@ -77,7 +77,10 @@ fn universal_outer_entry_reloads_moving_callable_and_arguments() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     egcl_rt::rooted!(prototype = read_eval_all_env("#'list", &mut env).unwrap());
-    let (head, identity) = cp(*prototype);
+    let closure = crate::cli::reified_closure(*prototype).expect("builtin source closure");
+    let (head, identity) = cp(closure);
+    // Clone the source cons so this callable is young and must move, even if
+    // the cached reified builtin wrapper has already been promoted.
     egcl_rt::rooted!(function = crate::cli::arena_cons(head, identity));
     egcl_rt::rooted!(argument = crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL));
     let before = argument.to_raw();

@@ -6647,6 +6647,8 @@ fn complex_number_equality_predicates() {
 fn functions_print_as_function_objects() {
     // String-returning exprs print with surrounding quotes under (print …).
     let cases = [
+        ("#'car", "#<FUNCTION>"),
+        ("(list #'car #'cdr)", "(#<FUNCTION> #<FUNCTION>)"),
         ("(princ-to-string (lambda (x) x))", "\"#<FUNCTION>\""),
         ("(princ-to-string #'car)", "\"#<FUNCTION>\""),
         ("(prin1-to-string (complement #'evenp))", "\"#<FUNCTION>\""),

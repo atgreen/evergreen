@@ -1274,9 +1274,9 @@ fn egclval_to_print_inner(v: EgclVal, escapep: bool) -> String {
         }
         return print_symbol_for_output(v, escapep);
     }
-    // An interpreter closure `(EGCL::CLOSURE . id)` is a function, not the data
-    // list it is structurally — print it as #<FUNCTION> (matches cli print_val).
-    if is_closure_cons(v) {
+    // Reified function objects and legacy source closures share the same
+    // opaque function representation (matches cli print_val).
+    if egcl_rt::function::is_interpreted_function(v) || is_closure_cons(v) {
         return "#<FUNCTION>".to_string();
     }
     if v.is_cons() {
