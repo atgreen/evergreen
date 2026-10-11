@@ -1,7 +1,7 @@
 # EGCL Specification — Master Index
 
 **Version:** 0.1-draft
-**Last updated:** 2026-08-11
+**Last updated:** 2026-10-11
 
 This index provides at-a-glance navigation across all specification
 chapters, sections, and subsections. Code references spec sections
@@ -43,6 +43,10 @@ algorithms as `A N.xx`. See `conventions.md` for full notation.
 | `04-08-inline-caches.md` | §4.8 | Inline Caches | R4.48–R4.52 |
 | `04-09-profiling.md` | §4.9 | Profiling Infrastructure | R4.53–R4.58 |
 | `04-10-t2-frame-state.md` | §4.10 | T2 Frame State & Deopt-Preserving Optimisation | R4.59–R4.68 |
+
+The [proposed x86-64 native Lisp ABI](04-07-x86-64-lisp-abi.md) supplements
+§4.7 with register assignments, stack layout, returns and runtime transitions.
+It is a target design, not a statement of current implementation coverage.
 
 ## Standard Library Sub-Chapters (§5)
 

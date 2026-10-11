@@ -237,8 +237,11 @@ distinguishes implemented mechanisms from the remaining work.
 The baseline already includes machine-stack self-recursion, precise native
 call-site/root/unwind metadata, deoptimization, and single-value return fast
 paths. Ordinary generated call-cell adapters avoid Rust dispatch for eligible
-calls but still construct managed callee activations. The goal is to remove
-that activation cost for eligible calls between distinct T2 functions.
+calls but still construct managed callee activations. The goal is to establish the
+[register-based native Lisp ABI](04-07-x86-64-lisp-abi.md) as the ordinary
+compiled calling convention. Calls between distinct T2 functions are its first
+deliverable; avoiding per-call managed activation construction is part of that
+contract. The initial eligibility limits are rollout steps, not the final ABI.
 
 Suggested implementation order:
 
@@ -249,7 +252,9 @@ Suggested implementation order:
 2. Add a fast edge for known published T2 targets with fixed arity zero through
    four and tagged parameters. Preserve code ownership, definition-generation
    checks, replacement and invalidation, with general adapters for unsupported
-   targets or signatures. Reuse the existing argument and return contracts.
+   targets or signatures. Use the proposed argument contract (three register
+   arguments, then stack), retain the mapped return contract, and version the
+   new entry separately from legacy frame-slot and self-recursive entries.
 3. Generalize native frame walking, root relocation, unwind and deoptimization
    metadata across different code owners. Materialize managed frames at cold
    boundaries when needed; preserve signal handling, fiber suspension/migration,

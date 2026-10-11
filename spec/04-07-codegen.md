@@ -110,6 +110,10 @@ pub struct MachBlock {
 | Stack alignment | 16-byte before `CALL` |
 | Red zone | MUST NOT be used (signal handlers / GC may clobber) |
 
+The proposed ordinary register-based Lisp ABI is specified separately in
+[the x86-64 native Lisp ABI contract](04-07-x86-64-lisp-abi.md).
+The following describes the released implementation.
+
 **Current EGCL entry paths (v0.0.6, x86-64 Linux):**
 
 There is no single register-argument ABI shared by every native Lisp call.
