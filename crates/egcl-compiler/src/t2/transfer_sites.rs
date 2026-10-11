@@ -94,6 +94,9 @@ pub struct SysvTransferSite {
     /// have updated these shadows without restoring the native homes yet.
     /// Emission must include every moving root synchronized before this call.
     pub shadow_roots: Vec<(Location, u16)>,
+    /// Canonical tagged spill copies in body-RSP-relative native word slots.
+    /// These are authoritative after collection and before register restoration.
+    pub native_spills: Vec<(Location, u32)>,
     pub map: TransferCaptureMap,
 }
 
@@ -143,7 +146,8 @@ pub enum TransferSiteError {
 }
 
 struct CaptureRecipe {
-    native: SysvCaptureLocation,
+    native: Option<SysvCaptureLocation>,
+    native_spill: Option<SysvCaptureLocation>,
     shadow_slot: Option<usize>,
 }
 
@@ -224,6 +228,18 @@ impl SysvTransferTable {
                     return Err(TransferSiteError::InvalidShadowRoot(location));
                 }
             }
+            for (index, &(location, slot)) in site.native_spills.iter().enumerate() {
+                if !site.map.roots.contains(&location)
+                    || slot >= site.stack_slots
+                    || site.shadow_roots.iter().any(|&(prior, _)| prior == location)
+                    || snapshot.locations().any(|other| other != location
+                        && other == Location::Stack(crate::t2::mach::StackSlot(slot)))
+                    || site.native_spills[..index].iter().any(|&(prior, prior_slot)|
+                        prior == location || prior_slot == slot)
+                {
+                    return Err(TransferSiteError::InvalidShadowRoot(location));
+                }
+            }
             let mut recipes = Vec::new();
             for location in snapshot.locations() {
                 let home = match location {
@@ -237,9 +253,18 @@ impl SysvTransferTable {
                     }
                     _ => return Err(TransferSiteError::UnsupportedRegister(location)),
                 };
-                let recipe =
-                    SysvCaptureLocation::for_home(home, site.stack_slots, site.call_stack_adjust)
-                        .map_err(TransferSiteError::Physical)?;
+                let native_spill = site.native_spills.iter()
+                    .find(|(native, _)| *native == location)
+                    .map(|(_, slot)| SysvCaptureLocation::for_home(
+                        ValueHome::Stack(*slot), site.stack_slots, site.call_stack_adjust))
+                    .transpose().map_err(TransferSiteError::Physical)?;
+                let recipe = match SysvCaptureLocation::for_home(home, site.stack_slots, site.call_stack_adjust) {
+                    Ok(recipe) => Some(recipe),
+                    // Volatile registers are absent from a helper's capture.
+                    // An explicitly mapped native spill supplies their value.
+                    Err(CaptureLocationError::UnavailableRegister(_)) if native_spill.is_some() => None,
+                    Err(error) => return Err(TransferSiteError::Physical(error)),
+                };
                 let shadow_slot = site
                     .shadow_roots
                     .iter()
@@ -249,6 +274,7 @@ impl SysvTransferTable {
                     location,
                     CaptureRecipe {
                         native: recipe,
+                        native_spill,
                         shadow_slot,
                     },
                 ));
@@ -620,7 +646,8 @@ impl SysvSiteSnapshot {
                     .1;
                 match recipe.shadow_slot {
                     Some(slot) => activation[slot].to_raw(),
-                    None => recipe.native.read(capture),
+                    None => recipe.native_spill.or(recipe.native)
+                        .expect("validated native capture recipe").read(capture),
                 }
             });
         }
@@ -646,13 +673,10 @@ impl SysvSiteSnapshot {
         unsafe {
             self.snapshot
                 .write_back(|location, word| {
-                    self.recipes
-                        .iter()
-                        .find(|(key, _)| *key == location)
-                        .expect("validated descriptor location")
-                        .1
-                        .native
-                        .write(capture, word)
+                    let recipe = &self.recipes.iter().find(|(key, _)| *key == location)
+                        .expect("validated descriptor location").1;
+                    if let Some(native) = recipe.native { native.write(capture, word); }
+                    if let Some(spill) = recipe.native_spill { spill.write(capture, word); }
                 })
                 .map_err(TransferSiteError::Capture)
         }

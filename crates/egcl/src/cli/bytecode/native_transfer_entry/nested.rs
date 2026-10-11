@@ -348,16 +348,25 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut Map
 pub(super) unsafe fn record_parent_owner(
     record: *mut MappedCallRecord,
 ) -> Option<*const TransferCode> {
-    let child = unsafe { (*record).owner.cast::<ChildActivation>() };
-    if child.is_null() {
-        return None; // no child selected yet: the caller is CAPTURE's own owner
-    }
-    let parent = unsafe { (*child).parent };
-    if parent.is_null() {
-        return None;
-    }
+    let parent = unsafe { record_parent_context(record) }?;
     let owner = unsafe { (*parent).owner };
     (!owner.is_null()).then_some(owner)
+}
+
+/// Exact retained caller context for a prepared adapter, including its managed
+/// anchor and native control identity; CAPTURE may currently name the child.
+///
+/// # Safety
+/// Same initialized-record/lifetime contract as `record_parent_owner`.
+pub(super) unsafe fn record_parent_context(
+    record: *mut MappedCallRecord,
+) -> Option<*mut CaptureContext> {
+    let child = unsafe { (*record).owner.cast::<ChildActivation>() };
+    if child.is_null() {
+        return None;
+    }
+    let parent = unsafe { (*child).parent };
+    (!parent.is_null()).then_some(parent)
 }
 
 /// The child's machine frames are already gone. Resume its captured logical

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Speed up native recursion on Linux x86-64: eligible T2 self-calls use machine
+  frames, and native returns avoid redundant stack lookups. A controlled
+  release-build `fib(32)` comparison improved from about 1.04 seconds to
+  0.21–0.23 seconds (4.9× faster by the median)
+  ([#248](https://github.com/atgreen/evergreen/pull/248),
+  [#259](https://github.com/atgreen/evergreen/pull/259)).
+
 - Evaluate optional `TYPEP` and `SUBTYPEP` arguments consistently, preserving
   side effects and nonlocal exits; enforce `TYPEP` errors through `FUNCALL`
   ([#257](https://github.com/atgreen/evergreen/pull/257)).
@@ -33,9 +40,6 @@
 - Preserve large rational-number numerators when denominator allocation
   triggers moving garbage collection
   ([#249](https://github.com/atgreen/evergreen/pull/249)).
-
-- Reduce stack-lookup work when returning from native recursive calls
-  ([#248](https://github.com/atgreen/evergreen/pull/248)).
 
 ## 0.0.5 - 2026-10-10
 

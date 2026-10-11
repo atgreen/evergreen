@@ -33,6 +33,7 @@ use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
 pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
+mod native_frames;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
@@ -118,6 +119,17 @@ static RECURSIVE_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> 
 #[cfg(test)]
 pub(super) fn take_recursive_entries() -> usize {
     RECURSIVE_ENTRIES.with(|count| count.replace(0))
+}
+
+// Keep helper traffic independent from the logical native-entry oracle: the
+// latter must continue to count generated entries after these helpers retire.
+#[cfg(test)]
+static RECURSIVE_HELPER_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<(usize, usize)>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((0, 0))) };
+
+#[cfg(test)]
+pub(super) fn take_recursive_helper_calls() -> (usize, usize) {
+    RECURSIVE_HELPER_CALLS.with(|count| count.replace((0, 0)))
 }
 
 fn try_clone_string(value: &str) -> Result<String, EgclError> {
@@ -224,6 +236,10 @@ pub(super) struct TransferCode {
     recompile: Cell<bool>,
     recursive_symbol: Option<u32>,
     recursive_generation: u64,
+    pub(super) native_entry_kind_slot: Option<u32>,
+    native_control_slot: Option<u32>,
+    native_argument_base: Option<u32>,
+    native_argument_count: u16,
     landing: JitBuffer,
     sites: SysvTransferTable,
     slots: u16,
@@ -611,7 +627,7 @@ impl TransferCode {
         let deopt_capture = if deopt_metadata.is_some() {
             Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
         } else { None };
-        let deopt_veneer = match &deopt_capture {
+        let mut deopt_veneer = match &deopt_capture {
             Some(capture) => Some(JitBuffer::new(&emit_published_helper_veneer(resume_guard, capture.as_ptr()))?),
             None => None,
         };
@@ -657,7 +673,7 @@ impl TransferCode {
             .filter(|symbol| body.code.iter().any(|op| {
                 matches!(op, Instr::CallNamed { sym, .. } if sym == symbol)
             }));
-        let recursive_prepare = match recursive_symbol {
+        let mut recursive_prepare = match recursive_symbol {
             Some(_) => Some(JitBuffer::new(&emit_published_helper_veneer(prepare_recursive, capture.as_ptr()))?),
             None => None,
         };
@@ -667,7 +683,37 @@ impl TransferCode {
             prepare: recursive_prepare.as_ref().unwrap().as_ptr() as u64,
             finish: finish_recursive as *const () as u64,
         });
-        let (emitted, sites) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries(
+        let native_frames = if matches!(tier, CompilationTier::T2)
+            && body.arity <= 4 && ir.osr_entries.is_empty()
+            && deopt_metadata.is_some()
+        {
+            recursive_symbol.zip(native_frames::flags()).and_then(|(symbol, flags)| {
+                let cold = JitBuffer::new(&emit_published_helper_veneer(
+                    native_frames::slow_call, capture.as_ptr()))?;
+                let guard = JitBuffer::new(&emit_published_helper_veneer(
+                    deopt::resume_native_guard, deopt_capture.as_ref()?.as_ptr()))?;
+                let result = egcl_compiler::t2::emit::emit_framed_native_handlers_with_native_recursion(
+                    ir, veneer.as_ptr() as u64, base_slots,
+                    save_cleanup as *const () as u64, completion.as_ptr() as u64,
+                    c2i_t2_mv as *const () as u64, deliver_catch as *const () as u64,
+                    deliver_handler as *const () as u64, poll.as_ptr() as u64,
+                    guard.as_ptr() as u64, &named_veneers,
+                    egcl_compiler::t2::emit::NativeRecursiveTransfer {
+                        symbol, arity: usize::from(body.arity),
+                        initialize: native_frames::initialize as *const () as u64,
+                        cold_veneer: cold.as_ptr() as u64, flags,
+                    },
+                ).inspect_err(|error| t2_log_write(format_args!(
+                    "{}: native recursive entry: {error:?}", display_fn_name(&body.name)
+                ))).ok()?;
+                recursive_prepare = Some(cold);
+                deopt_veneer = Some(guard);
+                Some(result)
+            })
+        } else { None };
+        // A shape not yet admitted by the native-frame emitter retains its
+        // existing mapped execution and original recovery veneers.
+        let (emitted, sites) = native_frames.or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries(
             ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -686,7 +732,7 @@ impl TransferCode {
             "{}: mapped emitter: {error:?}{}",
             display_fn_name(&body.name), describe_emit_error(error)
         )))
-        .ok()?;
+        .ok())?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
         // UNWIND-PROTECT cleanups from exact scope maps. Other records require the
         // forthcoming native scope state; rejecting them is part of admission.
@@ -741,9 +787,10 @@ impl TransferCode {
         }
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
         let mut code = JitBuffer::new(&emitted.code)?;
-        // Segment entries receive the same managed slot address as checked
-        // entries. Publish proven original argument homes with their code.
-        let arguments = native_debug::arguments(&body, false);
+        // A private native child receives its control pointer in RDI, so the
+        // managed argument recipe would describe unrelated memory there.
+        // Runtime stack capture uses the immutable native argument homes.
+        let arguments = native_debug::arguments(&body, emitted.native_recursive_entry.is_some());
         let debug_info = code
             .install_debug_info_with_arguments(&body.name, arguments.as_ref())
             .ok()?;
@@ -789,6 +836,10 @@ impl TransferCode {
             recompile: Cell::new(false),
             recursive_symbol,
             recursive_generation,
+            native_entry_kind_slot: emitted.native_entry_kind_slot,
+            native_control_slot: emitted.native_control_slot,
+            native_argument_base: emitted.native_argument_base,
+            native_argument_count: emitted.native_argument_count,
             landing,
             sites,
             slots,
@@ -1304,6 +1355,11 @@ unsafe extern "C" fn prepare_recursive(
     out: *mut NativeOutcome,
     image: *mut SysvTransferCapture,
 ) {
+    #[cfg(test)]
+    RECURSIVE_HELPER_CALLS.with(|count| {
+        let (prepare, finish) = count.get();
+        count.set((prepare + 1, finish));
+    });
     unsafe {
         root_publication::published(image, || {
             #[cfg(test)]
@@ -1451,6 +1507,11 @@ unsafe fn retire_recursive(context: &mut CaptureContext, activation: *mut Recurs
 }
 
 unsafe extern "C" fn finish_recursive(activation: *mut RecursiveActivation) {
+    #[cfg(test)]
+    RECURSIVE_HELPER_CALLS.with(|count| {
+        let (prepare, finish) = count.get();
+        count.set((prepare, finish + 1));
+    });
     let context = unsafe { &mut *CAPTURE.with(Cell::get) };
     unsafe {
         retire_recursive(context, activation);
@@ -2687,6 +2748,7 @@ struct CaptureContext {
     recursive_enabled: bool,
     recursive_profile: bool,
     recursive_generation: u64,
+    native_recursive: Option<egcl_compiler::t2::emit::NativeRecursiveControl>,
     recursive: *mut RecursiveActivation,
     recursive_escape: bool,
     handlers: *mut Vec<SavedHandler>,
@@ -2865,12 +2927,16 @@ unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
                 })
                 .ok_or(TransferSiteError::WrongReturnPc)?;
             unsafe {
-                (&mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index))
-                    .capture_from_activation(
+                let snapshot = &mut *context.snapshots.cast::<SysvSiteSnapshot>().add(index);
+                if context.native_recursive.is_some() {
+                    snapshot.capture(context.code_base, capture)?;
+                } else {
+                    snapshot.capture_from_activation(
                         context.code_base,
                         capture,
                         std::slice::from_raw_parts(frame.add(1).cast(), context.slots),
                     )?;
+                }
             }
             Ok(())
         })();
@@ -2882,6 +2948,7 @@ unsafe fn prepare_unpublished(capture: *mut SysvTransferCapture) {
                 retire_recursive(context, context.recursive);
             }
         }
+        native_frames::retire_children(context);
         context.recursive_escape = true;
         capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
         return;

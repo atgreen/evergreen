@@ -210,6 +210,19 @@ fn global_safepoint_page() -> &'static SafepointPage {
     PAGE.get_or_init(|| SafepointPage::init().expect("failed to allocate global safepoint page"))
 }
 
+/// Addresses of the existing GC-request and SIGUSR1 flags for generated polls.
+///
+/// Returns `None` before explicit safepoint initialization; this getter never
+/// maps a page, registers a thread, or consumes work. Both pointers remain valid
+/// for the process lifetime. They address one-byte `AtomicBool` objects: generated
+/// readers must use atomic loads (GC request SeqCst, SIGUSR1 Relaxed), and must
+/// enter the published runtime poll when either flag is set. Do not read the
+/// protected polling page itself through either of these pointers.
+pub fn native_poll_flag_addresses() -> Option<(*const AtomicBool, *const AtomicBool)> {
+    let page = PAGE.get()?;
+    Some((std::ptr::addr_of!(page.requested), std::ptr::addr_of!(SIGUSR1_PENDING)))
+}
+
 /// Whether a safepoint poll needs its published runtime path. This only reads
 /// state: it cannot allocate, register a thread, park, yield, or consume work.
 /// A request arriving after an idle observation remains pending for the next
@@ -1037,22 +1050,44 @@ mod pending_work_tests {
 
         // Preflight cannot initialize a page or register an unseen thread.
         assert!(PAGE.get().is_none());
+        assert!(native_poll_flag_addresses().is_none());
+        assert!(crate::thread::current_execution_context_for_native().is_none());
         assert!(poll_work_pending());
         assert!(PAGE.get().is_none());
         assert!(crate::thread::current_yield_requested());
         let thread = crate::thread::current_thread();
         let page = global_safepoint_page();
+        let (requested, interrupted) = native_poll_flag_addresses().unwrap();
+        assert_eq!(requested, std::ptr::addr_of!(page.requested));
+        assert_eq!(interrupted, std::ptr::addr_of!(SIGUSR1_PENDING));
+        assert_eq!(native_poll_flag_addresses(), Some((requested, interrupted)));
+        let execution = crate::thread::current_execution_context_for_native().unwrap();
+        assert_eq!(execution, thread.execution().as_ptr());
+        let posted = crate::thread::posted_pending_signals_address();
+        assert_eq!(unsafe { &*posted }.load(Ordering::Relaxed), 0);
+        crate::thread::post_current_pending_signal(crate::thread::PendingSignal::Interrupt);
+        assert_ne!(unsafe { &*posted }.load(Ordering::Relaxed), 0);
+        assert!(crate::thread::any_posted_pending_signal());
+        assert!(crate::thread::take_current_pending_signal().is_some());
+        assert_eq!(unsafe { &*posted }.load(Ordering::Relaxed), 0);
         assert!(!poll_work_pending());
 
         crate::runtime::take_process_signal_activity();
         assert!(!crate::runtime::process_signal_activity_pending());
+        let seen = crate::runtime::current_seen_signal_activity().unwrap();
+        let epoch = crate::runtime::process_signal_activity_address();
+        assert_eq!(unsafe { &*epoch }.load(Ordering::Acquire), seen);
         crate::runtime::mark_process_signal_activity();
+        assert_ne!(unsafe { &*epoch }.load(Ordering::Acquire), seen);
+        assert_eq!(crate::runtime::current_seen_signal_activity(), Some(seen));
         assert!(crate::runtime::process_signal_activity_pending());
         assert!(crate::runtime::process_signal_activity_pending());
         assert!(crate::runtime::take_process_signal_activity());
         assert!(!crate::runtime::process_signal_activity_pending());
 
         thread.execution().request_yield();
+        assert!(unsafe { &*execution }.yield_requested());
+        assert_eq!(crate::thread::current_execution_context_for_native(), Some(execution));
         assert!(poll_work_pending());
         assert!(poll_work_pending());
         assert!(thread.check_and_clear_yield());
@@ -1062,10 +1097,13 @@ mod pending_work_tests {
         assert!(poll_work_pending());
         assert!(poll_work_pending());
         assert!(page.is_requested());
+        assert!(unsafe { &*requested }.load(Ordering::SeqCst));
         page.resume().unwrap();
+        assert!(!unsafe { &*requested }.load(Ordering::SeqCst));
         assert!(!poll_work_pending());
 
         SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+        assert!(unsafe { &*interrupted }.load(Ordering::Relaxed));
         assert!(poll_work_pending());
         assert!(poll_work_pending());
         assert!(SIGUSR1_PENDING.load(Ordering::Relaxed));

@@ -822,6 +822,22 @@ pub fn mark_process_signal_activity() {
     PROCESS_SIGNAL_ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Process-lifetime address of the 64-bit atomic process-signal arrival epoch.
+/// Generated readers must use Acquire loads and must not acknowledge arrivals
+/// by writing this word. Compare against `current_seen_signal_activity()` from
+/// the same carrier, refreshing that copied value after carrier migration.
+pub fn process_signal_activity_address() -> *const std::sync::atomic::AtomicU64 {
+    std::ptr::addr_of!(PROCESS_SIGNAL_ACTIVITY)
+}
+
+/// Copy this carrier's acknowledged epoch without draining or acknowledging it.
+/// Returns `None` when TLS is inaccessible. This returns a value, never a TLS
+/// pointer: generated code must refresh it after changing carriers, and must
+/// not substitute a newer global arrival epoch for this acknowledged value.
+pub fn current_seen_signal_activity() -> Option<u64> {
+    SEEN_SIGNAL_ACTIVITY.try_with(std::cell::Cell::get).ok()
+}
+
 /// Check this carrier's signal epoch without acknowledging or draining it.
 /// An unavailable TLS slot conservatively requires the ordinary signal path.
 #[inline(never)]

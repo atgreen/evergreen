@@ -681,7 +681,7 @@ pub fn backtrace_call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         );
         let origin = match frames[index].origin {
             egcl_rt::debug_stack::FrameOrigin::Interpreted => 0,
-            egcl_rt::debug_stack::FrameOrigin::Managed => 1,
+            egcl_rt::debug_stack::FrameOrigin::Managed | egcl_rt::debug_stack::FrameOrigin::Native => 1,
             egcl_rt::debug_stack::FrameOrigin::Entry => 2,
             egcl_rt::debug_stack::FrameOrigin::Foreign => 3,
         };

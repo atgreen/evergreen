@@ -183,6 +183,28 @@ impl<T> ExecutionLocal<T> {
         Some(f(unsafe { &*pointer }))
     }
 
+    /// Inspect an existing slot of a suspended fiber without initializing it.
+    ///
+    /// # Safety
+    /// The caller must retain the fiber owner and hold its mount/state exclusion
+    /// for this entire call, excluding execution and retirement. Neither the
+    /// callback nor its callees may safepoint, yield, or allocate Lisp objects.
+    /// Borrowed state must not escape that exclusion. This does not authorize
+    /// scanning arbitrary running executions or replace stop-the-world `scan`.
+    pub unsafe fn try_with_stopped_fiber<R>(
+        &self,
+        fiber: crate::thread::FiberId,
+        f: impl FnOnce(&T) -> R,
+    ) -> Option<R> {
+        let pointer = {
+            let slots = self.slots.lock().unwrap();
+            &**slots.0.get(&Key::Fiber(fiber))? as *const T
+        };
+        // SAFETY: the caller's owner/exclusion keeps this stable box alive and
+        // prevents access by the fiber while the registry lock is released.
+        Some(f(unsafe { &*pointer }))
+    }
+
     /// Visit every execution's state during a stop-the-world collection.
     /// # Safety
     /// All mutators must be stopped; callback must not evaluate or yield.

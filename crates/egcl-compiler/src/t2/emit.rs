@@ -132,7 +132,9 @@
 use crate::t2::x64_calls::{
     CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
 };
-use crate::t2::x64_value_maps::{NativeFrameLayout, NativeFrameValues};
+use crate::t2::x64_value_maps::{NativeFrameLayout, NativeFrameValues, NativeValueArea};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use crate::t2::x64_value_maps::NativeValueLocation;
 use egcl_rt::asm::{Asm, Cc};
 
 use crate::t2::ir::Function;
@@ -647,6 +649,14 @@ fn float_operand_to_xmm(
 ///   are already in the argument registers `[rcx, r8, r9, r10]` (arg0..arg3), so
 ///   a compiled caller skips the frame load entirely. Result in rax.
 pub struct FramedCode {
+    /// Private same-owner native entry; requires the retained control pointer.
+    pub native_recursive_entry: Option<usize>,
+    /// Raw word slots, relative to body RSP, never collector roots.
+    pub native_entry_kind_slot: Option<u32>,
+    pub native_control_slot: Option<u32>,
+    /// Immutable original arguments retained by this physical native frame.
+    pub native_argument_base: Option<u32>,
+    pub native_argument_count: u16,
     pub code: Vec<u8>,
     /// Exact x86-64 returning-call attachment points, independent of debugger flags.
     /// SysV records bind authoritative value copies; other backends explicitly
@@ -903,6 +913,49 @@ fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
     }
 }
 
+fn emit_call_root_sync(
+    a: &mut Asm,
+    roots: &[crate::t2::ir::Value],
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame_base: FramedHome,
+    area: NativeValueArea,
+    slots: u16,
+) -> Result<(), EmitError> {
+    match area {
+        NativeValueArea::Activation(base) => emit_shadow_root_sync(a, roots, homes, frame_base, base, slots),
+        NativeValueArea::NativeStack(base) => {
+            // Exact native maps scan only live copies; unused slots need no NIL clearing.
+            for (index, value) in roots.iter().enumerate() {
+                load_home(a, RAX, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?, 0);
+                store_home(a, FramedHome::Stack(base + index as u32), RAX, 0);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn emit_call_root_restore(
+    a: &mut Asm,
+    roots: &[crate::t2::ir::Value],
+    restore: &std::collections::HashSet<crate::t2::ir::Value>,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    frame_base: FramedHome,
+    area: NativeValueArea,
+) -> Result<(), EmitError> {
+    match area {
+        NativeValueArea::Activation(base) => emit_shadow_root_restore(a, roots, restore, homes, frame_base, base),
+        NativeValueArea::NativeStack(base) => {
+            for (index, value) in roots.iter().enumerate() {
+                if restore.contains(value) {
+                    load_home(a, RAX, FramedHome::Stack(base + index as u32), 0);
+                    store_home(a, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xFC))?, RAX, 0);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn emit_shadow_root_sync(
     a: &mut Asm,
     roots: &[crate::t2::ir::Value],
@@ -958,6 +1011,9 @@ fn emit_shadow_root_restore(
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct PollFrame {
+    arguments: Vec<(crate::t2::ir::Value, u32)>,
+    native_frame_mode: bool,
+    spill_area: NativeValueArea,
     base: FramedHome,
     activation_slots: u16,
     shadow_slots: u16,
@@ -987,50 +1043,52 @@ fn emit_mapped_poll(
     }
     let layout = NativeFrameLayout {
         native_slots: frame.native_slots,
-        activation_base_slot: match frame.base {
+        activation_base_slot: if frame.native_frame_mode { None } else { match frame.base {
             FramedHome::Stack(slot) => Some(slot),
             _ => return Err(EmitError::UnsupportedOp(0xFE)),
-        },
-        activation_slots: frame
+        } },
+        activation_slots: if frame.native_frame_mode { 0 } else { frame
             .activation_slots
             .checked_add(frame.shadow_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFE))?,
+            .ok_or(EmitError::UnsupportedOp(0xFE))? },
     };
     let map = std::sync::Arc::new(
-        NativeFrameValues::for_call(
+        NativeFrameValues::for_call_in_area(
             values.values(),
             roots,
-            frame.activation_slots,
+            frame.spill_area,
             &[],
             None,
             layout,
             Some(frame.raw_spill_start),
             |_| false,
         )
+        .and_then(|map| map.with_native_arguments(&frame.arguments, |_| false))
         .map_err(|_| EmitError::UnsupportedOp(0xFE))?,
     );
-    emit_shadow_root_sync(
+    emit_call_root_sync(
         a,
         roots,
         homes,
         frame.base,
-        frame.activation_slots,
+        frame.spill_area,
         frame.shadow_slots,
     )?;
-    load_home(a, 7, frame.base, 0);
+    if frame.native_frame_mode { mov_imm64(a, 7, 0); }
+    else { load_home(a, 7, frame.base, 0); }
     if heat {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
     let site = emit_runtime_helper_call(a, 0, None);
     let restore = roots.iter().copied().collect();
-    emit_shadow_root_restore(
+    emit_call_root_restore(
         a,
         roots,
         &restore,
         homes,
         frame.base,
-        frame.activation_slots,
+        frame.spill_area,
     )?;
     for (index, home) in values.raw_registers().enumerate() {
         load_home(
@@ -1757,8 +1815,7 @@ fn emit_invoke_call(
     homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
     constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
     frame_base: FramedHome,
-    activation_slots: u16,
-    argument_base: u16,
+    outgoing_area: NativeValueArea,
     veneer: u64,
     recursion: Option<(RecursiveTransfer, egcl_rt::asm::Label)>,
 ) -> Result<(Vec<u32>, u32), EmitError> {
@@ -1826,7 +1883,10 @@ fn emit_invoke_call(
         _ => return Err(EmitError::UnsupportedOp(0xF8)),
     };
     load_home(a, SCRATCH, frame_base, 0);
-    let args_slot = i32::from(activation_slots) + i32::from(argument_base);
+    let args_slot = match outgoing_area {
+        NativeValueArea::Activation(base) => i32::from(base),
+        NativeValueArea::NativeStack(base) => i32::try_from(base).map_err(|_| EmitError::UnsupportedOp(0xFD))?,
+    };
     for (index, value) in data.args.iter().enumerate() {
         if let Some(&bits) = constants.get(value) {
             mov_imm64(a, RAX, bits as i64);
@@ -1838,9 +1898,12 @@ fn emit_invoke_call(
                 0,
             );
         }
-        store_mem64_disp(a, SCRATCH, (args_slot + index as i32) * 8, RAX);
+        match outgoing_area {
+            NativeValueArea::Activation(_) => store_mem64_disp(a, SCRATCH, (args_slot + index as i32) * 8, RAX),
+            NativeValueArea::NativeStack(_) => store_to_rsp(a, RAX, (args_slot + index as i32) * 8),
+        }
     }
-    // Fixed, aligned request; rooted arguments remain in the activation. The
+    // Fixed, aligned request; arguments remain in the mapped backing area. The
     // cold capture table records this exact temporary RSP adjustment.
     const _: () = {
         assert!(std::mem::size_of::<TransferCallRequest>() == 32);
@@ -1859,7 +1922,13 @@ fn emit_invoke_call(
     if cleanup {
         mov_imm64(a, SCRATCH, 0); // reserved, not an argument pointer
     } else {
-        alu_r_imm(a, 0, SCRATCH, args_slot * 8);
+        match outgoing_area {
+            NativeValueArea::Activation(_) => alu_r_imm(a, 0, SCRATCH, args_slot * 8),
+            NativeValueArea::NativeStack(_) => {
+                mov_rr(a, SCRATCH, 4);
+                alu_r_imm(a, 0, SCRATCH, args_slot * 8 + temporary_bytes);
+            }
+        }
     }
     store_to_rsp(a, SCRATCH, 16);
     mov_rr(a, 7, 4); // rdi = request
@@ -1896,6 +1965,156 @@ fn emit_invoke_call(
         );
     }
     Ok((offsets, temporary_bytes as u32))
+}
+
+/// Emit a same-owner child using only native frames on the successful edge.
+/// All slow checks run before admission; their published helper may return a
+/// completed generic result or authorize one generated admission after GC/yield.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_native_recursive_call(
+    a: &mut Asm,
+    data: &crate::t2::ir::InstData,
+    homes: &std::collections::HashMap<crate::t2::ir::Value, FramedHome>,
+    constants: &std::collections::HashMap<crate::t2::ir::Value, u64>,
+    outgoing_area: NativeValueArea,
+    control_home: FramedHome,
+    stack_home: FramedHome,
+    recursion: NativeRecursiveTransfer,
+    entry: egcl_rt::asm::Label,
+    child_frame_bytes: u32,
+) -> Result<Vec<CallReturn>, EmitError> {
+    let NativeValueArea::NativeStack(argument_base) = outgoing_area else {
+        return Err(EmitError::UnsupportedOp(0xFD));
+    };
+    let slow = a.label();
+    let commit = a.label();
+    let done = a.label();
+    for (index, value) in data.args.iter().enumerate() {
+        if let Some(&bits) = constants.get(value) { mov_imm64(a, RAX, bits as i64); }
+        else { load_home(a, RAX, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?, 0); }
+        store_home(a, FramedHome::Stack(argument_base + index as u32), RAX, 0);
+    }
+    // RDI/RAX/SCRATCH/R11 are not final value homes. The control pointer is raw,
+    // execution-owned, and follows a fiber across carrier migration.
+    load_home(a, 7, control_home, 0);
+    for (address, byte) in [(recursion.flags.gc_requested, true),
+        (recursion.flags.sigusr1_pending, true), (recursion.flags.posted_signal, false),
+        (recursion.flags.native_errors, false)] {
+        mov_imm64(a, SCRATCH, address as i64);
+        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
+        alu_r_imm(a, 7, RAX, 0); // cmp rax,0
+        a.jcc(Cc::Ne, slow);
+    }
+    mov_imm64(a, SCRATCH, recursion.flags.generation as i64);
+    load_mem64_disp(a, RAX, SCRATCH, 0);
+    cmp_mem64_disp8(a, RAX, 7, 32);
+    a.jcc(Cc::Ne, slow);
+    mov_imm64(a, SCRATCH, recursion.flags.signal_epoch as i64);
+    load_mem64_disp(a, RAX, SCRATCH, 0);
+    cmp_mem64_disp8(a, RAX, 7, 48);
+    a.jcc(Cc::Ne, slow);
+    load_mem64_disp(a, SCRATCH, 7, 0); // execution
+    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
+    cmp_mem64_disp8(a, RAX, 7, 40);
+    a.jcc(Cc::Ne, slow);
+    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+    mov_rr(a, SCRATCH, 7);
+    alu_r_imm(a, 0, SCRATCH, 64);
+    movzx_mem8(a, RAX, SCRATCH); // deadline_armed
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+    if recursion.flags.observe_forces_cold {
+        let no_observer = a.label();
+        load_mem64_disp(a, SCRATCH, 7, 80);
+        alu_r_imm(a, 7, SCRATCH, 0);
+        a.jcc(Cc::E, no_observer);
+        load_mem64_disp(a, RAX, SCRATCH, 0);
+        alu_r_imm(a, 7, RAX, 0);
+        a.jcc(Cc::Ne, slow);
+        a.bind(no_observer);
+    }
+    // An active MV state requires the runtime to clear both the flag and its
+    // vector. Do not rely on Rust Vec layout or leave stale secondary values.
+    load_mem64_disp(a, SCRATCH, 7, 24);
+    movzx_mem8(a, RAX, SCRATCH);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+    load_mem64_disp(a, SCRATCH, 7, 8); // *depth
+    a.extend_from_slice(&[0x8b, 0x02]); // mov eax,[rdx]
+    a.extend_from_slice(&[0x8b, 0x57, 56]); // mov edx,[rdi+56]
+    cmp_rr(a, RAX, SCRATCH); // zero-extended u32 values, signed compare is equivalent
+    a.jcc(Cc::Ge, slow);
+    mov_rr(a, RAX, 4);
+    alu_r_imm(a, 5, RAX, child_frame_bytes as i32);
+    mov_imm64(a, SCRATCH, recursion.flags.stack_limit as i64);
+    load_mem64_disp(a, SCRATCH, SCRATCH, 0);
+    cmp_rr(a, RAX, SCRATCH);
+    a.jcc(Cc::Le, slow);
+    a.jmp(commit);
+
+    a.bind(slow);
+    alu_r_imm(a, 5, 4, 48);
+    mov_imm64(a, RAX, i64::from(recursion.symbol));
+    store_to_rsp(a, RAX, 0);
+    mov_imm64(a, RAX, data.args.len() as i64);
+    store_to_rsp(a, RAX, 8);
+    mov_rr(a, RAX, 4);
+    alu_r_imm(a, 0, RAX, (argument_base * 8 + 48) as i32);
+    store_to_rsp(a, RAX, 16);
+    mov_imm64(a, RAX, 0);
+    store_to_rsp(a, RAX, 24); // no per-child managed activation
+    store_to_rsp(a, 7, 32); // retained control pointer
+    store_to_rsp(a, RAX, 40); // not admitted until cold checks complete
+    mov_rr(a, 7, 4);
+    mov_imm64(a, RAX, recursion.cold_veneer as i64);
+    a.extend_from_slice(&[0xff, 0xd0]);
+    let cold_return = CallReturn { return_offset: a.here(), stack_adjust: 48 };
+    load_from_rsp(a, SCRATCH, 40);
+    alu_r_imm(a, 0, 4, 48);
+    alu_r_imm(a, 7, SCRATCH, 1);
+    a.jcc(Cc::E, commit);
+    a.jmp(done); // RAX is the completed ordinary fallback result
+
+    a.bind(commit);
+    load_home(a, 7, control_home, 0);
+    load_mem64_disp(a, SCRATCH, 7, 8);
+    a.extend_from_slice(&[0x83, 0x02, 1]); // add dword ptr[rdx],1
+    if recursion.flags.instrument_entries {
+        load_mem64_disp(a, SCRATCH, 7, 72);
+        a.extend_from_slice(&[0x48, 0x83, 0x02, 1]); // increment execution-local usize
+    }
+    let profile_done = a.label();
+    let profile_loop = a.label();
+    load_mem64_disp(a, 11, 7, 16);
+    alu_r_imm(a, 7, 11, 0);
+    a.jcc(Cc::E, profile_done);
+    a.extend_from_slice(&[0x41, 0x8b, 0x03]); // mov eax,[r11]
+    a.bind(profile_loop);
+    a.extend_from_slice(&[0x3d, 0xff, 0xff, 0xff, 0xff]); // cmp eax,u32::MAX
+    a.jcc(Cc::E, profile_done);
+    a.extend_from_slice(&[0x8d, 0x50, 1]); // lea edx,[rax+1]
+    a.extend_from_slice(&[0xf0, 0x41, 0x0f, 0xb1, 0x13]); // lock cmpxchg [r11],edx
+    a.jcc(Cc::Ne, profile_loop);
+    a.bind(profile_done);
+    // A collecting slow path rewrites this contiguous native slice. Never read
+    // pre-helper volatile homes to form the child's arguments after it returns.
+    for (index, reg) in [1, 8, 9, 10].into_iter().take(data.args.len()).enumerate() {
+        load_home(a, reg, FramedHome::Stack(argument_base + index as u32), 0);
+    }
+    load_home(a, 6, stack_home, 0);
+    a.call(entry);
+    let direct_return = CallReturn { return_offset: a.here(), stack_adjust: 0 };
+    load_home(a, 7, control_home, 0);
+    load_mem64_disp(a, SCRATCH, 7, 8);
+    a.extend_from_slice(&[0x83, 0x2a, 1]); // sub dword ptr[rdx],1; RAX/MV untouched
+    a.bind(done);
+    if let Some(value) = data.results.first() {
+        store_home(a, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?, RAX, 0);
+    }
+    Ok(vec![cold_return, direct_return])
 }
 
 /// `(symbol-value sym)` — a global read. Lowers to `c2i_load_global(sym) -> rax`,
@@ -3176,8 +3395,9 @@ pub const TRANSFER_GLOBAL_LOAD_REQUEST: u64 = 13_u64 << 32;
 pub const TRANSFER_GLOBAL_STORE_REQUEST: u64 = 14_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
-/// normal return or completion of cold preparation. Arguments and shadow roots
-/// reside in the rooted owning activation, not in this unscanned request.
+/// normal return or completion of cold preparation. The args slice resides in
+/// the selected precisely mapped call-storage area, never in this raw request.
+/// `activation` still identifies the managed owning frame for runtime helpers.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[repr(C)]
 pub struct TransferCallRequest {
@@ -3197,6 +3417,99 @@ pub struct TransferDeoptRequest {
     pub words: *const u64,
     pub activation: *mut egcl_rt::value::EgclVal,
 }
+
+/// Stable execution-owned state shared by one retained code owner and its
+/// physical recursive frames. Raw pointers are refreshed by the runtime cold
+/// path; no movable Lisp value lives in this record.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct NativeRecursiveControl {
+    pub execution: *const egcl_rt::exec_context::LispExecutionContext,
+    pub depth: *mut u32,
+    pub invoke_count: *const std::sync::atomic::AtomicU32,
+    pub mv_active: *const bool,
+    pub expected_generation: u64,
+    pub seen_carrier: u64,
+    pub seen_signal_epoch: u64,
+    pub depth_limit: u32,
+    pub anchor_depth: u32,
+    pub deadline_armed: u8,
+    pub reserved: [u8; 7],
+    pub test_entries: *mut usize,
+    pub test_observer: *const usize,
+}
+
+/// Addresses of runtime-owned atomic flag cells. Generated reads use x86's
+/// acquire-load ordering; instrumentation is omitted entirely when disabled.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub struct NativeRecursiveFlags {
+    pub gc_requested: u64,
+    pub sigusr1_pending: u64,
+    pub posted_signal: u64,
+    pub native_errors: u64,
+    pub signal_epoch: u64,
+    pub generation: u64,
+    pub stack_limit: u64,
+    pub instrument_entries: bool,
+    pub observe_forces_cold: bool,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub struct NativeRecursiveTransfer {
+    pub symbol: u32,
+    pub arity: usize,
+    /// No-argument, nonallocating outer-entry initializer. Returns the current
+    /// retained activation's execution-owned NativeRecursiveControl pointer.
+    pub initialize: u64,
+    pub cold_veneer: u64,
+    pub flags: NativeRecursiveFlags,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct NativeRecursiveCallRequest {
+    pub call: TransferCallRequest,
+    pub control: *mut NativeRecursiveControl,
+    /// One means checks completed and generated code must commit exactly one
+    /// child entry; zero means the ordinary fallback result is already complete.
+    pub admitted: u64,
+}
+
+/// Cold continuation for a native frame. The runtime validates the raw kind
+/// against the exact native frame metadata and roots serialized values and
+/// original arguments before any allocation or yield.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct NativeFrameDeoptRequest {
+    pub n_scopes: u64,
+    pub n_words: u64,
+    pub words: *const u64,
+    pub entry_kind: u64,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    assert!(size_of::<NativeRecursiveControl>() == 88);
+    assert!(offset_of!(NativeRecursiveControl, depth) == 8);
+    assert!(offset_of!(NativeRecursiveControl, invoke_count) == 16);
+    assert!(offset_of!(NativeRecursiveControl, mv_active) == 24);
+    assert!(offset_of!(NativeRecursiveControl, expected_generation) == 32);
+    assert!(offset_of!(NativeRecursiveControl, seen_carrier) == 40);
+    assert!(offset_of!(NativeRecursiveControl, seen_signal_epoch) == 48);
+    assert!(offset_of!(NativeRecursiveControl, depth_limit) == 56);
+    assert!(offset_of!(NativeRecursiveControl, anchor_depth) == 60);
+    assert!(offset_of!(NativeRecursiveControl, deadline_armed) == 64);
+    assert!(offset_of!(NativeRecursiveControl, test_entries) == 72);
+    assert!(offset_of!(NativeRecursiveControl, test_observer) == 80);
+    assert!(size_of::<NativeRecursiveCallRequest>() == 48);
+    assert!(offset_of!(NativeRecursiveCallRequest, control) == 32);
+    assert!(offset_of!(NativeRecursiveCallRequest, admitted) == 40);
+    assert!(size_of::<NativeFrameDeoptRequest>() == 32);
+    assert!(offset_of!(NativeFrameDeoptRequest, entry_kind) == 24);
+};
 
 /// A generated self-call owns this record until ordinary return or cold
 /// retirement. Its precise Lisp frame belongs to the same retained code as
@@ -3276,8 +3589,19 @@ pub enum NativeRootPublication {
     PublishedHomes,
 }
 
+/// Storage for call-preserved tagged values and outgoing argument slices.
+/// Native stack storage requires exact published maps at every collecting edge;
+/// it does not by itself remove the caller's managed activation or change entry ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeCallStorage {
+    ManagedActivation,
+    NativeStack,
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
+    native_recursion: Option<NativeRecursiveTransfer>,
+    storage: NativeCallStorage,
     roots: NativeRootPublication,
     veneer: u64,
     named_veneers: Vec<(u32, u64)>,
@@ -3304,6 +3628,23 @@ pub fn emit_framed_transfers(
     activation_slots: u16,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     emit_framed_transfers_with_cleanup(f, call_veneer, activation_slots, None)
+}
+
+/// Emit helper calls whose tagged spill/outgoing areas use explicit storage.
+/// NativeStack callers must publish the returned native value maps while helpers
+/// run; the activation pointer still denotes the real managed entry frame.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn emit_framed_transfers_with_storage(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    storage: NativeCallStorage,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_transfer_function_with_storage(f, call_veneer, activation_slots, None, None,
+        None, None, &[], match storage {
+            NativeCallStorage::ManagedActivation => NativeRootPublication::ActivationShadows,
+            NativeCallStorage::NativeStack => NativeRootPublication::PublishedHomes,
+        }, storage, None)
 }
 
 /// Cleanup helpers take `(cleanup_bcp, resume_bcp, primary)` and return the
@@ -3483,10 +3824,68 @@ pub fn emit_framed_native_handlers_with_entries(
     named_veneers: &[(u32, u64)],
     roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_native_handlers_with_entries_and_storage(f, call_veneer, activation_slots,
+        save, complete, multiple_values, catch_landing, handler_landing, poll_veneer,
+        recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation)
+}
+
+/// Scope-free fixed-arity worker T2 entry with physical native recursion.
+/// Alternate OSR entries and local control ledgers retain the managed emitter
+/// until their entry and cold materialization contracts are supplied.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_native_recursion(
+    f: &Function, call_veneer: u64, activation_slots: u16,
+    save: u64, complete: u64, multiple_values: u64,
+    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
+    deopt_veneer: u64, named_veneers: &[(u32, u64)], recursion: NativeRecursiveTransfer,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    use crate::t2::ir::{AuxData, Opcode};
+    if f.is_variadic() || recursion.arity > 4 || recursion.arity != f.block(f.entry()).params.len()
+        || !f.osr_entries.is_empty() || recursion.initialize == 0 || recursion.cold_veneer == 0
+        || deopt_veneer == 0
+        || [recursion.flags.gc_requested, recursion.flags.sigusr1_pending,
+            recursion.flags.posted_signal, recursion.flags.native_errors,
+            recursion.flags.signal_epoch, recursion.flags.generation, recursion.flags.stack_limit]
+            .contains(&0)
+        || f.block_order().iter().flat_map(|&block| &f.block(block).insts).any(|&inst| {
+            let data = f.inst(inst);
+            matches!(data.opcode, Opcode::CleanupSave | Opcode::CleanupRestore | Opcode::CleanupLanding
+                | Opcode::CatchLanding | Opcode::HandlerLanding | Opcode::TakeValuesToLocals)
+                || (data.opcode == Opcode::Invoke && !matches!(data.aux, AuxData::CallTarget(_)))
+        })
+    {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    emit_transfer_function_with_storage(f, call_veneer, activation_slots,
+        Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
+        (poll_veneer != 0).then_some(poll_veneer), None, Some(deopt_veneer), named_veneers,
+        NativeRootPublication::PublishedHomes, NativeCallStorage::NativeStack, Some(recursion))
+}
+
+/// Explicit backing storage for the existing managed-entry helper contract.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_entries_and_storage(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    save: u64,
+    complete: u64,
+    multiple_values: u64,
+    catch_landing: u64,
+    handler_landing: u64,
+    poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
+    storage: NativeCallStorage,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
-    emit_transfer_function(
+    emit_transfer_function_with_storage(
         f,
         call_veneer,
         activation_slots,
@@ -3502,6 +3901,8 @@ pub fn emit_framed_native_handlers_with_entries(
         deopt_veneer,
         named_veneers,
         roots,
+        storage,
+        None,
     )
 }
 
@@ -3519,8 +3920,30 @@ fn emit_transfer_function(
     named_veneers: &[(u32, u64)],
     roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_transfer_function_with_storage(f, call_veneer, activation_slots, cleanup,
+        poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn emit_transfer_function_with_storage(
+    f: &Function,
+    call_veneer: u64,
+    activation_slots: u16,
+    cleanup: Option<CleanupEmission>,
+    poll_veneer: Option<u64>,
+    recursion: Option<RecursiveTransfer>,
+    deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)],
+    roots: NativeRootPublication,
+    storage: NativeCallStorage,
+    native_recursion: Option<NativeRecursiveTransfer>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
     if deopt_veneer == Some(0) || named_veneers.iter().any(|(_, entry)| *entry == 0) {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    if storage == NativeCallStorage::NativeStack && roots != NativeRootPublication::PublishedHomes {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
     let native_cleanups = matches!(cleanup, Some(CleanupEmission::Native { .. }));
@@ -3642,6 +4065,8 @@ fn emit_transfer_function(
         }
     }
     let mut transfers = TransferEmission {
+        native_recursion,
+        storage,
         roots,
         veneer: call_veneer,
         named_veneers: named_veneers.to_vec(),
@@ -3763,6 +4188,17 @@ fn emit_framed_inner(
         .is_some_and(|emission| emission.roots == NativeRootPublication::PublishedHomes);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let published_native_roots = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native_call_storage = transfers.as_ref()
+        .is_some_and(|emission| emission.storage == NativeCallStorage::NativeStack);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let native_call_storage = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native_recursion = transfers.as_ref().and_then(|emission| emission.native_recursion);
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native_frame_mode = native_recursion.is_some();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let native_frame_mode = false;
     if f.block_order().iter().any(|&b| {
         f.block(b).insts.iter().any(|&i| {
             !transfer_mode
@@ -4550,9 +4986,23 @@ fn emit_framed_inner(
         .unwrap_or(0);
     let call_arg_slots =
         u16::try_from(call_arg_slots).map_err(|_| EmitError::UnsupportedOp(0xFD))?;
-    let shadow_root_slots = root_shadow_slots
-        .checked_add(call_arg_slots)
+    let call_storage_slots = root_shadow_slots.checked_add(call_arg_slots)
         .ok_or(EmitError::UnsupportedOp(0xFD))?;
+    let spill_area = if native_call_storage {
+        let start = next_stack;
+        next_stack = next_stack.checked_add(u32::from(call_storage_slots))
+            .ok_or(EmitError::UnsupportedOp(0xFD))?;
+        NativeValueArea::NativeStack(start)
+    } else {
+        NativeValueArea::Activation(activation_slots.unwrap_or(0))
+    };
+    let outgoing_area = match spill_area {
+        NativeValueArea::Activation(base) => NativeValueArea::Activation(base.checked_add(root_shadow_slots)
+            .ok_or(EmitError::UnsupportedOp(0xFD))?),
+        NativeValueArea::NativeStack(base) => NativeValueArea::NativeStack(base.checked_add(u32::from(root_shadow_slots))
+            .ok_or(EmitError::UnsupportedOp(0xFD))?),
+    };
+    let shadow_root_slots = if native_call_storage { 0 } else { call_storage_slots };
     let needs_activation_frame = transfer_mode
         || f.block_order().iter().any(|&block| {
             f.block(block)
@@ -4575,11 +5025,25 @@ fn emit_framed_inner(
     };
     // Native callees resume their own deoptimization, including register-entry
     // recursion. Record whether this activation owns an EgclStack frame.
-    let entry_kind_home = (code_id != 0).then(|| {
+    let entry_kind_home = (code_id != 0 || native_frame_mode).then(|| {
         let home = FramedHome::Stack(next_stack);
         next_stack += 1;
         home
     });
+    let native_control_home = native_frame_mode.then(|| {
+        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+    });
+    let native_stack_home = native_frame_mode.then(|| {
+        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+    });
+    let native_argument_base = native_frame_mode.then(|| {
+        let base = next_stack;
+        next_stack += f.block(entry).params.len() as u32;
+        base
+    });
+    let native_arguments: Vec<_> = native_argument_base.into_iter().flat_map(|base|
+        f.block(entry).params.iter().enumerate().map(move |(index, &value)| (value, base + index as u32)))
+        .collect();
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
     let allocation_edits = machine.allocation_edits.len();
@@ -4596,10 +5060,11 @@ fn emit_framed_inner(
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
                                     // Variadic and activation-backed functions require the frame entry.
-    let has_reg_entry = !has_declared_params
+    if native_frame_mode && has_declared_params { return Err(EmitError::UnsupportedOp(0xFA)); }
+    let has_reg_entry = native_frame_mode || (!has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()
-        && f.block(entry).params.len() <= arg_regs.len();
+        && f.block(entry).params.len() <= arg_regs.len());
     // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
     // Every native caller must propagate a transfer raised by that fallback.
     let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
@@ -4730,6 +5195,18 @@ fn emit_framed_inner(
     if let Some(home) = frame_base_home {
         store_home(&mut a, home, 7 /* rdi */, 0);
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(recursion) = native_recursion {
+        store_home(&mut a, native_stack_home.unwrap(), 6, 0);
+        mov_imm64(&mut a, RAX, recursion.initialize as i64);
+        a.extend_from_slice(&[0xff, 0xd0]); // noncollecting, once per public entry
+        store_home(&mut a, native_control_home.unwrap(), RAX, 0);
+        load_home(&mut a, 7, frame_base_home.unwrap(), 0);
+        for (index, &(_, slot)) in native_arguments.iter().enumerate() {
+            mov_from_frame(&mut a, RAX, 7, index);
+            store_home(&mut a, FramedHome::Stack(slot), RAX, 0);
+        }
+    }
     for (i, &p) in f.block(entry).params.iter().enumerate() {
         let home = *homes.get(&p).ok_or(EmitError::UnsupportedOp(0xF2))?;
         match home {
@@ -4741,16 +5218,29 @@ fn emit_framed_inner(
         }
     }
     let compiled_entry;
+    let mut native_recursive_entry = None;
     if has_reg_entry {
         jump_to_shared_body(&mut a, block_label[&entry]); // skip register entry
         a.bind(reg_entry_label);
-        compiled_entry = a.here();
+        if native_frame_mode {
+            native_recursive_entry = Some(a.here());
+            compiled_entry = 0;
+        } else { compiled_entry = a.here(); }
         // Register entry: same prologue, but args arrive in the arg registers and
         // move into the (callee-saved) value registers; then fall into the body.
         emit_prologue(&mut a);
         if let Some(home) = entry_kind_home {
-            mov_imm64(&mut a, RAX, (code_id | (1 << 63)) as i64);
+            mov_imm64(&mut a, RAX, if native_frame_mode { 1 } else { (code_id | (1 << 63)) as i64 });
             store_home(&mut a, home, RAX, 0);
+        }
+        if native_frame_mode {
+            store_home(&mut a, native_control_home.unwrap(), 7, 0);
+            store_home(&mut a, native_stack_home.unwrap(), 6, 0);
+            mov_imm64(&mut a, RAX, 0);
+            store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
+            for (index, &(_, slot)) in native_arguments.iter().enumerate() {
+                store_home(&mut a, FramedHome::Stack(slot), arg_regs[index], 0);
+            }
         }
         let entry_moves = f
             .block(entry)
@@ -4778,20 +5268,21 @@ fn emit_framed_inner(
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
-        base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
+        arguments: native_arguments.clone(), native_frame_mode,
+        spill_area, base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
         native_slots: native_spill_slots,
     });
     let native_layout = NativeFrameLayout {
         native_slots: native_spill_slots,
-        activation_base_slot: match frame_base_home {
+        activation_base_slot: if native_frame_mode { None } else { match frame_base_home {
             Some(FramedHome::Stack(slot)) => Some(slot),
             None => None,
             _ => return Err(EmitError::UnsupportedOp(0xFD)),
-        },
-        activation_slots: activation_slots
+        } },
+        activation_slots: if native_frame_mode { 0 } else { activation_slots
             .unwrap_or(0)
             .checked_add(shadow_root_slots)
-            .ok_or(EmitError::UnsupportedOp(0xFD))?,
+            .ok_or(EmitError::UnsupportedOp(0xFD))? },
     };
     let resolved_by_source: HashMap<_, _> = resolved
         .iter()
@@ -4835,20 +5326,25 @@ fn emit_framed_inner(
                 )
             {
                 let mut shadow_roots = Vec::new();
+                let mut native_spills = Vec::new();
                 for (index, value) in loop_roots[&b].iter().enumerate() {
                     let location = homes[value].location().ok_or(EmitError::UnsupportedOp(0xFE))?;
                     if map.roots.contains(&location) {
-                        shadow_roots.push((location, activation_slots.unwrap()
-                            .checked_add(index as u16).ok_or(EmitError::UnsupportedOp(0xFE))?));
+                        match spill_area.location(index).map_err(|_| EmitError::UnsupportedOp(0xFE))? {
+                            NativeValueLocation::Activation(slot) => shadow_roots.push((location, slot)),
+                            NativeValueLocation::Stack(offset) => native_spills.push((location, offset as u32 / 8)),
+                            _ => unreachable!(),
+                        }
                     }
                 }
                 transfers.as_mut().unwrap().sites.push(crate::t2::transfer_sites::SysvTransferSite {
                     return_offset: call.return_offset.try_into().map_err(|_| EmitError::BadBranch)?,
                     stack_slots: native_spill_slots,
                     call_stack_adjust: call.stack_adjust,
-                    activation_slots: activation_slots.unwrap().checked_add(shadow_root_slots)
-                        .ok_or(EmitError::UnsupportedOp(0xFE))?,
+                    activation_slots: if native_frame_mode { 0 } else { activation_slots.unwrap().checked_add(shadow_root_slots)
+                        .ok_or(EmitError::UnsupportedOp(0xFE))? },
                     shadow_roots,
+                    native_spills,
                     map,
                 });
             }
@@ -4927,17 +5423,10 @@ fn emit_framed_inner(
                     })
                     .collect()
             });
-            if let (Some(roots), Some(frame_base), Some(base_slots)) =
+            if let (Some(roots), Some(frame_base), Some(_)) =
                 (roots, frame_base_home, activation_slots)
             {
-                emit_shadow_root_sync(
-                    &mut a,
-                    roots,
-                    &homes,
-                    frame_base,
-                    base_slots,
-                    shadow_root_slots,
-                )?;
+                emit_call_root_sync(&mut a, roots, &homes, frame_base, spill_area, shadow_root_slots)?;
             }
             let sync_offset = a.here();
             // Record the bytecode position this instruction reconstructs, at its
@@ -5008,23 +5497,27 @@ fn emit_framed_inner(
                         matches!(d.aux, AuxData::CallTarget(symbol) if symbol == r.symbol)
                             && d.args.len() == r.arity
                     });
-                    let (return_offsets, call_stack_adjust) = emit_invoke_call(
-                        &mut a,
-                        &d,
-                        &homes,
-                        &const_tagged,
-                        frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
-                        activation_slots.unwrap(),
-                        root_shadow_slots,
-                        veneer,
-                        recursion.map(|r| (r, frame_entry_label)),
-                    )?;
+                    let calls = if let Some(recursion) = transfer.native_recursion.filter(|r|
+                        matches!(d.aux, AuxData::CallTarget(symbol) if symbol == r.symbol)
+                            && d.args.len() == r.arity) {
+                        let child_bytes = u32::try_from(spill_bytes + usize::from(pad) * 8 + saved.len() * 8 + 8)
+                            .map_err(|_| EmitError::UnsupportedOp(0xFD))?;
+                        emit_native_recursive_call(&mut a, &d, &homes, &const_tagged, outgoing_area,
+                            native_control_home.unwrap(), native_stack_home.unwrap(), recursion,
+                            reg_entry_label, child_bytes)?
+                    } else {
+                        let (offsets, stack_adjust) = emit_invoke_call(&mut a, &d, &homes,
+                            &const_tagged, frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                            outgoing_area, veneer, recursion.map(|r| (r, frame_entry_label)))?;
+                        offsets.into_iter().map(|offset| CallReturn { return_offset: offset as usize, stack_adjust }).collect()
+                    };
                     let index = transfer_maps
                         .iter()
                         .position(|map| map.call == inst)
                         .ok_or(EmitError::UnsupportedOp(0xFD))?;
                     let map = transfer_maps.remove(index);
                     let mut shadow_roots = Vec::new();
+                    let mut native_spills = Vec::new();
                     for (index, value) in roots
                         .ok_or(EmitError::UnsupportedOp(0xFD))?
                         .iter()
@@ -5034,11 +5527,11 @@ fn emit_framed_inner(
                             .location()
                             .ok_or(EmitError::UnsupportedOp(0xFD))?;
                         if map.roots.contains(&location) {
-                            let slot = activation_slots
-                                .unwrap()
-                                .checked_add(index as u16)
-                                .ok_or(EmitError::UnsupportedOp(0xFD))?;
-                            shadow_roots.push((location, slot));
+                            match spill_area.location(index).map_err(|_| EmitError::UnsupportedOp(0xFD))? {
+                                NativeValueLocation::Activation(slot) => shadow_roots.push((location, slot)),
+                                NativeValueLocation::Stack(offset) => native_spills.push((location, offset as u32 / 8)),
+                                _ => unreachable!(),
+                            }
                         }
                     }
                     // Only values live at this call justify an unshadowed
@@ -5048,7 +5541,8 @@ fn emit_framed_inner(
                         .get(&inst)
                         .ok_or(EmitError::UnsupportedOp(0xFD))?;
                     for root in &map.roots {
-                        if shadow_roots.iter().any(|(location, _)| location == root) {
+                        if shadow_roots.iter().any(|(location, _)| location == root)
+                            || native_spills.iter().any(|(location, _)| location == root) {
                             continue;
                         }
                         let values: Vec<_> = point
@@ -5064,20 +5558,19 @@ fn emit_framed_inner(
                             return Err(EmitError::UnsupportedOp(0xFD));
                         }
                     }
-                    for return_offset in return_offsets {
-                        inst_calls.push(CallReturn {
-                            return_offset: return_offset as usize,
-                            stack_adjust: call_stack_adjust,
-                        });
+                    for call in calls {
+                        let return_offset = u32::try_from(call.return_offset).map_err(|_| EmitError::BadBranch)?;
+                        let call_stack_adjust = call.stack_adjust;
+                        inst_calls.push(call);
                         transfer.sites.push(crate::t2::transfer_sites::SysvTransferSite {
                             return_offset,
                             stack_slots: native_spill_slots,
                             call_stack_adjust,
-                            activation_slots: activation_slots
-                                .unwrap()
-                                .checked_add(shadow_root_slots)
-                                .ok_or(EmitError::UnsupportedOp(0xFD))?,
+                            activation_slots: if native_frame_mode { 0 } else { activation_slots
+                                .unwrap().checked_add(shadow_root_slots)
+                                .ok_or(EmitError::UnsupportedOp(0xFD))? },
                             shadow_roots: shadow_roots.clone(),
+                            native_spills: native_spills.clone(),
                             map: map.clone(),
                         });
                     }
@@ -5406,36 +5899,29 @@ fn emit_framed_inner(
             }
             if cfg!(all(target_arch = "x86_64", unix))
                 && !inst_calls.is_empty()
-                && let Some(activation_slots) = activation_slots
+                && activation_slots.is_some()
             {
                 let outgoing = if d.opcode == Opcode::Invoke || wide_call {
                     d.args.as_slice()
                 } else {
                     &[]
                 };
-                let outgoing_base = if outgoing.is_empty() {
-                    None
-                } else {
-                    Some(
-                        activation_slots
-                            .checked_add(root_shadow_slots)
-                            .ok_or(EmitError::UnsupportedOp(0xFD))?,
-                    )
-                };
+                let outgoing_base = (!outgoing.is_empty()).then_some(outgoing_area);
                 let point = resolved_by_source
                     .get(&inst)
                     .ok_or(EmitError::UnsupportedOp(0xFD))?;
                 let values = std::sync::Arc::new(
-                    NativeFrameValues::for_call(
+                    NativeFrameValues::for_call_in_area(
                         point.values(),
                         roots.ok_or(EmitError::UnsupportedOp(0xFD))?,
-                        activation_slots,
+                        spill_area,
                         outgoing,
                         outgoing_base,
                         native_layout,
                         None,
                         proven_immediate,
                     )
+                    .and_then(|map| map.with_native_arguments(&native_arguments, proven_immediate))
                     .map_err(|_| EmitError::UnsupportedOp(0xFD))?,
                 );
                 for call in &inst_calls {
@@ -5453,17 +5939,10 @@ fn emit_framed_inner(
                 store_home(&mut a, home, src, 0);
             }
             if let Some(roots) = roots {
-                if let (Some(frame_base), Some(base_slots)) = (frame_base_home, activation_slots) {
-                    emit_shadow_root_restore(
-                        &mut a,
-                        roots,
-                        restore_roots
-                            .as_ref()
-                            .expect("root-sync site has restore metadata"),
-                        &homes,
-                        frame_base,
-                        base_slots,
-                    )?;
+                if let (Some(frame_base), Some(_)) = (frame_base_home, activation_slots) {
+                    emit_call_root_restore(&mut a, roots,
+                        restore_roots.as_ref().expect("root-sync site has restore metadata"),
+                        &homes, frame_base, spill_area)?;
                 }
                 root_sync_sites.push(RootSyncSite {
                     code_offset: u32::try_from(sync_offset)
@@ -5879,7 +6358,8 @@ fn emit_framed_inner(
             load_home(
                 &mut a,
                 RAX,
-                frame_base_home.ok_or(EmitError::UnsupportedOp(0xFD))?,
+                (if native_frame_mode { entry_kind_home } else { frame_base_home })
+                    .ok_or(EmitError::UnsupportedOp(0xFD))?,
                 alloc as i32,
             );
             store_to_rsp(&mut a, RAX, request + 24);
@@ -6177,6 +6657,11 @@ fn emit_framed_inner(
     }
 
     Ok(FramedCode {
+        native_recursive_entry,
+        native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },
+        native_control_slot: native_control_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }),
+        native_argument_base,
+        native_argument_count: if native_frame_mode { f.block(entry).params.len() as u16 } else { 0 },
         native_calls: Some(native_calls),
         code,
         #[cfg(all(target_arch = "x86_64", windows))]
@@ -6543,8 +7028,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             FramedHome::Reg(12),
-            4,
-            2,
+            NativeValueArea::Activation(6),
             0x1234,
             Some((
                 RecursiveTransfer {
@@ -6613,8 +7097,7 @@ mod tests {
             &Default::default(),
             &Default::default(),
             FramedHome::Stack(0),
-            0,
-            0,
+            NativeValueArea::Activation(0),
             callee.as_ptr() as u64,
             None,
         )
@@ -8032,7 +8515,7 @@ mod poll_map_tests {
         let emit = |roots: &[crate::t2::ir::Value], shadow_slots| {
             let mut a = Asm::new();
             let (_, map) = emit_mapped_poll(&mut a, &values, roots, &homes.values,
-                &PollFrame { base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
+                &PollFrame { arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
                     raw_spill_start: 2, native_slots: 3 }, 0x12345678, false).unwrap();
             (a.finish().unwrap(), map)
         };
@@ -8069,6 +8552,15 @@ mod poll_map_tests {
 
     #[test]
     fn poll_relocates_tagged_home_without_scanning_raw_register_bits() {
+        exercise_poll_relocation(false);
+    }
+
+    #[test]
+    fn native_stack_poll_relocates_volatile_tagged_home_without_scanning_raw_bits() {
+        exercise_poll_relocation(true);
+    }
+
+    fn exercise_poll_relocation(native_storage: bool) {
         use crate::t2::x64_value_maps::NativeValueLocation;
         struct Check {
             map: std::sync::Arc<NativeFrameValues>,
@@ -8076,6 +8568,7 @@ mod poll_map_tests {
             raw: crate::t2::ir::Value,
             raw_bits: u64,
             observed: bool,
+            native_storage: bool,
         }
         thread_local! {
             static CHECK: std::cell::Cell<*mut Check> = const {
@@ -8107,6 +8600,22 @@ mod poll_map_tests {
             assert!(!raw.may_reference_heap());
             let before = read(&tagged.locations()[0]);
             assert_eq!(read(&raw.locations()[0]), check.raw_bits);
+            struct MappedRoots(Vec<*mut EgclVal>);
+            impl egcl_rt::gc::TraceHostRoots for MappedRoots {
+                fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+                    for &slot in &self.0 { visit(slot); }
+                }
+            }
+            let mut roots = MappedRoots(Vec::new());
+            if check.native_storage {
+                for location in check.map.gc_locations() {
+                    let NativeValueLocation::Stack(offset) = *location else {
+                        panic!("native volatile root must be in the native frame");
+                    };
+                    roots.0.push(unsafe { body_rsp.byte_offset(offset as isize) }.cast_mut().cast());
+                }
+            }
+            egcl_rt::rooted_ref!(_native_roots = &mut roots);
             HeapCollector::new().minor_gc().unwrap();
             assert_ne!(
                 read(&tagged.locations()[0]),
@@ -8171,9 +8680,11 @@ mod poll_map_tests {
                 &[tagged],
                 &homes.values,
                 &PollFrame {
+                    arguments: Vec::new(), native_frame_mode: false,
+                    spill_area: if native_storage { NativeValueArea::NativeStack(3) } else { NativeValueArea::Activation(1) },
                     base: FramedHome::Stack(1),
                     activation_slots: 1,
-                    shadow_slots: 1,
+                    shadow_slots: u16::from(!native_storage),
                     raw_spill_start: 2,
                     native_slots: 5,
                 },
@@ -8202,6 +8713,7 @@ mod poll_map_tests {
                 raw,
                 raw_bits: original,
                 observed: false,
+                native_storage,
             };
             CHECK.with(|slot| slot.set(&mut check));
             let returned = run(activation.as_mut_ptr().cast(), original);

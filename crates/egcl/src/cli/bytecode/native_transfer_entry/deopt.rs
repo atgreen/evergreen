@@ -313,6 +313,345 @@ unsafe fn validate_guard_stream(
     Ok(bcp)
 }
 
+/// The top deoptimizing native map deliberately omits its old SSA homes.
+/// Keep the serialized tagged payload and immutable argument copies rooted in
+/// place until the resumed interpreter owns its values. Header words are raw.
+struct NativeDeoptRoots {
+    payload: *mut EgclVal,
+    payload_len: usize,
+    arguments: *mut EgclVal,
+    argument_count: usize,
+}
+
+impl egcl_rt::gc::TraceHostRoots for NativeDeoptRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        for index in 0..self.payload_len {
+            visit(unsafe { self.payload.add(index) });
+        }
+        for index in 0..self.argument_count {
+            visit(unsafe { self.arguments.add(index) });
+        }
+    }
+}
+
+/// A native child acquires a managed frame only on this cold continuation.
+/// T0 normally pops it; errors and intercepted Rust panics also retire it.
+/// Unlike RestoreNativeFrame, never recreate a child which has no native owner.
+struct RetireNativeDeoptFrame {
+    fp: *const Frame,
+    sp: *const u8,
+}
+
+impl Drop for RetireNativeDeoptFrame {
+    fn drop(&mut self) {
+        let stack = egcl_rt::current_stack();
+        while stack.fp() != self.fp {
+            assert!(
+                !stack.fp().is_null(),
+                "native child deopt crossed its anchor"
+            );
+            stack.pop_frame();
+        }
+        assert_eq!(
+            stack.sp(),
+            self.sp,
+            "native child deopt changed its anchor extent"
+        );
+    }
+}
+
+pub(super) unsafe extern "C" fn resume_native_guard(
+    request: *mut u8,
+    out: *mut NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || resume_native_guard_unpublished(request, out));
+    }
+}
+
+unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
+    use egcl_compiler::t2::emit::NativeFrameDeoptRequest;
+    use egcl_compiler::t2::x64_calls::NativeCallValues;
+    const _: () = assert!(std::mem::size_of::<NativeFrameDeoptRequest>() == 32);
+
+    let context = CAPTURE.with(Cell::get);
+    let mut managed_outcome_written = false;
+    let result = guard_c2i(|| {
+        let boundary = root_publication::ACTIVE.with(Cell::get);
+        if context.is_null() || boundary.is_null() {
+            return Err(invalid_capture());
+        }
+        // Copy geometry, never retain a mutable GC-scanned context borrow.
+        let (owner, cursor, bounds) = unsafe {
+            (
+                (*boundary).owner,
+                (*boundary).cursor,
+                (*boundary).bounds.clone(),
+            )
+        };
+        if owner.is_null()
+            || owner != unsafe { (*context).owner }
+            || unsafe { !(*context).recursive.is_null() }
+        {
+            return Err(invalid_capture());
+        }
+        let code = unsafe { &*owner };
+        let base = code.code.as_ptr() as usize;
+        let offset = cursor.pc.checked_sub(base).ok_or_else(invalid_capture)?;
+        if !code.sites.is_deopt_return(base, cursor.pc) {
+            return Err(invalid_capture());
+        }
+        let native_slots = match code._native_calls.value_map(offset) {
+            Some(NativeCallValues::Deoptimizing { native_slots }) => *native_slots,
+            _ => return Err(invalid_capture()),
+        };
+        let read_word = |address: usize| -> Option<usize> {
+            if address % 8 != 0 || address < bounds.start || address.checked_add(8)? > bounds.end {
+                return None;
+            }
+            Some(unsafe { (address as *const usize).read() })
+        };
+        let body_sp = code
+            ._native_calls
+            .unwind(base, &cursor, bounds.clone(), read_word)
+            .and_then(|step| step.body_sp)
+            .ok_or_else(invalid_capture)?;
+        let native_word = |slot: u32| -> Option<usize> {
+            if slot >= native_slots {
+                return None;
+            }
+            body_sp.checked_add(usize::try_from(slot).ok()?.checked_mul(8)?)
+        };
+        let kind_address = native_word(code.native_entry_kind_slot.ok_or_else(invalid_capture)?)
+            .ok_or_else(invalid_capture)?;
+        let control_address = native_word(code.native_control_slot.ok_or_else(invalid_capture)?)
+            .ok_or_else(invalid_capture)?;
+        let control = unsafe { (*context).native_recursive.as_ref() }
+            .map(|control| control as *const _ as usize)
+            .ok_or_else(invalid_capture)?;
+        if kind_address == control_address || read_word(control_address) != Some(control) {
+            return Err(invalid_capture());
+        }
+        let in_temporary = |start: usize, bytes: usize| {
+            start % 8 == 0
+                && start >= cursor.call_sp
+                && start.checked_add(bytes).is_some_and(|end| end <= body_sp)
+        };
+        let request_address = request as usize;
+        if !in_temporary(
+            request_address,
+            std::mem::size_of::<NativeFrameDeoptRequest>(),
+        ) {
+            return Err(invalid_capture());
+        }
+        // No request field is read until its whole object is proven owned.
+        let request = unsafe { request.cast::<NativeFrameDeoptRequest>().read() };
+        if request.entry_kind > 1
+            || read_word(kind_address) != usize::try_from(request.entry_kind).ok()
+            || request.n_scopes != 1
+            || request.n_words < 4
+            || request.n_words > 4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack)
+        {
+            return Err(invalid_capture());
+        }
+        let words_len = usize::try_from(request.n_words).map_err(|_| invalid_capture())?;
+        let words_bytes = words_len.checked_mul(8).ok_or_else(invalid_capture)?;
+        let words_address = request.words as usize;
+        if !in_temporary(words_address, words_bytes)
+            || words_address
+                .checked_add(words_bytes)
+                .is_none_or(|end| end > request_address)
+        {
+            return Err(invalid_capture());
+        }
+        let count = usize::from(code.native_argument_count);
+        let argument_slot = code.native_argument_base.ok_or_else(invalid_capture)?;
+        if count != usize::from(code.body.arity)
+            || argument_slot
+                .checked_add(u32::from(code.native_argument_count))
+                .is_none_or(|end| end > native_slots)
+            || !fixed_tagged_parameters(&code.body)
+            || !scope_free_native_body(&code.body, true)
+        {
+            return Err(invalid_capture());
+        }
+        let arguments_address = body_sp
+            .checked_add(argument_slot as usize * 8)
+            .ok_or_else(invalid_capture)?;
+        for index in 0..count {
+            let address = arguments_address
+                .checked_add(index * 8)
+                .ok_or_else(invalid_capture)?;
+            if address == kind_address || address == control_address || read_word(address).is_none()
+            {
+                return Err(invalid_capture());
+            }
+        }
+        let frame = unsafe { (*context).frame };
+        let stack = egcl_rt::current_stack();
+        if frame.is_null()
+            || stack.fp() != frame
+            || !std::ptr::eq(unsafe { (*boundary).stack }, stack)
+            || unsafe {
+                !std::ptr::eq((*frame).code_info, code.code_info) || !(*frame).return_pc.is_null()
+            }
+        {
+            return Err(invalid_capture());
+        }
+        let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
+        let adapted = TransferDeoptRequest {
+            n_scopes: request.n_scopes,
+            n_words: request.n_words,
+            words: request.words,
+            activation: unsafe { frame.add(1).cast() },
+        };
+        let bcp = unsafe { validate_guard_stream(&adapted, code, &*frame, &metadata) }?;
+        let active = code
+            .control_scopes
+            .before(bcp)
+            .ok_or_else(invalid_capture)?;
+        if active.iter().any(|scope| {
+            scope.ownership != Ownership::Local
+                || !matches!(
+                    scope.kind,
+                    ScopeKind::Block {
+                        register: false,
+                        ..
+                    }
+                )
+        }) {
+            return Err(invalid_capture());
+        }
+        let mut roots = NativeDeoptRoots {
+            payload: unsafe { request.words.add(4).cast_mut().cast() },
+            payload_len: words_len - 4,
+            arguments: arguments_address as *mut EgclVal,
+            argument_count: count,
+        };
+        egcl_rt::rooted_ref!(_native_payload = &mut roots);
+        // Preserve the existing all-or-unavailable debugger policy for mutated
+        // parameter bindings; immutable native copies are still rooted above.
+        let recipe = native_debug::arguments(&code.body, false);
+        egcl_rt::rooted!(
+            arguments = if recipe
+                .as_ref()
+                .is_some_and(|recipe| recipe.parameters.iter().all(|(_, slot)| slot.is_some()))
+            {
+                Some(unsafe { std::slice::from_raw_parts(roots.arguments, count) }.to_vec())
+            } else {
+                None
+            }
+        );
+        if request.entry_kind == 0 {
+            unsafe {
+                resume_guard_with_arguments(
+                    (&adapted as *const TransferDeoptRequest).cast_mut().cast(),
+                    out,
+                    Some(arguments.take()),
+                );
+            }
+            managed_outcome_written = true;
+            return Ok(NIL);
+        }
+        let env = NATIVE_ENV.with(Cell::get);
+        if env.is_null() {
+            return Err(invalid_capture());
+        }
+        egcl_rt::rooted!(callable = unsafe { (*frame).function });
+        if !egcl_rt::function::is_interpreted_function(*callable) {
+            return Err(invalid_capture());
+        }
+        let mut state = OuterResumeState {
+            debug_call: None,
+            handlers: Vec::new(),
+            cleanup_conts: Vec::new(),
+            dyn_binds: Vec::new(),
+        };
+        state
+            .handlers
+            .try_reserve(active.len())
+            .map_err(|_| EgclError::Oom)?;
+        for scope in active {
+            let ScopeKind::Block {
+                id,
+                resume_bcp,
+                register: false,
+            } = scope.kind
+            else {
+                unreachable!()
+            };
+            state.handlers.push(Handler::Block {
+                block_id: id,
+                token: String::new(),
+                resume_bcp,
+                sp_restore: scope.sp_restore,
+            });
+        }
+        egcl_rt::rooted!(state = Some(state));
+        let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
+        let _retire = RetireNativeDeoptFrame {
+            fp: stack.fp(),
+            sp: stack.sp(),
+        };
+        let child = stack
+            .push_frame(
+                *callable,
+                std::ptr::null(),
+                code.body.num_slots(),
+                FLAG_CALL,
+            )
+            .ok_or_else(|| {
+                EgclError::StackOverflow(
+                    egcl_rt::current_fiber_id()
+                        .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+                )
+            })?;
+        let (scopes, metadata) = materialize_t2_deopt_scopes(
+            request.n_scopes,
+            request.n_words,
+            request.words,
+            Some(child),
+            Some(metadata),
+        )
+        .map_err(|message| EgclError::Internal(message.into()))?;
+        note_segment_deopt(code);
+        if let Some(arguments) = arguments.as_ref() {
+            state
+                .as_mut()
+                .expect("native child resume state")
+                .debug_call = Some(unsafe {
+                egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, child)
+            });
+        }
+        resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
+    });
+    if managed_outcome_written && result.is_ok() {
+        return;
+    }
+    let outcome = match result {
+        Ok(value) => NativeOutcome {
+            value,
+            exit: NativeExit::Returned,
+        },
+        Err(error) => {
+            stash_native_error(error);
+            if !context.is_null() {
+                unsafe {
+                    (*context).completed_deopt = true;
+                }
+            }
+            NativeOutcome {
+                value: NIL,
+                exit: NativeExit::Transfer,
+            }
+        }
+    };
+    unsafe {
+        out.write(outcome);
+    }
+}
+
 pub(super) unsafe extern "C" fn resume_guard(
     request: *mut u8,
     out: *mut NativeOutcome,
@@ -322,6 +661,19 @@ pub(super) unsafe extern "C" fn resume_guard(
 }
 
 unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
+    unsafe {
+        resume_guard_with_arguments(request, out, None);
+    }
+}
+
+// The outer option distinguishes legacy managed recipes from an explicit
+// native-frame snapshot, whose inner None means arguments are unavailable.
+unsafe fn resume_guard_with_arguments(
+    request: *mut u8,
+    out: *mut NativeOutcome,
+    mut native_arguments: Option<Option<Vec<EgclVal>>>,
+) {
+    egcl_rt::rooted_ref!(_native_arguments = &mut native_arguments);
     let request = unsafe { &*request.cast::<TransferDeoptRequest>() };
     let context = CAPTURE.with(Cell::get);
     let owner = unsafe { (*context).owner };
@@ -365,8 +717,9 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         // Native recipes describe proven original arguments before the deopt
         // stream replaces dead locals. Keep a traced copy until a managed
         // debug-call record owns it; unavailable native arguments stay unknown.
-        egcl_rt::rooted!(original_arguments = unsafe {
-            (&*header.code_info).original_arguments((*frame).locals())
+        egcl_rt::rooted!(original_arguments = match native_arguments.take() {
+            Some(arguments) => arguments,
+            None => unsafe { (&*header.code_info).original_arguments((*frame).locals()) },
         });
         // Resumed Lisp owns the frame; it must not borrow the abandoned
         // native capture. Restore that capture only after restoring the frame.
@@ -466,6 +819,7 @@ unsafe fn prepare_completed_deopt_unpublished(capture: *mut SysvTransferCapture)
         }
     }
     context.completed_deopt = false;
+    native_frames::retire_children(context);
     context.recursive_escape = true;
     prepare_escape(context);
     capture.request = std::ptr::from_mut(&mut context.dispatch).cast();
