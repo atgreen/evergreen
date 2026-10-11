@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.0.6 - 2026-10-11
+
+This release also includes the [0.0.5 changes](https://github.com/atgreen/evergreen/blob/v0.0.6/CHANGELOG.md#005---2026-10-10).
+
 - Speed up T2 native recursion on Linux x86-64 with machine-stack self-calls,
   cheaper returns, fewer multiple-value resets, and correct fiber stack limits.
   A release-build `fib(32)` comparison improved from 1.04 s to 0.21–0.23 s
