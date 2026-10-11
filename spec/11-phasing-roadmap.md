@@ -264,6 +264,11 @@ Suggested implementation order:
    observed relocation, guard failure in caller and callee with side effects
    executed exactly once, definition replacement, tier changes, mixed native
    and interpreter fallback, zero/one/many values, and fiber/stack boundaries.
+   Include an outer live object held in a callee-preserved register that inner
+   callees save/reuse, a tail transfer that overwrites overflow arguments while
+   an outer value remains live in a separate home, and a wrong-arity entry whose
+   condition construction triggers relocation of supplied arguments. Check a
+   zero-value return followed by an ordinary call normalizes active MV state.
 
 Acceptance evidence should include disassembly showing register arguments and
 no per-call managed frame construction on the fast edge, exact-PC metadata for
