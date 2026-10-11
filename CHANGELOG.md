@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Accept open and closed file streams in `TRUENAME` and pathname coercion,
+  retaining their opening path when pathname defaults change
+  ([#252](https://github.com/atgreen/evergreen/pull/252)).
+
 - Preserve the identity of saved builtin function objects when installed
   in user-defined function cells, including after replacement and restoration
   ([#251](https://github.com/atgreen/evergreen/pull/251)).
