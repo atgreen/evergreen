@@ -14383,6 +14383,7 @@ fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
             cmd.env(k, v);
         }
         let output = cmd
+            .env_remove("EGCL_STACK_SIZE")
             .args(["--eval", program])
             .output()
             .expect("failed to run egcl");
@@ -14410,9 +14411,17 @@ fn deep_self_recursion_signals_rather_than_running_off_the_stack() {
         (dotimes (i 300) (fib 15) (deep 100)) \
         (cl:format t \"~S~%\" (list (fib 25) (deep 1000) (deep 50000))))";
     let output = egcl_bin()
+        .env_remove("EGCL_STACK_SIZE")
         .args(["--eval", shallow])
         .output()
         .expect("failed to run egcl");
+    assert!(
+        output.status.success(),
+        "shallow recursion failed: status={}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout)
             .lines()

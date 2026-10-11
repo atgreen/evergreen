@@ -30,7 +30,8 @@ pub struct RuntimeConfig {
     pub nursery_size: usize,
     /// Per-thread TLAB size (default: 2 MB).
     pub tlab_size: usize,
-    /// CL stack size per green thread (default: 512 KiB).
+    /// CL stack size per green thread (4 MiB on Linux x86-64 and s390x,
+    /// 512 KiB elsewhere).
     pub stack_size: usize,
     /// OS worker thread count (default: nproc).
     pub num_workers: usize,

@@ -126,10 +126,12 @@ fn environment_variables_map_to_runtime_config_and_defaults() {
             assert_eq!(cfg.heap_size, 512 * 1024 * 1024);
             assert_eq!(cfg.nursery_size, 64 * 1024 * 1024);
             assert_eq!(cfg.tlab_size, 2 * 1024 * 1024);
-            // s390x fibers default to 4 MiB (spec §2.3, bliss-hfdq2 / #102):
-            // its frames are larger and the 512 KiB default overflowed in
-            // ordinary nested evaluation.
-            let default_stack = if cfg!(target_arch = "s390x") {
+            // Linux x86-64 mapped frames and s390x's earlier native fallback
+            // need managed stack capacity for ordinary deep recursion.
+            let default_stack = if cfg!(any(
+                target_arch = "s390x",
+                all(target_arch = "x86_64", target_os = "linux")
+            )) {
                 4 * 1024 * 1024
             } else {
                 512 * 1024

@@ -145,28 +145,27 @@ impl FiberContinuation {
 /// Maximum number of TLS slots per fiber.
 pub const MAX_TLS: usize = 4096;
 
-/// Default CL stack size (512 KiB; 4 MiB on s390x).
+/// Default CL stack size: 4 MiB on Linux x86-64 and s390x, 512 KiB elsewhere.
 ///
-/// The CL stack bounds recursion depth once the native stack reserve is
-/// spent: a self-recursive function's T2 code recurses natively until the
-/// published native stack limit, then every deeper call goes through c2i and
-/// pushes a CL activation here. On x86-64 a T2 frame is ~64 bytes, so the
-/// 6 MiB reserve holds ~98 000 frames and `(deep 50000)` never touches this
-/// stack; on s390x the ELF ABI's 160-byte register save area plus the
-/// home-based emitter's spill words make the same frame ~430 bytes, the
-/// reserve is spent after ~14 000, and the rest of the recursion lands here
-/// at ~56 bytes per activation. Measured on a z17 (bliss-hfdq2): with 512 KiB
-/// every tier signalled STORAGE-CONDITION at ~9 000-28 000 frames where
-/// x86-64 computes 50 000; 4 MiB gives s390x the same reach. The mapping is
-/// lazy, so untouched stack costs no resident memory.
-pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(target_arch = "s390x") {
+/// Linux x86-64 mapped native calls retain precise frames on this stack and
+/// fall back to flat bytecode execution at the native depth cap. Both paths
+/// therefore need managed stack capacity for ordinary deep recursion. On
+/// s390x, larger native frames exhaust the machine stack reserve sooner and
+/// the remaining bytecode activations likewise use this stack. Four MiB lets
+/// `(deep 50000)` compute while excessive recursion still signals
+/// STORAGE-CONDITION. The mapping is lazy: untouched pages cost no resident
+/// memory, and EGCL_STACK_SIZE remains an explicit override.
+pub(crate) const DEFAULT_STACK_SIZE: usize = if cfg!(any(
+    target_arch = "s390x",
+    all(target_arch = "x86_64", target_os = "linux")
+)) {
     4 * 1024 * 1024
 } else {
     512 * 1024
 };
 
 /// Usable `EgclStack` size for a fiber, honouring `EGCL_STACK_SIZE`
-/// (accepts a raw byte count or a `k`/`m`/`g` suffix), defaulting to 512 KiB.
+/// (accepts a raw byte count or a `k`/`m`/`g` suffix), using the platform default.
 ///
 /// Deep interpreted recursion is bounded by this size once CL activations live
 /// on the `EgclStack` (bliss-nmq): overflow raises `STORAGE-CONDITION` (R2.20).
