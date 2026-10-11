@@ -1303,6 +1303,7 @@ pub fn emit_framed_with_runtime(
     }
 
     Ok(FramedCode {
+        ordinary_entry: None,
         native_recursive_entry: None,
         native_entry_kind_slot: None,
         native_control_slot: None,

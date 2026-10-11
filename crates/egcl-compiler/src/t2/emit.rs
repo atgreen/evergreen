@@ -143,6 +143,12 @@ use crate::t2::slot_map;
 use crate::t2::slot_map::ConversionKind;
 use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86};
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_leaf.rs"]
+mod ordinary_leaf;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
+
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
 mod frame_tests;
@@ -649,6 +655,9 @@ fn float_operand_to_xmm(
 ///   are already in the argument registers `[rcx, r8, r9, r10]` (arg0..arg3), so
 ///   a compiled caller skips the frame load entirely. Result in rax.
 pub struct FramedCode {
+    /// Distinct ordinary Lisp ABI entry; never a legacy or managed adapter.
+    /// Installation also requires validated runtime admission and ownership.
+    pub ordinary_entry: Option<usize>,
     /// Private same-owner native entry; requires the retained control pointer.
     pub native_recursive_entry: Option<usize>,
     /// Raw word slots, relative to body RSP, never collector roots.
@@ -3248,6 +3257,8 @@ pub fn emit_framed(
         EnvironmentCalls::default(),
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
     )
 }
 
@@ -3441,6 +3452,8 @@ pub fn emit_framed_with_direct_natives(
         named_calls,
         code_id,
         environment,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
     )
@@ -4220,6 +4233,7 @@ fn emit_transfer_function_with_storage(
         0,
         EnvironmentCalls::default(),
         Some(&mut transfers),
+        None,
     )?;
     let mut landings = Vec::new();
     let mut catch_landings = Vec::new();
@@ -4291,6 +4305,7 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))] mut transfers: Option<
         &mut TransferEmission,
     >,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary: Option<OrdinaryLispEntryOptions>,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
     use crate::t2::ir::{
@@ -4301,10 +4316,14 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_returns = transfers.as_ref().is_some_and(|emission|
+    let native_returns = ordinary.is_some() || transfers.as_ref().is_some_and(|emission|
         matches!(emission.cleanup, Some(CleanupEmission::Native { .. })));
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let native_returns = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_mode = ordinary.is_some();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_mode = false;
     let single_returns = if native_returns {
         crate::t2::opt_clear_mv::single_value_state(f, true)
     } else { HashSet::new() };
@@ -4687,8 +4706,11 @@ fn emit_framed_inner(
     // location for its entire reported live range remains register-resident;
     // any split range gets a stable spill home consumed by the framed templates.
     let mut machine = crate::t2::lower::lower(f);
-    crate::t2::regalloc::allocate_framed(&mut machine)
-        .map_err(|error| EmitError::RegAlloc(format!("{error:?}")))?;
+    if ordinary_mode {
+        crate::t2::regalloc::allocate_framed_ordinary(&mut machine)
+    } else {
+        crate::t2::regalloc::allocate_framed(&mut machine)
+    }.map_err(|error| EmitError::RegAlloc(format!("{error:?}")))?;
     if !machine.insts.is_empty() && machine.inst_allocations.len() != machine.insts.len() {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -4886,6 +4908,9 @@ fn emit_framed_inner(
             || fused.iter().any(|&i| f.inst(i).results.contains(&value))
     })
     .map_err(|_| EmitError::UnsupportedOp(0xFA))?;
+    if ordinary_mode && layout.values.values().any(|home| *home == FramedHome::Reg(13)) {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     // Inserted polls are not allocator calls. A value needed only for poll
     // recovery may therefore keep a caller-saved register even though the
     // transfer capture, and a later landing write-back, cannot access it.
@@ -5272,10 +5297,11 @@ fn emit_framed_inner(
             .into_iter()
             .collect();
         s.sort_unstable();
+        if ordinary_mode { s.insert(0, 5); } // RBP is the first saved word.
         s
     };
     #[cfg(not(all(target_arch = "x86_64", windows)))]
-    let pad = has_calls && saved.len() % 2 == 0;
+    let pad = (has_calls || ordinary_mode) && saved.len() % 2 == 0;
     #[cfg(all(target_arch = "x86_64", windows))]
     let windows_frame = WindowsFrame::new(&saved, spill_bytes)?;
     let emit_prologue = |a: &mut Asm| {
@@ -5287,6 +5313,7 @@ fn emit_framed_inner(
         {
             for &r in &saved {
                 push_reg(a, r);
+                if ordinary_mode && r == 5 { mov_rr(a, 5, 4); } // mov rbp, rsp
             }
             if pad {
                 a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
@@ -5303,12 +5330,21 @@ fn emit_framed_inner(
         windows_frame.epilogue(a);
         #[cfg(not(all(target_arch = "x86_64", windows)))]
         {
-            if spill_bytes != 0 {
-                a.extend_from_slice(&[0x48, 0x81, 0xC4]);
-                a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
-            }
-            if pad {
-                a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+            if ordinary_mode {
+                let bytes = spill_bytes + usize::from(pad) * 8;
+                if bytes != 0 {
+                    // LEA retires storage without disturbing the result carry.
+                    a.extend_from_slice(&[0x48, 0x8D, 0xA4, 0x24]);
+                    a.extend_from_slice(&(bytes as i32).to_le_bytes());
+                }
+            } else {
+                if spill_bytes != 0 {
+                    a.extend_from_slice(&[0x48, 0x81, 0xC4]);
+                    a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
+                }
+                if pad {
+                    a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+                }
             }
             for &r in saved.iter().rev() {
                 pop_reg(a, r);
@@ -5410,6 +5446,31 @@ fn emit_framed_inner(
             a.here()
         };
     }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_entry = if let Some(options) = ordinary {
+        jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
+        let offset = a.here();
+        let accepted = a.label();
+        alu_r_imm(&mut a, 7, 1, options.arity as i32); // cmp rcx, supplied arity
+        a.jcc(Cc::E, accepted);
+        mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
+        a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+        a.bind(accepted);
+        emit_prologue(&mut a);
+        if options.arity == 4 {
+            mov_mem64_disp8(&mut a, 11, 5, 16); // arg4 follows saved RBP + return PC
+        }
+        let incoming = [7, 6, 2, 11]; // RDI, RSI, RDX, staged stack argument
+        let moves = f.block(entry).params.iter().enumerate().map(|(index, value)| {
+            Ok((*homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                HomeMoveSrc::Home(FramedHome::Reg(incoming[index]))))
+        }).collect::<Result<Vec<_>, EmitError>>()?;
+        parallel_home_move(&mut a, &moves);
+        Some(offset)
+    } else { None };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_entry = None;
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
@@ -6329,33 +6390,39 @@ fn emit_framed_inner(
         a.push(0xC3); // ret
     }
 
-    // Deopt stub: restore callee-saved (so the caller's registers are intact),
-    // then align rsp and call c2i_deopt, unwind the alignment, return (the value is
-    // ignored on deopt). After the epilogue rsp%16==8 (as at entry), so one
-    // sub/add aligns the call.
     a.bind(deopt);
-    if !cfg!(windows) {
-        emit_epilogue(&mut a);
-        a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
-    }
-    mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
-                                                 // Deopt stubs have their own temporary stack layout and return immediately;
-                                                 // they must finish that cleanup instead of taking the normal transfer exit.
-    let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
-    if !cfg!(windows) {
-        call.stack_adjust += 8;
-        native_value_maps.insert(call.return_offset, NativeCallValues::Retired);
-    }
-    native_calls.push(call.site(
-        NativeCallOrigin::RestartDeopt,
-        if cfg!(windows) { NativeStackBase::Body } else { NativeStackBase::Entry },
-    ));
-    if cfg!(windows) {
-        emit_epilogue(&mut a);
+    if ordinary_mode {
+        // The admitted leaf subset cannot deoptimize. Keep its artifact free
+        // of unreachable runtime calls and refuse any newly introduced edge.
+        if a.label_is_referenced(deopt) { return Err(EmitError::UnsupportedOp(0xF4)); }
     } else {
-        a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+        // Deopt stub: restore callee-saved (so the caller's registers are intact),
+        // then align rsp and call c2i_deopt, unwind the alignment, return (the value is
+        // ignored on deopt). After the epilogue rsp%16==8 (as at entry), so one
+        // sub/add aligns the call.
+        if !cfg!(windows) {
+            emit_epilogue(&mut a);
+            a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]); // sub rsp, 8
+        }
+        mov_imm64(&mut a, 0, c2i_deopt_addr as i64); // mov rax, c2i_deopt
+                                                     // Deopt stubs have their own temporary stack layout and return immediately;
+                                                     // they must finish that cleanup instead of taking the normal transfer exit.
+        let mut call = emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, None);
+        if !cfg!(windows) {
+            call.stack_adjust += 8;
+            native_value_maps.insert(call.return_offset, NativeCallValues::Retired);
+        }
+        native_calls.push(call.site(
+            NativeCallOrigin::RestartDeopt,
+            if cfg!(windows) { NativeStackBase::Body } else { NativeStackBase::Entry },
+        ));
+        if cfg!(windows) {
+            emit_epilogue(&mut a);
+        } else {
+            a.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+        }
+        a.push(0xC3); // ret
     }
-    a.push(0xC3); // ret
 
     // Precise per-guard deopt stubs (bliss-mba). Each serialises every logical
     // FrameState scope — outermost to innermost, locals then live operands, all
@@ -6817,6 +6884,7 @@ fn emit_framed_inner(
     }
 
     Ok(FramedCode {
+        ordinary_entry,
         native_recursive_entry,
         native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },
         native_control_slot: native_control_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }),
