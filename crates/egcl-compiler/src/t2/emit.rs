@@ -658,6 +658,8 @@ pub struct FramedCode {
     /// Distinct ordinary Lisp ABI entry; never a legacy or managed adapter.
     /// Installation also requires validated runtime admission and ownership.
     pub ordinary_entry: Option<usize>,
+    /// Maximum stack use below ordinary entry RSP, including phi snapshots.
+    pub ordinary_stack_required: Option<usize>,
     /// Private same-owner native entry; requires the retained control pointer.
     pub native_recursive_entry: Option<usize>,
     /// Raw word slots, relative to body RSP, never collector roots.
@@ -6883,8 +6885,25 @@ fn emit_framed_inner(
         return Err(EmitError::UnsupportedOp(0xFD));
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_stack_required = if ordinary_entry.is_some() {
+        let frame_bytes = native_calls
+            .unwind_recipe()
+            .ok_or(EmitError::BadBranch)?
+            .frame_bytes() as usize;
+        let move_values = f.block_order().iter()
+            .map(|&b| f.block(b).params.len())
+            .max().unwrap_or(0);
+        Some(ordinary_leaf::stack_requirement(frame_bytes, move_values).ok_or(EmitError::BadBranch)?)
+    } else {
+        None
+    };
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_stack_required = None;
+
     Ok(FramedCode {
         ordinary_entry,
+        ordinary_stack_required,
         native_recursive_entry,
         native_entry_kind_slot: if native_frame_mode { entry_kind_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }) } else { None },
         native_control_slot: native_control_home.and_then(|home| match home { FramedHome::Stack(slot) => Some(slot), _ => None }),
