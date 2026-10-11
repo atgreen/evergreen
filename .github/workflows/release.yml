@@ -39,6 +39,7 @@ jobs:
     uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository] same-repo caller; retain actionlint-compatible syntax
     with:
       suite: full
+      platform_scope: linux
       preserve_run: true
 
   plan:
