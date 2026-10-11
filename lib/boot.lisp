@@ -363,15 +363,51 @@
 
 (defvar *type-expanders* nil)
 
+(defun egcl-internal::%deftype-defaults (lambda-list)
+  ;; Preserve explicit initforms, including NIL. Only an omitted optional/key
+  ;; initform differs from an ordinary lambda list (CLHS 3.4.8).
+  (let ((mode nil))
+    (mapcar
+      (lambda (parameter)
+        (cond
+          ((member parameter '(&optional &key &rest &body &aux &whole &environment))
+           (setq mode parameter)
+           parameter)
+          ((eq parameter '&allow-other-keys) parameter)
+          ((or (eq mode '&optional) (eq mode '&key))
+           (cond ((symbolp parameter) (list parameter ''*))
+                 ((null (cdr parameter)) (list (car parameter) ''*))
+                 (t parameter)))
+          (t parameter)))
+      lambda-list)))
+
 (defmacro deftype (name lambda-list &rest body)
-  ;; Even a zero-argument alias is a use-time expansion. The closure captures
-  ;; the definition's lexical bindings without executing its body now.
-  `(progn
-     (setq *type-expanders*
-           (cons (list ',name (function (lambda ,lambda-list ,@body)))
-                 *type-expanders*))
-     (egcl-internal::%home-symbol ',name)
-     ',name))
+  ;; Keep declarations at the lambda's body head and put only executable forms
+  ;; inside the named block. Parameter initforms remain outside that block.
+  (let ((declarations nil) (documentation nil))
+    (tagbody
+      scan
+      (cond
+        ((and (consp body) (consp (car body)) (eq (caar body) 'declare))
+         (push (car body) declarations)
+         (setq body (cdr body))
+         (go scan))
+        ((and (consp body) (stringp (car body)) (cdr body) (null documentation))
+         (setq documentation (car body) body (cdr body))
+         (go scan))))
+    ;; Even a zero-argument alias is a use-time expansion. The closure captures
+    ;; the definition's lexical bindings without executing its body now.
+    `(progn
+       (setq *type-expanders*
+             (cons (list ',name
+                         (function (lambda ,(egcl-internal::%deftype-defaults lambda-list)
+                                     ,@(nreverse declarations)
+                                     (block ,name ,@body))))
+                   *type-expanders*))
+       ,@(when documentation
+           `((egcl-internal::%set-documentation ',name 'type ,documentation)))
+       (egcl-internal::%home-symbol ',name)
+       ',name)))
 
 ;; Track condition definitions so MAKE-CONDITION/SIGNAL can create and match
 ;; real condition instances through the evaluator.

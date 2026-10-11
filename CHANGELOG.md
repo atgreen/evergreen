@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Honor `DEFTYPE` default arguments, named returns, and documentation;
+  preserve `SPECIAL` parameter declarations when compiling closures
+  ([#256](https://github.com/atgreen/evergreen/pull/256)).
+
 - Defer zero-argument `DEFTYPE` bodies until type expansion, preserving
   captured lexical bindings and use-time dynamic values
   ([#255](https://github.com/atgreen/evergreen/pull/255)).
