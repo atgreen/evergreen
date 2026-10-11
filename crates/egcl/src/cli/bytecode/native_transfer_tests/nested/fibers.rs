@@ -230,7 +230,7 @@ fn child_fiber_checked() -> EgclVal {
         ),
         4 => format!("((unwind-protect (values x (list :normal-cleanup)) ({pause} x active)))"),
         5 => format!("((+ n 1) ({pause} x active) ({finish} x))"),
-        6 | 7 | 8 | 9 => format!(
+        6..=9 => format!(
             "((if (= n 0) (progn ({pause} x active) ({finish} x active))
                 (progn ({name} x active (- n 1))
                        (if (= (car x) {case}) x (error \"recursive caller value changed\")))))"

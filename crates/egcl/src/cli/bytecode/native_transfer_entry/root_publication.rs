@@ -596,11 +596,19 @@ unsafe fn walk_boundary(
     }) }
 }
 
+type NativeFrameVisitor<'a> = dyn FnMut(
+    &TransferCode,
+    *mut CaptureContext,
+    &NativeFrameValues,
+    &NativeFrameCursor,
+    Option<usize>,
+    &Walk<'_>,
+) -> usize + 'a;
+
 unsafe fn walk_boundary_frames(
     boundary: &PublishedBoundary,
     _count_gc_walks: bool,
-    visit: &mut dyn FnMut(&TransferCode, *mut CaptureContext, &NativeFrameValues,
-        &NativeFrameCursor, Option<usize>, &Walk<'_>) -> usize,
+    visit: &mut NativeFrameVisitor<'_>,
 ) -> usize {
     if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
         note_bail(if boundary.owner.is_null() {
