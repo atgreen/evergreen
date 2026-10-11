@@ -409,39 +409,6 @@ impl Arena {
             EgclVal::from_cons_ptr(ptr)
         }
     }
-
-    fn alloc_str(&mut self, s: &str) -> EgclVal {
-        let b = s.as_bytes();
-        // Primary path (bliss-jtc.1): allocate the string on the shared GC heap.
-        // Body layout [len:u64 | bytes]; the value points at the object header
-        // (body−8), matching the old std::alloc layout [header | len | bytes].
-        if let Some(body) = egcl_rt::gc::alloc_typed(8 + b.len(), type_id::SIMPLE_BASE_STRING) {
-            unsafe {
-                *(body as *mut u64) = b.len() as u64;
-                std::ptr::copy_nonoverlapping(b.as_ptr(), body.add(8), b.len());
-                // A large (>~512KB) string has a 16-byte header; subtract the
-                // true header offset or the value points into the
-                // size-extension word and is misread (bliss-31x8/bliss-tjru).
-                let header_off = egcl_rt::gc::body_header_offset(8 + b.len());
-                return EgclVal::from_heap_ptr(body.sub(header_off));
-            }
-        }
-        // Fallback: a local block freed on drop.
-        let sz = 8 + 8 + b.len();
-        let layout = std::alloc::Layout::from_size_align(sz, 8).unwrap();
-        unsafe {
-            let p = std::alloc::alloc_zeroed(layout);
-            if p.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-            *(p as *mut ObjectHeader) =
-                ObjectHeader::new(type_id::SIMPLE_BASE_STRING, sz.div_ceil(8) as u16);
-            *(p.add(8) as *mut u64) = b.len() as u64;
-            std::ptr::copy_nonoverlapping(b.as_ptr(), p.add(16), b.len());
-            self.blocks.push((p, layout));
-            EgclVal::from_heap_ptr(p)
-        }
-    }
 }
 
 impl Drop for Arena {
@@ -530,9 +497,7 @@ fn arena_cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
 }
 
 fn arena_str(s: &str) -> EgclVal {
-    let val = ARENA.with(|a| a.borrow_mut().alloc_str(s));
-    egcl_stdlib::register_string(val, s);
-    val
+    egcl_stdlib::make_lisp_string_fresh(s)
 }
 
 /// Coerce a pathname designator to a pathname, as ANSI requires for the
