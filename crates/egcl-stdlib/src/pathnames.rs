@@ -984,6 +984,24 @@ pub fn parse_namestring(
         return Ok((make_record_value(existing), 0));
     }
 
+    if egcl_rt::types::streamp(thing) {
+        // The opening path survives CLOSE. Copy the Rust-owned string before
+        // constructing a pathname, so no stream borrow spans Lisp allocation.
+        let opening_path = crate::streams::file_namestring(thing)?;
+        let parsed = parse_namestring_model(&opening_path, None)?;
+        if let Some(requested) = host.filter(|value| *value != NIL) {
+            let requested = component_string(requested);
+            if requested.is_none() || requested != parsed.host_name {
+                return Err(EgclError::FileError(
+                    "stream pathname host does not match requested host".into(),
+                ));
+            }
+        }
+        let pathname = make_record_value(build_record_from_namestring(parsed, None));
+        // A stream is a pathname designator, not a string being consumed.
+        return Ok((pathname, 0));
+    }
+
     if thing.tag() != TAG_HEAP_OBJECT {
         return Err(EgclError::TypeError {
             datum: thing,
