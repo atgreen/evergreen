@@ -1823,6 +1823,41 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_stdlib::aref(arr, idx.as_fixnum() as usize)
         }),
 
+        "TYPEP" => Some(|operator, args, env| {
+            if !(2..=3).contains(&args.len()) {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires 2 or 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            // The caller evaluates every argument, including the optional
+            // environment, before expansion can execute a DEFTYPE body.
+            if type_spec_invalid_for_typep(args[1]) {
+                return Err(EgclError::ProgramError(
+                    "TYPEP: VALUES and FUNCTION type specifiers are not valid here".into(),
+                ));
+            }
+            typep_matches(env, args[0], args[1]).map(|matches| if matches { T } else { NIL })
+        }),
+        "SUBTYPEP" => Some(|operator, args, env| {
+            if !(2..=3).contains(&args.len()) {
+                return Err(EgclError::ProgramError(format!(
+                    "{operator} requires 2 or 3 arguments, got {}",
+                    args.len()
+                )));
+            }
+            egcl_rt::rooted!(second_spec = args[1]);
+            // Resolution roots its input. Retain the second spec across the
+            // first expansion, then the first result across the second.
+            egcl_rt::rooted!(first = resolve_type_spec(env, args[0])?);
+            let second = resolve_type_spec(env, *second_spec)?;
+            let (subtype, certain) = subtypep_relation(*first, second);
+            Ok(env.return_values(vec![
+                if subtype { T } else { NIL },
+                if certain { T } else { NIL },
+            ]))
+        }),
+
         "EGCL-INTERNAL::%EXPAND-TYPE-SPEC"
         | "EGCL-INTERNAL:%EXPAND-TYPE-SPEC"
         | "%EXPAND-TYPE-SPEC" => Some(|_operator, args, env| {

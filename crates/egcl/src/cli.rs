@@ -18946,30 +18946,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     None => NIL,
                 });
             }
-            "TYPEP" => {
-                // (typep object type &optional environment): 2 or 3 args, else a
-                // PROGRAM-ERROR (ansi TYPEP.ERROR.1/2/3).
-                let n = form_arg_count(cdr);
-                if !(2..=3).contains(&n) {
-                    return Err(EgclError::ProgramError(format!(
-                        "TYPEP requires 2 or 3 arguments, got {n}"
-                    )));
-                }
-                let (obj_form, r) = cp(cdr);
-                egcl_rt::rooted!(type_form = cp(r).0);
-                egcl_rt::rooted!(obj = eval_form(obj_form, env)?);
-                let raw_type_spec = eval_form(*type_form, env)?;
-                // VALUES and FUNCTION type specifiers are not valid for TYPEP —
-                // signal an error rather than silently returning NIL (ansi
-                // TYPEP.ERROR.4-7).
-                if type_spec_invalid_for_typep(raw_type_spec) {
-                    return Err(EgclError::ProgramError(
-                        "TYPEP: VALUES and FUNCTION type specifiers are not valid here".into(),
-                    ));
-                }
-                let matches = typep_matches(env, *obj, raw_type_spec)?;
-                return Ok(if matches { T } else { NIL });
-            }
+            "TYPEP" => return eval_builtin_arguments(&name, cdr, env),
             "EQ" => {
                 // ANSI: EQ takes exactly two arguments; wrong arity (e.g. via
                 // `(funcall #'eq x)`) is a PROGRAM-ERROR, not a NIL-padded result.
@@ -22725,33 +22702,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Ok(egcl_stdlib::class_name(class));
             }
             "FIND-METHOD" => return eval_builtin_arguments(&name, cdr, env),
-            "SUBTYPEP" => {
-                // (subtypep type1 type2 &optional environment) → two values:
-                // subtype-p and certain-p. 2 or 3 args, else a PROGRAM-ERROR
-                // (ansi SUBTYPEP.ERROR.1/2/3). The optional environment is
-                // accepted and ignored (ansi SUBTYPE.ENV.1/2).
-                let n = form_arg_count(cdr);
-                if !(2..=3).contains(&n) {
-                    return Err(EgclError::ProgramError(format!(
-                        "SUBTYPEP requires 2 or 3 arguments, got {n}"
-                    )));
-                }
-                let (t1_form, rest) = cp(cdr);
-                let (t2_form, _) = cp(rest);
-                // Root across later evals/resolutions: type specs are often
-                // heap conses like (OR NULL PATHNAME) (moving GC; bliss-4bp).
-                egcl_rt::rooted!(t2_form = t2_form);
-                egcl_rt::rooted!(t1_r = eval_form(t1_form, env)?);
-                egcl_rt::rooted!(t2_r = eval_form(*t2_form, env)?);
-                egcl_rt::rooted!(t1_res = resolve_type_spec(env, *t1_r)?);
-                let t2 = resolve_type_spec(env, *t2_r)?;
-                let t1 = *t1_res;
-                let (subtype_p, certain_p) = subtypep_relation(t1, t2);
-                let subp = if subtype_p { T } else { NIL };
-                let certainp = if certain_p { T } else { NIL };
-                env.set_mv(vec![subp, certainp]);
-                return Ok(subp);
-            }
+            "SUBTYPEP" => return eval_builtin_arguments(&name, cdr, env),
             "CLASS-PRECEDENCE-LIST" | "COMPUTE-CLASS-PRECEDENCE-LIST" => {
                 let (class_form, _) = cp(cdr);
                 let class_input = eval_form(class_form, env)?;
@@ -36210,13 +36161,6 @@ fn apply_builtin_fast(
                 _ => egcl_stdlib::numbers::minusp(args[0]),
             };
             Some(result.map(|yes| if yes { T } else { NIL }))
-        }
-        "TYPEP" if args.len() == 2 => {
-            let r = typep_matches(env, args[0], args[1]).map(|m| if m { T } else { NIL });
-            if r.is_ok() {
-                env.clear_mv();
-            }
-            Some(r)
         }
         "EQ" if args.len() == 2 => {
             env.clear_mv();
