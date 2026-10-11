@@ -14861,11 +14861,13 @@ fn run_with_binding(
                 },
             )
         {
+            let e = e.capture_backtrace();
             stack.pop_frame();
             return Err(e);
         }
     } else if entry.variadic {
         if let Err(e) = bind_variadic(&entry, frame, &args, env_frame.as_ref(), env) {
+            let e = e.capture_backtrace();
             stack.pop_frame();
             return Err(e);
         }
@@ -15554,6 +15556,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             if let Err(e) =
                                 bind_variadic(&callee, frame, args, env_frame.as_ref(), env)
                             {
+                                let e = e.capture_backtrace();
                                 stack.pop_frame();
                                 drop(debug_call);
                                 initiate_unwind(acts, stack, env, Pending::Propagate(e))?;
@@ -20735,6 +20738,7 @@ fn resume_inlined_in_t0(
 /// Handler tokens stay registered in Env; running cleanups retain their saved
 /// multiple values or private pending-transfer payload until T0 consumes them.
 struct OuterResumeState {
+    debug_call: Option<egcl_rt::debug_stack::CallFrame>,
     handlers: Vec<Handler>,
     cleanup_conts: Vec<CleanupCont>,
     dyn_binds: Vec<ScopedDynBind>,
@@ -20773,6 +20777,7 @@ fn resume_inlined_in_t0_with_state(
         let entry = scope.body;
         let mut state = if index == 0 { outer_state.take() } else { None }
             .unwrap_or_else(|| OuterResumeState {
+                debug_call: None,
                 handlers: rebuild_resume_handlers(&entry, scope.bcp, env),
                 cleanup_conts: Vec::new(),
                 dyn_binds: Vec::new(),
@@ -20791,7 +20796,7 @@ fn resume_inlined_in_t0_with_state(
         };
         acts.push(Activation {
             frame: scope.frame,
-            _debug_call: None,
+            _debug_call: state.debug_call.take(),
             n_locals: entry.n_locals,
             // Inlined bodies cannot capture; only the root activation owns
             // the native environment. Preserve the exact frame, including any

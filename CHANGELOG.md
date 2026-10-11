@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve original arguments after native deoptimization and retain the callee
+  in keyword-binding error backtraces
+  ([#245](https://github.com/atgreen/evergreen/pull/245)).
+
 - Fix character counts and indexing in runtime-created Unicode strings, and
   preserve fresh-string mutability for wider characters
   ([#244](https://github.com/atgreen/evergreen/pull/244)).

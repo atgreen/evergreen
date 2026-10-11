@@ -3000,10 +3000,38 @@ impl FiberCallFrame {
         Self::enter_recorded(Some(name), Some(arguments), FrameOrigin::Managed)
     }
 
+    /// Record original arguments for a resumed managed activation beneath
+    /// live condition-cluster frames, using its exact physical frame anchor.
+    ///
+    /// # Safety
+    /// `frame` must be a live call frame owned by this execution. Drop the
+    /// returned guard when that activation retires, in logical call-stack order.
+    pub unsafe fn enter_managed_at(
+        name: &str,
+        arguments: &[EgclVal],
+        frame: *const crate::stack::Frame,
+    ) -> Self {
+        Self::enter_recorded_at(
+            Some(name),
+            Some(arguments),
+            FrameOrigin::Managed,
+            Some(frame as usize),
+        )
+    }
+
     fn enter_recorded(
         name: Option<&str>,
         arguments: Option<&[EgclVal]>,
         origin: FrameOrigin,
+    ) -> Self {
+        Self::enter_recorded_at(name, arguments, origin, None)
+    }
+
+    fn enter_recorded_at(
+        name: Option<&str>,
+        arguments: Option<&[EgclVal]>,
+        origin: FrameOrigin,
+        anchor: Option<usize>,
     ) -> Self {
         let owner = match current_fiber_id() {
             Some(id) => {
@@ -3017,11 +3045,11 @@ impl FiberCallFrame {
                     // registered executions take the allocation-free path.
                     crate::rooted!(arguments = arguments.map(<[EgclVal]>::to_vec));
                     let owner = CallFrameOwner::Native(ensure_current_native_thread());
-                    return Self::enter_on_owner(owner, name, arguments.as_deref(), origin);
+                    return Self::enter_on_owner(owner, name, arguments.as_deref(), origin, anchor);
                 }
             },
         };
-        Self::enter_on_owner(owner, name, arguments, origin)
+        Self::enter_on_owner(owner, name, arguments, origin, anchor)
     }
 
     fn enter_on_owner(
@@ -3029,8 +3057,9 @@ impl FiberCallFrame {
         name: Option<&str>,
         arguments: Option<&[EgclVal]>,
         origin: FrameOrigin,
+        anchor: Option<usize>,
     ) -> Self {
-        let anchor = current_stack().fp() as usize;
+        let anchor = anchor.unwrap_or_else(|| current_stack().fp() as usize);
         owner
             .frames()
             .lock()

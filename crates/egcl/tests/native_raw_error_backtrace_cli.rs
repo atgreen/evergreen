@@ -194,13 +194,16 @@ fn osr_error_keeps_its_loop_frame_and_condition_type() {
 #[test]
 fn native_keyword_binding_error_keeps_its_callee() {
     for (tier, installed) in [("t1", 1), ("t2", 2)] {
+        let callee_tier = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { 0 } else { installed };
         let program = format!(
             r#"
               (defun native-keyword-leaf (&key value) value)
-              (dotimes (i 100) (assert (= 42 (native-keyword-leaf :value 42))))
-              (assert (= {installed} (egcl-ext:function-tier 'native-keyword-leaf)))
+              (defun native-keyword-caller (key value) (native-keyword-leaf key value))
+              (dotimes (i 100) (assert (= 42 (native-keyword-caller :value 42))))
+              (assert (= {callee_tier} (egcl-ext:function-tier 'native-keyword-leaf)))
+              (assert (= {installed} (egcl-ext:function-tier 'native-keyword-caller)))
               (format t "KEYWORD-TIER-CONFIRMED~%")
-              (native-keyword-leaf :unknown 42)
+              (native-keyword-caller :unknown 42)
             "#
         );
         let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
@@ -224,5 +227,6 @@ fn native_keyword_binding_error_keeps_its_callee() {
             1,
             "{tier}: {stderr}"
         );
+        assert_eq!(stderr.matches("NATIVE-KEYWORD-CALLER").count(), 1, "{tier}: {stderr}");
     }
 }
