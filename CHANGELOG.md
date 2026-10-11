@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Avoid redundant multiple-value clearing on proven single-value native paths,
+  with explicit zero/one/many return handling and precise secondary-value roots
+  ([#262](https://github.com/atgreen/evergreen/pull/262)).
+
 - Speed up native recursion on Linux x86-64: eligible T2 self-calls use machine
   frames, and native returns avoid redundant stack lookups. A controlled
   release-build `fib(32)` comparison improved from about 1.04 seconds to
