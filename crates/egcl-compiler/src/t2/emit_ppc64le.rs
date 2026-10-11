@@ -9,7 +9,7 @@
 //! activation contract: an `EgclStack` activation of `activation_slots` tagged
 //! words, extended by the shadow-root slots needed at runtime calls. The module
 //! owns instruction selection for the opcode subset below, the frame layout,
-//! GC-root synchronisation around runtime calls, sampled back-edge polls, OSR
+//! GC-root synchronisation around runtime calls, back-edge polls, OSR
 //! entry prologues and guard-failure deopt exits. Native transfer dispatch is
 //! not here: the ppc64le transfer stubs live in native_transfer_ppc64le.rs,
 //! and the ppc64le native-segment entry uses `emit_framed` (no adapters) for
@@ -54,9 +54,9 @@
 //! (r14–r16, r20–r29) go at the top of the frame. From `frame::LOCALS_BASE`
 //! upward: spill slots (regalloc2's plus stable homes for split values), the
 //! edge parallel-copy buffer, the deopt serialisation buffer and the remat
-//! buffer; the call result and poll countdown use the fixed
-//! `frame::SCRATCH_SLOT` and `frame::POLL_SLOT`. Every access uses a signed
-//! 16-bit displacement, so a frame over 32752 bytes declines.
+//! buffer; the call result uses the fixed `frame::SCRATCH_SLOT`. The legacy
+//! poll slot stays reserved. Every access uses a signed 16-bit displacement,
+//! so a frame over 32752 bytes declines.
 //!
 //! The entry prologue imports the entry block's parameters from activation
 //! slots `0..n`. OSR entries are extra prologues for each `osr_entries` record
@@ -79,8 +79,8 @@
 //! edge args, minus its defs. Each site is a [`RootSyncSite`] and installation
 //! checks the count against `emitted_safepoints`. A nonzero `transfer_pending`
 //! is consulted after each call and a nonzero answer takes the shared NIL exit
-//! (the checked legacy ABI). Back-edge polls decrement a 256-count frame word
-//! and call `poll` through the same path at zero; a cycle without a `poll`
+//! (the checked legacy ABI). Each selected backward-edge terminator calls
+//! `poll` through the same path before edge moves; a cycle without a `poll`
 //! adapter declines.
 //!
 //! # Supported opcodes
@@ -141,9 +141,6 @@ const LINK: u8 = 0;
 /// Working float registers, from the call-clobbered range.
 const F0: u8 = 0;
 const F1: u8 = 1;
-
-/// Back-edge polls run one in this many iterations, matching the other emitters.
-const POLL_PERIOD: u64 = 256;
 
 fn calls_runtime(opcode: Opcode) -> bool {
     matches!(
@@ -293,8 +290,7 @@ impl Emitter<'_> {
         // The first argument is the frame-slots pointer, and it must survive the
         // whole body, so it moves out of the working registers immediately.
         self.asm.mov(SLOTS, W0);
-        self.asm.imm64(W0, POLL_PERIOD);
-        self.frame_store(W0, frame::POLL_SLOT)
+        Ok(())
     }
 
     fn epilogue(&mut self) -> Result<(), EmitError> {
@@ -593,18 +589,9 @@ impl Emitter<'_> {
             return Ok(());
         }
         if self.polls.contains(&instruction) {
-            // Sampled back-edge safepoint, so a hot loop still reaches GC
-            // stop-the-world and remains interruptible.
-            let skip = self.asm.label();
-            self.frame_load(W0, frame::POLL_SLOT)?;
-            self.asm.addi(W0, W0, -1);
-            self.frame_store(W0, frame::POLL_SLOT)?;
-            self.asm.compare_imm(0, W0, 0);
-            self.asm.branch(Cc::Ne, 0, skip);
-            self.asm.imm64(W0, POLL_PERIOD);
-            self.frame_store(W0, frame::POLL_SLOT)?;
+            // Every selected backward-edge terminator reaches the existing
+            // root-synchronizing poll before its edge moves.
             self.runtime_call(instruction, None)?;
-            self.asm.bind(skip);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -927,7 +914,7 @@ pub fn emit_framed(
 }
 
 /// Emit optimized ppc64le code with native roots synchronized through extra
-/// activation slots at runtime calls. Every cycle crosses a sampled GC/signal poll
+/// activation slots at runtime calls. Every cycle crosses a GC/signal poll
 /// before its edge transfers.
 pub fn emit_framed_with_runtime(
     function: &Function,
@@ -1075,7 +1062,7 @@ pub fn emit_framed_with_runtime(
         roots.dedup();
         emitter.roots.insert(source, roots);
     }
-    // A sampled back-edge poll is a runtime call too, so it needs a root set; a
+    // A back-edge poll is a runtime call too, so it needs a root set; a
     // loop whose poll had none was declined wholesale (bliss-83icg). Poll before
     // the edge's parallel transfers: lowering represents those as anonymous
     // moves ahead of the machine terminator, and their destination phi values do

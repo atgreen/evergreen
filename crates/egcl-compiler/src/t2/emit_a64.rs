@@ -9,7 +9,7 @@
 //! activation contract: an `EgclStack` activation of `activation_slots` tagged
 //! words, extended by the shadow-root slots needed at runtime calls. The module
 //! owns instruction selection for the opcode subset below, the frame layout,
-//! GC-root synchronisation around runtime calls, sampled back-edge polls, OSR
+//! GC-root synchronisation around runtime calls, back-edge polls, OSR
 //! entry prologues and guard-failure deopt exits. It does not own native
 //! transfer dispatch: runtime calls end with the checked `transfer_pending`
 //! test, and the AArch64 native-segment entry admits only call-free,
@@ -50,7 +50,7 @@
 //! recovery epilogue share, so one recovery address can unwind either tier.
 //! Below that: spill slots (regalloc2's plus stable homes for split values),
 //! the edge parallel-copy buffer, the deopt serialisation buffer, the remat
-//! buffer, and two words for the saved call result and the poll countdown,
+//! buffer, and a word for the saved call result,
 //! rounded to a pair so sp stays 16-byte aligned at calls. Frames over 0x1000
 //! words decline rather than materialise addresses per access.
 //!
@@ -73,8 +73,8 @@
 //! a [`RootSyncSite`] and installation checks the count against
 //! `emitted_safepoints`. A nonzero `transfer_pending` is consulted after each
 //! call and a nonzero answer takes the shared NIL exit (the checked legacy
-//! ABI). Back-edge polls decrement a 256-count frame word and call `poll`
-//! through the same path at zero; a cycle without a `poll` adapter declines.
+//! ABI). Each selected backward-edge terminator calls `poll` through the same
+//! path before edge moves; a cycle without a `poll` adapter declines.
 //!
 //! # Supported opcodes
 //!
@@ -132,11 +132,6 @@ const F1: a64::Fpr = 1;
 /// recovery epilogue, which must be able to unwind either tier.
 const SAVE_BYTES: i32 = a64::JIT_SAVE_BYTES;
 
-/// Back-edge polls run one in this many iterations. Matching the System Z
-/// emitter: frequent enough that a hot loop reaches a collection promptly,
-/// rare enough that the counter is not the loop's cost.
-const POLL_PERIOD: u64 = 256;
-
 /// C-ABI runtime adapters used by optimized code, as the System Z emitter defines
 /// them. Re-exported rather than redefined so one call site fills both.
 pub use super::emit_s390x::RuntimeCalls;
@@ -178,7 +173,6 @@ struct Emitter<'a> {
     roots: HashMap<Inst, Vec<Value>>,
     root_sites: Vec<RootSyncSite>,
     result_offset: i32,
-    poll_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<egcl_rt::asm::Label>,
 }
@@ -366,9 +360,7 @@ impl Emitter<'_> {
         // The first argument is the frame-slots pointer, and it must survive the
         // whole body, so it moves out of the working registers immediately.
         self.mov(SLOTS, W0);
-        self.imm(W0, POLL_PERIOD);
-        let offset = self.poll_offset;
-        self.store_at(W0, a64::SP, offset)
+        Ok(())
     }
 
     fn epilogue(&mut self) -> Result<(), EmitError> {
@@ -638,19 +630,9 @@ impl Emitter<'_> {
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
         if self.polls.contains(&instruction) {
-            // Sampled back-edge safepoint: a hot loop must still reach GC
-            // stop-the-world and still be interruptible.
-            let skip = self.asm.label();
-            let poll_offset = self.poll_offset;
-            self.load_at(W0, a64::SP, poll_offset)?;
-            self.asm
-                .word(a64::subs_imm(W0, W0, 1).expect("one is an add-immediate"));
-            self.store_at(W0, a64::SP, poll_offset)?;
-            self.asm.jcc(Cc::Ne, skip);
-            self.imm(W0, POLL_PERIOD);
-            self.store_at(W0, a64::SP, poll_offset)?;
+            // Every selected backward-edge terminator reaches the existing
+            // root-synchronizing poll before its edge moves.
             self.runtime_call(instruction, None)?;
-            self.asm.bind(skip);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -977,7 +959,7 @@ pub fn emit_framed(
 }
 
 /// Emit optimized AArch64 code with native roots synchronized through extra
-/// activation slots at runtime calls. Every cycle crosses a sampled GC/signal poll
+/// activation slots at runtime calls. Every cycle crosses a GC/signal poll
 /// before its edge transfers, so a hot loop stays interruptible and reachable by
 /// stop-the-world collection.
 pub fn emit_framed_with_runtime(
@@ -1038,7 +1020,6 @@ pub fn emit_framed_with_runtime(
         roots: HashMap::new(),
         root_sites: Vec::new(),
         result_offset: 0,
-        poll_offset: 0,
         polls,
         transfer_exit: None,
     };
@@ -1136,6 +1117,46 @@ pub fn emit_framed_with_runtime(
         roots.dedup();
         emitter.roots.insert(source, roots);
     }
+    // A poll runs before edge copies. Anonymous lowered moves define the
+    // destination phi homes before the machine terminator, so the ordinary
+    // call's Late point does not describe the state published by this emitter.
+    for (block_index, &block) in function.block_order().iter().enumerate() {
+        let Some(&source) = function.block(block).insts.last() else {
+            continue;
+        };
+        if !emitter.polls.contains(&source) {
+            continue;
+        }
+        let mb = &machine.blocks[block_index];
+        let mut boundary = mb.end;
+        while boundary > mb.start
+            && machine.insts[boundary - 1]
+                .source_inst
+                .is_none_or(|inst| inst == source)
+        {
+            boundary -= 1;
+        }
+        let point = u32::try_from(boundary).map_err(|_| unsupported())? * 2;
+        let data = function.inst(source);
+        let mut roots: Vec<_> = machine
+            .value_locations
+            .iter()
+            .filter(|range| {
+                range.vreg.class == RegClass::Gpr && range.start <= point && point < range.end
+            })
+            .map(|range| Value(range.vreg.num))
+            .chain(data.args.iter().copied())
+            .chain(
+                data.targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
+            .filter(|value| emitter.homes.contains_key(value))
+            .collect();
+        roots.sort_by_key(|value| value.0);
+        roots.dedup();
+        emitter.roots.insert(source, roots);
+    }
     emitter.root_slots = u16::try_from(emitter.roots.values().map(Vec::len).max().unwrap_or(0))
         .map_err(|_| unsupported())?;
     emitter.argument_slots = u16::try_from(
@@ -1182,9 +1203,9 @@ pub fn emit_framed_with_runtime(
         .map(|(_, state)| state.remat.len())
         .max()
         .unwrap_or(0);
-    // Two extra words hold the call result and the poll counter. Round to a pair
+    // One extra word holds the call result. Round to a pair
     // so the stack pointer stays 16-byte aligned, which AAPCS64 requires at a call.
-    let frame_words = (spill_slots as usize + edge_words + deopt_words + remat_words + 2 + 1) & !1;
+    let frame_words = (spill_slots as usize + edge_words + deopt_words + remat_words + 1 + 1) & !1;
     // Every frame access must remain reachable; beyond this the emitter would be
     // materialising an address for each one.
     if frame_words > 0x1000 {
@@ -1194,8 +1215,7 @@ pub fn emit_framed_with_runtime(
     emitter.edge_base = spill_slots as i32 * 8;
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
-    emitter.result_offset = (frame_words as i32 - 2) * 8;
-    emitter.poll_offset = emitter.result_offset + 8;
+    emitter.result_offset = (frame_words as i32 - 1) * 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported());
     }
