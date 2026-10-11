@@ -1189,6 +1189,10 @@ unsafe fn trace_object(
         | tid::SIMPLE_BASE_STRING
         | tid::SIMPLE_CHARACTER_STRING => {}
 
+        // Packed specialised arrays contain only an element tag, length and
+        // raw numeric/bit payload. Pointer-shaped float bits are not roots.
+        tid::SIMPLE_ARRAY => {}
+
         // ── Fixed reference pairs. ──
         tid::CONS => {
             // Real conses are headerless (§1.5.1); this covers a headered

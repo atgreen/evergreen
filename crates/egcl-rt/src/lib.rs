@@ -36,6 +36,7 @@ pub mod symbols;
 #[cfg_attr(target_os = "macos", path = "syscall/macos.rs")]
 pub mod syscall;
 pub mod types;
+pub mod packed_f64;
 pub mod value;
 
 // ── Memory / GC ───────────────────────────────────────────────────
