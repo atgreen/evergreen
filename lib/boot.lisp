@@ -364,19 +364,12 @@
 (defvar *type-expanders* nil)
 
 (defmacro deftype (name lambda-list &rest body)
-  ;; Parameterized types need an expander at use time. Keep the existing
-  ;; concrete expansion for zero-argument aliases, which are common in hot
-  ;; element-type checks. A NIL expander also hides an older parameterized
-  ;; definition when the type is redefined without parameters.
+  ;; Even a zero-argument alias is a use-time expansion. The closure captures
+  ;; the definition's lexical bindings without executing its body now.
   `(progn
      (setq *type-expanders*
-           (cons (list ',name ,(when lambda-list
-                                `(function (lambda ,lambda-list ,@body))))
+           (cons (list ',name (function (lambda ,lambda-list ,@body)))
                  *type-expanders*))
-     ,@(unless lambda-list
-         `((setq *type-definitions*
-                 (cons (list ',name ,(if body (cons 'progn body) t))
-                       *type-definitions*))))
      (egcl-internal::%home-symbol ',name)
      ',name))
 
