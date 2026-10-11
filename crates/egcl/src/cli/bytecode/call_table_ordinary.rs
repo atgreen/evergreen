@@ -17,7 +17,6 @@ use super::super::native_transfer_entry::TransferCode;
 struct RetainedEntry<C> {
     descriptor: OrdinaryEntryDescriptor,
     cell: Arc<CallCell>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     code: Rc<C>,
 }
 
@@ -54,7 +53,6 @@ impl<C> RetainedEntries<C> {
         self.sweep();
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     fn retain(
         &mut self,
         cell: Arc<CallCell>,
@@ -92,7 +90,6 @@ impl<C> RetainedEntries<C> {
         });
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
         self.entries
             .iter()
