@@ -68,6 +68,9 @@ pub struct LispExecutionContext {
     /// Cooperative preemption request, polled at safepoints (§2.5.3 step 4).
     /// A word rather than a bool so its offset and width are stable for codegen.
     yield_requested: AtomicU64,
+    /// Raw address of the owning execution's active native segment control.
+    /// Zero outside a segment; the segment owner retains the pointee.
+    active_native_control: AtomicU64,
 }
 
 /// Byte offsets generated code uses. These are the ABI: the emitters bake them,
@@ -82,6 +85,8 @@ pub mod offsets {
     pub const CARRIER_ID: usize = 16;
     /// `yield_requested`
     pub const YIELD_REQUESTED: usize = 24;
+    /// `active_native_control`
+    pub const ACTIVE_NATIVE_CONTROL: usize = 32;
 }
 
 impl LispExecutionContext {
@@ -91,6 +96,7 @@ impl LispExecutionContext {
             execution_id,
             carrier_id: AtomicU64::new(carrier_id),
             yield_requested: AtomicU64::new(0),
+            active_native_control: AtomicU64::new(0),
         }
     }
 
@@ -135,6 +141,25 @@ impl LispExecutionContext {
         self.yield_requested.load(Ordering::Acquire) != 0
     }
 
+    /// Read the active segment control address without dereferencing it.
+    /// Reading an address grants no access to the execution-owned pointee.
+    pub fn active_native_control(&self) -> u64 {
+        self.active_native_control.load(Ordering::Acquire)
+    }
+
+    /// Install a segment control address, returning the enclosing address.
+    ///
+    /// # Safety
+    /// Only the owning execution may change this word. A nonzero address must
+    /// identify an initialized control object with the layout expected by its
+    /// generated code. The caller must retain that object across all active
+    /// and suspended uses, restore the enclosing address before its owner is
+    /// released (including unwind), and prevent access after either lifetime
+    /// ends. Atomic publication does not make the pointee concurrently mutable.
+    pub unsafe fn swap_active_native_control(&self, address: u64) -> u64 {
+        self.active_native_control.swap(address, Ordering::AcqRel)
+    }
+
     /// Address generated code will hold in the reserved register.
     pub fn as_ptr(&self) -> *const Self {
         self as *const Self
@@ -165,13 +190,48 @@ mod tests {
             &ctx.yield_requested as *const _ as usize - base,
             offsets::YIELD_REQUESTED
         );
+        assert_eq!(
+            &ctx.active_native_control as *const _ as usize - base,
+            offsets::ACTIVE_NATIVE_CONTROL
+        );
+    }
+
+    #[test]
+    fn active_native_control_is_execution_local_and_survives_migration() {
+        let first = LispExecutionContext::new(ExecutionKind::Fiber, 11, 1);
+        let second = LispExecutionContext::new(ExecutionKind::NativeThread, 12, 1);
+        let mut outer = 17u64;
+        let mut inner = 23u64;
+        let outer_address = &mut outer as *mut u64 as u64;
+        let inner_address = &mut inner as *mut u64 as u64;
+        assert_eq!(first.active_native_control(), 0);
+        assert_eq!(second.active_native_control(), 0);
+        // This test owns both inactive contexts and keeps each pointee alive
+        // until its address has been restored or cleared.
+        unsafe {
+            assert_eq!(first.swap_active_native_control(outer_address), 0);
+            assert_eq!(second.swap_active_native_control(inner_address), 0);
+            let previous = first.swap_active_native_control(inner_address);
+            assert_eq!(previous, outer_address);
+            first.set_carrier_id(9);
+            assert_eq!(first.active_native_control(), inner_address);
+            assert_eq!(first.swap_active_native_control(previous), inner_address);
+            assert_eq!(first.active_native_control(), outer_address);
+            assert_eq!(second.active_native_control(), inner_address);
+            assert_eq!(first.swap_active_native_control(0), outer_address);
+            assert_eq!(second.swap_active_native_control(0), inner_address);
+        }
+        assert_eq!(first.active_native_control(), 0);
+        assert_eq!(second.active_native_control(), 0);
+        assert_eq!(offsets::ACTIVE_NATIVE_CONTROL, 32);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 40);
     }
 
     /// Every field is one machine word, so generated code can load any of them
     /// with a single `mov` at a fixed displacement.
     #[test]
     fn every_field_is_one_machine_word() {
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 32);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 40);
         assert_eq!(std::mem::align_of::<LispExecutionContext>(), 8);
     }
 
