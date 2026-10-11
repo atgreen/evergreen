@@ -38174,8 +38174,8 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // same-named inherited one (not a plain intern, which would return the
     // inherited symbol unchanged). See bliss-b1o.
     let mut shadows: Vec<String> = Vec::new();
-    // (from-package, symbol-name) pairs to import into this package.
-    let mut import_from: Vec<(String, String)> = Vec::new();
+    // (from-package, symbol-name, shadowing) imports retain their category.
+    let mut import_from: Vec<(String, String, bool)> = Vec::new();
     // :size / :documentation may each appear at most once (CLHS); a repeat is a
     // PROGRAM-ERROR (ansi-test DEFPACKAGE.13/.14).
     let mut size_count = 0usize;
@@ -38236,7 +38236,11 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     if let Some((pkg, syms)) = vals.split_first() {
                         let from = resolve_package_name(env, &string_designator_name(*pkg));
                         for s in syms {
-                            import_from.push((from.clone(), symbol_bare_name(&val_as_str(*s))));
+                            import_from.push((
+                                from.clone(),
+                                symbol_bare_name(&val_as_str(*s)),
+                                key_bare == "SHADOWING-IMPORT-FROM",
+                            ));
                         }
                     }
                 }
@@ -38250,7 +38254,7 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     }
 
     // Validate the options (CLHS 11.1.2.1): :size / :documentation at most once;
-    // a symbol-name may not appear more than once among :shadow,
+    // symbol-name sets must be disjoint between :shadow,
     // :shadowing-import-from, :import-from and :intern; and a name may not appear
     // in both :intern and :export. Each is a PROGRAM-ERROR
     // (ansi-test DEFPACKAGE.13/.14/.17/.19/.21/.23/…).
@@ -38265,16 +38269,34 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         ));
     }
     {
-        let mut seen = std::collections::HashSet::new();
-        for name in shadows
-            .iter()
-            .chain(import_from.iter().map(|(_, n)| n))
-            .chain(interns.iter())
+        let mut categories = std::collections::HashMap::new();
+        for (name, category) in shadows.iter().map(|name| (name, "SHADOW"))
+            .chain(interns.iter().map(|name| (name, "INTERN")))
+            .chain(import_from.iter().map(|(_, name, shadowing)| {
+                (name, if *shadowing { "SHADOWING-IMPORT-FROM" } else { "IMPORT-FROM" })
+            }))
         {
-            if !seen.insert(name.clone()) {
+            if let Some(previous) = categories.insert(name, category)
+                && previous != category
+            {
                 return Err(EgclError::ProgramError(format!(
-                    "DEFPACKAGE: symbol name {name} appears in more than one of \
-                     :SHADOW, :SHADOWING-IMPORT-FROM, :IMPORT-FROM, :INTERN"
+                    "DEFPACKAGE: symbol name {name} appears in both :{previous} and :{category}"
+                )));
+            }
+        }
+        // A repeated source spelling, nickname, or reexport may designate the
+        // same symbol. Different same-named symbols are still a conflict, even
+        // for shadowing imports; reject before creating or mutating the package.
+        let mut imported = std::collections::HashMap::new();
+        for (from, name, shadowing) in &import_from {
+            let symbol = find_symbol_in_package(env, from, name).map(|(symbol, _)| symbol);
+            if let Some((previous_from, previous_symbol)) =
+                imported.insert((name, shadowing), (from, symbol))
+                && previous_from != from
+                && (symbol.is_none() || previous_symbol != symbol)
+            {
+                return Err(EgclError::PackageError(format!(
+                    "DEFPACKAGE: conflicting imports of {name} from {previous_from} and {from}"
                 )));
             }
         }
@@ -38317,12 +38339,16 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
 
     // Import named symbols so they are accessible (and identical) in this
     // package; fall back to a fresh internal symbol if the source lacks it.
-    for (from, sym_name_str) in &import_from {
+    for (from, sym_name_str, shadowing) in &import_from {
         let found = find_symbol_in_package(env, from, sym_name_str).map(|(sym, _)| sym);
         match found {
             Some(sym) => {
                 if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
-                    let _ = egcl_stdlib::add_symbol(pkg, sym_name_str, sym, false);
+                    if *shadowing {
+                        egcl_stdlib::shadowing_import(&[sym], pkg)?;
+                    } else {
+                        egcl_stdlib::import(&[sym], pkg)?;
+                    }
                 }
             }
             None => {
