@@ -227,6 +227,49 @@ means "A must be fully loaded before B can load."
 order consistent with this DAG. Any violation MUST be caught at load
 time with a clear diagnostic naming the missing dependency.
 
+### 11.4.3 x86-64 Native Cross-Function Calls
+
+**Post-v0.0.6 milestone — planned, tracked by `bliss-t8a48`.** This outline
+adds no requirement IDs and does not advance the current build stage or alter
+accepted coverage debt. The [current ABI comparison](04-07-codegen.md#4744-comparison-with-sbcl-and-remaining-work)
+distinguishes implemented mechanisms from the remaining work.
+
+The baseline already includes machine-stack self-recursion, precise native
+call-site/root/unwind metadata, deoptimization, and single-value return fast
+paths. Ordinary generated call-cell adapters avoid Rust dispatch for eligible
+calls but still construct managed callee activations. The goal is to remove
+that activation cost for eligible calls between distinct T2 functions.
+
+Suggested implementation order:
+
+1. Establish a warmed, non-inlined cross-function call benchmark. Confirm both
+   bodies and the measured edge execute in T2; separate call overhead from
+   arithmetic, allocation, dispatch, and compilation. Record repeated release
+   timing and managed-frame/runtime-helper counts, with a matched baseline.
+2. Add a fast edge for known published T2 targets with fixed arity zero through
+   four and tagged parameters. Preserve code ownership, definition-generation
+   checks, replacement and invalidation, with general adapters for unsupported
+   targets or signatures. Reuse the existing argument and return contracts.
+3. Generalize native frame walking, root relocation, unwind and deoptimization
+   metadata across different code owners. Materialize managed frames at cold
+   boundaries when needed; preserve signal handling, fiber suspension/migration,
+   depth limits, and stack-overflow behavior. Broader lambda lists, unboxed
+   signatures, OSR entry shapes and complex control flow can follow separately.
+4. Validate the fast edge before widening eligibility. Exercise moving GC with
+   observed relocation, guard failure in caller and callee with side effects
+   executed exactly once, definition replacement, tier changes, mixed native
+   and interpreter fallback, zero/one/many values, and fiber/stack boundaries.
+
+Acceptance evidence should include disassembly showing register arguments and
+no per-call managed frame construction on the fast edge, exact-PC metadata for
+every supported boundary, differential results against interpreted execution,
+and a repeatable improvement in the isolated call benchmark. Fibonacci alone
+cannot establish this: the existing self-recursion path already benefits it.
+
+This milestone can precede aggressive speculative inlining without requiring
+it. Small register-only multiple-value tuples and multi-scope inlining remain
+separate work; the current carry-based return protocol suffices for this step.
+
 ## 11.5  Phase 3 — Production Ready
 
 **Goal:** ANSI-compliant, performant, embeddable, documented.

@@ -95,7 +95,7 @@ pub struct MachBlock {
 | `IRStore(base, off, val)` | `Mov64mr` | Same addressing |
 | `IRFAdd/FMul` f64 | `Addsd` / `Mulsd` | SSE2; AVX2 prefers `VADDSD` (3-op) |
 | `IRRound(x, mode)` f64 | `Roundsd` | SSE4.1; see §4.7.4.3 fallback |
-| `IRCall` | `Call64r` / `Call64m` | System V ABI |
+| `IRCall` | `Call64r` / `Call64m` | C helpers use System V; Lisp entries use the contracts below |
 | `IRBranch(cmp, t, f)` | `Jcc` | Fused compare-and-branch |
 | `IRSafepoint` | `Nop` + stack map | Metadata only |
 
@@ -110,15 +110,21 @@ pub struct MachBlock {
 | Stack alignment | 16-byte before `CALL` |
 | Red zone | MUST NOT be used (signal handlers / GC may clobber) |
 
-**EGCL-internal convention (x86-64):**
+**Current EGCL entry paths (v0.0.6, x86-64 Linux):**
 
-| Aspect | Register |
-|--------|----------|
-| Closure pointer | `R13` (pinned, callee-saved) |
-| Arg count | `RCX` |
-| First 4 Lisp args | `RDI`, `RSI`, `RDX`, `R8` |
-| Return value | `RAX` |
-| Execution-context pointer | `R13` (reserved in generated code, callee-saved) |
+There is no single register-argument ABI shared by every native Lisp call.
+
+| Entry path | Arguments and activation |
+|------------|--------------------------|
+| Ordinary mapped T2 body | `RDI` points to managed frame slots. Eligible generated call-cell adapters bind arguments, initialize and publish an `EgclStack` frame, then enter the body without Rust dispatch. |
+| Eligible T2 self-recursive entry | Up to four tagged arguments in `RCX`, `R8`, `R9`, `R10`; `RDI` carries native execution control and `RSI` the `EgclStack` pointer. Each recursive activation uses the machine stack under an outer managed anchor. |
+| General Lisp call | Runtime adapters handle unsupported signatures, targets, and control-flow shapes. |
+
+See [ordinary T2 installation](../crates/egcl/src/cli/bytecode/native_transfer_entry/ordinary_t2.rs),
+[generated linkage adapters](../crates/egcl/src/cli/bytecode/call_table_native.rs),
+and [native recursion emission](../crates/egcl-compiler/src/t2/emit.rs).
+Ordinary mapped installation sets `compiled_entry` to zero; the register-entry
+machinery is not yet the general cross-function T2 calling mechanism.
 
 **Mapped native returns (x86-64 Linux, transfer ABI version 3):** `RAX`
 holds the primary value, or `NIL` for zero values. `CF=0` denotes exactly one
@@ -145,6 +151,11 @@ none interprets an ordinary C function's carry flag as Lisp return status.
 Snapshot helpers are nonallocating leaves, so temporary primary spills need no
 new GC map. Secondary values remain traced until an actual clear or tuple
 replacement, independent of the carry flag.
+
+**Planned execution-context convention (S6):** The following requirements
+specify the target ABI, not the v0.0.6 register allocation. Current mapped T2
+can allocate `R12`–`R15`; neither `R12` nor `R13` is a universal pinned context
+register in that path.
 
 **R4.72** Generated Lisp code MUST reserve `R13` for the current Lisp execution
 context pointer (§2.3.1). `R14` and `R15` MUST NOT be used for it: T1 holds the
@@ -173,8 +184,9 @@ fiber switching, not by instruction cost:
   a SIB byte for fixed displacements. SBCL documents exactly this reason for the
   same choice (`src/compiler/x86-64/vm.lisp`).
 - Prior art agrees: HotSpot pins `r15` (`assembler_x86.hpp`), Go pins `R14`, and
-  SBCL pins `r13`. Go's ABI notes it keeps a TLS copy on amd64 yet still pins the
-  register "for simplicity and for consistency with other architectures".
+  SBCL uses `r13` when built without `gs-seg` (with that feature it uses
+  the GS segment instead; see the sources in §4.7.4.4). Go's ABI notes it
+  keeps a TLS copy on amd64 yet still pins the register "for simplicity and for consistency with other architectures".
 
 **R4.73** Rust code MUST NOT read `R13` via inline assembly to obtain the
 context: `rustc` allocates `R13` freely, so a Rust function may already have
@@ -212,6 +224,41 @@ multi-instruction software sequence: save MXCSR, set rounding mode,
 operations MUST use the MXCSR rounding-mode sequence. The backend MUST
 save and restore MXCSR around each rounding operation to avoid corrupting
 the rounding mode for subsequent FP instructions.
+
+### 4.7.4.4 Comparison with SBCL and Remaining Work
+
+This comparison concerns SBCL's ordinary full Lisp calls and unknown-values
+returns, not the System V C ABI or every compiler-selected local convention.
+SBCL's local calls can specialize argument and result placement.
+
+| Aspect | EGCL v0.0.6 mapped native path | SBCL x86-64 full-call / unknown-values convention |
+|--------|-------------------------------|--------------------------------------------------|
+| Arguments | Managed slots for ordinary calls; four registers for eligible self-recursion | `RDI`, `RSI`, `RDX`, then stack |
+| Argument count | Entry/adapter-specific metadata | Fixnum-encoded count in `RCX` |
+| Primary result | `RAX` | `RDI`; `RAX` instead carries the closure/function environment on calls |
+| Single result | `CF=0`; proven single-value returns avoid snapshot helpers and redundant clears | `CF=0`; no meaningful result count required |
+| Zero/many results | `CF=1`, full-width count in `RDX`, borrowed complete tuple pointer in `RCX` | `CF=1`, fixnum-encoded count in `RCX`, first three values in `RDI`, `RSI`, `RDX` |
+| Runtime context | Entry-specific control; reserved `R13` is an S6 target | `R13` without `gs-seg`, GS with it; `R12` serves NIL/card-table roles |
+| Activation | Ordinary calls publish managed frames; eligible self-recursion uses machine frames | Native control-stack frames with Lisp call conventions |
+
+SBCL facts are pinned to revision
+[`950441ee`](https://github.com/sbcl/sbcl/blob/950441ee3377cc4a4cbfbe77d4cc81f8a9a2e00f/src/compiler/x86-64/vm.lisp):
+[call/return implementation](https://github.com/sbcl/sbcl/blob/950441ee3377cc4a4cbfbe77d4cc81f8a9a2e00f/src/compiler/x86-64/call.lisp)
+and [local calling conventions](https://github.com/sbcl/sbcl/blob/950441ee3377cc4a4cbfbe77d4cc81f8a9a2e00f/doc/internals/calling-convention.texinfo).
+Its experimental
+[`TLS-BASED-MV-RETURN` feature](https://github.com/sbcl/sbcl/commit/4abf6ef5f73c56d17997cdff749701c94f22d712),
+introduced on 2026-08-30, moves excess values from the stack to thread-local
+storage while retaining the register/carry/count protocol. Automatic enabling
+remains disabled at the audited revision in
+[`src/cold/shared.lisp`](https://github.com/sbcl/sbcl/blob/950441ee3377cc4a4cbfbe77d4cc81f8a9a2e00f/src/cold/shared.lisp).
+
+EGCL already has precise native call-site maps, root publication, unwind
+recipes, deoptimization support, and a cheap known-single-value return path.
+The remaining milestone is to extend machine-frame calls to eligible
+**distinct T2 functions**, preserving those mechanisms across heterogeneous
+native frame chains. See [§11.4.3](11-phasing-roadmap.md#1143-x86-64-native-cross-function-calls).
+Small fixed tuples returned entirely in registers are a separate optimization;
+they are not a prerequisite for this milestone.
 
 ---
 
@@ -394,18 +441,20 @@ safepoint. After allocation, map to physical registers / spill slots.
 Only heap-pointer types (per type inference §4.4) are recorded; unboxed
 fixnums, floats, and raw pointers are excluded.
 
-**Current x86-64 T2 boundary form:** the framed emitter realizes the same map
-contract by synchronizing exact live tagged VRegs into dedicated tagged shadow
-slots appended to the owning `EgclStack` activation immediately before every
-runtime call. Unused shadow slots are cleared to `NIL`; after the call, possibly
-relocated values are restored to their allocated GPR or native spill homes.
-This makes moving-GC updates explicit without asynchronously inspecting a host
-register context. Code that needs shadow roots has no frame-less compiled entry.
-The emitted artifact records each sync-site offset plus its register/spill root
-counts; installation rejects a missing site, an out-of-range offset, inconsistent
-counts, or a shadow-slot range outside the installed activation bitmap. A future
-backend may instead expose `live_regs` directly when its safepoint trampoline
-publishes a complete machine context.
+**Current x86-64 T2 boundary forms (v0.0.6):** The legacy framed route
+synchronizes live tagged values into shadow slots in the owning `EgclStack`
+activation and restores relocated values after runtime calls. The mapped
+`PublishedHomes` route already publishes native stack and saved-register homes,
+with immutable exact-return-PC call-site maps and unwind recipes. Eligible
+self-recursion uses these maps to walk machine frames without allocating a
+managed activation for each child. Root ownership transfers to reconstructed
+managed frames when deoptimization materializes interpreter state.
+
+See [native call-site metadata](../crates/egcl-compiler/src/t2/x64_calls.rs)
+and [root publication](../crates/egcl/src/cli/bytecode/native_transfer_entry/root_publication.rs).
+These mechanisms expose updateable homes for moving GC, not untracked raw
+register values. Generalizing them across distinct compiled functions remains
+part of §11.4.3; precise native maps themselves are already implemented.
 
 **Validation (R4.46):** At code installation, verify: every `is_safepoint`
 instruction has a stack map entry; all slot indices are valid
