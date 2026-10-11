@@ -2,55 +2,33 @@
 
 ## Unreleased
 
-- Avoid redundant multiple-value clearing on proven single-value native paths,
-  with explicit zero/one/many return handling and precise secondary-value roots
-  ([#262](https://github.com/atgreen/evergreen/pull/262)).
-
-- Speed up native recursion on Linux x86-64: eligible T2 self-calls use machine
-  frames, and native returns avoid redundant stack lookups. A controlled
-  release-build `fib(32)` comparison improved from about 1.04 seconds to
-  0.21–0.23 seconds (4.9× faster by the median)
+- Speed up T2 native recursion on Linux x86-64 with machine-stack self-calls,
+  cheaper returns, fewer multiple-value resets, and correct fiber stack limits.
+  A release-build `fib(32)` comparison improved from 1.04 s to 0.21–0.23 s
   ([#248](https://github.com/atgreen/evergreen/pull/248),
-  [#259](https://github.com/atgreen/evergreen/pull/259)).
-  Native calls on fibers use their own stack limits, avoiding unnecessary
-  interpreter fallback
-  ([#260](https://github.com/atgreen/evergreen/pull/260)).
-  Ordinary T2 execution no longer counts invocations;
-  `FUNCTION-INVOKE-COUNT` reports tiering heat, with exact counts available
-  through explicit `PROFILE`
+  [#259](https://github.com/atgreen/evergreen/pull/259),
+  [#260](https://github.com/atgreen/evergreen/pull/260),
+  [#262](https://github.com/atgreen/evergreen/pull/262)).
+- Remove invocation counting from ordinary T2 execution.
+  `FUNCTION-INVOKE-COUNT` now reports tiering heat; use `PROFILE` for exact counts
   ([#261](https://github.com/atgreen/evergreen/pull/261)).
-
-- Evaluate optional `TYPEP` and `SUBTYPEP` arguments consistently, preserving
-  side effects and nonlocal exits; enforce `TYPEP` errors through `FUNCALL`
-  ([#257](https://github.com/atgreen/evergreen/pull/257)).
-
-- Honor `DEFTYPE` default arguments, named returns, and documentation;
-  preserve `SPECIAL` parameter declarations when compiling closures
-  ([#256](https://github.com/atgreen/evergreen/pull/256)).
-
-- Defer zero-argument `DEFTYPE` bodies until type expansion, preserving
-  captured lexical bindings and use-time dynamic values
-  ([#255](https://github.com/atgreen/evergreen/pull/255)).
-
-- Accept redundant names within `DEFPACKAGE` options while preserving
-  cross-category and import conflicts, including correct shadowing imports
-  ([#253](https://github.com/atgreen/evergreen/pull/253)).
-
-- Accept open and closed file streams in `TRUENAME` and pathname coercion,
-  retaining their opening path when pathname defaults change
+- Correct `DEFTYPE` defaults, lexical and dynamic bindings, named returns, and
+  documentation; preserve `SPECIAL` parameters in compiled closures. Evaluate
+  optional `TYPEP`/`SUBTYPEP` arguments and enforce `TYPEP` errors through `FUNCALL`
+  ([#255](https://github.com/atgreen/evergreen/pull/255),
+  [#256](https://github.com/atgreen/evergreen/pull/256),
+  [#257](https://github.com/atgreen/evergreen/pull/257)).
+- Accept repeated `DEFPACKAGE` option names without losing conflict checks;
+  fix `APROPOS` handling of `NIL`, `T`, and invalid argument counts
+  ([#250](https://github.com/atgreen/evergreen/pull/250),
+  [#253](https://github.com/atgreen/evergreen/pull/253)).
+- Accept open and closed file streams as pathname designators, retaining their
+  opening paths when defaults change
   ([#252](https://github.com/atgreen/evergreen/pull/252)).
-
-- Preserve the identity of saved builtin function objects when installed
-  in user-defined function cells, including after replacement and restoration
-  ([#251](https://github.com/atgreen/evergreen/pull/251)).
-
-- Make `APROPOS` searches handle `NIL` and `T` without panicking, and signal
-  `PROGRAM-ERROR` for invalid `APROPOS`/`APROPOS-LIST` argument counts
-  ([#250](https://github.com/atgreen/evergreen/pull/250)).
-
-- Preserve large rational-number numerators when denominator allocation
-  triggers moving garbage collection
-  ([#249](https://github.com/atgreen/evergreen/pull/249)).
+- Preserve saved builtin function identity across replacement and restoration,
+  and protect large rational numerators during moving GC
+  ([#249](https://github.com/atgreen/evergreen/pull/249),
+  [#251](https://github.com/atgreen/evergreen/pull/251)).
 
 ## 0.0.5 - 2026-10-10
 
