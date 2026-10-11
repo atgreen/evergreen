@@ -8548,7 +8548,14 @@ fn compile_function_forcing_boxed(
         match compiler_macroexpand::macroexpand_all(progn, &menv) {
             Ok(mut expanded) => {
                 egcl_rt::rooted_ref!(_expanded_root = &mut expanded);
-                *body = arena_cons(expanded, NIL);
+                // Remove our synthetic PROGN so leading declarations remain
+                // visible to parameter admission and body-scope analysis below.
+                let (head, forms) = cp(expanded);
+                if head.is_symbol() && sym_name(head) == "PROGN" {
+                    *body = forms;
+                } else {
+                    *body = arena_cons(expanded, NIL);
+                }
             }
             Err(err) => {
                 // A macrolet body that will not expand cannot be lowered; a
