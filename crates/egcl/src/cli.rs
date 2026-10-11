@@ -9724,8 +9724,8 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                 out.push_str(&egcl_stdlib::format::print_symbol_for_output(val, true));
             }
         }
-    } else if is_closure_cons(val) {
-        // An interpreter closure `(EGCL::CLOSURE . id)` is a function, not data.
+    } else if egcl_rt::function::is_interpreted_function(val) || is_closure_cons(val) {
+        // Reified function objects and legacy source closures print alike.
         out.push_str("#<FUNCTION>");
     } else if val.is_cons() {
         // *PRINT-LEVEL*: past the depth limit, a nested list prints as `#`.
