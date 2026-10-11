@@ -25,10 +25,11 @@
 - Accept open and closed file streams as pathname designators, retaining their
   opening paths when defaults change
   ([#252](https://github.com/atgreen/evergreen/pull/252)).
-- Preserve saved builtin function identity across replacement and restoration,
-  and protect large rational numerators during moving GC
+- Preserve saved builtin function identity and printing across replacement and
+  restoration; protect large rational numerators during moving GC
   ([#249](https://github.com/atgreen/evergreen/pull/249),
-  [#251](https://github.com/atgreen/evergreen/pull/251)).
+  [#251](https://github.com/atgreen/evergreen/pull/251),
+  [#263](https://github.com/atgreen/evergreen/pull/263)).
 
 ## 0.0.5 - 2026-10-10
 
