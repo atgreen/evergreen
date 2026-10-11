@@ -100,7 +100,6 @@ pub mod emit_riscv64;
 pub mod emit_s390x;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub mod native_transfer;
-#[cfg(target_arch = "x86_64")]
 pub mod native_return;
 #[cfg(all(
     target_arch = "powerpc64",

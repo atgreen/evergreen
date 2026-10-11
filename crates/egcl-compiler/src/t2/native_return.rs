@@ -44,7 +44,7 @@ pub fn emit_tuple_return(a: &mut Asm) {
     emit_single_return(a);
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(all(test, target_arch = "x86_64", not(target_os = "windows")))]
 mod tests {
     use super::*;
     use egcl_rt::{jit::JitBuffer, value::EgclVal};

@@ -93,6 +93,29 @@ pub struct NativeOutcome {
     pub exit: NativeExit,
 }
 
+/// Borrowed successful-return tuple at a nonallocating C/native boundary.
+///
+/// On x86-64 Linux, native Lisp returns use CF=0 for exactly one RAX value,
+/// or CF=1 with count in RDX and this payload pointer in RCX. The payload
+/// includes the primary at index zero. Counts zero and one have a null payload.
+/// The environment owns and precisely traces the tuple; this descriptor is
+/// not a root and must not outlive a safepoint, yield, or tuple mutation.
+/// Exceptional transfers continue to use NativeOutcome, independently.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeReturnValues {
+    pub count: usize,
+    pub payload: *const EgclVal,
+}
+
+impl NativeReturnValues {
+    pub const SINGLE: Self = Self { count: 1, payload: std::ptr::null() };
+}
+
+/// Reserved operation in the T2 multiple-value helper: write a
+/// NativeReturnValues descriptor to the destination without allocating.
+pub const SNAPSHOT_NATIVE_RETURN_VALUES: u64 = u64::MAX;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentOwner {
     Thread(crate::thread::NativeThreadId),

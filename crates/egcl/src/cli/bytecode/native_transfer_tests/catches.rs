@@ -180,8 +180,10 @@ fn native_v2_catch_registration_preserves_values_and_fallback_identity() {
             usize::from(source.contains("throw"))
         );
         assert_eq!(take_native_fallback_count(), 0);
-        assert!(env.mv_active);
-        assert_eq!(env.mv.len(), count);
+        // A native one-value return releases its duplicate tuple root; zero
+        // values remain active and distinct from the primary-only convention.
+        assert_eq!(env.mv_active, count != 1);
+        assert!(env.mv.is_empty());
         assert!(env.catch_stack.is_empty());
     }
 }

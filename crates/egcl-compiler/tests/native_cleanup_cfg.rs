@@ -383,7 +383,14 @@ mod execution {
             });
         }
     }
-    extern "C" fn clear_mv() {}
+    unsafe extern "C" fn single_values(_: u64, dst: *mut EgclVal, count: u64) {
+        if count == egcl_rt::native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
+            unsafe { dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
+                .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE); }
+        } else {
+            assert_eq!(count, 0);
+        }
+    }
 
     unsafe extern "C" fn save(cleanup: u32, resume: u32, value: EgclVal) -> EgclVal {
         assert_eq!((cleanup, resume, value), (8, 12, EgclVal::from_fixnum(99)));
@@ -484,7 +491,7 @@ mod execution {
             2,
             save as *const () as u64,
             complete_veneer.as_ptr() as u64,
-            clear_mv as *const () as u64,
+            single_values as *const () as u64,
         )
         .unwrap();
         let code = JitBuffer::new(&emitted.code).unwrap();

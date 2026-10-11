@@ -491,13 +491,21 @@ fn guarded_leaf_without_poll_has_a_call_capable_deopt_frame() {
         JitBuffer::new(&emit_helper_veneer(complete_leaf_guard, std::ptr::null())).unwrap();
     let mut top = Box::new([0usize; 2]);
     let probe = native_unwind::capture_call(veneer.as_ptr(), top.as_mut_ptr(), false);
+    unsafe extern "C" fn single_values(_: u64, dst: *mut EgclVal, count: u64) {
+        if count == egcl_rt::native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
+            unsafe { dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
+                .write(egcl_rt::native_transfer::NativeReturnValues::SINGLE); }
+        } else {
+            assert_eq!(count, 0);
+        }
+    }
     let (emitted, _) = egcl_compiler::t2::emit::emit_framed_native_handlers_with_recursion(
         &ir,
         1,
         1,
         1,
         1,
-        1,
+        single_values as *const () as u64,
         1,
         1,
         0,

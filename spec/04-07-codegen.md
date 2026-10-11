@@ -120,6 +120,32 @@ pub struct MachBlock {
 | Return value | `RAX` |
 | Execution-context pointer | `R13` (reserved in generated code, callee-saved) |
 
+**Mapped native returns (x86-64 Linux, transfer ABI version 3):** `RAX`
+holds the primary value, or `NIL` for zero values. `CF=0` denotes exactly one
+value; `RDX` and `RCX` are unspecified in that case. `CF=1` denotes zero or
+multiple values: `RDX` is the full-width count and `RCX` is a borrowed pointer
+to the complete value tuple, including its primary (null for zero values).
+Return sequences set carry after stack teardown. A tail jump inherits the
+callee's return convention.
+
+The tuple remains materialized in the execution's `Env` buffer, which owns
+its GC roots. The borrowed pointer is valid only until the next tuple mutation,
+collection, or suspension; it is not an additional root. Returning one value
+normalizes the buffer to empty and inactive, releasing any duplicate root.
+Callers establish an empty, inactive buffer before normal mapped entry.
+A proven empty, inactive state permits a direct single-value return and removal
+of redundant clears. Calls and control landings invalidate that proof, and OSR
+entries start with unknown multiple-value state.
+
+Published adapters reconstruct the descriptor from `Env` after Rust retirement,
+interpreter fallback, or cold resumption. Precise deoptimization returns snapshot
+the completed interpreter result. The outer segment boundary, T0/T1, legacy
+checked native ABI version 1, and C helpers use the materialized `Env` tuple;
+none interprets an ordinary C function's carry flag as Lisp return status.
+Snapshot helpers are nonallocating leaves, so temporary primary spills need no
+new GC map. Secondary values remain traced until an actual clear or tuple
+replacement, independent of the carry flag.
+
 **R4.72** Generated Lisp code MUST reserve `R13` for the current Lisp execution
 context pointer (§2.3.1). `R14` and `R15` MUST NOT be used for it: T1 holds the
 frame-slots pointer in `R14` and the operand-stack pointer in `R15`, and the T2

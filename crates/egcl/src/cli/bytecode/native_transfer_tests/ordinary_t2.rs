@@ -1130,6 +1130,108 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_single_return_releases_secondary_roots_without_clear_calls() {
+    use egcl_rt::gc::TraceHostRoots;
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let (symbol, code) = install("MV-ABI-SINGLE", "(x)", "(x)", &mut env);
+    assert_mapped_t2(&code);
+
+    // These objects have no Lisp owner other than the pending value tuple.
+    // Inspect the actual root visitor, not just the active flag: an inactive
+    // Vec with a nonzero length still retains every secondary object.
+    {
+        egcl_rt::rooted!(primary = super::super::super::arena_cons(EgclVal::from_fixnum(81), NIL));
+        env.set_mv(vec![*primary]);
+    }
+    let secondary_bits = {
+        egcl_rt::rooted!(secondary = super::super::super::arena_cons(EgclVal::from_fixnum(82), NIL));
+        env.mv.push(*secondary);
+        secondary.to_raw()
+    };
+    let mut roots_before = 0;
+    env.trace_host_roots(&mut |slot| {
+        if unsafe { (*slot).to_raw() } == secondary_bits { roots_before += 1; }
+    });
+    assert!(roots_before > 0, "the stale-secondary probe must start as a real root");
+    assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(42)], &mut env).unwrap(),
+        EgclVal::from_fixnum(42));
+    assert!(!env.mv_active);
+    assert!(env.mv.is_empty());
+    let mut roots_after = 0;
+    env.trace_host_roots(&mut |slot| {
+        if unsafe { (*slot).to_raw() } == secondary_bits { roots_after += 1; }
+    });
+    assert_eq!(roots_after, 0, "single return must release stale secondary roots");
+
+    let bytes = unsafe { std::slice::from_raw_parts(code.entry, code.code_len) };
+    let clear = c2i_t2_mv as *const () as u64;
+    let mut decoder = iced_x86::Decoder::with_ip(
+        64, bytes, code.entry as u64, iced_x86::DecoderOptions::NONE);
+    while decoder.can_decode() {
+        let instruction = decoder.decode();
+        assert!(!(0..instruction.op_count()).any(|operand|
+            instruction.op_kind(operand) == iced_x86::OpKind::Immediate64
+                && instruction.immediate64() == clear),
+            "proven single-valued body still calls the MV clear helper");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_return_distinguishes_zero_one_and_many_after_stale_values() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    for (name, form, expected) in [
+        ("MV-ABI-ZERO", "((values))", vec![]),
+        ("MV-ABI-ONE", "((values x))", vec![42]),
+        ("MV-ABI-MANY", "((values x 43 44))", vec![42, 43, 44]),
+        ("MV-ABI-AFTER-MANY", "((progn (values 10 11) x))", vec![42]),
+    ] {
+        let (symbol, code) = install(name, "(x)", form, &mut env);
+        assert_mapped_t2(&code);
+        for stale in [vec![], vec![70], vec![70, 71, 72, 73]] {
+            env.set_mv(stale.into_iter().map(EgclVal::from_fixnum).collect());
+            let result = run_native(&code, symbol, &[EgclVal::from_fixnum(42)], &mut env).unwrap();
+            let actual = if env.mv_active { env.mv.clone() } else { vec![result] };
+            assert_eq!(actual, expected.iter().copied().map(EgclVal::from_fixnum).collect::<Vec<_>>(),
+                "{name}: zero, one and many must not inherit the previous tuple");
+        }
+    }
+}
+
+#[test]
+fn native_return_snapshot_canonicalizes_one_and_borrows_many() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    for count in [0, 1, 2, 19] {
+        env.set_mv((0..count).map(EgclVal::from_fixnum).collect());
+        let descriptor = env.native_return_values();
+        assert_eq!(descriptor.count, count as usize);
+        if count <= 1 {
+            assert!(descriptor.payload.is_null());
+        } else {
+            assert_eq!(descriptor.payload, env.mv.as_ptr());
+            assert_eq!(unsafe { std::slice::from_raw_parts(descriptor.payload, descriptor.count) },
+                env.mv.as_slice());
+        }
+        assert_eq!(env.mv_active, count != 1);
+        if count == 1 { assert!(env.mv.is_empty(), "single tuple must not retain duplicate roots"); }
+    }
+    env.clear_mv();
+    let descriptor = env.native_return_values();
+    assert_eq!(descriptor.count, 1);
+    assert!(descriptor.payload.is_null());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_recursive_frames_do_not_grow_the_managed_stack() {
     assert!(egcl_rt::native_transfer::is_supported());
     let _lock = super::super::super::heap_test_lock()
