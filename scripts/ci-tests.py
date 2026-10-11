@@ -34,8 +34,31 @@ def balance(cases, count):
     return shards
 
 
-def checked(command, cwd):
-    return subprocess.check_output(command, cwd=cwd, text=True)
+def checked(command, cwd, env=None):
+    return subprocess.check_output(command, cwd=cwd, text=True, env=env)
+
+
+def runtime_environment(root, manifest):
+    """Restore Cargo's loader paths when invoking its artifacts directly."""
+    env = os.environ.copy()
+    directories = [str(root / directory) for directory in manifest.get("library_dirs", [])]
+    for artifact in sorted(manifest.get("artifacts", {})):
+        parent = (root / artifact).parent
+        directories.append(str(parent))
+        if parent.name == "deps":
+            directories.append(str(parent.parent))
+    if "linux" in manifest.get("target", ""):
+        # Proc-macro tests use the host ABI even in a musl target build. Resolve
+        # both toolchain paths on this runner; producer paths are not portable.
+        for options in ([], ["--target", manifest["target"]]):
+            directory = checked(["rustc", "--print", "target-libdir", *options], root).strip()
+            if not directory or "\n" in directory:
+                raise ValueError("rustc returned an invalid target library directory")
+            directories.append(directory)
+    directories.extend(env.get("LD_LIBRARY_PATH", "").split(os.pathsep))
+    if directories:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(dict.fromkeys(path for path in directories if path))
+    return env
 
 
 def identity(root):
@@ -71,12 +94,12 @@ def relative(root, path):
         raise ValueError(f"artifact outside checkout: {path}") from error
 
 
-def discover(root, harness, native):
+def discover(root, harness, native, env=None):
     executable = root / harness["executable"]
     if not executable.is_file():
         raise FileNotFoundError(f"missing test artifact: {executable}")
     def names(extra):
-        output = checked([str(executable), "--list", "--format", "terse", *extra], root / harness["cwd"])
+        output = checked([str(executable), "--list", "--format", "terse", *extra], root / harness["cwd"], env=env)
         return {line[:-6] for line in output.splitlines() if line.endswith(": test")}
     all_names, ignored = names([]), names(["--ignored"])
     if not ignored <= all_names:
@@ -162,9 +185,10 @@ def prepare(args):
             raise ValueError(f"missing runtime artifact: {path}")
     native = args.target.startswith("x86_64-") and "linux" in args.target
     timings = json.loads(Path(args.timings).read_text())
+    environment = runtime_environment(root, {"target": args.target, "artifacts": runtime_artifacts})
     cases = []
     for name, harness in sorted(harnesses.items()):
-        found = discover(root, harness, native)
+        found = discover(root, harness, native, environment)
         selected_cases = [case for case in found if any(case["test"].startswith(prefix) for prefix in selected[name])]
         if not selected_cases:
             if selected[name] != [""]:
@@ -219,6 +243,7 @@ def archive_files(root, manifest_path):
     if not artifacts:
         raise ValueError("zero artifacts to archive")
     libraries = set()
+    environment = runtime_environment(root, manifest)
     for name, expected in list(artifacts.items()):
         path = root / name
         relative(root, path)
@@ -228,7 +253,7 @@ def archive_files(root, manifest_path):
             raise ValueError(f"artifact changed since discovery: {name}")
         if "linux" not in manifest["target"] or not dynamic_elf(path):
             continue
-        output = checked(["ldd", str(path)], root)
+        output = checked(["ldd", str(path)], root, env=environment)
         if "not found" in output:
             raise ValueError(f"unresolved shared library for {name}: {output}")
         for line in output.splitlines():
@@ -256,14 +281,11 @@ def test_environment(root, manifest):
             previous = executables.setdefault(case["name"], case["executable"])
             if previous != case["executable"]:
                 raise ValueError(f"ambiguous harness executable: {case['name']}")
-    env = os.environ.copy()
+    env = runtime_environment(root, manifest)
     for variable, harness in NESTED_REGRESSIONS.items():
         env.pop(variable, None)
         if harness in executables:
             env[variable] = str(root / executables[harness])
-    directories = [str(root / directory) for directory in manifest.get("library_dirs", [])]
-    if directories:
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(directories + [env.get("LD_LIBRARY_PATH", "")])
     return env
 
 
