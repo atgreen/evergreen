@@ -162,6 +162,14 @@ fn published_return_registers_after_real_mapped_t2_execution() {
         .unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // The observation hook is intentionally a tree-walker-only test form, not
+    // a compiler builtin. Reach it through a real named function, as the other
+    // mapped-entry probes do, so the compiled body retains an admissible call.
+    read_eval_all_env(
+        "(defun return-abi-observe-mapped () (%ordinary-t2-entry-for-test))",
+        &mut env,
+    )
+    .unwrap();
     for (name, values, expected) in [
         ("RETURN-ABI-MAPPED-ZERO", "(values)", vec![]),
         ("RETURN-ABI-MAPPED-ONE", "(values 42)", vec![42]),
@@ -172,14 +180,14 @@ fn published_return_registers_after_real_mapped_t2_execution() {
         ),
     ] {
         read_eval_all_env(
-            &format!("(defun {name} () (%ordinary-t2-entry-for-test) {values})"),
+            &format!("(defun {name} () (return-abi-observe-mapped) {values})"),
             &mut env,
         )
         .unwrap();
         let (_, code) = ordinary_t2::install(
             name,
             "()",
-            &format!("((%ordinary-t2-entry-for-test) {values})"),
+            &format!("((return-abi-observe-mapped) {values})"),
             &mut env,
         );
         assert!(code.is_t2 && matches!(code._storage, NativeCodeStorage::Mapped(_)));
