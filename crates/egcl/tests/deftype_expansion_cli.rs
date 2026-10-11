@@ -134,3 +134,72 @@ fn redefining_parameterized_and_constant_aliases_replaces_the_expansion() {
         "T"
     );
 }
+
+#[test]
+fn zero_argument_deftype_defers_errors_until_expansion() {
+    assert_eq!(
+        eval(
+            r#"(progn
+          (assert (eq 'lazy-error (deftype lazy-error () (error "expanded"))))
+          (format t "RESULT:~s"
+            (handler-case (progn (typep 1 'lazy-error) nil) (error () t))))"#
+        ),
+        "T"
+    );
+}
+
+#[test]
+fn zero_argument_deftype_uses_definition_lexicals_and_use_time_state() {
+    assert_eq!(
+        eval(
+            r#"(progn
+          (defvar *lazy-type* 'integer)
+          (deftype dynamic-alias () *lazy-type*)
+          (let ((captured (list 'integer 0 9)))
+            (deftype lexical-alias () captured)
+            (setq captured (list 'integer 10 19)))
+          (let ((*lazy-type* 'character) (captured 'string))
+            (declare (ignore captured))
+            (format t "RESULT:~s"
+              (list (typep #\x 'dynamic-alias)
+                    (typep 3 'dynamic-alias)
+                    (typep 15 'lexical-alias)
+                    (typep 5 'lexical-alias)))))"#
+        ),
+        "(T NIL T NIL)"
+    );
+}
+
+#[test]
+fn lazy_deftype_survives_fresh_process_compiled_file_loading() {
+    let directory = std::env::temp_dir().join(format!("egcl-lazy-deftype-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.join("types.lisp");
+    let artifact = directory.join("types.bfasl");
+    std::fs::write(
+        &source,
+        r#"
+      (deftype stored-lazy-error () (error "expanded stored type"))
+      (defvar *stored-lazy-kind* 'integer)
+      (deftype stored-lazy-kind () *stored-lazy-kind*)
+    "#,
+    )
+    .unwrap();
+    assert_eq!(eval(&format!(
+        "(progn (compile-file {source:?} :output-file {artifact:?}) (format t \"RESULT:~s\" (not (null (probe-file {artifact:?})))) )"
+    )), "T");
+    std::fs::remove_file(&source).unwrap();
+    assert_eq!(
+        eval(&format!(
+            r#"(progn
+      (load {artifact:?})
+      (let ((*stored-lazy-kind* 'character))
+        (format t "RESULT:~s"
+          (list (typep #\x 'stored-lazy-kind)
+                (handler-case (progn (typep 1 'stored-lazy-error) nil)
+                  (error () t))))))"#
+        )),
+        "(T T)"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
