@@ -11,6 +11,10 @@
   Native calls on fibers use their own stack limits, avoiding unnecessary
   interpreter fallback
   ([#260](https://github.com/atgreen/evergreen/pull/260)).
+  Ordinary T2 execution no longer counts invocations;
+  `FUNCTION-INVOKE-COUNT` reports tiering heat, with exact counts available
+  through explicit `PROFILE`
+  ([#261](https://github.com/atgreen/evergreen/pull/261)).
 
 - Evaluate optional `TYPEP` and `SUBTYPEP` arguments consistently, preserving
   side effects and nonlocal exits; enforce `TYPEP` errors through `FUNCALL`
