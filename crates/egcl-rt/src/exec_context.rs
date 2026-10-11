@@ -160,6 +160,39 @@ impl LispExecutionContext {
         self.active_native_control.swap(address, Ordering::AcqRel)
     }
 
+    /// Publish pinned control storage only for the dynamic extent of `run`.
+    /// Nested entries restore the enclosing address even when `run` unwinds.
+    /// The restore guard is private so callers cannot forget it or drop it early.
+    ///
+    /// # Safety
+    /// This must run on the owning execution. `control` and every pointer it
+    /// contains must have the layout and lifetimes expected by generated code.
+    /// Native access must end before `run` returns or unwinds, including any
+    /// suspended continuation. Such access must respect Rust aliasing rules;
+    /// atomic address publication does not permit concurrent pointee access.
+    pub unsafe fn with_active_native_control<T, R>(
+        &self,
+        mut control: std::pin::Pin<&mut T>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct Restore<'a> {
+            execution: &'a LispExecutionContext,
+            previous: u64,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                // SAFETY: the enclosing invocation still owns its storage and
+                // this private guard cannot escape the nested dynamic scope.
+                unsafe { self.execution.swap_active_native_control(self.previous); }
+            }
+        }
+        // SAFETY: obtaining the address does not move the pinned storage.
+        let address = unsafe { control.as_mut().get_unchecked_mut() as *mut T as u64 };
+        let previous = unsafe { self.swap_active_native_control(address) };
+        let _restore = Restore { execution: self, previous };
+        run()
+    }
+
     /// Address generated code will hold in the reserved register.
     pub fn as_ptr(&self) -> *const Self {
         self as *const Self
@@ -169,6 +202,34 @@ impl LispExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_native_control_restores_nested_state_on_unwind() {
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7, 3);
+        let other = LispExecutionContext::new(ExecutionKind::Fiber, 8, 3);
+        let mut outer = std::pin::pin!(11u64);
+        let outer_address = (&*outer as *const u64) as u64;
+        unsafe {
+            execution.with_active_native_control(outer.as_mut(), || {
+                assert_eq!(execution.active_native_control(), outer_address);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut inner = std::pin::pin!(22u64);
+                    let inner_address = (&*inner as *const u64) as u64;
+                    execution.with_active_native_control(inner.as_mut(), || {
+                        assert_eq!(execution.active_native_control(), inner_address);
+                        assert_eq!(other.active_native_control(), 0);
+                        execution.set_carrier_id(9);
+                        assert_eq!(execution.active_native_control(), inner_address);
+                        panic!("leave nested native entry");
+                    });
+                }));
+                assert!(result.is_err());
+                assert_eq!(execution.active_native_control(), outer_address);
+            });
+        }
+        assert_eq!(execution.active_native_control(), 0);
+        assert_eq!(execution.carrier_id(), 9);
+    }
 
     /// The offsets in [`offsets`] ARE the codegen ABI. If a field is reordered or
     /// resized this test fails rather than letting generated code read the wrong
