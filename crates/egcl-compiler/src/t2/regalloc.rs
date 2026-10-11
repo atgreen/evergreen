@@ -616,21 +616,38 @@ fn x86_call_clobbers() -> PRegSet {
 /// Allocate for the live framed x86 emitter, reserving its ABI and scratch
 /// registers while still using the same regalloc2 pipeline and edit model.
 pub fn allocate_framed(mf: &mut MachFunc) -> Result<(), AllocationError> {
+    allocate_framed_mode(mf, false)
+}
+
+/// Ordinary Lisp entries reserve hardware R13 for the execution context.
+pub(crate) fn allocate_framed_ordinary(mf: &mut MachFunc) -> Result<(), AllocationError> {
+    allocate_framed_mode(mf, true)
+}
+
+fn allocate_framed_mode(mf: &mut MachFunc, ordinary: bool) -> Result<(), AllocationError> {
+    let environment = |reduced| {
+        let mut env = framed_machine_env(reduced);
+        if ordinary {
+            // Abstract GPR 11 maps to hardware R13 in GPR_X86.
+            env.preferred_regs_by_class[0].remove(PReg::new(11, Ra2RegClass::Int));
+        }
+        env
+    };
     // Reduced-pool-first (bliss-x5y.29): short prologues for the small hot
     // functions that dominate recursion, with a FULL-pool retry when the
     // reduced pool genuinely runs out of registers — a retry costs one extra
     // background-thread allocation pass, declining to T1 costs the tier.
     // EGCL_T2_FRAME_ENV=full|reduced pins one environment for debugging.
     match std::env::var("EGCL_T2_FRAME_ENV").as_deref() {
-        Ok("full") => return allocate_with_env(mf, framed_machine_env(false), x86_call_clobbers()),
+        Ok("full") => return allocate_with_env(mf, environment(false), x86_call_clobbers()),
         Ok("reduced") => {
-            return allocate_with_env(mf, framed_machine_env(true), x86_call_clobbers());
+            return allocate_with_env(mf, environment(true), x86_call_clobbers());
         }
         _ => {}
     }
-    match allocate_with_env(mf, framed_machine_env(true), x86_call_clobbers()) {
+    match allocate_with_env(mf, environment(true), x86_call_clobbers()) {
         Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => {
-            allocate_with_env(mf, framed_machine_env(false), x86_call_clobbers())
+            allocate_with_env(mf, environment(false), x86_call_clobbers())
         }
         done => done,
     }
