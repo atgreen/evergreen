@@ -18,11 +18,19 @@ on:
         type: choice
         options: [fast, full]
         default: full
+      platform_scope:
+        description: Full validation platforms
+        type: choice
+        options: [all, linux]
+        default: all
   workflow_call:
     inputs:
       suite:
         type: string
         default: full
+      platform_scope:
+        type: string
+        default: all
       preserve_run:
         type: boolean
         default: true
@@ -50,6 +58,7 @@ jobs:
     outputs:
       runtime: ${{ steps.select.outputs.runtime }}
       full: ${{ steps.select.outputs.full }}
+      windows: ${{ steps.select.outputs.windows }}
       areas: ${{ steps.select.outputs.areas }}
       pgo: ${{ steps.select.outputs.pgo }}
     steps:
@@ -66,9 +75,10 @@ jobs:
         env:
           CI_EVENT: ${{ github.event_name }}
           CI_SUITE: ${{ inputs.suite || 'fast' }}
+          CI_PLATFORM_SCOPE: ${{ inputs.platform_scope || 'all' }}
           CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           CI_HEAD: ${{ github.sha }}
-        run: python3 scripts/ci-plan.py --event "$CI_EVENT" --suite "$CI_SUITE" --base "$CI_BASE" --head "$CI_HEAD" --output "$GITHUB_OUTPUT"
+        run: python3 scripts/ci-plan.py --event "$CI_EVENT" --suite "$CI_SUITE" --platform-scope "$CI_PLATFORM_SCOPE" --base "$CI_BASE" --head "$CI_HEAD" --output "$GITHUB_OUTPUT"
 
   lint:
     needs: plan
@@ -214,7 +224,7 @@ jobs:
           LINT_RESULT: ${{ needs.lint.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           TEST_RESULT: ${{ needs.regression.result }}
-          FULL: ${{ needs.plan.outputs.full }}
+          WINDOWS: ${{ needs.plan.outputs.windows }}
           WINDOWS_RESULT: ${{ needs.windows-native-transfer.result }}
         run: |
           test "$PLAN_RESULT" = success
@@ -228,16 +238,16 @@ jobs:
             test "$BUILD_RESULT" = skipped
             test "$TEST_RESULT" = skipped
           fi
-          if [[ "$FULL" == true ]]; then
+          if [[ "$WINDOWS" == true ]]; then
             test "$WINDOWS_RESULT" = success
           else
-            test "$FULL" = false
+            test "$WINDOWS" = false
             test "$WINDOWS_RESULT" = skipped
           fi
 
   windows-native-transfer:
     needs: plan
-    if: needs.plan.outputs.full == 'true'
+    if: needs.plan.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     env:

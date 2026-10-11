@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 """Exercise the CI planner against real, disposable Git histories."""
 import json
+import os
+import textwrap
 from pathlib import Path
 import subprocess
 import sys
@@ -54,7 +56,7 @@ class PlanTests(unittest.TestCase):
     def test_docs_only(self):
         self.changed("README.md", "CHANGELOG.md", "AGENTS.md", "CITATION.cff",
                      "docs/a guide.md", "docs/image.png")
-        self.assertEqual(self.plan(), dict(runtime=False, full=False, areas=[], pgo=False))
+        self.assertEqual(self.plan(), dict(runtime=False, full=False, areas=[], pgo=False, windows=False))
 
     def test_unknown_and_spec_markdown_require_runtime(self):
         for name in ("spec/01-reader.md", "notes.md", "unknown.file", "Cargo.toml",
@@ -97,7 +99,7 @@ class PlanTests(unittest.TestCase):
         result = self.plan("--output", str(output))
         self.assertFalse(result["runtime"])
         self.assertEqual(output.read_text(),
-                         'runtime=false\nfull=false\nareas=[]\npgo=false\n')
+                         'runtime=false\nfull=false\nareas=[]\npgo=false\nwindows=false\n')
         self.changed("crates/egcl/src/a\nfull=true.rs")
         self.assertTrue(self.plan()["runtime"])
 
@@ -131,11 +133,42 @@ class PlanTests(unittest.TestCase):
         for event in ("schedule", "merge_group"):
             with self.subTest(event=event):
                 self.assertEqual(self.plan("--event", event),
-                                 dict(runtime=True, full=True, areas=ALL_AREAS, pgo=True))
+                                 dict(runtime=True, full=True, areas=ALL_AREAS, pgo=True, windows=True))
         for event in ("pull_request", "push", "workflow_dispatch", "workflow_call"):
             with self.subTest(event=event):
                 self.assertTrue(self.plan("--event", event, "--suite", "full")["full"])
                 self.assertFalse(self.plan("--event", event)["full"])
+
+    def test_platform_scope_keeps_full_linux_checks(self):
+        for event in ("workflow_call", "workflow_dispatch"):
+            with self.subTest(event=event):
+                result = self.plan("--event", event, "--suite", "full",
+                                   "--platform-scope", "linux")
+                self.assertTrue(result["full"])
+                self.assertTrue(result["runtime"])
+                self.assertTrue(result["pgo"])
+                self.assertEqual(result["areas"], ALL_AREAS)
+                self.assertFalse(result["windows"])
+
+    def test_windows_selected_for_default_full_and_nightly(self):
+        for event in ("workflow_call", "workflow_dispatch", "schedule", "merge_group"):
+            with self.subTest(event=event):
+                args = () if event in ("schedule", "merge_group") else ("--suite", "full")
+                self.assertTrue(self.plan("--event", event, *args)["windows"])
+        for scope in ("all", "linux"):
+            self.assertFalse(self.plan("--platform-scope", scope)["windows"])
+
+    def test_invalid_reusable_platform_scope_is_rejected_without_outputs(self):
+        for scope in ("", "windows", "linxu", "all\nwindows=false"):
+            with self.subTest(scope=scope):
+                output = self.repo / "invalid-output"
+                result = subprocess.run(
+                    [sys.executable, str(PLANNER), "--event", "workflow_call",
+                     "--suite", "full", "--platform-scope", scope,
+                     "--output", str(output)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid choice", result.stderr)
+                self.assertFalse(output.exists())
 
     def test_pgo_paths(self):
         for name in ("Makefile", "scripts/build-pgo-image.sh", "scripts/pgo-workload.lisp",
@@ -159,6 +192,59 @@ class PlanTests(unittest.TestCase):
         parsed = {key: json.loads(value) for key, value in
                   (line.split("=", 1) for line in lines[1:])}
         self.assertEqual(parsed, result)
+
+
+class WorkflowScopeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).resolve().parent.parent
+        cls.ci = (root / ".github/workflows/ci.yml").read_text()
+        cls.release = (root / ".github/workflows/release.yml").read_text()
+
+    def test_scope_input_and_selection_are_wired(self):
+        dispatch, reusable = self.ci.split("  workflow_dispatch:\n", 1)[1].split(
+            "  workflow_call:\n", 1)
+        self.assertIn("      platform_scope:\n", dispatch)
+        self.assertIn("        options: [all, linux]\n        default: all", dispatch)
+        self.assertIn("      platform_scope:\n        type: string\n        default: all", reusable)
+        self.assertIn("CI_PLATFORM_SCOPE: ${{ inputs.platform_scope || 'all' }}", self.ci)
+        self.assertIn('--platform-scope "$CI_PLATFORM_SCOPE"', self.ci)
+        self.assertIn("windows: ${{ steps.select.outputs.windows }}", self.ci)
+        windows = self.ci.split("  windows-native-transfer:\n", 1)[1]
+        self.assertIn("if: needs.plan.outputs.windows == 'true'", windows)
+        gate = self.ci.split("  ci-required:\n", 1)[1].split(
+            "  windows-native-transfer:\n", 1)[0]
+        self.assertIn("WINDOWS: ${{ needs.plan.outputs.windows }}", gate)
+        self.assertIn("needs: [plan, lint, build, regression, windows-native-transfer]", gate)
+        self.assertIn("if: always()", gate)
+        validation = self.release.split("  validation:\n", 1)[1].split("  plan:\n", 1)[0]
+        self.assertIn("suite: full", validation)
+        self.assertIn("platform_scope: linux", validation)
+        self.assertIn("preserve_run: true", validation)
+        self.assertIn("if: inputs.mode != 'build'", validation)
+
+    def test_required_gate_checks_exact_selected_results(self):
+        gate = self.ci.split("  ci-required:\n", 1)[1].split(
+            "  windows-native-transfer:\n", 1)[0]
+        script = textwrap.dedent(gate.split("        run: |\n", 1)[1])
+        for windows, expected in (("true", "success"), ("false", "skipped")):
+            for outcome in ("success", "failure", "cancelled", "skipped", ""):
+                with self.subTest(windows=windows, outcome=outcome):
+                    env = dict(os.environ, PLAN_RESULT="success", RUNTIME="true",
+                               LINT_RESULT="success", BUILD_RESULT="success",
+                               TEST_RESULT="success", FULL="true", WINDOWS=windows,
+                               WINDOWS_RESULT=outcome)
+                    result = subprocess.run(["bash", "-e", "-c", script], env=env)
+                    self.assertEqual(result.returncode == 0, outcome == expected)
+        for failed in ("PLAN_RESULT", "LINT_RESULT", "BUILD_RESULT", "TEST_RESULT"):
+            with self.subTest(failed=failed):
+                env = dict(os.environ, PLAN_RESULT="success", RUNTIME="true",
+                           LINT_RESULT="success", BUILD_RESULT="success",
+                           TEST_RESULT="success", FULL="true", WINDOWS="false",
+                           WINDOWS_RESULT="skipped")
+                env[failed] = "failure"
+                self.assertNotEqual(subprocess.run(
+                    ["bash", "-e", "-c", script], env=env).returncode, 0)
 
 
 if __name__ == "__main__":

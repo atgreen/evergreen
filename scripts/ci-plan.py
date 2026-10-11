@@ -87,11 +87,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--event", choices=EVENTS, required=True)
     parser.add_argument("--suite", choices=("fast", "full"), default="fast")
+    parser.add_argument("--platform-scope", choices=("all", "linux"), default="all")
     parser.add_argument("--base")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     result = plan(args.event, args.suite, args.base, args.head)
+    result["windows"] = result["full"] and args.platform_scope == "all"
     if args.output:
         with args.output.open("a", encoding="utf-8") as output:
             for key, value in result.items():
