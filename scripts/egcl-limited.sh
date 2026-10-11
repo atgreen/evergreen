@@ -36,11 +36,27 @@ TIMEOUT="${EGCL_TIMEOUT:-600}"
 # --kill-after: T2 native loops can ignore SIGTERM (bliss-siv7), so follow the
 # TERM with a KILL or a hung run escapes the timeout entirely. A KILLed timeout
 # exits 137 like an OOM kill; disambiguate by elapsed wall-clock below.
+scope="egcl-limited-${BASHPID}-${RANDOM}-${RANDOM}.scope"
 start=$SECONDS
-systemd-run --user --scope --quiet -p MemoryMax="$MEM" -p MemorySwapMax=0 \
+systemd-run --user --scope --quiet --unit="$scope" \
+  -p MemoryMax="$MEM" -p MemorySwapMax=0 -p KillSignal=SIGKILL \
   -- timeout --kill-after=30 "$TIMEOUT" "$@"
 rc=$?
 elapsed=$((SECONDS - start))
+# timeout can reap the immediate shell and exit before its --kill-after timer
+# fires, leaving TERM-ignoring descendants (even new sessions) in this scope.
+# Stop only our scope, synchronously. KillSignal makes manager-driven cleanup
+# immediate; GNU timeout still sends TERM first during normal timeout handling.
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+  if ! cleanup_error=$(systemctl --user stop "$scope" 2>&1); then
+    # An empty scope may already have been collected. Do not hide failures to
+    # contact the manager or stop a scope that still exists.
+    load_state=$(systemctl --user show --property=LoadState --value "$scope" 2>/dev/null)
+    if [ "$load_state" != "not-found" ]; then
+      echo "[egcl-limited] scope cleanup failed: $cleanup_error" >&2
+    fi
+  fi
+fi
 if [ "$rc" -eq 137 ]; then
   if [ "$elapsed" -ge "$TIMEOUT" ]; then
     echo "[egcl-limited] exit 137 after ${elapsed}s >= ${TIMEOUT}s timeout:" \
