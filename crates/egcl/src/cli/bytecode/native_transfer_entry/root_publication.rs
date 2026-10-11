@@ -688,8 +688,8 @@ unsafe fn walk_boundary_frames_to(
                 continue;
             }
             if let Some(owner) = boundary.directory.code_for_pc(cursor.pc) {
-                if !cursor.pc.checked_sub(owner.code.as_ptr() as usize)
-                    .is_some_and(|offset| offset < owner.code_len) {
+                if cursor.pc.checked_sub(owner.code.as_ptr() as usize)
+                    .is_none_or(|offset| offset >= owner.code_len) {
                     note_bail(Bail::PcOutsideOwner);
                     return total;
                 }
