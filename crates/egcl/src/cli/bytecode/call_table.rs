@@ -13,7 +13,7 @@ use egcl_rt::call_table::{self as linkage, CallCell};
 #[path = "call_table_ordinary.rs"]
 mod ordinary;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub(super) use ordinary::enter_ordinary_segment;
+pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[expect(unused_imports, reason = "ordinary entry consumers follow in bliss-t8a48")]
 pub(super) use ordinary::{OrdinaryCodeDirectory, OrdinarySegmentGuard, publish_ordinary};
