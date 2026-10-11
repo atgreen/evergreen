@@ -17,7 +17,6 @@ pub(super) fn flags() -> Option<egcl_compiler::t2::emit::NativeRecursiveFlags> {
         native_errors: std::ptr::addr_of!(PENDING_NATIVE_ERRORS) as u64,
         signal_epoch: egcl_rt::runtime::process_signal_activity_address() as u64,
         generation: std::ptr::addr_of!(DIRECT_CALL_GEN) as u64,
-        stack_limit: egcl_rt::stack::native_stack_limit_addr(),
         instrument_entries: cfg!(test),
         observe_forces_cold: cfg!(test),
     })
@@ -65,6 +64,7 @@ pub(super) unsafe extern "C" fn initialize() -> *mut NativeRecursiveControl {
         reserved: [0; 7],
         test_entries: std::ptr::null_mut(),
         test_observer: std::ptr::null(),
+        stack_limit: egcl_rt::stack::current_native_stack_limit(),
     };
     unsafe { (*context).native_recursive = Some(control); }
     let control = unsafe { (*context).native_recursive.as_mut().unwrap() };
@@ -114,7 +114,7 @@ pub(super) unsafe extern "C" fn slow_call(
             }
             let matches = recursive_target_matches(context, request.call.symbol as u32);
             refresh(context);
-            let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(AtomicOrdering::Acquire);
+            let limit = (*context).native_recursive.as_ref().unwrap().stack_limit;
             // The cold request occupies 48 bytes below the caller's body SP.
             // Budget the child's exact prologue and CALL return word just as
             // the generated fast check does; a retry must not bypass that guard.

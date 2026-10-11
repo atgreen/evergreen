@@ -862,6 +862,26 @@ pub fn native_stack_limit_addr() -> u64 {
     (&NATIVE_STACK_LIMIT as *const std::sync::atomic::AtomicU64) as u64
 }
 
+/// Lowest address admitted for the current execution's native calls.
+///
+/// A fiber owns a separate downward-growing stack, even after carrier migration.
+/// Preserve the existing 128 KiB host-stack headroom for cleanup and signalling;
+/// the CLI carrier's absolute address is unrelated to this reservation. Native
+/// threads retain the configured process-wide carrier limit (including zero
+/// when uninitialized); obtaining each native thread's actual OS stack bounds
+/// remains a separate limitation. Fiber bounds never depend on CLI setup.
+///
+/// This does not allocate, yield, or modify the process-wide setting. A caller
+/// may retain the result while its execution remains alive: migrating a fiber
+/// changes its carrier, not its native stack allocation.
+pub fn current_native_stack_limit() -> u64 {
+    if let Some((low, high)) = crate::thread::current_fiber()
+        .and_then(|fiber| fiber.native_stack_bounds()) {
+        return low.saturating_add(128 * 1024).min(high) as u64;
+    }
+    NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Publish the limit. `reserve_bytes` is how much of the stack below the current
 /// frame compiled code may use; the remainder is headroom for the interpreter to
 /// unwind and signal in.

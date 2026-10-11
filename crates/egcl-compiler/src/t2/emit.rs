@@ -2049,8 +2049,8 @@ fn emit_native_recursive_call(
     a.jcc(Cc::Ge, slow);
     mov_rr(a, RAX, 4);
     alu_r_imm(a, 5, RAX, child_frame_bytes as i32);
-    mov_imm64(a, SCRATCH, recursion.flags.stack_limit as i64);
-    load_mem64_disp(a, SCRATCH, SCRATCH, 0);
+    load_mem64_disp(a, SCRATCH, 7,
+        std::mem::offset_of!(NativeRecursiveControl, stack_limit) as i32);
     cmp_rr(a, RAX, SCRATCH);
     a.jcc(Cc::Le, slow);
     a.jmp(commit);
@@ -3437,6 +3437,8 @@ pub struct NativeRecursiveControl {
     pub reserved: [u8; 7],
     pub test_entries: *mut usize,
     pub test_observer: *const usize,
+    /// Absolute lower bound of this execution's owned stack; never carrier TLS.
+    pub stack_limit: u64,
 }
 
 /// Addresses of runtime-owned atomic flag cells. Generated reads use x86's
@@ -3450,7 +3452,6 @@ pub struct NativeRecursiveFlags {
     pub native_errors: u64,
     pub signal_epoch: u64,
     pub generation: u64,
-    pub stack_limit: u64,
     pub instrument_entries: bool,
     pub observe_forces_cold: bool,
 }
@@ -3492,7 +3493,8 @@ pub struct NativeFrameDeoptRequest {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const _: () = {
     use std::mem::{offset_of, size_of};
-    assert!(size_of::<NativeRecursiveControl>() == 88);
+    assert!(size_of::<NativeRecursiveControl>() == 96);
+    assert!(offset_of!(NativeRecursiveControl, stack_limit) == 88);
     assert!(offset_of!(NativeRecursiveControl, depth) == 8);
     assert!(offset_of!(NativeRecursiveControl, invoke_count) == 16);
     assert!(offset_of!(NativeRecursiveControl, mv_active) == 24);
@@ -3846,7 +3848,7 @@ pub fn emit_framed_native_handlers_with_native_recursion(
         || deopt_veneer == 0
         || [recursion.flags.gc_requested, recursion.flags.sigusr1_pending,
             recursion.flags.posted_signal, recursion.flags.native_errors,
-            recursion.flags.signal_epoch, recursion.flags.generation, recursion.flags.stack_limit]
+            recursion.flags.signal_epoch, recursion.flags.generation]
             .contains(&0)
         || f.block_order().iter().flat_map(|&block| &f.block(block).insts).any(|&inst| {
             let data = f.inst(inst);

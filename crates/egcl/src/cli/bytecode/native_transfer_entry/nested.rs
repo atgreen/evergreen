@@ -221,7 +221,7 @@ unsafe fn prepare_child(
     select: impl FnOnce() -> Option<call_table::MappedCallee>,
 ) -> Result<EgclVal, EgclError> {
     let here = std::ptr::from_ref(&record) as usize as u64;
-    let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
+    let limit = egcl_rt::stack::current_native_stack_limit();
     if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
         return Ok(NIL); // clean legacy depth fallback, not an exceptional outcome
     }

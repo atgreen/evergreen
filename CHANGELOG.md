@@ -8,6 +8,9 @@
   0.21–0.23 seconds (4.9× faster by the median)
   ([#248](https://github.com/atgreen/evergreen/pull/248),
   [#259](https://github.com/atgreen/evergreen/pull/259)).
+  Native calls on fibers use their own stack limits, avoiding unnecessary
+  interpreter fallback
+  ([#260](https://github.com/atgreen/evergreen/pull/260)).
 
 - Evaluate optional `TYPEP` and `SUBTYPEP` arguments consistently, preserving
   side effects and nonlocal exits; enforce `TYPEP` errors through `FUNCALL`

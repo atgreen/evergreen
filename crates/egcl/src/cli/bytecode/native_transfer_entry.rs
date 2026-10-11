@@ -1437,7 +1437,7 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
         return;
     }
     let here = std::ptr::from_ref(&request) as usize as u64;
-    let limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
+    let limit = egcl_rt::stack::current_native_stack_limit();
     if NATIVE_DEPTH.with(|depth| depth.get() >= native_depth_cap()) || here <= limit {
         unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
         return;
