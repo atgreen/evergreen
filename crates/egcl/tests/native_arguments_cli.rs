@@ -54,6 +54,9 @@ fn native_snapshots_recover_original_arguments_from_managed_homes() {
 #[test]
 fn overwritten_and_variadic_parameters_do_not_masquerade_as_original_arguments() {
     for (tier, installed) in [("t1", 1), ("t2", 2)] {
+        let interpreted_optional = cfg!(all(target_arch = "x86_64", target_os = "linux"));
+        let optional_tier = if interpreted_optional { 0 } else { installed };
+        let interpreted_optional = if interpreted_optional { "t" } else { "nil" };
         let program = format!(
             r#"
           (defun changed-native-argument (value)
@@ -63,7 +66,7 @@ fn overwritten_and_variadic_parameters_do_not_masquerade_as_original_arguments()
             (prog1 (egcl-debug:list-backtrace :count 32) (1+ value)))
           (dotimes (i 100) (changed-native-argument 41) (variadic-native-argument 41))
           (assert (= {installed} (egcl-ext:function-tier 'changed-native-argument)))
-          (assert (= {installed} (egcl-ext:function-tier 'variadic-native-argument)))
+          (assert (= {optional_tier} (egcl-ext:function-tier 'variadic-native-argument)))
           (dolist (entry (list (cons "COMMON-LISP-USER::CHANGED-NATIVE-ARGUMENT"
                                     (changed-native-argument 41))
                               (cons "COMMON-LISP-USER::VARIADIC-NATIVE-ARGUMENT"
@@ -72,8 +75,14 @@ fn overwritten_and_variadic_parameters_do_not_masquerade_as_original_arguments()
               (dolist (frame (cdr entry))
                 (when (equal (getf frame :function) (car entry))
                   (setq found t)
-                  (assert (null (getf frame :arguments-available-p)))
-                  (assert (null (getf frame :arguments)))))
+                  (if (and {interpreted_optional}
+                           (equal (car entry) "COMMON-LISP-USER::VARIADIC-NATIVE-ARGUMENT"))
+                      (progn
+                        (assert (getf frame :arguments-available-p))
+                        (assert (equal (getf frame :arguments) '(41))))
+                      (progn
+                        (assert (null (getf frame :arguments-available-p)))
+                        (assert (null (getf frame :arguments)))))))
               (assert found)))
           (format t "UNAVAILABLE-ARGS-PASS~%")
         "#

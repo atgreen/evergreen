@@ -54,6 +54,7 @@ impl ActivationState {
                 return Err(EgclError::Oom);
             }
             let mut state = OuterResumeState {
+                debug_call: None,
                 handlers: Vec::new(),
                 cleanup_conts: Vec::new(),
                 dyn_binds: Vec::new(),

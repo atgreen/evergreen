@@ -182,7 +182,10 @@ unsafe fn take_guard_resume_state(
     let mut state = if context.recursive.is_null() {
         let reserved = unsafe { &mut *context.guard_resume };
         let state = reserved.as_ref().ok_or_else(invalid_capture)?;
-        if !state.handlers.is_empty() || !state.cleanup_conts.is_empty() || !state.dyn_binds.is_empty()
+        if state.debug_call.is_some()
+            || !state.handlers.is_empty()
+            || !state.cleanup_conts.is_empty()
+            || !state.dyn_binds.is_empty()
             || state.handlers.capacity() < handler_depth
             || state.cleanup_conts.capacity() < cleanups.len()
             || state.dyn_binds.capacity() < specials.len()
@@ -207,7 +210,7 @@ unsafe fn take_guard_resume_state(
         }
         let mut handlers = Vec::new();
         handlers.try_reserve(handler_depth).map_err(|_| EgclError::Oom)?;
-        OuterResumeState { handlers, cleanup_conts: Vec::new(), dyn_binds: Vec::new() }
+        OuterResumeState { debug_call: None, handlers, cleanup_conts: Vec::new(), dyn_binds: Vec::new() }
     };
     egcl_rt::rooted_ref!(_state_root = &mut state);
     state.cleanup_conts.extend(cleanups.drain(..).map(|saved| saved.continuation));
@@ -359,6 +362,12 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
                 return Err(invalid_capture());
             }
         }
+        // Native recipes describe proven original arguments before the deopt
+        // stream replaces dead locals. Keep a traced copy until a managed
+        // debug-call record owns it; unavailable native arguments stay unknown.
+        egcl_rt::rooted!(original_arguments = unsafe {
+            (&*header.code_info).original_arguments((*frame).locals())
+        });
         // Resumed Lisp owns the frame; it must not borrow the abandoned
         // native capture. Restore that capture only after restoring the frame.
         let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
@@ -394,6 +403,11 @@ unsafe fn resume_guard_unpublished(request: *mut u8, out: *mut NativeOutcome) {
         egcl_rt::rooted!(state = Some(unsafe {
             take_guard_resume_state(context, code, &scopes, &*env)
         }?));
+        if let Some(arguments) = original_arguments.as_ref() {
+            state.as_mut().expect("guard resume state").debug_call = Some(unsafe {
+                egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, frame)
+            });
+        }
         resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
     });
     // Fiber mounting establishes carrier compatibility before resumed Lisp or

@@ -163,6 +163,53 @@ fn managed_argument_records_merge_without_duplicate_calls() {
 }
 
 #[test]
+fn resumed_managed_arguments_keep_the_callable_anchor_beneath_control_frames() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    let stack = egcl_rt::thread::current_stack();
+    assert!(capture_current(100).is_empty());
+    let initial_fp = stack.fp();
+    let initial_used = stack.used();
+    let callable = stack
+        .push_frame(NIL, std::ptr::null(), 0, FrameType::Call as u32)
+        .unwrap();
+    let control = stack
+        .push_frame(NIL, std::ptr::null(), 0, FrameType::Special as u32)
+        .unwrap();
+    assert_eq!(stack.fp(), control.cast_const());
+    assert_ne!(stack.fp(), callable.cast_const());
+    egcl_rt::collect_t0_minor().unwrap();
+    let original = egcl_rt::gc::alloc_double_float(97.0);
+    // Only this execution-owned record roots the argument: neither physical
+    // frame has a slot, and no rooted snapshot exists before collection.
+    let resumed =
+        unsafe { CallFrame::enter_managed_at("RESUMED-CALLABLE", &[original, NIL], callable) };
+    egcl_rt::collect_t0_minor().unwrap();
+    egcl_rt::rooted!(snapshot = capture_current(100));
+    // Anchoring to the younger Special frame instead would expose a second,
+    // anonymous physical call here. A limit of one would hide that mistake.
+    assert_eq!(snapshot.len(), 1, "the record must merge with its callable");
+    assert_eq!(snapshot[0].function.as_deref(), Some("RESUMED-CALLABLE"));
+    assert_eq!(snapshot[0].origin, FrameOrigin::Managed);
+    let arguments = snapshot[0].arguments.as_ref().unwrap();
+    assert_eq!(arguments.len(), 2);
+    assert_ne!(
+        arguments[0], original,
+        "the original argument must relocate"
+    );
+    assert_eq!(arguments[0].as_double_float(), 97.0);
+    assert_eq!(arguments[1], NIL);
+    stack.pop_frame(); // the younger condition scope retires first
+    assert_eq!(stack.fp(), callable.cast_const());
+    assert_eq!(capture_current(100), *snapshot);
+    drop(resumed);
+    stack.pop_frame();
+    assert_eq!(stack.fp(), initial_fp);
+    assert_eq!(stack.used(), initial_used);
+    assert!(capture_current(100).is_empty());
+}
+
+#[test]
 fn anonymous_call_roots_arguments_without_inventing_an_identity() {
     let _serial = TEST_LOCK.lock().unwrap();
     init_heap();
