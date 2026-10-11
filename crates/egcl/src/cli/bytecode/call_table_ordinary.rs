@@ -122,6 +122,7 @@ impl OrdinaryCodeDirectory {
                 arity: 0,
                 environment: linkage::ORDINARY_ENV_NONE,
                 owner: Rc::as_ptr(code) as usize,
+                stack_required: 8,
             };
             assert!(retained.retain(Arc::new(CallCell::new(0, 11, 12)), descriptor, Rc::clone(code)).is_some());
         }
