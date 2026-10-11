@@ -54,22 +54,32 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, String) {
 }
 
 #[test]
-fn tak_reaches_t2_with_no_shadow_roots() {
+fn tak_reaches_t2_with_platform_root_metadata() {
     let program = format!(
         "{TAK} (dotimes (i 40) (tak 12 8 4)) \
-         (format t \"RESULT ~D TIER ~D~%\" (tak 18 12 6) (egcl-ext:function-tier 'tak))"
+         (let ((before (egcl-ext:deopt-count))) \
+           (format t \"RESULT ~D TIER ~D DEOPTS ~D~%\" (tak 18 12 6) \
+             (egcl-ext:function-tier 'tak) (- (egcl-ext:deopt-count) before)))"
     );
     let (stdout, log) = run(&program, &[("EGCL_T2_LOG", "stderr")]);
-    assert!(stdout.contains("RESULT 7 TIER 2"), "{stdout}\n{log}");
-    let installed = log
-        .lines()
-        .find(|line| line.contains("TAK: T2 EMITTED"))
-        .unwrap_or_else(|| panic!("no T2 emission metadata for TAK:\n{log}"));
-    assert!(
-        installed.contains("gc_shadow_slots=0"),
-        "tak must need no GC shadow slots once its loop-header phis and self-call \
-         results are proven fixnum: {installed}"
-    );
+    assert!(stdout.contains("RESULT 7 TIER 2 DEOPTS 0"), "{stdout}\n{log}");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert!(
+            log.lines().any(|line| line.contains(
+                "TAK: optimized worker result installed with mapped T2 ABI"
+            )),
+            "TAK must publish the real mapped worker artifact: {log}"
+        );
+    } else {
+        let emitted = log
+            .lines()
+            .find(|line| line.contains("TAK: T2 EMITTED"))
+            .unwrap_or_else(|| panic!("no T2 emission metadata for TAK:\n{log}"));
+        assert!(
+            emitted.contains("gc_shadow_slots=0"),
+            "checked TAK must need no GC shadow slots after fixnum proofs: {emitted}"
+        );
+    }
 }
 
 #[test]

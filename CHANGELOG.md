@@ -2,18 +2,6 @@
 
 ## Unreleased
 
-- Restore supported deep recursion on Linux x86-64 with a larger managed-stack
-  default, while preserving stack-overflow conditions and explicit overrides
-  ([#246](https://github.com/atgreen/evergreen/pull/246)).
-
-- Preserve original arguments after native deoptimization and retain the callee
-  in keyword-binding error backtraces
-  ([#245](https://github.com/atgreen/evergreen/pull/245)).
-
-- Fix character counts and indexing in runtime-created Unicode strings, and
-  preserve fresh-string mutability for wider characters
-  ([#244](https://github.com/atgreen/evergreen/pull/244)).
-
 ## 0.0.5 - 2026-10-10
 
 ### Performance and diagnostics
@@ -38,8 +26,11 @@
 
 - Correct T2 diagnostics to report the profile choices actually used and the
   code actually installed; distinguish code emission from publication and
-  clarify baseline arithmetic optimization
-  ([#236](https://github.com/atgreen/evergreen/pull/236)).
+  clarify baseline arithmetic optimization. Make native compilation refusals
+  searchable by function name, explain unsupported instructions, and report
+  the multiple-value resets remaining in emitted code
+  ([#236](https://github.com/atgreen/evergreen/pull/236),
+  [#247](https://github.com/atgreen/evergreen/pull/247)).
 
 ### Compatibility
 
@@ -50,7 +41,7 @@
   remain redefinable
   ([#237](https://github.com/atgreen/evergreen/pull/237)).
 
-### Live optimization and control-flow correctness
+### Runtime and control-flow correctness
 
 - Let eligible running native loops on Linux x86-64 switch to optimized T2
   code without restarting, preserving completed effects, moving GC roots,
@@ -82,6 +73,17 @@
   ([#215](https://github.com/atgreen/evergreen/pull/215),
   [#216](https://github.com/atgreen/evergreen/pull/216),
   [#217](https://github.com/atgreen/evergreen/pull/217)).
+
+- Preserve original arguments after native deoptimization and retain the callee
+  in keyword-binding error backtraces. Restore supported deep recursion on
+  Linux x86-64 with a larger managed-stack default, preserving stack-overflow
+  conditions and explicit overrides
+  ([#245](https://github.com/atgreen/evergreen/pull/245),
+  [#246](https://github.com/atgreen/evergreen/pull/246)).
+
+- Fix character counts and indexing in runtime-created Unicode strings, and
+  preserve fresh-string mutability for wider characters
+  ([#244](https://github.com/atgreen/evergreen/pull/244)).
 
 ### Packages
 

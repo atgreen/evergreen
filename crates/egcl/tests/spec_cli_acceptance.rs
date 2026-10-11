@@ -908,7 +908,7 @@ fn conditions_princ_to_their_report_string() {
 
 #[test]
 fn loop_it_anaphor_binds_conditional_test_value() {
-    // CLHS 6.1.5: inside a selected when/if branch, `it` denotes the value of the
+    // CLHS 6.1.6: inside a selected when/if branch, bare `it` denotes the value of the
     // test. ASDF's REGISTER-SYSTEM-DEFINITION relies on this
     //   (loop :for spec :in dep-forms :when (resolve-dependency-spec nil spec) :collect :it)
     // so a broken anaphor collected the literal keyword :IT and tried to
@@ -922,9 +922,9 @@ fn loop_it_anaphor_binds_conditional_test_value() {
         eval_ok("(loop for x in '(1 nil 2 nil 3) when x collect :it)"),
         "(1 2 3)"
     );
-    // The binding is visible to a nested `it`, and to `if`/`sum`/`do`.
+    // IT replaces the entire accumulation form, including for a cons-valued test.
     assert_eq!(
-        eval_ok("(loop for x in '(1 nil 2) when x collect (cons it it))"),
+        eval_ok("(loop for x in '(1 nil 2) when (and x (cons x x)) collect it)"),
         "((1 . 1) (2 . 2))"
     );
     assert_eq!(eval_ok("(loop for x in '(1 2 3) if (* x 10) sum it)"), "60");

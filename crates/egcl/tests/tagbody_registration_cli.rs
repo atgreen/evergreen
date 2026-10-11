@@ -89,7 +89,8 @@ fn macro_hidden_go_keeps_its_tag() {
     let stdout = run(&format!("{HIDDEN_GO}\n{CHECK_HIDDEN_GO}"), "t0");
     assert!(stdout.contains("RESULT::OK"), "{stdout}");
     assert!(stdout.contains("NamedTag"), "{stdout}");
-    assert!(stdout.contains("EvalHost"), "{stdout}");
+    assert!(stdout.contains("MakeClosure"), "{stdout}");
+    assert!(!stdout.contains("EvalHost"), "{stdout}");
 }
 
 #[test]

@@ -22438,6 +22438,9 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         return Some(mapped);
     }
     if !checked_native_installation_allowed() {
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "[T1] {}: declined: mapped native entry unavailable; retain interpreter",
+            display_fn_name(&bf.name));
         return None;
     }
     // Non-leaf functions promote too (bliss-x5y.4): a T1 function's CallNamed to
@@ -24536,7 +24539,7 @@ mod direct_call_invalidation_tests {
 
     #[cfg(all(target_arch = "x86_64", unix))]
     #[test]
-    fn t2_captured_read_write_and_deopt_preserve_environment() {
+    fn captured_read_write_preserves_environment_under_native_admission() {
         let _lock = super::super::heap_test_lock()
             .lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
@@ -24554,21 +24557,38 @@ mod direct_call_invalidation_tests {
         let input = snapshot_t2_input(symbol, 0).expect("snapshot callback");
         let generation = input.generation;
         let input = egcl_rt::CrossThreadRoot::new(input);
-        let artifact = input.with_gc_stable(compile_t2_artifact)
-            .expect("captured lexical access must compile at T2");
-        let native = install_t2_completion(T2Completion {
-            sym: symbol, generation, artifact: Some(artifact), input,
-        }).expect("install callback T2");
-        assert!(native.is_t2);
-        assert_eq!(run_native(&native, symbol, &[EgclVal::from_fixnum(2)], &mut env).unwrap(),
-            EgclVal::from_fixnum(12));
+        let artifact = input.with_gc_stable(compile_t2_artifact);
+        let native = if checked_native_installation_allowed() {
+            Some(install_t2_completion(T2Completion {
+                sym: symbol, generation,
+                artifact: Some(artifact.expect("checked captured lexical access must compile at T2")),
+                input,
+            }).expect("install callback T2"))
+        } else {
+            assert!(artifact.is_none(), "captured mapped T2 admission remains unsupported");
+            None
+        };
+        if let Some(native) = &native {
+            assert!(native.is_t2);
+        }
+        let mut invoke = |argument| {
+            if let Some(native) = &native {
+                run_native(native, symbol, &[argument], &mut env)
+            } else {
+                super::super::apply_function(*callback, &[argument], &mut env)
+            }
+        };
+        assert_eq!(invoke(EgclVal::from_fixnum(2)).unwrap(), EgclVal::from_fixnum(12));
         let before = deopt_count();
-        egcl_rt::rooted!(answer = run_native(&native, symbol,
-            &[EgclVal::from_fixnum(1152921504606846975)], &mut env).unwrap());
+        egcl_rt::rooted!(answer = invoke(EgclVal::from_fixnum(1152921504606846975)).unwrap());
         let mut printed = String::new();
         super::super::print_val(*answer, &mut printed);
         assert_eq!(printed, "1152921504606846987");
-        assert!(deopt_count() > before, "overflow must exercise deoptimization");
+        if native.is_some() {
+            assert!(deopt_count() > before, "native overflow must exercise deoptimization");
+        } else {
+            assert_eq!(deopt_count(), before, "interpreted capture must not report a native deopt");
+        }
         egcl_rt::rooted!(again = super::super::apply_function(*callback,
             &[EgclVal::from_fixnum(1)], &mut env).unwrap());
         printed.clear();

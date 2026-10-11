@@ -331,7 +331,13 @@ fn deopt_count_is_observable_and_precise() {
         (format t \" ~a\" (egcl-ext:deopt-count)) \
         (sq 9999999999) \
         (format t \" ~a~%\" (egcl-ext:deopt-count))";
-    let out = eval(program, &[("EGCL_T1_THRESHOLD", "2")]);
+    // Compile the warmed function before the measured calls, and keep this
+    // test on the speculative baseline rather than asynchronously installing T2.
+    let out = eval(program, &[
+        ("EGCL_T1_THRESHOLD", "2"),
+        ("EGCL_LAZY_COMPILE", "0"),
+        ("EGCL_DISABLE_T2", "1"),
+    ]);
     assert_eq!(
         out, "0 1 2",
         "fixnum calls deopt 0 times; a ratio arg then an overflow each add one"
@@ -393,6 +399,8 @@ fn repeated_deopts_blacklist_and_back_off_to_t0() {
         program,
         &[
             ("EGCL_T1_THRESHOLD", "2"),
+            ("EGCL_LAZY_COMPILE", "0"),
+            ("EGCL_DISABLE_T2", "1"),
             ("EGCL_DEOPT_BLACKLIST_THRESHOLD", "3"),
         ],
     );
@@ -403,7 +411,7 @@ fn repeated_deopts_blacklist_and_back_off_to_t0() {
         "blacklisted function drops to T0: {out:?}"
     );
     // The count stops at the threshold: once blacklisted there is no native code
-    // left to deopt, so the six float calls produce exactly three deopts.
+    // left to deopt, so the six ratio calls produce exactly three deopts.
     assert_eq!(
         fields.get(1).copied(),
         Some("3"),

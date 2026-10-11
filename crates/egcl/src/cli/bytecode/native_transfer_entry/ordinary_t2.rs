@@ -120,5 +120,15 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         t2_metadata: Some(metadata),
         _storage: NativeCodeStorage::Mapped(code),
     });
+    if t2_log_target().is_some() {
+        let clear_mv_resets = prepared.ir.block_order().iter()
+            .flat_map(|&block| prepared.ir.block(block).insts.iter())
+            .filter(|&&inst| prepared.ir.inst(inst).opcode == egcl_compiler::t2::ir::Opcode::ClearMv)
+            .count();
+        t2_log_write(format_args!(
+            "{}: mapped T2 emitted; clear_mv_resets={clear_mv_resets}",
+            display_fn_name(&body.name)
+        ));
+    }
     Some(native)
 }

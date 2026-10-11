@@ -39,9 +39,8 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
             ("callback-missing-variable", true),
             ("callback-missing-variable", false),
         ] {
-            // A call after the failing branch keeps the argument in a managed
-            // home. Also retain the optimized register-entry case and require
-            // explicit unavailability there, rather than guessing its argument.
+            // Exercise both a later use and a dead-on-error argument. Mapped
+            // entries retain original arguments in managed homes for both.
             let body = format!("(if *fail-callback* {failure} (+ value 1))");
             let body = if keep_home {
                 format!("(prog1 {body} (funcall *trace-keep-value* value))")
@@ -107,19 +106,13 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
                 "CALLBACK-TRACE-MIDDLE",
                 "CALLBACK-TRACE-OUTER",
             ];
-            let register_entry =
-                tier == "t2" && failure == "callback-missing-variable" && !keep_home;
             if tier == "t2" {
                 let log = std::fs::read_to_string(&t2_log).unwrap();
                 let installed = log
                     .lines()
-                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: T2 EMITTED"))
-                    .expect("leaf must have native emission evidence");
-                assert_eq!(
-                    !installed.contains("compiled_entry=+0,"),
-                    register_entry,
-                    "{installed}"
-                );
+                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: optimized worker result installed with mapped T2 ABI;"))
+                    .unwrap_or_else(|| panic!("leaf must have mapped native publication evidence: {log}"));
+                assert!(installed.contains("entry=0x"), "{installed}");
             }
             let trace_start = stderr.find("Backtrace (").expect("terminal backtrace");
             let trace = &stderr[trace_start..];
@@ -131,11 +124,7 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
             let mut previous = 0;
             for name in names {
                 assert_eq!(trace.matches(name).count(), 1, "{tier}/{failure}: {stderr}");
-                let argument = if name == "CALLBACK-TRACE-LEAF" && register_entry {
-                    "<arguments unavailable>"
-                } else {
-                    "41"
-                };
+                let argument = "41";
                 let position = trace
                     .find(&format!("{name} {argument})"))
                     .unwrap_or_else(|| panic!("{tier}/{failure}: {stderr}"));
