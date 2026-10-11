@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make `APROPOS` searches handle `NIL` and `T` without panicking, and signal
+  `PROGRAM-ERROR` for invalid `APROPOS`/`APROPOS-LIST` argument counts
+  ([#250](https://github.com/atgreen/evergreen/pull/250)).
+
 - Preserve large rational-number numerators when denominator allocation
   triggers moving garbage collection
   ([#249](https://github.com/atgreen/evergreen/pull/249)).
