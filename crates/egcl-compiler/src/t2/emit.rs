@@ -2086,19 +2086,8 @@ fn emit_native_recursive_call(
         load_mem64_disp(a, SCRATCH, 7, 72);
         a.extend_from_slice(&[0x48, 0x83, 0x02, 1]); // increment execution-local usize
     }
-    let profile_done = a.label();
-    let profile_loop = a.label();
-    load_mem64_disp(a, 11, 7, 16);
-    alu_r_imm(a, 7, 11, 0);
-    a.jcc(Cc::E, profile_done);
-    a.extend_from_slice(&[0x41, 0x8b, 0x03]); // mov eax,[r11]
-    a.bind(profile_loop);
-    a.extend_from_slice(&[0x3d, 0xff, 0xff, 0xff, 0xff]); // cmp eax,u32::MAX
-    a.jcc(Cc::E, profile_done);
-    a.extend_from_slice(&[0x8d, 0x50, 1]); // lea edx,[rax+1]
-    a.extend_from_slice(&[0xf0, 0x41, 0x0f, 0xb1, 0x13]); // lock cmpxchg [r11],edx
-    a.jcc(Cc::Ne, profile_loop);
-    a.bind(profile_done);
+    // Native recursive frames execute T2 only; invocation heat has served
+    // its purpose. Explicit profiling invalidates this path and runs T0.
     // A collecting slow path rewrites this contiguous native slice. Never read
     // pre-helper volatile homes to form the child's arguments after it returns.
     for (index, reg) in [1, 8, 9, 10].into_iter().take(data.args.len()).enumerate() {
@@ -3426,7 +3415,8 @@ pub struct TransferDeoptRequest {
 pub struct NativeRecursiveControl {
     pub execution: *const egcl_rt::exec_context::LispExecutionContext,
     pub depth: *mut u32,
-    pub invoke_count: *const std::sync::atomic::AtomicU32,
+    /// Reserved to keep the native control layout stable.
+    pub reserved_counter: u64,
     pub mv_active: *const bool,
     pub expected_generation: u64,
     pub seen_carrier: u64,
@@ -3496,7 +3486,7 @@ const _: () = {
     assert!(size_of::<NativeRecursiveControl>() == 96);
     assert!(offset_of!(NativeRecursiveControl, stack_limit) == 88);
     assert!(offset_of!(NativeRecursiveControl, depth) == 8);
-    assert!(offset_of!(NativeRecursiveControl, invoke_count) == 16);
+    assert!(offset_of!(NativeRecursiveControl, reserved_counter) == 16);
     assert!(offset_of!(NativeRecursiveControl, mv_active) == 24);
     assert!(offset_of!(NativeRecursiveControl, expected_generation) == 32);
     assert!(offset_of!(NativeRecursiveControl, seen_carrier) == 40);

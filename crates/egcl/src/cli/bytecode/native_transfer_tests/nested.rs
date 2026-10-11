@@ -64,7 +64,7 @@ fn native_v2_distinct_callees_share_segment_and_unwind_into_caller() {
         let calls = egcl_rt::function::invoke_count(*function);
         egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
         assert_eq!(*result, args[0]);
-        assert_eq!(egcl_rt::function::invoke_count(*function), calls + 1);
+        assert_eq!(egcl_rt::function::invoke_count(*function), calls);
         assert_ne!(
             args[0].to_raw(),
             before,

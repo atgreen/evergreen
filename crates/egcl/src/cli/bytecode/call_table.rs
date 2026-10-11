@@ -494,7 +494,7 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             if promote && promotion_due(*function) {
                 return cold(state, args);
             }
-            if !profiling_disabled() {
+            if !code.is_t2 && !profiling_disabled() {
                 egcl_rt::function::record_invocation(*function);
             }
             if NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap() {

@@ -15488,13 +15488,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         // are counted by apply_function below.
                         if !profiling_disabled()
                             && let Some(cell) = *fn_obj
+                            && !has_t2_body(callee_sym, &callee)
                         {
                             egcl_rt::function::record_invocation(cell);
                         }
                         // Installed native code → call via the i2c adapter.
                         // Unified tiering (bliss-jtc.3): the function object's
                         // FnMeta is the single tiering record — invoke counter
-                        // (bumped for this dispatch), current tier, and the
+                        // (bumped below T2), current tier, and the
                         // active compiled entry. Promotion is driven by that
                         // counter and, on success, tier + entry are recorded on
                         // the object. Anonymous compiled lambdas (gensyms) have no
@@ -17424,6 +17425,7 @@ fn c2i_call_result(
                     .then_some(*function);
                 if !profiling_disabled()
                     && let Some(cell) = fn_obj
+                    && !has_t2_body(callee_sym, &callee)
                 {
                     egcl_rt::function::record_invocation(cell);
                 }
@@ -18966,6 +18968,7 @@ fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
         !is_profile_pinned(owner)
             && registry_get(owner).is_some_and(|entry| Arc::ptr_eq(&entry, &body))
     }).unwrap_or(sym);
+    let optimized = has_t2_body(owner, &body);
     let invocations = CLOSURE_COMPILATION.with(|cache| {
         let mut cache = cache.borrow_mut();
         let state = cache.entry(key).or_insert_with(|| ClosureCompilation {
@@ -18973,7 +18976,9 @@ fn closure_compilation_owner(sym: u32, count: u32) -> (u32, u32) {
         });
         debug_assert!(state.body.upgrade().is_some_and(|entry| Arc::ptr_eq(&entry, &body)));
         state.owner = owner;
-        state.invocations = state.invocations.saturating_add(1).max(count);
+        if !optimized {
+            state.invocations = state.invocations.saturating_add(1).max(count);
+        }
         state.invocations
     });
     INVOKE_COUNTS.with(|counts| { counts.borrow_mut().insert(owner, invocations); });
@@ -19463,21 +19468,56 @@ fn t2_backedge_threshold() -> u32 {
     })
 }
 
-/// Return the current invocation count. Named functions have already had their
-/// FnMeta counter bumped by the caller; anonymous bytecode functions need the
-/// local fallback counter bumped here on every dispatch.
+/// Whether this execution has optimized code for this exact body. Closure
+/// instances may share a representative without sharing their object tier.
+fn has_t2_body(sym: u32, body: &Arc<BytecodeFunction>) -> bool {
+    if is_profile_pinned(sym) {
+        return false;
+    }
+    let owner = CLOSURE_COMPILATION.with(|cache| {
+        cache.borrow().get(&(Arc::as_ptr(body) as usize)).map(|state| state.owner)
+    }).filter(|&owner| !is_profile_pinned(owner)).unwrap_or(sym);
+    NATIVE_REGISTRY.with(|registry| {
+        registry.borrow().get(&owner).is_some_and(|code| {
+            code.is_t2 && code.body.as_ref().is_some_and(|saved| Arc::ptr_eq(saved, body))
+        })
+    })
+}
+
+/// Tiering heat stops while this callable has installed T2 code. PROFILE pins
+/// its target to T0, so the same dispatches count every explicitly profiled call.
+/// Resolve the retained definition rather than trusting shared object tier bits.
+pub(super) fn record_callable_invocation(function: EgclVal) {
+    if profiling_disabled() {
+        return;
+    }
+    let name = egcl_rt::function::name(function);
+    let optimized = name.is_symbol()
+        && bytecode_for_callable(name.as_symbol_index(), function)
+            .is_some_and(|(symbol, body)| has_t2_body(symbol, &body));
+    if !optimized {
+        egcl_rt::function::record_invocation(function);
+    }
+}
+
+/// Return invocation heat. Named functions have already been counted by the
+/// caller when below T2; anonymous functions use the same policy with a local
+/// fallback counter.
 fn dispatch_invoke_count(sym: u32, fn_obj: Option<EgclVal>) -> u32 {
     if profiling_disabled() {
         return 0;
     }
     match fn_obj {
         Some(f) => egcl_rt::function::invoke_count(f),
-        None => INVOKE_COUNTS.with(|m| {
-            let mut counts = m.borrow_mut();
-            let count = counts.entry(sym).or_insert(0);
-            *count = count.saturating_add(1);
-            *count
-        }),
+        None => {
+            let optimized = registry_get(sym).is_some_and(|body| has_t2_body(sym, &body));
+            INVOKE_COUNTS.with(|m| {
+                let mut counts = m.borrow_mut();
+                let count = counts.entry(sym).or_insert(0);
+                if !optimized { *count = count.saturating_add(1); }
+                *count
+            })
+        },
     }
 }
 

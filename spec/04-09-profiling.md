@@ -21,7 +21,7 @@ A4.12 are defined herein.
 
 | ID | Requirement | Level |
 |----|-------------|-------|
-| R4.53 | Every compiled function MUST maintain a monotonically-increasing invocation counter and a per-back-edge iteration counter, both readable without acquiring a lock. | MUST |
+| R4.53 | Every compiled function MUST maintain an invocation heat counter and a per-back-edge iteration counter, both readable without acquiring a lock. Ordinary T2 execution MUST NOT increment invocation counters. New dispatches MUST pause invocation counting while matching T2 code is installed, including native depth-limit fallback, and MUST resume after that code is removed or the function is redefined. Exact invocation counts MUST be available for explicitly profiled functions. | MUST |
 | R4.54 | The runtime MUST record receiver-type profiles for polymorphic call sites in a fixed-size ring buffer (D4.14), capturing class-wrapper pointers and hit counts. | MUST |
 | R4.55 | Counter reads by the compilation scheduler (T2 compiler thread) MUST use lock-free access (relaxed or acquire atomics); no mutex, spinlock, or CAS loop SHALL be required for reads. | MUST |
 | R4.56 | Tier-promotion from T1→T2 MUST be triggered when either the invocation counter or any back-edge counter of a function exceeds a configurable threshold (A4.12). | MUST |
@@ -43,8 +43,8 @@ has been compiled to at least T1.
 /// Alignment: 64 bytes (one cache line on x86-64 / aarch64).
 #[repr(C, align(64))]
 pub struct MethodCounters {
-    /// Monotonic invocation counter.  Incremented in the function
-    /// prologue of T1 code.  Accessed with Relaxed ordering.
+    /// Invocation heat counter. Paused while matching T2 code is installed.
+    /// Incremented by T0/T1 otherwise. Accessed with Relaxed ordering.
     pub invoke_count: AtomicU32,
 
     /// Overflow / tier-transition flag.  Set to 1 by the mutator
@@ -182,8 +182,23 @@ pub const TYPE_PROFILE_RING_SIZE: usize = 4;
 
 ### 4.9.3.1 Invocation Counters
 
-The T1 baseline compiler (§4.4) emits an invocation counter increment
-in every function prologue:
+Outside explicit profiling, invocation counts measure tiering heat rather
+than complete lifetime invocation totals. Counting pauses while T2 code for
+the current function definition is installed. This applies to direct native
+recursion and to runtime fallback calls, including native depth-limit
+fallbacks; merely executing a call at a lower tier does not resume counting.
+Removing the matching T2 code or redefining the function allows counting to
+resume. Already-running lower-tier activations may finish with their existing
+instrumentation after T2 is published. Back-edge counting is unchanged.
+
+`EGCL-EXT:PROFILE` provides exact counts for selected functions. It establishes
+count baselines, invalidates their compiled linkage, and pins those functions
+to T0. `EGCL-EXT:PROFILE-REPORT-CALLS` reports counts relative to those
+baselines; `FUNCTION-INVOKE-COUNT` remains the underlying diagnostic counter,
+not a complete lifetime total.
+
+When matching T2 code is not installed, the T1 baseline compiler (§4.4) emits
+an invocation counter increment in the function prologue:
 
 ```asm
 ; x86-64 T1 prologue — invocation counter
@@ -485,9 +500,11 @@ The overhead budget is allocated as follows:
    line).
 4. **Threshold-gated slow path** — The promotion slow path (A4.12
    steps 1–5) executes at most once per function per compilation cycle.
-5. **T2 eliminates overhead** — Once a function is compiled to T2,
-   profiling counters are removed from the optimised code. Only
-   deoptimisation stubs re-enable profiling.
+5. **T2 stops ordinary invocation counting** — While matching T2 code is
+   installed, invocation counters pause, including on depth-limit fallback.
+   Removing that code or redefining the function permits counting to resume.
+   Explicit profiling pins selected functions to T0 for exact counts. This
+   policy does not change back-edge instrumentation.
 
 ---
 

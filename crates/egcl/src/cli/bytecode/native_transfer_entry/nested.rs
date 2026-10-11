@@ -282,7 +282,7 @@ unsafe fn prepare_child(
     }
     CAPTURE.with(|slot| slot.set(context));
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() + 1));
-    if !profiling_disabled() {
+    if !unsafe { (*(*context).owner).is_t2 } && !profiling_disabled() {
         egcl_rt::function::record_invocation(target.function);
     }
     c2i_clear_mv();

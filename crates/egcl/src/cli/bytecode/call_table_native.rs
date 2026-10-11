@@ -308,19 +308,8 @@ impl NativeEntry {
         a.extend_from_slice(&[0x49, 0xff, 0x03]); // inc qword [r11]
         immediate(&mut a, R11, depth);
         a.extend_from_slice(&[0x41, 0xff, 0x03]); // inc dword [r11]
-        if !profiling_disabled() {
-            // The retained callable is a pinned, interpreted-function object.
-            let offset = std::mem::offset_of!(egcl_rt::object::FunctionData, invoke_count);
-            if self.dynamic {
-                memory(&mut a, 0x8b, R11, RSP, 0);
-                a.extend_from_slice(&[0x49, 0x83, 0xe3, 0xf8]); // clear value tag
-                memory(&mut a, 0x8d, R11, R11, offset as i32);
-            } else {
-                let count = unsafe { self.function.as_ptr() } as usize + offset;
-                immediate(&mut a, R11, count as u64);
-            }
-            a.extend_from_slice(&[0xf0, 0x41, 0xff, 0x03]); // lock inc dword [r11]
-        }
+        // This wrapper only admits T2. Explicit PROFILE invalidates its
+        // linkage and pins the target to T0 for exact call accounting.
         // This leaf helper neither allocates nor yields. It clears the real MV
         // buffer, without exposing Rust Vec internals to generated code.
         immediate(&mut a, RAX, c2i_clear_mv as *const () as u64);

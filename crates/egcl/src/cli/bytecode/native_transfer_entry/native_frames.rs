@@ -41,18 +41,10 @@ pub(super) unsafe extern "C" fn initialize() -> *mut NativeRecursiveControl {
     let execution = egcl_rt::thread::current_execution_context_for_native()
         .expect("native segment has a registered execution");
     let depth = NATIVE_DEPTH.with(Cell::as_ptr);
-    let function = unsafe { (*(*context).frame).function };
-    let invoke_count = if unsafe { (*context).recursive_profile } {
-        // FunctionData is pinned; its exact owner stays rooted in the anchor.
-        egcl_rt::function::invocation_counter_address(function)
-            .expect("profiled recursive owner is an interpreted callable")
-    } else {
-        std::ptr::null()
-    };
     let control = NativeRecursiveControl {
         execution,
         depth,
-        invoke_count,
+        reserved_counter: 0,
         mv_active: unsafe { std::ptr::addr_of!((*env).mv_active) },
         expected_generation: unsafe { (*context).recursive_generation },
         seen_carrier: unsafe { &*execution }.carrier_id(),
