@@ -10,6 +10,10 @@ use egcl_rt::call_table::NativeCallContext;
 use egcl_rt::native_transfer::{NativeSegment, current_segment};
 use std::cell::Cell;
 
+#[cfg(test)]
+#[path = "outer/return_tests.rs"]
+mod return_tests;
+
 #[repr(C)]
 struct Invocation {
     context: NativeCallContext,
