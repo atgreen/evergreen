@@ -970,6 +970,14 @@ thread_local! {
 static POSTED_PENDING_SIGNALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Process-lifetime address of the pending-signal count (`AtomicUsize`, native
+/// pointer width). Generated code may load it with Relaxed ordering; a nonzero
+/// value requires the normal published signal path. This getter neither consumes
+/// a signal nor registers the calling thread.
+pub fn posted_pending_signals_address() -> *const std::sync::atomic::AtomicUsize {
+    std::ptr::addr_of!(POSTED_PENDING_SIGNALS)
+}
+
 /// True if any thread or fiber holds a posted, untaken signal.
 pub fn any_posted_pending_signal() -> bool {
     POSTED_PENDING_SIGNALS.load(Ordering::Relaxed) != 0
@@ -2889,6 +2897,36 @@ pub fn current_fiber() -> Option<&'static Fiber> {
         .flatten()
 }
 
+/// Address of the already registered, currently mounted execution context.
+///
+/// Returns `None` for inaccessible/borrowed TLS or an unregistered native
+/// thread. This never registers, allocates, parks, yields, or consumes requests.
+/// The pointer is valid only while that execution is alive; retaining it on its
+/// active native stack is permitted. A fiber's address survives carrier
+/// migration, but its `carrier_id` field changes. Do not use the pointer for a
+/// different execution or after the owning execution retires. Generated readers
+/// use the `exec_context::offsets` ABI and atomic field load orderings.
+#[inline(never)]
+pub fn current_execution_context_for_native() -> Option<*const crate::exec_context::LispExecutionContext> {
+    let fiber = ACTIVE_FIBER
+        .try_with(|slot| {
+            let current = slot.try_borrow().ok()?;
+            Some(current.as_ref().map(|fiber| fiber.execution().as_ptr()))
+        })
+        .ok()
+        .flatten()?;
+    if fiber.is_some() {
+        return fiber;
+    }
+    CURRENT_NATIVE_THREAD
+        .try_with(|slot| {
+            let current = slot.try_borrow().ok()?;
+            current.as_ref().map(|current| current.thread.execution().as_ptr())
+        })
+        .ok()
+        .flatten()
+}
+
 /// Inspect the mounted execution without registering, parking, or consuming
 /// its request. Missing or inaccessible TLS requires a published slow path.
 // Resolve carrier TLS afresh after any possible fiber migration.
@@ -3086,7 +3124,10 @@ pub(crate) fn current_backtrace(count: usize) -> Vec<crate::debug_stack::Logical
         thread.lisp_frames.lock().unwrap().snapshot(count)
     };
     // SAFETY: this execution owns its active stack; copying does not yield.
-    unsafe { snapshot.copy_stack(current_stack().fp(), count) };
+    unsafe {
+        snapshot.copy_stack(current_stack().fp(), count);
+        snapshot.copy_native(crate::debug_stack::NativeBacktraceTarget::Current, current_stack(), count);
+    }
     snapshot.resolve(count)
 }
 
@@ -3109,7 +3150,10 @@ pub(crate) fn fiber_logical_backtrace(
             frames.snapshot(count)
         };
         // SAFETY: Arc owns the stack; the mount/state lock excludes a mutator.
-        unsafe { snapshot.copy_stack(fiber.stack.published_fp(), count) };
+        unsafe {
+            snapshot.copy_stack(fiber.stack.published_fp(), count);
+            snapshot.copy_native(crate::debug_stack::NativeBacktraceTarget::StoppedFiber(id), &fiber.stack, count);
+        }
         if *state == FiberState::Created && count != 0 {
             snapshot.entry(fiber.entry());
         }
@@ -3519,5 +3563,52 @@ mod chase_lev_tests {
         values.sort_unstable();
         assert_eq!(values, (0..TASKS as i64).collect::<Vec<_>>());
         assert!(deque.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_context_address_tests {
+    use super::*;
+
+    #[test]
+    fn native_context_address_follows_execution_without_registering_or_caching_carrier() {
+        std::thread::spawn(|| {
+            assert!(current_execution_context_for_native().is_none());
+            CURRENT_NATIVE_THREAD.with(|slot| assert!(slot.borrow().is_none()));
+            let thread = current_thread();
+            let native = thread.execution().as_ptr();
+            assert_eq!(current_execution_context_for_native(), Some(native));
+            CURRENT_NATIVE_THREAD.with(|slot| {
+                let _borrow = slot.borrow_mut();
+                assert!(current_execution_context_for_native().is_none());
+            });
+
+            let id = make_fiber(NIL).unwrap();
+            let fiber = lookup_fiber(id).unwrap();
+            let pointer = fiber.execution().as_ptr();
+            assert_ne!(pointer, native);
+            struct RestoreMounted(Option<Arc<Fiber>>);
+            impl Drop for RestoreMounted {
+                fn drop(&mut self) {
+                    ACTIVE_FIBER.with(|slot| *slot.borrow_mut() = self.0.take());
+                }
+            }
+            // Test only the selector/identity contract. Actual scheduler
+            // migration remains covered by the native recursive fiber fixture.
+            let restore = RestoreMounted(ACTIVE_FIBER.with(|slot| slot.replace(Some(Arc::clone(&fiber)))));
+            assert_eq!(current_execution_context_for_native(), Some(pointer));
+            fiber.execution().set_carrier_id(17);
+            assert_eq!(current_execution_context_for_native(), Some(pointer));
+            assert_eq!(unsafe { &*pointer }.carrier_id(), 17);
+            ACTIVE_FIBER.with(|slot| {
+                let _borrow = slot.borrow_mut();
+                assert!(current_execution_context_for_native().is_none());
+            });
+            drop(restore);
+            assert_eq!(current_execution_context_for_native(), Some(native));
+            fiber_registry().lock().unwrap().remove(&id);
+        })
+        .join()
+        .unwrap();
     }
 }

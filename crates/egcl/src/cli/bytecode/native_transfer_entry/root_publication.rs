@@ -52,6 +52,7 @@ impl PublishedAdapter {
 /// whose `saved_sp`/`return_pc` end the physical walk.
 pub(super) struct PublishedBoundary {
     pub(super) owner: *const TransferCode,
+    context: *mut CaptureContext,
     pub(super) cursor: NativeFrameCursor,
     /// Actual native stack ownership: from the capture image up to the segment
     /// entry. The six save words live below the caller's `call_sp`.
@@ -288,19 +289,20 @@ pub(super) unsafe fn published<R>(
 /// `cursor.pc` when the caller is not the current CAPTURE's own activation.
 unsafe fn publish_with<R>(
     cursor: NativeFrameCursor,
-    owner: Option<*const TransferCode>,
+    context: Option<*mut CaptureContext>,
     low: usize,
     body: impl FnOnce() -> R,
 ) -> R {
     static SCANNER: Once = Once::new();
-    SCANNER.call_once(|| egcl_rt::gc::register_root_scanner(scan_published_roots));
-    let context = CAPTURE.with(Cell::get);
+    SCANNER.call_once(|| {
+        egcl_rt::gc::register_root_scanner(scan_published_roots);
+        egcl_rt::debug_stack::install_native_backtrace_provider(copy_native_backtrace);
+    });
+    let context = context.unwrap_or_else(|| CAPTURE.with(Cell::get));
     let segment = native_transfer::current_segment();
     debug_assert!(!context.is_null(), "publication needs a captured activation");
     debug_assert!(!segment.is_null(), "publication needs an active native segment");
-    let owner = owner.unwrap_or_else(|| {
-        if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } }
-    });
+    let owner = if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } };
     debug_assert!(
         owner.is_null() || {
             let code = unsafe { &*owner };
@@ -312,6 +314,7 @@ unsafe fn publish_with<R>(
     let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
     let mut boundary = PublishedBoundary {
         owner,
+        context,
         cursor,
         bounds: low..saved_sp,
         segment,
@@ -368,10 +371,10 @@ pub(super) unsafe fn published_mapped_resuming<R>(
     // Never fall back to CAPTURE here: it names the child while this cursor
     // belongs to the parent. A missing owner publishes null, which makes any
     // collection fail explicitly before it can lose the parent's native roots.
-    let owner = unsafe { super::nested::record_parent_owner(record) };
-    debug_assert!(owner.is_some(), "a live child must yield its parent's owner");
-    let owner = owner.unwrap_or(std::ptr::null());
-    unsafe { publish_with(mapped_cursor(record), Some(owner), record as usize, body) }
+    let context = unsafe { super::nested::record_parent_context(record) };
+    debug_assert!(context.is_some(), "a live child must yield its parent's context");
+    let context = context.unwrap_or(std::ptr::null_mut());
+    unsafe { publish_with(mapped_cursor(record), Some(context), record as usize, body) }
 }
 
 /// The suspended caller's exact geometry, read out of the adapter frame.
@@ -585,6 +588,20 @@ unsafe fn walk_boundary(
     boundary: &PublishedBoundary,
     visit: &mut dyn FnMut(*mut EgclVal),
 ) -> usize {
+    unsafe { walk_boundary_frames(boundary, true, &mut |_, _, map, cursor, body_sp, walk| {
+        let visited = visit_frame(map, cursor, body_sp, walk, visit);
+        #[cfg(test)]
+        boundary.visited.set(boundary.visited.get() + visited);
+        visited
+    }) }
+}
+
+unsafe fn walk_boundary_frames(
+    boundary: &PublishedBoundary,
+    _count_gc_walks: bool,
+    visit: &mut dyn FnMut(&TransferCode, *mut CaptureContext, &NativeFrameValues,
+        &NativeFrameCursor, Option<usize>, &Walk<'_>) -> usize,
+) -> usize {
     if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
         note_bail(if boundary.owner.is_null() {
             Bail::NullOwner
@@ -596,6 +613,7 @@ unsafe fn walk_boundary(
         return 0;
     }
     let mut code = unsafe { &*boundary.owner };
+    let mut context = boundary.context;
     let segment = unsafe { &*boundary.segment };
     let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let mut cursor = boundary.cursor;
@@ -619,11 +637,16 @@ unsafe fn walk_boundary(
                 return total;
             }
             let record = record as *mut egcl_compiler::t2::native_transfer::MappedCallRecord;
-            let Some(owner) = (unsafe { super::nested::record_parent_owner(record) }) else {
+            let Some(parent_context) = (unsafe { super::nested::record_parent_context(record) }) else {
                 note_bail(Bail::AdapterOwnerMissing);
                 return total;
             };
             let caller = unsafe { mapped_cursor(record) };
+            let owner = unsafe { (*parent_context).owner };
+            if owner.is_null() {
+                note_bail(Bail::AdapterOwnerMissing);
+                return total;
+            }
             let parent = unsafe { &*owner };
             let Some(offset) = caller.pc.checked_sub(parent.code.as_ptr() as usize) else {
                 note_bail(Bail::AdapterCallerUnmapped);
@@ -637,8 +660,11 @@ unsafe fn walk_boundary(
             // child never saved. Replace every inherited register location.
             cursor = caller;
             code = parent;
+            context = parent_context;
             #[cfg(test)]
-            ADAPTER_CROSSINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if _count_gc_walks {
+                ADAPTER_CROSSINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             continue;
         };
         let Some(step) =
@@ -650,10 +676,7 @@ unsafe fn walk_boundary(
         };
         match code._native_calls.value_map(offset) {
             Some(NativeCallValues::Frame(map)) => {
-                let visited = unsafe { visit_frame(map, &cursor, step.body_sp, &walk, visit) };
-                total += visited;
-                #[cfg(test)]
-                boundary.visited.set(boundary.visited.get() + visited);
+                total += visit(code, context, map, &cursor, step.body_sp, &walk);
             }
             // T0 owns these roots while the native frame is being replaced.
             Some(NativeCallValues::Deoptimizing { .. } | NativeCallValues::Retired) => {}
@@ -670,6 +693,82 @@ unsafe fn walk_boundary(
             return total;
         }
         cursor = step.caller;
+    }
+}
+
+/// Copy logical calls only while exact native publications are live. This shares
+/// the collector's bounds/owner/adapter validation; it does not walk arbitrary
+/// machine stacks or resolve a retired code owner through a mutable registry.
+unsafe fn copy_native_backtrace(
+    target: egcl_rt::debug_stack::NativeBacktraceTarget,
+    stack: *const egcl_rt::stack::EgclStack,
+    limit: usize,
+    sink: &mut dyn FnMut(egcl_rt::debug_stack::AnchoredNativeFrame),
+) {
+    use egcl_rt::debug_stack::{AnchoredNativeFrame, FrameOrigin, LogicalFrame, NativeBacktraceTarget};
+    let mut copy = |slot: &Cell<*mut PublishedBoundary>| {
+        let mut boundary = slot.get();
+        let mut seen = std::collections::HashSet::new();
+        let mut copied = 0;
+        while !boundary.is_null() && copied < limit {
+            let published = unsafe { &*boundary };
+            assert_eq!(published.stack, stack, "native backtrace belongs to the protected execution");
+            unsafe { walk_boundary_frames(published, false, &mut |code, context, _, _, body_sp, walk| {
+                let Some(kind_slot) = code.native_entry_kind_slot else { return 0 };
+                if copied == limit { return 0; }
+                let body_sp = body_sp.expect("live native frame has an owned body SP");
+                if !seen.insert(body_sp) { return 0; }
+                assert!(!context.is_null(), "native backtrace needs its retained context");
+                assert!(std::ptr::eq((*context).owner, code), "native owner/context mismatch");
+                let word = |slot: u32| body_sp.checked_add(slot as usize * 8)
+                    .and_then(|address| walk.word(address));
+                let control_slot = code.native_control_slot.expect("native control recipe");
+                let expected_control = (*context).native_recursive.as_ref()
+                    .map(|control| std::ptr::from_ref(control) as usize)
+                    .expect("native recursive anchor control");
+                assert_eq!(word(control_slot), Some(expected_control), "native frame must belong to its exact anchor");
+                let kind = word(kind_slot).expect("owned native entry-kind word");
+                assert!(kind <= 1, "known native entry kind");
+                let anchor = (*context).frame;
+                let activation = anchor.add(1).cast::<EgclVal>();
+                assert_eq!(walk.activation(activation, 0), Some(activation),
+                    "native children must attach to a real live managed anchor");
+                // Keep the existing all-or-unavailable original-argument policy.
+                // Native homes are immutable entry copies, not current locals.
+                let arguments = native_debug::arguments(&code.body, false)
+                    .filter(|recipe| recipe.parameters.iter().all(|(_, slot)| slot.is_some()))
+                    .and_then(|recipe| {
+                        if recipe.parameters.len() != usize::from(code.native_argument_count) {
+                            return None;
+                        }
+                        if code.native_argument_count == 0 { return Some(Vec::new()); }
+                        let base = code.native_argument_base?;
+                        (0..u32::from(code.native_argument_count))
+                            .map(|index| word(base.checked_add(index)?).map(|bits| EgclVal(bits as u64)))
+                            .collect::<Option<Vec<_>>>()
+                    });
+                sink(AnchoredNativeFrame {
+                    managed_anchor: anchor as usize,
+                    enrich_anchor: kind == 0,
+                    frame: LogicalFrame {
+                        function: Some(code.body.name.clone()),
+                        origin: FrameOrigin::Native,
+                        arguments,
+                    },
+                });
+                copied += 1;
+                0
+            }); }
+            boundary = published.previous;
+        }
+    };
+    match target {
+        NativeBacktraceTarget::Current => { ACTIVE.try_with(&mut copy); }
+        NativeBacktraceTarget::StoppedFiber(id) => {
+            // SAFETY: debug_stack's provider contract requires the fiber owner
+            // and its mount/state exclusion throughout this uninterrupted copy.
+            unsafe { ACTIVE.try_with_stopped_fiber(id, &mut copy); }
+        }
     }
 }
 
@@ -1222,6 +1321,178 @@ mod tests {
         assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
     }
 
+    thread_local! {
+        static DISTINCT_RECURSIVE_ROOTS_MOVED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn observe_distinct_recursive_roots() {
+        if RECURSIVE_ENTRIES.with(Cell::get) != 6
+            || DISTINCT_RECURSIVE_ROOTS_MOVED.with(Cell::get) != 0
+        {
+            return;
+        }
+        let published = ACTIVE.with(Cell::get);
+        assert!(!published.is_null(), "the leaf helper must retain real published native frames");
+        let published = unsafe { &*published };
+        let mut roots = Vec::new();
+        for marker in 1..=6 {
+            let slot = native_only_slot_for(published, marker)
+                .expect("every suspended caller must retain its private value in a native home");
+            let bits = unsafe { slot.read() }.to_raw();
+            assert!(roots.iter().all(|&(_, previous, before)| previous != slot && before != bits),
+                "each caller must own a distinct heap value and native home");
+            // Raw diagnostic bits and slot addresses do not root the objects.
+            // native_only_slot_for also rejects managed-stack and MV aliases.
+            roots.push((marker, slot, bits));
+        }
+        DISTINCT_RECURSIVE_ROOTS_MOVED.with(|moved| moved.set(roots.len()));
+        force_minor_gc();
+        for (marker, slot, before) in roots {
+            let after = unsafe { slot.read() };
+            assert_ne!(after.to_raw(), before,
+                "caller {marker}'s sole native root must actually relocate");
+            assert_eq!(crate::cli::cp(after), (EgclVal::from_fixnum(marker), NIL));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn ordinary_t2_distinct_caller_only_roots_move_across_recursion() {
+        use crate::cli::bytecode::native_transfer_tests::ordinary_t2::{
+            expect_entry, RecursiveFixturePins, RECURSIVE_LEAF_OBSERVER,
+        };
+        assert!(egcl_rt::native_transfer::is_supported());
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let name = "ORDINARY-T2-PRIVATE-RECURSIVE-ROOTS";
+        let form = "(if (= n 0)
+            (ordinary-t2-private-root-leaf)
+            (let ((held (cons n nil)))
+              (ordinary-t2-private-root-clear)
+              (+ (ordinary-t2-private-recursive-roots (- n 1)) (car held))))";
+        crate::cli::read_eval_all_env(&format!(
+            "(defun ordinary-t2-private-root-clear () nil)
+             (defun ordinary-t2-private-root-leaf () (%ordinary-t2-entry-for-test) 0)
+             (defun {name} (n) {form})"), &mut env).unwrap();
+        let _pins = RecursiveFixturePins::new(&[
+            "ORDINARY-T2-PRIVATE-ROOT-CLEAR", "ORDINARY-T2-PRIVATE-ROOT-LEAF",
+        ]);
+        let (symbol, code) = crate::cli::bytecode::native_transfer_tests::ordinary_t2::install(
+            name, "(n)", &format!("({form})"), &mut env);
+        assert!(code.is_t2, "exercise the ordinary optimized worker artifact");
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("ordinary worker must publish mapped T2");
+        };
+        assert_eq!(mapped.recursive_symbol, Some(symbol), "fixture must admit direct native self calls");
+        expect_entry(&code);
+        let args = [EgclVal::from_fixnum(6)];
+        assert_eq!(run_native(&code, symbol, &args, &mut env).unwrap(), EgclVal::from_fixnum(21));
+        env.mv.clear();
+        force_minor_gc();
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+        let deopts = mapped.deopt_count();
+        take_recursive_entries();
+        take_recursive_helper_calls();
+        take_native_fallback_count();
+        DISTINCT_RECURSIVE_ROOTS_MOVED.with(|moved| moved.set(0));
+        assert!(ACTIVE.with(Cell::get).is_null());
+        struct ClearObserver(ObserveHook);
+        impl Drop for ClearObserver {
+            fn drop(&mut self) {
+                RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+                DISTINCT_RECURSIVE_ROOTS_MOVED.with(|moved| moved.set(0));
+            }
+        }
+        let _observer = ClearObserver(RECURSIVE_LEAF_OBSERVER.with(|hook| hook.replace(Some(observe_distinct_recursive_roots))));
+        let answer = run_native(&code, symbol, &args, &mut env).unwrap();
+        assert_eq!(take_recursive_entries(), 6, "all six self calls execute natively");
+        assert_eq!(DISTINCT_RECURSIVE_ROOTS_MOVED.with(Cell::get), 6,
+            "the published leaf helper must relocate all six private caller values");
+        assert_eq!(answer, EgclVal::from_fixnum(21),
+            "every suspended caller must consume its own relocated cons after its child returns");
+        assert_eq!(take_native_fallback_count(), 0);
+        assert_eq!(mapped.deopt_count(), deopts);
+        assert_eq!(take_recursive_helper_calls(), (0, 0));
+        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        assert!(ACTIVE.with(Cell::get).is_null(), "retire all native publication before return");
+    }
+
+    thread_local! {
+        static NATIVE_TRACE_SNAPSHOT: Cell<*mut Vec<egcl_rt::debug_stack::LogicalFrame>> =
+            const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    fn capture_native_recursive_trace() {
+        force_minor_gc();
+        let target = NATIVE_TRACE_SNAPSHOT.with(Cell::get);
+        assert!(!target.is_null());
+        // The fixture roots this Vec before entry; snapshot copies must stay
+        // valid through another collection and after the native stack retires.
+        unsafe { *target = egcl_rt::debug_stack::capture_current(64); }
+        force_minor_gc();
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn ordinary_t2_native_recursive_backtrace_keeps_order_and_original_arguments() {
+        use crate::cli::bytecode::native_transfer_tests::ordinary_t2::{
+            expect_entry, install, RecursiveFixturePins, RECURSIVE_LEAF_OBSERVER,
+        };
+        use egcl_rt::debug_stack::FrameOrigin;
+        let _lock = crate::cli::heap_test_lock()
+            .lock().unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let name = "ORDINARY-T2-NATIVE-TRACE";
+        let form = "(if (= n 0) (ordinary-t2-native-trace-leaf)
+            (let ((answer (ordinary-t2-native-trace (- n 1) marker)))
+              (car marker) (+ answer 1)))";
+        crate::cli::read_eval_all_env(&format!(
+            "(defun ordinary-t2-native-trace-leaf () (%ordinary-t2-entry-for-test) 0)
+             (defun {name} (n marker) {form})"), &mut env).unwrap();
+        let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-TRACE-LEAF"]);
+        let (symbol, code) = install(name, "(n marker)", &format!("({form})"), &mut env);
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped T2") };
+        assert!(code.is_t2 && mapped.native_entry_kind_slot.is_some());
+        assert_eq!(mapped.recursive_symbol, Some(symbol));
+        expect_entry(&code);
+        egcl_rt::rooted!(marker = crate::cli::arena_cons(EgclVal::from_fixnum(77), NIL));
+        egcl_rt::rooted!(snapshot = Vec::<egcl_rt::debug_stack::LogicalFrame>::new());
+        let original = marker.to_raw();
+        struct RestoreTrace(ObserveHook);
+        impl Drop for RestoreTrace {
+            fn drop(&mut self) {
+                RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+                NATIVE_TRACE_SNAPSHOT.with(|slot| slot.set(std::ptr::null_mut()));
+            }
+        }
+        NATIVE_TRACE_SNAPSHOT.with(|slot| slot.set(&mut *snapshot));
+        let _restore = RestoreTrace(RECURSIVE_LEAF_OBSERVER.with(|hook|
+            hook.replace(Some(capture_native_recursive_trace))));
+        take_recursive_entries();
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+        assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(4), *marker], &mut env).unwrap(),
+            EgclVal::from_fixnum(4));
+        assert_eq!(take_recursive_entries(), 4);
+        assert_ne!(marker.to_raw(), original, "arguments must actually move before snapshot capture");
+        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+        assert!(ACTIVE.with(Cell::get).is_null());
+        drop(code);
+        let rows: Vec<_> = snapshot.iter().filter(|row| row.function.as_deref() == Some(name)).collect();
+        assert_eq!(rows.len(), 5, "four physical-only callers and the original managed anchor");
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row.arguments.as_deref(), Some(&[EgclVal::from_fixnum(index as i64), *marker][..]));
+            assert_eq!(row.origin, if index < 4 { FrameOrigin::Native } else { FrameOrigin::Managed });
+        }
+        let leaf = snapshot.iter().position(|row| row.function.as_deref() == Some("ORDINARY-T2-NATIVE-TRACE-LEAF")).unwrap();
+        let first_native = snapshot.iter().position(|row| row.function.as_deref() == Some(name)).unwrap();
+        assert!(leaf < first_native, "interpreted leaf precedes its native caller chain");
+    }
+
     const RECURSION_DEPTH: usize = 6;
 
     /// At each recursive preparation, every enclosing activation is a native
@@ -1621,6 +1892,7 @@ mod tests {
         let code = unsafe { &*published.owner };
         let malformed = |owner, pc, bounds, stack| PublishedBoundary {
             owner,
+            context: published.context,
             cursor: NativeFrameCursor { pc, ..published.cursor },
             bounds,
             segment: published.segment,

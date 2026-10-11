@@ -186,6 +186,22 @@ pub fn definition_index(f: EgclVal) -> u32 {
     unsafe { (*data(f)).definition_index }
 }
 
+/// Address of this exact interpreted definition's 32-bit atomic call counter.
+/// Returns `None` for other value kinds. Interpreted function objects are pinned,
+/// so the address is stable across collections, but the caller must retain a
+/// traced root for `f` throughout any later pointer use. Installing a replacement
+/// function does not redirect this pointer to the replacement's counter.
+/// Generated increments must be atomic read-modify-write operations with at
+/// least Relaxed ordering, exactly once per successfully admitted invocation.
+pub fn invocation_counter_address(f: EgclVal) -> Option<*const core::sync::atomic::AtomicU32> {
+    if !is_interpreted_function(f) {
+        return None;
+    }
+    // SAFETY: the kind check established a live pinned FunctionData object;
+    // taking its field address neither reads the counter nor allocates.
+    Some(unsafe { std::ptr::addr_of!((*data(f)).invoke_count) })
+}
+
 /// Record an invocation (T0/T1 prologue): atomically bump and return the new
 /// invocation count. Lock-free (R4.53).
 pub fn record_invocation(f: EgclVal) -> u32 {
@@ -323,6 +339,25 @@ mod tests {
 
     fn egcl_rt_name() -> u32 {
         crate::symbols::intern("FN-OBJ-TEST")
+    }
+
+    #[test]
+    fn invocation_counter_address_retains_exact_definition_across_gc() {
+        use crate::Collector;
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(invocation_counter_address(NIL).is_none());
+        assert!(invocation_counter_address(EgclVal::from_fixnum(1)).is_none());
+        crate::rooted!(original = alloc_interpreted(NIL, EgclVal::from_fixnum(1), NIL, NIL));
+        let address = invocation_counter_address(*original).unwrap();
+        crate::rooted!(replacement = alloc_interpreted(NIL, EgclVal::from_fixnum(2), NIL, NIL));
+        assert_ne!(address, invocation_counter_address(*replacement).unwrap());
+        crate::HeapCollector::new().minor_gc().unwrap();
+        assert_eq!(invocation_counter_address(*original), Some(address));
+        // The root owns the pinned object throughout this generated-code-like
+        // atomic access. A different definition must not receive the count.
+        unsafe { &*address }.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(invoke_count(*original), 1);
+        assert_eq!(invoke_count(*replacement), 0);
     }
 
     #[test]

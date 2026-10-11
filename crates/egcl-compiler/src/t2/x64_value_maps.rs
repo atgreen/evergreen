@@ -22,6 +22,26 @@ pub enum NativeValueLocation {
     Unavailable,
 }
 
+/// Backing area for tagged call spills and contiguous outgoing arguments.
+/// Indices are word slots in the activation or body-RSP-relative native frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeValueArea {
+    Activation(u16),
+    NativeStack(u32),
+}
+
+impl NativeValueArea {
+    pub(crate) fn location(self, index: usize) -> Result<NativeValueLocation, NativeValueMapError> {
+        let invalid = NativeValueMapError::InvalidLocation;
+        match self {
+            Self::Activation(base) => Ok(NativeValueLocation::Activation(
+                base.checked_add(u16::try_from(index).map_err(|_| invalid)?).ok_or(invalid)?)),
+            Self::NativeStack(base) => Ok(NativeValueLocation::Stack(stack_offset(
+                base.checked_add(u32::try_from(index).map_err(|_| invalid)?).ok_or(invalid)?)?)),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeValue {
     pub value: Value,
@@ -84,6 +104,7 @@ impl NativeFrameValues {
     // Root order is the actual shadow write order; outgoing order is the ABI
     // slice order. Neither may be reconstructed by sorting values after emission.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn for_call(
         values: &[FrameValue],
         roots: &[Value],
@@ -94,13 +115,28 @@ impl NativeFrameValues {
         poll_spill_start: Option<u32>,
         nonmoving: impl Fn(Value) -> bool,
     ) -> Result<Self, NativeValueMapError> {
+        Self::for_call_in_area(values, roots, NativeValueArea::Activation(shadow_base),
+            outgoing, outgoing_base.map(NativeValueArea::Activation), layout, poll_spill_start, nonmoving)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_call_in_area(
+        values: &[FrameValue],
+        roots: &[Value],
+        spill_area: NativeValueArea,
+        outgoing: &[Value],
+        outgoing_area: Option<NativeValueArea>,
+        layout: NativeFrameLayout,
+        poll_spill_start: Option<u32>,
+        nonmoving: impl Fn(Value) -> bool,
+    ) -> Result<Self, NativeValueMapError> {
         use NativeValueMapError as Error;
         let known: HashSet<_> = values.iter().map(|v| v.value).collect();
         if known.len() != values.len()
             || roots.iter().any(|v| !known.contains(v))
             || outgoing.iter().any(|v| !known.contains(v))
             || roots.iter().copied().collect::<HashSet<_>>().len() != roots.len()
-            || (!outgoing.is_empty() && outgoing_base.is_none())
+            || (!outgoing.is_empty() && outgoing_area.is_none())
         {
             return Err(Error::InvalidValues);
         }
@@ -108,11 +144,7 @@ impl NativeFrameValues {
             .iter()
             .enumerate()
             .map(|(index, &value)| {
-                let index = u16::try_from(index).map_err(|_| Error::InvalidLocation)?;
-                let slot = shadow_base
-                    .checked_add(index)
-                    .ok_or(Error::InvalidLocation)?;
-                Ok((value, slot))
+                Ok((value, spill_area.location(index)?))
             })
             .collect::<Result<HashMap<_, _>, Error>>()?;
         let mut raw_slot = poll_spill_start.unwrap_or(0);
@@ -130,7 +162,7 @@ impl NativeFrameValues {
             let location = match entry.location {
                 FrameValueLocation::Immediate(value) => NativeValueLocation::Constant(value),
                 FrameValueLocation::Home(_) if shadow.is_some() => {
-                    NativeValueLocation::Activation(shadow.unwrap())
+                    shadow.unwrap()
                 }
                 FrameValueLocation::Home(ValueHome::Reg(reg))
                     if entry.repr == ValueRepresentation::Tagged
@@ -174,12 +206,10 @@ impl NativeFrameValues {
                     locations.push(home);
                 }
             }
-            if let Some(base) = outgoing_base {
+            if let Some(area) = outgoing_area {
                 for (index, &arg) in outgoing.iter().enumerate() {
                     if arg == entry.value {
-                        let index = u16::try_from(index).map_err(|_| Error::InvalidLocation)?;
-                        let slot = base.checked_add(index).ok_or(Error::InvalidLocation)?;
-                        let location = NativeValueLocation::Activation(slot);
+                        let location = area.location(index)?;
                         if !locations.contains(&location) {
                             locations.push(location);
                         }
@@ -197,6 +227,28 @@ impl NativeFrameValues {
             });
         }
         Self::checked(layout, mapped)
+    }
+
+    /// Retain immutable original arguments even after SSA liveness drops their
+    /// ordinary homes. These copies belong to this physical frame, never its
+    /// managed anchor or another recursive activation.
+    pub(crate) fn with_native_arguments(
+        mut self,
+        arguments: &[(Value, u32)],
+        nonmoving: impl Fn(Value) -> bool,
+    ) -> Result<Self, NativeValueMapError> {
+        for &(value, slot) in arguments {
+            let location = NativeValueLocation::Stack(stack_offset(slot)?);
+            if let Some(entry) = self.values.iter_mut().find(|entry| entry.value == value) {
+                if !entry.locations.contains(&location) { entry.locations.push(location); }
+            } else {
+                self.values.push(NativeValue {
+                    value, repr: ValueRepresentation::Tagged,
+                    may_reference_heap: !nonmoving(value), locations: vec![location],
+                });
+            }
+        }
+        Self::checked(self.layout, self.values)
     }
 
     fn checked(

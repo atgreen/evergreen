@@ -9,6 +9,8 @@ thread_local! {
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };
     static EXPECTED_OWNER: Cell<usize> = const { Cell::new(0) };
     static OBSERVED_ENTRY: Cell<bool> = const { Cell::new(false) };
+    pub(in crate::cli::bytecode) static RECURSIVE_LEAF_OBSERVER: Cell<Option<fn()>> = const { Cell::new(None) };
+    static LEAF_MANAGED_DEPTH: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 pub(crate) fn ordinary_t2_root_for_test() -> EgclVal {
@@ -33,10 +35,18 @@ pub(crate) fn ordinary_t2_entry_for_test() -> EgclVal {
         "helper must observe this installed mapped caller through the real segment links"
     );
     OBSERVED_ENTRY.with(|observed| observed.set(true));
+    if let Some(observe) = RECURSIVE_LEAF_OBSERVER.with(Cell::get) {
+        observe();
+    }
+    LEAF_MANAGED_DEPTH.with(|depth| {
+        if depth.get().is_some() {
+            depth.set(Some(egcl_rt::current_stack().frame_depth()));
+        }
+    });
     NIL
 }
 
-pub(super) fn expect_entry(code: &NativeCode) {
+pub(in crate::cli::bytecode) fn expect_entry(code: &NativeCode) {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         panic!("mapped caller")
     };
@@ -48,7 +58,7 @@ pub(super) fn observed_entry() -> bool {
     OBSERVED_ENTRY.with(Cell::get)
 }
 
-fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
+pub(in crate::cli::bytecode) fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
     egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let symbol = egcl_rt::symbols::intern(name);
@@ -538,9 +548,9 @@ fn ordinary_mv_zero_binding_preserves_the_existing_tuple() {
     }
 }
 
-struct RecursiveFixturePins(Vec<u32>);
+pub(in crate::cli::bytecode) struct RecursiveFixturePins(Vec<u32>);
 impl RecursiveFixturePins {
-    fn new(names: &[&str]) -> Self {
+    pub(in crate::cli::bytecode) fn new(names: &[&str]) -> Self {
         Self(
             names
                 .iter()
@@ -607,6 +617,8 @@ fn ordinary_t2_recursive_calls_move_roots_and_recover_deepest_guard_once() {
         let NativeCodeStorage::Mapped(mapped) = &code._storage else {
             unreachable!()
         };
+        assert!(mapped.native_entry_kind_slot.is_some(),
+            "recursive guard recovery must exercise actual native child frames");
         #[cfg(not(egcl_no_disassembly))]
         assert!(
             native_transfer_entry::installed_listing(mapped)
@@ -708,7 +720,7 @@ fn ordinary_t2_recursive_calls_move_roots_and_recover_deepest_guard_once() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_recursive_calls_preserve_redefinition_and_unbinding() {
-    use native_transfer_entry::take_recursive_entries;
+    use native_transfer_entry::{take_recursive_entries, take_recursive_helper_calls};
     assert!(egcl_rt::native_transfer::is_supported());
     let _lock = super::super::super::heap_test_lock()
         .lock()
@@ -754,12 +766,18 @@ fn ordinary_t2_recursive_calls_preserve_redefinition_and_unbinding() {
         }), "fixture must retain the named recursive call");
         let (symbol, code) = install_body(symbol, Arc::new(body));
         assert_mapped_t2(&code);
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+        assert!(mapped.native_entry_kind_slot.is_some(),
+            "generation invalidation must exercise the physical native-child entry mode");
         egcl_rt::rooted!(original = egcl_rt::symbols::symbol_function(symbol).unwrap());
         let stack = egcl_rt::current_stack();
         let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
         take_recursive_entries();
+        take_recursive_helper_calls();
         egcl_rt::rooted!(result = run_native(&code, symbol, &[EgclVal::from_fixnum(1)], &mut env));
         assert_ne!(egcl_rt::symbols::symbol_function(symbol), Some(*original));
+        assert_eq!(take_recursive_helper_calls(), (0, 0),
+            "replacement/unbinding must use the native entry's cold fallback");
         assert_eq!(
             take_recursive_entries(),
             0,
@@ -1041,4 +1059,307 @@ fn ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication() {
         published_log,
         "stale completion must not announce success"
     );
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
+    use native_transfer_entry::{
+        take_native_fallback_count, take_recursive_entries, take_recursive_helper_calls,
+    };
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-NATIVE-FRAME-FIB";
+    let form = "(if (< n 2) n
+        (+ (ordinary-t2-native-frame-fib (- n 1))
+           (ordinary-t2-native-frame-fib (- n 2))))";
+    super::super::super::read_eval_all_env(
+        &format!("(defun {name} (n) {form})"),
+        &mut env,
+    )
+    .unwrap();
+    let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        unreachable!()
+    };
+    assert!(mapped.native_entry_kind_slot.is_some(),
+        "invocation accounting must exercise generated native-child admission");
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    assert_eq!(
+        egcl_rt::function::tier(*function),
+        2,
+        "exercise an ordinarily published worker T2 definition"
+    );
+    // Warm the already installed code and its dispatch cells before measuring.
+    assert_eq!(
+        run_native(&code, symbol, &[EgclVal::from_fixnum(3)], &mut env).unwrap(),
+        EgclVal::from_fixnum(2)
+    );
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let deopts = mapped.deopt_count();
+    // This internal run_native entry bypasses apply_function's outer invocation
+    // bump. Only the 464 recursive calls belong to the measured delta.
+    let before_count = egcl_rt::function::invoke_count(*function);
+    take_recursive_entries();
+    take_native_fallback_count();
+    take_recursive_helper_calls();
+    assert_eq!(
+        run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
+        EgclVal::from_fixnum(144)
+    );
+    let entries = take_recursive_entries();
+    let helpers = take_recursive_helper_calls();
+    assert_eq!(entries, 464, "fib(12) must execute all 464 native self calls");
+    assert_eq!(egcl_rt::function::invoke_count(*function) - before_count, 464,
+        "each admitted native child increments the retained callable exactly once");
+    assert_eq!(take_native_fallback_count(), 0);
+    assert_eq!(mapped.deopt_count(), deopts, "measure successful native returns");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(
+        helpers,
+        (0, 0),
+        "ordinary T2 recursion must not prepare or retire frames through Rust helpers"
+    );
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_recursive_frames_do_not_grow_the_managed_stack() {
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-NATIVE-FRAME-DEPTH";
+    let form = "(if (= n 0) (ordinary-t2-native-frame-leaf)
+        (+ (ordinary-t2-native-frame-depth (- n 1)) 1))";
+    super::super::super::read_eval_all_env(
+        &format!(
+            "(defun ordinary-t2-native-frame-leaf () (%ordinary-t2-entry-for-test) 0)
+             (defun {name} (n) {form})"
+        ),
+        &mut env,
+    )
+    .unwrap();
+    // Keep observer dispatch identical in the depth-zero and recursive calls.
+    // Its constant adapter/managed frames must not masquerade as recursion.
+    let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-FRAME-LEAF"]);
+    let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    expect_entry(&code);
+    run_native(&code, symbol, &[EgclVal::from_fixnum(0)], &mut env).unwrap();
+    struct ClearDepthProbe;
+    impl Drop for ClearDepthProbe {
+        fn drop(&mut self) {
+            LEAF_MANAGED_DEPTH.with(|depth| depth.set(None));
+        }
+    }
+    let _probe = ClearDepthProbe;
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let mut depths = Vec::new();
+    for n in [0, 6] {
+        expect_entry(&code);
+        LEAF_MANAGED_DEPTH.with(|depth| depth.set(Some(0)));
+        native_transfer_entry::take_recursive_entries();
+        assert_eq!(
+            run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env).unwrap(),
+            EgclVal::from_fixnum(n),
+            "each recursive caller must resume its non-tail addition"
+        );
+        assert!(observed_entry(), "observe the installed native caller at the leaf");
+        assert_eq!(native_transfer_entry::take_recursive_entries(), n as usize);
+        let depth = LEAF_MANAGED_DEPTH.with(Cell::get).expect("active leaf probe");
+        assert!(depth > 0, "the callback must actually observe its managed boundary");
+        depths.push(depth);
+        assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    }
+    assert_eq!(
+        depths[1], depths[0],
+        "six actual native self calls must add no managed frames above the constant leaf boundary"
+    );
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
+    use native_transfer_entry::{take_recursive_entries, take_recursive_helper_calls};
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-NATIVE-FRAME-SUM";
+    let form = "(progn (ordinary-t2-native-frame-sum-tick)
+        (if (= n 0) (+ x 1)
+            (+ (ordinary-t2-native-frame-sum (- n 1) x) 1)))";
+    super::super::super::read_eval_all_env(
+        &format!(
+            "(setq *ordinary-t2-native-frame-sum-ticks* 0)
+             (defun ordinary-t2-native-frame-sum-tick ()
+               (setq *ordinary-t2-native-frame-sum-ticks*
+                     (+ *ordinary-t2-native-frame-sum-ticks* 1)))
+             (defun {name} (n x) {form})"
+        ),
+        &mut env,
+    )
+    .unwrap();
+    let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-FRAME-SUM-TICK"]);
+    let (symbol, code) = install(name, "(n x)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    assert!(code.has_deopt, "worker T2 must retain arithmetic guards");
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        unreachable!()
+    };
+    assert!(
+        mapped.native_entry_kind_slot.is_some(),
+        "guard recovery must exercise actual native child frames"
+    );
+    for overflow in [false, true] {
+        super::super::super::read_eval_all_env(
+            "(setq *ordinary-t2-native-frame-sum-ticks* 0)",
+            &mut env,
+        )
+        .unwrap();
+        let x = if overflow { (1_i64 << 60) - 1 } else { 10 };
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+        let deopts = mapped.deopt_count();
+        take_recursive_entries();
+        take_recursive_helper_calls();
+        egcl_rt::rooted!(
+            result = run_native(
+                &code,
+                symbol,
+                &[EgclVal::from_fixnum(8), EgclVal::from_fixnum(x)],
+                &mut env,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            take_recursive_entries(),
+            8,
+            "all eight selfcalls must enter native child frames"
+        );
+        assert_eq!(
+            take_recursive_helper_calls(),
+            (0, 0),
+            "neither entry nor guard recovery may prepare/retire managed child frames"
+        );
+        assert_eq!(
+            mapped.deopt_count() - deopts,
+            if overflow { 9 } else { 0 },
+            "each overflowing activation must resume its own continuation"
+        );
+        assert_eq!(
+            (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
+            before
+        );
+        assert_eq!(
+            super::super::super::format_val(*result),
+            (x + 9).to_string(),
+            "native returns and all nine guard resumptions must agree exactly"
+        );
+        assert_eq!(
+            super::super::super::read_eval_all_env(
+                "*ordinary-t2-native-frame-sum-ticks*",
+                &mut env,
+            )
+            .unwrap(),
+            EgclVal::from_fixnum(9),
+            "guard recovery must not replay any activation's prefix"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_native_recursion_falls_back_at_depth_cap_and_restores_anchor() {
+    use native_transfer_entry::{take_recursive_entries, take_recursive_helper_calls};
+    assert!(egcl_rt::native_transfer::is_supported());
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-NATIVE-CAP";
+    let form = "(if (= n 0) (ordinary-t2-native-cap-leaf)
+        (+ (ordinary-t2-native-cap (- n 1)) 1))";
+    super::super::super::read_eval_all_env(&format!(
+        "(defun ordinary-t2-native-cap-leaf () (%ordinary-t2-entry-for-test) 0)
+         (defun {name} (n) {form})"), &mut env).unwrap();
+    let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-CAP-LEAF"]);
+    let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.native_entry_kind_slot.is_some(),
+        "the cap must exercise physical native children, not managed recursive entries");
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    let cap = native_depth_cap();
+    assert!(cap >= 4, "fixture needs one fallback below two admitted native children");
+    let recursion_depth = usize::try_from(cap - 1).unwrap().min(8);
+    thread_local! {
+        static CAP_LEAF_DEPTH: Cell<Option<(usize, u32)>> = const { Cell::new(None) };
+    }
+    fn observe_leaf() {
+        CAP_LEAF_DEPTH.with(|slot| slot.set(Some((
+            egcl_rt::current_stack().frame_depth(), NATIVE_DEPTH.with(Cell::get),
+        ))));
+    }
+    struct RestoreObserver(Option<fn()>);
+    impl Drop for RestoreObserver {
+        fn drop(&mut self) {
+            RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+            CAP_LEAF_DEPTH.with(|slot| slot.set(None));
+        }
+    }
+    struct RestoreDepth(u32);
+    impl Drop for RestoreDepth {
+        fn drop(&mut self) { NATIVE_DEPTH.with(|depth| depth.set(self.0)); }
+    }
+    let _observer = RestoreObserver(RECURSIVE_LEAF_OBSERVER.with(|hook|
+        hook.replace(Some(observe_leaf))));
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let deopts = mapped.deopt_count();
+    let mut managed_depths = Vec::new();
+    for (initial_depth, expected_children) in [(0, recursion_depth), (cap - 3, 2)] {
+        let _depth = RestoreDepth(NATIVE_DEPTH.with(|depth| depth.replace(initial_depth)));
+        CAP_LEAF_DEPTH.with(|slot| slot.set(None));
+        expect_entry(&code);
+        take_recursive_entries();
+        take_recursive_helper_calls();
+        let before_count = egcl_rt::function::invoke_count(*function);
+        assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(recursion_depth as i64)], &mut env).unwrap(),
+            EgclVal::from_fixnum(recursion_depth as i64), "every non-tail addition must execute exactly once");
+        assert!(observed_entry(), "the terminal leaf must actually execute");
+        // run_native does not count the outer call. Generated admissions and
+        // the remaining c2i/T0 calls must jointly count every selfcall once,
+        // including the first call refused at the native depth cap.
+        assert_eq!(egcl_rt::function::invoke_count(*function) - before_count,
+            recursion_depth as u32,
+            "native admission and depth fallback must neither lose nor double-count calls");
+        assert_eq!(take_recursive_entries(), expected_children,
+            "the outer anchor consumes one depth slot before child admission");
+        assert_eq!(take_recursive_helper_calls(), (0, 0),
+            "native children never use managed-frame prepare/finish helpers");
+        assert_eq!(mapped.deopt_count(), deopts, "cap fallback is ordinary dispatch, not deopt");
+        let (managed, native) = CAP_LEAF_DEPTH.with(Cell::get).expect("observed terminal leaf");
+        assert_eq!(native, initial_depth + 1 + expected_children as u32,
+            "the leaf sees exactly the admitted native chain");
+        managed_depths.push(managed);
+        assert_eq!((stack.fp(), stack.sp()), (before.0, before.1));
+        assert_eq!(NATIVE_DEPTH.with(Cell::get), initial_depth,
+            "return retires all native children and their managed anchor exactly once");
+    }
+    assert!(managed_depths[1] > managed_depths[0],
+        "after the cap, remaining recursion must execute on the flat managed T0 stack");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
 }

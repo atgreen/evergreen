@@ -239,6 +239,7 @@ impl ActivationState {
             recursive_profile: !profiling_disabled()
                 && egcl_rt::function::is_interpreted_function(unsafe { (*frame).function }),
             recursive_generation: code.recursive_generation,
+            native_recursive: None,
             recursive: std::ptr::null_mut(),
             recursive_escape: false,
             #[cfg(test)]

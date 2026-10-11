@@ -19,6 +19,8 @@ pub enum FrameOrigin {
     Interpreted,
     /// A managed activation; this alone does not identify its compiler tier.
     Managed,
+    /// A generated physical frame reconstructed at a published native boundary.
+    Native,
     /// The entry function of a fiber that has not started executing.
     Entry,
     /// An outbound C call boundary, not an unwound internal C activation.
@@ -164,6 +166,43 @@ pub fn capture_fiber(id: FiberId, count: usize) -> Result<Option<Vec<LogicalFram
     crate::thread::fiber_logical_backtrace(id, count)
 }
 
+/// Which execution the caller has protected for an uninterrupted snapshot.
+#[derive(Clone, Copy)]
+pub enum NativeBacktraceTarget {
+    Current,
+    StoppedFiber(FiberId),
+}
+
+/// A physical native call attached to a real managed anchor. Outer entries
+/// enrich that existing row; private children insert rows immediately inside it.
+/// The copied frame owns its name/arguments, never executable pointers.
+pub struct AnchoredNativeFrame {
+    pub managed_anchor: usize,
+    pub enrich_anchor: bool,
+    pub frame: LogicalFrame,
+}
+
+/// A provider may allocate Rust storage only. The caller protects the indicated
+/// execution/stack from running or retiring and forbids GC/safepoints until the
+/// copies have joined its rooted PendingBacktrace. StoppedFiber additionally
+/// means the caller holds that fiber's mount/state exclusion and owner.
+pub type NativeBacktraceProvider = unsafe fn(
+    NativeBacktraceTarget,
+    *const crate::stack::EgclStack,
+    usize,
+    &mut dyn FnMut(AnchoredNativeFrame),
+);
+
+static NATIVE_BACKTRACE_PROVIDER: std::sync::OnceLock<NativeBacktraceProvider> =
+    std::sync::OnceLock::new();
+
+/// Install the runtime's single native-code owner before its first publication.
+/// No per-call registration is needed; later captures ask the provider to walk
+/// the precise published native frames that are still live.
+pub fn install_native_backtrace_provider(provider: NativeBacktraceProvider) {
+    assert!(NATIVE_BACKTRACE_PROVIDER.set(provider).is_ok(), "native backtrace provider already installed");
+}
+
 struct CopiedFrame {
     address: usize,
     function: Option<EgclVal>,
@@ -178,11 +217,15 @@ pub(crate) struct PendingBacktrace {
     // become function calls in the result.
     frames: Vec<CopiedFrame>,
     pub recorded: Vec<RecordedCall>,
+    native: Vec<AnchoredNativeFrame>,
 }
 
 impl TraceHostRoots for PendingBacktrace {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.recorded.trace_host_roots(visit);
+        for frame in &mut self.native {
+            frame.frame.trace_host_roots(visit);
+        }
         for frame in &mut self.frames {
             frame.arguments.trace_host_roots(visit);
             if let Some(function) = &mut frame.function {
@@ -235,6 +278,40 @@ impl PendingBacktrace {
         }
     }
 
+    /// # Safety
+    /// The selected execution must satisfy NativeBacktraceProvider's protection
+    /// contract. This PendingBacktrace must already be rooted before any later
+    /// allocation or safepoint, just like the ordinary managed-frame copies.
+    pub unsafe fn copy_native(
+        &mut self,
+        target: NativeBacktraceTarget,
+        stack: *const crate::stack::EgclStack,
+        count: usize,
+    ) {
+        if let Some(provider) = NATIVE_BACKTRACE_PROVIDER.get() {
+            unsafe { provider(target, stack, count, &mut |native| {
+                if native.enrich_anchor {
+                    // Preserve the existing call row and its position. Its
+                    // managed CodeInfo cannot describe private-entry registers.
+                    if let Some(frame) = self.frames.iter_mut()
+                        .find(|frame| frame.address == native.managed_anchor) {
+                        frame.installed_name.clone_from(&native.frame.function);
+                        frame.arguments.clone_from(&native.frame.arguments);
+                    }
+                    for call in &mut self.recorded {
+                        if call.anchor == native.managed_anchor
+                            && call.frame.origin == FrameOrigin::Managed {
+                            call.frame.function.clone_from(&native.frame.function);
+                            call.frame.arguments.clone_from(&native.frame.arguments);
+                        }
+                    }
+                } else {
+                    self.native.push(native);
+                }
+            }) };
+        }
+    }
+
     pub fn entry(&mut self, function: EgclVal) {
         self.frames.push(CopiedFrame {
             address: 0,
@@ -257,10 +334,23 @@ impl PendingBacktrace {
         } in &self.frames
         {
             let mut recorded_managed = false;
+            let mut native_inserted = false;
+            let insert_native = |frames: &mut Vec<LogicalFrame>| {
+                frames.extend(self.native.iter()
+                    .filter(|native| native.managed_anchor == *address)
+                    .map(|native| native.frame.clone()));
+            };
             while recorded.peek().is_some_and(|call| call.anchor == *address) {
                 let frame = &recorded.next().unwrap().frame;
+                if frame.origin == FrameOrigin::Managed && !native_inserted {
+                    insert_native(&mut frames);
+                    native_inserted = true;
+                }
                 recorded_managed |= frame.origin == FrameOrigin::Managed;
                 frames.push(frame.clone());
+            }
+            if !native_inserted {
+                insert_native(&mut frames);
             }
             if recorded_managed {
                 continue;

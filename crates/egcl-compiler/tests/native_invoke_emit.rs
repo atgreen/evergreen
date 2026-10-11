@@ -94,6 +94,7 @@ struct RunState {
     snapshots: *mut u8,
     snapshot_count: usize,
     activation_len: usize,
+    native_storage: bool,
     expected: *const EgclVal,
     expected_len: usize,
     first_nargs: usize,
@@ -138,6 +139,11 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
     let Some(NativeCallValues::Frame(map)) = calls.value_map(offset) else {
         panic!("collecting Invoke must have an authoritative map");
     };
+    if state.native_storage {
+        assert!(map.values().iter().flat_map(|value| value.locations()).all(|location|
+            !matches!(location, NativeValueLocation::Activation(_))),
+            "native-storage calls must publish native homes, not activation copies");
+    }
     let entry = unsafe { *state.entry_capture };
     let cursor = egcl_compiler::t2::x64_unwind::NativeFrameCursor {
         pc: return_pc, call_sp: call_rsp, registers: [None; 6],
@@ -185,8 +191,15 @@ unsafe extern "C" fn helper(request: *mut u8, out: *mut NativeOutcome) {
         assert!(expected.contains(unsafe { &*slots[0] }), "map must describe a relocated live value");
     }
     for index in 0..request.nargs {
-        let outgoing_slot = unsafe { request.args.add(index).offset_from(request.activation) } as u16;
-        assert!(map.gc_locations().any(|location| *location == NativeValueLocation::Activation(outgoing_slot)),
+        let outgoing = if state.native_storage {
+            let offset = (request.args as usize + index * 8).checked_sub(body_rsp as usize)
+                .expect("outgoing arguments live in the native body frame");
+            NativeValueLocation::Stack(i32::try_from(offset).unwrap())
+        } else {
+            let slot = unsafe { request.args.add(index).offset_from(request.activation) };
+            NativeValueLocation::Activation(u16::try_from(slot).unwrap())
+        };
+        assert!(map.gc_locations().any(|location| *location == outgoing),
             "every outgoing argument copy must be rooted");
         assert_eq!(unsafe { request.args.add(index).read() }, unsafe {
             state
@@ -278,6 +291,16 @@ fn double(value: f64) -> EgclVal {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
+    exercise_collecting_calls(false);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_stack_calls_relocate_arguments_and_recover_exact_continuation() {
+    exercise_collecting_calls(true);
+}
+
+fn exercise_collecting_calls(native_storage: bool) {
     assert!(native_transfer::is_supported());
     for nargs in [0usize, 1, 4, 8] {
         for exit in [
@@ -313,8 +336,17 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
             let mut call_capture = Box::new([0usize; 2]);
             // Tail-jump after observing the actual primary CALL coordinates.
             let probe = native_unwind::capture_call(veneer.as_ptr(), call_capture.as_mut_ptr(), false);
-            let (emitted, table) =
-                emit_framed_transfers(&ir, probe.as_ptr() as u64, activation_slots).unwrap();
+            let (emitted, table) = if native_storage {
+                egcl_compiler::t2::emit::emit_framed_transfers_with_storage(&ir,
+                    probe.as_ptr() as u64, activation_slots,
+                    egcl_compiler::t2::emit::NativeCallStorage::NativeStack)
+            } else {
+                emit_framed_transfers(&ir, probe.as_ptr() as u64, activation_slots)
+            }.unwrap();
+            if native_storage {
+                assert_eq!(emitted.shadow_root_slots, 0,
+                    "native storage must not request tagged activation copies");
+            }
             assert!(emitted.native_calls.as_ref().unwrap().unwind_recipe().is_some(), "SysV emitted code needs its exact prologue recipe");
             let code = JitBuffer::new(&emitted.code).unwrap();
             let mut entry_capture = Box::new([0usize; 8]);
@@ -347,6 +379,7 @@ fn compiler_emitted_calls_return_or_capture_after_collecting_helpers() {
                 snapshots: snapshots.as_mut_ptr().cast(),
                 snapshot_count: snapshots.len(),
                 activation_len: activation.len(),
+                native_storage,
                 expected: expected.as_ptr(),
                 expected_len: locals,
                 first_nargs: nargs,

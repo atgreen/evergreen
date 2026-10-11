@@ -1921,6 +1921,11 @@ pub fn emit_framed_with_runtime(
         emitter.deopt(function.frame_states.get(state), deopt_t2)?;
     }
     Ok(FramedCode {
+        native_recursive_entry: None,
+        native_entry_kind_slot: None,
+        native_control_slot: None,
+        native_argument_base: None,
+        native_argument_count: 0,
         native_calls: None,
         #[cfg(all(target_arch = "x86_64", windows))]
         windows_unwind: Vec::new(),
