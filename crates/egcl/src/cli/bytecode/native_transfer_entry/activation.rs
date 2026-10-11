@@ -240,6 +240,7 @@ impl ActivationState {
                 && egcl_rt::function::is_interpreted_function(unsafe { (*frame).function }),
             recursive_generation: code.recursive_generation,
             native_recursive: None,
+            native_poll: None,
             recursive: std::ptr::null_mut(),
             recursive_escape: false,
             #[cfg(test)]

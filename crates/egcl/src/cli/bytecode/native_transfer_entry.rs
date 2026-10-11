@@ -34,6 +34,7 @@ pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
 mod native_frames;
+pub(super) mod native_poll;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
@@ -664,6 +665,7 @@ impl TransferCode {
             .collect();
         // Optimized baseline code still needs T1 heat and OSR handling. The
         // construction tier, not IR optimization or deopt metadata, selects this.
+        let poll_fast_path = matches!(tier, CompilationTier::T2).then(native_poll::binding).flatten();
         let poll_helper = match tier {
             CompilationTier::T1 => poll_or_transfer,
             CompilationTier::T2 => poll_t2_or_transfer,
@@ -725,7 +727,7 @@ impl TransferCode {
         } else { None };
         // A shape not yet admitted by the native-frame emitter retains its
         // existing mapped execution and original recovery veneers.
-        let (emitted, sites) = native_frames.or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries(
+        let (emitted, sites) = native_frames.or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_and_poll_fast_path(
             ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -739,6 +741,7 @@ impl TransferCode {
             deopt_veneer.as_ref().map(|code| code.as_ptr() as u64),
             &named_veneers,
             egcl_compiler::t2::emit::NativeRootPublication::PublishedHomes,
+            poll_fast_path,
         )
         .inspect_err(|error| t2_log_write(format_args!(
             "{}: mapped emitter: {error:?}{}",
@@ -2350,9 +2353,11 @@ unsafe extern "C" fn poll_t2_or_transfer(
             counts.set((idle + 1, published));
         });
         unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Returned }) };
+        native_poll::refresh();
         return;
     }
     unsafe { poll_or_transfer(request, out, image) };
+    native_poll::refresh();
 }
 
 unsafe extern "C" fn poll_or_transfer(
@@ -2762,6 +2767,7 @@ struct CaptureContext {
     recursive_profile: bool,
     recursive_generation: u64,
     native_recursive: Option<egcl_compiler::t2::emit::NativeRecursiveControl>,
+    native_poll: Option<egcl_compiler::t2::emit::NativePollControl>,
     recursive: *mut RecursiveActivation,
     recursive_escape: bool,
     handlers: *mut Vec<SavedHandler>,

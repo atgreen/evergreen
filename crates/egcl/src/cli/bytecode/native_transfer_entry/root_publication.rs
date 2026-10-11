@@ -82,6 +82,21 @@ pub(in super::super) type ObserveHook = Option<fn()>;
 pub(in super::super) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<Cell<ObserveHook>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
+/// Locate a fixture value only at an actual published generated poll, and
+/// require that no managed activation or MV buffer is keeping it alive.
+#[cfg(test)]
+pub(in super::super) fn native_poll_root_for_test(marker: i64) -> Option<*mut EgclVal> {
+    use egcl_compiler::t2::x64_calls::NativeCallOrigin;
+    let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    let owner = unsafe { &*published.owner };
+    let offset = published.cursor.pc.checked_sub(owner.code.as_ptr() as usize)?;
+    let site = owner._native_calls.get(offset)?;
+    if !matches!(site.origin, NativeCallOrigin::LoopPoll(_) | NativeCallOrigin::StraightPoll(_)) {
+        return None;
+    }
+    tests::native_only_slot_for(published, marker)
+}
+
 #[cfg(test)]
 pub(super) fn observe() {
     if let Some(hook) = OBSERVE.with(Cell::get) {
