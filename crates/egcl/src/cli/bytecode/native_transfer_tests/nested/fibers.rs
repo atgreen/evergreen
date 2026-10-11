@@ -58,6 +58,20 @@ impl Drop for Cohort<'_> {
     }
 }
 
+fn assert_current_fiber_stack_limit() -> u64 {
+    let (low, high) = egcl_rt::thread::current_fiber()
+        .expect("the recursive callback runs on a fiber")
+        .native_stack_bounds()
+        .expect("the fiber owns a native stack");
+    let expected = low.saturating_add(128 * 1024).min(high) as u64;
+    assert_eq!(
+        egcl_rt::stack::current_native_stack_limit(),
+        expected,
+        "native admission must use this fiber's own stack and interpreter headroom"
+    );
+    expected
+}
+
 pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal, EgclError> {
     let probe = PROBE.with(|slot| {
         let mut probe = slot.get();
@@ -67,6 +81,7 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     });
     assert_eq!(probe.hits, 1, "child pause must execute exactly once");
     let recursive = probe.mode >= 6;
+    let native_limit = (probe.mode >= 8).then(assert_current_fiber_stack_limit);
     let stack = egcl_rt::current_stack();
     let suspended_frame = stack.fp();
     let suspended_sp = stack.sp();
@@ -150,6 +165,13 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
         #[cfg(feature = "native-transfer-test-hooks")]
         let before_refusal = held.to_raw();
         egcl_rt::fiber_sleep(std::time::Duration::from_millis(10))?;
+        if let Some(native_limit) = native_limit {
+            assert_eq!(
+                assert_current_fiber_stack_limit(),
+                native_limit,
+                "migration must retain the fiber's native stack bound"
+            );
+        }
         #[cfg(feature = "native-transfer-test-hooks")]
         if let Some((required, refused)) =
             egcl_rt::native_transfer::test_hooks::take_rejection(fiber)
@@ -500,6 +522,49 @@ fn ordinary_t2_recursive_backtraces_survive_stopped_fiber_gc_and_migration() {
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_recursive_throw_retires_native_frames_after_fiber_migration() {
     run_child_modes(false, 9..10);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_recursive_fibers_use_their_stack_limit_after_cli_initialization() {
+    const CHILD: &str = "EGCL_TEST_NATIVE_FIBER_STACK_LIMIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // cli::run publishes a process-global carrier limit. Keep that real
+        // initialization out of other libtests, which often start with zero.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::bytecode::native_transfer_tests::nested::fibers::ordinary_t2_recursive_fibers_use_their_stack_limit_after_cli_initialization",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "CLI-initialized fiber child failed: {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    // This early CLI command executes the production stack-limit setup and
+    // direct-builtin initialization without starting an interactive session.
+    assert_eq!(crate::cli::run(&["--runtime-info".into()]).unwrap(), 0);
+    let carrier_limit = egcl_rt::stack::NATIVE_STACK_LIMIT.load(Ordering::Acquire);
+    assert_ne!(carrier_limit, 0, "the production carrier limit must be active");
+    // Both normal return and THROW retain the existing exact four native child
+    // entries, moving original arguments, stopped backtraces, and migration.
+    run_child_modes(false, 8..10);
+    assert_eq!(
+        egcl_rt::stack::NATIVE_STACK_LIMIT.load(Ordering::Acquire),
+        carrier_limit,
+        "fiber mounting and migration must not rewrite the process-global limit"
+    );
 }
 
 fn run_children(refuse: bool) {
