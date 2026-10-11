@@ -9543,10 +9543,18 @@ pub(super) fn fmt_form_debug(val: EgclVal) -> String {
 }
 
 /// Render one axis of a multidimensional array's row-major storage as nested
-/// parenthesised lists for the `#nA` printer. `base` is the storage vector's
-/// object pointer, `dims` the remaining axes, `start` the flat offset. Returns
+/// parenthesised lists for the `#nA` printer. `base` is the row-major storage
+/// vector, `dims` the remaining axes, `start` the flat offset. Returns
 /// the number of leaf elements consumed.
-fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut String) -> usize {
+fn print_md_nested(base: EgclVal, dims: &[usize], start: usize, out: &mut String) -> usize {
+    if dims.is_empty() {
+        if let Some(raw) = egcl_rt::packed_f64::get(base, start) {
+            out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
+        } else {
+            print_val(egcl_stdlib::elt(base, start).unwrap_or(NIL), out);
+        }
+        return 1;
+    }
     out.push('(');
     let mut consumed = 0;
     if dims.len() <= 1 {
@@ -9555,8 +9563,11 @@ fn print_md_nested(base: *const u8, dims: &[usize], start: usize, out: &mut Stri
             if i > 0 {
                 out.push(' ');
             }
-            let e = unsafe { *(base.add(16 + (start + i) * 8) as *const EgclVal) };
-            print_val(e, out);
+            if let Some(raw) = egcl_rt::packed_f64::get(base, start + i) {
+                out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
+            } else {
+                print_val(egcl_stdlib::elt(base, start + i).unwrap_or(NIL), out);
+            }
         }
         consumed = n;
     } else {
@@ -9848,8 +9859,12 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                         if i > 0 {
                             out.push(' ');
                         }
-                        let e = egcl_stdlib::cvec_element(val, i).unwrap_or(NIL);
-                        print_val(e, out);
+                        if let Some(raw) = egcl_stdlib::sequences::double_float_array_element(val, i) {
+                            out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
+                        } else {
+                            let e = egcl_stdlib::cvec_element(val, i).unwrap_or(NIL);
+                            print_val(e, out);
+                        }
                     }
                     out.push(')');
                 }
@@ -9895,6 +9910,16 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                         out.push_str(&digits);
                     }
                 }
+                type_id::SIMPLE_ARRAY if egcl_rt::packed_f64::is_vector(val) => {
+                    out.push_str("#(");
+                    for i in 0..egcl_rt::packed_f64::len(val).unwrap() {
+                        if i != 0 { out.push(' '); }
+                        out.push_str(&egcl_stdlib::format::double_float_to_string(
+                            egcl_rt::packed_f64::get(val, i).unwrap(),
+                        ));
+                    }
+                    out.push(')');
+                }
                 type_id::SIMPLE_ARRAY if egcl_rt::types::bit_vector_p(val) => {
                     // A bit-vector prints in `#*bits` syntax (bliss-zg9).
                     let len = egcl_rt::types::bit_vector_len(val).unwrap_or(0);
@@ -9914,7 +9939,7 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                     out.push('#');
                     out.push_str(&rank.to_string());
                     out.push('A');
-                    print_md_nested(storage.as_ptr(), &dims, 0, out);
+                    print_md_nested(storage, &dims, 0, out);
                 }
                 _ => out.push_str(&format!("#<heap-object type={}>", hdr.type_id())),
             }
@@ -10512,7 +10537,7 @@ fn is_simple_vector_value(v: EgclVal) -> bool {
     // A bit vector's element type is BIT, not T -- and this must cover the
     // complex-bit case too, which is why it is `is_bit_vector_value` rather
     // than `types::bit_vector_p` (bliss-65nx).
-    if is_bit_vector_value(v) {
+    if is_bit_vector_value(v) || egcl_rt::packed_f64::is_vector(v) {
         return false;
     }
     // Fill pointer / adjustable / displaced => complex, hence not simple.
@@ -13995,6 +14020,7 @@ enum EltU {
     /// arms of the STRING union below.
     Nil,
     Bit,
+    DoubleFloat,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -14032,10 +14058,15 @@ fn upgrade_elt(spec: EgclVal) -> EltU {
             "BASE-CHAR" | "STANDARD-CHAR" => EltU::BaseChar,
             "NIL" => EltU::Nil,
             "BIT" => EltU::Bit,
+            "DOUBLE-FLOAT" | "LONG-FLOAT" => EltU::DoubleFloat,
             _ => EltU::T,
         };
     }
     if spec.is_cons() {
+        let head = cp(spec).0;
+        if head.is_symbol() && matches!(sym_bare_name_rc(head).as_ref(), "DOUBLE-FLOAT" | "LONG-FLOAT") {
+            return EltU::DoubleFloat;
+        }
         // (integer 0 1) / (mod 2) / (unsigned-byte 1) upgrade to BIT; other
         // compound element types upgrade to T under egcl's policy.
         if let Some(nt) = parse_num_type(spec) {
@@ -14225,17 +14256,15 @@ fn array_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 
 /// The element-type class egcl actually stores `object`'s elements in.
 ///
-/// Everything that is not a string or a bit vector reports general (T) storage,
-/// because egcl builds no packed numeric arrays (bliss-iqyv) and `upgrade_elt`
-/// upgrades `(unsigned-byte 8)` and friends to T for exactly that reason. The
-/// two sides therefore meet: a byte buffer built by `MAKE-ARRAY :element-type
-/// '(unsigned-byte 8)` still satisfies `(simple-array (unsigned-byte 8) (*))`,
-/// while a string no longer does.
+/// Packed storage reports its actual element class. General vectors still
+/// report T; `upgrade_elt` separately classifies requested type specifiers.
 fn object_elt_class(object: EgclVal) -> Elt {
     if is_string_value(object) {
         Elt::AnyString
     } else if is_bit_vector_value(object) {
         Elt::Up(EltU::Bit)
+    } else if egcl_stdlib::sequences::is_double_float_array(object) {
+        Elt::Up(EltU::DoubleFloat)
     } else {
         Elt::Up(EltU::T)
     }
@@ -15146,7 +15175,7 @@ fn typep_matches(
                 if op.as_ref() == "VECTOR" {
                     return Ok(false);
                 }
-                if !arr_elt_admits(Elt::Up(EltU::T), spec_elt) {
+                if !arr_elt_admits(object_elt_class(object), spec_elt) {
                     return Ok(false);
                 }
                 let dims = parse_array_dims(arg_vec.get(1).copied()).unwrap_or(Dims::Star);
@@ -19725,10 +19754,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     // (setf (subseq list start end) new): set_elt
                                     // rejects lists, so mutate the spine in place
                                     // (REPLACE semantics), like the (setf (elt list
-                                    // i)) arm. GC-safe: elt reads an element and
-                                    // never allocates, so `cursor` (a raw cons
-                                    // pointer) stays valid across the loop.
+                                    // i)) arm. Packed element reads allocate a box.
                                     let mut cursor = seq;
+                                    egcl_rt::rooted_ref!(_cursor_root = &mut cursor);
                                     for _ in 0..start {
                                         if !cursor.is_cons() {
                                             break;
@@ -19752,7 +19780,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 } else {
                                     for i in 0..n {
                                         let e = egcl_stdlib::elt(*val, i)?;
-                                        seq_set_elt(seq, start + i, e)?;
+                                        seq_set_elt(*seq_r, start + i, e)?;
                                     }
                                 }
                             }
@@ -20662,6 +20690,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-INTERNAL::%EXPAND-TYPE-SPEC"
             | "EGCL-INTERNAL:%EXPAND-TYPE-SPEC"
             | "%EXPAND-TYPE-SPEC" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
+            | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
+            | "%MAKE-DOUBLE-FLOAT-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-INTERNAL::%MAKE-SIMPLE-VECTOR"
             | "EGCL-INTERNAL:%MAKE-SIMPLE-VECTOR"
             | "%MAKE-SIMPLE-VECTOR" => return eval_builtin_arguments(&name, cdr, env),
@@ -20859,11 +20890,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let v = eval_form(af, env)?;
                 // Strings hold CHARACTER; bit-vectors (simple OR a
                 // fill-pointer/adjustable/displaced complex bit vector, egcl-
-                // 65nx) hold BIT; everything else T.
+                // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
                 let ty = if is_string_value(v) {
                     "CHARACTER"
                 } else if is_bit_vector_value(v) {
                     "BIT"
+                } else if egcl_stdlib::sequences::is_double_float_array(v) {
+                    "DOUBLE-FLOAT"
                 } else {
                     "T"
                 };
@@ -24630,6 +24663,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         return Ok(name);
                     }
                 }
+                if egcl_stdlib::sequences::is_double_float_array(v) {
+                    let complex = egcl_stdlib::is_complex_vector(v);
+                    let dims = if egcl_rt::types::md_array_p(v) {
+                        md_dims(v)?
+                    } else {
+                        vec![egcl_stdlib::array_total_size(v).unwrap()]
+                    };
+                    let dim_vals: Vec<_> = dims.into_iter()
+                        .map(|d| EgclVal::from_fixnum(d as i64)).collect();
+                    egcl_rt::rooted!(dims_list = vec_to_list(&dim_vals));
+                    return Ok(vec_to_list(&[
+                        resolve_sym(if complex { "ARRAY" } else { "SIMPLE-ARRAY" }).unwrap(),
+                        resolve_sym("DOUBLE-FLOAT").unwrap(),
+                        *dims_list,
+                    ]));
+                }
                 // A bit-vector's TYPE-OF is the compound (SIMPLE-BIT-VECTOR n)
                 // specifier, not a bare symbol (bliss-zg9).
                 if egcl_rt::types::bit_vector_p(v) {
@@ -26848,11 +26897,11 @@ fn eval_loop_extended(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
                     // a general vector its elements. `seq_elements` routes through
                     // the stdlib's ELT/LENGTH, so a non-string vector is iterated
                     // by element rather than mis-read as its printed string form.
-                    let items = seq_elements(seq)?;
+                    egcl_rt::rooted!(items = seq_elements(seq)?);
                     loop_bind(*pat, NIL, env);
                     states.push(ForState::Across {
                         pat: *pat,
-                        items,
+                        items: items.to_vec(),
                         idx: 0,
                     });
                     has_stepping_driver = true;
@@ -28582,12 +28631,13 @@ fn seq_elements(seq: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         }
         return Ok(out);
     }
-    let n = egcl_stdlib::length(seq)?;
-    let mut out = Vec::with_capacity(n);
+    egcl_rt::rooted!(seq = seq);
+    let n = egcl_stdlib::length(*seq)?;
+    egcl_rt::rooted!(out = Vec::with_capacity(n));
     for i in 0..n {
-        out.push(egcl_stdlib::elt(seq, i)?);
+        out.push(egcl_stdlib::elt(*seq, i)?);
     }
-    Ok(out)
+    Ok(out.to_vec())
 }
 
 /// CL COERCE for the type specifiers that actually occur in practice. The
@@ -28646,7 +28696,8 @@ fn compound_element_type_is_nil(type_val: EgclVal) -> bool {
 /// COERCE's bit-vector result, shared by the bare-symbol arm (`'bit-vector`)
 /// and the compound-specifier pre-check (`'(vector bit)`) so the two cannot
 /// diverge (bliss-h21k).
-fn coerce_to_bit_vector_value(value: EgclVal, type_val: EgclVal) -> Result<EgclVal, EgclError> {
+fn coerce_to_bit_vector_value(value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_type_root = &mut type_val);
     let elems = seq_elements(value)?;
     coerce_check_array_length(type_val, elems.len())?;
     let mut bits = Vec::with_capacity(elems.len());
@@ -28735,7 +28786,9 @@ fn subseq_values(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
     egcl_stdlib::subseq(args[0], start, end)
 }
 
-fn coerce_value(value: EgclVal, type_val: EgclVal) -> Result<EgclVal, EgclError> {
+fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_value_root = &mut value);
+    egcl_rt::rooted_ref!(_type_root = &mut type_val);
     // Reduce the type spec to a bare head-symbol name.
     let head = if type_val.is_cons() {
         cp(type_val).0
@@ -28818,7 +28871,7 @@ fn coerce_value(value: EgclVal, type_val: EgclVal) -> Result<EgclVal, EgclError>
         "VECTOR" | "SIMPLE-VECTOR" | "ARRAY" | "SIMPLE-ARRAY" => {
             let elems = seq_elements(value)?;
             coerce_check_array_length(type_val, elems.len())?;
-            Ok(egcl_stdlib::build_simple_vector(&elems))
+            egcl_stdlib::build_result_sequence(type_val, &elems)
         }
         // COMPLEX: an already-complex value passes through; a real coerces to a
         // complex with a zero imaginary part (float parts stay uncanonicalised,
@@ -36017,7 +36070,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "ARRAYP" | "ARRAY-DIMENSIONS"
             | "ARRAY-DIMENSION" | "ARRAY-TOTAL-SIZE" | "VECTOR-PUSH" | "VECTOR-PUSH-EXTEND"
             | "VECTOR-POP" | "FILL-POINTER" | "%MAKE-COMPLEX-VECTOR" | "%MAKE-DISPLACED-ARRAY"
-            | "%MAKE-SIMPLE-VECTOR"
+            | "%MAKE-SIMPLE-VECTOR" | "%MAKE-DOUBLE-FLOAT-VECTOR"
             | "%EXPAND-TYPE-SPEC"
             | "ADJUSTABLE-ARRAY-P" | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT"
             // Numbers
@@ -38566,6 +38619,25 @@ fn vals_equal(a: EgclVal, b: EgclVal) -> bool {
     false
 }
 
+/// Read a packed element through any displacement without boxing it.
+fn packed_element(array: EgclVal, index: usize) -> Option<f64> {
+    egcl_stdlib::sequences::double_float_array_element(array, index)
+}
+
+/// Compare a raw double against a Lisp number without allocating Lisp storage.
+fn raw_double_equalp(raw: f64, value: EgclVal) -> bool {
+    if egcl_rt::types::complexp(value) {
+        let Ok((re, im)) = complex_parts(value) else { return false; };
+        return raw_double_equalp(raw, re) && raw_double_equalp(0.0, im);
+    }
+    if !is_real_number(value) { return false; }
+    if raw.is_finite() && (!egcl_rt::types::floatp(value) || float_f64(value).is_finite()) {
+        return real_to_exact_bigrat(value).is_ok_and(|rhs|
+            bigrat_cmp(&f64_to_bigrat(raw), &rhs) == Ordering::Equal);
+    }
+    num_val(value).is_ok_and(|rhs| raw == rhs)
+}
+
 /// CL `EQUALP`: like `EQUAL` but numbers compare by value across types
 /// (`1` equalp `1.0`), characters and strings compare case-insensitively,
 /// vectors/arrays compare element-wise, and structures compare slot-wise.
@@ -38657,36 +38729,24 @@ fn vals_equalp(a: EgclVal, b: EgclVal) -> bool {
             return false;
         }
         for i in 0..la {
-            match (egcl_stdlib::elt(a, i), egcl_stdlib::elt(b, i)) {
-                (Ok(x), Ok(y)) if vals_equalp(x, y) => {}
-                _ => return false,
-            }
+            // Preserve EQUALP's allocation-free traversal: raw numeric elements
+            // need no transient Lisp boxes, including through displacement.
+            let equal = match (packed_element(a, i), packed_element(b, i)) {
+                (Some(x), Some(y)) => x == y,
+                (Some(x), None) => egcl_stdlib::elt(b, i).is_ok_and(|y| raw_double_equalp(x, y)),
+                (None, Some(y)) => egcl_stdlib::elt(a, i).is_ok_and(|x| raw_double_equalp(y, x)),
+                (None, None) => matches!((egcl_stdlib::elt(a, i), egcl_stdlib::elt(b, i)),
+                    (Ok(x), Ok(y)) if vals_equalp(x, y)),
+            };
+            if !equal { return false; }
         }
         return true;
     }
-    // Multidimensional arrays: EQUALP iff same dimensions and every element is
-    // EQUALP (CLHS 5.3; row-major storage comparison; bliss-rh0t).
+    // Compare row-major backing vectors without allocating element boxes.
     if egcl_rt::types::md_array_p(a) && egcl_rt::types::md_array_p(b) {
-        if md_dims(a).ok() != md_dims(b).ok() {
-            return false;
-        }
-        let (Some(sa), Some(sb)) = (
-            egcl_rt::types::md_array_storage(a),
-            egcl_rt::types::md_array_storage(b),
-        ) else {
-            return false;
-        };
-        let n = egcl_stdlib::length(sa).unwrap_or(usize::MAX);
-        if n == usize::MAX || Some(n) != egcl_stdlib::length(sb).ok() {
-            return false;
-        }
-        for i in 0..n {
-            match (egcl_stdlib::elt(sa, i), egcl_stdlib::elt(sb, i)) {
-                (Ok(x), Ok(y)) if vals_equalp(x, y) => {}
-                _ => return false,
-            }
-        }
-        return true;
+        return md_dims(a).ok() == md_dims(b).ok()
+            && matches!((egcl_rt::types::md_array_storage(a), egcl_rt::types::md_array_storage(b)),
+                (Some(sa), Some(sb)) if vals_equalp(sa, sb));
     }
     false
 }
