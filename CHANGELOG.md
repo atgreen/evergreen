@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve the identity of saved builtin function objects when installed
+  in user-defined function cells, including after replacement and restoration
+  ([#251](https://github.com/atgreen/evergreen/pull/251)).
+
 - Make `APROPOS` searches handle `NIL` and `T` without panicking, and signal
   `PROGRAM-ERROR` for invalid `APROPOS`/`APROPOS-LIST` argument counts
   ([#250](https://github.com/atgreen/evergreen/pull/250)).
