@@ -108,11 +108,15 @@ fn native_v2_callable_slot_reloads_a_moving_builtin_wrapper() {
         egcl_rt::rooted!(
             prototype = super::super::super::super::read_eval_all_env("#'list", &mut env).unwrap()
         );
+        egcl_rt::rooted!(
+            source = super::super::super::super::reified_closure(*prototype)
+                .expect("builtin source closure")
+        );
         assert!(
-            prototype.is_cons(),
+            source.is_cons(),
             "fixture must use the movable wrapper representation"
         );
-        let (head, identity) = cp(*prototype);
+        let (head, identity) = cp(*source);
         // Preserve the wrapper identity while giving this call a fresh nursery
         // object; the shared builtin-wrapper cache may already be tenured.
         egcl_rt::rooted!(function = super::super::super::super::arena_cons(head, identity));
