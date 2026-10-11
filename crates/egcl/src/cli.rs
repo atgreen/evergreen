@@ -16460,25 +16460,33 @@ fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal) -> EgclVal {
     })
 }
 
-/// Reify (and cache) a callable, FUNCTIONP wrapper closure for the builtin named
+/// Reify (and cache) one canonical function object for the builtin named
 /// `bare` (interned symbol `name_sym`). Its body dispatches by name through APPLY.
 fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
     {
         let mut cache = builtin_wrapper_cache().borrow_mut();
         if let Some(reference) = cache.values.get(bare).copied() {
             if let Some(sym) = name_sym.symbol_index() {
-                cache
-                    .symbols
-                    .insert(cp(reference).1.as_fixnum() as u64, sym);
+                cache.symbols.insert(
+                    cp(reified_closure(reference).expect("builtin source closure"))
+                        .1.as_fixnum() as u64,
+                    sym,
+                );
             }
             return reference;
         }
     }
     egcl_rt::rooted!(v = named_apply_wrapper(env, name_sym));
+    // Reify once before exposing the function. Installing a saved builtin in
+    // another symbol's cell must preserve EQ identity, not wrap it again.
+    *v = coerce_installed_function(env, *v);
     let mut cache = builtin_wrapper_cache().borrow_mut();
     let winner = *cache.values.entry(bare.to_string()).or_insert(*v);
     if let Some(sym) = name_sym.symbol_index() {
-        cache.symbols.insert(cp(winner).1.as_fixnum() as u64, sym);
+        cache.symbols.insert(
+            cp(reified_closure(winner).expect("builtin source closure")).1.as_fixnum() as u64,
+            sym,
+        );
     }
     winner
 }
@@ -16524,6 +16532,7 @@ fn generic_wrapper_name(v: EgclVal) -> Option<String> {
 /// before that change `#'equal` WAS the symbol EQUAL, which such call sites
 /// matched directly.
 fn builtin_wrapper_name(v: EgclVal) -> Option<String> {
+    let v = reified_closure(v).unwrap_or(v);
     if !v.is_cons() {
         return None;
     }
@@ -16538,7 +16547,10 @@ fn builtin_wrapper_name(v: EgclVal) -> Option<String> {
         .borrow()
         .values
         .iter()
-        .find(|(_, reference)| cp(**reference).1.as_fixnum() as u64 == id)
+        .find(|(_, reference)| {
+            reified_closure(**reference)
+                .is_some_and(|source| cp(source).1.as_fixnum() as u64 == id)
+        })
         .map(|(name, _)| name.clone())
 }
 

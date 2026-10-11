@@ -348,13 +348,16 @@ fn native_slot_callee_preserves_values_after_numeric_phase_changes() {
 }
 
 #[test]
-fn cached_gethash_calls_preserve_values_errors_and_redefinition() {
-    // Calling a saved builtin after restoring its function cell currently
-    // overflows even on the parent revision (bliss-cqtpe). This probe checks
-    // replacement invalidation and restores the cell only for cleanup.
+fn saved_builtin_alias_preserves_values_errors_and_restoration() {
+    // Standard CL bindings are fixed; replace a user-owned alias instead. The
+    // saved builtin must remain callable after replacement, restoration and
+    // unbinding of that alias, including through already-compiled callers.
     let program = r#"
-      (defun cached-get2 (key table) (gethash key table))
-      (defun cached-get3 (key table default) (gethash key table default))
+      (defparameter *saved-gethash* (symbol-function 'cl:gethash))
+      (setf (symbol-function 'user-gethash) *saved-gethash*)
+      (declaim (notinline user-gethash))
+      (defun cached-get2 (key table) (user-gethash key table))
+      (defun cached-get3 (key table default) (user-gethash key table default))
       (let ((table (make-hash-table :test 'eql)) (key (list :key)))
         (dotimes (i 40) (cached-get2 key table) (cached-get3 key table :absent))
         (assert (= EXPECTED-TIER (egcl-ext:function-tier 'cached-get2)))
@@ -366,17 +369,33 @@ fn cached_gethash_calls_preserve_values_errors_and_redefinition() {
         (setf (gethash key table) (list :stored))
         (assert (equal (multiple-value-list (cached-get2 key table)) '((:stored) t)))
         (assert (handler-case (progn (cached-get2 key nil) nil) (type-error () t)))
-        (let ((saved (symbol-function 'gethash)))
+        (let ((saved (symbol-function 'user-gethash)))
+          (assert (eq saved *saved-gethash*))
           (unwind-protect
               (progn
-                (setf (symbol-function 'gethash)
+                (setf (symbol-function 'user-gethash)
                       (lambda (key table &optional default)
                         (declare (ignore key table))
                         (values default :replacement)))
                 (assert (equal (multiple-value-list (cached-get2 key table)) '(nil :replacement)))
-                (assert (equal (multiple-value-list (cached-get3 key table :changed)) '(:changed :replacement))))
-            (setf (symbol-function 'gethash) saved))))
-      (format t "GETHASH-CACHE-CORRECT~%")
+                (assert (equal (multiple-value-list (cached-get3 key table :changed)) '(:changed :replacement)))
+                (assert (equal (multiple-value-list (funcall saved key table)) '((:stored) t)))
+                (assert (equal (multiple-value-list (cl:gethash key table)) '((:stored) t)))
+                (setf (symbol-function 'user-gethash) saved)
+                (assert (eq saved (symbol-function 'user-gethash)))
+                (assert (equal (multiple-value-list (cached-get2 key table)) '((:stored) t)))
+                (assert (equal (multiple-value-list (cached-get3 :missing table :restored)) '(:restored nil)))
+                (assert (handler-case (progn (cached-get2 key nil) nil) (type-error () t)))
+                (fmakunbound 'user-gethash)
+                (assert (handler-case (progn (cached-get2 key table) nil) (undefined-function () t)))
+                (assert (equal (multiple-value-list (funcall saved key table)) '((:stored) t)))
+                (assert (equal (multiple-value-list (funcall saved :missing table :saved)) '(:saved nil)))
+                (setf (symbol-function 'user-gethash) saved)
+                (assert (equal (multiple-value-list (cached-get2 key table)) '((:stored) t)))
+                (assert (= EXPECTED-TIER (egcl-ext:function-tier 'cached-get2)))
+                (assert (= EXPECTED-TIER (egcl-ext:function-tier 'cached-get3))))
+            (fmakunbound 'user-gethash))))
+      (format t "SAVED-BUILTIN-RESTORE-CORRECT~%")
     "#;
     for (tier, expected) in [("t0", "0"), ("t1", "1"), ("t2", "2")] {
         let program = program.replace("EXPECTED-TIER", expected);
@@ -387,6 +406,6 @@ fn cached_gethash_calls_preserve_values_errors_and_redefinition() {
             .output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(output.status.success(), "{tier}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.contains("GETHASH-CACHE-CORRECT"), "{tier}: {stdout}");
+        assert!(stdout.contains("SAVED-BUILTIN-RESTORE-CORRECT"), "{tier}: {stdout}");
     }
 }
