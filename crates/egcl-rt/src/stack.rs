@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::value::{EgclVal, TAG_CONS, TAG_FUNCTION, TAG_HEAP_OBJECT};
 
 /// CL stack for a green thread.
-/// Default usable size: 512 KiB (configurable via EGCL_STACK_SIZE).
+/// Default usable size: 4 MiB on Linux x86-64 and s390x, 512 KiB elsewhere
+/// (configurable via EGCL_STACK_SIZE).
 ///
 /// The stack is owned by exactly one green thread, which is the only mutator
 /// of `sp_offset`/`fp`; the GC reads only the `published_*` snapshot taken at a

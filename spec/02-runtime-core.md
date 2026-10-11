@@ -219,10 +219,10 @@ Creating a fiber (`EGCL-FIBER:MAKE-FIBER`) allocates a `EgclStack` from a
 pool and sets `state = Created`. `SUBMIT-FIBER` transitions it to `Runnable`
 and pushes it onto a carrier's deque. Creating a native thread
 (`EGCL-THREAD:MAKE-THREAD`) instead creates a dedicated OS thread and does
-not allocate or submit a fiber. **R2.19**: with a default CL stack of 512 KiB
-(guard-page protected), 100 000 fibers require
-~50 GiB of virtual address space — feasible on 64-bit with
-overcommit/lazy mapping.
+not allocate or submit a fiber. **R2.19**: the default CL stack is guard-page
+protected and lazily mapped: 4 MiB on Linux x86-64 and s390x, 512 KiB elsewhere.
+For 100 000 fibers this reserves approximately 400 GiB or 50 GiB of virtual
+address space, respectively, without committing unused pages to resident memory.
 
 ### 2.3.4 Scheduling Policy
 
@@ -268,10 +268,11 @@ carrier thread (the "shadow stack") is separate.
  Low address
 ```
 
-Default usable size: 512 KiB (configurable via `EGCL_STACK_SIZE`); 4 MiB on
-s390x, where a T2 native frame is ~7x the x86-64 size, so a deep recursion
-spends the native stack reserve ~7x sooner and the remainder of it lands on
-this stack (bliss-hfdq2).
+Default usable size: 4 MiB on Linux x86-64 and s390x, 512 KiB elsewhere
+(configurable via `EGCL_STACK_SIZE`). Linux x86-64 mapped native calls retain
+precise managed frames on this stack and use bytecode activations here after
+the native depth cap. On s390x, larger native frames exhaust the machine stack
+reserve sooner and the remaining recursion likewise uses this stack.
 
 ### 2.4.2 Frame Format
 
@@ -875,7 +876,7 @@ No JVM integration is implied or planned.
 | `EGCL_HEAP_SIZE` | `512m` | Initial old-gen heap reservation |
 | `EGCL_TLAB_SIZE` | `2m` | Per-thread TLAB size (§3.2.2, `--tlab-size`) |
 | `EGCL_NURSERY_SIZE` | `64m` | Total nursery region pool (§3.2.2, `--nursery-size`) |
-| `EGCL_STACK_SIZE` | `512k` (`4m` on s390x) | CL stack size per fiber |
+| `EGCL_STACK_SIZE` | `4m` on Linux x86-64 and s390x; `512k` elsewhere | CL stack size per fiber |
 | `EGCL_WORKERS` | `nproc` | Default scheduler-group carrier count (legacy name) |
 | `EGCL_IMAGE` | `egcl.bimg` | Path to boot image |
 | `EGCL_GC_LOG` | (none) | Path to GC log file (enables GC logging) |
