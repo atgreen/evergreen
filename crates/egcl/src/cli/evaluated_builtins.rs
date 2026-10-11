@@ -4102,6 +4102,11 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "APROPOS-LIST" => Some(|_operator, args, env| {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EgclError::ProgramError(
+                    "APROPOS-LIST requires one or two arguments".into(),
+                ));
+            }
             let args = RootedVals::new(args.to_vec());
 
             // (apropos-list string &optional package) → matching symbols.
@@ -4113,6 +4118,11 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "APROPOS" => Some(|_operator, args, env| {
+            if args.is_empty() || args.len() > 2 {
+                return Err(EgclError::ProgramError(
+                    "APROPOS requires one or two arguments".into(),
+                ));
+            }
             let args = RootedVals::new(args.to_vec());
 
             // (apropos string &optional package) — print each match to

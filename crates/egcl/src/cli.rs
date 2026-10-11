@@ -8938,6 +8938,11 @@ impl Env {
     }
 
     fn lookup_var_symbol(&self, symbol: EgclVal) -> Option<EgclVal> {
+        // NIL and T are self-valued symbols with special tags, not registry
+        // indices. Package enumeration (including APROPOS) can pass them here.
+        if symbol == NIL || symbol == T {
+            return Some(symbol);
+        }
         let idx = symbol.as_symbol_index();
         // A special variable (earmuff `*…*`) reference is always DYNAMIC: read its
         // global value cell — which `let`/`DynBind` save-and-restore, so it holds
