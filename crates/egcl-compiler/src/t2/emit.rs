@@ -2097,8 +2097,8 @@ fn emit_native_recursive_call(
     a.call(entry);
     let direct_return = CallReturn { return_offset: a.here(), stack_adjust: 0 };
     load_home(a, 7, control_home, 0);
-    load_mem64_disp(a, SCRATCH, 7, 8);
-    a.extend_from_slice(&[0x83, 0x2a, 1]); // sub dword ptr[rdx],1; RAX/MV untouched
+    load_mem64_disp(a, 11, 7, 8);
+    a.extend_from_slice(&[0x41, 0xff, 0x0b]); // dec dword ptr[r11]; preserve CF/RDX/RCX
     a.bind(done);
     if let Some(value) = data.results.first() {
         store_home(a, *homes.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?, RAX, 0);
@@ -3663,9 +3663,14 @@ pub fn emit_framed_transfers_with_cleanup(
 }
 
 /// Emit verified exceptional cleanup edges and helper-v2 cleanup completion.
+/// Normal entry requires an empty, inactive multiple-value buffer. OSR entries
+/// preserve incoming state and are analyzed separately.
 /// `multiple_values` is a leaf `extern "C" fn(primary: u64, dst: *mut EgclVal,
 /// count: u64)`: count zero clears MV; a positive count copies the primary and
 /// secondary values (NIL padding) into separate activation slots, preserving MV.
+/// The reserved count u64::MAX instead writes a NativeReturnValues snapshot to
+/// dst for the native CF/count/payload return convention. Exactly one value
+/// must normalize the environment to empty and inactive.
 /// It must not allocate, poll, yield, signal, invoke Lisp or unwind.
 /// `save` has the normal save-helper contract above; `complete` is a veneer for
 /// a helper consuming `TransferCleanupRequest`. The owner must root the pending
@@ -4173,6 +4178,14 @@ fn emit_framed_inner(
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native_returns = transfers.as_ref().is_some_and(|emission|
+        matches!(emission.cleanup, Some(CleanupEmission::Native { .. })));
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let native_returns = false;
+    let single_returns = if native_returns {
+        crate::t2::opt_clear_mv::single_value_state(f, true)
+    } else { HashSet::new() };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -6053,7 +6066,15 @@ fn emit_framed_inner(
                     }
                 }
                 emit_epilogue(&mut a); // restore callee-saved (no-op frameless)
-                a.push(0xC3); // ret
+                if native_returns {
+                    if single_returns.contains(&t) {
+                        crate::t2::native_return::emit_single_return(&mut a);
+                    } else {
+                        crate::t2::native_return::emit_dynamic_return(&mut a, c2i_mv_addr);
+                    }
+                } else {
+                    a.push(0xC3);
+                }
             }
             Opcode::Jump => {
                 let tc = &td.targets[0];
@@ -6405,7 +6426,11 @@ fn emit_framed_inner(
             a.extend_from_slice(&(alloc as i32).to_le_bytes());
         }
         emit_epilogue(&mut a);
-        a.push(0xC3); // ret
+        if native_returns {
+            crate::t2::native_return::emit_dynamic_return(&mut a, c2i_mv_addr);
+        } else {
+            a.push(0xC3);
+        }
     }
 
     // T1→T2 OSR entries.  The lower tier and T2 share the EgclStack slot

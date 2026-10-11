@@ -293,14 +293,18 @@ pub fn emit_capture_stub(prepare: NativeTransferPrepare, dispatch: *const u8) ->
 }
 
 fn capture_stack_word(a: &mut Asm, load: bool, reg: u8, offset: usize) {
-    let displacement = i8::try_from(offset).expect("capture image fits disp8") as u8;
+    let short = i8::try_from(offset).ok();
     a.extend_from_slice(&[
         0x48 | ((reg >> 3) << 2), // REX.W and high register bit
         if load { 0x8b } else { 0x89 },
-        0x44 | ((reg & 7) << 3),
+        (if short.is_some() { 0x44 } else { 0x84 }) | ((reg & 7) << 3),
         0x24,
-        displacement,
     ]);
+    if let Some(displacement) = short {
+        a.push(displacement as u8);
+    } else {
+        a.extend_from_slice(&i32::try_from(offset).expect("capture frame fits disp32").to_le_bytes());
+    }
 }
 
 /// Emit a callable adapter with SysV signature `(request) -> primary_value`.

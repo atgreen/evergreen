@@ -140,18 +140,14 @@ fn native_v2_normal_cleanup_executes_and_preserves_all_values() {
             assert!(env.mv_active && env.mv.is_empty());
         } else {
             assert_eq!(*primary, args[0]);
-            if result_form == "x" {
+            if result_form == "x" || result_form == "(values x)" {
                 assert!(!env.mv_active);
+                assert!(env.mv.is_empty(), "single return releases duplicate roots");
             } else {
                 assert!(env.mv_active);
+                assert_eq!(env.mv.len(), 2);
                 assert_eq!(env.mv[0], args[0]);
-                assert_eq!(
-                    env.mv.len(),
-                    if result_form.contains("list") { 2 } else { 1 }
-                );
-                if env.mv.len() == 2 {
-                    assert_eq!(super::super::super::cp(env.mv[1]).0, args[0]);
-                }
+                assert_eq!(super::super::super::cp(env.mv[1]).0, args[0]);
             }
         }
         egcl_rt::rooted!(

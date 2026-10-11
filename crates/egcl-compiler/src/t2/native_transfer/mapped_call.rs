@@ -23,6 +23,9 @@ pub struct MappedCallRecord {
     pub context: *mut egcl_rt::call_table::NativeCallContext,
     pub target: u64,
     pub forward: *const egcl_rt::function::NativeCallableEntries,
+    /// Materialized by the returning Rust callback from its canonical rooted
+    /// environment. Never a root or a descriptor that may span a safepoint.
+    pub return_values: egcl_rt::native_transfer::NativeReturnValues,
 }
 
 pub type PrepareMappedCall = unsafe extern "C" fn(u64, *mut MappedCallRecord);
@@ -41,8 +44,10 @@ pub const ADAPTER_FRAME_BYTES: usize = std::mem::size_of::<MappedCallRecord>() +
 /// or completes the checked compatibility call. Helpers return through Rust
 /// before any capture. Child retirement runs in this permanent mapping, so it
 /// may release child executable storage without unmapping a live return PC.
-/// Normal retirement must neither collect nor change MV. Cold resumption may
-/// run Lisp and must publish a rooted outcome before retiring the child.
+/// Normal retirement must not collect. Cold resumption may run Lisp and must
+/// publish a rooted outcome before retiring the child. Every successful finish,
+/// resume, or checked callback must write return_values after its final tuple
+/// mutation; the adapter restores the native return registers from that snapshot.
 pub fn emit_published_call_entry(
     slice: bool,
     prepare: PrepareMappedCall,
@@ -71,8 +76,8 @@ pub fn emit_published_call_entry_descriptor(
 ) -> PublishedCallEntry {
     const SIZE: u32 = ADAPTER_FRAME_BYTES as u32; // SysV call alignment
     const {
-        assert!(SIZE == 136);
-        assert!(std::mem::size_of::<MappedCallRecord>() == 128);
+        assert!(SIZE == 152);
+        assert!(std::mem::size_of::<MappedCallRecord>() == 144);
         assert!(std::mem::offset_of!(MappedCallRecord, preserved) == 8);
         assert!(std::mem::offset_of!(MappedCallRecord, entry) == 56);
         assert!(std::mem::offset_of!(MappedCallRecord, activation) == 64);
@@ -82,6 +87,7 @@ pub fn emit_published_call_entry_descriptor(
         assert!(std::mem::offset_of!(MappedCallRecord, context) == 104);
         assert!(std::mem::offset_of!(MappedCallRecord, target) == 112);
         assert!(std::mem::offset_of!(MappedCallRecord, forward) == 120);
+        assert!(std::mem::offset_of!(MappedCallRecord, return_values) == 128);
         assert!(std::mem::offset_of!(egcl_rt::function::NativeCallableEntries, registers) == 0);
         assert!(std::mem::offset_of!(egcl_rt::function::NativeCallableEntries, slice) == 8);
     }
@@ -163,8 +169,10 @@ pub fn emit_published_call_entry_descriptor(
     a.bind(returned);
     restore(&mut a);
     capture_stack_word(&mut a, true, 0, 88);
+    capture_stack_word(&mut a, true, 2, 128);
+    capture_stack_word(&mut a, true, 1, 136);
     release(&mut a);
-    a.extend_from_slice(&[0xc3]);
+    crate::t2::native_return::emit_tuple_return(&mut a);
 
     let cold_offset = a.len();
     a.extend_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]);

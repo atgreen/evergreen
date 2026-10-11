@@ -17135,12 +17135,19 @@ extern "C" fn c2i_take_values(primary: u64, dst: *mut EgclVal, n: u64) {
     }
 }
 
-/// T2 uses one runtime address for both multiple-value operations so the
+/// T2 uses one runtime address for its multiple-value operations so the
 /// compiler-facing emitter API stays independent of interpreter internals.
 /// A zero count clears MV state; a positive count copies the tuple into the
-/// supplied activation-frame slots.
+/// supplied activation-frame slots. The reserved maximum count snapshots
+/// native return metadata into a NativeReturnValues destination. All three
+/// operations are nonallocating, nonsuspending leaves.
 extern "C" fn c2i_t2_mv(primary: u64, dst: *mut EgclVal, n: u64) {
-    if n == 0 {
+    if n == egcl_rt::native_transfer::SNAPSHOT_NATIVE_RETURN_VALUES {
+        let env = NATIVE_ENV.with(std::cell::Cell::get);
+        assert!(!env.is_null() && !dst.is_null());
+        unsafe { dst.cast::<egcl_rt::native_transfer::NativeReturnValues>()
+            .write((*env).native_return_values()); }
+    } else if n == 0 {
         c2i_clear_mv();
     } else {
         c2i_take_values(primary, dst, n);
@@ -18359,7 +18366,7 @@ struct NativeCode {
 
 const NATIVE_TRANSFER_ABI_VERSION: u16 = 1;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-const MAPPED_TRANSFER_ABI_VERSION: u16 = 2;
+const MAPPED_TRANSFER_ABI_VERSION: u16 = 3;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE_TRANSFER_ARCH: u16 = 0x8664;

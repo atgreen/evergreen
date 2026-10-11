@@ -178,5 +178,9 @@ unsafe fn interpreted_published(target: u64, record: *mut MappedCallRecord) {
     };
     unsafe {
         (*record).outcome = outcome;
+        if outcome.exit == NativeExit::Returned {
+            let env = NATIVE_ENV.with(std::cell::Cell::get);
+            (*record).return_values = (*env).native_return_values();
+        }
     }
 }

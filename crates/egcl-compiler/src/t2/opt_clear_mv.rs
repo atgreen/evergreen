@@ -54,7 +54,80 @@
 
 use crate::t2::ir::{Function, Inst, Opcode};
 use crate::t2::pass::{Analyses, Pass};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Instructions entered with a proven empty, inactive multiple-value buffer.
+///
+/// `single_entry` is an ABI precondition supplied by the client, not a fact
+/// inferred from the result's SSA type. OSR entries can carry arbitrary pending
+/// values and always override that precondition. Calls and control landings
+/// forget it; a ClearMv establishes it. Intersecting predecessors makes this a
+/// must analysis, including loop backedges.
+pub fn single_value_state(f: &Function, single_entry: bool) -> HashSet<Inst> {
+    let blocks = f.block_order();
+    let incoming = |b, outgoing: &HashMap<_, bool>| {
+        if f.osr_entries.iter().any(|entry| entry.block == b) {
+            return false;
+        }
+        let preds = f.preds(b);
+        let entry = b == f.entry();
+        (if entry { single_entry } else { !preds.is_empty() })
+            && preds.iter().all(|pred| outgoing[pred])
+    };
+    let advance = |inst, single| {
+        let data = f.inst(inst);
+        if data.opcode == Opcode::ClearMv {
+            true
+        } else if data.flags.call || matches!(data.opcode,
+            Opcode::Call | Opcode::Invoke | Opcode::CleanupSave
+                | Opcode::CleanupRestore | Opcode::CleanupLanding
+                | Opcode::CatchLanding | Opcode::HandlerLanding)
+        {
+            false
+        } else {
+            single
+        }
+    };
+    // Start at the top of the must lattice: cycles without a mutating operation
+    // preserve the entry fact, rather than making every loop permanently unknown.
+    let mut outgoing: HashMap<_, bool> = blocks.iter().map(|&b| (b, true)).collect();
+    loop {
+        let mut changed = false;
+        for &block in blocks {
+            let mut single = incoming(block, &outgoing);
+            for &inst in &f.block(block).insts {
+                single = advance(inst, single);
+            }
+            if outgoing[&block] != single {
+                outgoing.insert(block, single);
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    let mut known = HashSet::new();
+    for &block in blocks {
+        let mut single = incoming(block, &outgoing);
+        for &inst in &f.block(block).insts {
+            if single { known.insert(inst); }
+            single = advance(inst, single);
+        }
+    }
+    known
+}
+
+/// Remove resets whose complete effect is already true, including release of
+/// secondary GC roots. Unlike backward dead-reset elimination this never moves
+/// a reset across a safepoint or assumes that a call returns one value.
+pub fn eliminate_redundant(f: &mut Function, single_entry: bool) -> usize {
+    let known = single_value_state(f, single_entry);
+    let redundant: HashSet<_> = known.into_iter()
+        .filter(|&inst| f.inst(inst).opcode == Opcode::ClearMv).collect();
+    for block in f.block_order().to_vec() {
+        f.block_mut(block).insts.retain(|inst| !redundant.contains(inst));
+    }
+    redundant.len()
+}
 
 #[derive(Default)]
 pub struct ClearMvElim;
@@ -317,5 +390,85 @@ mod tests {
         f.set_terminator(b, base(Opcode::Return));
         assert_eq!(eliminate(&mut f), 0);
         assert_eq!(count_clear_mv(&f), 2);
+    }
+
+    #[test]
+    fn known_entry_elides_resets_but_unknown_entry_keeps_first() {
+        for (entry, remaining) in [(true, 0), (false, 1)] {
+            let mut f = Function::new("entry");
+            let e = f.entry();
+            f.push_inst(e, clear_mv(), &[]);
+            f.push_inst(e, clear_mv(), &[]);
+            f.set_terminator(e, base(Opcode::Return));
+            assert_eq!(eliminate_redundant(&mut f, entry), 2 - remaining);
+            assert_eq!(count_clear_mv(&f), remaining);
+        }
+    }
+
+    #[test]
+    fn calls_and_control_landings_forget_single_value_state() {
+        for op in [Opcode::Call, Opcode::CleanupRestore,
+            Opcode::CleanupLanding, Opcode::CatchLanding, Opcode::HandlerLanding]
+        {
+            let mut f = Function::new("effect");
+            let e = f.entry();
+            f.push_inst(e, base(op), &[]);
+            f.push_inst(e, clear_mv(), &[]);
+            f.set_terminator(e, base(Opcode::Return));
+            assert_eq!(eliminate_redundant(&mut f, true), 0, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn invoke_forgets_single_state_on_both_successors() {
+        let mut f = Function::new("invoke");
+        let e = f.entry();
+        let normal = f.make_block();
+        let exceptional = f.make_block();
+        f.set_terminator(e, InstData {
+            targets: vec![BlockCall { block: normal, args: vec![] },
+                BlockCall { block: exceptional, args: vec![] }],
+            ..base(Opcode::Invoke)
+        });
+        for b in [normal, exceptional] {
+            f.push_inst(b, clear_mv(), &[]);
+            f.set_terminator(b, base(Opcode::Return));
+        }
+        assert_eq!(eliminate_redundant(&mut f, true), 0);
+    }
+
+    #[test]
+    fn join_needs_single_state_from_every_predecessor() {
+        let mut f = Function::new("join");
+        let e = f.entry();
+        let changed = f.make_block();
+        let join = f.make_block();
+        f.set_terminator(e, brif(changed, join));
+        f.push_inst(changed, call(), &[]);
+        f.set_terminator(changed, jump(join));
+        f.push_inst(join, clear_mv(), &[]);
+        f.set_terminator(join, base(Opcode::Return));
+        assert_eq!(eliminate_redundant(&mut f, true), 0);
+    }
+
+    #[test]
+    fn pure_loop_preserves_entry_state_but_osr_does_not() {
+        for osr in [false, true] {
+            let mut f = Function::new("loop-entry");
+            let e = f.entry();
+            let header = f.make_block();
+            let exit = f.make_block();
+            f.set_terminator(e, jump(header));
+            f.set_terminator(header, brif(header, exit));
+            f.push_inst(exit, clear_mv(), &[]);
+            f.set_terminator(exit, base(Opcode::Return));
+            if osr {
+                f.osr_entries.push(crate::t2::ir::OsrEntry {
+                    block: header, bcp: 0, control_scopes: vec![], checks: vec![],
+                    frame_state: crate::t2::frame_state::FrameStateId(0),
+                });
+            }
+            assert_eq!(eliminate_redundant(&mut f, true), usize::from(!osr));
+        }
     }
 }

@@ -9237,6 +9237,22 @@ impl Env {
         self.mv_active = true;
     }
 
+    /// Materialize successful native-return metadata without allocating. The
+    /// primary is already in a native register or an explicitly rooted caller
+    /// slot. Normalize VALUES-of-one so no duplicate root survives that return.
+    fn native_return_values(&mut self) -> egcl_rt::native_transfer::NativeReturnValues {
+        use egcl_rt::native_transfer::NativeReturnValues;
+        if !self.mv_active || self.mv.len() == 1 {
+            self.clear_mv();
+            NativeReturnValues::SINGLE
+        } else {
+            NativeReturnValues {
+                count: self.mv.len(),
+                payload: if self.mv.is_empty() { std::ptr::null() } else { self.mv.as_ptr() },
+            }
+        }
+    }
+
     /// Publish exactly these values, including the distinct zero-value result.
     fn return_values(&mut self, values: Vec<EgclVal>) -> EgclVal {
         let primary = values.first().copied().unwrap_or(NIL);

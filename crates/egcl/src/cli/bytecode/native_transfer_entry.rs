@@ -454,7 +454,13 @@ unsafe extern "C" fn checked_call_published(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
 ) {
     unsafe {
-        root_publication::published_mapped(record, || call_table::checked_call(target, record))
+        root_publication::published_mapped(record, || {
+            call_table::checked_call(target, record);
+            if (*record).outcome.exit == NativeExit::Returned {
+                let env = NATIVE_ENV.with(Cell::get);
+                (*record).return_values = (*env).native_return_values();
+            }
+        })
     }
 }
 
@@ -623,6 +629,12 @@ impl TransferCode {
         allow_recursion: bool,
         tier: CompilationTier,
     ) -> Option<Self> {
+        // Every normal mapped entry clears the complete MV buffer before
+        // admission (outer, nested, and recursive). OSR deliberately preserves
+        // pending values; the analysis treats each OSR header as unknown.
+        let mut prepared_ir = ir.clone();
+        egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut prepared_ir, true);
+        let ir = &prepared_ir;
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
         let deopt_capture = if deopt_metadata.is_some() {
             Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
