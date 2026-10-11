@@ -16468,6 +16468,24 @@ fn reader_preserves_case_when_resolving_existing_symbols() {
     run_expression_cases_batched(&cases);
 }
 
+#[test]
+fn constructed_strings_store_characters_and_remain_mutable() {
+    run_expression_cases(&[
+        (
+            "(every (lambda (code) (let ((s (string (code-char code))))
+                 (and (= (length s) 1) (= (char-code (char s 0)) code))))
+               '(65 233 955 8364 128512))",
+            "T",
+        ),
+        (
+            "(let ((s (string #\\A)))
+               (setf (char s 0) (code-char 128512))
+               (list (length s) (char-code (char s 0))))",
+            "(1 128512)",
+        ),
+    ]);
+}
+
 /// bliss-l3d7: a SIMPLE_BASE_STRING's payload is one BYTE per character, but
 /// `alloc_pinned_name` copied a symbol name's UTF-8 BYTES into one. Every
 /// non-ASCII symbol name therefore decoded back as Latin-1 mojibake -- two
