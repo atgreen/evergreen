@@ -17,6 +17,7 @@ static SNAPSHOT: AtomicBool = AtomicBool::new(false);
 static SNAPSHOTTED: AtomicUsize = AtomicUsize::new(0);
 static MOVED: AtomicUsize = AtomicUsize::new(0);
 static CHILD_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+static RECURSIVE_ARGUMENT_MOVES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Default)]
 struct Probe {
@@ -24,6 +25,7 @@ struct Probe {
     code: usize,
     argument: usize,
     hits: usize,
+    recursive_entries: usize,
 }
 // Only the owning execution reads its live argument location; the pointer is
 // published after its Vec is rooted and never survives that invocation.
@@ -64,6 +66,23 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
         probe
     });
     assert_eq!(probe.hits, 1, "child pause must execute exactly once");
+    let recursive = probe.mode >= 6;
+    let stack = egcl_rt::current_stack();
+    let suspended_frame = stack.fp();
+    let suspended_sp = stack.sp();
+    let mut argument_before = None;
+    if recursive {
+        let entered = super::super::super::native_transfer_entry::take_recursive_entries();
+        assert_eq!(
+            entered, 4,
+            "four direct native recursive frames must be live before suspension"
+        );
+        PROBE.with(|slot| {
+            let mut state = slot.get();
+            state.recursive_entries = entered;
+            slot.set(state);
+        });
+    }
     let capture = super::super::super::native_transfer_entry::child_capture_for_test();
     let cold_recovery = matches!(probe.mode, 3 | 5);
     // A Rust pause callback can own one or more outer adapter segments. Follow
@@ -114,6 +133,9 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     while !RELEASE.load(Ordering::Acquire) {
         if before.is_none() && SNAPSHOT.load(Ordering::Acquire) {
             before = Some(held.to_raw());
+            if recursive {
+                argument_before = Some(unsafe { *(probe.argument as *const EgclVal) }.to_raw());
+            }
             SNAPSHOTTED.fetch_add(1, Ordering::Release);
         }
         #[cfg(feature = "native-transfer-test-hooks")]
@@ -144,6 +166,14 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
         if carrier != egcl_rt::current_thread_id() {
             CHILD_MIGRATIONS.fetch_add(1, Ordering::Relaxed);
         }
+        if recursive {
+            assert!(
+                std::ptr::eq(egcl_rt::current_stack(), stack),
+                "fiber migration must retain the recursive activation's owned Lisp stack"
+            );
+            assert_eq!(stack.fp(), suspended_frame);
+            assert_eq!(stack.sp(), suspended_sp);
+        }
         assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
         assert_eq!(
             unsafe { (*segment).carrier() },
@@ -163,6 +193,9 @@ pub(in crate::cli::bytecode::native_transfer_tests) fn pause() -> Result<EgclVal
     }
     if before.is_some_and(|before| held.to_raw() != before) {
         MOVED.fetch_add(1, Ordering::Relaxed);
+    }
+    if argument_before.is_some_and(|before| unsafe { *(probe.argument as *const EgclVal) }.to_raw() != before) {
+        RECURSIVE_ARGUMENT_MOVES.fetch_add(1, Ordering::Relaxed);
     }
     assert_eq!(cp(*held), (*value, NIL));
     assert_eq!(*value, unsafe { *(probe.argument as *const EgclVal) });
@@ -197,7 +230,23 @@ fn child_fiber_checked() -> EgclVal {
         ),
         4 => format!("((unwind-protect (values x (list :normal-cleanup)) ({pause} x active)))"),
         5 => format!("((+ n 1) ({pause} x active) ({finish} x))"),
+        6 | 7 => format!(
+            "((if (= n 0) (progn ({pause} x active) ({finish} x active))
+                (progn ({name} x active (- n 1))
+                       (if (= (car x) {case}) x (error \"recursive caller value changed\")))))"
+        ),
         _ => unreachable!(),
+    };
+    let finish_definition = if mode >= 6 {
+        if mode == 7 {
+            format!(
+                "(defun {finish} (x active) (if active (throw :parent (values x (list :recursive-transfer))) x))"
+            )
+        } else {
+            format!("(defun {finish} (x active) (declare (ignore active)) x)")
+        }
+    } else {
+        format!("(defun {finish} (x) (values x (list :deopt)))")
     };
     super::super::super::super::read_eval_all_env(
         &format!(
@@ -207,7 +256,7 @@ fn child_fiber_checked() -> EgclVal {
          (defun {handler} (c)
            ({pause} (slot-value c 'datum) t)
            (invoke-restart '{restart} (slot-value c 'datum)))
-         (defun {finish} (x) (values x (list :deopt)))
+         {finish_definition}
          (defun {name} (x active n) {})",
             &source[1..source.len() - 1]
         ),
@@ -219,10 +268,10 @@ fn child_fiber_checked() -> EgclVal {
     let symbol = egcl_rt::symbols::intern(&name);
     let body = Arc::new(compile_function(&name, *params, *forms, &env, false, false).unwrap());
     registry_put(symbol, Arc::clone(&body));
-    let mut code = if mode == 5 {
+    let mut code = if mode >= 5 {
         let code = TransferCode::compile(Arc::clone(&body)).unwrap();
         assert!(
-            code.has_deopt,
+            mode != 5 || code.has_deopt,
             "fiber must suspend in a real guard continuation"
         );
         code
@@ -244,15 +293,19 @@ fn child_fiber_checked() -> EgclVal {
         egcl_rt::symbols::symbol_function(symbol),
         &installed,
     );
-    let caller = compile_caller(
-        "(x active n)",
-        &format!("((catch :parent ({name} x active n)))"),
-        &env,
-    );
+    let caller_source = if mode >= 6 {
+        format!(
+            "((catch :parent (let ((answer ({name} x active n))) (values answer (list :recursive-return)))))"
+        )
+    } else {
+        format!("((catch :parent ({name} x active n)))")
+    };
+    let caller = compile_caller("(x active n)", &caller_source, &env);
+    let warm_depth = if mode >= 6 { 0 } else { 1 };
     // Global publication invalidates call cells, so finish every setup before
     // resolving the measured callers. Warm helpers before the final barrier too.
     caller
-        .run(&[NIL, NIL, EgclVal::from_fixnum(1)], &mut env)
+        .run(&[NIL, NIL, EgclVal::from_fixnum(warm_depth)], &mut env)
         .unwrap();
     SETUP.fetch_add(1, Ordering::Release);
     while SETUP.load(Ordering::Acquire) != 8 {
@@ -260,7 +313,7 @@ fn child_fiber_checked() -> EgclVal {
         egcl_rt::fiber_sleep(std::time::Duration::from_millis(1)).unwrap();
     }
     caller
-        .run(&[NIL, NIL, EgclVal::from_fixnum(1)], &mut env)
+        .run(&[NIL, NIL, EgclVal::from_fixnum(warm_depth)], &mut env)
         .unwrap();
     WARMED.fetch_add(1, Ordering::Release);
     while WARMED.load(Ordering::Acquire) != 8 {
@@ -268,6 +321,7 @@ fn child_fiber_checked() -> EgclVal {
         egcl_rt::fiber_sleep(std::time::Duration::from_millis(1)).unwrap();
     }
     take_nested_entries();
+    super::super::super::native_transfer_entry::take_recursive_entries();
     super::super::super::native_transfer_entry::take_native_fallback_count();
     let stack = egcl_rt::current_stack();
     let fp = stack.fp();
@@ -278,7 +332,11 @@ fn child_fiber_checked() -> EgclVal {
         args = vec![
             super::super::super::super::arena_cons(EgclVal::from_fixnum(case as i64), NIL),
             T,
-            EgclVal::from_single_float(1.5)
+            if mode >= 6 {
+                EgclVal::from_fixnum(4)
+            } else {
+                EgclVal::from_single_float(1.5)
+            }
         ]
     );
     let address = args[0].to_raw();
@@ -291,10 +349,24 @@ fn child_fiber_checked() -> EgclVal {
             code: Rc::as_ptr(mapped) as usize,
             argument: args.as_mut_ptr() as usize,
             hits: 0,
+            recursive_entries: 0,
         })
     });
     egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
     assert_eq!(PROBE.with(|slot| slot.get().hits), 1);
+    if mode >= 6 {
+        assert_eq!(PROBE.with(|slot| slot.get().recursive_entries), 4);
+        assert_eq!(
+            super::super::super::native_transfer_entry::take_recursive_entries(),
+            0,
+            "resuming must retire the original frames without replaying recursion"
+        );
+        assert_eq!(
+            super::super::super::native_transfer_entry::take_native_fallback_count(),
+            0,
+            "recursive suspension/retirement must not fall back to the interpreter"
+        );
+    }
     if mode == 5 {
         assert_eq!(mapped.deopt_count(), 1);
     }
@@ -327,6 +399,8 @@ fn child_fiber_checked() -> EgclVal {
             ":cold",
             ":normal-cleanup",
             ":deopt",
+            ":recursive-return",
+            ":recursive-transfer",
         ][mode],
     )
     .unwrap()
@@ -356,7 +430,17 @@ fn native_v2_protected_children_reject_incompatible_carriers() {
     run_children(true);
 }
 
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn native_v2_recursive_frames_retire_after_fiber_migration() {
+    run_child_modes(false, 6..8);
+}
+
 fn run_children(refuse: bool) {
+    run_child_modes(refuse, 0..6);
+}
+
+fn run_child_modes(refuse: bool, modes: std::ops::Range<usize>) {
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -365,7 +449,7 @@ fn run_children(refuse: bool) {
     egcl_rt::rooted_ref!(_startup = &mut startup);
     for num_workers in if refuse { &[4][..] } else { &[1, 4][..] } {
         let num_workers = *num_workers;
-        for mode in 0..6 {
+        for mode in modes.clone() {
             MODE.store(mode, Ordering::Relaxed);
             #[cfg(feature = "native-transfer-test-hooks")]
             {
@@ -377,6 +461,7 @@ fn run_children(refuse: bool) {
             SNAPSHOTTED.store(0, Ordering::Relaxed);
             MOVED.store(0, Ordering::Relaxed);
             CHILD_MIGRATIONS.store(0, Ordering::Relaxed);
+            RECURSIVE_ARGUMENT_MOVES.store(0, Ordering::Relaxed);
             RELEASE.store(false, Ordering::Release);
             PAUSED.lock().unwrap().clear();
             let group =
@@ -458,6 +543,12 @@ fn run_children(refuse: bool) {
                 refuse || MOVED.load(Ordering::Relaxed) > 0,
                 "external collection must relocate a paused child's precise root"
             );
+            if mode >= 6 {
+                assert!(
+                    RECURSIVE_ARGUMENT_MOVES.load(Ordering::Relaxed) > 0,
+                    "GC must relocate a native recursive caller's argument while suspended"
+                );
+            }
             if num_workers == 4 {
                 assert!(
                     CHILD_MIGRATIONS.load(Ordering::Relaxed) > 0,
