@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Accept redundant names within `DEFPACKAGE` options while preserving
+  cross-category and import conflicts, including correct shadowing imports
+  ([#253](https://github.com/atgreen/evergreen/pull/253)).
+
 - Accept open and closed file streams in `TRUENAME` and pathname coercion,
   retaining their opening path when pathname defaults change
   ([#252](https://github.com/atgreen/evergreen/pull/252)).
