@@ -1438,10 +1438,13 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
 /// Nonallocating retirement shared by normal returns and cold chain exits.
 unsafe fn retire_recursive(context: &mut CaptureContext, activation: *mut RecursiveActivation) {
     let record = unsafe { &*activation };
-    let stack = egcl_rt::current_stack();
     assert_eq!(context.recursive, activation);
+    // Preparation stores the exact stack that owns this live frame. A fiber's
+    // Arc-owned Lisp stack stays put when its carrier changes, and retirement
+    // cannot yield or collect. Do not cache the carrier's execution context.
+    let stack = unsafe { &*record.stack };
+    debug_assert!(std::ptr::eq(stack, egcl_rt::current_stack()));
     assert_eq!(stack.fp(), record.frame);
-    assert!(std::ptr::eq(stack, record.stack));
     stack.pop_frame();
     context.recursive = record.previous;
     NATIVE_DEPTH.with(|depth| depth.set(depth.get() - 1));
