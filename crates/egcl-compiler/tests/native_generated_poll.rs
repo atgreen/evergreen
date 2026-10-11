@@ -185,7 +185,6 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     check(true);
     CONTROL.with(|slot| slot.set(&mut control));
     check(false);
-    drop(check);
 
     // The cold edge must retain the existing synchronization/reload contract.
     let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
