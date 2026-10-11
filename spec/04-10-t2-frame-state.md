@@ -17,10 +17,14 @@ unboxing, and register allocation have rewritten the fast path beyond
 recognition.
 
 > **Physical layout.** This chapter specifies the *IR-level* FrameState.
-> The concrete native frame it is reconstructed from — the EgclStack
-> `Frame` header, the activation slot area, shadow root slots, and the
-> rule that T2 code may only be entered on a frame large enough to hold
-> them — is documented in `docs/design/t2-frame-layout.md`.
+> The managed activation layout (`EgclStack` header, slots, and legacy shadow
+> roots) is documented in [t2-frame-layout.md](../docs/design/t2-frame-layout.md).
+> Mapped native execution also uses published native homes and exact-PC maps;
+> eligible self-recursion already has machine-stack activations under a managed
+> anchor. See [§4.7.9](04-07-codegen.md#479-gc-stack-maps-at-safepoints) for root publication.
+> Deoptimization reconstructs interpreter-compatible state from those homes.
+> Extending this to distinct native callees is separate from representing
+> multiple inlined logical scopes within one physical frame (R4.67).
 
 This chapter specifies that mapping — the **FrameState** — as a first-class IR
 artefact, the **deopt-preservation invariant** every pass obeys, the

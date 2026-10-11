@@ -1,7 +1,17 @@
 # Design: direct native→native calls via an ABI redesign (bliss-zhvn)
 
-Status: **proposal** · Owner: — · Related: bliss-zhvn, bliss-gq5, bliss-jtc.9,
+Status: **historical proposal** · Owner: — · Related: bliss-zhvn, bliss-gq5, bliss-jtc.9,
 bliss-x5y.8, bliss-izt.2, bliss-4u5u, bliss-011, bliss-cfo6
+
+> **Status as of v0.0.6:** The problem description, measurements and staged ABI
+> below describe the original proposal, not the current implementation.
+> Generated call-cell adapters now avoid Rust dispatch for eligible ordinary
+> calls; eligible T2 self-recursion already uses machine frames and precise
+> native maps. The current contracts and corrected SBCL comparison are in
+> [spec §4.7.4](../../spec/04-07-codegen.md#474-x86-64-backend).
+> Remaining cross-function work is outlined in
+> [spec §11.4.3](../../spec/11-phasing-roadmap.md#1143-x86-64-native-cross-function-calls)
+> (`bliss-t8a48`).
 
 ## 1. Problem
 
@@ -56,16 +66,12 @@ off thread-locals and into the calling convention.
 Every mature native Lisp/VM keeps per-call state out of thread-locals. The
 tiered, deopting ones (HotSpot) show the exact recipe.
 
-**SBCL / CMUCL.** Register-based convention; `RCX` carries the arg count for full
-calls; MV uses an unknown-values return protocol. A **thread-structure pointer**
-is kept in a reserved register (for special bindings + the pseudo-atomic GC flag)
-— no TLS lookup in compiled code. Calls indirect through an **`fdefn`** (function
-cell): redefinition rewrites the fdefn, so callers pick up new code with no
-call-site patching; within a component, **local-call** optimization uses a
-tailored near-inlined linkage. **No per-call error/deopt slot:** errors are
-condition-system **unwinds** through the frame chain, and SBCL simply **does not
-speculate-and-deopt** (a failed type assumption is a `type-error`, not a tier
-transition). GC is precise/moving with compiler stack maps at safepoints.
+**SBCL.** Full Lisp calls pass three arguments in `RDI`, `RSI`, `RDX`,
+with a fixnum-encoded argument count in `RCX`; the primary return is `RDI`.
+Local calls can use specialized conventions. Runtime context uses `R13` without
+`gs-seg`, or GS with that feature. Its native call conventions are useful prior
+art, but do not supply EGCL's tier-transition and deoptimization contracts.
+See the pinned sources and multiple-value details in spec §4.7.4.4 above.
 
 **Clozure CL / ECL / Chez Scheme (and Racket).** Same shape: register convention
 (Chez with proper tail calls), function-cell indirection, moving GC via stack
