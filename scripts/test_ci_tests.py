@@ -2,6 +2,7 @@
 """Contracts for artifact reuse and fail-closed libtest sharding."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -107,11 +108,12 @@ class RunnerTests(unittest.TestCase):
                         "artifacts": {harness["executable"]: runner.fingerprint(root / harness["executable"])}}
             path = root / "target" / "manifest.json"
             path.write_text(json.dumps(manifest))
-            files = runner.archive_files(root, path)
+            with patch.object(runner, "checked", return_value="/toolchain/lib\n"):
+                files = runner.archive_files(root, path)
             self.assertEqual(files, ["fake-test", "target/manifest.json"])
             self.assertNotIn("target/incremental/cache.bin", files)
             (root / "fake-test").unlink()
-            with self.assertRaisesRegex(ValueError, "missing"):
+            with patch.object(runner, "checked", return_value="/toolchain/lib\n"), self.assertRaisesRegex(ValueError, "missing"):
                 runner.archive_files(root, path)
 
     def test_archive_keeps_local_shared_library_alias_and_runtime_search_path(self):
@@ -128,7 +130,8 @@ class RunnerTests(unittest.TestCase):
             path.write_text(json.dumps({"target": "x86_64-unknown-linux-gnu",
                 "artifacts": {harness["executable"]: runner.fingerprint(root / harness["executable"])}}))
             with patch.object(runner, "dynamic_elf", return_value=True), patch.object(
-                    runner, "checked", return_value=f"libfixture.so => {alias} (0x123)\n"):
+                    runner, "checked", side_effect=lambda command, cwd, **kwargs:
+                        "/toolchain/lib\n" if command[0] == "rustc" else f"libfixture.so => {alias} (0x123)\n"):
                 files = runner.archive_files(root, path)
             self.assertIn("target/deps/libfixture.so", files)
             self.assertIn("target/deps/libfixture.so.1", files)
@@ -149,6 +152,68 @@ class RunnerTests(unittest.TestCase):
         runner = self.load()
         with self.assertRaisesRegex(ValueError, "missing"):
             runner.validate_expected({"egcl:lib:egcl"}, [])
+
+    def test_host_rust_libraries_reach_discovery_and_test_processes(self):
+        runner = self.load()
+        for target in ("x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                harness = self.fixture(root)
+                host = root.parent / "host toolchain" / "lib"
+                target_lib = root.parent / "target toolchain" / "lib"
+                executable = root / harness["executable"]
+                executable.write_text(executable.read_text().replace("import sys\n",
+                    "import sys, os\n"
+                    + f"if {str(host)!r} not in os.environ.get('LD_LIBRARY_PATH', '').split(os.pathsep):\n"
+                    + " print('missing Rust host libstd'); sys.exit(127)\n"))
+                case = {**harness, "test": "ordinary", "id": "fake::ordinary", "ignored": False}
+                manifest = {"target": target, "artifacts": {"fake-test": runner.fingerprint(executable)},
+                            "shards": [[case]], "library_dirs": ["native libs"]}
+                original_checked = runner.checked
+                def checked(command, cwd, **kwargs):
+                    if command[:3] == ["rustc", "--print", "target-libdir"]:
+                        return str(target_lib if "--target" in command else host) + "\n"
+                    return original_checked(command, cwd, **kwargs)
+                with patch.object(runner, "checked", side_effect=checked), patch.dict(
+                        os.environ, {"LD_LIBRARY_PATH": "/inherited/library"}):
+                    environment = runner.test_environment(root, manifest)
+                    result = runner.run_case(root, case, 5, environment)
+                    self.assertTrue(result["passed"], result["output"])
+                    self.assertEqual([case["test"] for case in runner.discover(
+                        root, harness, False, environment)], ["ordinary"])
+                search = environment["LD_LIBRARY_PATH"].split(os.pathsep)
+                self.assertIn(str(target_lib), search)
+                self.assertIn(str(root / "native libs"), search)
+                self.assertIn(str(root), search)
+                self.assertIn("/inherited/library", search)
+                self.assertNotIn("", search)
+
+    def test_archive_resolves_host_rust_libraries_and_shards_relocate_toolchain(self):
+        runner = self.load()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            harness = self.fixture(root)
+            host = root.parent / "producer rust" / "lib"
+            consumer = root.parent / "consumer rust" / "lib"
+            case = {**harness, "test": "ordinary", "id": "fake::ordinary", "ignored": False}
+            path = root / "manifest.json"
+            path.write_text(json.dumps({"target": "x86_64-unknown-linux-musl",
+                "artifacts": {"fake-test": runner.fingerprint(root / "fake-test")}, "shards": [[case]]}))
+            def checked(command, cwd, **kwargs):
+                if command[:3] == ["rustc", "--print", "target-libdir"]:
+                    return str(host) + "\n"
+                self.assertEqual(command, ["ldd", str(root / "fake-test")])
+                self.assertIn(str(host), kwargs["env"]["LD_LIBRARY_PATH"].split(os.pathsep))
+                return f"libstd-fixture.so => {host / 'libstd-fixture.so'} (0x123)\n"
+            with patch.object(runner, "dynamic_elf", return_value=True), patch.object(
+                    runner, "checked", side_effect=checked):
+                self.assertEqual(runner.archive_files(root, path), ["fake-test", "manifest.json"])
+            manifest = json.loads(path.read_text())
+            self.assertNotIn(str(host), path.read_text(), "producer toolchain paths must not be serialized")
+            with patch.object(runner, "checked", return_value=str(consumer) + "\n"):
+                environment = runner.test_environment(root, manifest)
+            self.assertIn(str(consumer), environment["LD_LIBRARY_PATH"].split(os.pathsep))
+            self.assertNotIn(str(host), environment["LD_LIBRARY_PATH"].split(os.pathsep))
 
 
 if __name__ == "__main__":
