@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Restore supported deep recursion on Linux x86-64 with a larger managed-stack
+  default, while preserving stack-overflow conditions and explicit overrides
+  ([#246](https://github.com/atgreen/evergreen/pull/246)).
+
 - Preserve original arguments after native deoptimization and retain the callee
   in keyword-binding error backtraces
   ([#245](https://github.com/atgreen/evergreen/pull/245)).
