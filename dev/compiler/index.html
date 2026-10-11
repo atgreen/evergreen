@@ -2229,8 +2229,17 @@ completed background compilation before reading the tier.</p>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="p">(</span><span class="nv">egcl-ext:function-osr-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
 <a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">(</span><span class="nv">egcl-ext:deopt-count</span><span class="p">)</span>
 </code></pre></div>
-<p>The first two report invocation and back-edge counts, or <code>nil</code> for an
-unrecognized designator. <code>function-osr-count</code> reports successful native OSR
+<p><code>function-invoke-count</code> reports tiering heat, not a complete lifetime
+invocation total. New dispatches stop counting while T2 code for the current
+definition is installed, including calls that fall back because of native
+depth limits. It
+resumes after that code is removed or the function is redefined. For exact
+counts of selected functions, use <a href="../profiling/#profile">explicit profiling</a>,
+which invalidates compiled linkage and pins those functions to T0.</p>
+<p><code>function-back-edge-count</code> reports aggregate loop back-edge counts; its
+behavior is unchanged by the invocation-counting policy. Both functions
+return <code>nil</code> for an unrecognized designator.
+<code>function-osr-count</code> reports successful native OSR
 entries on the current thread for a non-nil function-name symbol; it returns
 <code>nil</code> for other designators. <code>deopt-count</code> is a process-wide count.
 These are observations; use them for diagnostics, not application decisions.</p>
