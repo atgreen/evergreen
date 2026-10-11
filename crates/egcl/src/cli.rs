@@ -40474,7 +40474,7 @@ mod jtc1_heap_tests {
         // the reader — jtc.15 — so we use an evaluator-produced string here.)
         let marker = "918273645";
         let src = "(cons (write-to-string 918273645) (cons 1 (cons 2 nil)))";
-        read_eval_all(src).expect("eval");
+        egcl_rt::rooted!(result = read_eval_all(src).expect("eval"));
 
         let mut cons_count = 0usize;
         let mut found_marker = false;
@@ -40490,6 +40490,15 @@ mod jtc1_heap_tests {
                         found_marker |= bytes == marker.as_bytes();
                     }
                 }
+            } else if tid == type_id::SIMPLE_CHARACTER_STRING {
+                // Character-string body layout: [len:u64 | codepoints:u32].
+                unsafe {
+                    let len = *(ptr as *const u64) as usize;
+                    if len == marker.chars().count() {
+                        let chars = std::slice::from_raw_parts(ptr.add(8).cast::<u32>(), len);
+                        found_marker |= chars.iter().copied().eq(marker.chars().map(u32::from));
+                    }
+                }
             }
             true
         })
@@ -40503,6 +40512,7 @@ mod jtc1_heap_tests {
             found_marker,
             "the evaluator-allocated string must be walkable on the GC heap"
         );
+        assert_eq!(val_as_str(cp(*result).0), marker);
     }
 }
 
