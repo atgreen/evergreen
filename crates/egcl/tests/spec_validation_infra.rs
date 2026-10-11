@@ -286,7 +286,7 @@ fn stress_and_regression_scenarios_run_via_real_test_binaries() {
         "EGCL_CI_TEST_EGCL_STDLIB_SPEC_PACKAGES_BOOTSTRAP",
         "egcl-stdlib",
         &["--test", "spec_packages_bootstrap"],
-        "concurrent_bootstrap_and_mutation_on_separate_threads_remain_isolated",
+        "shared_registry_supports_concurrent_bootstrap_lookup_and_mutation",
         "run exactly one package concurrency regression",
     );
     run_regression(

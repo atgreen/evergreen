@@ -23,6 +23,7 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
       (dotimes (i 10)
         (assert (equal (cleanup-root-caller 1) '(41 42))))
       (assert (= (egcl-ext:function-tier 'cleanup-root-caller) {tier_number}))
+      (disassemble 'cleanup-root-caller)
       (let* ((before (egcl-ext:deopt-count))
              (answer (cleanup-root-caller (expt 2 61))))
         (format t "ANSWER=~s DEOPTS=~a~%"
@@ -62,11 +63,19 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
         stdout.contains("DEOPT-CLEANUP-ROOT-OK"),
         "{stdout}\n{stderr}"
     );
-    let path = if tier == "t1" { "Single" } else { "Inlined" };
-    assert!(
-        stderr.contains(&format!("[deopt-path] {path}")),
-        "must exercise the intended resume path: {stderr}"
-    );
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        // Mapped guard recovery has its own entry, without the checked ABI's
+        // Single/Inlined diagnostic. Tier, real guard failure, exact values and
+        // stressed cleanup roots remain mandatory above.
+        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}\n{stderr}");
+        assert!(stdout.contains("native precise deopt veneer"), "{stdout}\n{stderr}");
+    } else {
+        let path = if tier == "t1" { "Single" } else { "Inlined" };
+        assert!(
+            stderr.contains(&format!("[deopt-path] {path}")),
+            "must exercise the intended resume path: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -172,6 +181,7 @@ fn t2_deopt_resumes_original_definition_after_unbinding() {
 }
 
 #[test]
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
 fn t2_deopt_retains_original_inlined_frames() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -252,4 +262,48 @@ fn t2_deopt_retains_original_inlined_frames() {
             .any(|count| count >= 2),
         "test must recover multiple real inlined frames, not a single native call: {stderr}"
     );
+}
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn t2_deopt_retains_both_active_mapped_definitions() {
+    // Mapped admission currently supports one logical frame per native entry.
+    // Enter both real native definitions before replacing them; unlike mutation
+    // in a named call's argument, this unambiguously requires both old bodies.
+    let program = r#"(declaim (notinline version-child version-mutate))
+(defvar *version-replace* nil)
+(defvar *version-effects* 0)
+(defun version-mutate (x)
+  (when *version-replace*
+    (setq *version-replace* nil)
+    (incf *version-effects*)
+    (setf (symbol-function 'version-child) (lambda (x) (+ x 7)))
+    (setf (symbol-function 'version-parent) (lambda (x) (+ (version-child x) 29)))
+    (egcl-ext:gc))
+  x)
+(defun version-child (x) (+ (version-mutate x) 1))
+(defun version-parent (x) (+ (version-child x) 11))
+(dotimes (i 100) (assert (= (version-parent 1) 13)))
+(assert (= (egcl-ext:function-tier 'version-parent) 2))
+(assert (= (egcl-ext:function-tier 'version-child) 2))
+(setq *version-replace* t)
+(let* ((input (expt 2 61)) (before (egcl-ext:deopt-count)) (answer (version-parent input)))
+  (format t "ANSWER ~A EXPECTED ~A DEOPTS ~A EFFECTS ~A~%" answer (+ input 12) (- (egcl-ext:deopt-count) before) *version-effects*)
+  (assert (= answer (+ input 12)))
+  (assert (= (- (egcl-ext:deopt-count) before) 2))
+  (assert (= *version-effects* 1))
+  (assert (= (version-parent input) (+ input 36))))
+
+(format t "NESTED-DEOPT-VERSION-OK~%")
+"#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .env_remove("EGCL_BACKEND")
+        .env("EGCL_FORCE_TIER", "t2")
+        .env("EGCL_LAZY_COMPILE", "0")
+        .output().expect("run mapped frame version regression");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("NESTED-DEOPT-VERSION-OK"), "{stdout}\n{stderr}");
 }

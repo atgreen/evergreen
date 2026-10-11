@@ -153,6 +153,7 @@ fn t2_calls_stop_before_later_side_effects() {
         (dolist (name '(t2-middle t2-throw-middle t2-builtin t2-wide
                        t2-global t2-thunk t2-self))
           (assert (= 2 (egcl-ext:function-tier name))))
+        (disassemble 't2-self)
         (setf *after-transfer* 0)
         (let ((cleanups 0))
           (assert (eq :caught
@@ -201,14 +202,22 @@ fn t2_calls_stop_before_later_side_effects() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("T2-TRANSFERS-OK"));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let self_entry = stderr
-        .lines()
-        .find(|line| line.contains("T2-SELF: T2 EMITTED"))
-        .unwrap_or_else(|| panic!("recursive function must emit register-entry metadata:\n{stderr}"));
-    assert!(
-        !self_entry.contains("compiled_entry=+0,"),
-        "recursive test must exercise the direct register entry: {self_entry}"
-    );
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stderr.contains("T2-SELF: optimized worker result installed with mapped T2 ABI;"),
+            "recursive function must publish mapped T2 code: {stderr}");
+        assert!(stdout.contains("native recursive entry veneer"), "{stdout}");
+        assert!(stdout.contains("native recursive frame retirement"), "{stdout}");
+    } else {
+        let self_entry = stderr
+            .lines()
+            .find(|line| line.contains("T2-SELF: T2 EMITTED"))
+            .unwrap_or_else(|| panic!("recursive function must emit register-entry metadata:\n{stderr}"));
+        assert!(
+            !self_entry.contains("compiled_entry=+0,"),
+            "recursive test must exercise the direct register entry: {self_entry}"
+        );
+    }
 }
 
 #[test]

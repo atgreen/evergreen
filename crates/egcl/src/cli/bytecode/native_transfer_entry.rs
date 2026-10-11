@@ -682,7 +682,10 @@ impl TransferCode {
             &named_veneers,
             egcl_compiler::t2::emit::NativeRootPublication::PublishedHomes,
         )
-        .inspect_err(|error| t2_log_write(format_args!("{}: mapped emitter: {error:?}", body.name)))
+        .inspect_err(|error| t2_log_write(format_args!(
+            "{}: mapped emitter: {error:?}{}",
+            display_fn_name(&body.name), describe_emit_error(error)
+        )))
         .ok()?;
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
         // UNWIND-PROTECT cleanups from exact scope maps. Other records require the

@@ -66,12 +66,17 @@ fn a_declined_function_explains_itself_under_one_name() {
     );
     let decline = ours
         .iter()
-        .find(|l| l.contains("=> stay T1"))
+        .find(|l| l.contains("refused Opcode #"))
         .unwrap_or_else(|| panic!("no decline reason under the plain name:\n{log}"));
 
+    assert!(
+        ours.iter().any(|line| line.contains("=> stay T1")
+            || line.contains("mapped T2 emission declined; keep mapped T1 or interpreter")),
+        "the decline must explain the retained execution path:\n{log}"
+    );
     // And it must say WHICH opcode, not only an opaque tag.
     assert!(
-        decline.contains("refused Opcode #"),
+        decline.contains("refused Opcode #14 in t2/ir.rs"),
         "the decline must name the refused opcode index: {decline}"
     );
     // The package-qualified spelling must not reappear for this function, or the
