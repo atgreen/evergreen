@@ -176,7 +176,7 @@ A function designator may be a function-name symbol or a function object.
 | Function | Result |
 | --- | --- |
 | `(egcl-ext:function-tier function)` | `0`, `1`, or `2` for T0 bytecode/interpreter, T1 baseline native, or T2 optimized native; `NIL` if the designator is not a tiered function |
-| `(egcl-ext:function-invoke-count function)` | Monotonic invocation count, or `NIL` for an unrecognized designator |
+| `(egcl-ext:function-invoke-count function)` | Invocation heat counter; pauses while matching T2 code is installed, or `NIL` for an unrecognized designator |
 | `(egcl-ext:function-back-edge-count function)` | Aggregate loop back-edge count, or `NIL` for an unrecognized designator |
 | `(egcl-ext:deopt-count)` | Process-wide number of speculative native deoptimizations |
 | `(egcl-ext:bail-report)` | Prints bytecode-lowering bail reasons and counts, then returns the number of distinct reasons |
@@ -185,6 +185,15 @@ A function designator may be a function-name symbol or a function object.
 tier. `BAIL-REPORT` is useful when the process was started with
 `EGCL_BAIL_TRACE=1`; without collected reasons it prints nothing and returns
 zero.
+
+`FUNCTION-INVOKE-COUNT` measures tiering heat outside explicit profiling; it
+is not a complete lifetime invocation total. New dispatches stop counting
+while T2 code for the current definition is installed, including calls that fall back
+because of native depth limits. It resumes after that code is removed or the
+function is redefined. Back-edge counting is unchanged. For exact counts of
+selected functions, use `EGCL-EXT:PROFILE` and
+`EGCL-EXT:PROFILE-REPORT-CALLS`. Profiling establishes count baselines,
+invalidates compiled linkage, and pins the selected functions to T0.
 
 ```lisp
 (defun sum-to (n)

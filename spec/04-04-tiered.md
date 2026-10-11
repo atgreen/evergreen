@@ -241,7 +241,12 @@ pub struct FnMeta {
 At T0, `invoke_count` is bumped at bytecode function entry and
 `back_edge_count` is bumped by `BACK_EDGE` bytecodes.  This lets hot loops OSR
 directly from bytecode to T2 even before a function has reached the call-count
-threshold for T1.
+threshold for T1. New dispatches stop counting while matching T2 code
+is installed, including calls that fall back because of native depth limits.
+It resumes after that code is removed or the function is redefined. Thus
+`FUNCTION-INVOKE-COUNT` exposes tiering heat, not a complete lifetime total.
+Explicit `EGCL-EXT:PROFILE` invalidates compiled linkage and pins selected
+functions to T0 for exact counts (§4.9.3.1). Back-edge counting is unchanged.
 
 ---
 

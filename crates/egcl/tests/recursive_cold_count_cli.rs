@@ -23,6 +23,7 @@ fn cold_recursive_source_counts_each_logical_call_once() {
         ])
         .env("EGCL_LAZY_COMPILE", "1")
         .env("EGCL_LAZY_THRESHOLD", "8")
+        .env("EGCL_DISABLE_T2", "1")
         .env("EGCL_PROFILING_DISABLED", "0")
         .env_remove("EGCL_FORCE_TIER")
         .output()

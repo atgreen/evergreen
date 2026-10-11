@@ -132,8 +132,18 @@ completed background compilation before reading the tier.
 (egcl-ext:deopt-count)
 ```
 
-The first two report invocation and back-edge counts, or `nil` for an
-unrecognized designator. `function-osr-count` reports successful native OSR
+`function-invoke-count` reports tiering heat, not a complete lifetime
+invocation total. New dispatches stop counting while T2 code for the current
+definition is installed, including calls that fall back because of native
+depth limits. It
+resumes after that code is removed or the function is redefined. For exact
+counts of selected functions, use [explicit profiling](profiling.md#profile),
+which invalidates compiled linkage and pins those functions to T0.
+
+`function-back-edge-count` reports aggregate loop back-edge counts; its
+behavior is unchanged by the invocation-counting policy. Both functions
+return `nil` for an unrecognized designator.
+`function-osr-count` reports successful native OSR
 entries on the current thread for a non-nil function-name symbol; it returns
 `nil` for other designators. `deopt-count` is a process-wide count.
 These are observations; use them for diagnostics, not application decisions.

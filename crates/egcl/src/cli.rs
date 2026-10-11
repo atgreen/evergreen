@@ -1796,7 +1796,7 @@ fn callable_body_inner_ex(
         NamedCallTarget::Body { params, body, .. } => Some((params, body)),
         NamedCallTarget::Function(function) => {
             if !bytecode::profiling_disabled() {
-                egcl_rt::function::record_invocation(function);
+                bytecode::record_callable_invocation(function);
             }
             Some((
                 egcl_rt::function::lambda_list(function),
@@ -35470,7 +35470,7 @@ fn apply_function_impl(
     // once. Re-reading its public cell could pair a replacement with this call.
     if let Some(closure) = reified_closure(fn_val) {
         if !bytecode::profiling_disabled() {
-            egcl_rt::function::record_invocation(fn_val);
+            bytecode::record_callable_invocation(fn_val);
         }
         return apply_function_impl(closure, args, env);
     }
@@ -35728,7 +35728,7 @@ fn apply_function_impl(
     // or a #' on a global defun. Call it by its own lambda list and body.
     if fn_val.is_heap_object() && egcl_rt::function::is_interpreted_function(fn_val) {
         if !bytecode::profiling_disabled() {
-            egcl_rt::function::record_invocation(fn_val);
+            bytecode::record_callable_invocation(fn_val);
         }
         // Function-object calls participate in the same tiering dispatch as
         // operator-position symbol calls. ASDF commonly retains a function

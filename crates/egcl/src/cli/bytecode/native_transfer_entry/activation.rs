@@ -236,7 +236,7 @@ impl ActivationState {
             owner: code,
             completed_deopt: false,
             recursive_enabled: code.recursive_symbol.is_some(),
-            recursive_profile: !profiling_disabled()
+            recursive_profile: !code.is_t2 && !profiling_disabled()
                 && egcl_rt::function::is_interpreted_function(unsafe { (*frame).function }),
             recursive_generation: code.recursive_generation,
             native_recursive: None,

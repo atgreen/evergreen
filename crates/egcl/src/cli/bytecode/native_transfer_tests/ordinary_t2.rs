@@ -1116,8 +1116,8 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
     let entries = take_recursive_entries();
     let helpers = take_recursive_helper_calls();
     assert_eq!(entries, 464, "fib(12) must execute all 464 native self calls");
-    assert_eq!(egcl_rt::function::invoke_count(*function) - before_count, 464,
-        "each admitted native child increments the retained callable exactly once");
+    assert_eq!(egcl_rt::function::invoke_count(*function), before_count,
+        "ordinary T2 children must not update invocation heat");
     assert_eq!(take_native_fallback_count(), 0);
     assert_eq!(mapped.deopt_count(), deopts, "measure successful native returns");
     assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
@@ -1340,12 +1340,9 @@ fn ordinary_t2_native_recursion_falls_back_at_depth_cap_and_restores_anchor() {
         assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(recursion_depth as i64)], &mut env).unwrap(),
             EgclVal::from_fixnum(recursion_depth as i64), "every non-tail addition must execute exactly once");
         assert!(observed_entry(), "the terminal leaf must actually execute");
-        // run_native does not count the outer call. Generated admissions and
-        // the remaining c2i/T0 calls must jointly count every selfcall once,
-        // including the first call refused at the native depth cap.
-        assert_eq!(egcl_rt::function::invoke_count(*function) - before_count,
-            recursion_depth as u32,
-            "native admission and depth fallback must neither lose nor double-count calls");
+        // Depth fallback does not uninstall T2 or resume tiering heat.
+        assert_eq!(egcl_rt::function::invoke_count(*function), before_count,
+            "installed T2 remains uncounted through depth fallback");
         assert_eq!(take_recursive_entries(), expected_children,
             "the outer anchor consumes one depth slot before child admission");
         assert_eq!(take_recursive_helper_calls(), (0, 0),
@@ -1362,4 +1359,37 @@ fn ordinary_t2_native_recursion_falls_back_at_depth_cap_and_restores_anchor() {
     assert!(managed_depths[1] > managed_depths[0],
         "after the cap, remaining recursion must execute on the flat managed T0 stack");
     assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_shared_closures_pause_heat_until_native_code_is_removed() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(forms = super::super::super::vec_to_list(&[EgclVal::from_fixnum(73)]));
+    let body = Arc::new(compile_function("COUNTER-SHARED-BODY", NIL, *forms, &env, false, false).unwrap());
+    egcl_rt::rooted!(first = make_bytecode_closure(&body, None));
+    egcl_rt::rooted!(second = make_bytecode_closure(&body, None));
+    let a = egcl_rt::function::name(*first).as_symbol_index();
+    let b = egcl_rt::function::name(*second).as_symbol_index();
+    assert_eq!(closure_compilation_owner(a, 1).0, a);
+    let (_, code) = install_body(a, Arc::clone(&body));
+    assert_mapped_t2(&code);
+    assert_eq!(egcl_rt::function::tier(*second), 0, "sibling metadata is not installed-code authority");
+    let aggregate = closure_compilation_owner(b, 0).1;
+    let anonymous = dispatch_invoke_count(b, None);
+    let before = egcl_rt::function::invoke_count(*second);
+    for _ in 0..3 {
+        record_callable_invocation(*second);
+        assert_eq!(call_registered(b, &[], *second, &mut env).unwrap().unwrap(), EgclVal::from_fixnum(73));
+    }
+    assert_eq!(egcl_rt::function::invoke_count(*second), before);
+    assert_eq!(closure_compilation_owner(b, 0).1, aggregate);
+    assert_eq!(dispatch_invoke_count(b, None), anonymous);
+    NATIVE_REGISTRY.with(|registry| registry.borrow_mut().remove(&a));
+    record_callable_invocation(*second);
+    assert_eq!(egcl_rt::function::invoke_count(*second), before + 1,
+        "lower-tier heat resumes after optimized code is removed");
 }
