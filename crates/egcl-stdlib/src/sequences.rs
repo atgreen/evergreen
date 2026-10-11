@@ -238,6 +238,15 @@ fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         }
         return Ok(elems);
     }
+    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+        egcl_rt::rooted!(sequence = sequence);
+        egcl_rt::rooted!(values = Vec::with_capacity(len));
+        for index in 0..len {
+            let raw = egcl_rt::packed_f64::get(*sequence, index).unwrap();
+            values.push(egcl_rt::gc::alloc_double_float(raw));
+        }
+        return Ok(values.to_vec());
+    }
     if is_complex_vector(sequence) {
         // A fill-pointer / adjustable vector's active elements are the prefix
         // (0..fill-pointer) of its backing storage — the same view LENGTH and ELT
@@ -704,6 +713,9 @@ pub fn array_total_size(v: EgclVal) -> Option<usize> {
     if is_vector(v) {
         return Some(vector_length(v));
     }
+    if let Some(n) = egcl_rt::packed_f64::len(v) {
+        return Some(n);
+    }
     if let Some(n) = egcl_rt::types::bit_vector_len(v) {
         return Some(n);
     }
@@ -1134,6 +1146,22 @@ fn sort_vector_in_place(
     key: Option<EgclVal>,
     stable: bool,
 ) -> EgclVal {
+    if egcl_rt::packed_f64::is_vector(sequence) {
+        egcl_rt::rooted!(inputs = (sequence, (predicate, key)));
+        let mut elems = collect_elements(sequence).expect("packed sequence");
+        let compare = |a: &EgclVal, b: &EgclVal| {
+            compare_with_predicate(inputs.1.0, inputs.1.1, *a, *b)
+        };
+        if stable {
+            elems.sort_by(compare);
+        } else {
+            elems.sort_unstable_by(compare);
+        }
+        for (index, value) in elems.into_iter().enumerate() {
+            egcl_rt::packed_f64::set(inputs.0, index, value.as_double_float());
+        }
+        return inputs.0;
+    }
     let ptr = unsafe { sequence.as_ptr() };
     let len = vector_length(sequence);
     let offset = vector_payload_offset(ptr) + 8;
@@ -1247,6 +1275,9 @@ const SYMBOL_MULTIPLICATION: u32 = 6;
 /// - T: treated as EQL.
 /// - Any other test function: fall back to EQL semantics.
 fn test_equal(test: EgclVal, a: EgclVal, b: EgclVal) -> bool {
+    if a.is_double_float() && b.is_double_float() {
+        return a.as_double_float() == b.as_double_float();
+    }
     if test.is_nil() {
         // Default EQL
         return a == b;
@@ -1417,6 +1448,9 @@ pub fn length(sequence: EgclVal) -> Result<usize, EgclError> {
     if is_vector(sequence) {
         return Ok(vector_length(sequence));
     }
+    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+        return Ok(len);
+    }
     if is_complex_vector(sequence) {
         // A fill-pointer vector's LENGTH is its fill pointer.
         return Ok(cvec_fill_pointer(sequence));
@@ -1467,6 +1501,15 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
             });
         }
         return Ok(vector_elt(sequence, index));
+    }
+    if egcl_rt::packed_f64::is_vector(sequence) {
+        let value = egcl_rt::packed_f64::get(sequence, index).ok_or_else(|| {
+            EgclError::TypeError {
+                datum: sequence,
+                expected: "valid packed double-float array index".into(),
+            }
+        })?;
+        return Ok(egcl_rt::gc::alloc_double_float(value));
     }
     if is_complex_vector(sequence) {
         let len = cvec_fill_pointer(sequence);
@@ -1597,6 +1640,22 @@ pub fn set_elt(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), Eg
         vector_set_elt(sequence, index, value);
         return Ok(());
     }
+    if egcl_rt::packed_f64::is_vector(sequence) {
+        if !value.is_double_float() {
+            return Err(EgclError::TypeError {
+                datum: value,
+                expected: "DOUBLE-FLOAT".into(),
+            });
+        }
+        return if egcl_rt::packed_f64::set(sequence, index, value.as_double_float()) {
+            Ok(())
+        } else {
+            Err(EgclError::TypeError {
+                datum: sequence,
+                expected: "valid packed double-float array index".into(),
+            })
+        };
+    }
     if is_complex_vector(sequence) {
         let len = cvec_fill_pointer(sequence);
         if index >= len {
@@ -1690,6 +1749,9 @@ pub fn set_aref(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), E
 
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if egcl_rt::packed_f64::is_vector(sequence) {
+        return subseq(sequence, 0, None);
+    }
     if sequence.is_nil() {
         return Ok(NIL);
     }
@@ -1744,6 +1806,24 @@ pub fn subseq(
     start: usize,
     end: Option<usize>,
 ) -> Result<EgclVal, EgclError> {
+    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+        let end = end.unwrap_or(len);
+        if start > end || end > len {
+            return Err(EgclError::TypeError {
+                datum: sequence,
+                expected: "valid subsequence bounds".into(),
+            });
+        }
+        // Root the base across allocation, then derive each source address
+        // from its relocated value. No interior pointer crosses a safepoint.
+        egcl_rt::rooted!(sequence = sequence);
+        let result = egcl_rt::packed_f64::make(end - start, 0.0)?;
+        for i in start..end {
+            let value = egcl_rt::packed_f64::get(*sequence, i).unwrap();
+            egcl_rt::packed_f64::set(result, i - start, value);
+        }
+        return Ok(result);
+    }
     if is_char_seq(sequence) {
         let chars: Vec<char> = string_content(sequence)
             .unwrap_or_default()
@@ -1832,6 +1912,9 @@ pub fn subseq(
 
 /// Reverse a sequence (non-destructive, CL `REVERSE`).
 pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if egcl_rt::packed_f64::is_vector(sequence) {
+        return nreverse(subseq(sequence, 0, None)?);
+    }
     if sequence.is_nil() {
         return Ok(NIL);
     }
@@ -1853,6 +1936,15 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
 
 /// Reverse a sequence destructively (CL `NREVERSE`).
 pub fn nreverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
+    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+        for i in 0..len / 2 {
+            let left = egcl_rt::packed_f64::get(sequence, i).unwrap();
+            let right = egcl_rt::packed_f64::get(sequence, len - i - 1).unwrap();
+            egcl_rt::packed_f64::set(sequence, i, right);
+            egcl_rt::packed_f64::set(sequence, len - i - 1, left);
+        }
+        return Ok(sequence);
+    }
     if sequence.is_nil() {
         return Ok(NIL);
     }
@@ -2216,14 +2308,33 @@ pub fn build_result_sequence(
     Ok(build_list(elems))
 }
 
+fn build_packed_f64(values: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let raw: Vec<f64> = values.iter().map(|&value| {
+        if value.is_double_float() {
+            Ok(value.as_double_float())
+        } else {
+            Err(EgclError::TypeError {
+                datum: value,
+                expected: "DOUBLE-FLOAT".into(),
+            })
+        }
+    }).collect::<Result<_, _>>()?;
+    let array = egcl_rt::packed_f64::make(raw.len(), 0.0)?;
+    for (index, value) in raw.into_iter().enumerate() {
+        egcl_rt::packed_f64::set(array, index, value);
+    }
+    Ok(array)
+}
+
 /// Concatenate sequences (CL `CONCATENATE`). R5.30.
 pub fn concatenate(result_type: EgclVal, sequences: &[EgclVal]) -> Result<EgclVal, EgclError> {
-    let mut all_elems = Vec::new();
-    for &seq in sequences {
-        let elems = collect_elements(seq)?;
+    egcl_rt::rooted!(inputs = (result_type, sequences.to_vec()));
+    egcl_rt::rooted!(all_elems = Vec::new());
+    for index in 0..inputs.1.len() {
+        let elems = collect_elements(inputs.1[index])?;
         all_elems.extend(elems);
     }
-    build_result_sequence(result_type, &all_elems)
+    build_result_sequence(inputs.0, &all_elems)
 }
 
 // ── Search and comparison ──────────────────────────────────────────
@@ -2238,7 +2349,9 @@ pub fn find(
     end: Option<usize>,
     from_end: bool,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (item, (test, key)));
     let elems = collect_elements(sequence)?;
+    let (item, (test, key)) = *inputs;
     let actual_end = end.unwrap_or(elems.len());
     let range = &elems[start..actual_end];
 
@@ -2270,7 +2383,9 @@ pub fn position(
     end: Option<usize>,
     from_end: bool,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (item, (test, key)));
     let elems = collect_elements(sequence)?;
+    let (item, (test, key)) = *inputs;
     let actual_end = end.unwrap_or(elems.len());
 
     if from_end {
@@ -2300,7 +2415,9 @@ pub fn count(
     start: usize,
     end: Option<usize>,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (item, (test, key)));
     let elems = collect_elements(sequence)?;
+    let (item, (test, key)) = *inputs;
     let actual_end = end.unwrap_or(elems.len());
     let mut n = 0i64;
     for elem in elems.iter().take(actual_end).skip(start) {
@@ -2320,10 +2437,14 @@ pub fn map(
     function: EgclVal,
     sequences: &[EgclVal],
 ) -> Result<EgclVal, EgclError> {
-    let collected: Vec<Vec<EgclVal>> = sequences
-        .iter()
-        .map(|&s| collect_elements(s))
-        .collect::<Result<_, _>>()?;
+    egcl_rt::rooted!(inputs = (result_type, (function, sequences.to_vec())));
+    egcl_rt::rooted!(collected = Vec::<Vec<EgclVal>>::new());
+    for index in 0..inputs.1.1.len() {
+        let elems = collect_elements(inputs.1.1[index])?;
+        collected.push(elems);
+    }
+    let result_type = inputs.0;
+    let function = inputs.1.0;
 
     let min_len = collected.iter().map(|v| v.len()).min().unwrap_or(0);
     let mut results = Vec::with_capacity(min_len);
@@ -2351,7 +2472,9 @@ pub fn reduce(
     end: Option<usize>,
     from_end: bool,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (function, (initial_value, key)));
     let elems = collect_elements(sequence)?;
+    let (function, (initial_value, key)) = *inputs;
     let actual_end = end.unwrap_or(elems.len());
     let slice = &elems[start..actual_end];
 
@@ -2417,7 +2540,9 @@ pub fn remove(
     count_limit: Option<usize>,
     from_end: bool,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (sequence, (item, (test, key))));
     let elems = collect_elements(sequence)?;
+    let (sequence, (item, (test, key))) = *inputs;
     let len = elems.len();
     let actual_end = end.unwrap_or(len);
 
@@ -2447,7 +2572,9 @@ pub fn remove(
             .map(|(_, &v)| v)
             .collect();
 
-        if is_list(sequence) {
+        if egcl_rt::packed_f64::is_vector(sequence) {
+            build_packed_f64(&result)
+        } else if is_list(sequence) {
             Ok(build_list(&result))
         } else {
             Ok(build_vector(&result))
@@ -2471,7 +2598,9 @@ pub fn remove(
             }
             result.push(elem);
         }
-        if is_list(sequence) {
+        if egcl_rt::packed_f64::is_vector(sequence) {
+            build_packed_f64(&result)
+        } else if is_list(sequence) {
             Ok(build_list(&result))
         } else {
             Ok(build_vector(&result))
@@ -2492,7 +2621,9 @@ pub fn substitute(
     count_limit: Option<usize>,
     from_end: bool,
 ) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(inputs = (sequence, ((new_item, old_item), (test, key))));
     let elems = collect_elements(sequence)?;
+    let (sequence, ((new_item, old_item), (test, key))) = *inputs;
     let len = elems.len();
     let actual_end = end.unwrap_or(len);
 
@@ -2519,7 +2650,9 @@ pub fn substitute(
             .map(|(i, &v)| if sub_set.contains(&i) { new_item } else { v })
             .collect();
 
-        if is_list(sequence) {
+        if egcl_rt::packed_f64::is_vector(sequence) {
+            build_packed_f64(&result)
+        } else if is_list(sequence) {
             Ok(build_list(&result))
         } else {
             Ok(build_vector(&result))
@@ -2544,7 +2677,9 @@ pub fn substitute(
             }
             result.push(elem);
         }
-        if is_list(sequence) {
+        if egcl_rt::packed_f64::is_vector(sequence) {
+            build_packed_f64(&result)
+        } else if is_list(sequence) {
             Ok(build_list(&result))
         } else {
             Ok(build_vector(&result))
@@ -2593,6 +2728,8 @@ fn compare_with_predicate(
 
     let ord = if ka.is_fixnum() && kb.is_fixnum() {
         ka.as_fixnum().cmp(&kb.as_fixnum())
+    } else if ka.is_double_float() && kb.is_double_float() {
+        ka.as_double_float().total_cmp(&kb.as_double_float())
     } else if ka.is_character() && kb.is_character() {
         ka.as_char().cmp(&kb.as_char())
     } else {
