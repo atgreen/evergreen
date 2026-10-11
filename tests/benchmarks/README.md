@@ -24,6 +24,27 @@ interpreter/T1 number, not a T2 codegen number.
 `sumloop` is not a Gabriel benchmark: a hot loop entered once, it tracks the
 on-stack-replacement gap (bliss-izt) directly.
 
+`native-call4` measures one million uninlined, four-argument calls to a leaf
+that returns its fourth argument without arithmetic or allocation.
+`native-call-base` performs the same loop and accumulation without that call.
+Both validate the sum and warm the functions through repeated invocations.
+Run `tests/benchmarks/run.sh native-call-base native-call4` to compare them.
+The time difference estimates added call cost, including argument setup and
+dispatch; it is not a measurement of one machine instruction. Four arguments
+include one overflow stack argument under the proposed x86-64 Lisp ABI.
+
+The runner's `T2=yes` means some function was published at T2. Before attributing
+these timings to native calling conventions, retain an `EGCL_T2_LOG` trace and
+verify publication of both `NATIVE-CALL4-LEAF` and `NATIVE-CALL4-LOOP` (and
+`NATIVE-CALL-BASE-LOOP` for the baseline). Inspect the generated call site as
+well: promotion alone does not prove that it uses the new register ABI.
+Record the binary revision, build profile, tier settings and host load; use
+release builds on a quiet host for performance comparisons. Sub-millisecond
+differences are below this runner's timer resolution. Compare on 64-bit
+implementations, where the sum fits a fixnum; a 32-bit implementation may box
+the accumulation. The two reported minima come from separate runs, so their
+difference is an estimate rather than an exact per-call latency.
+
 Still to come (tracked on bliss-jpd0): the rest of the Gabriel core (boyer,
 browse, puzzle, triangle, …) as stdlib coverage allows, cl-bench proper,
 `thresholds.toml` (R10.62) once numbers stabilize, and archived trend results
