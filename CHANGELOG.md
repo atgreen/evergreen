@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Evaluate optional `TYPEP` and `SUBTYPEP` arguments consistently, preserving
+  side effects and nonlocal exits; enforce `TYPEP` errors through `FUNCALL`
+  ([#257](https://github.com/atgreen/evergreen/pull/257)).
+
 - Honor `DEFTYPE` default arguments, named returns, and documentation;
   preserve `SPECIAL` parameter declarations when compiling closures
   ([#256](https://github.com/atgreen/evergreen/pull/256)).
