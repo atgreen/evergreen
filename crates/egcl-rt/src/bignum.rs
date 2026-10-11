@@ -715,7 +715,10 @@ impl BigRat {
         if self.is_integer() {
             self.num.to_val()
         } else {
-            alloc_ratio_cli(self.num.to_val(), self.den.to_val())
+            // Denominator construction can relocate a heap-allocated numerator.
+            crate::rooted!(num = self.num.to_val());
+            let den = self.den.to_val();
+            alloc_ratio_cli(*num, den)
         }
     }
 }
