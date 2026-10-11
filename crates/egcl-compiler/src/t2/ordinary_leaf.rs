@@ -106,3 +106,72 @@ pub fn emit_framed_ordinary_leaf(
         Some(options),
     )
 }
+
+/// Bound the leaf frame and conservative parallel-move snapshot headroom.
+/// The largest block parameter list bounds both entry moves and phi edges.
+pub(super) fn stack_requirement(frame_bytes: usize, move_values: usize) -> Option<usize> {
+    let snapshot_bytes = move_values.checked_mul(8)?.checked_add(15)? & !15;
+    let required = frame_bytes.checked_add(snapshot_bytes)?;
+    (required <= isize::MAX as usize).then_some(required)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        FramedHome, HomeMoveSrc, mov_rr, parallel_home_move, pop_reg, push_reg, store_mem64_disp,
+    };
+    use super::*;
+    use egcl_rt::{asm::Asm, jit::JitBuffer};
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+
+    #[test]
+    fn ordinary_stack_bound_covers_an_executed_parallel_phi_cycle() {
+        let mut a = Asm::new();
+        push_reg(&mut a, 5);
+        mov_rr(&mut a, 5, 4);
+        mov_rr(&mut a, 1, 7);
+        mov_rr(&mut a, 8, 6);
+        parallel_home_move(
+            &mut a,
+            &[
+                (FramedHome::Reg(1), HomeMoveSrc::Home(FramedHome::Reg(8))),
+                (FramedHome::Reg(8), HomeMoveSrc::Home(FramedHome::Reg(1))),
+            ],
+        );
+        store_mem64_disp(&mut a, 2, 0, 1);
+        store_mem64_disp(&mut a, 2, 8, 8);
+        pop_reg(&mut a, 5);
+        a.push(0xc3);
+        let code = a.finish().unwrap();
+        let buffer = JitBuffer::new(&code).unwrap();
+        let run: extern "C" fn(u64, u64, *mut u64) =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut swapped = [0; 2];
+        run(11, 22, swapped.as_mut_ptr());
+        assert_eq!(swapped, [22, 11]);
+
+        let mut decoder = Decoder::new(64, &code, DecoderOptions::NONE);
+        let mut depth = 0usize;
+        let mut maximum = 0usize;
+        while decoder.can_decode() {
+            let instruction = decoder.decode();
+            match instruction.mnemonic() {
+                Mnemonic::Push => depth += 8,
+                Mnemonic::Pop => depth -= 8,
+                Mnemonic::Sub if instruction.op0_register() == Register::RSP => {
+                    depth += instruction.immediate32() as usize
+                }
+                Mnemonic::Add if instruction.op0_register() == Register::RSP => {
+                    depth -= instruction.immediate32() as usize
+                }
+                _ => {}
+            }
+            maximum = maximum.max(depth);
+        }
+        assert_eq!(depth, 0);
+        assert_eq!(maximum, 24, "RBP plus the actual cycle snapshot");
+        assert_eq!(stack_requirement(8, 2), Some(maximum));
+        assert_eq!(stack_requirement(usize::MAX, 2), None);
+        assert_eq!(stack_requirement(8, usize::MAX), None);
+    }
+}

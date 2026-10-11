@@ -3,7 +3,7 @@
 
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use egcl_compiler::t2::emit::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
+use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, emit_framed_ordinary_leaf};
 use egcl_compiler::t2::ir::{
     AuxData, BlockCall, Function, IRType, InstData, InstFlags, Opcode, Value, ValueRepresentation,
 };
@@ -313,5 +313,21 @@ fn ordinary_leaf_has_an_rbp_chain_aligned_body_and_reserved_execution_register()
             !matches!(inst.mnemonic(), Mnemonic::Add | Mnemonic::Sub),
             "ordinary frame teardown must preserve the return flags"
         );
+    }
+}
+
+#[test]
+fn ordinary_stack_bound_reserves_phi_snapshot_headroom() {
+    for arity in 0..=4 {
+        let code = emit_framed_ordinary_leaf(&leaf(arity, 0, true), options(arity)).unwrap();
+        let fixed = code
+            .native_calls
+            .as_ref()
+            .unwrap()
+            .unwind_recipe()
+            .unwrap()
+            .frame_bytes() as usize;
+        let move_bytes = (arity * 8 + 15) & !15;
+        assert_eq!(code.ordinary_stack_required, Some(fixed + move_bytes));
     }
 }

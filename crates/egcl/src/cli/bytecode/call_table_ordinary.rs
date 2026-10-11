@@ -204,6 +204,7 @@ mod tests {
             arity: 0,
             environment: linkage::ORDINARY_ENV_NONE,
             owner: Rc::as_ptr(owner) as usize,
+            stack_required: 8,
         }
     }
 
@@ -245,6 +246,7 @@ mod tests {
             arity: 0,
             environment: linkage::ORDINARY_ENV_NONE,
             owner,
+            stack_required: 8,
         };
         assert!(
             directory

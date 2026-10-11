@@ -58,6 +58,9 @@ pub struct OrdinaryEntryDescriptor {
     pub arity: usize,
     pub environment: u64,
     pub owner: usize,
+    /// Maximum bytes below entry RSP, including temporary move storage.
+    /// Excludes the return address and caller-owned outgoing arguments.
+    pub stack_required: usize,
 }
 
 impl OrdinaryEntryDescriptor {
@@ -66,6 +69,7 @@ impl OrdinaryEntryDescriptor {
             && self.version == ORDINARY_X64_LISP_VERSION
             && matches!(self.environment, ORDINARY_ENV_NONE | ORDINARY_ENV_CLOSURE)
             && self.owner != 0
+            && (8..=isize::MAX as usize).contains(&self.stack_required)
             && self.code_start != 0
             && self.contains_pc(self.entry)
     }
@@ -336,7 +340,19 @@ mod tests {
             arity: 4,
             environment: ORDINARY_ENV_NONE,
             owner: 0x2000,
+            stack_required: 8,
         }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn ordinary_descriptor_preserves_existing_offsets_and_appends_stack_bound() {
+        assert_eq!(std::mem::offset_of!(OrdinaryEntryDescriptor, owner), 64);
+        assert_eq!(
+            std::mem::offset_of!(OrdinaryEntryDescriptor, stack_required),
+            72
+        );
+        assert_eq!(std::mem::size_of::<OrdinaryEntryDescriptor>(), 80);
     }
 
     #[test]
@@ -374,7 +390,7 @@ mod tests {
         let mut table = Table::default();
         let ordinal = table.ordinal(43);
         let cell = CallCell::new(ordinal, 11, 12);
-        for mutation in 0..7 {
+        for mutation in 0..9 {
             let mut entry = ordinary_descriptor(0);
             match mutation {
                 0 => entry.kind ^= 1,
@@ -384,6 +400,8 @@ mod tests {
                 4 => entry.owner = 0,
                 5 => entry.environment = 99,
                 6 => entry.code_len = 0,
+                7 => entry.stack_required = 0,
+                8 => entry.stack_required = usize::MAX,
                 _ => unreachable!(),
             }
             assert!(
