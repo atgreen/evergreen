@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fix character counts and indexing in runtime-created Unicode strings, and
+  preserve fresh-string mutability for wider characters
+  ([#244](https://github.com/atgreen/evergreen/pull/244)).
+
 ## 0.0.5 - 2026-10-10
 
 ### Performance and diagnostics
