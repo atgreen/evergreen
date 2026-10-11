@@ -478,13 +478,24 @@ pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
 /// roots T0 already owns (deoptimizing or retired) are skipped, and a malformed
 /// or missing map is a fatal invariant failure.
 fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    // Publications can describe the same physical save slot. Relocate that
+    // word once per collector pass, while still visiting distinct copies.
+    let mut homes = std::collections::HashSet::new();
+    let mut visit = |slot: *mut EgclVal| {
+        if !homes.insert(slot as usize) {
+            return;
+        }
+        #[cfg(test)]
+        SCAN_VISIT_HOOK.with(|hook| { if let Some(hook) = hook.get() { hook(slot); } });
+        visit(slot);
+    };
     #[cfg(test)]
     let here = egcl_rt::current_stack() as *const egcl_rt::stack::EgclStack;
     unsafe {
         ACTIVE.scan(|slot| {
             let mut boundary = slot.get();
             while !boundary.is_null() {
-                let visited = walk_boundary(&*boundary, visit);
+                let visited = walk_boundary(&*boundary, &mut visit);
                 #[cfg(test)]
                 if !std::ptr::eq((*boundary).stack, here) {
                     use std::sync::atomic::Ordering::Relaxed;
@@ -497,6 +508,13 @@ fn scan_published_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
             }
         });
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    // Observe actual collector visitor calls, never an unsynchronized manual
+    // scan of other executions. Each callback belongs to root_scan_pass().
+    static SCAN_VISIT_HOOK: Cell<Option<fn(*mut EgclVal)>> = const { Cell::new(None) };
 }
 
 /// Validated extent of one publication: native stack words it may read, and
@@ -932,6 +950,10 @@ fn verify_frame_aliases(
 #[cfg(test)]
 #[path = "root_publication_matrix_tests.rs"]
 mod matrix_tests;
+
+#[cfg(test)]
+#[path = "root_publication_alias_tests.rs"]
+mod alias_tests;
 
 #[cfg(test)]
 mod tests {
