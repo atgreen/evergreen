@@ -4,6 +4,9 @@
 
 - Visit overlapping native GC root slots once per scan while preserving distinct
   copies of live values ([#274](https://github.com/atgreen/evergreen/pull/274)).
+- Keep idle mapped T2 loop polls in generated code on Linux x86-64, avoiding
+  runtime calls and root publication until work is pending
+  ([#272](https://github.com/atgreen/evergreen/pull/272)).
 
 ## 0.0.6 - 2026-10-11
 

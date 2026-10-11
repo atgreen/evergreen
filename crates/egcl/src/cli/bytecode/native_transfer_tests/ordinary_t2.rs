@@ -829,7 +829,7 @@ fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
     );
     let name = "ORDINARY-IDLE-POLL-LOOP";
     // More than 64 nonconstant arithmetic operations make the compiler emit
-    // straight-line polls as well as the always-slow loop-header heat poll.
+    // straight-line polls as well as loop-header polls, which retain heat in T1.
     let additions = "(setq sum (+ sum i)) ".repeat(80);
     let source = format!("((let ((sum 0)) (dotimes (i n) {additions}) (values sum n)))");
     super::super::super::read_eval_all_env(
@@ -875,21 +875,17 @@ fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
     assert_mapped_t2(&optimized);
     assert!(native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.get().is_none()));
     native_transfer_entry::reset_poll_paths_for_test();
+    native_transfer_entry::native_poll::take_generated_skips();
     assert_eq!(
         run_native(&optimized, symbol, &[EgclVal::from_fixnum(8)], &mut env).unwrap(),
         EgclVal::from_fixnum(2240)
     );
     let (fast, slow) = native_transfer_entry::take_poll_paths_for_test();
-    assert!(fast > 0,
-        "the executed worker T2 loop must take the real unpublished idle path; fast={fast}, slow={slow}");
-    assert!(
-        slow >= 8,
-        "T2 loop-header heat polls must still take the slow path: {slow}"
-    );
-    assert!(
-        fast + slow >= 8,
-        "preflight must preserve loop polls rather than sample them away"
-    );
+    let skipped = native_transfer_entry::native_poll::take_generated_skips();
+    assert!(skipped >= 8,
+        "T2 must execute generated idle skips in the installed loop: {skipped}");
+    assert_eq!(fast, 0, "generated idle polls must not enter the Rust preflight");
+    assert!(slow < skipped, "idle loop must predominantly bypass publication");
     assert_eq!(
         env.mv,
         vec![EgclVal::from_fixnum(2240), EgclVal::from_fixnum(8)]
@@ -898,6 +894,50 @@ fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
         (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
         before
     );
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_generated_poll_cold_edge_relocates_a_native_only_root() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun generated-poll-allocator () (%ordinary-t2-root-for-test))", &mut env,
+    ).unwrap();
+    let (symbol, code) = install("GENERATED-POLL-ROOT", "(n)",
+        "((let ((held (generated-poll-allocator)))
+            (values nil)
+            (let ((sum 0)) (dotimes (i n) (setq sum (+ sum i))))
+            held))", &mut env);
+    assert_mapped_t2(&code);
+    expect_entry(&code);
+    egcl_rt::collect_t0_minor().unwrap();
+    thread_local! { static MOVED: Cell<bool> = const { Cell::new(false) }; }
+    MOVED.with(|moved| moved.set(false));
+    fn observe() {
+        if MOVED.with(Cell::get) { return; }
+        let Some(root) = native_transfer_entry::root_publication::native_poll_root_for_test(71) else { return };
+        let before = unsafe { root.read() }.to_raw();
+        egcl_rt::collect_t0_minor().unwrap();
+        assert_ne!(unsafe { root.read() }.to_raw(), before,
+            "the generated cold edge must publish and relocate the native-only root");
+        MOVED.with(|moved| moved.set(true));
+    }
+    struct ClearObserver;
+    impl Drop for ClearObserver {
+        fn drop(&mut self) {
+            native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(None));
+        }
+    }
+    let _observer = ClearObserver;
+    native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(Some(observe)));
+    native_transfer_entry::reset_poll_paths_for_test();
+    let result = run_native(&code, symbol, &[EgclVal::from_fixnum(8)], &mut env).unwrap();
+    assert!(MOVED.with(Cell::get), "a real mapped T2 poll must expose the root");
+    assert_eq!(super::super::super::cp(result), (EgclVal::from_fixnum(71), NIL));
+    assert!(native_transfer_entry::take_poll_paths_for_test().1 > 0);
 }
 
 #[test]

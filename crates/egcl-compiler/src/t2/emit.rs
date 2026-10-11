@@ -1009,8 +1009,95 @@ fn emit_shadow_root_restore(
     Ok(())
 }
 
+/// Activation-owned snapshot for generated T2 polls. The runtime retains this
+/// record and its execution until the native activation returns. Carrier and
+/// signal snapshots are refreshed only by the runtime after servicing a poll.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct NativePollControl {
+    pub execution: *const egcl_rt::exec_context::LispExecutionContext,
+    pub seen_carrier: u64,
+    pub seen_signal_epoch: u64,
+    pub deadline_armed: u8,
+    pub reserved: [u8; 7],
+    pub test_observer: *const usize,
+    pub test_skips: *mut usize,
+}
+
+/// Process-lifetime flag addresses, using the runtime's atomic widths and
+/// ordering. `initialize` is noncollecting and returns the current activation's
+/// control pointer, or null to require the existing published poll every time.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub struct NativePollFastPath {
+    pub initialize: u64,
+    pub gc_requested: u64,
+    pub sigusr1_pending: u64,
+    pub posted_signal: u64,
+    pub native_errors: u64,
+    pub signal_epoch: u64,
+    pub observe_forces_cold: bool,
+    pub instrument_skips: bool,
+}
+
+/// Only reserved scratch registers are touched before the conditional edge;
+/// the caller has not spilled or published any roots yet. x86 loads provide the
+/// required Acquire/SeqCst load ordering for these runtime atomic cells.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
+    idle: egcl_rt::asm::Label)
+{
+    use std::mem::offset_of;
+    let slow = a.label();
+    for (address, byte) in [(fast.gc_requested, true), (fast.sigusr1_pending, true),
+        (fast.posted_signal, false), (fast.native_errors, false)] {
+        mov_imm64(a, SCRATCH, address as i64);
+        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
+        alu_r_imm(a, 7, RAX, 0);
+        a.jcc(Cc::Ne, slow);
+    }
+    load_home(a, 7, home, 0);
+    alu_r_imm(a, 7, 7, 0);
+    a.jcc(Cc::E, slow);
+    mov_imm64(a, SCRATCH, fast.signal_epoch as i64);
+    load_mem64_disp(a, RAX, SCRATCH, 0);
+    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_signal_epoch) as u8);
+    a.jcc(Cc::Ne, slow);
+    load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, execution) as i32);
+    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
+    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_carrier) as u8);
+    a.jcc(Cc::Ne, slow);
+    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+    mov_rr(a, SCRATCH, 7);
+    alu_r_imm(a, 0, SCRATCH, offset_of!(NativePollControl, deadline_armed) as i32);
+    movzx_mem8(a, RAX, SCRATCH);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+    if fast.observe_forces_cold {
+        let no_observer = a.label();
+        load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_observer) as i32);
+        alu_r_imm(a, 7, SCRATCH, 0);
+        a.jcc(Cc::E, no_observer);
+        load_mem64_disp(a, RAX, SCRATCH, 0);
+        alu_r_imm(a, 7, RAX, 0);
+        a.jcc(Cc::Ne, slow);
+        a.bind(no_observer);
+    }
+    if fast.instrument_skips {
+        load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_skips) as i32);
+        alu_r_imm(a, 7, SCRATCH, 0);
+        a.jcc(Cc::E, slow);
+        a.extend_from_slice(&[0x48, 0xff, 0x02]); // inc qword [rdx]
+    }
+    a.jmp(idle);
+    a.bind(slow);
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct PollFrame {
+    fast_path: Option<(NativePollFastPath, FramedHome)>,
     arguments: Vec<(crate::t2::ir::Value, u32)>,
     native_frame_mode: bool,
     spill_area: NativeValueArea,
@@ -1032,6 +1119,11 @@ fn emit_mapped_poll(
     veneer: u64,
     heat: bool,
 ) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
+    let idle = frame.fast_path.map(|(fast, home)| {
+        let idle = a.label();
+        emit_idle_poll_guard(a, fast, home, idle);
+        idle
+    });
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -1076,7 +1168,7 @@ fn emit_mapped_poll(
     )?;
     if frame.native_frame_mode { mov_imm64(a, 7, 0); }
     else { load_home(a, 7, frame.base, 0); }
-    if heat {
+    if heat && frame.fast_path.is_none() {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
@@ -1099,6 +1191,7 @@ fn emit_mapped_poll(
         );
         store_home(a, home, RAX, 0);
     }
+    if let Some(idle) = idle { a.bind(idle); }
     Ok((site, map))
 }
 
@@ -3592,6 +3685,7 @@ pub enum NativeCallStorage {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct TransferEmission {
+    poll_fast_path: Option<NativePollFastPath>,
     native_recursion: Option<NativeRecursiveTransfer>,
     storage: NativeCallStorage,
     roots: NativeRootPublication,
@@ -3636,7 +3730,7 @@ pub fn emit_framed_transfers_with_storage(
         None, None, &[], match storage {
             NativeCallStorage::ManagedActivation => NativeRootPublication::ActivationShadows,
             NativeCallStorage::NativeStack => NativeRootPublication::PublishedHomes,
-        }, storage, None)
+        }, storage, None, None)
 }
 
 /// Cleanup helpers take `(cleanup_bcp, resume_bcp, primary)` and return the
@@ -3826,6 +3920,27 @@ pub fn emit_framed_native_handlers_with_entries(
         recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation)
 }
 
+/// Mapped worker T2 polls may bypass the entire published helper on an idle
+/// observation. T1 callers must use the ordinary entry so heat and OSR remain
+/// on their existing published path. Alternate OSR entries initialize the same
+/// activation-owned control before importing native homes.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_entries_and_poll_fast_path(
+    f: &Function, call_veneer: u64, activation_slots: u16,
+    save: u64, complete: u64, multiple_values: u64,
+    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>, deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)], roots: NativeRootPublication,
+    poll_fast_path: Option<NativePollFastPath>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    if catch_landing == 0 || handler_landing == 0 { return Err(EmitError::UnsupportedOp(0xFA)); }
+    emit_transfer_function_with_storage(f, call_veneer, activation_slots,
+        Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
+        (poll_veneer != 0).then_some(poll_veneer), recursion, deopt_veneer, named_veneers,
+        roots, NativeCallStorage::ManagedActivation, None, poll_fast_path)
+}
+
 /// Scope-free fixed-arity worker T2 entry with physical native recursion.
 /// Alternate OSR entries and local control ledgers retain the managed emitter
 /// until their entry and cold materialization contracts are supplied.
@@ -3857,7 +3972,7 @@ pub fn emit_framed_native_handlers_with_native_recursion(
     emit_transfer_function_with_storage(f, call_veneer, activation_slots,
         Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
         (poll_veneer != 0).then_some(poll_veneer), None, Some(deopt_veneer), named_veneers,
-        NativeRootPublication::PublishedHomes, NativeCallStorage::NativeStack, Some(recursion))
+        NativeRootPublication::PublishedHomes, NativeCallStorage::NativeStack, Some(recursion), None)
 }
 
 /// Explicit backing storage for the existing managed-entry helper contract.
@@ -3900,6 +4015,7 @@ pub fn emit_framed_native_handlers_with_entries_and_storage(
         roots,
         storage,
         None,
+        None,
     )
 }
 
@@ -3918,7 +4034,7 @@ fn emit_transfer_function(
     roots: NativeRootPublication,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     emit_transfer_function_with_storage(f, call_veneer, activation_slots, cleanup,
-        poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None)
+        poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None, None)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -3935,8 +4051,13 @@ fn emit_transfer_function_with_storage(
     roots: NativeRootPublication,
     storage: NativeCallStorage,
     native_recursion: Option<NativeRecursiveTransfer>,
+    poll_fast_path: Option<NativePollFastPath>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     use crate::t2::ir::{AuxData, Opcode};
+    if poll_fast_path.is_some_and(|fast| [fast.initialize, fast.gc_requested,
+        fast.sigusr1_pending, fast.posted_signal, fast.native_errors, fast.signal_epoch].contains(&0)) {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     if deopt_veneer == Some(0) || named_veneers.iter().any(|(_, entry)| *entry == 0) {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
@@ -4062,6 +4183,7 @@ fn emit_transfer_function_with_storage(
         }
     }
     let mut transfers = TransferEmission {
+        poll_fast_path,
         native_recursion,
         storage,
         roots,
@@ -5035,6 +5157,13 @@ fn emit_framed_inner(
         next_stack += 1;
         home
     });
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let poll_fast_path = transfers.as_ref().and_then(|transfer| transfer.poll_fast_path)
+        .filter(|_| !backedge_headers.is_empty() || !straight_poll_sources.is_empty());
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let poll_control_home = poll_fast_path.map(|_| {
+        let home = FramedHome::Stack(next_stack); next_stack += 1; home
+    });
     let native_control_home = native_frame_mode.then(|| {
         let home = FramedHome::Stack(next_stack); next_stack += 1; home
     });
@@ -5061,6 +5190,15 @@ fn emit_framed_inner(
         })
         .collect();
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let initialize_poll = |a: &mut Asm| {
+        if let Some((fast, home)) = poll_fast_path.zip(poll_control_home) {
+            mov_imm64(a, RAX, fast.initialize as i64);
+            a.extend_from_slice(&[0xff, 0xd0]); // noncollecting, once per entry
+            store_home(a, home, RAX, 0);
+            load_home(a, 7, frame_base_home.expect("mapped poll activation"), 0);
+        }
+    };
     let mut a = Asm::new();
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
@@ -5201,6 +5339,8 @@ fn emit_framed_inner(
         store_home(&mut a, home, 7 /* rdi */, 0);
     }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    initialize_poll(&mut a);
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(recursion) = native_recursion {
         store_home(&mut a, native_stack_home.unwrap(), 6, 0);
         mov_imm64(&mut a, RAX, recursion.initialize as i64);
@@ -5273,6 +5413,7 @@ fn emit_framed_inner(
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let poll_frame = frame_base_home.zip(activation_slots).map(|(base, activation_slots)| PollFrame {
+        fast_path: poll_fast_path.zip(poll_control_home),
         arguments: native_arguments.clone(), native_frame_mode,
         spill_area, base, activation_slots, shadow_slots: shadow_root_slots, raw_spill_start: raw_poll_spill_start,
         native_slots: native_spill_slots,
@@ -6526,6 +6667,8 @@ fn emit_framed_inner(
         if let Some(home) = frame_base_home {
             store_home(&mut a, home, 7 /* rdi */, 0);
         }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        initialize_poll(&mut a);
         // The header state names values that are not live at the target and
         // so are never imported — deopt-only loop phis. Give those homes NIL
         // first, so a later deopt stub (a failed entry check, or any guard in
@@ -8532,7 +8675,7 @@ mod poll_map_tests {
         let emit = |roots: &[crate::t2::ir::Value], shadow_slots| {
             let mut a = Asm::new();
             let (_, map) = emit_mapped_poll(&mut a, &values, roots, &homes.values,
-                &PollFrame { arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
+                &PollFrame { fast_path: None, arguments: Vec::new(), native_frame_mode: false, spill_area: NativeValueArea::Activation(0), base: FramedHome::Stack(1), activation_slots: 0, shadow_slots,
                     raw_spill_start: 2, native_slots: 3 }, 0x12345678, false).unwrap();
             (a.finish().unwrap(), map)
         };
@@ -8697,6 +8840,7 @@ mod poll_map_tests {
                 &[tagged],
                 &homes.values,
                 &PollFrame {
+                    fast_path: None,
                     arguments: Vec::new(), native_frame_mode: false,
                     spill_area: if native_storage { NativeValueArea::NativeStack(3) } else { NativeValueArea::Activation(1) },
                     base: FramedHome::Stack(1),

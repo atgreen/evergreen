@@ -46,6 +46,8 @@ fn observe_osr() {
                     .map(|code| (state.symbol, code, state.replacement_function));
             }
         } else if owner == state.next_owner {
+            assert!(native_transfer_entry::native_poll::initialized_for_test(),
+                "the alternate T2 OSR entry must initialize its generated poll control");
             assert_eq!(
                 frame, state.frame,
                 "OSR must retain this managed activation"
