@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Defer zero-argument `DEFTYPE` bodies until type expansion, preserving
+  captured lexical bindings and use-time dynamic values
+  ([#255](https://github.com/atgreen/evergreen/pull/255)).
+
 - Accept redundant names within `DEFPACKAGE` options while preserving
   cross-category and import conflicts, including correct shadowing imports
   ([#253](https://github.com/atgreen/evergreen/pull/253)).
