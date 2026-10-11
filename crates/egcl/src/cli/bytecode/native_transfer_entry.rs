@@ -987,6 +987,7 @@ impl TransferCode {
         // An OSR source has already polled. Its destination header polls again
         // with the inherited scopes installed; deliver pending errors there,
         // through normal transfer handling, rather than skipping their cleanup.
+        let _ordinary_segment = super::call_table::enter_ordinary_segment();
         let outcome = unsafe {
             native_transfer::invoke_native_segment(
                 self.code.as_ptr().add(osr_offset.unwrap_or(0)),
@@ -2839,6 +2840,7 @@ pub(super) unsafe fn invoke_outer_callable(
         stack: egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
     };
     egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+    let _ordinary_segment = super::call_table::enter_ordinary_segment();
     let outcome = unsafe {
         native_transfer::invoke_native_segment(code, invocation, egcl_rt::current_stack())
     }.map_err(|_| EgclError::Internal("published native callable boundary is unavailable".into()))?;
