@@ -17,6 +17,7 @@ use super::super::native_transfer_entry::TransferCode;
 struct RetainedEntry<C> {
     descriptor: OrdinaryEntryDescriptor,
     cell: Arc<CallCell>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     code: Rc<C>,
 }
 
@@ -53,6 +54,7 @@ impl<C> RetainedEntries<C> {
         self.sweep();
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     fn retain(
         &mut self,
         cell: Arc<CallCell>,
@@ -90,6 +92,7 @@ impl<C> RetainedEntries<C> {
         });
     }
 
+    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     fn code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
         self.entries
             .iter()
@@ -106,6 +109,7 @@ pub(in crate::cli::bytecode) struct OrdinaryCodeDirectory {
 }
 
 impl OrdinaryCodeDirectory {
+    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     pub(in crate::cli::bytecode) fn code_for_pc(&self, pc: usize) -> Option<Rc<TransferCode>> {
         self.retained.borrow().code_for_pc(pc)
     }
@@ -126,6 +130,7 @@ pub(in crate::cli::bytecode) struct OrdinarySegmentGuard {
 }
 
 impl OrdinarySegmentGuard {
+    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
     pub(in crate::cli::bytecode) fn directory(&self) -> Rc<OrdinaryCodeDirectory> {
         Rc::clone(&self.directory)
     }
@@ -153,6 +158,7 @@ pub(in crate::cli::bytecode) fn enter_ordinary_segment() -> OrdinarySegmentGuard
 /// # Safety
 /// `cell` identifies this execution's live CallCell; descriptor entry/range and
 /// ABI metadata must describe `code` and have passed installation validation.
+#[expect(dead_code, reason = "ordinary entry installation follows in bliss-t8a48")]
 pub(in crate::cli::bytecode) unsafe fn publish_ordinary(
     cell: u64,
     descriptor: OrdinaryEntryDescriptor,
