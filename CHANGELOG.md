@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Use register arguments and native child frames for eligible Linux x86-64 T2
+  leaves and forwarding calls, preserving multiple values, moving-GC roots,
+  error backtraces, and suspended code across redefinition
+  ([#285](https://github.com/atgreen/evergreen/pull/285)).
 - Support packed `DOUBLE-FLOAT` arrays, including adjustable and displaced arrays,
   sequence operations, printing, and hash keys
   ([#278](https://github.com/atgreen/evergreen/pull/278)).
