@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Use the x86-64 return carry flag to skip redundant multiple-value cleanup in
+  ordinary T2 calls. Reduce measured untyped `fib(35)` time from 390 ms to 211 ms
+  on the benchmark host ([#308](https://github.com/atgreen/evergreen/pull/308)).
+
 - Compile eligible recursive self-calls directly through the x86-64 Lisp ABI,
   preserving `NOTINLINE`, lexical function bindings, and the executing definition
   across redefinition and garbage collection. Retain this behavior in source-free
