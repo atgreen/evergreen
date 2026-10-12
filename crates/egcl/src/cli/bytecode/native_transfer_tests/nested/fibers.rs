@@ -669,7 +669,9 @@ fn run_child_modes(refuse: bool, modes: std::ops::Range<usize>) {
                     .collect::<Vec<_>>()
             } else { Vec::new() };
             if !refuse {
-                HeapCollector::new().minor_gc().unwrap();
+                // Allocation stress can already have moved these arguments to
+                // Survivor space, which another minor collection does not visit.
+                HeapCollector::new().full_gc().unwrap();
             }
             egcl_rt::rooted!(traces = Vec::<Vec<egcl_rt::debug_stack::LogicalFrame>>::new());
             if mode >= 8 {

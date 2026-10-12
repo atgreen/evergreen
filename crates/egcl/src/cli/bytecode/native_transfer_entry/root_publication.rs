@@ -1489,7 +1489,9 @@ mod tests {
             roots.push((marker, slot, bits));
         }
         DISTINCT_RECURSIVE_ROOTS_MOVED.with(|moved| moved.set(roots.len()));
-        force_minor_gc();
+        // Earlier recursive allocations can already have moved older callers'
+        // values into Survivor space; include it in the measured collection.
+        egcl_rt::gc::full_gc().unwrap();
         for (marker, slot, before) in roots {
             let after = unsafe { slot.read() };
             assert_ne!(after.to_raw(), before,
