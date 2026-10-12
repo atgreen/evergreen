@@ -179,3 +179,55 @@ fn ordinary_foreign_guard_collection_updates_older_caller_return_home() {
     assert_eq!(crate::cli::read_eval_all_env("*ordinary-guard-home-effects*", &mut env).unwrap(),
         EgclVal::from_fixnum(1));
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_caller_guard_resumes_after_native_child_completed_once() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(setq *ordinary-caller-guard-effects* 0)
+         (defun ordinary-caller-guard-effect (x)
+           (setq *ordinary-caller-guard-effects* (+ *ordinary-caller-guard-effects* 1)) x)
+         (defun ordinary-caller-guard-child (x a b c) (ordinary-caller-guard-effect x))",
+        &mut env).unwrap();
+    let (_, child) = ordinary_t2::install("ORDINARY-CALLER-GUARD-CHILD", "(x a b c)",
+        "((ordinary-caller-guard-effect x))", &mut env);
+    let (symbol, caller) = ordinary_t2::install("ORDINARY-CALLER-GUARD-CALLER", "(x)",
+        "((+ (ordinary-caller-guard-child x nil nil nil) 1))", &mut env);
+    for code in [&child, &caller] {
+        assert!(mapped(code).ordinary_entry.is_some());
+        assert!(mapped(code).mapped_entry().is_none());
+    }
+    // A's smaller incoming overflow capacity requires a real CALL to B.
+    // B may tail-forward its own terminal effect call; that cannot erase A.
+    assert!(mapped(&caller).value_maps_for_test().iter().next().is_some());
+    for _ in 0..2 {
+        assert_eq!(run_native(&caller, symbol, &[EgclVal::from_fixnum(10)], &mut env).unwrap(),
+            EgclVal::from_fixnum(11));
+    }
+    crate::cli::read_eval_all_env("(setq *ordinary-caller-guard-effects* 0)", &mut env).unwrap();
+    egcl_rt::rooted!(input = egcl_rt::gc::alloc_double_float(2.5));
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+    let control = unsafe { &*execution }.active_native_control();
+    let segment = egcl_rt::native_transfer::current_segment();
+    // Drain ambient requests before counting cold calls; the terminal effect
+    // helper is cold, but the already-warmed A->B edge must execute directly.
+    egcl_rt::poll_safepoint();
+    assert_eq!(super::super::native_loop_should_exit(), 0);
+    native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    egcl_rt::rooted!(answer = run_native(&caller, symbol, &[*input], &mut env).unwrap());
+    assert_eq!(answer.as_double_float(), 3.5);
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
+        "only B's terminal effect call is cold; A must execute its warmed ordinary CALL");
+    assert_eq!(mapped(&caller).deopt_count(), 1, "A fails only after B completed");
+    assert_eq!(mapped(&child).deopt_count(), 0, "B completes using its ordinary forwarding entry");
+    assert_eq!(crate::cli::read_eval_all_env("*ordinary-caller-guard-effects*", &mut env).unwrap(),
+        EgclVal::from_fixnum(1), "A's post-call continuation must not execute B again");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(unsafe { &*execution }.active_native_control(), control);
+    assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
+}
