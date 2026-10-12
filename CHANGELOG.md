@@ -19,6 +19,9 @@
   leaves and forwarding calls, preserving multiple values, moving-GC roots,
   error backtraces, and suspended code across redefinition
   ([#285](https://github.com/atgreen/evergreen/pull/285)).
+- Clarify implemented native safepoint polling and the remaining per-backend
+  latency validation in the runtime specification
+  ([#291](https://github.com/atgreen/evergreen/pull/291)).
 - Support packed `DOUBLE-FLOAT` arrays, including adjustable and displaced arrays,
   sequence operations, printing, and hash keys
   ([#278](https://github.com/atgreen/evergreen/pull/278)).
