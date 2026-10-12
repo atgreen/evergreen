@@ -52,6 +52,8 @@ impl PublishedAdapter {
 /// whose `saved_sp`/`return_pc` end the physical walk.
 pub(super) struct PublishedBoundary {
     pub(super) owner: *const TransferCode,
+    /// Root activation's owner, which need not be the innermost code owner.
+    root_owner: *const TransferCode,
     // Captured on publication so stopped-fiber walks never consult the
     // collector's execution-local directory.
     directory: std::rc::Rc<super::super::call_table::OrdinaryCodeDirectory>,
@@ -318,21 +320,39 @@ unsafe fn publish_with<R>(
     });
     let context = context.unwrap_or_else(|| CAPTURE.with(Cell::get));
     let segment = native_transfer::current_segment();
-    debug_assert!(!context.is_null(), "publication needs a captured activation");
     debug_assert!(!segment.is_null(), "publication needs an active native segment");
-    let owner = if context.is_null() { std::ptr::null() } else { unsafe { (*context).owner } };
-    debug_assert!(
-        owner.is_null() || {
-            let code = unsafe { &*owner };
-            let offset = cursor.pc.wrapping_sub(code.code.as_ptr() as usize);
-            offset < code.code_len && code._native_calls.value_map(offset).is_some()
-        },
-        "a publication's PC must be a recorded site of its own owner"
-    );
     let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
+    // A rejected pre-prologue root entry has no compiled caller to publish.
+    // Its arity helper separately roots every incoming argument and closure.
+    if !segment.is_null()
+        && (cursor.call_sp, cursor.pc) == (saved_sp, unsafe { (*segment).return_pc() })
+    {
+        return body();
+    }
+    assert!(!context.is_null() && !segment.is_null(), "native publication needs an active root");
+    let root_owner = unsafe { (*context).owner };
+    assert!(!root_owner.is_null(), "native publication needs its root owner");
+    let root = unsafe { &*root_owner };
+    let directory = super::super::call_table::active_ordinary_directory();
+    let retained_owner = if cursor.pc.checked_sub(root.code.as_ptr() as usize)
+        .is_some_and(|offset| offset < root.code_len)
+    {
+        None
+    } else {
+        Some(directory.code_for_pc(cursor.pc)
+            .expect("native publication PC needs a retained code owner"))
+    };
+    let owner = retained_owner.as_ref().map_or(root_owner, std::rc::Rc::as_ptr);
+    let code = unsafe { &*owner };
+    let offset = cursor.pc.checked_sub(code.code.as_ptr() as usize)
+        .filter(|offset| *offset < code.code_len)
+        .expect("native publication PC must belong to its retained owner");
+    assert!(code._native_calls.value_map(offset).is_some(),
+        "native publication PC must have an exact value map");
     let mut boundary = PublishedBoundary {
         owner,
-        directory: super::super::call_table::active_ordinary_directory(),
+        root_owner,
+        directory,
         context,
         cursor,
         bounds: low..saved_sp,
@@ -668,12 +688,14 @@ unsafe fn walk_boundary_frames_to(
     _count_gc_walks: bool,
     visit: &mut NativeFrameVisitor<'_>,
 ) -> usize {
-    let root_owner = unsafe { &*boundary.owner };
-    let mut code = root_owner;
+    let root_owner = unsafe { &*boundary.root_owner };
+    let mut code = unsafe { &*boundary.owner };
     // Hold the selected owner while visiting its maps, independently of any
     // later lookup. The directory itself retains all in-flight revisions.
     let mut _retained_owner = None;
-    let mut context = boundary.context;
+    let mut context = if boundary.owner == boundary.root_owner {
+        boundary.context
+    } else { std::ptr::null_mut() };
     let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let mut cursor = boundary.cursor;
     let mut total = 0;
@@ -2000,6 +2022,7 @@ mod tests {
         let code = unsafe { &*published.owner };
         let malformed = |owner, pc, bounds, stack| PublishedBoundary {
             owner,
+            root_owner: published.root_owner,
             directory: std::rc::Rc::clone(&published.directory),
             context: published.context,
             cursor: NativeFrameCursor { pc, ..published.cursor },
