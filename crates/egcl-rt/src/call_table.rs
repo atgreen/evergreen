@@ -38,6 +38,8 @@ pub struct NativeCallContext {
 /// entries. The version describes this descriptor and the register/stack ABI.
 pub const ORDINARY_X64_LISP_KIND: u64 = 0x5836344c495350;
 pub const ORDINARY_X64_LISP_VERSION: u64 = 1;
+/// Binding adapters accept the actual supplied count and validate it themselves.
+pub const ORDINARY_ARITY_ANY: usize = usize::MAX;
 pub const ORDINARY_ENV_NONE: u64 = 0;
 pub const ORDINARY_ENV_CLOSURE: u64 = 1;
 
@@ -81,8 +83,23 @@ impl OrdinaryEntryDescriptor {
     }
 
     pub fn accepts(&self, nargs: usize, environment: u64) -> bool {
-        self.is_compatible() && self.arity == nargs && self.environment == environment
+        self.is_compatible()
+            && (self.arity == nargs || self.arity == ORDINARY_ARITY_ANY)
+            && self.environment == environment
     }
+}
+
+/// Immutable profiling record retained with its exact ordinary descriptor.
+/// Counter addresses name pinned, traced callable fields. A mismatching
+/// descriptor must never dereference them, including after redefinition.
+#[repr(C)]
+#[derive(PartialEq, Eq)]
+pub struct OrdinaryCallHeat {
+    pub descriptor: usize,
+    pub invocation_counter: usize,
+    pub back_edge_counter: usize,
+    pub invocation_threshold: u32,
+    pub back_edge_threshold: u32,
 }
 
 /// Stable executable slots and an opaque pointer to their owning execution's
@@ -93,6 +110,7 @@ pub struct CallCell {
     // compatibility linkage for callers that still poll after returning.
     native_entries: Option<[AtomicUsize; 2]>,
     ordinary_entry: AtomicUsize,
+    ordinary_heat: AtomicUsize,
     register_entry: AtomicUsize,
     slice_entry: AtomicUsize,
     state: AtomicUsize,
@@ -107,6 +125,7 @@ impl CallCell {
         Self {
             native_entries: None,
             ordinary_entry: AtomicUsize::new(0),
+            ordinary_heat: AtomicUsize::new(0),
             register_entry: AtomicUsize::new(cold_register),
             slice_entry: AtomicUsize::new(cold_slice),
             state: AtomicUsize::new(0),
@@ -168,6 +187,11 @@ impl CallCell {
         &self.ordinary_entry
     }
 
+    /// Atomic pointer to retained immutable OrdinaryCallHeat metadata.
+    pub fn ordinary_heat_address(&self) -> *const AtomicUsize {
+        &self.ordinary_heat
+    }
+
     /// Explicit legacy return-and-poll contract. Never call these slots as a
     /// native-transfer entry, even when a native segment happens to be active.
     pub fn checked_entry_address(&self, slice: bool) -> *const AtomicUsize {
@@ -189,6 +213,7 @@ impl CallCell {
         // before the dedicated entry slot is cleared.
         self.revision.store(revision, Ordering::Release);
         self.ordinary_entry.store(0, Ordering::Release);
+        self.ordinary_heat.store(0, Ordering::Release);
         self.register_entry
             .store(self.cold_register, Ordering::Release);
         self.slice_entry.store(self.cold_slice, Ordering::Release);
@@ -232,11 +257,16 @@ impl Table {
     }
 
     fn publish_ordinary(&self, cell: &CallCell, descriptor: &OrdinaryEntryDescriptor) -> bool {
+        self.publish_ordinary_with_heat(cell, descriptor, 0)
+    }
+
+    fn publish_ordinary_with_heat(&self, cell: &CallCell, descriptor: &OrdinaryEntryDescriptor, heat: usize) -> bool {
         if !descriptor.is_compatible()
             || self.bindings[cell.ordinal].revision != descriptor.revision
         {
             return false;
         }
+        cell.ordinary_heat.store(heat, Ordering::Release);
         cell.ordinary_entry
             .store(descriptor as *const _ as usize, Ordering::Release);
         true
@@ -325,6 +355,19 @@ pub fn invalidate(symbol: u32) {
     if let Some(&ordinal) = table.by_symbol.get(&symbol) {
         table.invalidate(ordinal);
     }
+}
+
+/// Publish retained profiling metadata atomically with the descriptor's
+/// revision check. Zero removes any previous profile (e.g. a named adapter).
+///
+/// # Safety
+/// Both pointers must remain valid under the same execution segment lease;
+/// a nonzero heat pointer must identify this exact descriptor.
+pub unsafe fn publish_ordinary_with_heat(
+    cell: &CallCell, descriptor: &OrdinaryEntryDescriptor, heat: usize,
+) -> bool {
+    TABLE.get_or_init(Default::default).lock().unwrap()
+        .publish_ordinary_with_heat(cell, descriptor, heat)
 }
 
 /// Existing broad native-code invalidations also redirect callable slots.
@@ -429,6 +472,10 @@ mod tests {
         assert!(entry.accepts(4, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(3, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(4, ORDINARY_ENV_CLOSURE));
+        let binder = OrdinaryEntryDescriptor { arity: ORDINARY_ARITY_ANY, ..entry };
+        assert!(binder.accepts(0, ORDINARY_ENV_NONE));
+        assert!(binder.accepts(19, ORDINARY_ENV_NONE));
+        assert!(!binder.accepts(19, ORDINARY_ENV_CLOSURE));
     }
 
     #[test]

@@ -113,8 +113,8 @@ fn native_adapter_preserves_returning_restart_dynamic_context_and_values() {
     );
     assert!(stdout.contains("NATIVE-RETURNING-RESTART-OK"), "{stdout}");
     assert!(
-        stdout.contains("Mapped native transfer ABI"),
-        "caller must execute native segment code: {stdout}"
+        stdout.contains("Ordinary x86-64 Lisp ABI"),
+        "caller must execute ordinary native segment code: {stdout}"
     );
 }
 
@@ -122,7 +122,7 @@ fn native_adapter_preserves_returning_restart_dynamic_context_and_values() {
 fn t2_calls_stop_before_later_side_effects() {
     let program = r#"
         (defvar *after-transfer* 0)
-        ;; Keep global mutation behind a call so this caller remains mapped.
+        ;; Keep the side effect behind a distinct native call.
         (defun t2-after-transfer () (incf *after-transfer*))
         (defun t2-leaf (fail) (when fail (error "expected")) 1)
         (defun t2-middle (fail) (t2-leaf fail) (t2-after-transfer))
@@ -204,9 +204,10 @@ fn t2_calls_stop_before_later_side_effects() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stderr.contains("T2-SELF: optimized worker result installed with mapped T2 ABI;"),
-            "recursive function must publish mapped T2 code: {stderr}");
-        assert!(stdout.contains("native recursive entry veneer"), "{stdout}");
+        assert!(stderr.contains("T2-SELF: optimized worker result installed with ordinary x86-64 Lisp T2 ABI;"),
+            "recursive function must publish ordinary register T2 code: {stderr}");
+        assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
+        assert!(!stdout.contains("native recursive entry veneer"), "{stdout}");
         // Machine-stack recursion retires depth inline; DEC preserves the
         // carry flag that now reports the native multiple-value return status.
         assert!(stdout.contains("dec dword [r11]"), "{stdout}");
@@ -261,7 +262,7 @@ fn osr_calls_stop_before_later_side_effects() {
 fn native_calls_stop_at_errors_and_nonlocal_exits() {
     let program = r#"
         (defvar *after-transfer* 0)
-        ;; Keep global mutation behind a call so this caller remains mapped.
+        ;; Keep the side effect behind a distinct native call.
         (defun native-after-transfer () (incf *after-transfer*))
         (defun signal-leaf (fail) (when fail (error "expected")) 1)
         (defun throw-leaf (fail) (when fail (throw 'escape 42)) 1)
@@ -295,14 +296,14 @@ fn native_calls_stop_at_errors_and_nonlocal_exits() {
         NATIVE-DISASSEMBLY
         (format t "NATIVE-TRANSFERS-OK~%")
     "#;
-    let mapped_listing = cfg!(all(
+    let native_listing = cfg!(all(
         target_arch = "x86_64",
         target_os = "linux",
         not(egcl_no_disassembly)
     ));
     let program = program.replace(
         "NATIVE-DISASSEMBLY",
-        if mapped_listing {
+        if native_listing {
             "(disassemble 'code-middle)"
         } else {
             ""
@@ -325,10 +326,10 @@ fn native_calls_stop_at_errors_and_nonlocal_exits() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("NATIVE-TRANSFERS-OK"));
-        if mapped_listing {
+        if native_listing {
             assert!(
-                String::from_utf8_lossy(&output.stdout).contains("Mapped native transfer ABI"),
-                "caller must use the mapped ABI:\n{}",
+                String::from_utf8_lossy(&output.stdout).contains("Ordinary x86-64 Lisp ABI"),
+                "caller must use the ordinary ABI:\n{}",
                 String::from_utf8_lossy(&output.stdout)
             );
         } else if direct == "1" && !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
@@ -444,7 +445,7 @@ fn osr_transfers_preserve_inherited_handlers_and_cleanup_order() {
 fn native_reentry_preserves_resumption_and_cleanup_replacement() {
     let program = r#"
         (defvar *transfer-effects* 0)
-        ;; Keep global mutation behind a call so this caller remains mapped.
+        ;; Keep the side effect behind a distinct native call.
         (defun transfer-after () (incf *transfer-effects*))
         (defvar *transfer-binding* :outer)
         (defvar *cleanup-log* nil)

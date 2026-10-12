@@ -198,3 +198,28 @@ at_both_tiers!(
     optional_rest_t1,
     optional_rest_t2
 );
+
+fn ordinary_primitives_preserve_global_and_cons_semantics(tier: &str) {
+    check_native(
+        r#"
+        (defvar *abi-global* 10)
+        (defun abi-global-read () *abi-global*)
+        (defun abi-global-store (x) (setq *abi-global* x))
+        (defun abi-pair (x) (cons x (cons (+ x 1) nil)))
+        (dotimes (i 40)
+          (assert (= (abi-global-store i) i))
+          (assert (= (abi-global-read) i))
+          (assert (equal (abi-pair i) (list i (+ i 1)))))
+        (assert (= (abi-global-store 73) 73))
+        (assert (= (abi-global-read) 73))
+        (assert (equal (abi-pair 20) '(20 21)))
+        "#,
+        &["abi-global-read", "abi-global-store", "abi-pair"],
+        tier,
+    );
+}
+at_both_tiers!(
+    ordinary_primitives_preserve_global_and_cons_semantics,
+    primitives_t1,
+    primitives_t2
+);

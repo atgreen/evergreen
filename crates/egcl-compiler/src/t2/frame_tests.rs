@@ -428,3 +428,31 @@ fn windows_t2_stack_probe_preserves_four_compiled_arguments() {
     let args = [0x1000_0001, 0x2000_0002, 0x4000_0004, 0x8000_0008];
     assert_eq!(call_compiled_entry(code.as_ptr(), &args), args.iter().sum());
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn large_cyclic_home_moves_probe_the_snapshot_stack_pages() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+    let moves: Vec<_> = (0..1030).map(|index| (
+        FramedHome::Stack(index),
+        HomeMoveSrc::Home(FramedHome::Stack((index + 1) % 1030)),
+    )).collect();
+    let mut asm = Asm::new();
+    parallel_home_move(&mut asm, &moves);
+    let bytes = asm.finish().unwrap();
+    let mut decoder = Decoder::new(64, &bytes, DecoderOptions::NONE);
+    let mut reserved = 0;
+    while reserved < 8240 {
+        let sub = decoder.decode();
+        assert_eq!(sub.mnemonic(), Mnemonic::Sub);
+        assert_eq!(sub.op0_register(), Register::RSP);
+        let step = sub.immediate(1);
+        assert!(step <= 4096, "snapshot skipped a stack page: {step}");
+        reserved += step;
+        let touch = decoder.decode();
+        assert_eq!(touch.mnemonic(), Mnemonic::Test);
+        assert_eq!(touch.memory_base(), Register::RSP);
+        assert_eq!(touch.memory_displacement64(), 0);
+    }
+    assert_eq!(reserved, 8240);
+}

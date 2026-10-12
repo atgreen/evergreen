@@ -24,14 +24,14 @@ fn run(program: &str) -> String {
 }
 
 #[test]
-fn linux_default_installs_mapped_native_calls() {
+fn linux_default_installs_ordinary_register_calls() {
     let output = run("(defun policy-leaf (x) (list x))
         (defun policy-caller (x) (policy-leaf x))
         (dotimes (i 40) (assert (equal '(8) (policy-caller 8))))
         (format t \"POLICY-TIER=~D~%\" (egcl-ext:function-tier 'policy-caller))
         (disassemble 'policy-caller)");
     assert!(output.contains("POLICY-TIER=1"), "{output}");
-    assert!(output.contains("Mapped native transfer ABI"), "{output}");
+    assert!(output.contains("Ordinary x86-64 Lisp ABI"), "{output}");
     assert!(!output.contains("Legacy checked ABI"), "{output}");
 }
 

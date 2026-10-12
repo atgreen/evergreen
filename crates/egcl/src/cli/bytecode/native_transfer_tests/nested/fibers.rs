@@ -296,6 +296,10 @@ fn child_fiber_checked() -> EgclVal {
             mode != 5 || code.has_deopt,
             "fiber must suspend in a real guard continuation"
         );
+        if mode == 5 {
+            assert!(code.ordinary_entry.is_some() && code.mapped_entry().is_none(),
+                "guarded child suspends through its ordinary segment boundary");
+        }
         code
     } else {
         TransferCode::compile_nested_protected(Arc::clone(&body)).unwrap()
@@ -408,8 +412,8 @@ fn child_fiber_checked() -> EgclVal {
     }
     assert_eq!(
         take_nested_entries(),
-        1,
-        "the suspended invocation must use a mapped child"
+        usize::from(mode != 5),
+        "protected children share the mapped segment; the ordinary guard child has its own boundary"
     );
     if mode == 3 {
         assert_eq!(

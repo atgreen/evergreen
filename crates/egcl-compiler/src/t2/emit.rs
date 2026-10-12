@@ -151,9 +151,15 @@ pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_call.rs"]
 mod ordinary_call;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_primitives.rs"]
+mod ordinary_primitives;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, OrdinaryCallTarget, OrdinaryCallFlags,
+    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, OrdinaryCallTarget, OrdinaryCallFlags,
     OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -1297,10 +1303,15 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
         return;
     }
     let bytes = ((moves.len() * 8) + 15) & !15;
-    #[cfg(all(target_arch = "x86_64", windows))]
-    probe_windows_stack(a, bytes as u32);
-    a.extend_from_slice(&[0x48, 0x81, 0xEC]);
-    a.extend_from_slice(&(bytes as i32).to_le_bytes());
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    ordinary_call::reserve_ordinary_stack(a, bytes);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    {
+        #[cfg(all(target_arch = "x86_64", windows))]
+        probe_windows_stack(a, bytes as u32);
+        a.extend_from_slice(&[0x48, 0x81, 0xEC]);
+        a.extend_from_slice(&(bytes as i32).to_le_bytes());
+    }
     for (i, (_, src)) in moves.iter().enumerate() {
         match src {
             HomeMoveSrc::Home(home) => load_home(a, RAX, *home, bytes as i32),
@@ -4505,13 +4516,16 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_call_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let ordinary_returns_from_call = ordinary_call.is_some_and(|call| matches!(call.return_policy, ordinary_call::OrdinaryReturnPolicy::FromCall(_)));
+    let ordinary_returns_from_call = ordinary_call.is_some_and(|call| matches!(call.return_policy, ordinary_call::OrdinaryReturnPolicy::Call(_)));
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_returns_from_call = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_guard_veneer = ordinary_call.and_then(|call| call.guard).map(|guard| guard.veneer);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_guard_veneer: Option<u64> = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let native_poll_veneer = ordinary_call.and_then(|call| call.poll_veneer)
+        .or_else(|| transfers.as_ref().and_then(|transfer| transfer.poll_veneer));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4655,7 +4669,7 @@ fn emit_framed_inner(
     // even when the ordinary body contains no calls or guards.
     let has_checked_osr = f.osr_entries.iter().any(|osr| !osr.checks.is_empty());
     let has_calls = has_ir_calls || has_inlined_scopes || has_segment_calls || has_checked_osr
-        || code_id != 0;
+        || code_id != 0 || ordinary_call_mode;
 
     // Precise state-transfer deopt (bliss-mba): a function that CALLS other code
     // can commit a visible side effect before a later guard fails, so re-running
@@ -4949,10 +4963,7 @@ fn emit_framed_inner(
     let (backedge_headers, loop_points): (
         HashSet<crate::t2::ir::Block>,
         HashMap<crate::t2::ir::Block, usize>,
-    ) = if transfers
-        .as_ref()
-        .and_then(|transfer| transfer.poll_veneer)
-        .is_some()
+    ) = if native_poll_veneer.is_some()
     {
         let mut successors: HashMap<_, Vec<_>> = HashMap::new();
         for &block in &blocks {
@@ -5042,10 +5053,7 @@ fn emit_framed_inner(
     let (straight_poll_sources, straight_poll_points): (
         HashSet<Inst>,
         HashMap<Inst, usize>,
-    ) = if transfers
-        .as_ref()
-        .and_then(|transfer| transfer.poll_veneer)
-        .is_some()
+    ) = if native_poll_veneer.is_some()
     {
         const POLL_INTERVAL: usize = 64;
         let mut sources = HashSet::new();
@@ -5525,7 +5533,10 @@ fn emit_framed_inner(
             if pad {
                 a.extend_from_slice(&[0x48, 0x83, 0xEC, 0x08]);
             }
-            if spill_bytes != 0 {
+            if ordinary_mode {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                ordinary_call::reserve_ordinary_stack(a, spill_bytes);
+            } else if spill_bytes != 0 {
                 a.extend_from_slice(&[0x48, 0x81, 0xEC]);
                 a.extend_from_slice(&(spill_bytes as i32).to_le_bytes());
             }
@@ -5734,10 +5745,7 @@ fn emit_framed_inner(
         a.bind(block_label[&b]);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if backedge_headers.contains(&b) {
-            let poll_veneer = transfers
-                .as_ref()
-                .and_then(|transfer| transfer.poll_veneer)
-                .ok_or(EmitError::UnsupportedOp(0xFE))?;
+            let poll_veneer = native_poll_veneer.ok_or(EmitError::UnsupportedOp(0xFE))?;
             let (call, values) = emit_mapped_poll(
                 &mut a,
                 loop_maps.get(&b).ok_or(EmitError::UnsupportedOp(0xFE))?,
@@ -5749,7 +5757,7 @@ fn emit_framed_inner(
             )?;
             native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
             native_calls.push(call.site(NativeCallOrigin::LoopPoll(b), NativeStackBase::Body));
-            if local_osr_scopes
+            if transfer_mode && local_osr_scopes
                 && let Some(map) = crate::t2::transfer_map::lower_poll_transfer_map(
                     f, b, loop_points[&b], &loop_maps[&b],
                 )
@@ -5791,10 +5799,7 @@ fn emit_framed_inner(
             let d = f.inst(inst).clone();
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             if straight_poll_sources.contains(&inst) {
-                let poll_veneer = transfers
-                    .as_ref()
-                    .and_then(|transfer| transfer.poll_veneer)
-                    .ok_or(EmitError::UnsupportedOp(0xFE))?;
+                let poll_veneer = native_poll_veneer.ok_or(EmitError::UnsupportedOp(0xFE))?;
                 let (call, values) = emit_mapped_poll(
                     &mut a,
                     straight_poll_maps.get(&inst).ok_or(EmitError::UnsupportedOp(0xFE))?,
@@ -6457,7 +6462,9 @@ fn emit_framed_inner(
                 }
                 // An intermediate or guarded continuation consumes the primary. Preserve it
                 // before root reloads; its later FrameState must not replay CALL.
-                store_home(&mut a, homes[&d.results[0]], RAX, 0);
+                if let Some(result) = d.results.first() {
+                    store_home(&mut a, homes[result], RAX, 0);
+                }
             }
             for (home, src) in result_stores {
                 store_home(&mut a, home, src, 0);
@@ -6872,7 +6879,10 @@ fn emit_framed_inner(
         a.bind(label);
         #[cfg(all(target_arch = "x86_64", windows))]
         probe_windows_stack(&mut a, alloc as u32);
-        if alloc > 0 {
+        if ordinary_mode {
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            ordinary_call::reserve_ordinary_stack(&mut a, alloc);
+        } else if alloc > 0 {
             a.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
             a.extend_from_slice(&(alloc as i32).to_le_bytes());
         }

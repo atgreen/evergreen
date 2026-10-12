@@ -46,6 +46,12 @@ fn native_v2_recursive_frames_preserve_moving_roots_and_retire_on_error() {
             Arc::clone(&body),
         );
         let code = TransferCode::compile(Arc::clone(&body)).expect("admit recursive source body");
+        assert!(code.ordinary_entry.is_some() && code.mapped_entry().is_none());
+        assert!(code.value_maps_for_test().iter().next().is_some());
+        let symbol = egcl_rt::symbols::intern(name);
+        let installed = native_transfer_entry::install_baseline_code(symbol, code).unwrap();
+        publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed);
+        let NativeCodeStorage::Mapped(code) = &installed._storage else { unreachable!() };
         egcl_rt::rooted!(
             args = vec![
                 EgclVal::from_fixnum(8),
@@ -62,8 +68,8 @@ fn native_v2_recursive_frames_preserve_moving_roots_and_retire_on_error() {
         egcl_rt::rooted!(result = code.run(&args, &mut env));
         assert_eq!(
             take_recursive_entries(),
-            8,
-            "all recursive calls entered native code: {:?}; result={:?}",
+            0,
+            "ordinary recursive calls must not enter legacy frames: {:?}; result={:?}",
             body.code,
             &*result
         );

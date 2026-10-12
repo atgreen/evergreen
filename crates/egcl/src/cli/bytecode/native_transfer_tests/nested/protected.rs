@@ -240,7 +240,7 @@ fn native_v2_protected_child_handler_recovery_retires_clusters() {
             egcl_rt::symbols::symbol_function(symbol),
             &installed,
         );
-        let caller = compile_caller("(x)", "((protected-handler-child x))", &env);
+        let caller = compile_mapped_caller("(x)", "((protected-handler-child x))", &env);
         caller.run(&[NIL], &mut env).unwrap();
         take_nested_entries();
         super::super::super::native_transfer_entry::take_native_fallback_count();

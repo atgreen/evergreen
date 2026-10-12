@@ -8,6 +8,7 @@ use super::native_transfer_entry::root_publication::PublishedAdapter;
 use super::*;
 use egcl_compiler::t2::native_transfer::{MappedCallRecord, emit_published_call_entry_descriptor};
 use egcl_rt::function::NativeCallableEntries;
+use egcl_rt::jit::JitBuffer;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 
 pub(super) mod outer;
@@ -53,6 +54,9 @@ struct Entries {
 static COLLECT_NEXT: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
 #[cfg(test)]
+static COLLECT_WRAPPER_ONLY: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
+#[cfg(test)]
 static MOVED: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<bool>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(false)) };
 #[cfg(test)]
@@ -76,8 +80,14 @@ pub(super) fn inject_entry_poll_error() {
 
 #[cfg(test)]
 pub(super) fn collect_next_entry() {
+    COLLECT_WRAPPER_ONLY.with(|flag| flag.set(false));
     COLLECT_NEXT.with(|flag| flag.set(true));
     MOVED.with(|flag| flag.set(false));
+}
+#[cfg(test)]
+pub(super) fn collect_next_wrapped_entry() {
+    collect_next_entry();
+    COLLECT_WRAPPER_ONLY.with(|flag| flag.set(true));
 }
 #[cfg(test)]
 pub(super) fn take_relocation() -> bool {
@@ -86,7 +96,15 @@ pub(super) fn take_relocation() -> bool {
 #[cfg(test)]
 pub(super) unsafe fn collect_at_entry(target: u64) -> Result<(), EgclError> {
     use egcl_rt::Collector;
+    // FUNCALL/APPLY can enter through a symbol designator before dispatching
+    // the movable cons wrapper whose publication this fixture exercises.
+    if COLLECT_WRAPPER_ONLY.with(|flag| flag.get())
+        && !unsafe { *(target as *const EgclVal) }.is_cons()
+    {
+        return Ok(());
+    }
     if COLLECT_NEXT.with(|flag| flag.replace(false)) {
+        COLLECT_WRAPPER_ONLY.with(|flag| flag.set(false));
         let before = unsafe { *(target as *const EgclVal) }.to_raw();
         // Full collection also relocates actuals aged by stress collections
         // during fixture construction.

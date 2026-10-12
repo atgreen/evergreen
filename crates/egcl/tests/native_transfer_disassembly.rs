@@ -6,13 +6,13 @@
 use std::process::Command;
 
 #[test]
-fn disassemble_labels_installed_mapped_code_with_cache_disabled() {
+fn disassemble_labels_installed_ordinary_code_with_cache_disabled() {
     check_listing(false);
 }
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn disassemble_labels_installed_mapped_code_with_cache_enabled() {
+fn disassemble_labels_installed_ordinary_code_with_cache_enabled() {
     assert!(
         egcl_rt::native_transfer::is_supported(),
         "segment execution gate"
@@ -38,7 +38,7 @@ fn check_listing(enabled: bool) {
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
+    assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
     assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
     assert!(
         stdout.contains("+0000:"),

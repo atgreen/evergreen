@@ -901,7 +901,8 @@ impl Function {
         let data = self.inst(call).clone();
         if data.opcode != Opcode::Call
             || data.frame_state.is_none()
-            || !matches!(data.aux, AuxData::CallTarget(_))
+            || !matches!(data.aux, AuxData::CallTarget(_) | AuxData::GlobalValue { .. }
+                | AuxData::FunctionLookup(_))
             || !self.block_has_terminator(block)
         {
             return Err("exceptional conversion requires a mapped call in a finished block");

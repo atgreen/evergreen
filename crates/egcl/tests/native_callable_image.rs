@@ -29,13 +29,11 @@ fn run(args: &[&str], marker: &str) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(marker));
     if marker == "CALLABLE-RESTORE-OK" {
-        // Restored forwarding bodies can select the ordinary register entry;
-        // other shapes retain the mapped transfer entry. Both must describe
-        // currently installed T2 code, not an interpreter-only restoration.
+        // The restored FUNCALL wrapper must reinstall an ordinary register
+        // entry and its local named adapter in this process.
         assert!(stdout.contains("; T2 —"), "{stdout}");
         assert!(
-            stdout.contains("Mapped native transfer ABI — installed native code.")
-                || stdout.contains("Ordinary x86-64 Lisp ABI — installed native code."),
+            stdout.contains("Ordinary x86-64 Lisp ABI — installed native code."),
             "{stdout}"
         );
     }

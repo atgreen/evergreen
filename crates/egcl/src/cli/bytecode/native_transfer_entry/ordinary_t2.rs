@@ -105,7 +105,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         ));
         return None;
     };
-    code.installed_symbol = Some(symbol);
+    code.set_installed_symbol(symbol);
     let code = Rc::new(code);
     let entry = code.code.as_ptr();
     // Report the actual mapped bytes and positions, never the checked fallback.
@@ -140,8 +140,12 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         let raw_f64_values = (0..prepared.ir.num_values()).filter(|&index|
             prepared.ir.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
         ).count();
+        let abi = match &native._storage {
+            NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
+            _ => "mapped",
+        };
         t2_log_write(format_args!(
-            "{}: mapped T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}",
+            "{}: {abi} T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}",
             display_fn_name(&body.name)
         ));
     }

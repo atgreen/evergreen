@@ -110,8 +110,11 @@ fn callback_errors_keep_their_original_chain_after_c_returns() {
                 let log = std::fs::read_to_string(&t2_log).unwrap();
                 let installed = log
                     .lines()
-                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: optimized worker result installed with mapped T2 ABI;"))
-                    .unwrap_or_else(|| panic!("leaf must have mapped native publication evidence: {log}"));
+                    // Branches with unknown MV state can retain the mapped body;
+                    // both entries must be installed native T2 code for this trace test.
+                    .find(|line| line.contains("CALLBACK-TRACE-LEAF: optimized worker result installed with ordinary x86-64 Lisp T2 ABI;")
+                        || line.contains("CALLBACK-TRACE-LEAF: optimized worker result installed with mapped T2 ABI;"))
+                    .unwrap_or_else(|| panic!("leaf must have native T2 publication evidence: {log}"));
                 assert!(installed.contains("entry=0x"), "{installed}");
             }
             let trace_start = stderr.find("Backtrace (").expect("terminal backtrace");

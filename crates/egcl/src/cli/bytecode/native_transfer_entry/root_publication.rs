@@ -284,7 +284,7 @@ impl Drop for Linked {
 /// `image` must be the live capture the published veneer built for this
 /// helper invocation, and the caller must not hold a Rust reference to it
 /// across writes through the overlapping outcome pointer.
-pub(super) unsafe fn published<R>(
+pub(in crate::cli::bytecode) unsafe fn published<R>(
     image: *mut egcl_compiler::t2::native_transfer::SysvTransferCapture,
     body: impl FnOnce() -> R,
 ) -> R {

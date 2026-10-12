@@ -70,6 +70,9 @@ pub(super) fn pause_native_child_for_test() -> Result<EgclVal, EgclError> {
 pub(super) use native_transfer_tests::{NativeEvalProbe, native_reentry_event_for_test};
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use native_transfer_tests::recursive_heat::recursive_heat_observe_for_test;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use native_transfer_tests::ordinary_t2::{ordinary_t2_root_for_test, ordinary_t2_entry_for_test};
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
@@ -19988,8 +19991,12 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
             .filter(|&value| egcl_rt::function::is_interpreted_function(value));
         mark_fresh_promotion(done.sym);
         publish_native(done.sym, function, &native);
+        let abi = match &native._storage {
+            NativeCodeStorage::Mapped(code) if code.ordinary_entry.is_some() => "ordinary x86-64 Lisp",
+            _ => "mapped",
+        };
         t2_log_write(format_args!(
-            "{}: optimized worker result installed with mapped T2 ABI; bytes={}, entry={:p}, activation_slots={}, osr_entries={}",
+            "{}: optimized worker result installed with {abi} T2 ABI; bytes={}, entry={:p}, activation_slots={}, osr_entries={}",
             display_fn_name(&bf.name), native.code_len, native.entry,
             native.num_slots, native.osr_entries.len()
         ));
@@ -22743,10 +22750,16 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
             | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
-            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
-            | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)))
+            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
+    } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && bf.code.iter().any(|op| matches!(op, Instr::LoadGlobal(_) | Instr::StoreGlobal(_)))
+    {
+        // Keep scope-free global operations available to ordinary primitive
+        // lowering. The native-scope builder makes them exceptional Invokes
+        // before optimization, which belong to the mapped control protocol.
+        egcl_compiler::t2::build::build_for_transfer_optimization(bf, sym)
     } else {
         egcl_compiler::t2::build::build_from_bytecode_with_inline_options(bf, inline_options)
     };

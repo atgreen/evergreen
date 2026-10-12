@@ -114,9 +114,21 @@ pub(super) fn invoke(
     unsafe { native_transfer_entry::invoke_outer_ordinary(entry, *function, &args, env) }
 }
 
+// A one-shot, noncollecting observer verifies the machine entry precondition
+// before the callable helper polls or dispatches its body.
+#[cfg(test)]
+type EntryObserver = Cell<Option<fn()>>;
+#[cfg(test)]
+pub(super) static ENTRY_OBSERVER: egcl_rt::execution_local::ExecutionLocal<EntryObserver> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
 // The ordinary root shim owns the segment's machine geometry. Keep the
 // invocation chain for diagnostics while no mapped adapter record is involved.
 pub(super) fn observe_ordinary_entry() {
+    #[cfg(test)]
+    if let Some(observe) = ENTRY_OBSERVER.with(|slot| slot.take()) {
+        observe();
+    }
     let invocation = ACTIVE.with(Cell::get);
     assert!(
         !invocation.is_null(),

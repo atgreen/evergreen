@@ -26,6 +26,22 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<Nat
     result
 }
 
+// Keep the final generated owner suspended across the collecting/suspending
+// terminal adapter. Earlier forwarders still use production tail admission;
+// allowing this last edge to tail-jump would remove the native homes under test.
+fn install_terminal_caller(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
+    let result = native_transfer_entry::with_ordinary_non_tail_emission_for_test(|| {
+        install_ordinary(name, params, forms, env)
+    });
+    let NativeCodeStorage::Mapped(mapped) = &result.1._storage else {
+        panic!("ordinary terminal caller")
+    };
+    assert!(mapped.ordinary_entry.is_some());
+    assert_eq!(mapped.value_maps_for_test().iter().count(), 2,
+        "terminal CALL retains both admitted and cold continuation maps");
+    result
+}
+
 const READY: &str = "*ORDINARY-TAIL-FIBER-READY*";
 const RELEASE: &str = "*ORDINARY-TAIL-FIBER-RELEASE*";
 
@@ -58,7 +74,7 @@ impl Drop for Cohort<'_> {
 fn tail_fiber() -> EgclVal {
     let mut env = Env::new_impl(false, false, false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    let (_, middle) = install(
+    let (_, middle) = install_terminal_caller(
         "ORDINARY-TAIL-FIBER-MIDDLE",
         "(a b c d)",
         "((ordinary-tail-fiber-terminal b d a c))",
@@ -103,11 +119,14 @@ fn tail_fiber() -> EgclVal {
     egcl_rt::poll_safepoint();
     assert_eq!(super::super::native_loop_should_exit(), 0);
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     let result = run_native(&outer, symbol, &arguments, &mut env).unwrap();
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
     assert_eq!(
-        native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
         1,
-        "only the terminal suspension call is cold; middle uses the generated edge"
+        "only the terminal suspension uses the named adapter; middle enters its generated body"
     );
     assert_eq!(result, arguments[2]);
     assert!(env.mv_active);
@@ -304,7 +323,8 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         } else {
             format!("((ordinary-tail-chain-{} d c b a))", index + 1)
         };
-        codes.push(install(
+        let emit = if index == BRIDGES { install_terminal_caller } else { install };
+        codes.push(emit(
             &format!("ORDINARY-TAIL-CHAIN-{index}"),
             "(a b c d)",
             &body,
@@ -343,11 +363,14 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         }
         let bits: Vec<_> = arguments.iter().map(|value| value.to_raw()).collect();
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test();
         egcl_rt::rooted!(error = run_native(&root, symbol, &arguments, &mut env).unwrap_err());
+        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+            "all generated edges are admitted");
         assert_eq!(
-            native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+            native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
             1,
-            "repeat {repeat}: all 65 forwarding edges must tail-jump; only terminal C is cold"
+            "repeat {repeat}: all 65 forwarding edges tail-jump; only terminal C uses the named adapter"
         );
         assert!(
             arguments
@@ -418,7 +441,7 @@ fn ordinary_tail_descendant_overflow_preserves_suspended_caller_roots() {
          (defun ordinary-tail-overflow-b (a b c d)
            (ordinary-tail-overflow-c c d a b))", &mut env,
     ).unwrap();
-    let (_, c) = install("ORDINARY-TAIL-OVERFLOW-C", "(a b c d)",
+    let (_, c) = install_terminal_caller("ORDINARY-TAIL-OVERFLOW-C", "(a b c d)",
         "((ordinary-tail-overflow-terminal a b c d))", &mut env);
     let (_, b) = install("ORDINARY-TAIL-OVERFLOW-B", "(a b c d)",
         "((ordinary-tail-overflow-c c d a b))", &mut env);
@@ -460,9 +483,12 @@ fn ordinary_tail_descendant_overflow_preserves_suspended_caller_roots() {
     egcl_rt::poll_safepoint();
     assert_eq!(super::super::native_loop_should_exit(), 0);
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(error = run_native(&a, symbol, &arguments, &mut env).unwrap_err());
-    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
-        "A CALL and B tail JMP are admitted; only C's terminal call is cold");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 1,
+        "A CALL and B tail JMP are admitted; only C's terminal uses the named adapter");
     assert!(arguments.iter().zip(bits).any(|(value, bits)| value.to_raw() != bits),
         "collection must actually relocate supplied arguments");
     assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);

@@ -32,7 +32,7 @@ mod ordinary_tail;
 mod packed_f64;
 mod payloads;
 mod recursion;
-mod recursive_heat;
+pub(super) mod recursive_heat;
 mod deopt;
 
 #[test]

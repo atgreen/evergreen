@@ -236,6 +236,12 @@ pub fn back_edge_count(f: EgclVal) -> u32 {
     unsafe { (*data(f)).back_edge_count.load(Ordering::Relaxed) }
 }
 
+/// Stable address of the pinned callable's loop counter. The caller must
+/// retain a traced root, as for `invocation_counter_address`.
+pub fn back_edge_counter_address(f: EgclVal) -> Option<*const core::sync::atomic::AtomicU32> {
+    is_interpreted_function(f).then(|| unsafe { std::ptr::addr_of!((*data(f)).back_edge_count) })
+}
+
 /// Reset the loop back-edge count to zero. Used as OSR-deopt backoff (bliss-izt.2):
 /// after a speculating OSR loop deoptimizes back to T0, clearing the counter means
 /// the loop must run another full threshold of interpreted iterations before it is

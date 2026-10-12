@@ -32,7 +32,7 @@ impl egcl_rt::gc::TraceHostRoots for ArityRoots {
 
 // The assembly request and every actual incoming word stay writable and live
 // throughout body. No references to those values cross a possible collection.
-unsafe fn with_arity_roots<R>(request: *mut OrdinaryArityRequest, body: impl FnOnce() -> R) -> R {
+pub(in crate::cli::bytecode) unsafe fn with_entry_roots<R>(request: *mut OrdinaryArityRequest, body: impl FnOnce() -> R) -> R {
     let mut roots = ArityRoots(request);
     egcl_rt::rooted_ref!(_roots = &mut roots);
     body()
@@ -45,6 +45,14 @@ thread_local! {
 #[cfg(test)]
 static COLD_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
+#[cfg(test)]
+static NAMED_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_named_entries_for_test() -> usize {
+    NAMED_ENTRIES.with(|count| count.replace(0))
+}
+
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn take_cold_calls_for_test() -> usize {
     COLD_CALLS.with(|count| count.replace(0))
@@ -64,7 +72,7 @@ unsafe fn refresh_control(control: *mut NativeRecursiveControl) {
     control.deadline_armed = u8::from(egcl_rt::sandbox_cpu_deadline_armed());
 }
 
-fn finish(result: Result<EgclVal, EgclError>, out: *mut OrdinaryHelperOutcome) {
+pub(in crate::cli::bytecode) fn finish(result: Result<EgclVal, EgclError>, out: *mut OrdinaryHelperOutcome) {
     let value = match result {
         Ok(value) => value,
         Err(error) => {
@@ -147,6 +155,46 @@ pub(super) unsafe extern "C" fn cold_call(
     }
 }
 
+/// Ordinary ingress for runtime-bound named targets. The request contains the
+/// actual register/overflow arguments, including excess arguments needed for
+/// diagnostics. Every source remains a writable root until the copy is rooted.
+pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    let request = request.cast::<OrdinaryArityRequest>();
+    #[cfg(test)]
+    if !ordinary_primitives::is_private(unsafe { (*request).entry_data } as u32) {
+        NAMED_ENTRIES.with(|count| count.set(count.get() + 1));
+    }
+    unsafe {
+        with_entry_roots(request, || {
+            root_publication::published(image, || {
+                let execution = egcl_rt::thread::current_execution_context_for_native()
+                    .expect("ordinary named adapter owns an execution");
+                let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
+                let result = guard_c2i(|| {
+                    if native_error_pending() { return Ok(NIL); }
+                    egcl_rt::rooted!(args = Vec::new());
+                    let count = (*request).nargs;
+                    args.try_reserve_exact(count).map_err(|_| EgclError::Oom)?;
+                    args.extend_from_slice(&(&(*request).register_args)[..count.min(3)]);
+                    if count > 3 {
+                        args.extend_from_slice(std::slice::from_raw_parts((*request).overflow_args, count - 3));
+                    }
+                    let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+                    poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
+                    if poll.exit != NativeExit::Returned { return Ok(NIL); }
+                    super::super::call_table::ordinary_call((*request).entry_data as u32, &args)
+                });
+                refresh_control(control);
+                finish(result, out);
+            });
+        });
+    }
+}
+
 /// Finish a precise guard continuation through the ordinary tuple protocol.
 pub(super) unsafe extern "C" fn guard(
     request: *mut u8,
@@ -174,7 +222,7 @@ pub(super) unsafe extern "C" fn wrong_arity(
 ) {
     let request = request.cast::<OrdinaryArityRequest>();
     unsafe {
-        with_arity_roots(request, || {
+        with_entry_roots(request, || {
             root_publication::published(image, || {
                 let result = guard_c2i(|| {
                     if native_error_pending() {
@@ -198,7 +246,7 @@ pub(super) unsafe extern "C" fn wrong_arity(
                     }
                     Err(EgclError::ProgramError(format!(
                         "wrong number of arguments: expected {}, got {}",
-                        (*request).expected_arity,
+                        (*request).entry_data,
                         args.len()
                     )))
                 });
@@ -231,13 +279,13 @@ mod tests {
             nargs: 7,
             register_args: [values[0], values[1], values[2]],
             overflow_args: overflow.as_mut_ptr(),
-            expected_arity: 1,
+            entry_data: 1,
             reserved: 0,
         };
         values.clear(); // the incoming view now owns every live Lisp root
         let request = std::ptr::from_mut(&mut request);
         unsafe {
-            with_arity_roots(request, || {
+            with_entry_roots(request, || {
                 egcl_rt::HeapCollector::new().minor_gc().unwrap();
                 let request = &*request;
                 let mut moved = false;
@@ -270,7 +318,7 @@ mod tests {
         egcl_rt::HeapCollector::new().minor_gc().unwrap();
         let request = unsafe { &*request };
         assert_eq!(request.nargs, 4);
-        assert_eq!(request.expected_arity, 1);
+        assert_eq!(request.entry_data, 1);
         let values = [
             request.register_args[0],
             request.register_args[1],
@@ -416,7 +464,7 @@ mod tests {
 
     unsafe fn collect_seven_in_arity_helper(request: *mut OrdinaryArityRequest) {
         assert_eq!(unsafe { (*request).nargs }, 7);
-        assert_eq!(unsafe { (*request).expected_arity }, 1);
+        assert_eq!(unsafe { (*request).entry_data }, 1);
         let anchor = native_transfer::current_segment();
         assert!(!anchor.is_null());
         assert_eq!(unsafe { (*request).overflow_args } as usize, unsafe { (*anchor).saved_sp });

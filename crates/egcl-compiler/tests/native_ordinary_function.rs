@@ -8,7 +8,7 @@ use egcl_rt::{
     jit::JitBuffer,
     value::NIL,
 };
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 // SysV adapter used only by this test: 7 actual tagged arguments, full ordinary
 // register contract, and writable output independent of the callee's registers.
@@ -162,6 +162,15 @@ fn recursive_fib_executes_using_ordinary_descriptors_and_native_frames() {
 }
 
 fn execute(f: &Function, arity: usize, args: &[u64; 7], expected: u64) {
+    execute_with_poll(f, arity, args, expected, 0);
+}
+
+fn execute_with_poll(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64) {
+    execute_with_heat(f, arity, args, expected, poll, None);
+}
+fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>) {
+    let heat_slot = AtomicUsize::new(0);
     let slot = AtomicUsize::new(0);
     let revision = AtomicU64::new(7);
     let bytes = [AtomicU8::new(0), AtomicU8::new(0)];
@@ -184,12 +193,12 @@ fn execute(f: &Function, arity: usize, args: &[u64; 7], expected: u64) {
                 OrdinaryCallTarget {
                     symbol: 77,
                     descriptor_slot: slot.as_ptr() as u64,
-                    revision_address: revision.as_ptr() as u64,
+                    revision_address: revision.as_ptr() as u64, heat_slot: heat_slot.as_ptr() as u64,
                 },
             )
         })
         .collect();
-    let code = emit_framed_ordinary_function(
+    let code = emit_framed_ordinary_function_with_poll(
         f,
         OrdinaryLispEntryOptions {
             arity,
@@ -202,6 +211,7 @@ fn execute(f: &Function, arity: usize, args: &[u64; 7], expected: u64) {
             veneer: rejected as *const () as u64,
             multiple_values: clear_mv as *const () as u64,
         },
+        poll,
     )
     .unwrap();
     assert!(code.frame_entry.is_none());
@@ -219,6 +229,16 @@ fn execute(f: &Function, arity: usize, args: &[u64; 7], expected: u64) {
         owner: buffer.as_ptr() as usize,
         stack_required: code.ordinary_stack_required.unwrap(),
     };
+    let heat_record = heat.map(|(calls, threshold, backedges, backedge_threshold, stale)| OrdinaryCallHeat {
+        descriptor: if stale { 1 } else { &descriptor as *const _ as usize },
+        invocation_counter: calls.as_ptr() as usize,
+        back_edge_counter: backedges.as_ptr() as usize,
+        invocation_threshold: threshold,
+        back_edge_threshold: backedge_threshold,
+    });
+    if let Some(record) = &heat_record {
+        heat_slot.store(record as *const _ as usize, Ordering::Release);
+    }
     slot.store(&descriptor as *const _ as usize, Ordering::Release);
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
     let mut depth = 1;
@@ -359,4 +379,185 @@ fn ordinary_entry_rejects_unpolled_cycles() {
         },
     );
     assert!(result.is_err(), "cycles require lifecycle polls");
+}
+
+#[test]
+fn call_free_guarded_arithmetic_uses_precise_ordinary_recovery() {
+    let mut f = Function::new("ordinary-guarded-leaf");
+    let entry = f.entry();
+    let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let one = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+    );
+    let mut add = instruction(Opcode::FixnumAdd, vec![x, one], AuxData::None);
+    add.frame_state = Some(state(&mut f, x, &[x, one], 0));
+    let result = value(&mut f, entry, add);
+    f.set_terminator(
+        entry,
+        instruction(Opcode::Return, vec![result], AuxData::None),
+    );
+    execute(&f, 1, &[40 << 3, 0, 0, 0, 0, 0, 0], 41 << 3);
+}
+
+#[test]
+fn call_free_loop_runs_with_native_poll_sites() {
+    let mut f = Function::new("ordinary-polled-countdown");
+    let entry = f.entry();
+    let header = f.make_block();
+    let body = f.make_block();
+    let done = f.make_block();
+    let initial = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let remaining = f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged);
+    let zero = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(0)),
+    );
+    let one = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+    );
+    let answer = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(42)),
+    );
+    let mut start = instruction(Opcode::Jump, vec![], AuxData::None);
+    start.targets = vec![BlockCall {
+        block: header,
+        args: vec![initial],
+    }];
+    f.set_terminator(entry, start);
+    let condition = value(
+        &mut f,
+        header,
+        instruction(Opcode::GenericEq, vec![remaining, zero], AuxData::None),
+    );
+    let mut branch = instruction(Opcode::Brif, vec![condition], AuxData::None);
+    branch.targets = vec![
+        BlockCall {
+            block: done,
+            args: vec![],
+        },
+        BlockCall {
+            block: body,
+            args: vec![],
+        },
+    ];
+    f.set_terminator(header, branch);
+    let mut subtract = instruction(Opcode::FixnumSub, vec![remaining, one], AuxData::None);
+    subtract.frame_state = Some(state(&mut f, initial, &[remaining, one], 1));
+    let next = value(&mut f, body, subtract);
+    let mut repeat = instruction(Opcode::Jump, vec![], AuxData::None);
+    repeat.targets = vec![BlockCall {
+        block: header,
+        args: vec![next],
+    }];
+    f.set_terminator(body, repeat);
+    f.set_terminator(
+        done,
+        instruction(Opcode::Return, vec![answer], AuxData::None),
+    );
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn poll(_activation: *mut u8) -> u64 {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+    POLLS.store(0, Ordering::Relaxed);
+    execute_with_poll(
+        &f,
+        1,
+        &[24 << 3, 0, 0, 0, 0, 0, 0],
+        42 << 3,
+        poll as *const () as u64,
+    );
+    assert!(
+        POLLS.load(Ordering::Relaxed) >= 25,
+        "every backedge must cross a poll"
+    );
+}
+
+#[test]
+fn three_named_calls_share_the_ordinary_entry_contract() {
+    let mut f = Function::new("ordinary-three-calls");
+    let entry = f.entry();
+    let base = f.make_block();
+    let caller = f.make_block();
+    let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let zero = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(0)),
+    );
+    let one = value(
+        &mut f,
+        entry,
+        instruction(Opcode::ConstFixnum, vec![], AuxData::FixnumImm(1)),
+    );
+    let condition = value(
+        &mut f,
+        entry,
+        instruction(Opcode::GenericEq, vec![x, zero], AuxData::None),
+    );
+    let mut branch = instruction(Opcode::Brif, vec![condition], AuxData::None);
+    branch.targets = vec![
+        BlockCall {
+            block: base,
+            args: vec![],
+        },
+        BlockCall {
+            block: caller,
+            args: vec![],
+        },
+    ];
+    f.set_terminator(entry, branch);
+    f.set_terminator(base, instruction(Opcode::Return, vec![one], AuxData::None));
+    let mut result = one;
+    for count in 0..3 {
+        let mut call = instruction(Opcode::Call, vec![zero], AuxData::CallTarget(77));
+        call.flags = InstFlags {
+            call: true,
+            safepoint: true,
+            effectful: true,
+            ..Default::default()
+        };
+        result = value(&mut f, caller, call);
+        if count < 2 {
+            let mut clear = instruction(Opcode::ClearMv, vec![], AuxData::None);
+            clear.flags = InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..Default::default()
+            };
+            f.push_inst(caller, clear, &[]);
+        }
+    }
+    f.set_terminator(
+        caller,
+        instruction(Opcode::Return, vec![result], AuxData::None),
+    );
+    execute(&f, 1, &[8, 0, 0, 0, 0, 0, 0], 8);
+}
+
+#[test]
+fn ordinary_direct_calls_count_exact_admissions_and_preserve_promotion() {
+    let calls = AtomicU32::new(0);
+    let backedges = AtomicU32::new(0);
+    let f = fib();
+    let args = [2 << 3, 0, 0, 0, 0, 0, 0];
+    execute_with_heat(&f, 1, &args, 1 << 3, 0, Some((&calls, 100, &backedges, 100, false)));
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "both direct children record invocation heat");
+    calls.store(0, Ordering::Relaxed);
+    execute_with_heat(&f, 1, &args, 0, 0, Some((&calls, 2, &backedges, 100, false)));
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "threshold edge delegates counting to cold dispatch");
+    calls.store(0, Ordering::Relaxed);
+    execute_with_heat(&f, 1, &args, 1 << 3, 0, Some((&calls, 1, &backedges, 100, true)));
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "stale descriptor cannot access old heat");
+    backedges.store(10, Ordering::Relaxed);
+    execute_with_heat(&f, 1, &args, (-2_i64 << 3) as u64, 0, Some((&calls, 100, &backedges, 10, false)));
+    assert_eq!(calls.load(Ordering::Relaxed), 0, "hot loops preserve the promotion cold edge");
 }
