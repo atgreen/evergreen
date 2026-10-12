@@ -104,6 +104,7 @@ pub fn emit_framed_ordinary_leaf(
         EnvironmentCalls::default(),
         None,
         Some(options),
+        None,
     )
 }
 

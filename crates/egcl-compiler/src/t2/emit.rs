@@ -148,6 +148,11 @@ use crate::t2::x64_frame::{select_frame_homes, ValueHome as FramedHome, GPR_X86}
 mod ordinary_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_call.rs"]
+mod ordinary_call;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_call::{emit_framed_ordinary_call, OrdinaryCallTarget, OrdinaryCallFlags, OrdinaryColdRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -3261,6 +3266,8 @@ pub fn emit_framed(
         None,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
     )
 }
 
@@ -3454,6 +3461,8 @@ pub fn emit_framed_with_direct_natives(
         named_calls,
         code_id,
         environment,
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        None,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         None,
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4236,6 +4245,7 @@ fn emit_transfer_function_with_storage(
         EnvironmentCalls::default(),
         Some(&mut transfers),
         None,
+        None,
     )?;
     let mut landings = Vec::new();
     let mut catch_landings = Vec::new();
@@ -4308,6 +4318,7 @@ fn emit_framed_inner(
         &mut TransferEmission,
     >,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary: Option<OrdinaryLispEntryOptions>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))] ordinary_call: Option<ordinary_call::OrdinaryCallEmission>,
 ) -> Result<FramedCode, EmitError> {
     use crate::t2::frame_state::ValueSource;
     use crate::t2::ir::{
@@ -4315,6 +4326,10 @@ fn emit_framed_inner(
     };
     use std::collections::{HashMap, HashSet};
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_call_mode = ordinary_call.is_some();
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_call_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -4332,19 +4347,19 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let published_native_roots = transfers.as_ref()
+    let published_native_roots = ordinary_call_mode || transfers.as_ref()
         .is_some_and(|emission| emission.roots == NativeRootPublication::PublishedHomes);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let published_native_roots = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_call_storage = transfers.as_ref()
+    let native_call_storage = ordinary_call_mode || transfers.as_ref()
         .is_some_and(|emission| emission.storage == NativeCallStorage::NativeStack);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let native_call_storage = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let native_recursion = transfers.as_ref().and_then(|emission| emission.native_recursion);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let native_frame_mode = native_recursion.is_some();
+    let native_frame_mode = native_recursion.is_some() || ordinary_call_mode;
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let native_frame_mode = false;
     if f.block_order().iter().any(|&b| {
@@ -5133,7 +5148,7 @@ fn emit_framed_inner(
         .flat_map(|&block| f.block(block).insts.iter().copied())
         .map(|inst| f.inst(inst))
         .filter(|data| {
-            (data.opcode == Opcode::Call && data.args.len() > 3) || data.opcode == Opcode::Invoke
+            (data.opcode == Opcode::Call && (ordinary_call_mode || data.args.len() > 3)) || data.opcode == Opcode::Invoke
         })
         .map(|data| data.args.len())
         .max()
@@ -5170,7 +5185,7 @@ fn emit_framed_inner(
     if call_arg_slots != 0 && activation_slots.is_none() {
         return Err(EmitError::UnsupportedOp(0xF9));
     }
-    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame {
+    let frame_base_home = if shadow_root_slots == 0 && !needs_activation_frame && !ordinary_call_mode {
         None
     } else {
         let home = FramedHome::Stack(next_stack);
@@ -5179,7 +5194,7 @@ fn emit_framed_inner(
     };
     // Native callees resume their own deoptimization, including register-entry
     // recursion. Record whether this activation owns an EgclStack frame.
-    let entry_kind_home = (code_id != 0 || native_frame_mode).then(|| {
+    let entry_kind_home = (code_id != 0 || (native_frame_mode && !ordinary_call_mode)).then(|| {
         let home = FramedHome::Stack(next_stack);
         next_stack += 1;
         home
@@ -5194,7 +5209,7 @@ fn emit_framed_inner(
     let native_control_home = native_frame_mode.then(|| {
         let home = FramedHome::Stack(next_stack); next_stack += 1; home
     });
-    let native_stack_home = native_frame_mode.then(|| {
+    let native_stack_home = (native_frame_mode && !ordinary_call_mode).then(|| {
         let home = FramedHome::Stack(next_stack); next_stack += 1; home
     });
     let native_argument_base = native_frame_mode.then(|| {
@@ -5231,10 +5246,10 @@ fn emit_framed_inner(
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
                                     // Variadic and activation-backed functions require the frame entry.
     if native_frame_mode && has_declared_params { return Err(EmitError::UnsupportedOp(0xFA)); }
-    let has_reg_entry = native_frame_mode || (!has_declared_params
+    let has_reg_entry = !ordinary_call_mode && (native_frame_mode || (!has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()
-        && f.block(entry).params.len() <= arg_regs.len());
+        && f.block(entry).params.len() <= arg_regs.len()));
     // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
     // Every native caller must propagate a transfer raised by that fallback.
     let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
@@ -5365,6 +5380,7 @@ fn emit_framed_inner(
     let frame_entry_label = a.label();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     a.bind(frame_entry_label);
+    if ordinary_call_mode { a.extend_from_slice(&[0x0f, 0x0b]); } // no legacy entry for this artifact
     let _unwind_info = emit_prologue(&mut a);
     if let Some(home) = entry_kind_home {
         mov_imm64(&mut a, RAX, code_id as i64);
@@ -5469,6 +5485,16 @@ fn emit_framed_inner(
                 HomeMoveSrc::Home(FramedHome::Reg(incoming[index]))))
         }).collect::<Result<Vec<_>, EmitError>>()?;
         parallel_home_move(&mut a, &moves);
+        if ordinary_call_mode {
+            mov_imm64(&mut a, RAX, 0);
+            store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
+            load_mem64_disp(&mut a, RAX, 13, egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL as i32);
+            store_home(&mut a, native_control_home.unwrap(), RAX, 0);
+            for &(value, slot) in &native_arguments {
+                load_home(&mut a, RAX, homes[&value], 0);
+                store_home(&mut a, FramedHome::Stack(slot), RAX, 0);
+            }
+        }
         Some(offset)
     } else { None };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -5657,7 +5683,7 @@ fn emit_framed_inner(
                         | Opcode::CatchLanding
                         | Opcode::HandlerLanding
                 )
-                || wide_call
+                || wide_call || (ordinary_call_mode && d.opcode == Opcode::Call)
             {
                 (HashMap::new(), Vec::new())
             } else {
@@ -5665,7 +5691,11 @@ fn emit_framed_inner(
             };
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
-            if d.opcode == Opcode::ConstHeapObj {
+            if ordinary_call_mode && d.opcode == Opcode::Call {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                { inst_calls = ordinary_call.unwrap().emit(&mut a, &d, &homes, &const_tagged,
+                    outgoing_area, native_control_home.unwrap())?; }
+            } else if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = *inst_reg
                     .get(&result)
@@ -6110,7 +6140,7 @@ fn emit_framed_inner(
                 && !inst_calls.is_empty()
                 && activation_slots.is_some()
             {
-                let outgoing = if d.opcode == Opcode::Invoke || wide_call {
+                let outgoing = if d.opcode == Opcode::Invoke || wide_call || ordinary_call_mode {
                     d.args.as_slice()
                 } else {
                     &[]
@@ -6144,6 +6174,13 @@ fn emit_framed_inner(
             native_calls.extend(inst_calls.into_iter().map(|call| {
                 call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
             }));
+            if ordinary_call_mode && d.opcode == Opcode::Call {
+                // The validated call result is returned immediately. No root
+                // reload or generic result move may clobber RDX/RCX/CF here.
+                emit_epilogue(&mut a);
+                a.push(0xc3);
+                continue;
+            }
             for (home, src) in result_stores {
                 store_home(&mut a, home, src, 0);
             }
@@ -6176,6 +6213,7 @@ fn emit_framed_inner(
             }
         }
 
+        if ordinary_call_mode { continue; } // call already emitted the full tuple return
         let next = blocks.get(bi + 1).copied();
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
@@ -6894,7 +6932,9 @@ fn emit_framed_inner(
         let move_values = f.block_order().iter()
             .map(|&b| f.block(b).params.len())
             .max().unwrap_or(0);
-        Some(ordinary_leaf::stack_requirement(frame_bytes, move_values).ok_or(EmitError::BadBranch)?)
+        let leaf_bound = ordinary_leaf::stack_requirement(frame_bytes, move_values).ok_or(EmitError::BadBranch)?;
+        // The cold request is 64 bytes plus its machine return address.
+        Some(if ordinary_call_mode { leaf_bound.max(frame_bytes.checked_add(72).ok_or(EmitError::BadBranch)?) } else { leaf_bound })
     } else {
         None
     };

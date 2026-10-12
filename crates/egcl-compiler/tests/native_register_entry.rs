@@ -44,6 +44,8 @@ ordinary_entry_probe:
     call r11
     mov r10, [rsp + 8]
     mov [r10], rax
+    mov [r10 + 64], rdx
+    mov [r10 + 72], rcx
     setc byte ptr [r10 + 8]
     mov [r10 + 16], rbp
     mov [r10 + 24], rbx
@@ -145,10 +147,10 @@ fn probe(
     code: &egcl_compiler::t2::emit::FramedCode,
     count: u64,
     closure: u64,
-) -> ([u64; 8], [u64; 8]) {
+) -> ([u64; 10], [u64; 8]) {
     let buffer = JitBuffer::new(&code.code).unwrap();
     let mut observed = [0; 8];
-    let mut output = [0; 8];
+    let mut output = [0; 10];
     let args = [0x110, 0x220, 0x330, 0x440];
     unsafe {
         ordinary_entry_probe(
@@ -163,7 +165,7 @@ fn probe(
         );
     }
     assert_eq!(
-        output[2..],
+        output[2..8],
         [
             0x5151,
             0x5252,
@@ -329,5 +331,371 @@ fn ordinary_stack_bound_reserves_phi_snapshot_headroom() {
             .frame_bytes() as usize;
         let move_bytes = (arity * 8 + 15) & !15;
         assert_eq!(code.ordinary_stack_required, Some(fixed + move_bytes));
+    }
+}
+
+static ORDINARY_COLD_BODY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORDINARY_COLD_SLICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn ordinary_caller(arity: usize, reverse: bool) -> Function {
+    let mut f = Function::new("ordinary-caller");
+    let entry = f.entry();
+    let mut args: Vec<_> = (0..arity)
+        .map(|_| f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged))
+        .collect();
+    if reverse {
+        args.reverse();
+    }
+    let mut call = instruction(Opcode::Call, args);
+    call.aux = AuxData::CallTarget(77);
+    call.flags.call = true;
+    call.flags.safepoint = true;
+    let (_, result) = f.push_inst(entry, call, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+    f.set_terminator(entry, instruction(Opcode::Return, result));
+    f
+}
+
+static ORDINARY_COLD_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORDINARY_COLD_PC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORDINARY_COLD_CLOSURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ORDINARY_COLD_ARGS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[unsafe(naked)]
+unsafe extern "C" fn ordinary_cold_observer() {
+    core::arch::naked_asm!(
+        "push rbp", "mov rsi, [rsp + 8]", "call {observe}", "pop rbp",
+        "mov rdx, 3", "mov rcx, 0x789", "stc", "ret",
+        observe = sym observe_ordinary_cold,
+    );
+}
+
+unsafe extern "C" fn observe_ordinary_cold(
+    request: *const egcl_compiler::t2::emit::OrdinaryColdRequest,
+    pc: usize,
+) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let request = unsafe { &*request };
+    ORDINARY_COLD_COUNT.fetch_add(1, Relaxed);
+    ORDINARY_COLD_PC.store(pc, Relaxed);
+    ORDINARY_COLD_BODY.store(
+        request as *const _ as usize + std::mem::size_of_val(request),
+        Relaxed,
+    );
+    ORDINARY_COLD_SLICE.store(request.args as usize, Relaxed);
+    ORDINARY_COLD_CLOSURE.store(request.closure.0, Relaxed);
+    for (i, slot) in ORDINARY_COLD_ARGS.iter().enumerate().take(request.nargs) {
+        slot.store(unsafe { (*request.args.add(i)).0 }, Relaxed);
+    }
+    0xc01d
+}
+
+#[test]
+fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
+    use egcl_compiler::t2::emit::{
+        NativeRecursiveControl, OrdinaryCallFlags, OrdinaryCallTarget, emit_framed_ordinary_call,
+    };
+    use egcl_rt::{
+        call_table::*,
+        exec_context::{ExecutionKind, LispExecutionContext},
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    let callee = emit_framed_ordinary_leaf(&leaf(4, 3, false), options(4)).unwrap();
+    let callee_buffer = JitBuffer::new(&callee.code).unwrap();
+    let mut descriptor = OrdinaryEntryDescriptor {
+        kind: ORDINARY_X64_LISP_KIND,
+        version: ORDINARY_X64_LISP_VERSION,
+        revision: 7,
+        entry: callee_buffer.as_ptr() as usize + callee.ordinary_entry.unwrap(),
+        code_start: callee_buffer.as_ptr() as usize,
+        code_len: callee.code.len(),
+        arity: 4,
+        environment: ORDINARY_ENV_NONE,
+        owner: &callee as *const _ as usize,
+        stack_required: callee.ordinary_stack_required.unwrap(),
+    };
+    let slot = AtomicUsize::new(&descriptor as *const _ as usize);
+    let revision = AtomicU64::new(7);
+    let bytes = [AtomicU8::new(0), AtomicU8::new(0)];
+    let words = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let flags = OrdinaryCallFlags {
+        gc_requested: bytes[0].as_ptr() as u64,
+        sigusr1_pending: bytes[1].as_ptr() as u64,
+        posted_signal: words[0].as_ptr() as u64,
+        native_errors: words[1].as_ptr() as u64,
+        signal_epoch: words[2].as_ptr() as u64,
+    };
+    let target = OrdinaryCallTarget {
+        symbol: 77,
+        descriptor_slot: &slot as *const _ as u64,
+        revision_address: &revision as *const _ as u64,
+    };
+    let f = ordinary_caller(4, false);
+    let caller = emit_framed_ordinary_call(
+        &f,
+        options(4),
+        target,
+        flags,
+        ordinary_cold_observer as *const () as u64,
+    )
+    .unwrap();
+    assert_eq!(caller.compiled_entry, 0);
+    assert_eq!(&caller.code[..2], &[0x0f, 0x0b]);
+    assert!(caller.native_recursive_entry.is_none());
+    assert!(
+        caller.native_entry_kind_slot.is_none(),
+        "ordinary frames have no legacy managed identity"
+    );
+    let buffer = JitBuffer::new(&caller.code).unwrap();
+    let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    let mut depth = 0;
+    let mv_active = AtomicBool::new(false);
+    let mut control = NativeRecursiveControl {
+        execution: execution.as_ptr(),
+        depth: &mut depth,
+        reserved_counter: 0,
+        mv_active: mv_active.as_ptr(),
+        expected_generation: 999,
+        seen_carrier: 2,
+        seen_signal_epoch: 0,
+        depth_limit: 8,
+        anchor_depth: 0,
+        deadline_armed: 0,
+        reserved: [0; 7],
+        test_entries: std::ptr::null_mut(),
+        test_observer: std::ptr::null(),
+        stack_limit: 0,
+    };
+    unsafe {
+        execution.swap_active_native_control(&mut control as *mut _ as u64);
+    }
+    let args = [0x110, 0x220, 0x330, 0x440];
+    let run = || {
+        let mut output = [0; 10];
+        unsafe {
+            ordinary_entry_probe(
+                buffer.as_ptr().add(caller.ordinary_entry.unwrap()),
+                args.as_ptr(),
+                4,
+                NIL.0,
+                execution.as_ptr() as *mut u64,
+                output.as_mut_ptr(),
+            );
+        }
+        assert_eq!(
+            output[2..8],
+            [
+                0x5151,
+                0x5252,
+                0x5353,
+                execution.as_ptr() as u64,
+                0x5454,
+                0x5555
+            ]
+        );
+        output
+    };
+    ORDINARY_COLD_COUNT.store(0, Relaxed);
+    let output = run();
+    assert_eq!(output[0], args[3]);
+    assert_eq!(output[1], 0);
+    assert_eq!(depth, 0, "direct call balances shared depth");
+    assert_eq!(output[5], execution.as_ptr() as u64);
+    let maps = caller.native_calls.as_ref().unwrap();
+    assert_eq!(maps.iter().count(), 2, "direct and bounded cold return PCs");
+    assert_eq!(
+        maps.iter()
+            .map(|site| site.stack_adjust)
+            .collect::<Vec<_>>(),
+        [16, 64]
+    );
+    assert!(
+        caller.ordinary_stack_required.unwrap()
+            >= maps.unwind_recipe().unwrap().frame_bytes() as usize + 72
+    );
+    for site in maps.iter() {
+        let egcl_compiler::t2::x64_calls::NativeCallValues::Frame(values) =
+            maps.value_map(site.return_offset).unwrap()
+        else {
+            panic!("exact call values")
+        };
+        assert_eq!(values.layout().activation_slots, 0);
+        assert!(values.layout().activation_base_slot.is_none());
+        assert!(values.gc_locations().count() >= 4);
+    }
+    let original = descriptor;
+    let control_address = &mut control as *mut _ as u64;
+    for case in 0..23 {
+        match case {
+            0 => descriptor.kind ^= 1,
+            1 => descriptor.version += 1,
+            2 => descriptor.arity = 3,
+            3 => descriptor.environment = ORDINARY_ENV_CLOSURE,
+            4 => revision.store(8, Relaxed),
+            5 => slot.store(0, Relaxed),
+            6 => descriptor.stack_required = 0,
+            7 => descriptor.stack_required = usize::MAX,
+            8 => control.stack_limit = u64::MAX,
+            9 => control.depth_limit = 0,
+            10 => mv_active.store(true, Relaxed),
+            11 => control.deadline_armed = 1,
+            12 => execution.set_carrier_id(3),
+            13 => words[2].store(1, Relaxed),
+            14 => bytes[0].store(1, Relaxed),
+            15 => bytes[1].store(1, Relaxed),
+            16 => words[0].store(1, Relaxed),
+            17 => words[1].store(1, Relaxed),
+            18 => execution.request_yield(),
+            19 => unsafe {
+                execution.swap_active_native_control(0);
+            },
+            20 => descriptor.owner = 0,
+            21 => descriptor.code_start = descriptor.entry + 1,
+            22 => descriptor.code_len = usize::MAX,
+            _ => unreachable!(),
+        }
+        // Generated code reads these records through the published raw addresses.
+        std::hint::black_box(&descriptor);
+        std::hint::black_box(&control);
+        let before = ORDINARY_COLD_COUNT.load(Relaxed);
+        let output = run();
+        assert_eq!(
+            ORDINARY_COLD_COUNT.load(Relaxed),
+            before + 1,
+            "case {case}: bounded cold handoff"
+        );
+        assert_eq!(
+            [output[0], output[1], output[8], output[9]],
+            [0xc01d, 1, 3, 0x789],
+            "case {case}: full cold tuple"
+        );
+        assert_eq!(depth, 0, "case {case}: cold path owns no child depth");
+        assert_eq!(ORDINARY_COLD_CLOSURE.load(Relaxed), NIL.0);
+        assert_eq!(ORDINARY_COLD_ARGS.each_ref().map(|x| x.load(Relaxed)), args);
+        let cold_offset = ORDINARY_COLD_PC.load(Relaxed) - buffer.as_ptr() as usize;
+        assert!(
+            maps.value_map(cold_offset).is_some(),
+            "actual cold return PC has roots"
+        );
+        let egcl_compiler::t2::x64_calls::NativeCallValues::Frame(values) =
+            maps.value_map(cold_offset).unwrap()
+        else {
+            unreachable!()
+        };
+        let body = ORDINARY_COLD_BODY.load(Relaxed);
+        let slice = ORDINARY_COLD_SLICE.load(Relaxed);
+        for argument in 0..4 {
+            assert!(
+                values.gc_locations().any(|location| matches!(location,
+                egcl_compiler::t2::x64_value_maps::NativeValueLocation::Stack(offset)
+                    if body.wrapping_add_signed(*offset as isize) == slice + argument * 8)),
+                "case {case}: actual outgoing argument {argument} has a writable map location"
+            );
+        }
+        descriptor = original;
+        revision.store(7, Relaxed);
+        slot.store(&descriptor as *const _ as usize, Relaxed);
+        control.stack_limit = 0;
+        control.depth_limit = 8;
+        control.deadline_armed = 0;
+        mv_active.store(false, Relaxed);
+        execution.set_carrier_id(2);
+        execution.take_yield_request();
+        for flag in &bytes {
+            flag.store(0, Relaxed);
+        }
+        for flag in &words {
+            flag.store(0, Relaxed);
+        }
+        unsafe {
+            execution.swap_active_native_control(control_address);
+        }
+    }
+    std::hint::black_box(&control);
+    std::hint::black_box(&descriptor);
+    assert_eq!(run()[0], args[3], "restored target is direct again");
+    let cold_count = ORDINARY_COLD_COUNT.load(Relaxed);
+    // A distinct ordinary callee observes depth while it is active, then
+    // returns a machine tuple with an opaque payload token. No Rust shim sets its flags.
+    let tuple_code = [
+        0x55, 0x48, 0x89, 0xe5, // push rbp; mov rbp,rsp
+        0x4d, 0x8b, 0x5d, 0x20, // r11=[r13+ACTIVE_NATIVE_CONTROL]
+        0x4d, 0x8b, 0x5b, 0x08, // r11=control.depth
+        0x41, 0x8b, 0x03, // eax=*depth
+        0x48, 0xc7, 0xc2, 3, 0, 0, 0, // rdx=count
+        0x48, 0xc7, 0xc1, 0x89, 7, 0, 0, // rcx=payload token
+        0x5d, 0xf9, 0xc3, // pop rbp; stc; ret
+    ];
+    let tuple_buffer = JitBuffer::new(&tuple_code).unwrap();
+    descriptor.code_start = tuple_buffer.as_ptr() as usize;
+    descriptor.code_len = tuple_code.len();
+    descriptor.entry = descriptor.code_start;
+    descriptor.owner = &tuple_buffer as *const _ as usize;
+    descriptor.stack_required = 8;
+    std::hint::black_box(&descriptor);
+    let tuple = run();
+    assert_eq!([tuple[0], tuple[1], tuple[8], tuple[9]], [1, 1, 3, 0x789]);
+    assert_eq!(depth, 0);
+    assert_eq!(
+        ORDINARY_COLD_COUNT.load(Relaxed),
+        cold_count,
+        "tuple callee took the direct edge"
+    );
+    for arity in 0..4 {
+        let callee =
+            emit_framed_ordinary_leaf(&leaf(arity, arity.saturating_sub(1), false), options(arity))
+                .unwrap();
+        let callee_buffer = JitBuffer::new(&callee.code).unwrap();
+        descriptor = original;
+        descriptor.code_start = callee_buffer.as_ptr() as usize;
+        descriptor.code_len = callee.code.len();
+        descriptor.entry = descriptor.code_start + callee.ordinary_entry.unwrap();
+        descriptor.arity = arity;
+        descriptor.owner = &callee as *const _ as usize;
+        descriptor.stack_required = callee.ordinary_stack_required.unwrap();
+        let caller = emit_framed_ordinary_call(
+            &ordinary_caller(arity, true),
+            options(arity),
+            target,
+            flags,
+            ordinary_cold_observer as *const () as u64,
+        )
+        .unwrap();
+        let buffer = JitBuffer::new(&caller.code).unwrap();
+        let mut output = [0; 10];
+        std::hint::black_box(&descriptor);
+        unsafe {
+            ordinary_entry_probe(
+                buffer.as_ptr().add(caller.ordinary_entry.unwrap()),
+                args.as_ptr(),
+                arity as u64,
+                NIL.0,
+                execution.as_ptr() as *mut u64,
+                output.as_mut_ptr(),
+            );
+        }
+        assert_eq!(
+            output[0],
+            if arity == 0 { NIL.0 } else { args[0] },
+            "arity {arity}: reversed arguments"
+        );
+        assert_eq!(output[1], 0);
+        assert_eq!(depth, 0);
+    }
+    assert_eq!(ORDINARY_COLD_COUNT.load(Relaxed), cold_count);
+    let mut unsupported = ordinary_caller(4, false);
+    unsupported.set_variadic(true);
+    assert!(
+        emit_framed_ordinary_call(
+            &unsupported,
+            options(4),
+            target,
+            flags,
+            ordinary_cold_observer as *const () as u64
+        )
+        .is_err()
+    );
+    unsafe {
+        execution.swap_active_native_control(0);
     }
 }
