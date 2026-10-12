@@ -478,6 +478,17 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
     }
 }
 
+/// Ordinary cold admission shares the current named-call target's warming and
+/// publication path. No table borrow spans execution of the selected callable.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let Some(cell) = resolve(symbol) else {
+        return c2i_call_result(u64::from(symbol), args, 0);
+    };
+    let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+    if cell.is_cold() { cold(state, args) } else { warm(state, args) }
+}
+
 fn promotion_due(function: EgclVal) -> bool {
     egcl_rt::function::invoke_count(function).saturating_add(1) >= t2_invoke_threshold()
         || egcl_rt::function::back_edge_count(function) >= t2_backedge_threshold()

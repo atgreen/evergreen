@@ -34,6 +34,7 @@ pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
 mod native_frames;
+pub(super) mod ordinary_calls;
 pub(super) mod native_poll;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
