@@ -153,7 +153,9 @@ fn observe_local_catch_poll() {
         let before_tag = unsafe { slot_get(frame, 1) }.to_raw();
         let before_marker = unsafe { slot_get(frame, 0) }.to_raw();
         let parent_before = parent_root_before_collection();
-        egcl_rt::collect_t0_minor().unwrap();
+        // Stress may have moved the parent and catch roots out of the nursery.
+        // Keep the relocation assertions below and collect Survivor space too.
+        egcl_rt::gc::full_gc().unwrap();
         assert_parent_root_moved(parent_before);
         let after_tag = unsafe { slot_get(frame, 1) }.to_raw();
         let after_marker = unsafe { slot_get(frame, 0) }.to_raw();
@@ -244,7 +246,9 @@ pub(in crate::cli) fn local_catch_osr_observe_for_test(
         });
         // No RefCell borrow or copied heap value crosses the collection.
         let parent_before = parent_root_before_collection();
-        egcl_rt::collect_t0_minor()?;
+        // Stress may have moved the parent and catch roots out of the nursery.
+        // Keep the relocation assertions below and collect Survivor space too.
+        egcl_rt::gc::full_gc()?;
         assert_parent_root_moved(parent_before);
         assert_live_catch(env);
         CATCH_OBSERVATION.with(|state| {
