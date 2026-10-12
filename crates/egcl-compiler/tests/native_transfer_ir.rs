@@ -10,6 +10,7 @@ use egcl_rt::bytecode::{BytecodeFunction, Instr};
 
 fn body() -> BytecodeFunction {
     BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: vec![
             Instr::PushBlock {
                 block_id: 7,

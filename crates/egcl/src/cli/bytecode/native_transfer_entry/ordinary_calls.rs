@@ -49,6 +49,11 @@ static COLD_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
 static NAMED_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
 #[cfg(test)]
+type SelfColdObserver = Cell<Option<fn()>>;
+#[cfg(test)]
+pub(in crate::cli::bytecode) static SELF_COLD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<SelfColdObserver> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(None) }) };
+#[cfg(test)]
 pub(in crate::cli::bytecode) fn take_named_entries_for_test() -> usize {
     NAMED_ENTRIES.with(|count| count.replace(0))
 }
@@ -115,7 +120,8 @@ pub(in crate::cli::bytecode) fn finish(result: Result<EgclVal, EgclError>, out: 
     }
 }
 
-/// Complete a failed ordinary admission through the current named-call cell.
+/// Complete a failed ordinary admission through a named cell or the exact
+/// callable retained by a directly recursive caller's native code owner.
 /// The caller maps own args; only the separate closure word is host-rooted
 /// here. The copied argument vector has distinct physical root locations.
 pub(super) unsafe extern "C" fn cold_call(
@@ -133,12 +139,39 @@ pub(super) unsafe extern "C" fn cold_call(
                 if native_error_pending() {
                     return Ok(NIL);
                 }
+                egcl_rt::rooted!(self_callable = NIL);
+                match (*request).reserved {
+                    0 => {}
+                    1 => {
+                        let boundary = root_publication::ACTIVE.with(Cell::get);
+                        if boundary.is_null() { return Err(invalid_capture()); }
+                        let boundary = &*boundary;
+                        if boundary.owner.is_null() || (*boundary.owner).ordinary_entry.is_none() {
+                            return Err(invalid_capture());
+                        }
+                        // Both root ingress and published callees reserve an
+                        // exact identity. Release the directory borrow before
+                        // the GC gate can park; resolve before polling can
+                        // replace the public definition.
+                        let retained = boundary.directory.callable_for_pc(boundary.cursor.pc)
+                            .ok_or_else(invalid_capture)?;
+                        retained.with_gc_stable_mutator(|value| *self_callable = *value);
+                        if !egcl_rt::function::is_interpreted_function(*self_callable) {
+                            return Err(invalid_capture());
+                        }
+                    }
+                    _ => return Err(invalid_capture()),
+                }
                 egcl_rt::rooted!(args = Vec::new());
                 let count = (*request).nargs;
                 args.try_reserve_exact(count).map_err(|_| EgclError::Oom)?;
                 if count != 0 {
                     args.extend_from_slice(std::slice::from_raw_parts((*request).args, count));
                 }
+                #[cfg(test)]
+                if (*request).reserved == 1
+                    && let Some(observe) = SELF_COLD_OBSERVER.with(Cell::get)
+                { observe(); }
                 let mut poll = NativeOutcome {
                     value: NIL,
                     exit: NativeExit::Returned,
@@ -147,7 +180,13 @@ pub(super) unsafe extern "C" fn cold_call(
                 if poll.exit != NativeExit::Returned {
                     return Ok(NIL);
                 }
-                super::super::call_table::ordinary_call((*request).symbol as u32, &args)
+                if (*request).reserved == 1 {
+                    let env = NATIVE_ENV.with(Cell::get);
+                    if env.is_null() { return Err(invalid_capture()); }
+                    apply_function(*self_callable, &args, &mut *env)
+                } else {
+                    super::super::call_table::ordinary_call((*request).symbol as u32, &args)
+                }
             });
             refresh_control((*request).control);
             finish(result, out);
@@ -564,6 +603,38 @@ mod tests {
         );
         assert!(OVERFLOW_OBSERVED.with(Cell::get));
         assert!(native_transfer::current_segment().is_null());
+    }
+
+    #[test]
+    fn ordinary_cold_self_requires_a_retained_native_owner() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let mut entry = EntryGuard {
+            env: NATIVE_ENV.with(|slot| slot.replace(&mut env)),
+            capture: CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())),
+            error: NATIVE_ERROR.with(|slot| slot.take()),
+        };
+        egcl_rt::rooted_ref!(_entry = &mut entry);
+        let code = JitBuffer::new(
+            &egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(cold_call),
+        ).unwrap();
+        for reserved in [1, 2] {
+            let mut request = OrdinaryColdRequest {
+                symbol: u64::from(egcl_rt::symbols::intern("VALUES")),
+                nargs: 0, args: std::ptr::null_mut(), closure: NIL,
+                control: std::ptr::null_mut(), descriptor_slot: 0,
+                revision_address: 0, reserved,
+            };
+            let result = unsafe {
+                native_transfer::invoke_native_segment(
+                    code.as_ptr(), std::ptr::from_mut(&mut request).cast(), egcl_rt::current_stack(),
+                )
+            }.unwrap();
+            assert_eq!(result.exit, NativeExit::Transfer,
+                "self without an owner and unknown flags must not resolve the global VALUES cell");
+            assert!(NATIVE_ERROR.with(|slot| slot.take()).is_some());
+        }
     }
 
     #[test]

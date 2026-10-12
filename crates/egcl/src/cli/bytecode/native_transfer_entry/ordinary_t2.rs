@@ -151,3 +151,20 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     }
     Some(native)
 }
+
+/// Only source-proven root-frame calls can bind to this retained definition.
+/// Inlined frames and generated primitive calls never acquire that identity.
+pub(super) fn proven_self_calls(ir: &Function, body: &BytecodeFunction, symbol: u32) -> Vec<egcl_compiler::t2::ir::Inst> {
+    use egcl_compiler::t2::ir::{AuxData, Opcode};
+    ir.block_order().iter().flat_map(|&block| ir.block(block).insts.iter().copied())
+        .filter(|&inst| {
+            let data = ir.inst(inst);
+            if data.opcode != Opcode::Call || !matches!(data.aux, AuxData::CallTarget(target) if target == symbol) {
+                return false;
+            }
+            let Some(state) = data.frame_state else { return false };
+            let scopes = &ir.frame_states.get(state).scopes;
+            scopes.len() == 1 && scopes[0].function == symbol
+                && body.self_call_sites.binary_search(&scopes[0].bcp).is_ok()
+        }).collect()
+}

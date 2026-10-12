@@ -95,6 +95,8 @@ mod pending_error;
 mod call_table;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
+#[path = "bytecode/self_calls.rs"]
+mod self_calls;
 #[cfg(all(target_arch = "x86_64", windows))]
 #[path = "bytecode/native_callable_windows.rs"]
 mod native_callable;
@@ -2291,6 +2293,9 @@ const PRIMITIVE_ALLOWLIST: &[&str] = &[
 
 /// Compiler state for lowering one function body.
 struct Lowerer<'e> {
+    self_symbol: Option<u32>,
+    self_call_sites: Vec<u32>,
+    inline_policies: Vec<(u32, bool)>,
     code: Vec<Instr>,
     constants: Vec<EgclVal>,
     load_time_values: Vec<(u16, EgclVal)>,
@@ -2434,6 +2439,9 @@ impl egcl_rt::gc::TraceHostRoots for Lowerer<'_> {
 impl<'e> Lowerer<'e> {
     fn new(env: &'e Env) -> Self {
         Lowerer {
+            self_symbol: None,
+            self_call_sites: Vec::new(),
+            inline_policies: env.active_declarations.iter().flat_map(|&specifier| self_calls::declaration_inline_policies(specifier)).collect(),
             code: Vec::new(),
             constants: Vec::new(),
             load_time_values: Vec::new(),
@@ -2563,15 +2571,17 @@ impl<'e> Lowerer<'e> {
     /// Record `body`'s user-proclaimed declaration specifiers for its extent, so
     /// a macro expanded while lowering the body sees them through its
     /// `&ENVIRONMENT` value. Returns the mark for `leave_body_declarations`.
-    fn enter_body_declarations(&mut self, body: EgclVal) -> usize {
-        let mark = self.declared_specifiers.len();
+    fn enter_body_declarations(&mut self, body: EgclVal) -> (usize, usize) {
+        let mark = (self.declared_specifiers.len(), self.inline_policies.len());
+        self.inline_policies.extend(self_calls::body_inline_policies(body));
         let specifiers = super::body_custom_declarations(body);
         self.declared_specifiers.extend(specifiers);
         mark
     }
 
-    fn leave_body_declarations(&mut self, mark: usize) {
-        self.declared_specifiers.truncate(mark);
+    fn leave_body_declarations(&mut self, mark: (usize, usize)) {
+        self.declared_specifiers.truncate(mark.0);
+        self.inline_policies.truncate(mark.1);
     }
 
     /// `self.macro_env` augmented with the declarations in force here, or `None`
@@ -3400,15 +3410,13 @@ impl<'e> Lowerer<'e> {
     fn lower_macrolet(&mut self, mut form: EgclVal) -> LowerResult<()> {
         // Root across the allocating macro-env build (moving GC; bliss-wlf).
         egcl_rt::rooted_ref!(_form_root = &mut form);
-        // `macroexpand_all` strips the MACROLET wrapper, and its BODY
-        // DECLARATIONS with it, so a free `(declare (special v))` would simply
-        // vanish. Read it off the wrapper first and keep it in force over the
-        // expansion, exactly as lower_locally does (ansi MACROLET.47; bliss-vmge).
-        let decl_special = {
-            let (_operator, rest) = cp(form);
-            let (_definitions, body) = cp(rest);
-            body_declared_special(body)
-        };
+        // Establish body declarations before expansion so both macro environments
+        // and source-call proofs see them. Restore their lexical extent after
+        // lowering, including an expansion failure (ansi MACROLET.47; bliss-vmge).
+        let (_operator, rest) = cp(form);
+        let (_definitions, body) = cp(rest);
+        let decl_special = body_declared_special(body);
+        let declarations = self.enter_body_declarations(body);
         if self.macro_env.is_none() {
             self.macro_env = Some(super::macroexpand_environment_from_cli(self.env));
         }
@@ -3419,13 +3427,17 @@ impl<'e> Lowerer<'e> {
             .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
         let expanded = match compiler_macroexpand::macroexpand_all(form, menv) {
             Ok(expanded) => expanded,
-            Err(_) => return Err(record_bail(|| "macroexpand:macrolet".to_string())),
+            Err(_) => {
+                self.leave_body_declarations(declarations);
+                return Err(record_bail(|| "macroexpand:macrolet".to_string()));
+            }
         };
         // Rooted across the lowering below, which allocates (moving GC).
         egcl_rt::rooted!(expanded = expanded);
         self.push_declared_special(&decl_special);
         let lowered = self.lower_expr(*expanded);
         self.pop_declared_special(&decl_special);
+        self.leave_body_declarations(declarations);
         lowered
     }
 
@@ -3450,6 +3462,11 @@ impl<'e> Lowerer<'e> {
             }
             for i in 0..nargs {
                 self.lower_expr(args[i])?;
+            }
+            if self.self_symbol == Some(sym)
+                && !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
+            {
+                self.self_call_sites.push(self.code.len() as u32);
             }
             self.emit(Instr::CallNamed {
                 sym,
@@ -3521,7 +3538,9 @@ impl<'e> Lowerer<'e> {
         let menv = scoped
             .as_ref()
             .unwrap_or_else(|| self.macro_env.as_ref().unwrap());
-        if let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv) {
+        if !self_calls::notinline(op.as_symbol_index(), &self.inline_policies)
+            && let Ok((expanded, true)) = compiler_macroexpand::compiler_macroexpand_1(form, menv)
+        {
             return self.lower_expr(expanded);
         }
         // Keep function calls intact here: source-level builtin and accessor
@@ -3565,6 +3584,12 @@ impl<'e> Lowerer<'e> {
         }
         for i in 0..nargs {
             self.lower_expr(args[i])?;
+        }
+        let symbol = op.as_symbol_index();
+        if self.self_symbol == Some(symbol)
+            && !self_calls::notinline(symbol, &self.inline_policies)
+        {
+            self.self_call_sites.push(self.code.len() as u32);
         }
         self.emit(Instr::CallNamed {
             sym: op.as_symbol_index(),
@@ -6793,6 +6818,8 @@ impl<'e> Lowerer<'e> {
             let sym = parsed[i].1;
             let (params_form, fbody) = flet_def_forms(defs[i]);
             let bf = compile_local_function(
+                sym,
+                &self.inline_policies,
                 params_form,
                 fbody,
                 self.env,
@@ -6801,7 +6828,21 @@ impl<'e> Lowerer<'e> {
                 self.portable,
             )
             .ok_or(Bail)?;
-            registry_put(sym, Arc::new(bf));
+            // Give this noncapturing lexical definition the same source-free
+            // callable identity as a loaded bytecode function. Native cold
+            // calls and deoptimization must retain an object, not re-resolve
+            // the synthetic registration name after a safepoint.
+            let bf = Arc::new(bf);
+            egcl_rt::rooted!(_body_root = ActiveBytecodeRoot::new(&bf));
+            egcl_rt::rooted!(lambda_list = if bf.variadic {
+                bf.params_form
+            } else {
+                installed_lambda_list(bf.arity)
+            });
+            egcl_rt::rooted!(function = egcl_rt::function::alloc_interpreted(
+                *lambda_list, NIL, NIL, EgclVal::from_symbol_index(sym)));
+            egcl_rt::symbols::set_symbol_function(sym, *function);
+            if !publish_bytecode(sym, bf, None, *function) { return Err(Bail); }
         }
 
         // Compile the form body with all local functions visible.
@@ -6984,7 +7025,10 @@ fn flet_def_forms(def: EgclVal) -> (EgclVal, EgclVal) {
 /// Compile a local (flet/labels) function body to a [`BytecodeFunction`],
 /// inheriting the visible local-function namespace so sibling/self calls
 /// resolve. Returns `None` on any unsupported form.
+#[allow(clippy::too_many_arguments)]
 fn compile_local_function(
+    self_symbol: u32,
+    inherited_policies: &[(u32, bool)],
     mut params_form: EgclVal,
     mut fbody: EgclVal,
     env: &Env,
@@ -6997,6 +7041,8 @@ fn compile_local_function(
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
+    lo.self_symbol = Some(self_symbol);
+    lo.inline_policies = inherited_policies.to_vec();
     lo.declared_special = inherited_specials.clone();
     for name in &param_names {
         lo.declared_special.remove(name);
@@ -7010,9 +7056,11 @@ fn compile_local_function(
         let loc = lo.alloc_local(pn);
         param_layout.push((pn.clone(), loc));
     }
+    let declarations = lo.enter_body_declarations(fbody);
     if lower_body(&mut lo, fbody).is_err() {
         return None;
     }
+    lo.leave_body_declarations(declarations);
     lo.emit(Instr::Return);
     let param_types = if variadic {
         vec![DeclaredType::Any; param_names.len()]
@@ -7020,6 +7068,7 @@ fn compile_local_function(
         declared_parameter_types(fbody, &param_names)?
     };
     Some(BytecodeFunction {
+        self_call_sites: lo.self_call_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -7034,7 +7083,7 @@ fn compile_local_function(
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
         arity: min_args,
-        name: "<flet>".to_string(),
+        name: sym_name(EgclVal::from_symbol_index(self_symbol)),
         params_form: if variadic { params_form } else { NIL },
         min_args,
         max_args,
@@ -7105,6 +7154,7 @@ fn compile_capturing_local(
     }
     lo.emit(Instr::Return);
     Some(BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -7739,6 +7789,7 @@ fn compile_restart_clause(
     lower_body(&mut lo, body).ok()?;
     lo.emit(Instr::Return);
     Some(BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8572,6 +8623,9 @@ fn compile_function_forcing_boxed(
     }
 
     let mut lo = Lowerer::new(env);
+    if !macro_lambda_list && name != "<lambda>" {
+        lo.self_symbol = resolve_sym(name).map(|symbol| symbol.as_symbol_index());
+    }
     lo.declared_special = inherited_specials.clone();
     for name in &param_names {
         lo.declared_special.remove(name);
@@ -8657,6 +8711,7 @@ fn compile_function_forcing_boxed(
     lo.emit(Instr::Return);
 
     let mut function = BytecodeFunction {
+        self_call_sites: lo.self_call_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8891,6 +8946,7 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
     }
     lo.emit(Instr::Return);
     Some(BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -8955,6 +9011,8 @@ const BBU_FUNC_NESTED: u32 = 1 << 4;
 const BBU_AUX_FUNCTION_METADATA: u16 = 6;
 const BBU_AUX_RESTART_TABLES: u16 = 7;
 const BBU_AUX_HANDLER_CASES: u16 = 9;
+// Optional: older units conservatively retain dynamic named calls.
+const BBU_AUX_SELF_CALL_SITES: u16 = 10;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -9395,6 +9453,7 @@ impl BbuConstPool {
 }
 
 struct BbuFunction {
+    self_call_sites: Vec<u32>,
     name_ref: u32,
     lambda_list_ref: u32,
     flags: u32,
@@ -9774,6 +9833,7 @@ fn serialize_bbu_function(
         })
         .collect();
     Some(BbuFunction {
+        self_call_sites: bf.self_call_sites.iter().map(|&pc| bbu_pc(pc, &offsets, end_pc)).collect::<Option<Vec<_>>>()?,
         name_ref,
         lambda_list_ref,
         flags,
@@ -9936,6 +9996,33 @@ fn serialize_bbu_function_record(out: &mut Vec<u8>, f: &BbuFunction) {
     put_u32(out, 0);
     put_u32(out, 0);
     put_u32(out, BBU_NO_INDEX);
+}
+
+fn serialize_bbu_self_call_sites(functions: &[BbuFunction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, functions.len() as u32);
+    for function in functions {
+        put_u32(&mut out, function.self_call_sites.len() as u32);
+        for &site in &function.self_call_sites { put_u32(&mut out, site); }
+    }
+    out
+}
+
+fn parse_bbu_self_call_sites(bytes: &[u8], count: usize) -> Result<Vec<Vec<u32>>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.u32()? as usize != count { return Err(bbu_error("self-call table count mismatch")); }
+    let mut functions = Vec::new();
+    for _ in 0..count {
+        let count = cursor.u32()?;
+        let mut sites = Vec::new();
+        for _ in 0..count { sites.push(cursor.u32()?); }
+        if sites.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(bbu_error("self-call sites must be ordered and unique"));
+        }
+        functions.push(sites);
+    }
+    if !cursor.done() { return Err(bbu_error("trailing self-call table bytes")); }
+    Ok(functions)
 }
 
 fn serialize_bbu_function_metadata(functions: &[BbuFunction]) -> Vec<u8> {
@@ -10479,7 +10566,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 3);
+    put_u32(&mut out, 4);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -10511,6 +10598,11 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
+    let self_calls = serialize_bbu_self_call_sites(&functions);
+    put_u16(&mut out, BBU_AUX_SELF_CALL_SITES);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, self_calls.len() as u32);
+    out.extend_from_slice(&self_calls);
     Ok(Some(out))
 }
 
@@ -10532,7 +10624,7 @@ fn assemble_bbu(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 3);
+    put_u32(&mut out, 4);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(content_tag));
     for entry in &pool.entries {
@@ -10563,6 +10655,11 @@ fn assemble_bbu(
     put_u16(&mut out, 0);
     put_u32(&mut out, handler_cases.len() as u32);
     out.extend_from_slice(&handler_cases);
+    let self_calls = serialize_bbu_self_call_sites(functions);
+    put_u16(&mut out, BBU_AUX_SELF_CALL_SITES);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, self_calls.len() as u32);
+    out.extend_from_slice(&self_calls);
     out
 }
 
@@ -11187,6 +11284,7 @@ enum BbuConstant {
 
 #[derive(Clone, Debug)]
 struct EncodedBbuFunction {
+    self_call_sites: Vec<u32>,
     name_ref: u32,
     lambda_list_ref: u32,
     flags: u32,
@@ -11439,6 +11537,7 @@ fn parse_bbu_function(cursor: &mut BbuCursor<'_>) -> Result<EncodedBbuFunction, 
         return Err(bbu_error("function max_stack must be nonzero"));
     }
     Ok(EncodedBbuFunction {
+        self_call_sites: Vec::new(),
         name_ref,
         lambda_list_ref,
         flags,
@@ -12073,7 +12172,17 @@ fn decode_bbu_function(
     } else {
         constants[bbu_index(encoded.lambda_list_ref, constants.len(), "lambda-list")?]
     };
+    let mut self_call_sites = Vec::new();
+    for &offset in &encoded.self_call_sites {
+        let pc = map_pc(offset)?;
+        let symbol = bbu_symbol(constants, encoded.name_ref)?;
+        if !matches!(code.get(pc as usize), Some(Instr::CallNamed { sym, .. }) if *sym == symbol) {
+            return Err(bbu_error("self-call metadata does not name this function"));
+        }
+        self_call_sites.push(pc);
+    }
     Ok(BytecodeFunction {
+        self_call_sites,
         code,
         constants: literal_values,
         load_time_values: Vec::new(),
@@ -13074,7 +13183,8 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
     };
     let sites: Vec<usize> = (0..code.len().saturating_sub(1))
         .filter(|&i| {
-            matches!(code[i], Instr::CallNamed { sym, nargs }
+            func.self_call_sites.binary_search(&(i as u32)).is_ok()
+                && matches!(code[i], Instr::CallNamed { sym, nargs }
                      if sym == self_sym && nargs == arity)
                 && site_epilogue(i)
         })
@@ -13230,6 +13340,9 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
         func.code = original;
         return tco_debug(func, &format!("rewrite failed verification, reverted: {e:?}"));
     }
+    func.self_call_sites = func.self_call_sites.iter()
+        .filter(|site| !sites.contains(&(**site as usize)))
+        .map(|site| map[*site as usize]).collect();
     true
 }
 
@@ -13671,6 +13784,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut function_metadata = None;
     let mut restart_tables = None;
     let mut handler_case_tables = None;
+    let mut self_call_tables = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
         let flags = cursor.u16()?;
@@ -13689,6 +13803,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate restart-table metadata"));
             }
             restart_tables = Some(parse_bbu_restart_tables(bytes, function_count)?);
+        } else if kind == BBU_AUX_SELF_CALL_SITES {
+            if self_call_tables.is_some() { return Err(bbu_error("duplicate self-call metadata")); }
+            self_call_tables = Some(parse_bbu_self_call_sites(bytes, function_count)?);
         } else if kind == BBU_AUX_HANDLER_CASES {
             if handler_case_tables.is_some() {
                 return Err(bbu_error("duplicate handler-case metadata"));
@@ -13710,6 +13827,11 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     if let Some(metadata) = function_metadata {
         for (function, metadata) in encoded_functions.iter_mut().zip(metadata) {
             function.metadata = Some(metadata);
+        }
+    }
+    if let Some(tables) = self_call_tables {
+        for (function, sites) in encoded_functions.iter_mut().zip(tables) {
+            function.self_call_sites = sites;
         }
     }
     for function in &encoded_functions {
@@ -15464,8 +15586,14 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // Internal FLET/LABELS bodies can have an absent public cell.
                 // Keep that exact owner for registry selection; only translate
                 // it to a symbol when falling back to ordinary dispatch.
-                egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(sym)
-                    .unwrap_or_else(|| EgclVal::from_symbol_index(sym)));
+                let act = &acts[top_idx];
+                let self_call = act.func.self_call_sites.binary_search(&(act.bcp as u32 - 1)).is_ok();
+                egcl_rt::rooted!(function = if self_call {
+                    act.fn_obj.unwrap_or_else(|| unsafe { (*act.frame).function })
+                } else {
+                    egcl_rt::symbols::symbol_function(sym)
+                        .unwrap_or_else(|| EgclVal::from_symbol_index(sym))
+                });
                 let registered_callee = bytecode_for_callable(sym, *function);
 
                 // Profile every call site's execution frequency.  Type details
@@ -23682,12 +23810,22 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
         if op.is_symbol() {
             let bare = sym_bare_name_rc(op);
             if bare.as_ref() == "PROGN" || bare.as_ref() == "LOCALLY" {
-                let mut last = NIL;
                 egcl_rt::rooted!(forms = list_to_vec(cdr));
-                for index in 0..forms.len() {
-                    last = eval_toplevel(forms[index], env)?;
+                // Processing each subform separately must preserve LOCALLY's
+                // lexical declaration extent, including during DEFUN capture.
+                let declarations = (bare.as_ref() == "LOCALLY")
+                    .then(|| super::enter_body_declarations(env, cdr));
+                let result = (|| {
+                    let mut last = NIL;
+                    for index in 0..forms.len() {
+                        last = eval_toplevel(forms[index], env)?;
+                    }
+                    Ok(last)
+                })();
+                if let Some(mark) = declarations {
+                    super::leave_body_declarations(env, mark);
                 }
-                return Ok(last);
+                return result;
             }
         }
     }

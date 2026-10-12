@@ -34,6 +34,30 @@ unsafe extern "C" fn run(
     );
 }
 #[unsafe(naked)]
+unsafe extern "C" fn run_with_stack_bound(
+    _entry: *const u8, _args: *const u64, _count: usize,
+    _execution: *const LispExecutionContext, _out: *mut u64, _distance: usize,
+) {
+    core::arch::naked_asm!(
+        "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
+        "sub rsp, 40", "mov [rsp+32], r8", "mov r11, rdi", "mov r10, rsi",
+        "mov r13, rcx", "mov rcx, rdx", "mov rax, [r10+24]", "mov [rsp], rax",
+        "mov rax, [r10+32]", "mov [rsp+8], rax", "mov rax, [r10+40]", "mov [rsp+16], rax",
+        "mov rax, [r10+48]", "mov [rsp+24], rax",
+        "mov rdi, [r10]", "mov rsi, [r10+8]", "mov rdx, [r10+16]",
+        // Anchor the synthetic bound to the actual machine call SP, avoiding
+        // assumptions about the Rust test function's stack frame.
+        "mov r10, [r13+{control}]", "mov rax, rsp", "sub rax, r9",
+        "mov [r10+{limit}], rax",
+        "mov rax, {nil}", "call r11", "mov r10, [rsp+32]", "mov [r10], rax",
+        "mov [r10+8], rdx", "mov [r10+16], rcx", "setc byte ptr [r10+24]",
+        "add rsp, 40", "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp", "ret",
+        nil = const NIL.0,
+        control = const egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL,
+        limit = const std::mem::offset_of!(NativeRecursiveControl, stack_limit),
+    );
+}
+#[unsafe(naked)]
 unsafe extern "C" fn rejected() {
     core::arch::naked_asm!("mov rax, -8", "clc", "ret");
 }
@@ -170,6 +194,16 @@ fn execute_with_poll(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
 }
 fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
     heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>) {
+    execute_with_self_calls(f, arity, args, expected, poll, heat, false);
+}
+#[allow(clippy::too_many_arguments)]
+fn execute_with_self_calls(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool) {
+    execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None);
+}
+#[allow(clippy::too_many_arguments)]
+fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>) {
     let heat_slot = AtomicUsize::new(0);
     let slot = AtomicUsize::new(0);
     let revision = AtomicU64::new(7);
@@ -198,7 +232,8 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
             )
         })
         .collect();
-    let code = emit_framed_ordinary_function_with_poll(
+    let self_sites = if direct_self { targets.iter().map(|(inst, _)| *inst).collect() } else { Vec::new() };
+    let code = emit_framed_ordinary_function_with_self_calls(
         f,
         OrdinaryLispEntryOptions {
             arity,
@@ -212,6 +247,7 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
             multiple_values: clear_mv as *const () as u64,
         },
         poll,
+        &self_sites,
     )
     .unwrap();
     assert!(code.frame_entry.is_none());
@@ -239,7 +275,9 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
     if let Some(record) = &heat_record {
         heat_slot.store(record as *const _ as usize, Ordering::Release);
     }
-    slot.store(&descriptor as *const _ as usize, Ordering::Release);
+    if !direct_self {
+        slot.store(&descriptor as *const _ as usize, Ordering::Release);
+    }
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
     let mut depth = 1;
     let active = AtomicBool::new(false);
@@ -264,13 +302,20 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
     }
     let mut out = [0; 4];
     unsafe {
-        run(
+        if let Some(below_bottom) = below_bottom {
+            assert_eq!(arity, 1, "boundary fixture has no outgoing overflow arguments");
+            let parent_frame = code.native_calls.as_ref().unwrap().unwind_recipe().unwrap().frame_bytes() as usize;
+            // Root CALL + parent prologue + child CALL + complete child budget.
+            let distance = (16 + parent_frame + code.ordinary_stack_required.unwrap()) as i64 + below_bottom;
+            run_with_stack_bound(entry, args.as_ptr(), arity, execution.as_ptr(), out.as_mut_ptr(),
+                usize::try_from(distance).unwrap());
+        } else { run(
             entry,
             args.as_ptr(),
             arity,
             execution.as_ptr(),
             out.as_mut_ptr(),
-        );
+        ); }
     }
     assert_eq!(out[0], expected);
     assert_eq!(out[3], 0, "exactly one value returns with clear carry");
@@ -340,12 +385,24 @@ fn seven_argument_recursive_call_marshals_every_overflow_word() {
         effectful: true,
         ..Default::default()
     };
+    call.frame_state = Some(f.frame_states.add(FrameState {
+        scopes: vec![FrameScope {
+            function: 77, bcp: 0,
+            locals: args.iter().map(|&value| ValueSource::Value {
+                value, repr: ValueRepresentation::Tagged,
+            }).collect(),
+            stack: call.args.iter().map(|&value| ValueSource::Value {
+                value, repr: ValueRepresentation::Tagged,
+            }).collect(),
+        }], remat: vec![],
+    }));
     let result = value(&mut f, recurse, call);
     f.set_terminator(
         recurse,
         instruction(Opcode::Return, vec![result], AuxData::None),
     );
     execute(&f, 7, &[8, 16, 24, 32, 40, 48, 56], 16);
+    execute_with_self_calls(&f, 7, &[8, 16, 24, 32, 40, 48, 56], 16, 0, None, true);
 }
 
 #[test]
@@ -560,4 +617,33 @@ fn ordinary_direct_calls_count_exact_admissions_and_preserve_promotion() {
     backedges.store(10, Ordering::Relaxed);
     execute_with_heat(&f, 1, &args, (-2_i64 << 3) as u64, 0, Some((&calls, 100, &backedges, 10, false)));
     assert_eq!(calls.load(Ordering::Relaxed), 0, "hot loops preserve the promotion cold edge");
+}
+
+#[test]
+fn direct_recursive_fib_does_not_resolve_a_global_descriptor() {
+    let f = fib();
+    // The global slot stays empty. Every recursive edge must use the exact
+    // current artifact, with balanced native depth and actual ordinary returns.
+    execute_with_self_calls(&f, 1, &[24 << 3, 0, 0, 0, 0, 0, 0], 46368 << 3, 0, None, true);
+}
+
+#[test]
+fn direct_recursive_fib_does_not_charge_global_invocation_heat() {
+    let calls = AtomicU32::new(17);
+    let backedges = AtomicU32::new(23);
+    execute_with_self_calls(&fib(), 1, &[12 << 3, 0, 0, 0, 0, 0, 0], 144 << 3,
+        0, Some((&calls, 1, &backedges, 1, false)), true);
+    assert_eq!(calls.load(Ordering::Relaxed), 17);
+    assert_eq!(backedges.load(Ordering::Relaxed), 23);
+}
+
+#[test]
+fn direct_self_stack_admission_checks_exact_child_budget_and_balances_depth() {
+    let f = fib();
+    // fib(2) has two leaf children. A denied admission returns the cold
+    // sentinel -1 for each child, while admitted children return 1 and 0.
+    for (below_bottom, expected) in [(1, 1_i64), (0, -2), (-1, -2)] {
+        execute_with_self_stack_bound(&f, 1, &[2 << 3, 0, 0, 0, 0, 0, 0],
+            (expected << 3) as u64, 0, None, true, Some(below_bottom));
+    }
 }

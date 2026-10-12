@@ -534,6 +534,7 @@ Unknown `table_kind` values MUST be skipped by `length`.
 | `Dependencies` | MUST | required `.bfasl` identities, provided features, package dependencies, content hashes |
 | `Policy` | SHOULD | compiler optimization/safety/debug/speed policy that influenced bytecode |
 | `FunctionMetadata` | MUST for bytecode version 1.3+ | per-function `has_env`/`variadic` flags and parameter name, `VarLoc`, and primitive declared-type entries |
+| `SelfCallSites` | Optional | source-proven calls bound to the executing definition, excluding effective `NOTINLINE` declarations and differently resolved lexical names |
 
 Debug records may include macroexpansion provenance as source spans or compact
 forms for tooling, but the executable semantics remain the bytecode and load
@@ -548,6 +549,17 @@ u16 slot, u8 declared_type}`. Location kind 0 names a checked local slot; kind
 mean `Any`, `Fixnum`, and `SingleFloat`. A variadic function's core
 `lambda_list_ref` is executable binder metadata and MUST be present; it is not
 a retained function body or source fallback.
+
+`SelfCallSites` uses `table_kind = 10`, with flags zero. Its payload is a
+`u32 function_count`, followed in function-table order by a `u32 site_count`
+and that many `u32` bytecode byte offsets. Offsets are strictly increasing;
+each identifies a `CALL_NAMED` targeting that function's own name. The loader
+rejects duplicate tables, inconsistent counts, invalid instruction offsets,
+and mismatched targets. Missing metadata supplies no self-call proof, so older
+units retain dynamic named-call behavior. The compiler records the declaration
+and lexical binding decision when compiling source; loading does not infer
+self identity from matching names alone. Native cold calls and deoptimization
+retain the same callable identity as the compiled self call.
 
 ## 6.11.4 Loading Semantics
 

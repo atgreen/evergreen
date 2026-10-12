@@ -29264,7 +29264,7 @@ fn body_custom_declarations(body: EgclVal) -> Vec<EgclVal> {
             }
             // OPTIMIZE is retained unconditionally: DECLARATION-INFORMATION must
             // report the policy in force, and no proclamation introduces it.
-            let retain = sym_bare_name_rc(name).as_ref() == "OPTIMIZE"
+            let retain = matches!(sym_bare_name_rc(name).as_ref(), "OPTIMIZE" | "INLINE" | "NOTINLINE")
                 || (any_proclaimed_declarations()
                     && PROCLAIMED_DECLARATIONS
                         .borrow()
@@ -29827,6 +29827,31 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     }
     // Record the docstring before the wrap below replaces `body`.
     record_function_documentation(name_form, body, env)?;
+    // Store lexical call policy in the definition's source: lazy compilation
+    // can happen after the enclosing LOCALLY has returned. Later declarations
+    // in the function body still override these outer declarations.
+    egcl_rt::rooted!(inherited_policy = NIL);
+    for index in (0..env.active_declarations.len()).rev() {
+        let specifier = env.active_declarations[index];
+        let (kind, _) = cp(specifier);
+        if kind.is_symbol() && matches!(sym_bare_name_rc(kind).as_ref(), "INLINE" | "NOTINLINE") {
+            *inherited_policy = arena_cons(specifier, *inherited_policy);
+        }
+    }
+    if !inherited_policy.is_nil() {
+        let declare = resolve_sym("DECLARE").unwrap_or(NIL);
+        egcl_rt::rooted!(declaration = arena_cons(declare, *inherited_policy));
+        if body.is_cons() && cp(body).0.is_string() && cp(body).1.is_cons() {
+            // Keep documentation first and insert the outer declaration before
+            // the function's own declarations, so the inner policy wins.
+            egcl_rt::rooted!(docstring = cp(body).0);
+            egcl_rt::rooted!(tail = arena_cons(*declaration, cp(body).1));
+            body = arena_cons(*docstring, *tail);
+        } else {
+            body = arena_cons(*declaration, body);
+        }
+    }
+
     // A defun body is wrapped in an implicit block named after the function
     // (ANSI 3.1.2.1), so `(return-from NAME ...)` works from anywhere in the
     // body — including inside nested flet/loop/etypecase forms. For `(setf x)`
@@ -40109,6 +40134,7 @@ mod env_gc_root_tests {
         }
         use egcl_rt::bytecode::{BytecodeFunction, Instr, VarLoc};
         let nested = BytecodeFunction {
+            self_call_sites: Vec::new(),
             code: vec![Instr::LoadLocal(0), Instr::Return],
             constants: vec![],
             load_time_values: vec![],

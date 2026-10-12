@@ -88,6 +88,17 @@ fn install_body(symbol: u32, body: Arc<BytecodeFunction>) -> (u32, Rc<NativeCode
     (symbol, code)
 }
 
+fn assert_proven_self_call(code: &NativeCode, symbol: u32) {
+    let body = code.body.as_ref().expect("installed source body");
+    let calls: Vec<_> = body.code.iter().enumerate().filter_map(|(pc, instruction)| {
+        matches!(instruction, Instr::CallNamed { sym, .. } if *sym == symbol)
+            .then_some(pc as u32)
+    }).collect();
+    assert_eq!(calls.len(), 1, "fixture retains its non-tail recursive instruction");
+    assert_eq!(body.self_call_sites, calls,
+        "stack/deopt regression must exercise proven direct self admission");
+}
+
 fn assert_mapped_t2(code: &NativeCode) {
     assert!(
         code.is_t2,
@@ -1373,6 +1384,7 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         crate::cli::read_eval_all_env("(ordinary-t2-native-frame-sum-tick)", &mut env).unwrap();
     }
     let (symbol, code) = install(name, "(n x)", &format!("({form})"), &mut env);
+    assert_proven_self_call(&code, symbol);
     assert_mapped_t2(&code);
     assert!(code.has_deopt, "worker T2 must retain arithmetic guards");
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
@@ -1468,6 +1480,7 @@ fn ordinary_t2_native_recursion_falls_back_at_depth_cap_and_restores_anchor() {
          (defun {name} (n) {form})"), &mut env).unwrap();
     let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-CAP-LEAF"]);
     let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    assert_proven_self_call(&code, symbol);
     assert_mapped_t2(&code);
     let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
     assert!(mapped.native_entry_kind_slot.is_some(),

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Compile eligible recursive self-calls directly through the x86-64 Lisp ABI,
+  preserving `NOTINLINE`, lexical function bindings, and the executing definition
+  across redefinition and garbage collection. Retain this behavior in source-free
+  BFASL files ([#307](https://github.com/atgreen/evergreen/pull/307)).
+
 - Reject oversized typed allocations before their body lengths or aligned footprints overflow GC size metadata.
   ([#302](https://github.com/atgreen/evergreen/pull/302)).
 

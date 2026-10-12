@@ -445,7 +445,10 @@ mod tests {
         let mut table = Table::default();
         let ordinal = table.ordinal(43);
         let cell = CallCell::new(ordinal, 11, 12);
-        for mutation in 0..9 {
+        let published = CallCell::new(ordinal, 11, 12);
+        let valid = ordinary_descriptor(0);
+        assert!(table.publish_ordinary(&published, &valid));
+        for mutation in 0..12 {
             let mut entry = ordinary_descriptor(0);
             match mutation {
                 0 => entry.kind ^= 1,
@@ -457,6 +460,14 @@ mod tests {
                 6 => entry.code_len = 0,
                 7 => entry.stack_required = 0,
                 8 => entry.stack_required = usize::MAX,
+                9 => {
+                    // Keep the entry inside the range so this specifically
+                    // checks that address zero is not a valid code base.
+                    entry.code_start = 0;
+                    entry.entry = 0x10;
+                }
+                10 => entry.entry = entry.code_start - 1,
+                11 => entry.stack_required = 7,
                 _ => unreachable!(),
             }
             assert!(
@@ -466,6 +477,15 @@ mod tests {
             assert_eq!(
                 unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
                 0
+            );
+            assert!(
+                !table.publish_ordinary(&published, &entry),
+                "invalid replacement {mutation}"
+            );
+            assert_eq!(
+                unsafe { &*published.ordinary_entry_address() }.load(Ordering::Acquire),
+                &valid as *const _ as usize,
+                "rejected replacement {mutation} must preserve the valid target"
             );
         }
         let entry = ordinary_descriptor(0);

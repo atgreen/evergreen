@@ -11,6 +11,7 @@ use egcl_compiler::t2::x64_value_maps::NativeValueLocation;
 
 fn body() -> BytecodeFunction {
     BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: vec![
             Instr::LoadLocal(0),
             Instr::CallNamed {

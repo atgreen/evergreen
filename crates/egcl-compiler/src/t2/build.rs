@@ -3086,6 +3086,7 @@ mod tests {
         max_stack: u16,
     ) -> BytecodeFunction {
         BytecodeFunction {
+            self_call_sites: Vec::new(),
             code,
             constants,
             load_time_values: vec![],
