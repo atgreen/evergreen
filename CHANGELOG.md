@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Let eligible ordinary T2 functions return from bounded, noncollecting entry
+  paths before constructing a native frame, including simple recursive base
+  cases ([#310](https://github.com/atgreen/evergreen/pull/310)).
+
 - Reduce ordinary T2 call overhead with direct pending-flag comparisons,
   proven-empty multiple-value admission and smaller frames. Improve measured
   untyped `fib(35)` time from 212 ms to 204 ms on the benchmark host

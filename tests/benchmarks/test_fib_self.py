@@ -13,6 +13,8 @@ class EvidenceTests(unittest.TestCase):
             listing = ("FIB-CODE-BASE 4096\n; FIB\n; T2 — native\n"
                        "; Ordinary x86-64 Lisp ABI — installed native code.\n"
                        "; 128 bytes of x86-64:\n"
+                       "  +0000: cmp rcx,1\n  +0004: je 0x1010\n"
+                       "  +0006: mov r11,0x9999\n  +000c: jmp r11\n"
                        "  +0010: push rbp\n  +0011: mov rbp,rsp\n"
                        "  +0020: call 0x1010\n  +0030: call 0x1010\n")
         block = "FIB-DISASSEMBLY-BEGIN\n" + listing + "FIB-DISASSEMBLY-END\n"
@@ -25,6 +27,20 @@ class EvidenceTests(unittest.TestCase):
 
     def test_sbcl_compiled_self_calls(self):
         self.assertEqual(parse_trial(self.transcript("sbcl"), "sbcl", 1)["self_call_count"], 2)
+
+    def test_early_return_prefix_at_accepted_ordinary_entry(self):
+        text = self.transcript().replace(
+            "+0010: push rbp\n  +0011: mov rbp,rsp",
+            "+0010: test dil,7\n  +0014: jne 0x101c\n"
+            "  +0016: mov rax,rdi\n  +0019: clc\n  +001a: ret\n"
+            "  +001c: push rbp\n  +001d: mov rbp,rsp")
+        self.assertEqual(parse_trial(text, "after", 1)["self_call_target_offset"], 16)
+
+    def test_reject_calls_to_unrelated_internal_prologue(self):
+        text = self.transcript().replace("je 0x1010", "je 0x1040")
+        text = text.replace("+0030: call 0x1010", "+0030: call 0x1010\n  +0040: push rbp")
+        with self.assertRaisesRegex(ValueError, "self calls"):
+            parse_trial(text, "after", 1)
 
     def test_reject_changed_code(self):
         with self.assertRaisesRegex(ValueError, "changed"):

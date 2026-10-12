@@ -105,6 +105,27 @@ fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
 }
 
 #[test]
+fn recursive_calls_enter_the_frameless_base_case_prefix() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8, 0, None, true);
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
+    let calls: Vec<_> = instructions.iter().filter(|instruction|
+        instruction.mnemonic() == Mnemonic::Call && instruction.op0_kind() == OpKind::NearBranch64)
+        .collect();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].near_branch_target(), calls[1].near_branch_target());
+    let start = instructions.iter().position(|instruction|
+        instruction.ip() == calls[0].near_branch_target()).unwrap();
+    let frame = instructions[start..].iter().position(|instruction|
+        instruction.mnemonic() == Mnemonic::Push && instruction.op0_register() == Register::RBP)
+        .unwrap() + start;
+    assert!(instructions[start..frame].iter().any(|instruction|
+        instruction.mnemonic() == Mnemonic::Ret),
+        "both recursive edges must enter the base-case return before frame setup");
+}
+
+#[test]
 fn recursive_admission_tests_flags_without_register_round_trips() {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic};
     let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],

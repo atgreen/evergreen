@@ -1146,6 +1146,24 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
     assert!(mapped.mapped_entry().is_none(), "no mapped recursive entry is available");
     assert!(mapped.value_maps_for_test().iter().next().is_some(),
         "recursive CALL continuations retain exact native frame maps");
+    let bytes = unsafe { std::slice::from_raw_parts(code.entry, code.code_len) };
+    let instructions: Vec<_> = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
+        iced_x86::DecoderOptions::NONE).into_iter().collect();
+    let self_calls: Vec<_> = instructions.iter().filter(|instruction|
+        instruction.code() == iced_x86::Code::Call_rel32_64
+            && instruction.near_branch_target() >= code.entry as u64
+            && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
+        .collect();
+    assert_eq!(self_calls.len(), 2, "installed Fibonacci must contain both direct self calls");
+    assert_eq!(self_calls[0].near_branch_target(), self_calls[1].near_branch_target());
+    let start = instructions.iter().position(|instruction|
+        instruction.ip() == self_calls[0].near_branch_target()).unwrap();
+    let frame = instructions[start..].iter().position(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Push
+            && instruction.op0_register() == iced_x86::Register::RBP).unwrap() + start;
+    assert!(instructions[start..frame].iter().any(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Ret),
+        "installed worker-optimized Fibonacci must return base cases before its prologue");
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
     assert_eq!(
         egcl_rt::function::tier(*function),
