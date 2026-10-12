@@ -2373,7 +2373,10 @@ unsafe extern "C" fn poll_or_transfer(
     unsafe {
         root_publication::published(image, || {
             #[cfg(test)]
-            root_publication::observe();
+            {
+                root_publication::observe();
+                native_poll::observe_request();
+            }
             poll_or_transfer_unpublished(request, out);
             if (*out).exit == NativeExit::Returned && prepare_osr(image) {
                 (*out).exit = NativeExit::Transfer;

@@ -76,6 +76,31 @@ pub(super) fn refresh() {
         }
         None => control.deadline_armed = 1,
     }
+    #[cfg(test)]
+    if let Some(hook) = AFTER_REFRESH.with(Cell::get) {
+        hook();
+    }
+}
+
+/// Unlike root_publication::OBSERVE, this observer never forces an idle guard
+/// into the runtime. It runs only after a real slow poll has published roots.
+#[cfg(test)]
+pub(in super::super) static OBSERVE_REQUEST:
+    egcl_rt::execution_local::ExecutionLocal<Cell<Option<fn()>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+/// Completes request handshakes only after runtime consumption and control
+/// refresh, so a requester cannot post its next epoch during the previous drain.
+#[cfg(test)]
+pub(in super::super) static AFTER_REFRESH:
+    egcl_rt::execution_local::ExecutionLocal<Cell<Option<fn()>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+#[cfg(test)]
+pub(super) fn observe_request() {
+    if let Some(hook) = OBSERVE_REQUEST.with(Cell::get) {
+        hook();
+    }
 }
 
 #[cfg(test)]
