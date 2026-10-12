@@ -1,6 +1,6 @@
 ---
 name: grind
-description: EGCL-local autonomous work loop. Survey the Beads queue, pick the highest-value next task (prioritizing correctness and progress toward the HotSpot-like tiered-JIT Common Lisp goal), reprioritize the queue accordingly, then execute it end-to-end with the project's validation + GC-safety discipline. Trigger when the user says "/grind", "grind", "pick the next thing and do it", "keep making progress", or wants an autonomous session that decides and works without hand-holding.
+description: EGCL autonomous work loop. Survey the Beads queue, pick the highest-value next task (prioritizing correctness and progress toward the HotSpot-like tiered-JIT Common Lisp goal), reprioritize the queue accordingly, then implement, validate, push a focused feature branch, and open a pull request using the project's GC-safety discipline. Trigger when the user says "/grind", "grind", "pick the next thing and do it", "keep making progress", or wants an autonomous session that decides and works without hand-holding.
 ---
 
 # grind — the EGCL progress loop
@@ -11,8 +11,11 @@ deoptimization, and OSR, over a **moving, precise, generational GC**, converging
 on real ANSI semantics and self-hosting (ASDF, real `uiop:getenv`, …).
 
 `/grind` = **decide what to work on next, reprioritize the queue so that
-decision is legible, then do the work to completion.** One good increment,
-committed and closed, beats a half-finished heroic epic. Prefer correctness and
+decision is legible, then do the work to completion.** Deliver each coherent,
+validated increment on a pushed feature branch with a focused pull request.
+Publishing the branch and creating the PR are part of `/grind` by default;
+ask only when an explicit user constraint or a concrete access blocker requires it.
+Prefer correctness and
 demonstrable progress toward the goal over breadth.
 
 ## 0. Orient (every run)
@@ -66,8 +69,8 @@ delivers real, verifiable value and do *that* this run.
 - **Chase a done-signal, not a rabbit.** Every task needs an observable "it
   works now" (a form that returns the right value, a test that flips, a gate
   that passes). If you can't state it, you're rat-holing.
-- **Commit validated increments.** Don't stockpile a giant uncommitted change.
-  Land each proven step; the next session/agent benefits.
+- **Commit and publish validated increments.** Push each focused branch and open
+  its PR as the work becomes reviewable; the next session/agent can inspect it.
 - **A decision that's genuinely the maintainer's** (a semantics policy, a big
   irreversible direction) — surface it briefly and pick the safe default or ask,
   rather than guessing and building the wrong thing at length.
@@ -124,7 +127,8 @@ start coding:
 bd update <id> --claim
 ```
 
-1. Implement the smallest correct change. Match surrounding code idiom.
+1. Create or reuse a focused feature branch from current `main`, following
+   `AGENTS.md`. Implement the smallest correct change. Match surrounding code idiom.
 2. Build the real binary; **drive the affected flow** and observe the result
    (the /verify discipline) — not just tests. Wrong-result bugs demand you *see*
    the right value now.
@@ -156,13 +160,28 @@ bd update <id> --claim
 6. Commit with an imperative subject citing the bead id and a GC-safety note
    when relevant; end the message with:
    `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
-7. `bd close <id>` with the commit hash and what was verified; `bd sync`.
-   `git push` only when the user asks.
+7. Push the feature branch and open a focused PR by default, unless the user
+   explicitly asked to keep changes local. Use a draft PR when implementation
+   or required validation is incomplete. Describe the problem, resulting
+   behavior, Bead, validation results, and any remaining blockers accurately.
+   Use `gh pr create` with `--body-file` for multiline descriptions; an existing
+   PR should be updated around the final change rather than duplicated.
+8. Record the commit hash, PR URL, and validation evidence in Beads; close the
+   Bead only when its work is complete. Keep blocked or unfinished work open.
+   Run `bd sync` and report any publication or synchronization failure.
+9. Follow `AGENTS.md` for review and merge checks. Opening a PR does not itself
+   authorize merging; merge only when the user's instructions authorize it.
+
+If Git or GitHub API access blocks publication, diagnose the specific operation
+using existing authentication before requesting credentials. Finish independent
+implementation and validation, prepare the complete PR description, and report
+exactly what was pushed, what was created, and what remains blocked.
 
 ## 6. Loop or hand off
 
 Report: what you picked and **why** (the rubric line it satisfied), the change,
-how you verified it (including the GC evidence), what you re-ranked, and any new
+how you verified it (including the GC evidence), the branch and PR URL (or the
+specific publication blocker), what you re-ranked, and any new
 Beads filed. Then pick the next task (repeat) until told to stop or the queue has
 no tractable correctness/goal work left — at which point say so plainly rather
 than inventing busywork.
