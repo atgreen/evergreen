@@ -405,3 +405,96 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_tail_descendant_overflow_preserves_suspended_caller_roots() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(defun ordinary-tail-overflow-terminal (a b c d)
+           (if (consp a)
+             (progn (%force-minor-gc-for-test) (error \"descendant overflow\")) d))
+         (defun ordinary-tail-overflow-c (a b c d)
+           (ordinary-tail-overflow-terminal a b c d))
+         (defun ordinary-tail-overflow-b (a b c d)
+           (ordinary-tail-overflow-c c d a b))", &mut env,
+    ).unwrap();
+    let (_, c) = install("ORDINARY-TAIL-OVERFLOW-C", "(a b c d)",
+        "((ordinary-tail-overflow-terminal a b c d))", &mut env);
+    let (_, b) = install("ORDINARY-TAIL-OVERFLOW-B", "(a b c d)",
+        "((ordinary-tail-overflow-c c d a b))", &mut env);
+    // A has no incoming overflow capacity, so even with tail emission selected
+    // it must CALL B. B then overwrites its incoming fourth argument (A.a) with
+    // C's fourth argument (A.b), while A remains suspended at that CALL.
+    let (symbol, a) = native_transfer_entry::with_ordinary_tail_emission_for_test(|| {
+        install_ordinary("ORDINARY-TAIL-OVERFLOW-A", "(a b c)",
+            "((ordinary-tail-overflow-b a b c a))", &mut env)
+    });
+    let NativeCodeStorage::Mapped(mapped) = &a._storage else { panic!("mapped A") };
+    assert_eq!(mapped.value_maps_for_test().iter().count(), 2,
+        "capacity fallback retains direct and cold CALL maps");
+    for site in mapped.value_maps_for_test().iter() {
+        let Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(values)) =
+            mapped.value_maps_for_test().value_map(site.return_offset)
+        else { panic!("ordinary caller frame map") };
+        for location in values.gc_locations() {
+            if let egcl_compiler::t2::x64_value_maps::NativeValueLocation::Stack(offset) = location {
+                assert!(*offset >= 0,
+                    "caller roots stay in its private frame; temporary ABI overflow is below body RSP");
+            }
+        }
+    }
+    let warm = [11, 22, 33].map(EgclVal::from_fixnum);
+    for _ in 0..3 {
+        assert_eq!(run_native(&a, symbol, &warm, &mut env).unwrap(), warm[1]);
+    }
+    drop((b, c));
+    HeapCollector::new().minor_gc().unwrap();
+    egcl_rt::rooted!(arguments = Vec::new());
+    for index in 0..3 {
+        arguments.push(crate::cli::arena_cons(EgclVal::from_fixnum(400 + index), NIL));
+    }
+    let bits: Vec<_> = arguments.iter().map(|value| value.to_raw()).collect();
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+    let control = unsafe { &*execution }.active_native_control();
+    let segment = egcl_rt::native_transfer::current_segment();
+    egcl_rt::poll_safepoint();
+    assert_eq!(super::super::native_loop_should_exit(), 0);
+    native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    egcl_rt::rooted!(error = run_native(&a, symbol, &arguments, &mut env).unwrap_err());
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
+        "A CALL and B tail JMP are admitted; only C's terminal call is cold");
+    assert!(arguments.iter().zip(bits).any(|(value, bits)| value.to_raw() != bits),
+        "collection must actually relocate supplied arguments");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
+    assert_eq!(unsafe { &*execution }.active_native_control(), control);
+    HeapCollector::new().minor_gc().unwrap();
+    let trace = error.backtrace().expect("descendant tail error trace");
+    assert!(!trace.iter().any(|frame| frame.function.as_deref()
+        .is_some_and(|name| name.ends_with("ORDINARY-TAIL-OVERFLOW-B"))),
+        "retired B must be absent: {trace:?}");
+    let rows: Vec<_> = trace.iter().filter(|frame| frame.function.as_deref()
+        .is_some_and(|name| name.ends_with("ORDINARY-TAIL-OVERFLOW-A")
+            || name.ends_with("ORDINARY-TAIL-OVERFLOW-C"))).collect();
+    assert_eq!(rows.len(), 2, "A and C must remain physical owners: {trace:?}");
+    for (name, origin, indices) in [
+        ("ORDINARY-TAIL-OVERFLOW-A", FrameOrigin::Managed, &[0, 1, 2][..]),
+        ("ORDINARY-TAIL-OVERFLOW-C", FrameOrigin::Native, &[2, 0, 0, 1][..]),
+    ] {
+        let row = rows.iter().find(|row| row.function.as_deref()
+            .is_some_and(|function| function.ends_with(name))).unwrap();
+        assert_eq!(row.origin, origin);
+        let actual = row.arguments.as_ref().expect("original frame arguments");
+        assert_eq!(actual.len(), indices.len());
+        for (value, &index) in actual.iter().zip(indices) {
+            assert_eq!(*value, arguments[index]);
+            assert_eq!(crate::cli::cp(*value),
+                (EgclVal::from_fixnum(400 + index as i64), NIL));
+        }
+    }
+}
