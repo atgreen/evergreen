@@ -35,8 +35,7 @@ fn public_packed_f64_loop_keeps_raw_values_and_reloads_moved_arrays() {
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
         "(defun packed-f64-collector ()
-           (%ordinary-t2-entry-for-test)
-           (%force-minor-gc-for-test))",
+           (%ordinary-t2-entry-for-test))",
         &mut env,
     )
     .unwrap();
@@ -69,6 +68,20 @@ fn public_packed_f64_loop_keeps_raw_values_and_reloads_moved_arrays() {
     let before = (src.to_raw(), dst.to_raw());
     egcl_rt::rooted!(args = vec![*src, *dst, EgclVal::from_fixnum(4), *scale]);
     ordinary_t2::expect_entry(&code);
+    // Stress allocations can promote the arrays before entry. Collect Survivor
+    // as well as nursery objects at the helper's verified native publication;
+    // the generated loop must reload relocated bases before its next access.
+    fn collect_arrays() {
+        egcl_rt::gc::full_gc().unwrap();
+    }
+    struct RestoreObserver(Option<fn()>);
+    impl Drop for RestoreObserver {
+        fn drop(&mut self) {
+            ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+        }
+    }
+    let _observer = RestoreObserver(ordinary_t2::RECURSIVE_LEAF_OBSERVER
+        .with(|hook| hook.replace(Some(collect_arrays))));
     egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env).unwrap());
     assert!(
         ordinary_t2::observed_entry(),
