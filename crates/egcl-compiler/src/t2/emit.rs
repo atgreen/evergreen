@@ -933,6 +933,23 @@ fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
     }
 }
 
+/// Keep raw results in their authoritative homes before the next IR boundary.
+/// Both operands are read before the store, including when homes overlap.
+fn emit_stack_float(a: &mut Asm, opcode: crate::t2::ir::Opcode, slots: [u32; 3]) {
+    use crate::t2::ir::Opcode;
+    let arithmetic = match opcode {
+        Opcode::FloatAdd => 0x58,
+        Opcode::FloatMul => 0x59,
+        _ => unreachable!("stack float emission requires add or multiply"),
+    };
+    for (operation, slot) in [0x10, arithmetic, 0x11].into_iter().zip(slots) {
+        // MOVSD XMM0,[RSP+disp32]; ADDSD/MULSD XMM0,[RSP+disp32];
+        // MOVSD [RSP+disp32],XMM0. No XMM value survives this instruction.
+        a.extend_from_slice(&[0xf2, 0x0f, operation, 0x84, 0x24]);
+        a.extend_from_slice(&framed_stack_disp(slot).to_le_bytes());
+    }
+}
+
 fn emit_call_root_sync(
     a: &mut Asm,
     roots: &[crate::t2::ir::Value],
@@ -5847,7 +5864,20 @@ fn emit_framed_inner(
                 }
             }
             let wide_call = d.opcode == Opcode::Call && d.args.len() > 3;
-            let (mut inst_reg, result_stores) = if d.opcode == Opcode::TakeValuesToLocals
+            let stack_float = if published_native_roots && native_call_storage
+                && matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                && d.args.len() == 2 && d.results.len() == 1
+                && d.args.iter().chain(&d.results).all(|&value|
+                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+            {
+                match (homes.get(&d.args[0]), homes.get(&d.args[1]), homes.get(&d.results[0])) {
+                    (Some(FramedHome::Stack(lhs)), Some(FramedHome::Stack(rhs)),
+                        Some(FramedHome::Stack(result))) => Some([*lhs, *rhs, *result]),
+                    _ => None,
+                }
+            } else { None };
+            let (mut inst_reg, result_stores) = if stack_float.is_some()
+                || d.opcode == Opcode::TakeValuesToLocals
                 || d.opcode == Opcode::Invoke
                 || matches!(
                     d.opcode,
@@ -5864,7 +5894,9 @@ fn emit_framed_inner(
             };
             let mut inst_calls = Vec::new();
             let mut inst_pool = Vec::new();
-            if ordinary_call_mode && d.opcode == Opcode::Call {
+            if let Some(slots) = stack_float {
+                emit_stack_float(&mut a, d.opcode, slots);
+            } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
@@ -9315,3 +9347,7 @@ mod poll_map_tests {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "emit_raw_float_tests.rs"]
+mod raw_float_tests;

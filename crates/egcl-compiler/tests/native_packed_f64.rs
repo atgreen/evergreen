@@ -485,6 +485,10 @@ fn exercise(input: Input) {
         NativeCallStorage::NativeStack,
     )
     .expect("native packed double operations");
+    for opcode in [0x58, 0x59] {
+        assert!(emitted.code.windows(5).any(|bytes| bytes == [0xf2, 0x0f, opcode, 0x84, 0x24]),
+            "raw packed arithmetic must use an SSE2 stack operand, opcode {opcode:x}");
+    }
     let code = JitBuffer::new(&emitted.code).unwrap();
     let stack = EgclStack::new(64 * 1024);
     let mut activation = {
