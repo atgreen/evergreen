@@ -199,6 +199,17 @@ fn shr_bits(m: &[u64], shift: u32) -> Vec<u64> {
     out
 }
 
+fn mag_shl_bits(m: &[u64], shift: usize) -> Vec<u64> {
+    if m.is_empty() {
+        return Vec::new();
+    }
+    let bits = (shift % 64) as u32;
+    let shifted = shl_bits_exact(m, bits, m.len() + usize::from(bits != 0));
+    let mut out = vec![0; shift / 64];
+    out.extend(shifted);
+    mag_trim(out)
+}
+
 /// Truncating division of magnitudes: (quotient, remainder). `b` must be
 /// nonzero, which is `big_divmod`'s documented contract.
 ///
@@ -708,7 +719,83 @@ impl BigRat {
     }
 
     pub fn to_f64(&self) -> f64 {
-        self.num.to_f64() / self.den.to_f64()
+        let num_bits = mag_bitlen(&self.num.mag);
+        let den_bits = mag_bitlen(&self.den.mag);
+        if den_bits == 0 || (num_bits <= 53 && den_bits <= 53) {
+            // Exactly represented components need only one hardware rounding.
+            return self.num.to_f64() / self.den.to_f64();
+        }
+        let sign = u64::from((self.num.sign < 0) != (self.den.sign < 0)) << 63;
+        if num_bits == 0 {
+            return f64::from_bits(sign);
+        }
+
+        // The bit-length difference is either floor(log2(num/den)) or one
+        // above it. Bound it before casting or allocating shifted magnitudes.
+        let difference = num_bits as i128 - den_bits as i128;
+        if difference > 1024 {
+            return f64::from_bits(sign | f64::INFINITY.to_bits());
+        }
+        if difference < -1075 {
+            return f64::from_bits(sign);
+        }
+        let mut exponent = difference as i32;
+        let below_power = if exponent >= 0 {
+            mag_cmp(
+                &self.num.mag,
+                &mag_shl_bits(&self.den.mag, exponent as usize),
+            )
+        } else {
+            mag_cmp(
+                &mag_shl_bits(&self.num.mag, (-exponent) as usize),
+                &self.den.mag,
+            )
+        };
+        if below_power == Ordering::Less {
+            exponent -= 1;
+        }
+        if exponent > 1023 {
+            return f64::from_bits(sign | f64::INFINITY.to_bits());
+        }
+        if exponent < -1075 {
+            return f64::from_bits(sign);
+        }
+
+        // Quantize normals to 53 significant bits, subnormals to multiples of
+        // 2^-1074. Divide exact integers and use the remainder to round ONCE,
+        // including ties to even; converting components first loses this data.
+        // All temporaries are Rust magnitudes, so no Lisp allocation/GC occurs.
+        let shift = 52 - exponent.max(-1022);
+        let (numerator, denominator) = if shift >= 0 {
+            (
+                mag_shl_bits(&self.num.mag, shift as usize),
+                self.den.mag.clone(),
+            )
+        } else {
+            (
+                self.num.mag.clone(),
+                mag_shl_bits(&self.den.mag, (-shift) as usize),
+            )
+        };
+        let (quotient, remainder) = mag_divmod(&numerator, &denominator);
+        debug_assert!(quotient.len() <= 1);
+        let mut significand = quotient.first().copied().unwrap_or(0);
+        let rounding = mag_cmp(&mag_shl1(&remainder), &denominator);
+        if rounding == Ordering::Greater || (rounding == Ordering::Equal && significand & 1 != 0) {
+            significand += 1;
+        }
+        if exponent < -1022 {
+            // A carry to bit 52 naturally becomes the smallest normal value.
+            return f64::from_bits(sign | significand);
+        }
+        if significand == 1 << 53 {
+            significand >>= 1;
+            exponent += 1;
+        }
+        if exponent > 1023 {
+            return f64::from_bits(sign | f64::INFINITY.to_bits());
+        }
+        f64::from_bits(sign | ((exponent + 1023) as u64) << 52 | (significand & ((1 << 52) - 1)))
     }
 
     pub fn to_val(&self) -> EgclVal {
