@@ -3567,6 +3567,8 @@ pub struct NativeRecursiveControl {
     pub depth: *mut u32,
     /// Reserved to keep the native control layout stable.
     pub reserved_counter: u64,
+    /// The current native Env's MV flag. At generated-code boundaries, false
+    /// guarantees an empty buffer, including release of all secondary roots.
     pub mv_active: *const bool,
     pub expected_generation: u64,
     pub seen_carrier: u64,
@@ -4537,8 +4539,11 @@ fn emit_framed_inner(
     let ordinary_mode = ordinary.is_some();
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_mode = false;
+    let normalized_calls = if ordinary_call_mode {
+        crate::t2::opt_clear_mv::calls_with_discarded_multiple_values(f)
+    } else { HashSet::new() };
     let single_returns = if native_returns {
-        crate::t2::opt_clear_mv::single_value_state(f, true)
+        crate::t2::opt_clear_mv::single_value_state_after_normalized_calls(f, true, &normalized_calls)
     } else { HashSet::new() };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let transfer_mode = false;
@@ -5118,6 +5123,19 @@ fn emit_framed_inner(
     if ordinary_mode && layout.values.values().any(|home| *home == FramedHome::Reg(13)) {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
+    // The conditional MV cleanup runs after Call defines its primary. The
+    // allocator's original Call clobber does not protect that fresh result.
+    // Give it a preserved home before deriving any root or recovery maps.
+    for &call in &normalized_calls {
+        for result in &f.inst(call).results {
+            let home = layout.values.get_mut(result).ok_or(EmitError::UnsupportedOp(0xFD))?;
+            if !home.survives_sysv_call() {
+                *home = FramedHome::Stack(layout.stack_slots);
+                layout.stack_slots = layout.stack_slots.checked_add(1)
+                    .ok_or(EmitError::UnsupportedOp(0xFD))?;
+            }
+        }
+    }
     // Inserted polls are not allocator calls. A value needed only for poll
     // recovery may therefore keep a caller-saved register even though the
     // transfer capture, and a later landing write-back, cannot access it.
@@ -5446,6 +5464,18 @@ fn emit_framed_inner(
         pending_addr: c2i_transfer_pending_addr,
         exit: a.label(),
     });
+    let emit_clear_mv = |a: &mut Asm| {
+        // Zero count selects reset in the shared MV helper. It is a leaf
+        // that cannot allocate, collect, suspend or signal.
+        mov_imm32(a, 7, 0);
+        mov_imm32(a, 6, 0);
+        mov_imm32(a, 2, 0);
+        mov_imm64(a, 0, c2i_mv_addr as i64);
+        #[cfg(not(windows))]
+        a.extend_from_slice(&[0xff, 0xd0]);
+        #[cfg(windows)]
+        emit_runtime_helper_call(a, c2i_recovery_toggle_addr, transfer_check);
+    };
     // Precise deopt (bliss-mba): each guarding instruction gets its own deopt stub
     // that reconstructs the interpreter frame at that guard's bytecode position.
     // Every instruction that reaches `emit_arith_inst` (the only guard emitter)
@@ -6334,21 +6364,8 @@ fn emit_framed_inner(
                     transfer_check,
                 )?);
             } else if d.opcode == Opcode::ClearMv {
-                // A zero count selects the clear operation in the shared T2 MV
-                // helper. Initialise every argument because the same ABI also
-                // serves TakeValuesToLocals.
-                mov_imm32(&mut a, 7, 0); // edi = primary (unused)
-                mov_imm32(&mut a, 6, 0); // esi = destination (null)
-                mov_imm32(&mut a, 2, 0); // edx = count (clear)
-                mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                #[cfg(not(windows))]
-                {
-                    // The zero-count path is a leaf that cannot allocate or signal.
-                    a.extend_from_slice(&[0xff, 0xd0]);
-                }
-                #[cfg(windows)]
-                {
-                    emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
+                if !ordinary_call_mode || !single_returns.contains(&inst) {
+                    emit_clear_mv(&mut a);
                 }
             } else if d.opcode == Opcode::TakeValuesToLocals {
                 let (nvars, slot_base) = match d.aux {
@@ -6471,6 +6488,17 @@ fn emit_framed_inner(
                 // before root reloads; its later FrameState must not replay CALL.
                 if let Some(result) = d.results.first() {
                     store_home(&mut a, homes[result], RAX, 0);
+                }
+                if normalized_calls.contains(&inst) {
+                    // MOV, DEC and LEA in call retirement preserve carry. The
+                    // ABI guarantees CF=0 already means an empty/inactive MV
+                    // buffer. Only discarded CF=1 tuples need runtime cleanup.
+                    let single = a.label();
+                    let branch = a.here();
+                    a.jcc(Cc::E, single);
+                    a.patch_u8(branch + 1, 0x83); // JNC (x86 ordinary ABI only)
+                    emit_clear_mv(&mut a);
+                    a.bind(single);
                 }
             }
             for (home, src) in result_stores {

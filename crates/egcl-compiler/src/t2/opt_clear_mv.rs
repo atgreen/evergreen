@@ -64,6 +64,16 @@ use std::collections::{HashMap, HashSet};
 /// forget it; a ClearMv establishes it. Intersecting predecessors makes this a
 /// must analysis, including loop backedges.
 pub fn single_value_state(f: &Function, single_entry: bool) -> HashSet<Inst> {
+    single_value_state_after_normalized_calls(f, single_entry, &HashSet::new())
+}
+
+/// The ordinary emitter may consume a call's carry descriptor and normalize
+/// its discarded result tuple before continuing. Only calls actually emitted
+/// with that normalization may be supplied here; result types alone do not
+/// establish an empty, inactive buffer.
+pub fn single_value_state_after_normalized_calls(
+    f: &Function, single_entry: bool, normalized_calls: &HashSet<Inst>,
+) -> HashSet<Inst> {
     let blocks = f.block_order();
     let incoming = |b, outgoing: &HashMap<_, bool>| {
         if f.osr_entries.iter().any(|entry| entry.block == b) {
@@ -76,7 +86,7 @@ pub fn single_value_state(f: &Function, single_entry: bool) -> HashSet<Inst> {
     };
     let advance = |inst, single| {
         let data = f.inst(inst);
-        if data.opcode == Opcode::ClearMv {
+        if data.opcode == Opcode::ClearMv || normalized_calls.contains(&inst) {
             true
         } else if data.flags.call || matches!(data.opcode,
             Opcode::Call | Opcode::Invoke | Opcode::CleanupSave
@@ -221,6 +231,27 @@ pub fn unobserved_multiple_value_state(f: &Function) -> HashSet<Inst> {
         }
     }
     unobserved
+}
+
+/// Calls whose returned tuple is discarded on every path before another MV
+/// reader. Query the live state AFTER the call: the call itself is a reader
+/// of its incoming state. This uses the same deoptimization contract as dead
+/// ClearMv elimination; original bytecode resets remain available on guards.
+pub fn calls_with_discarded_multiple_values(f: &Function) -> HashSet<Inst> {
+    let live_in = live_at_block_entries(f);
+    let mut calls = HashSet::new();
+    for &block in f.block_order() {
+        let mut live = f.succs(block).iter().any(|successor| live_in[successor]);
+        for &inst in f.block(block).insts.iter().rev() {
+            if f.inst(inst).opcode == Opcode::Call && !live { calls.insert(inst); }
+            if f.inst(inst).opcode == Opcode::ClearMv {
+                live = false;
+            } else if reads_mv(f, inst) {
+                live = true;
+            }
+        }
+    }
+    calls
 }
 
 /// Remove every dead `ClearMv`; returns how many were removed.
@@ -535,6 +566,42 @@ mod tests {
         f.block_mut(loop_body).insts.push(branch);
         assert!(!unobserved_multiple_value_state(&f).contains(&point),
             "a reader on the cycle must keep the incoming tuple live");
+    }
+
+    #[test]
+    fn discarded_call_results_are_normalized_before_guards_and_resets() {
+        let mut f = Function::new("discarded-result");
+        let entry = f.entry();
+        let (call, _) = f.push_inst(entry, call(), &[]);
+        let (guard, _) = f.push_inst(entry, base(Opcode::Guard), &[]);
+        let (reset, _) = f.push_inst(entry, clear_mv(), &[]);
+        f.set_terminator(entry, base(Opcode::Return));
+        let calls = calls_with_discarded_multiple_values(&f);
+        assert_eq!(calls, HashSet::from([call]));
+        assert!(!single_value_state(&f, true).contains(&reset));
+        let normalized = single_value_state_after_normalized_calls(&f, true, &calls);
+        assert!(normalized.contains(&guard));
+        assert!(normalized.contains(&reset));
+    }
+
+    #[test]
+    fn forwarding_or_observing_any_result_path_prevents_normalization() {
+        for reader in [Opcode::Return, Opcode::TakeValuesToLocals, Opcode::Call] {
+            let mut f = Function::new("observed-result");
+            let entry = f.entry();
+            let discarded = f.make_block();
+            let observed = f.make_block();
+            let (producer, _) = f.push_inst(entry, call(), &[]);
+            f.set_terminator(entry, brif(discarded, observed));
+            f.push_inst(discarded, clear_mv(), &[]);
+            f.set_terminator(discarded, base(Opcode::Return));
+            if reader != Opcode::Return {
+                f.push_inst(observed, base(reader), &[]);
+                f.push_inst(observed, clear_mv(), &[]);
+            }
+            f.set_terminator(observed, base(Opcode::Return));
+            assert!(!calls_with_discarded_multiple_values(&f).contains(&producer));
+        }
     }
 
 }

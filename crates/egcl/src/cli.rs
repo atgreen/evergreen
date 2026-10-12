@@ -2102,6 +2102,9 @@ struct Env {
     handlers: Vec<HandlerCluster>,
     /// Multiple values from last (values ...) or (floor ...) call
     mv: Vec<EgclVal>,
+    /// Inactive implies an empty `mv` at evaluator/native boundaries. Clear
+    /// through `clear_mv`; copying/restoring this flag must also copy the tuple.
+    /// Generated ordinary calls use this invariant to skip redundant resets.
     mv_active: bool,
     /// Closures stored by name or lambda id
     /// Keyed by a plain `u64` id, so the default SipHash is pure overhead —

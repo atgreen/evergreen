@@ -1168,11 +1168,14 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
     take_recursive_helper_calls();
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    MV_CLEAR_HELPER_CALLS.with(|calls| calls.set(0));
     assert_eq!(
         run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
         EgclVal::from_fixnum(144)
     );
     let entries = take_recursive_entries();
+    assert_eq!(MV_CLEAR_HELPER_CALLS.with(Cell::get), 0,
+        "single-valued Fibonacci must skip runtime MV cleanup");
     let helpers = take_recursive_helper_calls();
     assert_eq!(entries, 0, "ordinary recursion must not enter legacy recursive frames");
     assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
@@ -1239,6 +1242,81 @@ fn ordinary_t2_single_return_releases_secondary_roots_without_clear_calls() {
             instruction.op_kind(operand) == iced_x86::OpKind::Immediate64
                 && instruction.immediate64() == clear),
             "proven single-valued body still calls the MV clear helper");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_discarded_call_tuples_release_mv_state() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun mv-clear-producer (n)
+           (if (= n 0) (values)
+             (if (= n 1) (values 71) (values 71 (cons 82 nil)))))",
+        &mut env).unwrap();
+    let (symbol, code) = install("MV-CLEAR-CONSUMER", "(n)",
+        "((declare (notinline mv-clear-producer))
+          (let ((x (mv-clear-producer n))) x))", &mut env);
+    assert_mapped_t2(&code);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some());
+    let deopts = mapped.deopt_count();
+    for (n, expected) in [(0, NIL), (1, EgclVal::from_fixnum(71)),
+        (2, EgclVal::from_fixnum(71))] {
+        MV_CLEAR_HELPER_CALLS.with(|calls| calls.set(0));
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+        assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env).unwrap(),
+            expected);
+        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0);
+        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 1,
+            "the ordinary caller must execute its producer through the named adapter");
+        let clears = MV_CLEAR_HELPER_CALLS.with(Cell::get);
+        if n == 1 {
+            // The named return adapter normalizes VALUES-of-one itself.
+            assert_eq!(clears, 0, "already normalized tuples need no further reset");
+        } else {
+            assert!(clears > 0, "active zero/many tuples still need clearing: {n}");
+        }
+        assert_eq!(mapped.deopt_count(), deopts);
+        assert!(!env.mv_active);
+        assert!(env.mv.is_empty(), "discarded secondary values must stop being roots");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_discarded_many_return_survives_arithmetic_and_deopt() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(setq *mv-clear-guard-ticks* 0)
+         (defun mv-clear-guard-producer (x)
+           (setq *mv-clear-guard-ticks* (+ *mv-clear-guard-ticks* 1))
+           (values x (cons 82 nil)))", &mut env).unwrap();
+    let (symbol, code) = install("MV-CLEAR-GUARDED", "(x)",
+        "((+ (mv-clear-guard-producer x) 1))", &mut env);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped code") };
+    assert!(mapped.ordinary_entry.is_some());
+    assert!(code.has_deopt);
+    for (index, (input, expected)) in [(41, "42"),
+        ((1_i64 << 60) - 1, "1152921504606846976")].into_iter().enumerate() {
+        let deopts = mapped.deopt_count();
+        MV_CLEAR_HELPER_CALLS.with(|calls| calls.set(0));
+        egcl_rt::rooted!(result = run_native(&code, symbol,
+            &[EgclVal::from_fixnum(input)], &mut env).unwrap());
+        assert_eq!(super::super::super::format_val(*result), expected);
+        assert_eq!(MV_CLEAR_HELPER_CALLS.with(Cell::get), 1,
+            "consume the many-value return before arithmetic or guard recovery");
+        assert_eq!(mapped.deopt_count() > deopts, index == 1);
+        assert!(!env.mv_active && env.mv.is_empty());
+        assert_eq!(super::super::super::read_eval_all_env("*mv-clear-guard-ticks*", &mut env).unwrap(),
+            EgclVal::from_fixnum(index as i64 + 1), "guard recovery must not replay the producer");
     }
 }
 
