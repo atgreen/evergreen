@@ -1,0 +1,662 @@
+{
+  "iterations": 10,
+  "cpu": 4,
+  "trials": [
+    {
+      "side": "after",
+      "trial": 0,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-0/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/after-0/control,/tmp/egcl-fib-parity/counters-35a2185f/after-0/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/tmp/egcl-fib-parity/egcl-after-35a2185f",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-0/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 391,
+          "units_per_second": 1000,
+          "seconds": 0.391,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 391,
+          "units_per_second": 1000,
+          "seconds": 0.391,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 392,
+          "units_per_second": 1000,
+          "seconds": 0.392,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 390,
+          "units_per_second": 1000,
+          "seconds": 0.39,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 391,
+          "units_per_second": 1000,
+          "seconds": 0.391,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "c6edbd539c3dadce640f290aeb0f474bdfd7a5241e3053a278957137125e8683",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        542,
+        1143
+      ],
+      "code_base": 140426858532864,
+      "perf": "# started on Mon Oct 12 15:32:59 2026\n\n59735553237;;cpu_core/instructions/u;3924004564;100.00;;\n7758002773;;cpu_core/cycles/u;3924004564;100.00;;\n13439830888;;cpu_core/branches/u;3924004564;100.00;;\n259675;;cpu_core/branch-misses/u;3924004564;100.00;;\n"
+    },
+    {
+      "side": "sbcl",
+      "trial": 0,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-0/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/sbcl-0/control,/tmp/egcl-fib-parity/counters-35a2185f/sbcl-0/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/home/linuxbrew/.linuxbrew/bin/sbcl",
+        "--noinform",
+        "--non-interactive",
+        "--no-userinit",
+        "--no-sysinit",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-0/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 149000,
+          "units_per_second": 1000000,
+          "seconds": 0.149,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 149000,
+          "units_per_second": 1000000,
+          "seconds": 0.149,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 150001,
+          "units_per_second": 1000000,
+          "seconds": 0.150001,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 150000,
+          "units_per_second": 1000000,
+          "seconds": 0.15,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 148000,
+          "units_per_second": 1000000,
+          "seconds": 0.148,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 150000,
+          "units_per_second": 1000000,
+          "seconds": 0.15,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 149000,
+          "units_per_second": 1000000,
+          "seconds": 0.149,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 153001,
+          "units_per_second": 1000000,
+          "seconds": 0.153001,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "9c872e922ad47daaf1e2b132a4b46cc37a2a94b520612967597e2b9620d1dbcb",
+      "self_call_count": 2,
+      "perf": "# started on Mon Oct 12 15:33:04 2026\n\n12549525980;;cpu_core/instructions/u;1512133888;100.00;;\n2935444706;;cpu_core/cycles/u;1512133888;100.00;;\n3734338609;;cpu_core/branches/u;1512133888;100.00;;\n557908;;cpu_core/branch-misses/u;1512133888;100.00;;\n"
+    },
+    {
+      "side": "sbcl",
+      "trial": 1,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-1/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/sbcl-1/control,/tmp/egcl-fib-parity/counters-35a2185f/sbcl-1/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/home/linuxbrew/.linuxbrew/bin/sbcl",
+        "--noinform",
+        "--non-interactive",
+        "--no-userinit",
+        "--no-sysinit",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-1/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 149000,
+          "units_per_second": 1000000,
+          "seconds": 0.149,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 151000,
+          "units_per_second": 1000000,
+          "seconds": 0.151,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 150000,
+          "units_per_second": 1000000,
+          "seconds": 0.15,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 156001,
+          "units_per_second": 1000000,
+          "seconds": 0.156001,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 156000,
+          "units_per_second": 1000000,
+          "seconds": 0.156,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 157000,
+          "units_per_second": 1000000,
+          "seconds": 0.157,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "9c872e922ad47daaf1e2b132a4b46cc37a2a94b520612967597e2b9620d1dbcb",
+      "self_call_count": 2,
+      "perf": "# started on Mon Oct 12 15:33:06 2026\n\n12549543233;;cpu_core/instructions/u;1542376078;100.00;;\n2977540841;;cpu_core/cycles/u;1542376078;100.00;;\n3734343123;;cpu_core/branches/u;1542376078;100.00;;\n568586;;cpu_core/branch-misses/u;1542376078;100.00;;\n"
+    },
+    {
+      "side": "after",
+      "trial": 1,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-1/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/after-1/control,/tmp/egcl-fib-parity/counters-35a2185f/after-1/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/tmp/egcl-fib-parity/egcl-after-35a2185f",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-1/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 395,
+          "units_per_second": 1000,
+          "seconds": 0.395,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 394,
+          "units_per_second": 1000,
+          "seconds": 0.394,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 394,
+          "units_per_second": 1000,
+          "seconds": 0.394,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 393,
+          "units_per_second": 1000,
+          "seconds": 0.393,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 395,
+          "units_per_second": 1000,
+          "seconds": 0.395,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 397,
+          "units_per_second": 1000,
+          "seconds": 0.397,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 398,
+          "units_per_second": 1000,
+          "seconds": 0.398,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 394,
+          "units_per_second": 1000,
+          "seconds": 0.394,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 395,
+          "units_per_second": 1000,
+          "seconds": 0.395,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 396,
+          "units_per_second": 1000,
+          "seconds": 0.396,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "9eb31f5a3dc35c365d738daf7b2875eb2c1c0667be40aac80df3ae488c8e06db",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        542,
+        1143
+      ],
+      "code_base": 140044112441344,
+      "perf": "# started on Mon Oct 12 15:33:08 2026\n\n59737502856;;cpu_core/instructions/u;3954576179;100.00;;\n7763430375;;cpu_core/cycles/u;3954576179;100.00;;\n13440154754;;cpu_core/branches/u;3954576179;100.00;;\n275632;;cpu_core/branch-misses/u;3954576179;100.00;;\n"
+    },
+    {
+      "side": "after",
+      "trial": 2,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-2/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/after-2/control,/tmp/egcl-fib-parity/counters-35a2185f/after-2/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/tmp/egcl-fib-parity/egcl-after-35a2185f",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/after-2/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 397,
+          "units_per_second": 1000,
+          "seconds": 0.397,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 400,
+          "units_per_second": 1000,
+          "seconds": 0.4,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 398,
+          "units_per_second": 1000,
+          "seconds": 0.398,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 397,
+          "units_per_second": 1000,
+          "seconds": 0.397,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 398,
+          "units_per_second": 1000,
+          "seconds": 0.398,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 398,
+          "units_per_second": 1000,
+          "seconds": 0.398,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 403,
+          "units_per_second": 1000,
+          "seconds": 0.403,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 404,
+          "units_per_second": 1000,
+          "seconds": 0.404,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 400,
+          "units_per_second": 1000,
+          "seconds": 0.4,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 402,
+          "units_per_second": 1000,
+          "seconds": 0.402,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "e76bd4ee6480001d1856f0a3ad0c5fb16c79042081330cc1028f5bc7186c05d8",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        542,
+        1143
+      ],
+      "code_base": 140635076030464,
+      "perf": "# started on Mon Oct 12 15:33:12 2026\n\n59731495268;;cpu_core/instructions/u;3991188796;100.00;;\n7865035446;;cpu_core/cycles/u;3991188796;100.00;;\n13439084472;;cpu_core/branches/u;3991188796;100.00;;\n262748;;cpu_core/branch-misses/u;3991188796;100.00;;\n"
+    },
+    {
+      "side": "sbcl",
+      "trial": 2,
+      "command": [
+        "/tmp/evergreen-fib-calls/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "perf",
+        "stat",
+        "-x",
+        ";",
+        "-o",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-2/perf.csv",
+        "-D",
+        "-1",
+        "--control",
+        "fifo:/tmp/egcl-fib-parity/counters-35a2185f/sbcl-2/control,/tmp/egcl-fib-parity/counters-35a2185f/sbcl-2/ack",
+        "-e",
+        "{cpu_core/instructions/u,cpu_core/cycles/u,cpu_core/branches/u,cpu_core/branch-misses/u}",
+        "--",
+        "/home/linuxbrew/.linuxbrew/bin/sbcl",
+        "--noinform",
+        "--non-interactive",
+        "--no-userinit",
+        "--no-sysinit",
+        "--load",
+        "/tmp/egcl-fib-parity/counters-35a2185f/sbcl-2/driver.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 154000,
+          "units_per_second": 1000000,
+          "seconds": 0.154,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 157001,
+          "units_per_second": 1000000,
+          "seconds": 0.157001,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 157000,
+          "units_per_second": 1000000,
+          "seconds": 0.157,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 154000,
+          "units_per_second": 1000000,
+          "seconds": 0.154,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 156000,
+          "units_per_second": 1000000,
+          "seconds": 0.156,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 7,
+          "ticks": 153001,
+          "units_per_second": 1000000,
+          "seconds": 0.153001,
+          "checksum": 9227465
+        },
+        {
+          "index": 8,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        },
+        {
+          "index": 9,
+          "ticks": 155000,
+          "units_per_second": 1000000,
+          "seconds": 0.155,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "9c872e922ad47daaf1e2b132a4b46cc37a2a94b520612967597e2b9620d1dbcb",
+      "self_call_count": 2,
+      "perf": "# started on Mon Oct 12 15:33:17 2026\n\n12549524363;;cpu_core/instructions/u;1548107033;100.00;;\n3002089182;;cpu_core/cycles/u;1548107033;100.00;;\n3734338516;;cpu_core/branches/u;1548107033;100.00;;\n573352;;cpu_core/branch-misses/u;1548107033;100.00;;\n"
+    }
+  ],
+  "method": "perf stat user-only cpu_core counters enabled after warmup/prelisting, disabled after ten checked fib35 calls; includes loop/check/printing and brief file handshake overhead",
+  "per_fib35_medians": {
+    "after": {
+      "cpu_core/instructions/u": 5973555323.7,
+      "cpu_core/cycles/u": 776343037.5,
+      "cpu_core/branches/u": 1343983088.8,
+      "cpu_core/branch-misses/u": 26274.8
+    },
+    "sbcl": {
+      "cpu_core/instructions/u": 1254952598.0,
+      "cpu_core/cycles/u": 297754084.1,
+      "cpu_core/branches/u": 373433860.9,
+      "cpu_core/branch-misses/u": 56858.6
+    }
+  },
+  "profile_report": "# To display the perf.data header info, please use --header/--header-only options.\n#\n#\n# Total Lost Samples: 0\n#\n# Samples: 3K of event 'cpu_core/cycles/u'\n# Event count (approx.): 7708116695\n#\n# Overhead  Symbol                                                      Shared Object        IPC   [IPC Coverage]\n# ........  ..........................................................  ...................  ....................\n#\n    38.55%  [.] egcl::cli::bytecode::c2i_clear_mv                       egcl-after-35a2185f  -      -            \n    37.18%  [.] T2:FIB                                                  [JIT] tid 3668483    -      -            \n    16.50%  [.] egcl_rt::execution_local::cached_pointer                egcl-after-35a2185f  -      -            \n     4.36%  [.] egcl::cli::bytecode::c2i_t2_mv                          egcl-after-35a2185f  -      -            \n     3.33%  [.] egcl_rt::thread::current_fiber                          egcl-after-35a2185f  -      -            \n\n\n#\n# (Tip: Order by the overhead of source file name and line number: perf report -s srcline)\n#\n",
+  "binary_sha256": "1949e855ce9be61b9c47becd90dea5b25390f97ec619b7880e96f2bf41b7917b"
+}
