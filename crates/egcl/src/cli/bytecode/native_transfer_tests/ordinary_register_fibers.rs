@@ -138,11 +138,11 @@ fn stopped_rows(fiber: egcl_rt::FiberId, deadline: Instant) -> Vec<LogicalFrame>
 
 fn native_arguments(rows: &[LogicalFrame]) -> Vec<Vec<EgclVal>> {
     [
-        "ORDINARY-REGISTER-FIBER-MIDDLE",
-        "ORDINARY-REGISTER-FIBER-OUTER",
+        ("ORDINARY-REGISTER-FIBER-MIDDLE", FrameOrigin::Native),
+        ("ORDINARY-REGISTER-FIBER-OUTER", FrameOrigin::Managed),
     ]
     .iter()
-    .map(|name| {
+    .map(|(name, origin)| {
         let matches: Vec<_> = rows
             .iter()
             .filter(|row| {
@@ -152,7 +152,9 @@ fn native_arguments(rows: &[LogicalFrame]) -> Vec<Vec<EgclVal>> {
             })
             .collect();
         assert_eq!(matches.len(), 1, "{rows:?}");
-        assert_eq!(matches[0].origin, FrameOrigin::Native);
+        // The root enriches its existing managed anchor; only the direct
+        // child adds a Native row. Both carry exact native argument homes.
+        assert_eq!(matches[0].origin, *origin);
         let arguments = matches[0]
             .arguments
             .as_ref()
@@ -171,15 +173,20 @@ fn ordinary_register_owners_survive_suspension_redefinition_and_external_gc() {
         .unwrap_or_else(|error| error.into_inner());
     let mut startup = Env::new(false);
     egcl_rt::rooted_ref!(_startup = &mut startup);
+    for name in [READY, RELEASE] {
+        egcl_rt::symbols::set_symbol_value_checked(egcl_rt::symbols::intern(name), NIL).unwrap();
+    }
     crate::cli::read_eval_all_env(
-        "(defparameter *ordinary-register-fiber-ready* nil)
-         (defparameter *ordinary-register-fiber-release* nil)
-         (defun ordinary-register-fiber-terminal (a b c d)
+        "(defun ordinary-register-fiber-terminal (a b c d)
            (if (consp a)
                (progn
                  (setq *ordinary-register-fiber-ready* t)
-                 (loop until *ordinary-register-fiber-release*
-                       do (egcl::%native-fiber :sleep 0.01d0))
+                 (tagbody
+                  again
+                    (if *ordinary-register-fiber-release* (go done))
+                    (egcl::%native-fiber :sleep 0.01d0)
+                    (go again)
+                  done)
                  (values a b c d))
                d))
          (defun ordinary-register-fiber-middle (a b c d)
