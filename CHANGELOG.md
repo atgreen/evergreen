@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Use native tail transfers for eligible environment-free Linux x86-64 T2
+  forwarders with zero to four fixed tagged arguments when the target fits the
+  caller's rounded incoming overflow capacity. Preserve moving-GC roots and
+  code owners across frame retirement; retain call-and-return when capacity
+  is insufficient ([#286](https://github.com/atgreen/evergreen/pull/286)).
 - Use register arguments and native child frames for eligible Linux x86-64 T2
   leaves and forwarding calls, preserving multiple values, moving-GC roots,
   error backtraces, and suspended code across redefinition
