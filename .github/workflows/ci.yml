@@ -66,10 +66,11 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Test CI selection and shard runner contracts
+      - name: Test CI and benchmark runner contracts
         run: |
           python3 scripts/test_ci_plan.py
           python3 scripts/test_ci_tests.py
+          python3 -m unittest discover -s tests/benchmarks -p 'test_*.py'
       - name: Select validation tier
         id: select
         env:
