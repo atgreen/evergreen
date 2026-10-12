@@ -1297,7 +1297,7 @@ fn ordinary_t2_discarded_many_return_survives_arithmetic_and_deopt() {
     super::super::super::read_eval_all_env(
         "(setq *mv-clear-guard-ticks* 0)
          (defun mv-clear-guard-producer (x)
-           (incf *mv-clear-guard-ticks*)
+           (setq *mv-clear-guard-ticks* (+ *mv-clear-guard-ticks* 1))
            (values x (cons 82 nil)))", &mut env).unwrap();
     let (symbol, code) = install("MV-CLEAR-GUARDED", "(x)",
         "((+ (mv-clear-guard-producer x) 1))", &mut env);
