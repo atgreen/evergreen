@@ -61,3 +61,7 @@ Run `python3 tests/benchmarks/test_ordinary_bridge.py` for both parser modes.
 `ordinary-chain-workload.lisp` itself is portable Common Lisp; the timed driver
 uses EGCL's nanosecond clock. SBCL may tail-call the chain despite `NOTINLINE`,
 so its checksum smoke establishes portability, not an equivalent call sequence.
+
+The [first quiet matched comparison](results/2026-10-12-ordinary-chain.md)
+retains all absolute and paired distributions. It uses fixed pre-tail release
+artifacts and keeps the small residual increment's noise explicit.
