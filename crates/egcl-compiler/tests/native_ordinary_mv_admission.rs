@@ -100,7 +100,7 @@ fn inst(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
     }
 }
 
-fn exercise(clear_between: bool) {
+fn exercise(clear_between: bool, pending: Option<u64>) {
     let mut f = Function::new("ordinary-mv-admission");
     let entry = f.entry();
     let mut sites = Vec::new();
@@ -159,7 +159,8 @@ fn exercise(clear_between: bool) {
     let revisions = [AtomicU64::new(7), AtomicU64::new(7)];
     let bytes = [AtomicU8::new(0), AtomicU8::new(0)];
     let words = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    let flags = OrdinaryCallFlags {
+    let events = AtomicU64::new(pending.unwrap_or(0));
+    let flags = OrdinaryCallFlags { pending_events: pending.map_or(0, |_| events.as_ptr() as u64),
         gc_requested: bytes[0].as_ptr() as u64,
         sigusr1_pending: bytes[1].as_ptr() as u64,
         posted_signal: words[0].as_ptr() as u64,
@@ -235,16 +236,27 @@ fn exercise(clear_between: bool) {
             },
         );
     }
-    assert_eq!(result, [if clear_between { 40 } else { 24 }, 0]);
+    let forced_cold = pending.is_some_and(|word| word != 0);
+    assert_eq!(result, [if clear_between && !forced_cold { 40 } else { 24 }, 0]);
     assert_eq!(depth, 1, "admitted children must balance native depth");
     assert!(!active.load(std::sync::atomic::Ordering::Relaxed));
-    assert_eq!(control.clears, u64::from(clear_between));
-    assert_eq!(control.second_calls, u64::from(clear_between));
+    assert_eq!(control.clears, u64::from(clear_between && !forced_cold));
+    assert_eq!(control.second_calls, u64::from(clear_between && !forced_cold));
     assert_eq!(
         control.cold_calls,
-        u64::from(!clear_between),
+        if forced_cold { 2 } else { u64::from(!clear_between) },
         "unknown active MV must take the cold path, normalized MV must admit second callee"
     );
+
+    if pending.is_some() {
+        let loads = iced_x86::Decoder::new(64, &emitted.code, iced_x86::DecoderOptions::NONE)
+            .into_iter().filter(|instruction| {
+                instruction.mnemonic() == iced_x86::Mnemonic::Mov
+                    && instruction.op1_kind() == iced_x86::OpKind::Immediate64
+                    && instruction.immediate64() == events.as_ptr() as u64
+            }).count();
+        assert_eq!(loads, 2, "one shared event observation per call site");
+    }
 
     // Execution proves the retained check matters; decoding proves the known
     // empty cases did not retain a redundant load of control.mv_active.
@@ -268,10 +280,15 @@ fn exercise(clear_between: bool) {
 
 #[test]
 fn known_empty_call_admission_omits_mv_load_after_real_tuple_cleanup() {
-    exercise(true);
+    exercise(true, None);
 }
 
 #[test]
 fn unknown_call_admission_keeps_mv_check_and_rejects_active_tuple() {
-    exercise(false);
+    exercise(false, None);
+}
+
+#[test]
+fn shared_event_word_admits_idle_and_rejects_each_kind_including_high_counts() {
+    for word in [0, 1, 2, 4, 8, 256] { exercise(true, Some(word)); }
 }

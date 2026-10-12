@@ -157,7 +157,7 @@ fn emit() -> FramedCode {
             arity_error_veneer: wrong_arity as *const () as u64,
         },
         &[],
-        OrdinaryCallFlags {
+        OrdinaryCallFlags { pending_events: 0,
             gc_requested: bytes[0].as_ptr() as u64,
             sigusr1_pending: bytes[1].as_ptr() as u64,
             posted_signal: words[0].as_ptr() as u64,

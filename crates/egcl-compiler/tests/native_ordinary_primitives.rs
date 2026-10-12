@@ -71,7 +71,7 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
             arity_error_veneer: 1,
         },
         &targets,
-        OrdinaryCallFlags {
+        OrdinaryCallFlags { pending_events: 0,
             gc_requested: 1,
             sigusr1_pending: 1,
             posted_signal: 1,
@@ -190,7 +190,7 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
             arity_error_veneer: 1,
         },
         &targets,
-        OrdinaryCallFlags {
+        OrdinaryCallFlags { pending_events: 0,
             gc_requested: 1,
             sigusr1_pending: 1,
             posted_signal: 1,

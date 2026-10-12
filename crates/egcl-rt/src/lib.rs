@@ -47,6 +47,7 @@ pub mod lock_order;
 
 // ── Thread runtime ────────────────────────────────────────────────
 pub mod safepoint;
+pub mod pending_events;
 pub mod scheduler;
 pub mod stack;
 pub mod sync;

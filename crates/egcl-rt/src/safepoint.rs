@@ -32,21 +32,21 @@ static SAFEPOINT_PAGE_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// Flag-only SIGUSR1 handoff. Directed delivery interrupts a blocking syscall;
 /// ordinary code observes this flag at its next safepoint poll.
-static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
+use crate::pending_events::GLOBAL as PENDING_EVENTS;
 
 #[cfg(unix)]
 pub(crate) extern "C" fn sigusr1_handler(_signal: i32) {
-    SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+    PENDING_EVENTS.post_sigusr1();
 }
 
 use crate::error::EgclError;
 
 /// Handle to the safepoint page.
 pub struct SafepointPage {
+    /// Each page owns its request and a reservation in the global observation.
+    requested: crate::pending_events::PendingFlag<'static>,
     /// Page-aligned memory buffer (one native kernel page).
     page: *mut u8,
-    /// Whether a safepoint is currently requested.
-    requested: AtomicBool,
     /// Whether the polling page is currently protected with PROT_NONE.
     protected: AtomicBool,
 }
@@ -80,8 +80,8 @@ impl SafepointPage {
         SAFEPOINT_PAGE_ADDR.store(page as usize, Ordering::Release);
         SAFEPOINT_PAGE_LEN.store(crate::syscall::page_size(), Ordering::Release);
         Ok(SafepointPage {
+            requested: crate::pending_events::PendingFlag::new(&PENDING_EVENTS),
             page,
-            requested: AtomicBool::new(false),
             protected: AtomicBool::new(false),
         })
     }
@@ -107,7 +107,7 @@ impl SafepointPage {
             EgclError::Internal(format!("safepoint mprotect failed: errno {errno}"))
         })?;
         self.protected.store(true, Ordering::SeqCst);
-        self.requested.store(true, Ordering::SeqCst);
+        self.requested.request();
         Ok(())
     }
 
@@ -127,13 +127,13 @@ impl SafepointPage {
             EgclError::Internal(format!("safepoint mprotect restore failed: errno {errno}"))
         })?;
         self.protected.store(false, Ordering::SeqCst);
-        self.requested.store(false, Ordering::SeqCst);
+        self.requested.clear();
         Ok(())
     }
 
     /// Check if a safepoint is currently requested.
     pub fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::SeqCst)
+        self.requested.is_requested()
     }
 
     pub fn poll_page_is_protected(&self) -> bool {
@@ -163,7 +163,7 @@ pub(crate) fn recover_poll_page_sigsegv() -> bool {
     }
     .is_ok();
     if restored {
-        SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+        PENDING_EVENTS.post_sigusr1();
     }
     restored
 }
@@ -210,17 +210,14 @@ fn global_safepoint_page() -> &'static SafepointPage {
     PAGE.get_or_init(|| SafepointPage::init().expect("failed to allocate global safepoint page"))
 }
 
-/// Addresses of the existing GC-request and SIGUSR1 flags for generated polls.
-///
-/// Returns `None` before explicit safepoint initialization; this getter never
-/// maps a page, registers a thread, or consumes work. Both pointers remain valid
-/// for the process lifetime. They address one-byte `AtomicBool` objects: generated
-/// readers must use atomic loads (GC request SeqCst, SIGUSR1 Relaxed), and must
-/// enter the published runtime poll when either flag is set. Do not read the
-/// protected polling page itself through either of these pointers.
-pub fn native_poll_flag_addresses() -> Option<(*const AtomicBool, *const AtomicBool)> {
+/// Process-lifetime GC request and conservative SIGUSR1 addresses. The first
+/// points to the page's AtomicBool; the second to the shared AtomicU64 whose low
+/// bit is SIGUSR1. Legacy generated x86 readers may test its low byte, which
+/// admits only extra cold polls from counted obligations. New ordinary readers
+/// test the full shared word. This getter never initializes or consumes work.
+pub fn native_poll_flag_addresses() -> Option<(*const AtomicBool, *const AtomicU64)> {
     let page = PAGE.get()?;
-    Some((std::ptr::addr_of!(page.requested), std::ptr::addr_of!(SIGUSR1_PENDING)))
+    Some((page.requested.address(), PENDING_EVENTS.address()))
 }
 
 /// Whether a safepoint poll needs its published runtime path. This only reads
@@ -232,7 +229,7 @@ pub fn poll_work_pending() -> bool {
         return true;
     };
     page.is_requested()
-        || SIGUSR1_PENDING.load(Ordering::Relaxed)
+        || PENDING_EVENTS.sigusr1_pending()
         || crate::thread::current_yield_requested()
 }
 
@@ -480,7 +477,7 @@ pub fn poll_safepoint() {
     // load stays pending for the next poll; a set flag still needs an atomic
     // take because another mutator can consume it concurrently.
     let interrupted =
-        SIGUSR1_PENDING.load(Ordering::Relaxed) && SIGUSR1_PENDING.swap(false, Ordering::Relaxed);
+        PENDING_EVENTS.take_sigusr1();
     if page.is_requested() || interrupted {
         enter_safepoint();
     } else {
@@ -1058,8 +1055,8 @@ mod pending_work_tests {
         let thread = crate::thread::current_thread();
         let page = global_safepoint_page();
         let (requested, interrupted) = native_poll_flag_addresses().unwrap();
-        assert_eq!(requested, std::ptr::addr_of!(page.requested));
-        assert_eq!(interrupted, std::ptr::addr_of!(SIGUSR1_PENDING));
+        assert_eq!(requested, page.requested.address());
+        assert_eq!(interrupted, PENDING_EVENTS.address());
         assert_eq!(native_poll_flag_addresses(), Some((requested, interrupted)));
         let execution = crate::thread::current_execution_context_for_native().unwrap();
         assert_eq!(execution, thread.execution().as_ptr());
@@ -1102,13 +1099,13 @@ mod pending_work_tests {
         assert!(!unsafe { &*requested }.load(Ordering::SeqCst));
         assert!(!poll_work_pending());
 
-        SIGUSR1_PENDING.store(true, Ordering::Relaxed);
-        assert!(unsafe { &*interrupted }.load(Ordering::Relaxed));
+        PENDING_EVENTS.post_sigusr1();
+        assert_ne!(unsafe { &*interrupted }.load(Ordering::Relaxed) & 1, 0);
         assert!(poll_work_pending());
         assert!(poll_work_pending());
-        assert!(SIGUSR1_PENDING.load(Ordering::Relaxed));
+        assert!(PENDING_EVENTS.sigusr1_pending());
         poll_safepoint();
-        assert!(!SIGUSR1_PENDING.load(Ordering::Relaxed));
+        assert!(!PENDING_EVENTS.sigusr1_pending());
         assert!(!poll_work_pending());
     }
 }

@@ -419,7 +419,7 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
     let revision = AtomicU64::new(7);
     let bytes = [AtomicU8::new(0), AtomicU8::new(0)];
     let words = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    let flags = OrdinaryCallFlags {
+    let flags = OrdinaryCallFlags { pending_events: 0,
         gc_requested: bytes[0].as_ptr() as u64,
         sigusr1_pending: bytes[1].as_ptr() as u64,
         posted_signal: words[0].as_ptr() as u64,
@@ -772,7 +772,7 @@ fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_t
     });
     let byte = AtomicU8::new(0);
     let word = AtomicU64::new(0);
-    let flags = OrdinaryCallFlags { gc_requested: byte.as_ptr() as u64, sigusr1_pending: byte.as_ptr() as u64,
+    let flags = OrdinaryCallFlags { pending_events: 0, gc_requested: byte.as_ptr() as u64, sigusr1_pending: byte.as_ptr() as u64,
         posted_signal: word.as_ptr() as u64, native_errors: word.as_ptr() as u64, signal_epoch: word.as_ptr() as u64 };
     let f = two_call_caller();
     let code = emit_framed_ordinary_two_calls(&f, options(4), targets, flags,
@@ -804,7 +804,7 @@ fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_t
 #[test]
 fn ordinary_two_calls_reject_missing_reset_targets_and_other_shapes() {
     use egcl_compiler::t2::emit::{emit_framed_ordinary_two_calls, OrdinaryCallFlags, OrdinaryCallTarget};
-    let flags = OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+    let flags = OrdinaryCallFlags { pending_events: 0, gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
         native_errors: 1, signal_epoch: 1 };
     let targets = [77, 88].map(|symbol| OrdinaryCallTarget { symbol, descriptor_slot: 1, revision_address: 1 , heat_slot: 0});
     let compile = |f: &Function, targets| emit_framed_ordinary_two_calls(f, options(4), targets, flags, 1, 1);

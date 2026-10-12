@@ -288,7 +288,7 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
     let revision = AtomicU64::new(7);
     let bytes = [AtomicU8::new(0), AtomicU8::new(0)];
     let words = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    let flags = OrdinaryCallFlags {
+    let flags = OrdinaryCallFlags { pending_events: 0,
         gc_requested: bytes[0].as_ptr() as u64,
         sigusr1_pending: bytes[1].as_ptr() as u64,
         posted_signal: words[0].as_ptr() as u64,
@@ -515,7 +515,7 @@ fn ordinary_entry_rejects_unpolled_cycles() {
             arity_error_veneer: 1,
         },
         &[],
-        OrdinaryCallFlags {
+        OrdinaryCallFlags { pending_events: 0,
             gc_requested: 1,
             sigusr1_pending: 1,
             posted_signal: 1,

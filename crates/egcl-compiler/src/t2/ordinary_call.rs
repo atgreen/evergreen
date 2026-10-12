@@ -25,6 +25,9 @@ pub struct OrdinaryCallTarget {
 /// Process-wide atomic cells, independent of each target's cell revision.
 #[derive(Clone, Copy)]
 pub struct OrdinaryCallFlags {
+    /// Optional AtomicU64 combining GC, SIGUSR1, posted signals and native
+    /// errors. Zero keeps the separate cells for independent embedders.
+    pub pending_events: u64,
     pub gc_requested: u64,
     pub sigusr1_pending: u64,
     pub posted_signal: u64,
@@ -573,15 +576,24 @@ impl OrdinaryCallEmission<'_> {
         a.jcc(Cc::E, cold);
         cmp_mem64_disp8(a, 13, 7, 0);
         a.jcc(Cc::Ne, cold);
-        for (address, byte) in [
-            (self.flags.gc_requested, true),
-            (self.flags.sigusr1_pending, true),
-            (self.flags.posted_signal, false),
-            (self.flags.native_errors, false),
-        ] {
-            mov_imm64(a, 11, address as i64);
-            compare_zero_memory(a, 11, 0, byte);
+        if self.flags.pending_events != 0 {
+            // The shared word owns reservations until each underlying request
+            // is consumed. Zero therefore permits the same unchanged cold
+            // continuation and poll cadence as the individual observations.
+            mov_imm64(a, 11, self.flags.pending_events as i64);
+            compare_zero_memory(a, 11, 0, false);
             a.jcc(Cc::Ne, cold);
+        } else {
+            for (address, byte) in [
+                (self.flags.gc_requested, true),
+                (self.flags.sigusr1_pending, true),
+                (self.flags.posted_signal, false),
+                (self.flags.native_errors, false),
+            ] {
+                mov_imm64(a, 11, address as i64);
+                compare_zero_memory(a, 11, 0, byte);
+                a.jcc(Cc::Ne, cold);
+            }
         }
         mov_imm64(a, 11, self.flags.signal_epoch as i64);
         load_mem64_disp(a, RAX, 11, 0);

@@ -44,7 +44,7 @@ fn emit(f: &Function, target: u32) -> Result<FramedCode, EmitError> {
     emit_framed_ordinary_guarded_call(f,
         OrdinaryLispEntryOptions { arity: 1, arity_error_veneer: 1 },
         OrdinaryCallTarget { symbol: target, descriptor_slot: 1, revision_address: 1 , heat_slot: 0},
-        OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+        OrdinaryCallFlags { pending_events: 0, gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
             native_errors: 1, signal_epoch: 1 }, 1,
         OrdinaryGuardOptions { veneer: 1, multiple_values: 1 })
 }
@@ -67,7 +67,7 @@ fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
     let result = emit_framed_ordinary_function(&f,
         OrdinaryLispEntryOptions { arity: 1, arity_error_veneer: 1 },
         &[(call, OrdinaryCallTarget { symbol: 1, descriptor_slot: 1, revision_address: 1 , heat_slot: 0})],
-        OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+        OrdinaryCallFlags { pending_events: 0, gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
             native_errors: 1, signal_epoch: 1 }, 1,
         OrdinaryGuardOptions { veneer: 1, multiple_values: 1 });
     assert!(result.is_ok(), "ordinary recursion must use the same entry as cross-function calls: {:?}", result.err());

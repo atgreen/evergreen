@@ -17683,7 +17683,7 @@ unsafe extern "C" fn c2i_call_legacy_v2(
 /// native call returns.
 static PENDING_NATIVE_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static NATIVE_ERROR: egcl_rt::execution_local::ExecutionLocal<PendingError<'static, EgclError>> = unsafe {
-    egcl_rt::execution_local::ExecutionLocal::new(|| PendingError::new(&PENDING_NATIVE_ERRORS))
+    egcl_rt::execution_local::ExecutionLocal::new(|| PendingError::with_events(&PENDING_NATIVE_ERRORS, &egcl_rt::pending_events::GLOBAL))
 };
 
 fn native_error_pending() -> bool {

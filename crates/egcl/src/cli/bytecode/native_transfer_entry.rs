@@ -853,7 +853,7 @@ impl TransferCode {
                         let emit_call = if ORDINARY_TAIL_EMISSION.with(Cell::get) {
                             emit_call
                         } else { egcl_compiler::t2::emit::emit_framed_ordinary_call };
-                        let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
+                        let call_flags = OrdinaryCallFlags { pending_events: egcl_rt::pending_events::GLOBAL.address() as u64, gc_requested: flags.gc_requested,
                             sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
                             native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
                         let self_calls = if matches!(tier, CompilationTier::T2) {

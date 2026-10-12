@@ -8,13 +8,41 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub(super) struct PendingError<'a, T> {
     value: RefCell<Option<T>>,
     count: &'a AtomicUsize,
+    events: Option<&'a egcl_rt::pending_events::PendingEvents>,
 }
 
 impl<'a, T> PendingError<'a, T> {
+    #[cfg(test)]
     pub(super) const fn new(count: &'a AtomicUsize) -> Self {
         Self {
             value: RefCell::new(None),
             count,
+            events: None,
+        }
+    }
+
+    pub(super) const fn with_events(
+        count: &'a AtomicUsize,
+        events: &'a egcl_rt::pending_events::PendingEvents,
+    ) -> Self {
+        Self {
+            value: RefCell::new(None),
+            count,
+            events: Some(events),
+        }
+    }
+
+    fn reserve(&self) {
+        if let Some(events) = self.events {
+            events.reserve();
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release(&self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        if let Some(events) = self.events {
+            events.release();
         }
     }
 
@@ -25,23 +53,23 @@ impl<'a, T> PendingError<'a, T> {
     pub(super) fn set_first(&self, error: T) {
         let mut value = self.value.borrow_mut();
         if value.is_none() {
-            self.count.fetch_add(1, Ordering::Relaxed);
+            self.reserve();
             *value = Some(error);
         }
     }
 
     pub(super) fn replace(&self, next: Option<T>) -> Option<T> {
         let mut value = self.value.borrow_mut();
-        match (value.is_some(), next.is_some()) {
-            (false, true) => {
-                self.count.fetch_add(1, Ordering::Relaxed);
-            }
-            (true, false) => {
-                self.count.fetch_sub(1, Ordering::Relaxed);
-            }
-            _ => {}
+        let was_pending = value.is_some();
+        let will_be_pending = next.is_some();
+        if !was_pending && will_be_pending {
+            self.reserve();
         }
-        std::mem::replace(&mut *value, next)
+        let previous = std::mem::replace(&mut *value, next);
+        if was_pending && !will_be_pending {
+            self.release();
+        }
+        previous
     }
 
     pub(super) fn take(&self) -> Option<T> {
@@ -58,8 +86,8 @@ impl<'a, T> PendingError<'a, T> {
 
 impl<T> Drop for PendingError<'_, T> {
     fn drop(&mut self) {
-        if self.value.get_mut().is_some() {
-            self.count.fetch_sub(1, Ordering::Relaxed);
+        if self.value.get_mut().take().is_some() {
+            self.release();
         }
     }
 }
@@ -68,6 +96,28 @@ impl<T> Drop for PendingError<'_, T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn event_word_tracks_replacement_restore_and_destruction() {
+        let count = AtomicUsize::new(0);
+        let events = egcl_rt::pending_events::PendingEvents::new();
+        let outer = PendingError::with_events(&count, &events);
+        let inner = PendingError::with_events(&count, &events);
+        outer.set_first(1);
+        inner.set_first(2);
+        let saved = outer.take();
+        assert!(events.pending());
+        outer.replace(saved);
+        drop(inner);
+        assert!(events.pending());
+        outer.replace(Some(3));
+        assert_eq!(outer.take(), Some(3));
+        assert!(!events.pending());
+        outer.set_first(4);
+        drop(outer);
+        assert!(!events.pending());
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn first_error_wins_and_nested_calls_restore_outer_error() {

@@ -95,7 +95,7 @@ fn large_ordinary_frames_and_outgoing_areas_touch_each_stack_page() {
                 heat_slot: 0,
             },
         )],
-        OrdinaryCallFlags {
+        OrdinaryCallFlags { pending_events: 0,
             gc_requested: 1,
             sigusr1_pending: 1,
             posted_signal: 1,

@@ -671,7 +671,7 @@ pub struct NativeThread {
     /// `pthread_t` for directed SIGUSR1 delivery on Unix (zero until mounted).
     #[cfg(unix)]
     os_thread_id: AtomicUsize,
-    pending_signals: AtomicU8,
+    pending_signals: PendingSignals,
 }
 
 unsafe impl Send for NativeThread {}
@@ -732,7 +732,7 @@ impl NativeThread {
             published_fp: AtomicUsize::new(0),
             #[cfg(unix)]
             os_thread_id: AtomicUsize::new(0),
-            pending_signals: AtomicU8::new(0),
+            pending_signals: PendingSignals::new(),
         }
     }
 
@@ -859,27 +859,14 @@ impl NativeThread {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        // Only a bit that was not already set adds an untaken signal, or the
-        // count would drift above the number `take_pending_signal` can remove.
-        if previous & signal.bit() == 0 {
-            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        }
+        self.pending_signals.post(signal.bit());
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
         loop {
-            let bits = self.pending_signals.load(Ordering::Acquire);
+            let bits = self.pending_signals.0.load(Ordering::Acquire);
             let signal = PendingSignal::from_bits(bits)?;
-            let new_bits = bits & !signal.bit();
-            if self
-                .pending_signals
-                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+            if self.pending_signals.take(bits, signal.bit()) {
                 return Some(signal);
             }
         }
@@ -969,6 +956,37 @@ thread_local! {
 /// thread's pending signal.
 static POSTED_PENDING_SIGNALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Owns each posted bit's reservation, including destruction without delivery.
+struct PendingSignals(AtomicU8);
+
+impl PendingSignals {
+    const fn new() -> Self { Self(AtomicU8::new(0)) }
+
+    fn post(&self, bit: u8) {
+        // Reserve both summaries before the bit can be consumed. A duplicate
+        // refunds only its own reservations, never the live bit's ownership.
+        POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        if !crate::pending_events::GLOBAL.post_signal(&self.0, bit) {
+            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    fn take(&self, old: u8, bit: u8) -> bool {
+        if crate::pending_events::GLOBAL.take_signal(&self.0, old, bit) {
+            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+            true
+        } else { false }
+    }
+}
+
+impl Drop for PendingSignals {
+    fn drop(&mut self) {
+        let count = std::mem::take(self.0.get_mut()).count_ones();
+        POSTED_PENDING_SIGNALS.fetch_sub(count as usize, Ordering::Release);
+        for _ in 0..count { crate::pending_events::GLOBAL.release(); }
+    }
+}
 
 /// Process-lifetime address of the pending-signal count (`AtomicUsize`, native
 /// pointer width). Generated code may load it with Relaxed ordering; a nonzero
@@ -1313,7 +1331,7 @@ pub struct Fiber {
     /// `0` means "running normally, not published".
     published_sp: AtomicUsize,
     published_fp: AtomicUsize,
-    pending_signals: AtomicU8,
+    pending_signals: PendingSignals,
 }
 
 impl Fiber {
@@ -1560,27 +1578,14 @@ impl Fiber {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        // Only a bit that was not already set adds an untaken signal, or the
-        // count would drift above the number `take_pending_signal` can remove.
-        if previous & signal.bit() == 0 {
-            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
-        }
+        self.pending_signals.post(signal.bit());
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
         loop {
-            let bits = self.pending_signals.load(Ordering::Acquire);
+            let bits = self.pending_signals.0.load(Ordering::Acquire);
             let signal = PendingSignal::from_bits(bits)?;
-            let new_bits = bits & !signal.bit();
-            if self
-                .pending_signals
-                .compare_exchange(bits, new_bits, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
+            if self.pending_signals.take(bits, signal.bit()) {
                 return Some(signal);
             }
         }
@@ -2780,7 +2785,7 @@ pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<F
         ),
         published_sp: AtomicUsize::new(0),
         published_fp: AtomicUsize::new(0),
-        pending_signals: AtomicU8::new(0),
+        pending_signals: PendingSignals::new(),
     });
     fiber_registry()
         .lock()
@@ -3610,5 +3615,39 @@ mod native_context_address_tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pending_admission_tests {
+    use super::*;
+
+    #[test]
+    fn abandoning_posted_signals_releases_only_the_owners_reservations() {
+        const CHILD: &str = "EGCL_PENDING_ADMISSION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "thread::pending_admission_tests::abandoning_posted_signals_releases_only_the_owners_reservations", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let events = &crate::pending_events::GLOBAL;
+        assert!(!events.pending());
+        let first = PendingSignals::new();
+        let survivor = PendingSignals::new();
+        first.post(1);
+        first.post(1);
+        first.post(2);
+        survivor.post(4);
+        assert_eq!(POSTED_PENDING_SIGNALS.load(Ordering::Acquire), 3);
+        drop(first);
+        assert!(events.pending());
+        assert_eq!(POSTED_PENDING_SIGNALS.load(Ordering::Acquire), 1);
+        assert!(survivor.take(4, 4));
+        assert!(!events.pending());
+        assert_eq!(POSTED_PENDING_SIGNALS.load(Ordering::Acquire), 0);
+        drop(survivor);
+        assert!(!events.pending());
     }
 }
