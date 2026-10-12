@@ -91,16 +91,17 @@ fn ordinary_foreign_guard_uses_retained_callable_after_redefinition() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     crate::cli::read_eval_all_env(
-        "(setq *ordinary-guard-roots-effects* 0)
+        "(setq *ordinary-guard-roots-effects* 0 *ordinary-guard-redefine* nil)
          (defun ordinary-guard-roots-effect (x)
            (setq *ordinary-guard-roots-effects* (+ *ordinary-guard-roots-effects* 1))
-           (if (floatp x)
+           (if *ordinary-guard-redefine*
                (progn (defun ordinary-guard-roots-child (x a b c) 909)
                       (%force-minor-gc-for-test)))
            x)
          (defun ordinary-guard-roots-child (x a b c) (+ (ordinary-guard-roots-effect x) 1))",
         &mut env).unwrap();
     let (symbol, caller, child) = install_chain(&mut env);
+    crate::cli::read_eval_all_env("(setq *ordinary-guard-redefine* t)", &mut env).unwrap();
     let stack = egcl_rt::current_stack();
     let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
     egcl_rt::rooted!(argument = egcl_rt::gc::alloc_double_float(2.5));
