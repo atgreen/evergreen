@@ -2,54 +2,33 @@
 
 ## Unreleased
 
-- Keep eligible T1/T2 callers on the ordinary x86-64 Lisp ABI when earlier
-  calls' extra values are discarded before a primitive operation
-  ([#299](https://github.com/atgreen/evergreen/pull/299)).
+## 0.0.7 - 2026-10-12
 
-- Use the ordinary x86-64 Linux Lisp register ABI by default for supported tagged
-  T1 and T2 bodies, including recursive and branching calls, global operations,
-  and stack arguments. Extend ordinary entry adapters to interpreted functions,
-  builtins, and callable objects while preserving GC roots and multiple values
-  ([#298](https://github.com/atgreen/evergreen/pull/298)).
+- Use the new x86-64 Linux Lisp register ABI for supported T1/T2 functions,
+  including recursive and cross-function calls, branches, global operations,
+  and stack arguments. Preserve multiple values, moving-GC roots, and function
+  redefinition across native calls and interpreter adapters
+  ([#298](https://github.com/atgreen/evergreen/pull/298),
+  [#299](https://github.com/atgreen/evergreen/pull/299)).
+- Add eligible native tail calls and resume failed optimization guards without
+  repeating completed calls
+  ([#286](https://github.com/atgreen/evergreen/pull/286),
+  [#292](https://github.com/atgreen/evergreen/pull/292)).
+- Support packed `DOUBLE-FLOAT` arrays, including adjustable and displaced
+  arrays. Compile eligible array arithmetic to unboxed native operations and
+  reduce the instructions needed for double addition and multiplication
+  ([#278](https://github.com/atgreen/evergreen/pull/278),
+  [#290](https://github.com/atgreen/evergreen/pull/290),
+  [#295](https://github.com/atgreen/evergreen/pull/295)).
+- Reduce idle T2 loop-poll overhead on Linux x86-64; poll every selected T2
+  backedge on AArch64, POWER, RISC-V, and System Z
+  ([#272](https://github.com/atgreen/evergreen/pull/272),
+  [#279](https://github.com/atgreen/evergreen/pull/279)).
+- Scan overlapping native GC root slots once while preserving distinct copies
+  of live values ([#274](https://github.com/atgreen/evergreen/pull/274)).
 
-- Continue through two eligible Linux x86-64 T2 native calls, normalizing
-  intermediate multiple-value state and preserving live roots before forwarding
-  the final result tuple ([#296](https://github.com/atgreen/evergreen/pull/296)).
-- Reduce native stack-home double addition and multiplication from seven
-  instructions to three on Linux x86-64
-  ([#295](https://github.com/atgreen/evergreen/pull/295)).
-
-- Compile eligible simple `DOUBLE-FLOAT` array expressions with native unboxed
-  loads, stores, addition, and multiplication on Linux x86-64, with rooted array
-  bases and boxed recovery when guards fail
-  ([#290](https://github.com/atgreen/evergreen/pull/290)).
-- Resume bounded Linux x86-64 T2 ordinary native guard failures without replaying
-  completed calls, preserving older callers' roots and the original callable
-  across redefinition ([#292](https://github.com/atgreen/evergreen/pull/292)).
-
-- Use native tail transfers for eligible environment-free Linux x86-64 T2
-  forwarders with zero to four fixed tagged arguments when the target fits the
-  caller's rounded incoming overflow capacity. Preserve moving-GC roots and
-  code owners across frame retirement; retain call-and-return when capacity
-  is insufficient ([#286](https://github.com/atgreen/evergreen/pull/286)).
-- Use register arguments and native child frames for eligible Linux x86-64 T2
-  leaves and forwarding calls, preserving multiple values, moving-GC roots,
-  error backtraces, and suspended code across redefinition
-  ([#285](https://github.com/atgreen/evergreen/pull/285)).
-- Clarify implemented native safepoint polling and the remaining per-backend
-  latency validation in the runtime specification
-  ([#291](https://github.com/atgreen/evergreen/pull/291)).
-- Support packed `DOUBLE-FLOAT` arrays, including adjustable and displaced arrays,
-  sequence operations, printing, and hash keys
-  ([#278](https://github.com/atgreen/evergreen/pull/278)).
-- Poll every selected T2 loop back-edge on AArch64, POWER, RISC-V, and System Z
-  instead of sampling one in 256
-  ([#279](https://github.com/atgreen/evergreen/pull/279)).
-- Visit overlapping native GC root slots once per scan while preserving distinct
-  copies of live values ([#274](https://github.com/atgreen/evergreen/pull/274)).
-- Keep idle mapped T2 loop polls in generated code on Linux x86-64, avoiding
-  runtime calls and root publication until work is pending
-  ([#272](https://github.com/atgreen/evergreen/pull/272)).
+The new ABI migration remains incomplete: protected control scopes, raw numeric
+bodies, and some multiple-value consumers still use compatible execution paths.
 
 ## 0.0.6 - 2026-10-11
 

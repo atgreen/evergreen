@@ -7,8 +7,8 @@ type: software
 authors:
   - family-names: Green
     given-names: Anthony
-version: 0.0.6
-date-released: "2026-10-11"
+version: 0.0.7
+date-released: "2026-10-12"
 repository-code: https://github.com/atgreen/evergreen
 url: https://atgreen.github.io/evergreen/
 # CFF 1.2 accepts individual SPDX license identifiers here, but not a `WITH`

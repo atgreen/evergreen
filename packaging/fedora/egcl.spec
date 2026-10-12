@@ -364,6 +364,9 @@ cp -a %{egcl_stage}/usr %{buildroot}/
 %endif
 
 %changelog
+* Mon Oct 12 2026 Anthony Green <green@moxielogic.com> - 0.0.7-1
+- Update to EGCL 0.0.7.
+
 * Sun Oct 11 2026 Anthony Green <green@moxielogic.com> - 0.0.6-1
 - Update to EGCL 0.0.6.
 
