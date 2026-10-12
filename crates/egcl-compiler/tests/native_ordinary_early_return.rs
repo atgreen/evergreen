@@ -107,6 +107,10 @@ fn fixture() -> Function {
     // As in the existing fib fixture, the framed emitter supplies the runtime
     // fixnum guard for an unchecked entry argument used by FixnumCmpLt.
     let mut compare = inst(Opcode::FixnumCmpLt, vec![n, two], AuxData::None);
+    // Speculation retains deopt ordering on the typed comparison even though
+    // its successful machine path is a pure comparison, not a runtime call.
+    compare.flags.guard = true;
+    compare.flags.effectful = true;
     compare.frame_state = Some(state);
     let predicate = f
         .push_inst(

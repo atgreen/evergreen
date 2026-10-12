@@ -81,9 +81,12 @@ fn walk(
         if d.opcode == Opcode::ClearMv && single.contains(&inst) {
             continue;
         }
-        // Speculation marks type guards effectful to preserve deopt ordering.
-        // Only the exact noncollecting FIXNUM guard below may carry that flag.
-        if d.flags.call || d.flags.safepoint || (d.flags.effectful && d.opcode != Opcode::Guard) {
+        // Speculation marks guards and typed comparisons effectful to preserve
+        // deopt ordering. Their successful paths are pure; failed prefix tests
+        // enter the original framed guards. No other effects may be bypassed.
+        if d.flags.call || d.flags.safepoint
+            || (d.flags.effectful && !matches!(d.opcode, Opcode::Guard | Opcode::FixnumCmpLt))
+        {
             return None;
         }
         if d.args
