@@ -10,6 +10,10 @@ use super::x64_value_maps::NativeFrameValues;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "x64_composed_roots_tests.rs"]
+mod composed_roots_tests;
+
 /// State of native values at the exact primary CALL return PC.
 #[derive(Clone, Debug)]
 pub enum NativeCallValues {
