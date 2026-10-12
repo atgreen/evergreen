@@ -56,8 +56,8 @@ pub(super) struct PublishedBoundary {
     root_owner: *const TransferCode,
     // Captured on publication so stopped-fiber walks never consult the
     // collector's execution-local directory.
-    directory: std::rc::Rc<super::super::call_table::OrdinaryCodeDirectory>,
-    context: *mut CaptureContext,
+    pub(super) directory: std::rc::Rc<super::super::call_table::OrdinaryCodeDirectory>,
+    pub(super) context: *mut CaptureContext,
     pub(super) cursor: NativeFrameCursor,
     /// Actual native stack ownership: from the capture image up to the segment
     /// entry. The six save words live below the caller's `call_sp`.

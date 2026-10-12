@@ -24,6 +24,8 @@ pub(super) mod ordinary_t2;
 mod ordinary_register_roots;
 mod ordinary_register_fibers;
 mod ordinary_mixed_entries;
+mod ordinary_guard;
+mod ordinary_guard_roots;
 mod ordinary_tail;
 mod payloads;
 mod recursion;

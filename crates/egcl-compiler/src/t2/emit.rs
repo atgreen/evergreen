@@ -152,7 +152,9 @@ pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
 #[path = "ordinary_call.rs"]
 mod ordinary_call;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call, OrdinaryCallTarget, OrdinaryCallFlags, OrdinaryColdRequest};
+pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
+    emit_framed_ordinary_guarded_call, OrdinaryCallTarget, OrdinaryCallFlags,
+    OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -4393,6 +4395,10 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_call_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_guard_veneer = ordinary_call.and_then(|call| call.guard).map(|guard| guard.veneer);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_guard_veneer: Option<u64> = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let transfer_mode = transfers.is_some();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let native_returns = ordinary.is_some() || transfers.as_ref().is_some_and(|emission|
@@ -6260,11 +6266,15 @@ fn emit_framed_inner(
                 call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
             }));
             if ordinary_call_mode && d.opcode == Opcode::Call {
-                // The validated call result is returned immediately. No root
-                // reload or generic result move may clobber RDX/RCX/CF here.
-                emit_epilogue(&mut a);
-                a.push(0xc3);
-                continue;
+                if ordinary_guard_veneer.is_none() {
+                    // Forward the complete tuple without clobbering CF.
+                    emit_epilogue(&mut a);
+                    a.push(0xc3);
+                    continue;
+                }
+                // The guarded continuation consumes the primary. Preserve it
+                // before root reloads; its later FrameState must not replay CALL.
+                store_home(&mut a, homes[&d.results[0]], RAX, 0);
             }
             for (home, src) in result_stores {
                 store_home(&mut a, home, src, 0);
@@ -6298,7 +6308,7 @@ fn emit_framed_inner(
             }
         }
 
-        if ordinary_call_mode { continue; } // call already emitted the full tuple return
+        if ordinary_call_mode && ordinary_guard_veneer.is_none() { continue; }
         let next = blocks.get(bi + 1).copied();
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
@@ -6668,7 +6678,7 @@ fn emit_framed_inner(
         let segment_deopt = transfers.as_ref().and_then(|t| t.deopt_veneer);
         #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
         let segment_deopt: Option<u64> = None;
-        let request_bytes = if segment_deopt.is_some() { 32 } else { 0 };
+        let request_bytes = if segment_deopt.is_some() || ordinary_guard_veneer.is_some() { 32 } else { 0 };
         let alloc = ((n_words * 8) + request_bytes + 15) & !15;
 
         a.bind(label);
@@ -6700,6 +6710,35 @@ fn emit_framed_inner(
                     store_to_rsp(&mut a, RAX, (i * 8) as i32);
                 }
             }
+        }
+        if let Some(veneer) = ordinary_guard_veneer {
+            let request = (n_words * 8) as i32;
+            mov_imm64(&mut a, RAX, fs.scopes.len() as i64);
+            store_to_rsp(&mut a, RAX, request);
+            mov_imm64(&mut a, RAX, n_words as i64);
+            store_to_rsp(&mut a, RAX, request + 8);
+            mov_rr(&mut a, RAX, 4);
+            store_to_rsp(&mut a, RAX, request + 16);
+            load_home(&mut a, RAX, native_control_home.ok_or(EmitError::UnsupportedOp(0xFD))?, alloc as i32);
+            store_to_rsp(&mut a, RAX, request + 24);
+            a.extend_from_slice(&[0x48, 0x8d, 0xbc, 0x24]);
+            a.extend_from_slice(&request.to_le_bytes());
+            mov_imm64(&mut a, RAX, veneer as i64);
+            let mut call = emit_runtime_helper_call(&mut a, 0, None);
+            call.stack_adjust = call.stack_adjust.checked_add(
+                u32::try_from(alloc).map_err(|_| EmitError::BadBranch)?)
+                .ok_or(EmitError::BadBranch)?;
+            native_value_maps.insert(call.return_offset, NativeCallValues::Deoptimizing {
+                native_slots: native_spill_slots, f64_slots: Box::new([]),
+            });
+            native_calls.push(call.site(NativeCallOrigin::Deopt(fsid), NativeStackBase::Body));
+            // The ordinary helper already returned the complete result tuple.
+            // LEA and the ordinary epilogue preserve its carry discriminator.
+            a.extend_from_slice(&[0x48, 0x8d, 0xa4, 0x24]);
+            a.extend_from_slice(&(alloc as i32).to_le_bytes());
+            emit_epilogue(&mut a);
+            a.push(0xc3);
+            continue;
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         if let Some(veneer) = segment_deopt {
@@ -7030,7 +7069,16 @@ fn emit_framed_inner(
             .max().unwrap_or(0);
         let leaf_bound = ordinary_leaf::stack_requirement(frame_bytes, move_values).ok_or(EmitError::BadBranch)?;
         // The cold request is 64 bytes plus its machine return address.
-        Some(if ordinary_call_mode { leaf_bound.max(frame_bytes.checked_add(72).ok_or(EmitError::BadBranch)?) } else { leaf_bound })
+        let guard_bytes = if ordinary_guard_veneer.is_some() {
+            f.frame_states.iter().map(|(_, state)| {
+                state.scopes.iter().map(|scope| 4 + scope.locals.len() + scope.stack.len()).sum::<usize>()
+            }).max().unwrap_or(0).checked_mul(8)
+                .and_then(|bytes| bytes.checked_add(32 + 15))
+                .map(|bytes| (bytes & !15) + 8).ok_or(EmitError::BadBranch)?
+        } else { 0 };
+        Some(if ordinary_call_mode {
+            leaf_bound.max(frame_bytes.checked_add(72.max(guard_bytes)).ok_or(EmitError::BadBranch)?)
+        } else { leaf_bound })
     } else {
         None
     };

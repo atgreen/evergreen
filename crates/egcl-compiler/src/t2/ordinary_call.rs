@@ -26,6 +26,25 @@ pub struct OrdinaryCallFlags {
     pub signal_epoch: u64,
 }
 
+/// Cold continuation and noncollecting MV snapshot/clear helper for a bounded
+/// ordinary activation which continues after its single call.
+#[derive(Clone, Copy)]
+pub struct OrdinaryGuardOptions {
+    pub veneer: u64,
+    pub multiple_values: u64,
+}
+
+/// Serialized single-scope guard payload, still owned by the native frame.
+#[repr(C)]
+pub struct OrdinaryGuardRequest {
+    pub n_scopes: u64,
+    pub n_words: u64,
+    pub words: *const u64,
+    pub control: *mut NativeRecursiveControl,
+}
+
+const _: () = assert!(std::mem::size_of::<OrdinaryGuardRequest>() == 32);
+
 /// The cold veneer publishes the native caller before collecting or unwinding.
 /// Arguments remain in the caller's exact mapped slice. The veneer returns a
 /// completed ordinary result in RAX/RDX/RCX/CF; it must not request a retry.
@@ -54,6 +73,7 @@ pub(super) struct OrdinaryCallEmission {
     flags: OrdinaryCallFlags,
     cold: u64,
     tail: bool,
+    pub(super) guard: Option<OrdinaryGuardOptions>,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its
@@ -69,7 +89,7 @@ pub fn emit_framed_ordinary_call(
     flags: OrdinaryCallFlags,
     cold: u64,
 ) -> Result<FramedCode, EmitError> {
-    emit_ordinary_forwarder(f, entry, target, flags, cold, false)
+    emit_ordinary_call_body(f, entry, target, flags, cold, false, None)
 }
 
 /// Opt into a tail handoff for the same bounded, scope-free forwarding shape.
@@ -84,16 +104,37 @@ pub fn emit_framed_ordinary_tail_call(
     flags: OrdinaryCallFlags,
     cold: u64,
 ) -> Result<FramedCode, EmitError> {
-    emit_ordinary_forwarder(f, entry, target, flags, cold, true)
+    emit_ordinary_call_body(f, entry, target, flags, cold, true, None)
 }
 
-fn emit_ordinary_forwarder(
+/// Admit only a linear tagged call followed by guarded arithmetic and return.
+/// Entry guards resume before the call; continuation guards resume strictly
+/// after the completed call. Native callers stay
+/// suspended while the failing activation completes in T0; no tail retirement
+/// or whole-chain continuation reconstruction is implied by this entry.
+pub fn emit_framed_ordinary_guarded_call(
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    target: OrdinaryCallTarget,
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    guard: OrdinaryGuardOptions,
+) -> Result<FramedCode, EmitError> {
+    if guard.veneer == 0 || guard.multiple_values == 0 {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
+    emit_ordinary_call_body(f, entry, target, flags, cold, false, Some(guard))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ordinary_call_body(
     f: &Function,
     entry: OrdinaryLispEntryOptions,
     target: OrdinaryCallTarget,
     flags: OrdinaryCallFlags,
     cold: u64,
     allow_tail: bool,
+    guard: Option<OrdinaryGuardOptions>,
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     if f.block_order().len() != 1
@@ -127,7 +168,11 @@ fn emit_ordinary_forwarder(
     if insts.len() < 2 || insts.len() > 64 {
         return Err(bad());
     }
-    let call = f.inst(insts[insts.len() - 2]);
+    let calls: Vec<_> = insts.iter().enumerate()
+        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call).collect();
+    if calls.len() != 1 { return Err(bad()); }
+    let (call_position, &call_inst) = calls[0];
+    let call = f.inst(call_inst);
     let ret = f.inst(insts[insts.len() - 1]);
     if call.opcode != Opcode::Call
         || call.args.len() > 4
@@ -136,19 +181,64 @@ fn emit_ordinary_forwarder(
         || !call.flags.call
         || !call.flags.safepoint
         || ret.opcode != Opcode::Return
-        || ret.args != call.results
-        || insts[..insts.len() - 2].iter().any(|&i| {
-            !matches!(
+        || ret.args.len() != 1
+        || (guard.is_none() && (call_position != insts.len() - 2 || ret.args != call.results))
+        || insts[..call_position].iter().any(|&i| {
+            !(matches!(
                 f.inst(i).opcode,
                 Opcode::ConstFixnum
                     | Opcode::ConstNil
                     | Opcode::ConstT
                     | Opcode::ConstSymbol
                     | Opcode::ConstChar
-            )
+            ) || guard.is_some() && f.inst(i).opcode == Opcode::Guard)
         })
     {
         return Err(bad());
+    }
+    if guard.is_some() {
+        // A continuing ordinary call consumes only the primary. Until a
+        // distinct tuple-to-runtime bridge exists, the fast continuation must
+        // explicitly normalize MV before its final return.
+        if !crate::t2::opt_clear_mv::single_value_state(f, true)
+            .contains(insts.last().ok_or_else(bad)?)
+        { return Err(bad()); }
+        let state = f.frame_states.get(call.frame_state.ok_or_else(bad)?);
+        if state.scopes.len() != 1 || state.scopes[0].function == target.symbol {
+            // Direct recursion is outside this first continuation slice.
+            return Err(bad());
+        }
+        let before = &state.scopes[0];
+        // The optimizer may hoist a pure type guard on an entry argument.
+        // Its continuation still precedes the call, so T0 must execute it.
+        for &inst in &insts[..call_position] {
+            let data = f.inst(inst);
+            if data.opcode == Opcode::Guard {
+                let state = f.frame_states.get(data.frame_state.ok_or_else(bad)?);
+                if state.scopes.len() != 1
+                    || state.scopes[0].function != before.function
+                    || state.scopes[0].bcp > before.bcp
+                { return Err(bad()); }
+            }
+        }
+        let mut guards = 0;
+        for &inst in &insts[call_position + 1..insts.len() - 1] {
+            let data = f.inst(inst);
+            match data.opcode {
+                Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT
+                | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv => {}
+                Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul => {
+                    let state = f.frame_states.get(data.frame_state.ok_or_else(bad)?);
+                    if state.scopes.len() != 1
+                        || state.scopes[0].function != before.function
+                        || state.scopes[0].bcp <= before.bcp
+                    { return Err(bad()); }
+                    guards += 1;
+                }
+                _ => return Err(bad()),
+            }
+        }
+        if guards == 0 { return Err(bad()); }
     }
     super::emit_framed_inner(
         f,
@@ -159,7 +249,7 @@ fn emit_ordinary_forwarder(
         0,
         0,
         0,
-        0,
+        guard.map_or(0, |guard| guard.multiple_values),
         0,
         0,
         Some(entry.arity as u16),
@@ -175,6 +265,7 @@ fn emit_ordinary_forwarder(
             cold,
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
             tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
+            guard,
         }),
     )
 }

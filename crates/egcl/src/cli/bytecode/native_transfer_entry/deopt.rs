@@ -290,6 +290,15 @@ unsafe fn validate_guard_stream(
     header: &Frame,
     metadata: &T2InstalledMetadata,
 ) -> Result<u32, EgclError> {
+    unsafe { validate_guard_stream_slots(request, code, header.num_locals, metadata) }
+}
+
+unsafe fn validate_guard_stream_slots(
+    request: &TransferDeoptRequest,
+    code: &TransferCode,
+    slots: u16,
+    metadata: &T2InstalledMetadata,
+) -> Result<u32, EgclError> {
     if request.n_scopes != 1 || request.words.is_null() || request.n_words < 4
         || request.n_words > 4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack)
     {
@@ -305,7 +314,7 @@ unsafe fn validate_guard_stream(
         || words[2] != u64::from(code.body.n_locals)
         || words[3] > u64::from(code.body.max_stack)
         || words[2] + words[3] + 4 != request.n_words
-        || words[2] + words[3] > u64::from(header.num_locals)
+        || words[2] + words[3] > u64::from(slots)
         || code.control_scopes.before(bcp).is_none()
     {
         return Err(invalid_capture());
@@ -567,77 +576,8 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
             managed_outcome_written = true;
             return Ok(NIL);
         }
-        let env = NATIVE_ENV.with(Cell::get);
-        if env.is_null() {
-            return Err(invalid_capture());
-        }
-        egcl_rt::rooted!(callable = unsafe { (*frame).function });
-        if !egcl_rt::function::is_interpreted_function(*callable) {
-            return Err(invalid_capture());
-        }
-        let mut state = OuterResumeState {
-            debug_call: None,
-            handlers: Vec::new(),
-            cleanup_conts: Vec::new(),
-            dyn_binds: Vec::new(),
-        };
-        state
-            .handlers
-            .try_reserve(active.len())
-            .map_err(|_| EgclError::Oom)?;
-        for scope in active {
-            let ScopeKind::Block {
-                id,
-                resume_bcp,
-                register: false,
-            } = scope.kind
-            else {
-                unreachable!()
-            };
-            state.handlers.push(Handler::Block {
-                block_id: id,
-                token: String::new(),
-                resume_bcp,
-                sp_restore: scope.sp_restore,
-            });
-        }
-        egcl_rt::rooted!(state = Some(state));
-        let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
-        let _retire = RetireNativeDeoptFrame {
-            fp: stack.fp(),
-            sp: stack.sp(),
-        };
-        let child = stack
-            .push_frame(
-                *callable,
-                std::ptr::null(),
-                code.body.num_slots(),
-                FLAG_CALL,
-            )
-            .ok_or_else(|| {
-                EgclError::StackOverflow(
-                    egcl_rt::current_fiber_id()
-                        .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
-                )
-            })?;
-        let (scopes, metadata) = materialize_t2_deopt_scopes(
-            request.n_scopes,
-            request.n_words,
-            request.words,
-            Some(child),
-            Some(metadata),
-        )
-        .map_err(|message| EgclError::Internal(message.into()))?;
-        note_segment_deopt(code);
-        if let Some(arguments) = arguments.as_ref() {
-            state
-                .as_mut()
-                .expect("native child resume state")
-                .debug_call = Some(unsafe {
-                egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, child)
-            });
-        }
-        resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
+        unsafe { resume_native_child_guard(code, &adapted, metadata,
+            (*frame).function, arguments.take(), bcp) }
     });
     if managed_outcome_written && result.is_ok() {
         return;
@@ -663,6 +603,208 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
     unsafe {
         out.write(outcome);
     }
+}
+
+// Both native self-recursion and ordinary foreign owners use the same cold
+// materialization/retirement path. Only the failing activation becomes T0.
+unsafe fn resume_native_child_guard(
+    code: &TransferCode,
+    request: &TransferDeoptRequest,
+    metadata: Arc<T2InstalledMetadata>,
+    callable: EgclVal,
+    arguments: Option<Vec<EgclVal>>,
+    bcp: u32,
+) -> Result<EgclVal, EgclError> {
+    let env = NATIVE_ENV.with(Cell::get);
+    if env.is_null() {
+        return Err(invalid_capture());
+    }
+    egcl_rt::rooted!(callable = callable);
+    egcl_rt::rooted!(arguments = arguments);
+    let stack = egcl_rt::current_stack();
+    let active = code.control_scopes.before(bcp).ok_or_else(invalid_capture)?;
+    if !egcl_rt::function::is_interpreted_function(*callable) {
+        return Err(invalid_capture());
+    }
+    let mut state = OuterResumeState {
+        debug_call: None,
+        handlers: Vec::new(),
+        cleanup_conts: Vec::new(),
+        dyn_binds: Vec::new(),
+    };
+    state
+        .handlers
+        .try_reserve(active.len())
+        .map_err(|_| EgclError::Oom)?;
+    for scope in active {
+        let ScopeKind::Block {
+            id,
+            resume_bcp,
+            register: false,
+        } = scope.kind
+        else {
+            return Err(invalid_capture());
+        };
+        state.handlers.push(Handler::Block {
+            block_id: id,
+            token: String::new(),
+            resume_bcp,
+            sp_restore: scope.sp_restore,
+        });
+    }
+    egcl_rt::rooted!(state = Some(state));
+    let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
+    let _retire = RetireNativeDeoptFrame {
+        fp: stack.fp(),
+        sp: stack.sp(),
+    };
+    let child = stack
+        .push_frame(
+            *callable,
+            std::ptr::null(),
+            code.body.num_slots(),
+            FLAG_CALL,
+        )
+        .ok_or_else(|| {
+            EgclError::StackOverflow(
+                egcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0)),
+            )
+        })?;
+    let (scopes, metadata) = materialize_t2_deopt_scopes(
+        request.n_scopes,
+        request.n_words,
+        request.words,
+        Some(child),
+        Some(metadata),
+    )
+    .map_err(|message| EgclError::Internal(message.into()))?;
+    note_segment_deopt(code);
+    if let Some(arguments) = arguments.as_ref() {
+        state
+            .as_mut()
+            .expect("native child resume state")
+            .debug_call = Some(unsafe {
+            egcl_rt::debug_stack::CallFrame::enter_managed_at(&code.body.name, arguments, child)
+        });
+    }
+    resume_inlined_in_t0_with_state(scopes, metadata, None, state.take(), unsafe { &mut *env })
+}
+
+/// Complete one guarded ordinary activation while its native callers remain
+/// published. The wrapper owns the ordinary tuple/error landing protocol.
+#[cfg(test)]
+type OrdinaryGuardObserver = Cell<Option<fn()>>;
+
+#[cfg(test)]
+static ORDINARY_GUARD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<OrdinaryGuardObserver> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn with_ordinary_guard_resume_observer_for_test<R>(observe: fn(), body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<fn()>);
+    impl Drop for Restore {
+        fn drop(&mut self) { ORDINARY_GUARD_OBSERVER.with(|slot| slot.set(self.0)); }
+    }
+    let _restore = Restore(ORDINARY_GUARD_OBSERVER.with(|slot| slot.replace(Some(observe))));
+    body()
+}
+
+pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, EgclError> {
+    use egcl_compiler::t2::emit::OrdinaryGuardRequest;
+    use egcl_compiler::t2::x64_calls::{NativeCallOrigin, NativeCallValues};
+    let context = CAPTURE.with(Cell::get);
+    let boundary = root_publication::ACTIVE.with(Cell::get);
+    if context.is_null() || boundary.is_null() { return Err(invalid_capture()); }
+    let boundary = unsafe { &*boundary };
+    if boundary.owner.is_null() || boundary.context != context { return Err(invalid_capture()); }
+    let code = unsafe { &*boundary.owner };
+    if code.ordinary_entry.is_none() || !code.has_deopt
+        || !scope_free_native_body(&code.body, false)
+    { return Err(invalid_capture()); }
+    let base = code.code.as_ptr() as usize;
+    let offset = boundary.cursor.pc.checked_sub(base).ok_or_else(invalid_capture)?;
+    if !code._native_calls.get(offset).is_some_and(|site| matches!(site.origin, NativeCallOrigin::Deopt(_))) {
+        return Err(invalid_capture());
+    }
+    let native_slots = match code._native_calls.value_map(offset) {
+        Some(NativeCallValues::Deoptimizing { native_slots, f64_slots }) if f64_slots.is_empty() => *native_slots,
+        _ => return Err(invalid_capture()),
+    };
+    let read_word = |address: usize| {
+        (address % 8 == 0 && address >= boundary.bounds.start
+            && address.checked_add(8).is_some_and(|end| end <= boundary.bounds.end))
+            .then(|| unsafe { (address as *const usize).read() })
+    };
+    let step = code._native_calls.unwind(base, &boundary.cursor, boundary.bounds.clone(), read_word)
+        .ok_or_else(invalid_capture)?;
+    let body_sp = step.body_sp.ok_or_else(invalid_capture)?;
+    let temporary = |address: usize, bytes: usize| address % 8 == 0
+        && address >= boundary.cursor.call_sp
+        && address.checked_add(bytes).is_some_and(|end| end <= body_sp);
+    if !temporary(request as usize, std::mem::size_of::<OrdinaryGuardRequest>()) {
+        return Err(invalid_capture());
+    }
+    let request = unsafe { &*request.cast::<OrdinaryGuardRequest>() };
+    let words = usize::try_from(request.n_words).ok().and_then(|words| words.checked_mul(8))
+        .ok_or_else(invalid_capture)?;
+    if !temporary(request.words as usize, words)
+        || (request.words as usize).checked_add(words).is_none_or(|end| end > request as *const _ as usize)
+    { return Err(invalid_capture()); }
+    let native_word = |slot: u32| (slot < native_slots).then_some(slot)
+        .and_then(|slot| body_sp.checked_add(slot as usize * 8));
+    let control = unsafe { (*context).native_recursive.as_ref() }
+        .map(|control| control as *const _ as usize).ok_or_else(invalid_capture)?;
+    let control_home = native_word(code.native_control_slot.ok_or_else(invalid_capture)?)
+        .ok_or_else(invalid_capture)?;
+    if request.control as usize != control || read_word(control_home) != Some(control) {
+        return Err(invalid_capture());
+    }
+    let count = usize::from(code.native_argument_count);
+    let argument_slot = code.native_argument_base.ok_or_else(invalid_capture)?;
+    if count != usize::from(code.body.arity)
+        || argument_slot.checked_add(count as u32).is_none_or(|end| end > native_slots)
+    { return Err(invalid_capture()); }
+    // An empty argument range may begin exactly at the end of the native
+    // frame. It still supplies a nonnull aligned zero-length slice pointer.
+    let arguments_address = body_sp.checked_add(argument_slot as usize * 8)
+        .ok_or_else(invalid_capture)?;
+    for index in 0..count {
+        let address = arguments_address.checked_add(index * 8).ok_or_else(invalid_capture)?;
+        if address == control_home || read_word(address).is_none() { return Err(invalid_capture()); }
+    }
+    let arguments = arguments_address as *mut EgclVal;
+    let metadata = code.deopt_metadata.clone().ok_or_else(invalid_capture)?;
+    let mut adapted = TransferDeoptRequest { n_scopes: request.n_scopes, n_words: request.n_words,
+        words: request.words, activation: std::ptr::null_mut() };
+    let bcp = unsafe { validate_guard_stream_slots(&adapted, code, code.body.num_slots(), &metadata) }?;
+    let mut roots = NativeDeoptRoots { payload: unsafe { request.words.add(4).cast_mut().cast() },
+        payload_len: request.n_words as usize - 4, arguments, argument_count: count };
+    egcl_rt::rooted_ref!(_roots = &mut roots);
+    egcl_rt::rooted!(original_arguments = Some(unsafe { std::slice::from_raw_parts(arguments, count) }.to_vec()));
+    let segment = boundary.segment;
+    if segment.is_null() { return Err(invalid_capture()); }
+    // Equal code owners can occur in different physical activations. Only the
+    // actual root frame is allowed to reuse the managed anchor's callable/state.
+    let is_root = boundary.owner == unsafe { (*context).owner }
+        && (step.caller.call_sp, step.caller.pc) == unsafe { ((*segment).saved_sp, (*segment).return_pc()) };
+    if is_root {
+        let frame = unsafe { (*context).frame };
+        if frame.is_null() || egcl_rt::current_stack().fp() != frame { return Err(invalid_capture()); }
+        adapted.activation = unsafe { frame.add(1).cast() };
+        let mut out = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+        #[cfg(test)]
+        if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(); }
+        unsafe { resume_guard_with_arguments((&adapted as *const TransferDeoptRequest).cast_mut().cast(),
+            &mut out, Some(original_arguments.take())); }
+        return Ok(out.value); // the ordinary wrapper consumes any stashed error
+    }
+    egcl_rt::rooted!(callable = NIL);
+    let retained = boundary.directory.callable_for_pc(boundary.cursor.pc).ok_or_else(invalid_capture)?;
+    retained.with_gc_stable_mutator(|value| *callable = *value);
+    #[cfg(test)]
+    if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(); }
+    unsafe { resume_native_child_guard(code, &adapted, metadata, *callable, original_arguments.take(), bcp) }
 }
 
 pub(super) unsafe extern "C" fn resume_guard(

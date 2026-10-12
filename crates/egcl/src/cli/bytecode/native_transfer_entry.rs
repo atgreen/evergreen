@@ -33,6 +33,8 @@ use condition_osr::{validate_condition_clusters, relocate_condition_clusters};
 pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
+#[cfg(test)]
+pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
 mod native_frames;
 pub(super) mod ordinary_calls;
 
@@ -803,21 +805,30 @@ impl TransferCode {
                         let flags = native_frames::flags()?;
                         let cold = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(
                             ordinary_calls::cold_call))?;
+                        let guard = deopt_metadata.as_ref().and_then(|_|
+                            JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(
+                                ordinary_calls::guard)));
                         let emit_call = egcl_compiler::t2::emit::emit_framed_ordinary_tail_call;
                         #[cfg(test)]
                         let emit_call = if ORDINARY_TAIL_EMISSION.with(Cell::get) {
                             emit_call
                         } else { egcl_compiler::t2::emit::emit_framed_ordinary_call };
                         let emitted = call_cells.iter().find_map(|(symbol, cell)| {
-                            emit_call(&ir, options,
-                                OrdinaryCallTarget { symbol: *symbol,
+                            let target = OrdinaryCallTarget { symbol: *symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,
-                                    revision_address: cell.revision_address() as u64 },
-                                OrdinaryCallFlags { gc_requested: flags.gc_requested,
+                                    revision_address: cell.revision_address() as u64 };
+                            let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
                                     sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
-                                    native_errors: flags.native_errors, signal_epoch: flags.signal_epoch },
-                                cold.as_ptr() as u64).ok()
+                                    native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
+                            emit_call(&ir, options, target, call_flags, cold.as_ptr() as u64).ok()
+                                .or_else(|| egcl_compiler::t2::emit::emit_framed_ordinary_guarded_call(
+                                    &ir, options, target, call_flags, cold.as_ptr() as u64,
+                                    egcl_compiler::t2::emit::OrdinaryGuardOptions {
+                                        veneer: guard.as_ref()?.as_ptr() as u64,
+                                        multiple_values: c2i_t2_mv as *const () as u64,
+                                    }).ok())
                         })?;
+                        if emitted.has_deopt { deopt_veneer = guard; }
                         ordinary_cold = Some(cold);
                         Some(emitted)
                     })?;

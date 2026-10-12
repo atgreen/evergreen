@@ -147,6 +147,23 @@ pub(super) unsafe extern "C" fn cold_call(
     }
 }
 
+/// Finish a precise guard continuation through the ordinary tuple protocol.
+pub(super) unsafe extern "C" fn guard(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe {
+        root_publication::published(image, || {
+            let result = guard_c2i(|| deopt::resume_ordinary_guard(request));
+            if result.is_ok() {
+                refresh_control((*request.cast::<egcl_compiler::t2::emit::OrdinaryGuardRequest>()).control);
+            }
+            finish(result, out);
+        });
+    }
+}
+
 /// Signal only after all actual incoming arguments and closure are rooted.
 /// The callee has no frame; publication starts at the captured caller or ends
 /// immediately at the root shim boundary.

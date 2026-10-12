@@ -19,6 +19,8 @@ pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
 pub(super) use ordinary::{OrdinaryCodeDirectory, OrdinarySegmentGuard, publish_ordinary};
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::ordinary_segment_depth_for_test;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use ordinary::assert_guarded_callable_publication_for_test;
 
 #[derive(Clone)]
 enum Target {
@@ -470,9 +472,9 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         let ordinary = match target.as_ref() {
-            Some(Target::Native { code, promote: false, .. }) => match &code._storage {
+            Some(Target::Native { code, function, promote: false }) => match &code._storage {
                 NativeCodeStorage::Mapped(code) => code.ordinary_descriptor(revision)
-                    .map(|descriptor| (descriptor, Rc::clone(code))),
+                    .map(|descriptor| (descriptor, Rc::clone(code), *function)),
                 _ => None,
             },
             _ => None,
@@ -480,10 +482,10 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
         *state.target.borrow_mut() = target;
         linkage::publish(&state.cell, revision, native[0], native[1]);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        if let Some((descriptor, code)) = ordinary {
+        if let Some((descriptor, code, function)) = ordinary {
             // The immutable owner is retained before the revision-checked slot
             // becomes visible to generated calls in this execution.
-            unsafe { ordinary::publish_ordinary(Arc::as_ptr(&state.cell) as u64, descriptor, code); }
+            unsafe { ordinary::publish_ordinary(Arc::as_ptr(&state.cell) as u64, descriptor, code, function); }
         }
         #[cfg(all(target_arch = "x86_64", unix))]
         state
