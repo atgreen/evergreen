@@ -813,13 +813,13 @@ impl TransferCode {
                         let emit_call = if ORDINARY_TAIL_EMISSION.with(Cell::get) {
                             emit_call
                         } else { egcl_compiler::t2::emit::emit_framed_ordinary_call };
+                        let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
+                            sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
+                            native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
                         let emitted = call_cells.iter().find_map(|(symbol, cell)| {
                             let target = OrdinaryCallTarget { symbol: *symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,
                                     revision_address: cell.revision_address() as u64 };
-                            let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
-                                    sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
-                                    native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
                             emit_call(&ir, options, target, call_flags, cold.as_ptr() as u64).ok()
                                 .or_else(|| egcl_compiler::t2::emit::emit_framed_ordinary_guarded_call(
                                     &ir, options, target, call_flags, cold.as_ptr() as u64,
@@ -827,6 +827,23 @@ impl TransferCode {
                                         veneer: guard.as_ref()?.as_ptr() as u64,
                                         multiple_values: c2i_t2_mv as *const () as u64,
                                     }).ok())
+                        }).or_else(|| {
+                            use egcl_compiler::t2::ir::{AuxData, Opcode};
+                            let calls: Vec<_> = ir.block_order().iter()
+                                .flat_map(|&block| &ir.block(block).insts)
+                                .filter(|&&inst| ir.inst(inst).opcode == Opcode::Call)
+                                .collect();
+                            if calls.len() != 2 { return None; }
+                            let target = |inst| {
+                                let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
+                                let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
+                                Some(OrdinaryCallTarget { symbol,
+                                    descriptor_slot: cell.ordinary_entry_address() as u64,
+                                    revision_address: cell.revision_address() as u64 })
+                            };
+                            egcl_compiler::t2::emit::emit_framed_ordinary_two_calls(
+                                &ir, options, [target(*calls[0])?, target(*calls[1])?], call_flags,
+                                cold.as_ptr() as u64, c2i_t2_mv as *const () as u64).ok()
                         })?;
                         if emitted.has_deopt { deopt_veneer = guard; }
                         ordinary_cold = Some(cold);

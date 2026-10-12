@@ -701,3 +701,140 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         execution.swap_active_native_control(0);
     }
 }
+
+fn two_call_caller() -> Function {
+    let mut f = Function::new("ordinary-two-calls");
+    let b = f.entry();
+    let args: Vec<_> = (0..4).map(|_| f.add_block_param(b, IRType::TOP, ValueRepresentation::Tagged)).collect();
+    for (symbol, operands) in [(77, args.clone()), (88, args.into_iter().rev().collect())] {
+        if symbol == 88 {
+            let mut clear = instruction(Opcode::ClearMv, vec![]);
+            clear.flags.call = true;
+            clear.flags.safepoint = true;
+            clear.flags.effectful = true;
+            f.push_inst(b, clear, &[]);
+        }
+        let mut call = instruction(Opcode::Call, operands);
+        call.aux = AuxData::CallTarget(symbol);
+        call.flags.call = true;
+        call.flags.safepoint = true;
+        let (_, result) = f.push_inst(b, call, &[(IRType::TOP, ValueRepresentation::Tagged)]);
+        if symbol == 88 { f.set_terminator(b, instruction(Opcode::Return, result)); }
+    }
+    f
+}
+
+static TWO_CALL_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TWO_CALL_FIRST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TWO_CALL_SECOND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TWO_CALL_CLEARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[unsafe(naked)]
+unsafe extern "C" fn two_call_zero() {
+    core::arch::naked_asm!(
+        "inc qword ptr [rip + {first}]", "mov byte ptr [rip + {active}], 1",
+        "mov rax, {nil}", "xor edx, edx", "xor ecx, ecx", "stc", "ret",
+        first = sym TWO_CALL_FIRST, active = sym TWO_CALL_ACTIVE, nil = const NIL.0,
+    );
+}
+#[unsafe(naked)]
+unsafe extern "C" fn two_call_many() {
+    core::arch::naked_asm!(
+        "inc qword ptr [rip + {second}]", "mov rax, rdi",
+        "mov rdx, 3", "mov rcx, 0x987", "stc", "ret", second = sym TWO_CALL_SECOND,
+    );
+}
+extern "C" fn two_call_clear(primary: u64, destination: *mut u64, count: u64) {
+    assert_eq!((primary, destination as usize, count), (0, 0, 0));
+    assert!(TWO_CALL_ACTIVE.swap(false, std::sync::atomic::Ordering::Relaxed));
+    TWO_CALL_CLEARS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_tuple() {
+    use egcl_compiler::t2::emit::{emit_framed_ordinary_two_calls, NativeRecursiveControl, OrdinaryCallFlags, OrdinaryCallTarget};
+    use egcl_rt::{call_table::*, exec_context::{ExecutionKind, LispExecutionContext}};
+    use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+    TWO_CALL_ACTIVE.store(false, Relaxed);
+    TWO_CALL_FIRST.store(0, Relaxed);
+    TWO_CALL_SECOND.store(0, Relaxed);
+    TWO_CALL_CLEARS.store(0, Relaxed);
+    let descriptors = [two_call_zero as *const () as usize, two_call_many as *const () as usize].map(|entry| OrdinaryEntryDescriptor {
+        kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision: 7,
+        entry, code_start: entry, code_len: 128, arity: 4, environment: ORDINARY_ENV_NONE,
+        owner: entry, stack_required: 8,
+    });
+    let slots = descriptors.each_ref().map(|d| AtomicUsize::new(d as *const _ as usize));
+    let revisions = [AtomicU64::new(7), AtomicU64::new(7)];
+    let targets = std::array::from_fn(|i| OrdinaryCallTarget {
+        symbol: [77, 88][i], descriptor_slot: slots[i].as_ptr() as u64,
+        revision_address: revisions[i].as_ptr() as u64,
+    });
+    let byte = AtomicU8::new(0);
+    let word = AtomicU64::new(0);
+    let flags = OrdinaryCallFlags { gc_requested: byte.as_ptr() as u64, sigusr1_pending: byte.as_ptr() as u64,
+        posted_signal: word.as_ptr() as u64, native_errors: word.as_ptr() as u64, signal_epoch: word.as_ptr() as u64 };
+    let f = two_call_caller();
+    let code = emit_framed_ordinary_two_calls(&f, options(4), targets, flags,
+        ordinary_cold_observer as *const () as u64, two_call_clear as *const () as u64).unwrap();
+    assert!(code.frame_entry.is_none());
+    let maps = code.native_calls.as_ref().unwrap();
+    assert_eq!(maps.iter().count(), 4, "each call owns direct and cold return maps");
+    let buffer = JitBuffer::new(&code.code).unwrap();
+    let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    let mut depth = 0;
+    let mut control = NativeRecursiveControl { execution: execution.as_ptr(), depth: &mut depth,
+        reserved_counter: 0, mv_active: TWO_CALL_ACTIVE.as_ptr(), expected_generation: 0,
+        seen_carrier: 2, seen_signal_epoch: 0, depth_limit: 8, anchor_depth: 0,
+        deadline_armed: 0, reserved: [0;7], test_entries: std::ptr::null_mut(),
+        test_observer: std::ptr::null(), stack_limit: 0 };
+    unsafe { execution.swap_active_native_control(&mut control as *mut _ as u64); }
+    let args = [0x110, 0x220, 0x330, 0x440];
+    let mut output = [0; 10];
+    unsafe { ordinary_entry_probe(buffer.as_ptr().add(code.ordinary_entry.unwrap()), args.as_ptr(),
+        4, NIL.0, execution.as_ptr() as *mut u64, output.as_mut_ptr()); }
+    assert_eq!([output[0], output[1], output[8], output[9]], [args[3], 1, 3, 0x987]);
+    assert_eq!(TWO_CALL_FIRST.load(Relaxed), 1);
+    assert_eq!(TWO_CALL_SECOND.load(Relaxed), 1, "second descriptor is selected, not the first reused");
+    assert_eq!(TWO_CALL_CLEARS.load(Relaxed), 1);
+    assert!(!TWO_CALL_ACTIVE.load(Relaxed));
+    assert_eq!(depth, 0);
+}
+
+#[test]
+fn ordinary_two_calls_reject_missing_reset_targets_and_other_shapes() {
+    use egcl_compiler::t2::emit::{emit_framed_ordinary_two_calls, OrdinaryCallFlags, OrdinaryCallTarget};
+    let flags = OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+        native_errors: 1, signal_epoch: 1 };
+    let targets = [77, 88].map(|symbol| OrdinaryCallTarget { symbol, descriptor_slot: 1, revision_address: 1 });
+    let compile = |f: &Function, targets| emit_framed_ordinary_two_calls(f, options(4), targets, flags, 1, 1);
+    let mut no_reset = two_call_caller();
+    let b = no_reset.entry();
+    let reset = no_reset.block(b).insts.iter().copied().find(|&i| no_reset.inst(i).opcode == Opcode::ClearMv).unwrap();
+    no_reset.block_mut(b).insts.retain(|&i| i != reset);
+    assert!(compile(&no_reset, targets).is_err());
+    let mut wrong = targets;
+    wrong[1].symbol = 99;
+    assert!(compile(&two_call_caller(), wrong).is_err());
+    assert!(compile(&ordinary_caller(4, false), targets).is_err());
+    let mut allocating = two_call_caller();
+    let block = allocating.entry();
+    let mut allocation = instruction(Opcode::Call, vec![Value(0), Value(1)]);
+    allocation.aux = AuxData::CallTarget(99); // an additional allocating helper
+    allocation.flags.call = true;
+    allocation.flags.safepoint = true;
+    let (extra, _) = allocating.push_inst(block, allocation,
+        &[(IRType::TOP, ValueRepresentation::Tagged)]);
+    allocating.block_mut(block).insts.retain(|&inst| inst != extra);
+    allocating.block_mut(block).insts.insert(2, extra);
+    assert!(compile(&allocating, targets).is_err());
+    let mut cfg = two_call_caller();
+    let block = cfg.make_block();
+    let (_, nil) = cfg.push_inst(block, instruction(Opcode::ConstNil, vec![]),
+        &[(IRType::TOP, ValueRepresentation::Tagged)]);
+    cfg.set_terminator(block, instruction(Opcode::Return, nil));
+    assert!(compile(&cfg, targets).is_err());
+    let mut raw = two_call_caller();
+    raw.set_repr(Value(0), ValueRepresentation::UnboxedF64);
+    assert!(compile(&raw, targets).is_err());
+}

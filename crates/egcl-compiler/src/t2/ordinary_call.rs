@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Bounded ordinary calls that forward the complete callee result immediately.
+//! Bounded ordinary calls with explicit continuation and final-result policies.
 use super::*;
-use crate::t2::ir::{AuxData, InstData, Opcode, Value, ValueRepresentation};
+use crate::t2::ir::{AuxData, Inst, InstData, Opcode, Value, ValueRepresentation};
 use egcl_rt::call_table::{
     ORDINARY_ENV_NONE, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, OrdinaryEntryDescriptor,
 };
@@ -68,8 +68,16 @@ const _: () = {
 };
 
 #[derive(Clone, Copy)]
+pub(super) enum OrdinaryReturnPolicy {
+    FromCall(Inst),
+    FromContinuation,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct OrdinaryCallEmission {
     target: OrdinaryCallTarget,
+    second_target: Option<(Inst, OrdinaryCallTarget)>,
+    pub(super) return_policy: OrdinaryReturnPolicy,
     flags: OrdinaryCallFlags,
     cold: u64,
     tail: bool,
@@ -137,33 +145,7 @@ fn emit_ordinary_call_body(
     guard: Option<OrdinaryGuardOptions>,
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
-    if f.block_order().len() != 1
-        || f.is_variadic()
-        || !f.osr_entries.is_empty()
-        || !f.handler_cases.is_empty()
-        || entry.arity > 4
-        || entry.arity_error_veneer == 0
-        || f.block(f.entry()).params.len() != entry.arity
-        || f.block(f.entry())
-            .params
-            .iter()
-            .any(|&v| f.is_entry_param_checked(v))
-        || [
-            target.descriptor_slot,
-            target.revision_address,
-            cold,
-            flags.gc_requested,
-            flags.sigusr1_pending,
-            flags.posted_signal,
-            flags.native_errors,
-            flags.signal_epoch,
-        ]
-        .contains(&0)
-        || crate::t2::verify::verify(f).is_err()
-        || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
-    {
-        return Err(bad());
-    }
+    validate_entry(f, entry, &[target], flags, cold)?;
     let insts = &f.block(f.entry()).insts;
     if insts.len() < 2 || insts.len() > 64 {
         return Err(bad());
@@ -261,6 +243,9 @@ fn emit_ordinary_call_body(
         Some(entry),
         Some(OrdinaryCallEmission {
             target,
+            second_target: None,
+            return_policy: if guard.is_some() { OrdinaryReturnPolicy::FromContinuation }
+                else { OrdinaryReturnPolicy::FromCall(call_inst) },
             flags,
             cold,
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
@@ -268,6 +253,84 @@ fn emit_ordinary_call_body(
             guard,
         }),
     )
+}
+
+fn validate_entry(
+    f: &Function, entry: OrdinaryLispEntryOptions, targets: &[OrdinaryCallTarget],
+    flags: OrdinaryCallFlags, cold: u64,
+) -> Result<(), EmitError> {
+    let bad = || EmitError::UnsupportedOp(0xFA);
+    if f.block_order().len() != 1
+        || f.is_variadic()
+        || !f.osr_entries.is_empty()
+        || !f.handler_cases.is_empty()
+        || entry.arity > 4
+        || entry.arity_error_veneer == 0
+        || f.block(f.entry()).params.len() != entry.arity
+        || f.block(f.entry())
+            .params
+            .iter()
+            .any(|&v| f.is_entry_param_checked(v))
+        || [
+            cold,
+            flags.gc_requested,
+            flags.sigusr1_pending,
+            flags.posted_signal,
+            flags.native_errors,
+            flags.signal_epoch,
+        ]
+        .contains(&0)
+        || targets.iter().any(|target| target.descriptor_slot == 0 || target.revision_address == 0)
+        || crate::t2::verify::verify(f).is_err()
+        || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
+    {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// Two straight-line ordinary calls with an explicit single-value reset between
+/// them. Targets correspond to call order, even when both name the same symbol.
+/// Only the final call forwards its tuple. No guards, OSR, raw values, branches
+/// or tail retirement are admitted. The MV helper's zero-count arm must be a
+/// nonallocating, nonpolling, nonsignaling clear operation.
+pub fn emit_framed_ordinary_two_calls(
+    f: &Function, entry: OrdinaryLispEntryOptions, targets: [OrdinaryCallTarget; 2],
+    flags: OrdinaryCallFlags, cold: u64, multiple_values: u64,
+) -> Result<FramedCode, EmitError> {
+    let bad = || EmitError::UnsupportedOp(0xFA);
+    validate_entry(f, entry, &targets, flags, cold)?;
+    if multiple_values == 0 { return Err(bad()); }
+    let insts = &f.block(f.entry()).insts;
+    if insts.len() < 4 || insts.len() > 64 { return Err(bad()); }
+    let calls: Vec<_> = insts.iter().enumerate()
+        .filter(|(_, inst)| f.inst(**inst).opcode == Opcode::Call).collect();
+    if calls.len() != 2 { return Err(bad()); }
+    let (first_position, &first) = calls[0];
+    let (last_position, &last) = calls[1];
+    for (&inst, target) in [first, last].iter().zip(targets) {
+        let call = f.inst(inst);
+        if call.args.len() > 4 || call.results.len() != 1 || !call.flags.call || !call.flags.safepoint
+            || !matches!(call.aux, AuxData::CallTarget(symbol) if symbol == target.symbol)
+        { return Err(bad()); }
+    }
+    let ret = f.inst(*insts.last().ok_or_else(bad)?);
+    if last_position != insts.len() - 2 || ret.opcode != Opcode::Return
+        || ret.args != f.inst(last).results
+    { return Err(bad()); }
+    let immediate = |inst: Inst| matches!(f.inst(inst).opcode,
+        Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT | Opcode::ConstSymbol | Opcode::ConstChar);
+    if insts[..first_position].iter().any(|&inst| !immediate(inst))
+        || insts[first_position + 1..last_position].iter()
+            .any(|&inst| !immediate(inst) && f.inst(inst).opcode != Opcode::ClearMv)
+        || !crate::t2::opt_clear_mv::single_value_state(f, true).contains(&last)
+    { return Err(bad()); }
+    super::emit_framed_inner(f, 0, 0, 0, 0, 0, 0, 0, multiple_values, 0, 0,
+        Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
+        Some(entry), Some(OrdinaryCallEmission {
+            target: targets[0], second_target: Some((last, targets[1])),
+            return_policy: OrdinaryReturnPolicy::FromCall(last), flags, cold, tail: false, guard: None,
+        }))
 }
 
 fn unsigned_branch(a: &mut Asm, inclusive: bool, target: egcl_rt::asm::Label) {
@@ -293,6 +356,16 @@ pub(super) struct OrdinaryCallFrame<'a> {
 }
 
 impl OrdinaryCallEmission {
+    pub(super) fn returns_at(self, inst: Inst) -> bool {
+        matches!(self.return_policy, OrdinaryReturnPolicy::FromCall(call) if call == inst)
+    }
+
+    pub(super) fn for_inst(mut self, inst: Inst) -> Self {
+        if let Some((second, target)) = self.second_target
+            && second == inst { self.target = target; }
+        self
+    }
+
     pub(super) fn emit(
         self,
         a: &mut Asm,
