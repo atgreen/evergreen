@@ -7,9 +7,11 @@
 - Use the new x86-64 Linux Lisp register ABI for supported T1/T2 functions,
   including recursive and cross-function calls, branches, global operations,
   and stack arguments. Preserve multiple values, moving-GC roots, and function
-  redefinition across native calls and interpreter adapters
+  redefinition across native calls and interpreter adapters; avoid false stack
+  overflow errors on worker threads and foreign callbacks
   ([#298](https://github.com/atgreen/evergreen/pull/298),
-  [#299](https://github.com/atgreen/evergreen/pull/299)).
+  [#299](https://github.com/atgreen/evergreen/pull/299),
+  [#301](https://github.com/atgreen/evergreen/pull/301)).
 - Add eligible native tail calls and resume failed optimization guards without
   repeating completed calls
   ([#286](https://github.com/atgreen/evergreen/pull/286),

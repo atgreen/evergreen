@@ -1426,6 +1426,22 @@ mod tests {
         }
     }
 
+    // These observers exercise the remaining mapped recursive preparation and
+    // alias protocol. Ordinary recursion has separate relocation fixtures.
+    fn compile_mapped_recursion(body: Arc<BytecodeFunction>) -> TransferCode {
+        let roots = retain_native_body(&body);
+        let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
+            let Instr::CallNamed { sym, .. } = instruction else { return None };
+            call_table::resolve(*sym).map(|cell| (*sym, cell))
+        }).collect();
+        let code = TransferCode::emit_prepared(body, roots, &ir, None, &call_cells,
+            true, CompilationTier::T1).expect("explicit mapped recursion fixture");
+        assert!(code.ordinary_entry.is_none() && code.mapped_entry().is_some());
+        assert!(code.recursive_symbol.is_some());
+        code
+    }
+
     fn observe_native_only_recursion() {
         if RECURSIVE_ENTRIES.with(Cell::get) >= 2 {
             observe_native_only();
@@ -1447,7 +1463,7 @@ mod tests {
         let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
         let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
         registry_put(symbol, Arc::clone(&body));
-        let code = TransferCode::compile(body).expect("admit native-only recursion");
+        let code = compile_mapped_recursion(body);
         let args = [EgclVal::from_fixnum(3)];
         code.run(&args, &mut env).unwrap();
         env.mv.clear();
@@ -1719,7 +1735,7 @@ mod tests {
         let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
         let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
         crate::cli::bytecode::registry_put(symbol, Arc::clone(&body));
-        let code = TransferCode::compile(Arc::clone(&body)).expect("admit recursive source body");
+        let code = compile_mapped_recursion(Arc::clone(&body));
         egcl_rt::rooted!(args = vec![
             EgclVal::from_fixnum(RECURSION_DEPTH as i64),
             crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL),

@@ -12,9 +12,9 @@ rust-version.workspace = true
 gimli = { version = "0.32.3", default-features = false, features = ["read", "write", "std"] }
 object = { version = "0.37.3", default-features = false, features = ["read_core", "write_std", "elf", "std"] }
 
-# On x86-64, internal OS services use direct syscalls (src/syscall.rs), and
-# libc is optional for dlopen-based C-ABI FFI. Other Linux architectures use
-# libc's ABI wrappers below. The default x86-64 musl build remains fully static.
+# Internal x86-64 OS services use direct syscalls. Linux also needs pthread
+# stack-bound queries below; these link statically on musl and do not enable
+# the separate dlopen-based c-ffi feature.
 libc = { version = "0.2", optional = true }
 
 # The static ELF loader currently supports neither POWER nor IBM Z. These
@@ -22,11 +22,11 @@ libc = { version = "0.2", optional = true }
 [target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 elf_loader = { version = "0.16", default-features = false, features = ["use-syscall", "version", "tls"] }
 
-[target.'cfg(not(target_arch = "x86_64"))'.dependencies]
+[target.'cfg(any(target_os = "linux", not(target_arch = "x86_64")))'.dependencies]
 libc = "0.2"
 
 # The macOS/BSD kqueue I/O poller still uses libc; keep it available off-Linux.
-# (On Linux the poller uses epoll via direct syscalls, so no libc is needed.)
+# On Linux the poller still uses epoll via direct syscalls.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 libc = "0.2"
 
@@ -44,8 +44,7 @@ python = ["c-ffi"]
 
 [dev-dependencies]
 # Tests exercise runtime self-hosting by calling libc directly (raise a signal,
-# build a pipe for fiber I/O, etc.). This is test-only and does not make the
-# library depend on libc.
+# build a pipe for fiber I/O, etc.), including targets without runtime wrappers.
 libc = "0.2"
 
 [build-dependencies]

@@ -64,10 +64,10 @@ fn check_deopt_cleanup_roots(tier: &str, tier_number: u8) {
         "{stdout}\n{stderr}"
     );
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        // Mapped guard recovery has its own entry, without the checked ABI's
+        // Ordinary guard recovery has its own entry, without the checked ABI's
         // Single/Inlined diagnostic. Tier, real guard failure, exact values and
         // stressed cleanup roots remain mandatory above.
-        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}\n{stderr}");
+        assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}\n{stderr}");
         assert!(stdout.contains("native precise deopt veneer"), "{stdout}\n{stderr}");
     } else {
         let path = if tier == "t1" { "Single" } else { "Inlined" };

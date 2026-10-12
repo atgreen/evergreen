@@ -36,10 +36,10 @@ fn unchanged_builtin_revalidates_after_unrelated_definition() {
     ]);
     assert!(stdout.contains("REVALIDATED"), "{stdout}");
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        // Published mapped calls replace the legacy c2i builtin helper whose
+        // Published ordinary calls replace the legacy c2i builtin helper whose
         // counters are checked below. Observe the actual installed caller;
         // the repeated results above and replacement test cover revalidation.
-        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
+        assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
         assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
         return;
     }
