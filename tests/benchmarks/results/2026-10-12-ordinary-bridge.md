@@ -1,5 +1,9 @@
 # Ordinary bridge release comparison, 2026-10-12
 
+This initial measurement is retained unchanged below. A later
+[leaf-entry fix comparison](2026-10-12-ordinary-bridge-fixed.md) reduced the
+direct regression substantially while retaining its remaining measured cost.
+
 The new ordinary path improves the forwarding workload, but regresses the
 matched direct-call workload. Median direct-loop cost rose **23.9%**, while
 median forwarding-loop cost fell **41.0%**. The direct regression is tracked

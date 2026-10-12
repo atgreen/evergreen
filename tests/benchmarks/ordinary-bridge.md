@@ -102,3 +102,9 @@ forwarding workload but regressed the direct loop by 23.9%; it retains raw
 samples and the limits of that measurement. Investigation and remeasurement
 are tracked by `bliss-zsz0x` before treating the runtime integration as a
 performance improvement for direct callers.
+
+The [leaf-entry fix remeasurement](results/2026-10-12-ordinary-bridge-fixed.md)
+reduced that direct median difference to +1.94%, with forwarding at −40.20%
+versus its newly measured baseline. The remaining direct difference is retained
+explicitly. Since direct and forward select different outer adapters, their
+paired difference is not isolated native-call latency (`bliss-n9gid`).
