@@ -44,7 +44,8 @@ impl OrdinaryPrimitive {
 ///
 /// Original instruction/result identities, source positions and continuation
 /// states stay intact. Stores can discard the adapter's returned primary.
-/// Each operation requires a proven single-value incoming state, and its
+/// Each operation requires a proven single-value or unobservable incoming state.
+/// Unobservable tuples are cleared before entry; the adapter's
 /// guaranteed single-value completion is made explicit with ClearMv.
 /// Resolution/shape failure leaves the IR unchanged. Captured environment and
 /// control-region operations cannot be lowered without their context protocol.
@@ -59,8 +60,8 @@ pub fn lower_ordinary_primitives(
     }
     // These semantic operations are transparent to the pre-existing MV
     // buffer. Model that fact rather than their old C-call clobber flags. An
-    // adapter's single-value return is equivalent only when the incoming MV
-    // state is already empty; never erase a tuple that a later consumer needs.
+    // adapter's single-value return is equivalent when the incoming MV state
+    // is already empty or unobservable. Never erase a tuple a later consumer needs.
     let mut state_model = f.clone();
     for block in f.block_order() {
         for &inst in &f.block(*block).insts {
@@ -81,6 +82,7 @@ pub fn lower_ordinary_primitives(
         }
     }
     let single = crate::t2::opt_clear_mv::single_value_state(&state_model, true);
+    let unobserved = crate::t2::opt_clear_mv::unobserved_multiple_value_state(&state_model);
     let mut replacements = Vec::new();
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
@@ -97,7 +99,7 @@ pub fn lower_ordinary_primitives(
                 Opcode::GenericEqual => (OrdinaryPrimitive::Equal, 2, 1, false),
                 _ => continue,
             };
-            if !single.contains(&inst) {
+            if !single.contains(&inst) && !unobserved.contains(&inst) {
                 return Err(bad());
             }
             if data.args.len() != arguments
@@ -121,10 +123,10 @@ pub fn lower_ordinary_primitives(
                 }
                 None
             };
-            replacements.push((block, inst, resolve(primitive).ok_or_else(bad)?, symbol));
+            replacements.push((block, inst, resolve(primitive).ok_or_else(bad)?, symbol, !single.contains(&inst)));
         }
     }
-    for &(block, inst, target, symbol) in &replacements {
+    for &(block, inst, target, symbol, normalize) in &replacements {
         if let Some(symbol) = symbol {
             let source_pos = f.inst(inst).source_pos;
             let (constant, values) = f.push_inst(
@@ -152,6 +154,17 @@ pub fn lower_ordinary_primitives(
                 .unwrap();
             block_data.insts.insert(position, constant);
             f.inst_mut(inst).args.insert(0, values[0]);
+        }
+        if normalize {
+            let (clear, _) = f.push_inst(block, InstData {
+                opcode: Opcode::ClearMv, args: vec![], results: vec![], aux: AuxData::None,
+                flags: InstFlags { call: true, safepoint: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: None, source_pos: f.inst(inst).source_pos,
+            }, &[]);
+            let layout = &mut f.block_mut(block).insts;
+            assert_eq!(layout.pop(), Some(clear));
+            let position = layout.iter().position(|&site| site == inst).unwrap();
+            layout.insert(position, clear);
         }
         let data = f.inst_mut(inst);
         data.opcode = Opcode::Call;

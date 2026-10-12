@@ -223,3 +223,29 @@ at_both_tiers!(
     primitives_t1,
     primitives_t2
 );
+
+fn primitive_after_discarded_multiple_values_uses_ordinary_abi(tier: &str) {
+    check_native(
+        r#"
+        (defvar *abi-mv-global* 7)
+        (defun abi-mv-producer (n) (values n (+ n 1)))
+        (defun abi-mv-global-add (n)
+          (let ((a (abi-mv-producer n))) (+ a *abi-mv-global*)))
+        (dotimes (i 50) (assert (= (abi-mv-global-add 4) 11)))
+        (assert (equal (multiple-value-list (abi-mv-global-add 4)) '(11)))
+        (let ((*abi-mv-global* 9))
+          (assert (equal (multiple-value-list (abi-mv-global-add 4)) '(13))))
+        (assert (equal (multiple-value-list (abi-mv-global-add 1152921504606846976))
+                       '(1152921504606846983)))
+        (dotimes (i 50) (assert (= (abi-mv-global-add 4) 11)))
+        "#,
+        &["abi-mv-global-add"],
+        tier,
+    );
+}
+
+at_both_tiers!(
+    primitive_after_discarded_multiple_values_uses_ordinary_abi,
+    discarded_mv_t1,
+    discarded_mv_t2
+);
