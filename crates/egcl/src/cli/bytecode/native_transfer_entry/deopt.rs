@@ -402,8 +402,9 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
         if !code.sites.is_deopt_return(base, cursor.pc) {
             return Err(invalid_capture());
         }
-        let native_slots = match code._native_calls.value_map(offset) {
-            Some(NativeCallValues::Deoptimizing { native_slots }) => *native_slots,
+        let (native_slots, f64_slots) = match code._native_calls.value_map(offset) {
+            Some(NativeCallValues::Deoptimizing { native_slots, f64_slots }) =>
+                (*native_slots, f64_slots.as_ref()),
             _ => return Err(invalid_capture()),
         };
         let read_word = |address: usize| -> Option<usize> {
@@ -525,11 +526,23 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
         }
         let mut roots = NativeDeoptRoots {
             payload: unsafe { request.words.add(4).cast_mut().cast() },
-            payload_len: words_len - 4,
+            // The reboxer roots tagged words while this owner roots arguments.
+            // Do not scan raw F64 words with the completed-payload descriptor.
+            payload_len: 0,
             arguments: arguments_address as *mut EgclVal,
             argument_count: count,
         };
         egcl_rt::rooted_ref!(_native_payload = &mut roots);
+        // SAFETY: the request is proven inside this live native frame, and its
+        // exact return-PC metadata describes the emitted word representations.
+        unsafe {
+            egcl_compiler::t2::deopt::rebox_f64_payload(
+                std::slice::from_raw_parts_mut(request.words.add(4).cast_mut(), words_len - 4),
+                f64_slots,
+                egcl_rt::gc::alloc_double_float,
+            )
+        }.map_err(|_| invalid_capture())?;
+        roots.payload_len = words_len - 4;
         // Preserve the existing all-or-unavailable debugger policy for mutated
         // parameter bindings; immutable native copies are still rooted above.
         let recipe = native_debug::arguments(&code.body, false);
@@ -673,6 +686,9 @@ unsafe fn resume_guard_with_arguments(
     out: *mut NativeOutcome,
     mut native_arguments: Option<Option<Vec<EgclVal>>>,
 ) {
+    // Native-frame entry already reboxed and rooted this exact payload. Avoid
+    // reboxing twice or registering the same physical words twice as roots.
+    let payload_already_boxed = native_arguments.is_some();
     egcl_rt::rooted_ref!(_native_arguments = &mut native_arguments);
     let request = unsafe { &*request.cast::<TransferDeoptRequest>() };
     let context = CAPTURE.with(Cell::get);
@@ -721,6 +737,43 @@ unsafe fn resume_guard_with_arguments(
             Some(arguments) => arguments,
             None => unsafe { (&*header.code_info).original_arguments((*frame).locals()) },
         });
+        let mut payload_roots = if payload_already_boxed {
+            None
+        } else {
+            let boundary = root_publication::ACTIVE.with(Cell::get);
+            if boundary.is_null() || unsafe { (*boundary).owner != owner } {
+                return Err(invalid_capture());
+            }
+            let base = code.code.as_ptr() as usize;
+            let pc = unsafe { (*boundary).cursor.pc };
+            let offset = pc.checked_sub(base).ok_or_else(invalid_capture)?;
+            if !code.sites.is_deopt_return(base, pc) {
+                return Err(invalid_capture());
+            }
+            let Some(egcl_compiler::t2::x64_calls::NativeCallValues::Deoptimizing {
+                f64_slots, ..
+            }) = code._native_calls.value_map(offset) else {
+                return Err(invalid_capture());
+            };
+            let payload_len = request.n_words as usize - 4;
+            // SAFETY: validate_guard_stream accepted the retained single-scope
+            // request. Its exact native return-PC descriptor supplies the raw
+            // indexes; immutable original arguments are independently rooted.
+            unsafe {
+                egcl_compiler::t2::deopt::rebox_f64_payload(
+                    std::slice::from_raw_parts_mut(request.words.add(4).cast_mut(), payload_len),
+                    f64_slots,
+                    egcl_rt::gc::alloc_double_float,
+                )
+            }.map_err(|_| invalid_capture())?;
+            Some(NativeDeoptRoots {
+                payload: unsafe { request.words.add(4).cast_mut().cast() },
+                payload_len,
+                arguments: std::ptr::null_mut(),
+                argument_count: 0,
+            })
+        };
+        egcl_rt::rooted_ref!(_payload_roots = &mut payload_roots);
         // Resumed Lisp owns the frame; it must not borrow the abandoned
         // native capture. Restore that capture only after restoring the frame.
         let _capture_pause = CapturePause(CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())));
@@ -827,6 +880,182 @@ unsafe fn prepare_completed_deopt_unpublished(capture: *mut SysvTransferCapture)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_v2_raw_f64_deopt_reboxes_before_t0_resume() {
+        use egcl_compiler::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use egcl_compiler::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, TypeBits, ValueRepresentation,
+        };
+        let _lock = super::super::super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        super::super::super::super::read_eval_all_env(
+            "(defun raw-f64-pass-through (x) x) (defun raw-f64-resume (x held) (if held (raw-f64-pass-through (raw-f64-resume x nil)) x))",
+            &mut env,
+        )
+        .unwrap();
+        let pass_through =
+            super::super::super::super::read_eval_all_env("(raw-f64-pass-through -0.0d0)", &mut env)
+                .unwrap();
+        assert!(pass_through.is_double_float());
+        assert_eq!(
+            pass_through.as_double_float().to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        let symbol = super::super::super::super::resolve_sym("RAW-F64-RESUME")
+            .unwrap()
+            .as_symbol_index();
+        egcl_rt::rooted!(params = reader::read_from_string("(x held)").unwrap().0);
+        egcl_rt::rooted!(
+            forms =
+                reader::read_from_string("((if held (raw-f64-pass-through (raw-f64-resume x nil)) x))")
+                    .unwrap()
+                    .0
+        );
+        let body =
+            Arc::new(compile_function("RAW-F64-RESUME", *params, *forms, &env, false, false).unwrap());
+        registry_put(symbol, Arc::clone(&body));
+        assert!(recursive_definition_matches(symbol, Arc::as_ptr(&body)));
+        assert!(scope_free_native_body(&body, false), "{:?}", body.code);
+        assert!(
+            native_frames::flags().is_some(),
+            "native carrier flags must be initialized"
+        );
+        assert!(
+            body.code
+                .iter()
+                .any(|op| matches!(op, Instr::CallNamed { sym, .. } if *sym == symbol)),
+            "must retain a non-tail self call: {:?}",
+            body.code
+        );
+        assert_eq!(body.n_locals, 2);
+        let mut ir = Function::new("raw-f64-resume");
+        let entry = ir.entry();
+        let boxed = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let held = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let tagged = |value| ValueSource::Value {
+            value,
+            repr: ValueRepresentation::Tagged,
+        };
+        let before = ir.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: symbol,
+                bcp: 0,
+                locals: vec![tagged(boxed), tagged(held)],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let mut unbox = InstData {
+            opcode: Opcode::UnboxFloat,
+            args: vec![boxed],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: Some(before),
+            source_pos: 0,
+        };
+        unbox.flags.guard = true;
+        unbox.flags.effectful = true;
+        let (_, raw) = ir.push_inst(
+            entry,
+            unbox,
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        );
+        let after = ir.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: symbol,
+                bcp: 0,
+                locals: vec![
+                    ValueSource::Value {
+                        value: raw[0],
+                        repr: ValueRepresentation::UnboxedF64,
+                    },
+                    tagged(held),
+                ],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        let binding = Box::new(1_u64);
+        let mut guard = InstData {
+            opcode: Opcode::Guard,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::BuiltinBinding {
+                address: (&*binding as *const u64) as usize,
+                expected: 0,
+            },
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: Some(after),
+            source_pos: 0,
+        };
+        guard.flags.guard = true;
+        guard.flags.effectful = true;
+        ir.push_inst(entry, guard, &[]);
+        ir.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![boxed],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        egcl_compiler::t2::verify::verify(&ir).unwrap();
+        let metadata = Arc::new(T2InstalledMetadata {
+            speculations: vec![],
+            _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+                bodies: vec![Arc::clone(&body)],
+            }),
+            deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+        });
+        let code = TransferCode::emit_prepared(
+            Arc::clone(&body),
+            retain_native_body(&body),
+            &ir,
+            Some(metadata),
+            &[],
+            true,
+            CompilationTier::T2,
+        )
+        .expect("raw F64 native body");
+        assert!(code.is_t2 && code.has_deopt);
+        assert!(
+            code.native_entry_kind_slot.is_some(),
+            "must exercise native-frame reboxing before managed T0 resume"
+        );
+        for number in [1.25_f64, -0.0] {
+            egcl_rt::rooted!(input = egcl_rt::gc::alloc_double_float(number));
+            egcl_rt::rooted!(held = egcl_rt::gc::alloc_double_float(73.5));
+            let prior = code.deopt_count();
+            egcl_rt::rooted!(result = code.run(&[*input, *held], &mut env).unwrap());
+            assert_eq!(
+                code.deopt_count(),
+                prior + 1,
+                "must execute the emitted guard and production deopt handler"
+            );
+            assert!(result.is_double_float());
+            assert_eq!(result.as_double_float().to_bits(), number.to_bits());
+            assert_ne!(
+                result.to_raw(),
+                input.to_raw(),
+                "raw payload must be reboxed"
+            );
+        }
+    }
+
     use super::*;
     use egcl_rt::Collector;
     use std::sync::atomic::{AtomicUsize, Ordering};

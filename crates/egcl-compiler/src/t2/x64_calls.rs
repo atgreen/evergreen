@@ -17,12 +17,15 @@ pub enum NativeCallValues {
     Unavailable,
     /// The epilogue removed this native frame before calling restart deopt.
     Retired,
-    /// The helper reconstructs managed frames before any collection or yield.
-    /// At GC points those frames own the live values; the old serialization
-    /// buffer must not be scanned. Errors abandon it without collecting.
+    /// The helper owns the serialized payload and roots its tagged words before
+    /// any collection or yield. Raw F64 words must be reboxed under that precise
+    /// root descriptor before the ordinary managed-frame materializer runs.
     /// Asynchronous debug samples during reconstruction have unavailable values.
     Deoptimizing {
         native_slots: u32,
+        /// Raw F64 indexes in the single scope's locals/operand payload, excluding
+        /// its four header words. Empty for existing all-tagged/inline streams.
+        f64_slots: Box<[u32]>,
     },
     Frame(Arc<NativeFrameValues>),
 }
@@ -331,7 +334,7 @@ mod tests {
         for (pc, values) in [
             (11, NativeCallValues::Unavailable),
             (12, NativeCallValues::Retired),
-            (12, NativeCallValues::Deoptimizing { native_slots: 3 }),
+            (12, NativeCallValues::Deoptimizing { native_slots: 3, f64_slots: Box::new([]) }),
         ] {
             assert!(
                 table
@@ -353,13 +356,13 @@ mod tests {
         let table = NativeCallSites::new(32, vec![deopt, restart])
             .unwrap()
             .with_value_maps(HashMap::from([
-                (12, NativeCallValues::Deoptimizing { native_slots: 3 }),
+                (12, NativeCallValues::Deoptimizing { native_slots: 3, f64_slots: Box::new([]) }),
                 (24, NativeCallValues::Retired),
             ]))
             .unwrap();
         assert!(matches!(
             table.value_map(12),
-            Some(NativeCallValues::Deoptimizing { native_slots: 3 })
+            Some(NativeCallValues::Deoptimizing { native_slots: 3, .. })
         ));
         assert!(matches!(
             table.value_map(24),
