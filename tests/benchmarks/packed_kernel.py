@@ -12,6 +12,7 @@ import shutil
 import statistics
 import subprocess
 import time
+from packed_provenance import github_metadata, source_identity, verify_ci_receipt
 
 NAME = 'PUBLIC-PACKED-BENCH'
 
@@ -42,15 +43,22 @@ def parse(stdout, log, n, samples, implementation, sbcl_mode='same-source'):
             raise ValueError('kernel lacks named mapped T2 code')
         if not all(re.search(r'\b' + opcode + r'\b', code) for opcode in ('mulsd', 'addsd')):
             raise ValueError('kernel lacks native double multiply/add instructions')
-        named = '\n'.join(line for line in log.splitlines() if NAME in line.upper())
-        raw = re.findall(r'raw_f64_values=(\d+)', named)
-        if not raw or max(map(int, raw)) < 4:
-            raise ValueError('kernel lacks raw F64 representation evidence')
-        installed = [line for line in named.splitlines() if re.search(r'installed|published', line)]
-        if not installed or not any('osr_entries=0' in line for line in installed):
-            raise ValueError('kernel lacks full-entry installation evidence')
+        # Current PackedF64Ref/Set templates use SCRATCH=rdx and DATA_OFFSET=16.
+        # This is an opcode gate, not a substitute for reviewing data flow.
+        if not (re.search(r'\bmov\s+r\w+,\[rdx\+10h\]', code)
+                and re.search(r'\bmov\s+\[rdx\+10h\],r\w+', code)):
+            raise ValueError('kernel lacks packed element load/store template')
+        named = '\n'.join(line for line in log.splitlines()
+                          if re.match(r'\[T2\] ' + NAME + r':', line))
+        emitted = list(re.finditer(r'mapped T2 emitted;[^\n]*raw_f64_values=(\d+)', named))
+        installed = list(re.finditer(r'installed with mapped T2 ABI; bytes=(\d+), entry=(0x[0-9a-f]+),[^\n]*osr_entries=0\b', named))
+        sizes = re.findall(r'; (\d+) bytes of x86-64:', code)
+        if (len(emitted) != 1 or len(installed) != 1
+                or int(emitted[0][1]) < 4 or emitted[0].start() >= installed[0].start()
+                or not sizes or any(size != installed[0][1] for size in sizes)):
+            raise ValueError('kernel requires one raw emission followed by one matching-size full-entry installation')
         if any(re.search(r'osr_entries=[1-9]|deopt|invalidat|recompil', line, re.I)
-               for line in named.splitlines()):
+               for line in log.splitlines() if NAME in line.upper()):
             raise ValueError('kernel changed or claims unsupported raw OSR entry')
     rows = re.findall(r'^PACKED-SAMPLE (\d+) (\d+) (\d+)\s*$', stdout, re.M)
     if len(rows) != samples:
@@ -133,6 +141,7 @@ def main():
     parser.add_argument('--egcl-root', type=Path, help='unpacked immutable release CI artifact')
     parser.add_argument('--egcl-run', help='immutable CI workflow run ID')
     parser.add_argument('--egcl-artifact', help='immutable CI artifact ID')
+    parser.add_argument('--egcl-archive', type=Path, help='original downloaded GitHub artifact ZIP')
     parser.add_argument('--sbcl', default='sbcl')
     parser.add_argument('--sbcl-mode', choices=('typed', 'same-source'), default='typed',
                         help='explicit optimized reference (default) or undeclared source control')
@@ -146,12 +155,20 @@ def main():
     args = parser.parse_args()
     if min(args.elements, args.passes, args.samples, args.trials) < 1 or args.elements > 10000000:
         parser.error('positive counts and at most10000000 elements required')
-    if args.cpu not in os.sched_getaffinity(0) or (not args.sbcl_only and not (args.egcl_root and args.egcl_run and args.egcl_artifact)):
+    if args.cpu not in os.sched_getaffinity(0) or (not args.sbcl_only and not (args.egcl_root and args.egcl_run and args.egcl_artifact and args.egcl_archive)):
         parser.error('permitted CPU and EGCL artifact required unless --sbcl-only')
     args.output.mkdir(parents=True, exist_ok=False)
     output = args.output.resolve()
     checkout = Path(__file__).resolve().parents[2]
     limiter = checkout / 'scripts/egcl-limited.sh'
+    receipt = None
+    if not args.sbcl_only:
+        run = github_metadata('runs', args.egcl_run)
+        artifact = github_metadata('artifacts', args.egcl_artifact)
+        receipt = verify_ci_receipt(root=args.egcl_root, archive=args.egcl_archive,
+            run=run, artifact=artifact, run_id=args.egcl_run, artifact_id=args.egcl_artifact,
+            source=source_identity(checkout, run['head_sha']))
+        (output / 'egcl-ci-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     env = {key: value for key, value in os.environ.items() if not key.startswith('EGCL_')}
     env.update(EGCL_MEM_MAX='1G', EGCL_TIMEOUT='300', EGCL_FORCE_TIER='t2')
     sbcl = Path(shutil.which(args.sbcl) or args.sbcl).resolve()
@@ -171,6 +188,7 @@ def main():
                 or digest(binary) != manifest['artifacts'].get(name)):
             raise ValueError('EGCL binary must match immutable release manifest')
         binaries['egcl'] = {'binary': str(binary), 'sha256': digest(binary),
+                            'verified_ci_receipt': receipt,
                             'manifest_sha256': digest(manifest_path), 'revision': manifest['revision'],
                             'run_id': args.egcl_run, 'artifact_id': args.egcl_artifact,
                             'clock_units_per_second': 1000000000}

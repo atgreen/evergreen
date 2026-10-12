@@ -1,8 +1,8 @@
 # Public packed-double kernel benchmark
 
 This benchmark prepares reproducible evidence for the closed raw-double pass.
-It does not yet report an EGCL result: the public-loop release artifact is
-pending. Do not claim a speedup, allocation-free kernel, or raw OSR support from
+It does not report a final CI EGCL measurement. Do not claim a speedup,
+allocation-free kernel, or raw OSR support from
 source inspection or a successful checksum alone.
 
 The portable [workload](packed-kernel-workload.lisp) uses only public
@@ -38,7 +38,7 @@ invocation/harness overhead rather than treating the value as instruction cost.
 ## Runner and correctness smoke
 
 ```sh
-python3 tests/benchmarks/test_packed_kernel.py
+python3 -m unittest discover -s tests/benchmarks -p 'test_packed*.py'
 python3 tests/benchmarks/packed_kernel.py --sbcl-only --sbcl-mode typed --cpu 4 \
   --elements 65536 --passes 256 --samples 3 --trials 1 \
   --output /tmp/packed-sbcl-typed-smoke
@@ -57,23 +57,54 @@ Once the verified public-loop CI artifact is available:
 ```sh
 python3 tests/benchmarks/packed_kernel.py \
   --egcl-root /tmp/packed-ci/extracted --egcl-run RUN --egcl-artifact ARTIFACT \
+  --egcl-archive /tmp/packed-ci/artifact.zip \
   --cpu 4 --elements 262144 --passes 16 --samples 9 --trials 5 \
   --output /tmp/packed-comparison
 ```
 
-No build is performed. The runner requires an x86-64 musl release artifact and
-verifies the executable against its copied CI manifest. Preserve the downloaded
-archive, its hash, and build logs alongside the results. An EGCL process is
+No build is performed. Supply the original GitHub artifact ZIP downloaded from
+the artifact API, not a ZIP repacked from `gh run download` output. The runner
+reads current public metadata using authenticated `gh api`, checks the run and
+artifact IDs and their source linkage, and matches the ZIP against GitHub's
+SHA-256 digest. It then streams the contained `ci-tests.tar.gz`, comparing its
+manifest and executable with the supplied extracted files. The manifest must
+describe an x86-64 musl release build and match both the exact commit and the
+committed path/content digest used by CI. That commit must be available in the
+local Git object database; the runner does not fetch or modify the checkout.
+
+Initially only successful first-attempt (`run_attempt=1`) `push` and
+`workflow_dispatch` CI runs are accepted. Reruns are rejected because a run's
+latest successful attempt could otherwise be paired with an older artifact.
+PR runs are rejected because their branch SHA can differ from the synthetic
+merge commit actually built. Missing API digests, expired artifacts, unknown
+source commits, and mismatches fail before any Lisp process starts. IDs in the
+example are placeholders to replace with real metadata, never provenance by
+themselves. Preserve the original archive while available, verified metadata
+receipt, source/build-input hashes, and build logs alongside results. The
+receipt records exact workflow, toolchain-file, Cargo lock/config hashes; build
+logs remain the evidence of the compiler version and executed build command.
+The runner preserves the caller's GitHub authentication environment. If stale
+ambient tokens override valid stored `gh` credentials on a particular host,
+invoke it with `env -u GH_TOKEN -u GITHUB_TOKEN` rather than changing the runner's
+authentication behavior.
+
+Local diagnostic runs remain separate from this CI-only EGCL route: do not
+invent run/artifact IDs for a locally built executable. `--sbcl-only` retains
+the portable tooling smoke without making an EGCL claim. An EGCL process is
 accepted only when the **named kernel** has all of:
 
-- Stable pre/post mapped T2 listings containing native `MULSD` and `ADDSD`.
-- A named installation log with `raw_f64_values >=4`, followed by actual mapped
-  installation/publication and `osr_entries=0`.
+- Stable pre/post mapped T2 listings containing native `MULSD`, `ADDSD`, and
+  current packed element load/store templates.
+- Exactly one named emission with `raw_f64_values >=4`, followed by exactly one
+  mapped installation with `osr_entries=0` and the listing's byte count.
 - No named deoptimization, invalidation, or recompilation in that process log.
 
 Repeated full invocations warm the ordinary mapped function entry. These checks
 make **no raw OSR claim**; representation-aware OSR import is separate work.
-Inspect the actual loop, guards, loads/stores, and slow branches before claiming
+Emission logs have no shared version token with disassembly. Rejecting multiple
+emissions/installations and checking ordering/size removes ambiguous histories;
+it does not constitute a machine-code identity hash. Inspect the actual loop,
+guards, loads/stores, and slow branches before claiming
 an allocation-free fast path. Listings and logging cannot by themselves count
 fallbacks in every timed invocation.
 

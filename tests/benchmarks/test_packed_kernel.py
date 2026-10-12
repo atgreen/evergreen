@@ -6,7 +6,7 @@ import packed_kernel as bench
 
 class EvidenceTests(unittest.TestCase):
     def output(self):
-        code = '; PUBLIC-PACKED-BENCH\n; T2 — code\n; Mapped native transfer ABI\n  +0000: mulsd xmm0,xmm1\n  +0004: addsd xmm0,xmm1\n'
+        code = '; PUBLIC-PACKED-BENCH\n; T2 — code\n; 32 bytes of x86-64:\n; Mapped native transfer ABI\n  +0000: mov r9,[rdx+10h]\n  +0004: mulsd xmm0,xmm1\n  +0008: addsd xmm0,xmm1\n  +000c: mov [rdx+10h],r9\n'
         return (f'PACKED-CODE-BEGIN before\n{code}PACKED-CODE-END\n'
                 'PACKED-SAMPLE 0 1000000 1584\nPACKED-SAMPLE 1 1200000 1584\n'
                 'PACKED-ALLOC-BEGIN 0\nEvaluation took:\n  96 bytes consed\nPACKED-ALLOC-END\n'
@@ -28,7 +28,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_requires_actual_raw_full_entry_installation(self):
         log = ('[T2] PUBLIC-PACKED-BENCH: mapped T2 emitted; raw_f64_values=4\n'
-               '[T2] PUBLIC-PACKED-BENCH: optimized worker result installed with mapped T2 ABI; osr_entries=0\n')
+               '[T2] PUBLIC-PACKED-BENCH: optimized worker result installed with mapped T2 ABI; bytes=32, entry=0x1234000, activation_slots=4, osr_entries=0\n')
         bench.parse(self.output(), log, 32, 2, 'egcl')
         with self.assertRaises(ValueError):
             bench.parse(self.output().replace('addsd', 'nop'), log, 32, 2, 'egcl')
@@ -54,7 +54,7 @@ class EvidenceTests(unittest.TestCase):
     def test_typed_reference_rejects_generic_machine_code(self):
         with self.assertRaises(ValueError):
             bench.parse(self.output(), '', 32, 2, 'sbcl', sbcl_mode='typed')
-        packed = self.output().replace('+0000: mulsd', '+0000: movsd xmm0,[rax]\n  +0001: mulsd')
+        packed = self.output().replace('+0004: mulsd', '+0003: movsd xmm0,[rax]\n  +0004: mulsd')
         bench.parse(packed, '', 32, 2, 'sbcl', sbcl_mode='typed')
 
     def test_rejects_missing_counter_wrong_checksum_or_changed_code(self):
@@ -63,6 +63,17 @@ class EvidenceTests(unittest.TestCase):
                     self.output().replace('mulsd xmm0,xmm1', 'nop', 1)):
             with self.subTest(output=bad), self.assertRaises(ValueError):
                 bench.parse(bad, '', 32, 2, 'sbcl')
+
+    def test_rejects_ambiguous_emission_installation_and_missing_memory_ops(self):
+        emitted = '[T2] PUBLIC-PACKED-BENCH: mapped T2 emitted; raw_f64_values=4\n'
+        installed = '[T2] PUBLIC-PACKED-BENCH: optimized worker result installed with mapped T2 ABI; bytes=32, entry=0x1234000, activation_slots=4, osr_entries=0\n'
+        for log in (emitted * 2 + installed, emitted + installed * 2,
+                    installed + emitted, emitted + installed.replace('bytes=32', 'bytes=64')):
+            with self.subTest(log=log), self.assertRaises(ValueError):
+                bench.parse(self.output(), log, 32, 2, 'egcl')
+        for instruction in ('mov r9,[rdx+10h]', 'mov [rdx+10h],r9'):
+            with self.subTest(instruction=instruction), self.assertRaises(ValueError):
+                bench.parse(self.output().replace(instruction, 'nop'), emitted + installed, 32, 2, 'egcl')
 
 
 if __name__ == '__main__':
