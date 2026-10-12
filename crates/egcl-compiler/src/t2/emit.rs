@@ -153,7 +153,7 @@ pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
 mod ordinary_call;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, OrdinaryCallTarget, OrdinaryCallFlags,
+    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, OrdinaryCallTarget, OrdinaryCallFlags,
     OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -4488,6 +4488,10 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_call_mode = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_returns_from_call = ordinary_call.is_some_and(|call| matches!(call.return_policy, ordinary_call::OrdinaryReturnPolicy::FromCall(_)));
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_returns_from_call = false;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_guard_veneer = ordinary_call.and_then(|call| call.guard).map(|guard| guard.veneer);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_guard_veneer: Option<u64> = None;
@@ -5862,7 +5866,7 @@ fn emit_framed_inner(
             let mut inst_pool = Vec::new();
             if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-                { inst_calls = ordinary_call.unwrap().emit(&mut a, &d, &homes, &const_tagged,
+                { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), emit_epilogue: &emit_epilogue })?; }
             } else if d.opcode == Opcode::ConstHeapObj {
@@ -6408,13 +6412,14 @@ fn emit_framed_inner(
                 call.site(NativeCallOrigin::Instruction(inst), NativeStackBase::Body)
             }));
             if ordinary_call_mode && d.opcode == Opcode::Call {
-                if ordinary_guard_veneer.is_none() {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                if ordinary_call.unwrap().returns_at(inst) {
                     // Forward the complete tuple without clobbering CF.
                     emit_epilogue(&mut a);
                     a.push(0xc3);
                     continue;
                 }
-                // The guarded continuation consumes the primary. Preserve it
+                // An intermediate or guarded continuation consumes the primary. Preserve it
                 // before root reloads; its later FrameState must not replay CALL.
                 store_home(&mut a, homes[&d.results[0]], RAX, 0);
             }
@@ -6450,7 +6455,7 @@ fn emit_framed_inner(
             }
         }
 
-        if ordinary_call_mode && ordinary_guard_veneer.is_none() { continue; }
+        if ordinary_returns_from_call { continue; }
         let next = blocks.get(bi + 1).copied();
         let t = f.terminator(b).ok_or(EmitError::UnsupportedOp(0xF3))?;
         let td = f.inst(t).clone();
