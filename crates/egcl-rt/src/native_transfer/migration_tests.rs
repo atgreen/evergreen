@@ -151,6 +151,7 @@ fn rejected_destination_does_not_partially_update_nested_anchors() {
     let make = |previous| NativeSegment {
         saved_sp: 0,
         landing_pc: 0,
+        entry_return_pc: 0,
         previous,
         owner: SegmentOwner::Thread(current),
         carrier: previous_carrier,
