@@ -33,6 +33,7 @@ fn universal_outer_entry_executes_published_adapter_for_all_callable_kinds() {
     ] {
         egcl_rt::rooted!(function = read_eval_all_env(source, &mut env).unwrap());
         ENTRY_COUNTS.with(|counts| counts.set((0, 0)));
+        ORDINARY_ENTRIES.with(|count| count.set(0));
         assert_eq!(
             apply_function(*function, &[EgclVal::from_fixnum(10)], &mut env).unwrap(),
             EgclVal::from_fixnum(expected)
@@ -40,6 +41,10 @@ fn universal_outer_entry_executes_published_adapter_for_all_callable_kinds() {
         assert!(
             ENTRY_COUNTS.with(|counts| counts.get().0) > 0,
             "{source} bypassed its published entry"
+        );
+        assert!(
+            ORDINARY_ENTRIES.with(|count| count.get()) > 0,
+            "{source} bypassed the ordinary register entry"
         );
         assert!(egcl_rt::native_transfer::current_segment().is_null());
     }
@@ -136,5 +141,52 @@ fn universal_outer_entry_preserves_live_restart_callbacks_and_multiple_values() 
         ENTRY_COUNTS.with(|counts| counts.get().1) > 0,
         "callbacks must create nested native segments"
     );
+    assert!(egcl_rt::native_transfer::current_segment().is_null());
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_outer_entry_relocates_register_and_overflow_arguments() {
+    let _lock = heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(prototype = read_eval_all_env("#'list", &mut env).unwrap());
+    let closure = crate::cli::reified_closure(*prototype).expect("builtin source closure");
+    let (head, identity) = cp(closure);
+    egcl_rt::rooted!(function = crate::cli::arena_cons(head, identity));
+    egcl_rt::rooted!(arguments = Vec::new());
+    for index in 0..7 {
+        arguments.push(crate::cli::arena_cons(EgclVal::from_fixnum(index), NIL));
+    }
+    let before: Vec<_> = arguments.iter().map(|value| value.to_raw()).collect();
+    ORDINARY_ENTRIES.with(|count| count.set(0));
+    collect_next_entry();
+    egcl_rt::rooted!(result = apply_function(*function, &arguments, &mut env).unwrap());
+    assert!(take_relocation(), "callable moves at the ordinary ingress");
+    assert!(ORDINARY_ENTRIES.with(|count| count.get()) > 0);
+    let mut cursor = *result;
+    let mut moved_register = false;
+    let mut moved_overflow = false;
+    for (index, argument) in arguments.iter().enumerate() {
+        let (value, rest) = cp(cursor);
+        assert_eq!(
+            value, *argument,
+            "actual argument {index} reloaded after collection"
+        );
+        assert_eq!(cp(value), (EgclVal::from_fixnum(index as i64), NIL));
+        if argument.to_raw() != before[index] {
+            if index < 3 {
+                moved_register = true;
+            } else {
+                moved_overflow = true;
+            }
+        }
+        cursor = rest;
+    }
+    assert_eq!(cursor, NIL);
+    assert!(moved_register, "a register argument must actually relocate");
+    assert!(moved_overflow, "a stack argument must actually relocate");
     assert!(egcl_rt::native_transfer::current_segment().is_null());
 }

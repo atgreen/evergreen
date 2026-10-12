@@ -3054,6 +3054,44 @@ pub(super) unsafe fn invoke_outer_callable(
         _ => Err(invalid_capture()),
     }
 }
+/// Enter an ordinary callable adapter in a fresh root segment. The adapter
+/// may interpret the body, but its machine ingress and return use the Lisp ABI.
+/// Hiding the enclosing capture prevents transfers from crossing Rust frames.
+pub(super) unsafe fn invoke_outer_ordinary(
+    code: *const u8,
+    function: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_env = &mut *env);
+    let mut entry = EntryGuard {
+        env: NATIVE_ENV.with(|slot| slot.replace(env)),
+        capture: CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())),
+        error: NATIVE_ERROR.with(|slot| slot.take()),
+    };
+    egcl_rt::rooted_ref!(_entry = &mut entry);
+    let _recovery = FaultRecoveryGuard {
+        null: egcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+        stack: egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+    };
+    egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+    let _ordinary_segment = super::call_table::enter_ordinary_segment();
+    let execution = egcl_rt::thread::current_execution_context_for_native()
+        .ok_or_else(|| EgclError::Internal("ordinary callable has no execution".into()))?;
+    let returned = unsafe {
+        native_transfer::invoke_ordinary_native_segment(
+            code, &*execution, function, args, egcl_rt::current_stack(),
+        )
+    }.map_err(|_| EgclError::Internal("ordinary callable boundary is unavailable".into()))?;
+    egcl_rt::rooted!(primary = returned.outcome.value);
+    egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
+    match returned.outcome.exit {
+        NativeExit::Returned if error.is_none() => Ok(*primary),
+        NativeExit::Transfer => Err(error.take().ok_or_else(invalid_capture)?),
+        _ => Err(invalid_capture()),
+    }
+}
+
 impl egcl_rt::gc::TraceHostRoots for EntryGuard {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.error.trace_host_roots(visit);
