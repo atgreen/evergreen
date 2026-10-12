@@ -110,7 +110,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     let entry = code.code.as_ptr();
     // Report the actual mapped bytes and positions, never the checked fallback.
     let bytes = unsafe { std::slice::from_raw_parts(entry, code.code_len) };
-    maybe_write_perf_map(entry as usize, code.code_len, symbol);
+    maybe_write_perf_map("T2", entry as usize, code.code_len, symbol);
     maybe_write_jitdump_code_load("T2", entry as usize, bytes, symbol);
     let native = Rc::new(NativeCode {
         _env_names: NativeEnvNames::new(body),
