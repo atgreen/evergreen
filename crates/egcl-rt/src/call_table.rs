@@ -11,7 +11,7 @@
 //! and an entered adapter retains that exact target before any safepoint.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Explicit continuation context for a native call. The request belongs to the
@@ -99,6 +99,7 @@ pub struct CallCell {
     ordinal: usize,
     cold_register: usize,
     cold_slice: usize,
+    revision: AtomicU64,
 }
 
 impl CallCell {
@@ -112,6 +113,7 @@ impl CallCell {
             ordinal,
             cold_register,
             cold_slice,
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -152,6 +154,13 @@ impl CallCell {
         }
     }
 
+    /// Stable owning-cell revision word for generated ordinary admission.
+    /// Registration seeds it under the binding lock before generated exposure.
+    /// Its address remains valid while the execution retains this cell.
+    pub fn revision_address(&self) -> *const AtomicU64 {
+        &self.revision
+    }
+
     /// Pointer to an OrdinaryEntryDescriptor, or zero for cold/ineligible targets.
     /// Loading it does not retain it: callers must be inside an owning native
     /// segment before loading or dereferencing the descriptor.
@@ -175,7 +184,10 @@ impl CallCell {
         self.register_entry.load(Ordering::Acquire) == self.cold_register
     }
 
-    fn invalidate(&self) {
+    fn invalidate(&self, revision: u64) {
+        // A caller that already loaded the old descriptor must reject it even
+        // before the dedicated entry slot is cleared.
+        self.revision.store(revision, Ordering::Release);
         self.ordinary_entry.store(0, Ordering::Release);
         self.register_entry
             .store(self.cold_register, Ordering::Release);
@@ -211,7 +223,7 @@ impl Table {
         binding.revision = binding.revision.wrapping_add(1);
         binding.cells.retain(|weak| {
             if let Some(cell) = weak.upgrade() {
-                cell.invalidate();
+                cell.invalidate(binding.revision);
                 true
             } else {
                 false
@@ -264,9 +276,9 @@ pub fn register(cell: &Arc<CallCell>) {
         .expect("resolve ordinal before registering")
         .lock()
         .unwrap();
-    table.bindings[cell.ordinal]
-        .cells
-        .push(Arc::downgrade(cell));
+    let binding = &mut table.bindings[cell.ordinal];
+    cell.revision.store(binding.revision, Ordering::Release);
+    binding.cells.push(Arc::downgrade(cell));
 }
 
 /// Capture before resolving a cold target. Publication checks it under the
@@ -417,6 +429,83 @@ mod tests {
         assert!(entry.accepts(4, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(3, ORDINARY_ENV_NONE));
         assert!(!entry.accepts(4, ORDINARY_ENV_CLOSURE));
+    }
+
+    #[test]
+    fn late_execution_cells_start_at_the_current_binding_revision() {
+        let symbol = crate::symbols::intern("ORDINARY-LATE-REVISION-CELL");
+        let ordinal = resolve_ordinal(symbol).unwrap();
+        let initial = revision(ordinal);
+        invalidate(symbol);
+        invalidate(symbol);
+        let cell = Arc::new(CallCell::new(ordinal, 11, 12));
+        register(&cell);
+        let revision_address = cell.revision_address();
+        assert_eq!(
+            unsafe { &*revision_address }.load(Ordering::Acquire),
+            initial + 2
+        );
+        let mut stale = ordinary_descriptor(initial);
+        assert!(
+            !TABLE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .publish_ordinary(&cell, &stale)
+        );
+        stale.revision = initial + 2;
+        assert!(
+            TABLE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .publish_ordinary(&cell, &stale)
+        );
+        invalidate(symbol);
+        assert_eq!(cell.revision_address(), revision_address);
+        assert_eq!(
+            unsafe { &*revision_address }.load(Ordering::Acquire),
+            initial + 3
+        );
+        assert_eq!(
+            unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn every_execution_cell_keeps_a_stable_current_revision_word() {
+        let mut table = Table::default();
+        let ordinal = table.ordinal(7);
+        let first = Arc::new(CallCell::new(ordinal, 1, 2));
+        let second = Arc::new(CallCell::new(ordinal, 3, 4));
+        table.bindings[ordinal]
+            .cells
+            .extend([Arc::downgrade(&first), Arc::downgrade(&second)]);
+        let addresses = [first.revision_address(), second.revision_address()];
+        assert_ne!(addresses[0], addresses[1]);
+        let old = ordinary_descriptor(0);
+        assert!(table.publish_ordinary(&first, &old));
+        assert!(table.publish_ordinary(&second, &old));
+        for symbol in 100..10000 {
+            table.ordinal(symbol);
+        }
+        table.invalidate(ordinal);
+        for (cell, address) in [&first, &second].into_iter().zip(addresses) {
+            assert_eq!(cell.revision_address(), address);
+            assert_eq!(unsafe { &*address }.load(Ordering::Acquire), 1);
+            assert_eq!(
+                unsafe { &*cell.ordinary_entry_address() }.load(Ordering::Acquire),
+                0
+            );
+            assert!(!table.publish_ordinary(cell, &old));
+        }
+        drop(second);
+        table.invalidate(ordinal);
+        assert_eq!(unsafe { &*addresses[0] }.load(Ordering::Acquire), 2);
+        assert_eq!(table.bindings[ordinal].cells.len(), 1);
     }
 
     #[test]
