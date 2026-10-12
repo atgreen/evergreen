@@ -511,6 +511,9 @@ fn compare_zero_memory(a: &mut Asm, base: u8, displacement: u8, byte: bool) {
 pub(super) struct OrdinaryCallFrame<'a> {
     pub outgoing: NativeValueArea,
     pub control_home: FramedHome,
+    /// Must-state at this call, after actual return normalization and resets.
+    /// Unknown tuples still require the runtime admission check.
+    pub mv_known_empty: bool,
     pub self_entry: egcl_rt::asm::Label,
     pub self_stack_fixups: &'a mut Vec<usize>,
     pub emit_epilogue: &'a dyn Fn(&mut Asm),
@@ -546,6 +549,7 @@ impl OrdinaryCallEmission<'_> {
         let OrdinaryCallFrame {
             outgoing,
             control_home,
+            mv_known_empty,
             self_entry,
             self_stack_fixups,
             emit_epilogue,
@@ -596,9 +600,11 @@ impl OrdinaryCallEmission<'_> {
         a.jcc(Cc::Ne, cold);
         compare_zero_memory(a, 7, 64, true);
         a.jcc(Cc::Ne, cold);
-        load_mem64_disp(a, 11, 7, 24);
-        compare_zero_memory(a, 11, 0, true);
-        a.jcc(Cc::Ne, cold);
+        if !mv_known_empty {
+            load_mem64_disp(a, 11, 7, 24);
+            compare_zero_memory(a, 11, 0, true);
+            a.jcc(Cc::Ne, cold);
+        }
         if !self.tail {
             load_mem64_disp(a, 11, 7, 8);
             a.extend_from_slice(&[0x41, 0x8b, 0x03, 0x8b, 0x57, 56]); // eax=*depth; edx=limit
