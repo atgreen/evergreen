@@ -52,6 +52,9 @@ impl PublishedAdapter {
 /// whose `saved_sp`/`return_pc` end the physical walk.
 pub(super) struct PublishedBoundary {
     pub(super) owner: *const TransferCode,
+    // Captured on publication so stopped-fiber walks never consult the
+    // collector's execution-local directory.
+    directory: std::rc::Rc<super::super::call_table::OrdinaryCodeDirectory>,
     context: *mut CaptureContext,
     pub(super) cursor: NativeFrameCursor,
     /// Actual native stack ownership: from the capture image up to the segment
@@ -329,6 +332,7 @@ unsafe fn publish_with<R>(
     let saved_sp = if segment.is_null() { 0 } else { unsafe { (*segment).saved_sp } };
     let mut boundary = PublishedBoundary {
         owner,
+        directory: super::super::call_table::active_ordinary_directory(),
         context,
         cursor,
         bounds: low..saved_sp,
@@ -653,9 +657,23 @@ unsafe fn walk_boundary_frames(
         });
         return 0;
     }
-    let mut code = unsafe { &*boundary.owner };
-    let mut context = boundary.context;
     let segment = unsafe { &*boundary.segment };
+    unsafe { walk_boundary_frames_to(boundary,
+        (segment.saved_sp, segment.return_pc()), _count_gc_walks, visit) }
+}
+
+unsafe fn walk_boundary_frames_to(
+    boundary: &PublishedBoundary,
+    end: (usize, usize),
+    _count_gc_walks: bool,
+    visit: &mut NativeFrameVisitor<'_>,
+) -> usize {
+    let root_owner = unsafe { &*boundary.owner };
+    let mut code = root_owner;
+    // Hold the selected owner while visiting its maps, independently of any
+    // later lookup. The directory itself retains all in-flight revisions.
+    let mut _retained_owner = None;
+    let mut context = boundary.context;
     let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let mut cursor = boundary.cursor;
     let mut total = 0;
@@ -663,6 +681,28 @@ unsafe fn walk_boundary_frames(
         let base = code.code.as_ptr() as usize;
         let Some(offset) = cursor.pc.checked_sub(base).filter(|offset| *offset < code.code_len)
         else {
+            let root_base = root_owner.code.as_ptr() as usize;
+            if cursor.pc.checked_sub(root_base).is_some_and(|offset| offset < root_owner.code_len) {
+                code = root_owner;
+                context = boundary.context;
+                continue;
+            }
+            if let Some(owner) = boundary.directory.code_for_pc(cursor.pc) {
+                if cursor.pc.checked_sub(owner.code.as_ptr() as usize)
+                    .is_none_or(|offset| offset >= owner.code_len) {
+                    note_bail(Bail::PcOutsideOwner);
+                    return total;
+                }
+                // Changing code identity does not change physical register
+                // homes. Those were composed by the younger frame's unwind.
+                code = unsafe { &*std::rc::Rc::as_ptr(&owner) };
+                _retained_owner = Some(owner);
+                // A managed CaptureContext describes one definition. Ordinary
+                // frames use their own code metadata, never another owner's
+                // activation state. GC location resolution needs no context.
+                context = std::ptr::null_mut();
+                continue;
+            }
             let adapter = super::mapped_adapter(cursor.pc)
                 .or_else(|| super::super::native_callable::mapped_adapter(cursor.pc));
             let Some(adapter) = adapter else {
@@ -730,7 +770,7 @@ unsafe fn walk_boundary_frames(
                 return total;
             }
         }
-        if step.caller.call_sp == segment.saved_sp && step.caller.pc == segment.return_pc() {
+        if (step.caller.call_sp, step.caller.pc) == end {
             return total;
         }
         cursor = step.caller;
@@ -1960,6 +2000,7 @@ mod tests {
         let code = unsafe { &*published.owner };
         let malformed = |owner, pc, bounds, stack| PublishedBoundary {
             owner,
+            directory: std::rc::Rc::clone(&published.directory),
             context: published.context,
             cursor: NativeFrameCursor { pc, ..published.cursor },
             bounds,
@@ -2033,3 +2074,7 @@ mod tests {
         assert_eq!(value, args[0]);
     }
 }
+
+#[cfg(test)]
+#[path = "root_publication_owner_tests.rs"]
+mod owner_tests;

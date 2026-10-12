@@ -106,7 +106,29 @@ pub(in crate::cli::bytecode) struct OrdinaryCodeDirectory {
 }
 
 impl OrdinaryCodeDirectory {
-    #[cfg_attr(not(test), expect(dead_code, reason = "ordinary entry consumers follow in bliss-t8a48"))]
+    #[cfg(test)]
+    pub(in crate::cli::bytecode) fn for_walk_test(codes: &[(Rc<TransferCode>, usize, usize)]) -> Self {
+        let mut retained = RetainedEntries::default();
+        for (code, start, len) in codes {
+            // Test-only ownership registration. Legacy fixture entries are
+            // never published or executed through the ordinary ABI.
+            let descriptor = OrdinaryEntryDescriptor {
+                kind: linkage::ORDINARY_X64_LISP_KIND,
+                version: linkage::ORDINARY_X64_LISP_VERSION,
+                revision: 0,
+                entry: *start,
+                code_start: *start,
+                code_len: *len,
+                arity: 0,
+                environment: linkage::ORDINARY_ENV_NONE,
+                owner: Rc::as_ptr(code) as usize,
+                stack_required: 8,
+            };
+            assert!(retained.retain(Arc::new(CallCell::new(0, 11, 12)), descriptor, Rc::clone(code)).is_some());
+        }
+        Self { retained: RefCell::new(retained) }
+    }
+
     pub(in crate::cli::bytecode) fn code_for_pc(&self, pc: usize) -> Option<Rc<TransferCode>> {
         self.retained.borrow().code_for_pc(pc)
     }
@@ -119,6 +141,15 @@ static DIRECTORY: egcl_rt::execution_local::ExecutionLocal<Rc<OrdinaryCodeDirect
         })
     })
 };
+
+/// Capture on the publishing execution, never during a foreign stack walk.
+/// The enclosing segment lease keeps retired owners until every frame returns.
+pub(in crate::cli::bytecode) fn active_ordinary_directory() -> Rc<OrdinaryCodeDirectory> {
+    DIRECTORY.with(|directory| {
+        assert!(directory.retained.borrow().segments > 0, "native publication needs a segment lease");
+        Rc::clone(directory)
+    })
+}
 
 /// Owns a lease for the whole segment, including suspension and Rust callbacks.
 /// Drop uses the saved directory, never whichever execution is currently cached.
