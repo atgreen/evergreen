@@ -53,6 +53,7 @@ pub(super) struct OrdinaryCallEmission {
     target: OrdinaryCallTarget,
     flags: OrdinaryCallFlags,
     cold: u64,
+    tail: bool,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its
@@ -67,6 +68,32 @@ pub fn emit_framed_ordinary_call(
     target: OrdinaryCallTarget,
     flags: OrdinaryCallFlags,
     cold: u64,
+) -> Result<FramedCode, EmitError> {
+    emit_ordinary_forwarder(f, entry, target, flags, cold, false)
+}
+
+/// Opt into a tail handoff for the same bounded, scope-free forwarding shape.
+/// A tail transfer reuses the incoming overflow capacity and return address;
+/// capacity misses retain an ordinary call and return. Admission failures use
+/// the existing rooted cold handoff. The enclosing segment must retain both
+/// code owners until quiescence, including after this frame is retired.
+pub fn emit_framed_ordinary_tail_call(
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    target: OrdinaryCallTarget,
+    flags: OrdinaryCallFlags,
+    cold: u64,
+) -> Result<FramedCode, EmitError> {
+    emit_ordinary_forwarder(f, entry, target, flags, cold, true)
+}
+
+fn emit_ordinary_forwarder(
+    f: &Function,
+    entry: OrdinaryLispEntryOptions,
+    target: OrdinaryCallTarget,
+    flags: OrdinaryCallFlags,
+    cold: u64,
+    allow_tail: bool,
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     if f.block_order().len() != 1
@@ -146,6 +173,8 @@ pub fn emit_framed_ordinary_call(
             target,
             flags,
             cold,
+            // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
+            tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
         }),
     )
 }
@@ -165,6 +194,13 @@ fn retire(a: &mut Asm, bytes: u32) {
     }
 }
 
+/// The frame storage and its matching callee-save retirement sequence.
+pub(super) struct OrdinaryCallFrame<'a> {
+    pub outgoing: NativeValueArea,
+    pub control_home: FramedHome,
+    pub emit_epilogue: &'a dyn Fn(&mut Asm),
+}
+
 impl OrdinaryCallEmission {
     pub(super) fn emit(
         self,
@@ -172,9 +208,13 @@ impl OrdinaryCallEmission {
         data: &InstData,
         homes: &HashMap<Value, FramedHome>,
         constants: &HashMap<Value, u64>,
-        outgoing: NativeValueArea,
-        control_home: FramedHome,
+        frame: OrdinaryCallFrame<'_>,
     ) -> Result<Vec<CallReturn>, EmitError> {
+        let OrdinaryCallFrame {
+            outgoing,
+            control_home,
+            emit_epilogue,
+        } = frame;
         let NativeValueArea::NativeStack(base) = outgoing else {
             return Err(EmitError::UnsupportedOp(0xFD));
         };
@@ -239,10 +279,12 @@ impl OrdinaryCallEmission {
         movzx_mem8(a, RAX, 11);
         alu_r_imm(a, 7, RAX, 0);
         a.jcc(Cc::Ne, cold);
-        load_mem64_disp(a, 11, 7, 8);
-        a.extend_from_slice(&[0x41, 0x8b, 0x03, 0x8b, 0x57, 56]); // eax=*depth; edx=limit
-        cmp_rr(a, RAX, SCRATCH);
-        a.jcc(Cc::Ge, cold);
+        if !self.tail {
+            load_mem64_disp(a, 11, 7, 8);
+            a.extend_from_slice(&[0x41, 0x8b, 0x03, 0x8b, 0x57, 56]); // eax=*depth; edx=limit
+            cmp_rr(a, RAX, SCRATCH);
+            a.jcc(Cc::Ge, cold);
+        }
 
         mov_imm64(a, 11, self.target.descriptor_slot as i64);
         load_mem64_disp(a, 11, 11, 0);
@@ -328,42 +370,71 @@ impl OrdinaryCallEmission {
         );
         alu_r_imm(a, 7, SCRATCH, 8);
         a.jcc(Cc::L, cold); // also rejects high-bit bounds
-        mov_rr(a, RAX, 4);
-        alu_r_imm(a, 5, RAX, overflow + 8);
-        unsigned_branch(a, false, cold);
+        if self.tail {
+            // Ordinary RBP names the first saved word. Retiring this frame
+            // restores entry RSP = RBP+8; no new return word is pushed.
+            mov_rr(a, RAX, 5);
+            alu_r_imm(a, 0, RAX, 8);
+            unsigned_branch(a, false, cold);
+        } else {
+            mov_rr(a, RAX, 4);
+            alu_r_imm(a, 5, RAX, overflow + 8);
+            unsigned_branch(a, false, cold);
+        }
         alu_rr(a, 0x29, RAX, SCRATCH);
         unsigned_branch(a, false, cold);
         load_mem64_disp(a, SCRATCH, 7, 88);
         cmp_rr(a, RAX, SCRATCH);
         unsigned_branch(a, true, cold);
-        load_mem64_disp(a, SCRATCH, 7, 8);
-        a.extend_from_slice(&[0xff, 0x02]); // inc dword[rdx]
+        if !self.tail {
+            load_mem64_disp(a, SCRATCH, 7, 8);
+            a.extend_from_slice(&[0xff, 0x02]); // inc dword[rdx]
+        }
         load_mem64_disp(
             a,
             11,
             11,
             std::mem::offset_of!(OrdinaryEntryDescriptor, entry) as i32,
         );
-        if overflow != 0 {
-            alu_r_imm(a, 5, 4, overflow);
-            load_home(a, RAX, FramedHome::Stack(base + 3), overflow);
-            store_to_rsp(a, RAX, 0);
-        }
-        for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
-            load_home(a, reg, FramedHome::Stack(base + index as u32), overflow);
-        }
-        mov_imm64(a, 1, data.args.len() as i64);
-        mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
-        a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, genuine ordinary ABI
-        let direct = CallReturn {
-            return_offset: a.here(),
-            stack_adjust: overflow as u32,
+        let direct = if self.tail {
+            // Every source was copied above before any incoming area is
+            // overwritten. The handoff has no safepoint: the target takes
+            // ownership before its first collecting boundary.
+            if overflow != 0 {
+                load_home(a, RAX, FramedHome::Stack(base + 3), 0);
+                a.extend_from_slice(&[0x48, 0x89, 0x45, 0x10]); // [rbp+16]=arg4
+            }
+            for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
+                load_home(a, reg, FramedHome::Stack(base + index as u32), 0);
+            }
+            mov_imm64(a, 1, data.args.len() as i64);
+            mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            emit_epilogue(a);
+            a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11; original return PC
+            None
+        } else {
+            if overflow != 0 {
+                alu_r_imm(a, 5, 4, overflow);
+                load_home(a, RAX, FramedHome::Stack(base + 3), overflow);
+                store_to_rsp(a, RAX, 0);
+            }
+            for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
+                load_home(a, reg, FramedHome::Stack(base + index as u32), overflow);
+            }
+            mov_imm64(a, 1, data.args.len() as i64);
+            mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+            a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, genuine ordinary ABI
+            let direct = CallReturn {
+                return_offset: a.here(),
+                stack_adjust: overflow as u32,
+            };
+            load_home(a, 11, control_home, overflow);
+            load_mem64_disp(a, 11, 11, 8);
+            a.extend_from_slice(&[0x41, 0xff, 0x0b]); // DEC preserves CF and all result registers
+            retire(a, overflow as u32);
+            a.jmp(done);
+            Some(direct)
         };
-        load_home(a, 11, control_home, overflow);
-        load_mem64_disp(a, 11, 11, 8);
-        a.extend_from_slice(&[0x41, 0xff, 0x0b]); // DEC preserves CF and all result registers
-        retire(a, overflow as u32);
-        a.jmp(done);
 
         a.bind(cold);
         alu_r_imm(a, 5, 4, 64);
@@ -392,6 +463,6 @@ impl OrdinaryCallEmission {
         };
         retire(a, 64);
         a.bind(done);
-        Ok(vec![direct, slow])
+        Ok(direct.into_iter().chain(std::iter::once(slow)).collect())
     }
 }

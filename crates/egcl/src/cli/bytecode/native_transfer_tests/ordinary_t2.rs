@@ -1550,7 +1550,7 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
     ).unwrap();
     let (_, leaf) = install("ORDINARY-REGISTER-FOUR", "(a b c d)", "(d)", &mut env);
     let (symbol, caller) = install(
-        "ORDINARY-REGISTER-CALLER", "(a b c d)", "((ordinary-register-four a b c d))", &mut env,
+        "ORDINARY-REGISTER-CALLER", "(a b c)", "((ordinary-register-four a b c 44))", &mut env,
     );
     for code in [&leaf, &caller] {
         assert_mapped_t2(code);
@@ -1560,10 +1560,14 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
         });
         assert!(listing.contains("Ordinary x86-64 Lisp ABI"), "{listing}");
     }
-    let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
+    // Incoming capacity is zero while the callee needs one overflow slot, so
+    // production tail selection must retain a real CALL with its precise map.
+    let NativeCodeStorage::Mapped(mapped) = &caller._storage else { unreachable!() };
+    assert_eq!(mapped.value_maps_for_test().iter().count(), 2);
+    let args = [11, 22, 33].map(EgclVal::from_fixnum);
     for iteration in 0..3 {
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
-        assert_eq!(run_native(&caller, symbol, &args, &mut env).unwrap(), args[3]);
+        assert_eq!(run_native(&caller, symbol, &args, &mut env).unwrap(), EgclVal::from_fixnum(44));
         assert!(!env.mv_active);
         let cold = native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
         if iteration != 0 {
