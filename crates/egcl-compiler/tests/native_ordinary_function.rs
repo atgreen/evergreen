@@ -103,6 +103,25 @@ fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
         }
     }
 }
+
+#[test]
+fn recursive_admission_tests_flags_without_register_round_trips() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8, 0, None, true);
+    let byte_loads = Decoder::new(64, &code, DecoderOptions::NONE).into_iter()
+        .filter(|instruction| instruction.mnemonic() == Mnemonic::Movzx).count();
+    assert_eq!(byte_loads, 0, "admission must test byte flags directly in memory");
+}
+
+#[test]
+fn recursive_admission_keeps_each_pending_condition_on_the_cold_path() {
+    for pending in 1..=9 {
+        // Both children of fib(2) are refused and return the cold sentinel -1.
+        execute_with_self_stack_bound(&fib(), 1, &[2 * 8, 0, 0, 0, 0, 0, 0],
+            (-16_i64) as u64, 0, None, true, None, pending);
+    }
+}
 fn instruction(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
     InstData {
         opcode,
@@ -238,11 +257,11 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
 #[allow(clippy::too_many_arguments)]
 fn execute_with_self_calls(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
     heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool) -> Vec<u8> {
-    execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None)
+    execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None, 0)
 }
 #[allow(clippy::too_many_arguments)]
 fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>) -> Vec<u8> {
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>, pending: u8) -> Vec<u8> {
     let heat_slot = AtomicUsize::new(0);
     let slot = AtomicUsize::new(0);
     let revision = AtomicU64::new(7);
@@ -336,6 +355,19 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
         test_observer: std::ptr::null(),
         stack_limit: 0,
     };
+    match pending {
+        0 => {},
+        1 => bytes[0].store(1, Ordering::Relaxed),
+        2 => bytes[1].store(1, Ordering::Relaxed),
+        3 => words[0].store(1 << 40, Ordering::Relaxed),
+        4 => words[1].store(1 << 40, Ordering::Relaxed),
+        5 => words[2].store(1, Ordering::Relaxed),
+        6 => control.seen_carrier = 3,
+        7 => control.deadline_armed = 1,
+        8 => control.depth_limit = 1,
+        9 => execution.request_yield(),
+        _ => unreachable!(),
+    }
     unsafe {
         execution.swap_active_native_control(&mut control as *mut _ as u64);
     }
@@ -684,6 +716,6 @@ fn direct_self_stack_admission_checks_exact_child_budget_and_balances_depth() {
     // sentinel -1 for each child, while admitted children return 1 and 0.
     for (below_bottom, expected) in [(1, 1_i64), (0, -2), (-1, -2)] {
         execute_with_self_stack_bound(&f, 1, &[2 << 3, 0, 0, 0, 0, 0, 0],
-            (expected << 3) as u64, 0, None, true, Some(below_bottom));
+            (expected << 3) as u64, 0, None, true, Some(below_bottom), 0);
     }
 }

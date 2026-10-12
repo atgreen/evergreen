@@ -24,12 +24,12 @@
 //! * `values` — a home for every non-excluded SSA value. A GPR value whose
 //!   every reported range agrees on one register keeps that register, mapped
 //!   through `GPR_X86` to its hardware encoding. A value whose ranges agree
-//!   on one stack slot keeps that slot. Anything else (split, or unreported
-//!   because the allocator never saw a use) is given a fresh stack slot above
-//!   the allocator's own.
-//! * `stack_slots` — the slot count after those assignments, starting from
-//!   `MachFunc::num_spill_slots`. The emitter adds its own scratch slots above
-//!   this and sizes the frame from the total.
+//!   on one stack slot keeps its alias relationship with that slot. Anything
+//!   else (split, or unreported because the allocator never saw a use) is given
+//!   a fresh stack slot. The selected stack homes are then densely renumbered,
+//!   preserving aliases while removing unused allocator slots.
+//! * `stack_slots` — the number of distinct selected stack homes. The emitter
+//!   adds its own scratch slots above this and sizes the frame from the total.
 //!
 //! Only GPR-class ranges are consulted; float values are handled by the
 //! emitter's XMM path and get a home here only through the fallback slot rule.
@@ -402,6 +402,25 @@ pub fn select_frame_homes(
             }
         };
         values.insert(value, home);
+    }
+    // Allocator edits are not emitted, so slots absent from the selected homes
+    // need no storage. Preserve exactly the existing alias relationships; this
+    // renumbering does not coalesce values or depend on HashMap iteration order.
+    // The emitter reserves nonvalue scratch/control slots after this step.
+    let mut used_slots: Vec<u32> = values
+        .values()
+        .filter_map(|home| match home {
+            ValueHome::Stack(slot) => Some(*slot),
+            ValueHome::Reg(_) => None,
+        })
+        .collect();
+    used_slots.sort_unstable();
+    used_slots.dedup();
+    let stack_slots = u32::try_from(used_slots.len()).map_err(|_| FrameHomeError::SlotOverflow)?;
+    for home in values.values_mut() {
+        if let ValueHome::Stack(slot) = home {
+            *slot = used_slots.binary_search(slot).unwrap() as u32;
+        }
     }
     Ok(FrameHomes {
         values,

@@ -331,7 +331,9 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
             for guard in 0..4 {
                 match guard {
                     0 => control.stack_limit = u64::MAX,
-                    1 => active.store(true, Relaxed),
+                    // Ordinary entry requires empty MV; dynamic tuple rejection is
+                    // covered by native_ordinary_mv_admission after a real producer.
+                    1 => execution.request_yield(),
                     2 => revision.store(8, Relaxed),
                     3 => bytes[0].store(1, Relaxed),
                     _ => unreachable!(),
@@ -368,7 +370,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
                     "cold return PC retains caller roots"
                 );
                 control.stack_limit = 0;
-                active.store(false, Relaxed);
+                assert_eq!(execution.take_yield_request(), guard == 1);
                 revision.store(7, Relaxed);
                 bytes[0].store(0, Relaxed);
             }

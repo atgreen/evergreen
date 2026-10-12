@@ -52,7 +52,6 @@ fn split_values_use_final_homes_with_complete_typed_call_inputs() {
         .iter()
         .find(|range| range.vreg.num == held.0)
         .unwrap();
-    let allocator_home = split.location;
     split.location = Location::Stack(StackSlot(machine.num_spill_slots));
     machine.num_spill_slots += 1;
     machine.value_locations.push(split);
@@ -60,8 +59,13 @@ fn split_values_use_final_homes_with_complete_typed_call_inputs() {
     let ValueHome::Stack(slot) = homes.values[&held] else {
         panic!("split value needs a stable spill")
     };
-    assert!(slot >= machine.num_spill_slots);
-    assert_ne!(homes.values[&held].location(), Some(allocator_home));
+    assert!(slot < homes.stack_slots);
+    for overlapping in [argument, raw, result] {
+        assert_ne!(
+            homes.values[&held], homes.values[&overlapping],
+            "the split value needs a distinct home throughout its lifetime"
+        );
+    }
     let maps = resolve_safepoint_maps(&f, &machine, &homes, &HashMap::new()).unwrap();
     let map = maps.iter().next().unwrap();
     assert_eq!(map.values().len(), 3);
@@ -415,4 +419,39 @@ fn comparison_live_across_inserted_poll_has_a_real_home() {
             EgclVal::from_fixnum(expected).to_raw()
         );
     }
+}
+
+#[test]
+fn sparse_allocator_slots_compact_without_changing_aliases_or_call_roots() {
+    let (f, mut machine, [held, argument, raw, result]) = fixture();
+    // Model stable homes with holes left by allocator-only spill/edit slots.
+    // The argument dies at CALL and its result starts afterward: their existing
+    // shared slot is legitimate and must stay shared. Held/raw remain distinct.
+    for range in &mut machine.value_locations {
+        let value = Value(range.vreg.num);
+        let slot = if value == held { 5 }
+            else if value == argument || value == result { 11 }
+            else if value == raw { 17 }
+            else { continue };
+        range.location = Location::Stack(StackSlot(slot));
+    }
+    machine.num_spill_slots = 24;
+    let homes = select_frame_homes(&f, &machine, |_| false).unwrap();
+    assert_eq!(homes.stack_slots, 3,
+        "unused allocator spill slots must not inflate the final native frame");
+    assert_eq!(homes.values[&held], ValueHome::Stack(0));
+    assert_eq!(homes.values[&argument], ValueHome::Stack(1));
+    assert_eq!(homes.values[&result], homes.values[&argument],
+        "renumbering must preserve existing nonoverlapping aliases");
+    assert_eq!(homes.values[&raw], ValueHome::Stack(2));
+    let maps = resolve_safepoint_maps(&f, &machine, &homes, &HashMap::new()).unwrap();
+    let call = maps.iter().next().unwrap();
+    assert_eq!(call.values().len(), 3);
+    assert_eq!(call.value(held).unwrap().gc_home(), Some(ValueHome::Stack(0)));
+    assert_eq!(call.value(argument).unwrap().gc_home(), Some(ValueHome::Stack(1)),
+        "the dying call argument remains a writable root in its compact home");
+    assert_eq!(call.value(raw).unwrap().location,
+        FrameValueLocation::Home(ValueHome::Stack(2)));
+    assert!(call.value(raw).unwrap().gc_home().is_none());
+    assert!(call.value(result).is_none(), "CALL has not defined its result yet");
 }

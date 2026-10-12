@@ -498,10 +498,22 @@ fn retire(a: &mut Asm, bytes: u32) {
     }
 }
 
+/// Compare a pending flag at its declared width without a scratch-register
+/// load. All admission observations still occur before the ordinary call.
+fn compare_zero_memory(a: &mut Asm, base: u8, displacement: u8, byte: bool) {
+    debug_assert_ne!(base & 7, 4, "rsp/r12 requires SIB addressing");
+    if !byte || base >= 8 { a.push(if byte { 0x40 } else { 0x48 } | (base >> 3)); }
+    a.extend_from_slice(&[if byte { 0x80 } else { 0x83 },
+        0x78 | (base & 7), displacement, 0]); // CMP r/m8 or r/m64, imm8=0
+}
+
 /// The frame storage and its matching callee-save retirement sequence.
 pub(super) struct OrdinaryCallFrame<'a> {
     pub outgoing: NativeValueArea,
     pub control_home: FramedHome,
+    /// Must-state at this call, after actual return normalization and resets.
+    /// Unknown tuples still require the runtime admission check.
+    pub mv_known_empty: bool,
     pub self_entry: egcl_rt::asm::Label,
     pub self_stack_fixups: &'a mut Vec<usize>,
     pub emit_epilogue: &'a dyn Fn(&mut Asm),
@@ -537,6 +549,7 @@ impl OrdinaryCallEmission<'_> {
         let OrdinaryCallFrame {
             outgoing,
             control_home,
+            mv_known_empty,
             self_entry,
             self_stack_fixups,
             emit_epilogue,
@@ -558,8 +571,7 @@ impl OrdinaryCallEmission<'_> {
         load_home(a, 7, control_home, 0);
         alu_r_imm(a, 7, 7, 0);
         a.jcc(Cc::E, cold);
-        load_mem64_disp(a, RAX, 7, 0);
-        cmp_rr(a, RAX, 13);
+        cmp_mem64_disp8(a, 13, 7, 0);
         a.jcc(Cc::Ne, cold);
         for (address, byte) in [
             (self.flags.gc_requested, true),
@@ -568,12 +580,7 @@ impl OrdinaryCallEmission<'_> {
             (self.flags.native_errors, false),
         ] {
             mov_imm64(a, 11, address as i64);
-            if byte {
-                movzx_mem8(a, RAX, 11);
-            } else {
-                load_mem64_disp(a, RAX, 11, 0);
-            }
-            alu_r_imm(a, 7, RAX, 0);
+            compare_zero_memory(a, 11, 0, byte);
             a.jcc(Cc::Ne, cold);
         }
         mov_imm64(a, 11, self.flags.signal_epoch as i64);
@@ -588,23 +595,16 @@ impl OrdinaryCallEmission<'_> {
         );
         cmp_mem64_disp8(a, RAX, 7, 40);
         a.jcc(Cc::Ne, cold);
-        load_mem64_disp(
-            a,
-            RAX,
-            13,
-            egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32,
-        );
-        alu_r_imm(a, 7, RAX, 0);
+        compare_zero_memory(a, 13,
+            egcl_rt::exec_context::offsets::YIELD_REQUESTED as u8, false);
         a.jcc(Cc::Ne, cold);
-        mov_rr(a, 11, 7);
-        alu_r_imm(a, 0, 11, 64);
-        movzx_mem8(a, RAX, 11);
-        alu_r_imm(a, 7, RAX, 0);
+        compare_zero_memory(a, 7, 64, true);
         a.jcc(Cc::Ne, cold);
-        load_mem64_disp(a, 11, 7, 24);
-        movzx_mem8(a, RAX, 11);
-        alu_r_imm(a, 7, RAX, 0);
-        a.jcc(Cc::Ne, cold);
+        if !mv_known_empty {
+            load_mem64_disp(a, 11, 7, 24);
+            compare_zero_memory(a, 11, 0, true);
+            a.jcc(Cc::Ne, cold);
+        }
         if !self.tail {
             load_mem64_disp(a, 11, 7, 8);
             a.extend_from_slice(&[0x41, 0x8b, 0x03, 0x8b, 0x57, 56]); // eax=*depth; edx=limit
@@ -676,8 +676,7 @@ impl OrdinaryCallEmission<'_> {
         }
         alu_rr(a, 0x29, RAX, SCRATCH);
         unsigned_branch(a, false, cold);
-        load_mem64_disp(a, SCRATCH, 7, 88);
-        cmp_rr(a, RAX, SCRATCH);
+        cmp_mem64_disp8(a, RAX, 7, 88);
         unsigned_branch(a, true, cold);
         if !self.direct_self && self.target.heat_slot != 0 {
             let no_heat = a.label();

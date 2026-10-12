@@ -5945,6 +5945,7 @@ fn emit_framed_inner(
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
+                        mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
                         emit_epilogue: &emit_epilogue })?; }
             } else if d.opcode == Opcode::ConstHeapObj {
