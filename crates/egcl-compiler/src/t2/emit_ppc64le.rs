@@ -1266,6 +1266,7 @@ pub fn emit_framed_with_runtime(
     }
 
     Ok(FramedCode {
+        frame_entry: Some(0),
         ordinary_entry: None,
         ordinary_stack_required: None,
         native_recursive_entry: None,

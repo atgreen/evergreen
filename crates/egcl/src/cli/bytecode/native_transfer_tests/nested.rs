@@ -95,44 +95,52 @@ fn native_v2_distinct_callee_preserves_live_handler_cluster() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut env = Env::new(false);
-    egcl_rt::rooted_ref!(_env = &mut env);
-    super::super::super::read_eval_all_env(
-        "(setq *distinct-signals* 0)
-         (defun distinct-signal-handler (c)
-           (declare (ignore c))
-           (setq *distinct-signals* (+ *distinct-signals* 1))
-           (invoke-restart 'distinct-resume))
-         (defun distinct-symbol-value (x) (symbol-value x))",
-        &mut env,
-    )
-    .unwrap();
-    install_t2("DISTINCT-SYMBOL-VALUE", "(x)", "((symbol-value x))", &env);
-    let code = compile_caller(
-        "(x)",
-        "((handler-bind ((type-error #'distinct-signal-handler))
-            (restart-case (distinct-symbol-value x) (distinct-resume () :resumed))))",
-        &env,
-    );
-    code.run(&[NIL], &mut env).unwrap(); // warm the callee cell with a valid symbol
-    let stack = egcl_rt::current_stack();
-    let old_frame = stack.fp();
-    let old_sp = stack.sp();
-    for _ in 0..2 {
-        take_nested_entries();
-        egcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
-        egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
-        assert_eq!(*result, reader::read_from_string(":resumed").unwrap().0);
-        assert_eq!(take_nested_entries(), 1);
-        assert_eq!(stack.fp(), old_frame);
-        assert_eq!(stack.sp(), old_sp);
-        assert!(env.handlers.is_empty());
-        assert!(env.restarts.is_empty());
+    // Exercise both the ordinary forwarder's compatible adapter and the
+    // legacy same-segment activation. Two effectful calls keep the latter
+    // outside the initial ordinary Call+Return admission shape.
+    for (body, expected_nested_entries) in [
+        ("(symbol-value x)", 0),
+        ("(symbol-value x) (symbol-value x)", 1),
+    ] {
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        super::super::super::read_eval_all_env(
+            &format!("(setq *distinct-signals* 0)
+             (defun distinct-signal-handler (c)
+               (declare (ignore c))
+               (setq *distinct-signals* (+ *distinct-signals* 1))
+               (invoke-restart 'distinct-resume))
+             (defun distinct-symbol-value (x) {body})"),
+            &mut env,
+        )
+        .unwrap();
+        install_t2("DISTINCT-SYMBOL-VALUE", "(x)", &format!("({body})"), &env);
+        let code = compile_caller(
+            "(x)",
+            "((handler-bind ((type-error #'distinct-signal-handler))
+                (restart-case (distinct-symbol-value x) (distinct-resume () :resumed))))",
+            &env,
+        );
+        code.run(&[NIL], &mut env).unwrap(); // warm the callee cell with a valid symbol
+        let stack = egcl_rt::current_stack();
+        let old_frame = stack.fp();
+        let old_sp = stack.sp();
+        for _ in 0..2 {
+            take_nested_entries();
+            egcl_rt::rooted!(args = vec![super::super::super::arena_cons(T, NIL)]);
+            egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
+            assert_eq!(*result, reader::read_from_string(":resumed").unwrap().0);
+            assert_eq!(take_nested_entries(), expected_nested_entries);
+            assert_eq!(stack.fp(), old_frame);
+            assert_eq!(stack.sp(), old_sp);
+            assert!(env.handlers.is_empty());
+            assert!(env.restarts.is_empty());
+        }
+        assert_eq!(
+            super::super::super::read_eval_all_env("*distinct-signals*", &mut env).unwrap(),
+            EgclVal::from_fixnum(2)
+        );
     }
-    assert_eq!(
-        super::super::super::read_eval_all_env("*distinct-signals*", &mut env).unwrap(),
-        EgclVal::from_fixnum(2)
-    );
 }
 
 #[test]

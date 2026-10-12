@@ -313,9 +313,9 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         return None;
     }
     if let NativeCodeStorage::Mapped(mapped) = &code._storage {
-        if mapped.needs_recompile() {
-            // The ordinary entry owns refresh/publication; do not rewrite a
-            // cell's retained target without its linkage revision transition.
+        if mapped.mapped_entry().is_none() || mapped.needs_recompile() {
+            // Only explicitly advertised managed-slot entries accept this adapter.
+            // Refresh still belongs to the linkage revision transition.
             return None;
         }
         let body = code.body.as_ref()?;
@@ -337,7 +337,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         && *cached_key == key
         && entry.code.as_ref().is_none_or(|code| !code.needs_recompile())
     {
-        return entry.code.clone().map(|code| MappedCallee {
+        return entry.code.clone().filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
             code,
             function: *function,
         });
@@ -349,7 +349,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         key,
         super::native_segment_cache::SegmentCacheEntry::new(&body, code.clone()),
     ));
-    code.map(|code| MappedCallee {
+    code.filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
         code,
         function: *function,
     })
@@ -468,14 +468,40 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
             native = version.entries();
             state.versions.borrow_mut().push(version);
         }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let ordinary = match target.as_ref() {
+            Some(Target::Native { code, promote: false, .. }) => match &code._storage {
+                NativeCodeStorage::Mapped(code) => code.ordinary_descriptor(revision)
+                    .map(|descriptor| (descriptor, Rc::clone(code))),
+                _ => None,
+            },
+            _ => None,
+        };
         *state.target.borrow_mut() = target;
         linkage::publish(&state.cell, revision, native[0], native[1]);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some((descriptor, code)) = ordinary {
+            // The immutable owner is retained before the revision-checked slot
+            // becomes visible to generated calls in this execution.
+            unsafe { ordinary::publish_ordinary(Arc::as_ptr(&state.cell) as u64, descriptor, code); }
+        }
         #[cfg(all(target_arch = "x86_64", unix))]
         state
             .versions
             .borrow_mut()
             .retain(|version| version.keep(&state.cell));
     }
+}
+
+/// Ordinary cold admission shares the current named-call target's warming and
+/// publication path. No table borrow spans execution of the selected callable.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn ordinary_call(symbol: u32, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let Some(cell) = resolve(symbol) else {
+        return c2i_call_result(u64::from(symbol), args, 0);
+    };
+    let state = unsafe { state(Arc::as_ptr(&cell) as u64) };
+    if cell.is_cold() { cold(state, args) } else { warm(state, args) }
 }
 
 fn promotion_due(function: EgclVal) -> bool {

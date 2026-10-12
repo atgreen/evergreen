@@ -72,6 +72,7 @@ fn observe_aliases() {
     // Both descriptors use the live frame's exact PC, bounds and unwind maps.
     let mut alias = PublishedBoundary {
         owner: original.owner,
+        root_owner: original.root_owner,
         directory: std::rc::Rc::clone(&original.directory),
         context: original.context,
         cursor: original.cursor,

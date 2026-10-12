@@ -234,6 +234,9 @@ unsafe fn prepare_child(
     };
     egcl_rt::rooted_ref!(_target = &mut target);
     let code = Rc::clone(&target.code);
+    let Some(entry) = code.mapped_entry() else {
+        return Ok(NIL);
+    };
     let invocation = unsafe { &*(*record).context };
     if invocation.nargs != usize::from(code.body.arity) {
         return Ok(NIL);
@@ -275,7 +278,7 @@ unsafe fn prepare_child(
     let context = child.context.as_mut().unwrap() as *mut CaptureContext;
     let owner = &mut *child as *mut ChildActivation;
     unsafe {
-        (*record).entry = child.code.code.as_ptr();
+        (*record).entry = entry;
         (*record).activation = frame.add(1).cast();
         (*record).owner = owner.cast();
         (*children).active.push(child);

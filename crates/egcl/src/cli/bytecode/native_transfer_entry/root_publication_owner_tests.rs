@@ -63,6 +63,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     let boundary = PublishedBoundary {
         directory: Rc::clone(&directory),
         owner: Rc::as_ptr(&inner), context: std::ptr::null_mut(),
+        root_owner: Rc::as_ptr(&inner),
         cursor: NativeFrameCursor {
             pc: inner.code.as_ptr() as usize + sites[0].return_offset,
             call_sp: first_sp, registers: initial_homes,
@@ -71,6 +72,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
         stack: egcl_rt::current_stack(), previous: std::ptr::null_mut(), visited: Cell::new(0),
     };
     let mut owners = Vec::new();
+    let mut second_cursor = None;
     unsafe { walk_boundary_frames_to(&boundary, (sp, 0x12345678), false,
         &mut |code, _, _, cursor, body, _| {
             owners.push(code as *const TransferCode);
@@ -83,6 +85,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
             assert_eq!(cursor.registers[1], initial_homes[1],
                 "unsaved RBP inherits its original home across every owner");
             if index == 1 {
+                second_cursor = Some(*cursor);
                 assert_eq!(cursor.registers[0], Some(saved_rbx), "outer RBX lives in inner save slot");
                 assert_eq!(*(saved_rbx as *const usize), 0xabc0);
                 // A visitor must update the inherited physical home, not a copy.
@@ -93,4 +96,13 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     assert_eq!(owners, vec![Rc::as_ptr(&inner), Rc::as_ptr(&outer), Rc::as_ptr(&inner)]);
     assert_eq!(words[(saved_rbx - low) / 8], 0xdef0);
     assert_eq!(words[0], 0, "the initial RBX home belongs to another frame");
+    // A helper can start in B while the segment's root A is unregistered.
+    // Publication must retain those two identities separately.
+    let foreign = PublishedBoundary {
+        owner: Rc::as_ptr(&outer), cursor: second_cursor.unwrap(), ..boundary
+    };
+    let mut owners = Vec::new();
+    unsafe { walk_boundary_frames_to(&foreign, (sp, 0x12345678), false,
+        &mut |code, _, _, _, _, _| { owners.push(code as *const TransferCode); 1 }); }
+    assert_eq!(owners, vec![Rc::as_ptr(&outer), Rc::as_ptr(&inner)]);
 }

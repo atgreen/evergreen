@@ -1538,3 +1538,84 @@ fn ordinary_t2_shared_closures_pause_heat_until_native_code_is_removed() {
     assert_eq!(egcl_rt::function::invoke_count(*second), before + 1,
         "lower-tier heat resumes after optimized code is removed");
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
+    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun ordinary-register-four (a b c d) d)", &mut env,
+    ).unwrap();
+    let (_, leaf) = install("ORDINARY-REGISTER-FOUR", "(a b c d)", "(d)", &mut env);
+    let (symbol, caller) = install(
+        "ORDINARY-REGISTER-CALLER", "(a b c d)", "((ordinary-register-four a b c d))", &mut env,
+    );
+    for code in [&leaf, &caller] {
+        assert_mapped_t2(code);
+        let listing = native_transfer_entry::installed_listing(match &code._storage {
+            NativeCodeStorage::Mapped(mapped) => mapped,
+            _ => unreachable!(),
+        });
+        assert!(listing.contains("Ordinary x86-64 Lisp ABI"), "{listing}");
+    }
+    let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
+    for iteration in 0..3 {
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        assert_eq!(run_native(&caller, symbol, &args, &mut env).unwrap(), args[3]);
+        assert!(!env.mv_active);
+        let cold = native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        if iteration != 0 {
+            assert_eq!(cold, 0, "warmed ordinary call must use the generated edge");
+        }
+    }
+    let cell = call_table::resolve(egcl_rt::symbols::find_index("ORDINARY-REGISTER-FOUR").unwrap()).unwrap();
+    let descriptor = unsafe { &*cell.ordinary_entry_address() }.load(std::sync::atomic::Ordering::Acquire);
+    assert_ne!(descriptor, 0, "cold call must publish the ordinary callee descriptor");
+    let descriptor = unsafe { &*(descriptor as *const egcl_rt::call_table::OrdinaryEntryDescriptor) };
+    assert_eq!(descriptor.arity, 4);
+    assert!(descriptor.is_compatible());
+    assert!(unsafe { call_table::mapped_callee(Arc::as_ptr(&cell) as u64) }.is_some(),
+        "dual-entry leaves retain their managed-slot adapter");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_register_chain_preserves_zero_many_and_redefinition() {
+    let _lock = super::super::super::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(defun ordinary-register-values () (values))
+         (defun ordinary-register-middle () (ordinary-register-values))", &mut env,
+    ).unwrap();
+    let (_, middle) = install("ORDINARY-REGISTER-MIDDLE", "()", "((ordinary-register-values))", &mut env);
+    let (symbol, outer) = install("ORDINARY-REGISTER-OUTER", "()", "((ordinary-register-middle))", &mut env);
+    for code in [&middle, &outer] {
+        let NativeCodeStorage::Mapped(code) = &code._storage else { panic!("mapped owner") };
+        assert!(native_transfer_entry::installed_listing(code).contains("Ordinary x86-64 Lisp ABI"));
+    }
+    for _ in 0..3 {
+        assert_eq!(run_native(&outer, symbol, &[], &mut env).unwrap(), NIL);
+        assert!(env.mv_active && env.mv.is_empty(), "zero values remain empty but active");
+    }
+    super::super::super::read_eval_all_env(
+        "(defun ordinary-register-values ()
+           (%force-minor-gc-for-test) (values 17 23 41))", &mut env,
+    ).unwrap();
+    for _ in 0..3 {
+        assert_eq!(run_native(&outer, symbol, &[], &mut env).unwrap(), EgclVal::from_fixnum(17));
+        assert!(env.mv_active);
+        assert_eq!(env.mv, [17, 23, 41].map(EgclVal::from_fixnum));
+    }
+    super::super::super::read_eval_all_env(
+        "(defun ordinary-register-middle () 89)", &mut env,
+    ).unwrap();
+    let (_, replacement) = install("ORDINARY-REGISTER-MIDDLE", "()", "(89)", &mut env);
+    assert_mapped_t2(&replacement);
+    for _ in 0..3 {
+        assert_eq!(run_native(&outer, symbol, &[], &mut env).unwrap(), EgclVal::from_fixnum(89));
+        assert!(!env.mv_active && env.mv.is_empty(), "normal entry clears the prior tuple");
+    }
+}

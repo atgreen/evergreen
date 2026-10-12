@@ -186,6 +186,7 @@ fn ordinary_leaf_executes_zero_through_four_arguments_and_permutations() {
                 let code =
                     emit_framed_ordinary_leaf(&leaf(arity, selected, permuted), options(arity))
                         .unwrap();
+                assert_eq!(code.frame_entry, Some(0), "leaf retains its distinct slot entry");
                 assert!(code.native_recursive_entry.is_none());
                 assert_ne!(code.ordinary_entry, Some(code.compiled_entry));
                 assert_eq!(code.shadow_root_slots, 0);
@@ -446,6 +447,7 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         caller.native_entry_kind_slot.is_none(),
         "ordinary frames have no legacy managed identity"
     );
+    assert!(caller.frame_entry.is_none(), "call-only artifact cannot advertise its UD2 entry");
     let buffer = JitBuffer::new(&caller.code).unwrap();
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
     let mut depth = 0;

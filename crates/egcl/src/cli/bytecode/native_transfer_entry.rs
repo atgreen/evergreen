@@ -34,6 +34,7 @@ pub(super) use activation::fail_next_guard_reservation_for_test;
 use activation::ActivationState;
 mod deopt;
 mod native_frames;
+pub(super) mod ordinary_calls;
 pub(super) mod native_poll;
 mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
@@ -70,7 +71,12 @@ pub(super) fn cached_listing(body: &Arc<BytecodeFunction>) -> Option<String> {
 /// Decode the actual installed owner, including its precise transfer veneers.
 #[cfg(not(egcl_no_disassembly))]
 pub(super) fn installed_listing(code: &TransferCode) -> String {
-    format_listing(code, "; Mapped native transfer ABI — installed native code.\n")
+    let header = if code.ordinary_entry.is_some() {
+        "; Ordinary x86-64 Lisp ABI — installed native code.\n"
+    } else {
+        "; Mapped native transfer ABI — installed native code.\n"
+    };
+    format_listing(code, header)
 }
 
 #[cfg(not(egcl_no_disassembly))]
@@ -220,6 +226,11 @@ pub(super) struct TransferCode {
     // Retired definitions retain their exact value recipes as long as code lives.
     _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
     code_len: usize,
+    frame_entry: Option<usize>,
+    pub(super) ordinary_entry: Option<usize>,
+    ordinary_stack_required: Option<usize>,
+    _ordinary_arity: Option<JitBuffer>,
+    _ordinary_cold: Option<JitBuffer>,
     pub(super) has_deopt: bool,
     bcp_offsets: Vec<u32>,
     osr_entries: HashMap<u32, usize>,
@@ -502,6 +513,23 @@ pub(super) fn take_nested_entries() -> usize {
 }
 
 impl TransferCode {
+    pub(super) fn mapped_entry(&self) -> Option<*const u8> {
+        let offset = self.frame_entry.filter(|offset| *offset < self.code_len)?;
+        Some(self.code.as_ptr().wrapping_add(offset))
+    }
+
+    pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
+        use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
+        let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
+        Some(OrdinaryEntryDescriptor {
+            kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision,
+            entry: (self.code.as_ptr() as usize).checked_add(offset)?,
+            code_start: self.code.as_ptr() as usize, code_len: self.code_len,
+            arity: usize::from(self.body.arity), environment: ORDINARY_ENV_NONE,
+            owner: self as *const Self as usize, stack_required: self.ordinary_stack_required?,
+        })
+    }
+
     #[cfg(test)]
     pub(super) fn value_maps_for_test(&self) -> &Arc<egcl_compiler::t2::x64_calls::NativeCallSites> {
         &self._native_calls
@@ -630,6 +658,20 @@ impl TransferCode {
         allow_recursion: bool,
         tier: CompilationTier,
     ) -> Option<Self> {
+        Self::emit_prepared_with_ordinary(body, roots, ir, None, deopt_metadata, call_cells, allow_recursion, tier)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_prepared_with_ordinary(
+        body: Arc<BytecodeFunction>,
+        roots: Arc<ActiveBytecodeRoot>,
+        ir: &egcl_compiler::t2::ir::Function,
+        ordinary_ir: Option<&egcl_compiler::t2::ir::Function>,
+        deopt_metadata: Option<Arc<T2InstalledMetadata>>,
+        call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
+        allow_recursion: bool,
+        tier: CompilationTier,
+    ) -> Option<Self> {
         // Every normal mapped entry clears the complete MV buffer before
         // admission (outer, nested, and recursive). OSR deliberately preserves
         // pending values; the analysis treats each OSR header as unknown.
@@ -725,9 +767,44 @@ impl TransferCode {
                 Some(result)
             })
         } else { None };
+        let mut ordinary_arity = None;
+        let mut ordinary_cold = None;
+        let ordinary = ordinary_ir.filter(|_| matches!(tier, CompilationTier::T2)
+            && fixed_tagged_parameters(&body) && scope_free_native_body(&body, false))
+            .and_then(|ir| {
+                use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
+                let mut ir = ir.clone();
+                egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ir, true);
+                let arity = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
+                    ordinary_calls::wrong_arity, usize::from(body.arity)))?;
+                let options = OrdinaryLispEntryOptions {
+                    arity: usize::from(body.arity), arity_error_veneer: arity.as_ptr() as u64,
+                };
+                let emitted = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(&ir, options).ok()
+                    .or_else(|| {
+                        let flags = native_frames::flags()?;
+                        let cold = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(
+                            ordinary_calls::cold_call))?;
+                        let emitted = call_cells.iter().find_map(|(symbol, cell)| {
+                            egcl_compiler::t2::emit::emit_framed_ordinary_call(&ir, options,
+                                OrdinaryCallTarget { symbol: *symbol,
+                                    descriptor_slot: cell.ordinary_entry_address() as u64,
+                                    revision_address: cell.revision_address() as u64 },
+                                OrdinaryCallFlags { gc_requested: flags.gc_requested,
+                                    sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
+                                    native_errors: flags.native_errors, signal_epoch: flags.signal_epoch },
+                                cold.as_ptr() as u64).ok()
+                        })?;
+                        ordinary_cold = Some(cold);
+                        Some(emitted)
+                    })?;
+                let sites = SysvTransferTable::new(emitted.code.len(), Vec::new()).ok()?;
+                ordinary_arity = Some(arity);
+                Some((emitted, sites))
+            });
         // A shape not yet admitted by the native-frame emitter retains its
         // existing mapped execution and original recovery veneers.
-        let (emitted, sites) = native_frames.or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_and_poll_fast_path(
+        let (emitted, sites) = ordinary.or(native_frames).or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_and_poll_fast_path(
             ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -801,11 +878,14 @@ impl TransferCode {
             }
         }
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
+        if emitted.frame_entry.is_some_and(|offset| offset >= emitted.code.len()) {
+            return None;
+        }
         let mut code = JitBuffer::new(&emitted.code)?;
-        // A private native child receives its control pointer in RDI, so the
-        // managed argument recipe would describe unrelated memory there.
-        // Runtime stack capture uses the immutable native argument homes.
-        let arguments = native_debug::arguments(&body, emitted.native_recursive_entry.is_some());
+        // Native entries do not receive the managed slots pointer in RDI:
+        // private entries receive control; ordinary entries receive argument 1.
+        // Runtime stack capture uses their immutable native argument homes.
+        let arguments = native_debug::arguments(&body, emitted.native_recursive_entry.is_some() || emitted.ordinary_entry.is_some());
         let debug_info = code
             .install_debug_info_with_arguments(&body.name, arguments.as_ref())
             .ok()?;
@@ -833,6 +913,11 @@ impl TransferCode {
             code,
             code_info,
             code_len: emitted.code.len(),
+            frame_entry: emitted.frame_entry,
+            ordinary_entry: emitted.ordinary_entry,
+            ordinary_stack_required: emitted.ordinary_stack_required,
+            _ordinary_arity: ordinary_arity,
+            _ordinary_cold: ordinary_cold,
             _native_calls: Arc::new(emitted.native_calls?),
             has_deopt: emitted.has_deopt,
             bcp_offsets: emitted.bcp_offsets,
@@ -991,14 +1076,33 @@ impl TransferCode {
         // with the inherited scopes installed; deliver pending errors there,
         // through normal transfer handling, rather than skipping their cleanup.
         let _ordinary_segment = super::call_table::enter_ordinary_segment();
-        let outcome = unsafe {
-            native_transfer::invoke_native_segment(
-                self.code.as_ptr().add(osr_offset.unwrap_or(0)),
-                context.activation.cast(),
-                stack,
-            )
-        }
-        .map_err(|_| EgclError::Internal("native segment is unavailable".into()))?;
+        let outcome = if let Some(offset) = self.ordinary_entry {
+            assert!(osr_offset.is_none(), "ordinary entry is not an OSR destination");
+            let control = unsafe { native_frames::initialize() };
+            let execution = unsafe { &*(*control).execution };
+            // Keep the existing execution-specific emergency stack reserve.
+            // This additional margin covers the bounded Rust/root-shim adapter;
+            // generated child calls check their exact emitted stack bounds.
+            let sp: usize;
+            unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
+            let required = self.ordinary_stack_required.expect("ordinary stack admission bound")
+                .checked_add(4096).ok_or_else(invalid_capture)?;
+            if sp.checked_sub(required).is_none_or(|bottom| bottom as u64 <= unsafe { (*control).stack_limit }) {
+                return Err(EgclError::StackOverflow(egcl_rt::current_fiber_id()
+                    .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0))));
+            }
+            unsafe {
+                execution.with_active_native_control(std::pin::Pin::new_unchecked(&mut *control), || {
+                    native_transfer::invoke_ordinary_native_segment(
+                        self.code.as_ptr().add(offset), execution, NIL, &args, stack)
+                })
+            }.map(|returned| returned.outcome)
+        } else {
+            unsafe {
+                native_transfer::invoke_native_segment(
+                    self.code.as_ptr().add(osr_offset.unwrap_or(0)), context.activation.cast(), stack)
+            }
+        }.map_err(|_| EgclError::Internal("native segment is unavailable".into()))?;
         // No Lisp allocation between the machine return and rooting its value
         // or taking ownership of the execution-local error.
         egcl_rt::rooted!(primary = outcome.value);

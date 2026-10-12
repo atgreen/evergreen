@@ -73,6 +73,10 @@
 //! s390x have no transfer stubs yet and stay on the checked ABI.
 
 mod mapped_call;
+#[path = "native_transfer_ordinary.rs"]
+mod ordinary;
+pub use ordinary::{OrdinaryArityRequest, OrdinaryHelperOutcome, OrdinaryPublishedHelper, emit_ordinary_arity_veneer, emit_ordinary_published_veneer};
+
 pub use mapped_call::{
     ADAPTER_FRAME_BYTES, MappedCallRecord, PublishedCallEntry, emit_published_call_entry,
     emit_published_call_entry_descriptor, emit_published_call_veneer,

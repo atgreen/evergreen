@@ -186,7 +186,6 @@ pub(in crate::cli::bytecode) fn enter_ordinary_segment() -> OrdinarySegmentGuard
 /// # Safety
 /// `cell` identifies this execution's live CallCell; descriptor entry/range and
 /// ABI metadata must describe `code` and have passed installation validation.
-#[expect(dead_code, reason = "ordinary entry installation follows in bliss-t8a48")]
 pub(in crate::cli::bytecode) unsafe fn publish_ordinary(
     cell: u64,
     descriptor: OrdinaryEntryDescriptor,
