@@ -360,6 +360,164 @@ mod tests {
         assert!(native_transfer::current_segment().is_null());
     }
 
+    #[repr(C)]
+    struct SevenActualInvocation {
+        entry: *const u8,
+        execution: *const u8,
+        closure: EgclVal,
+        arguments: [EgclVal; 7],
+    }
+
+    // Test-only outer entry: the production ordinary adapter remains limited
+    // to four actuals. Four overflow words precede private anchor homes. The
+    // generic segment shim saves/restores all preserved registers and FP state.
+    #[unsafe(naked)]
+    unsafe extern "C" fn enter_seven_actuals() {
+        core::arch::naked_asm!(
+            "endbr64",
+            "sub rsp, 56",
+            "mov rax, [rdx + {sp}]", "mov [rsp + 32], rax",
+            "mov rax, [rdx + {landing}]", "mov [rsp + 40], rax",
+            "mov [rsp + 48], rdx",
+            "mov [rdx + {sp}], rsp",
+            "lea rax, [rip + 2f]", "mov [rdx + {landing}], rax",
+            "mov r10, rdi", "mov r11, [r10 + {entry}]",
+            "mov r13, [r10 + {execution}]",
+            "mov rax, [r10 + {args} + 24]", "mov [rsp], rax",
+            "mov rax, [r10 + {args} + 32]", "mov [rsp + 8], rax",
+            "mov rax, [r10 + {args} + 40]", "mov [rsp + 16], rax",
+            "mov rax, [r10 + {args} + 48]", "mov [rsp + 24], rax",
+            "mov rax, [r10 + {closure}]", "mov ecx, 7",
+            "mov rdi, [r10 + {args}]", "mov rsi, [r10 + {args} + 8]",
+            "mov rdx, [r10 + {args} + 16]", "call r11",
+            // Generic NativeSegment::return_pc requires exactly these two
+            // bytes between the CALL return address and its cold landing.
+            "xor edx, edx",
+            "2:", "endbr64",
+            // Only generated frames are discarded. Restore the original
+            // anchor and enter its existing epilogue with RAX/RDX intact.
+            "mov r10, [rsp + 48]", "mov r11, [rsp + 40]",
+            "mov rcx, [rsp + 32]",
+            "mov [r10 + {sp}], rcx", "mov [r10 + {landing}], r11",
+            "mov rsp, rcx", "jmp r11",
+            sp = const std::mem::offset_of!(native_transfer::NativeSegment, saved_sp),
+            landing = const std::mem::offset_of!(native_transfer::NativeSegment, landing_pc),
+            entry = const std::mem::offset_of!(SevenActualInvocation, entry),
+            execution = const std::mem::offset_of!(SevenActualInvocation, execution),
+            closure = const std::mem::offset_of!(SevenActualInvocation, closure),
+            args = const std::mem::offset_of!(SevenActualInvocation, arguments),
+        );
+    }
+
+    thread_local! {
+        static OVERFLOW_BEFORE: Cell<[u64; 8]> = const { Cell::new([0; 8]) };
+        static OVERFLOW_OBSERVED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe fn collect_seven_in_arity_helper(request: *mut OrdinaryArityRequest) {
+        assert_eq!(unsafe { (*request).nargs }, 7);
+        assert_eq!(unsafe { (*request).expected_arity }, 1);
+        let anchor = native_transfer::current_segment();
+        assert!(!anchor.is_null());
+        assert_eq!(unsafe { (*request).overflow_args } as usize, unsafe { (*anchor).saved_sp });
+        let before = OVERFLOW_BEFORE.with(Cell::get);
+        // Stress allocation may already age these objects into Survivor.
+        egcl_rt::HeapCollector::new().full_gc().unwrap();
+        let request = unsafe { &*request };
+        for (index, value) in request.register_args.iter()
+            .chain(unsafe { std::slice::from_raw_parts(request.overflow_args, 4) })
+            .chain(std::iter::once(&request.closure)).enumerate()
+        {
+            assert_ne!(value.to_raw(), before[index], "incoming home {index} must relocate");
+            assert_eq!(crate::cli::cp(*value), (EgclVal::from_fixnum(index as i64), NIL));
+        }
+        OVERFLOW_OBSERVED.with(|observed| observed.set(true));
+    }
+
+    #[test]
+    fn wrong_arity_seven_actual_machine_entry_relocates_all_incoming_homes() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(values = Vec::new());
+        for index in 0..8 {
+            values.push(crate::cli::arena_cons(EgclVal::from_fixnum(index), NIL));
+        }
+        OVERFLOW_BEFORE.with(|before| before.set(std::array::from_fn(|index| values[index].to_raw())));
+        OVERFLOW_OBSERVED.with(|moved| moved.set(false));
+        struct RestoreObserver(Option<unsafe fn(*mut OrdinaryArityRequest)>);
+        impl Drop for RestoreObserver {
+            fn drop(&mut self) {
+                ARITY_ROOTED_OBSERVER.with(|observe| observe.set(self.0));
+            }
+        }
+        let _observer = RestoreObserver(ARITY_ROOTED_OBSERVER.with(|observe| {
+            observe.replace(Some(collect_seven_in_arity_helper))
+        }));
+        let code = JitBuffer::new(
+            &egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(wrong_arity, 1),
+        )
+        .unwrap();
+        use egcl_compiler::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, ValueRepresentation,
+        };
+        let mut ir = Function::new("wrong-arity-seven-actuals");
+        let entry = ir.entry();
+        let arg = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        ir.set_terminator(
+            entry,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![arg],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+        let framed = egcl_compiler::t2::emit::emit_framed_ordinary_leaf(
+            &ir,
+            egcl_compiler::t2::emit::OrdinaryLispEntryOptions {
+                arity: 1,
+                arity_error_veneer: code.as_ptr() as u64,
+            },
+        )
+        .unwrap();
+        let leaf = JitBuffer::new(&framed.code).unwrap();
+        let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+        // These comparison roots keep the objects live even in the negative
+        // mutation; every incoming machine home must independently be repaired.
+        let mut request = SevenActualInvocation {
+            entry: unsafe { leaf.as_ptr().add(framed.ordinary_entry.unwrap()) },
+            execution: execution.cast(),
+            closure: values[7],
+            arguments: std::array::from_fn(|index| values[index]),
+        };
+        let result = unsafe {
+            native_transfer::invoke_native_segment(
+                enter_seven_actuals as *const u8,
+                std::ptr::from_mut(&mut request).cast(),
+                egcl_rt::current_stack(),
+            )
+        }
+        .unwrap();
+        assert_eq!(result.exit, NativeExit::Transfer);
+        let error = NATIVE_ERROR
+            .with(|slot| slot.take())
+            .expect("arity condition");
+        assert!(
+            matches!(error.without_backtrace(), EgclError::ProgramError(message)
+                if message == "wrong number of arguments: expected 1, got 7"),
+            "{error:?}"
+        );
+        assert!(OVERFLOW_OBSERVED.with(Cell::get));
+        assert!(native_transfer::current_segment().is_null());
+    }
+
     #[test]
     fn ordinary_cold_fallback_keeps_zero_one_and_many_values() {
         let _lock = crate::cli::heap_test_lock()
