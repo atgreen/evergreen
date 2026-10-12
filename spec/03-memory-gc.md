@@ -490,8 +490,8 @@ is a MAY for v2+.
 
 Mutator threads must reach a **safepoint** before GC can proceed. EGCL
 uses a polling-based safepoint mechanism (R3.14 — no asynchronous
-signal-based suspension). The mechanism uses a synchronous page-fault
-trap: the GC thread `mprotect`s a polling page, causing the mutator
+signal-based suspension). The target protected-page design uses a synchronous
+page-fault trap: the GC thread `mprotect`s a polling page, causing the mutator
 thread itself to fault into a handler that parks the thread. This is a
 self-initiated synchronous trap, not an externally-delivered async
 signal like `SIGUSR1`.
@@ -504,7 +504,7 @@ The compiler inserts safepoint polls at:
 - Loop back-edges (every iteration of `LOOP`, `DO`, `DOTIMES`, etc.).
 - Allocation slow paths (automatically, before requesting a new TLAB).
 
-A safepoint poll reads a single **safepoint page**:
+The target protected-page polling design reads a single **safepoint page**:
 
 ```rust
 // Inserted by JIT; compiles to one load instruction.
@@ -518,12 +518,30 @@ To trigger a safepoint, the GC thread `mprotect`s the safepoint page as
 the thread. This is one-instruction overhead on the fast path
 (no branch, no test).
 
+**Implementation status:** the current x86-64 mapped-T2 fast path checks runtime
+request and execution-control state in generated code. When those checks are
+idle, it skips the runtime call and root publication. A pending request takes
+the existing published veneer path, where exact-PC metadata describes the live
+roots. This is not yet the single trapping-load path above; the existence of the
+runtime safepoint page does not establish that generated T2 code polls it.
+The [generated-poll benchmark](../tests/benchmarks/generated-poll.md) describes
+how to verify the executed path and its cost.
+
 ### 3.9.2  Time-to-Safepoint Guarantee
 
 Because polls exist at every back-edge and function entry, the maximum
 time-to-safepoint is bounded by the longest straight-line code between
 polls. The compiler MUST ensure no basic-block sequence between two
 safepoint polls exceeds an estimated 100 µs of execution (R3.14).
+
+Poll placement alone does not establish that estimate or a wall-clock upper
+bound: instruction cost, runtime slow paths, and OS scheduling also matter.
+Selected non-x86 T2 backward-edge poll sites now execute on every traversal
+rather than once per 256 traversals. QEMU execution validates this cadence and
+root handling, not native latency.
+R3.14 remains an outstanding validation obligation tracked by `bliss-vpb8u`.
+Request-to-published-poll observations, complete stop-the-world rendezvous time,
+and collection duration are distinct measurements and need separate evidence.
 
 ### 3.9.3  Safepoint State
 
