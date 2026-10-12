@@ -10,6 +10,8 @@ struct Probe {
     osr: Option<OsrRoute>,
     observed: bool,
     moved: usize,
+    ordinary_owner: Option<usize>,
+    ordinary_entries: usize,
 }
 thread_local! { static PROBE: Cell<*mut Probe> = const { Cell::new(std::ptr::null_mut()) }; }
 
@@ -128,6 +130,10 @@ fn compile(name: &str, params: &str, forms: &str, env: &Env) -> Arc<BytecodeFunc
 }
 
 fn install(name: &str, params: &str, forms: &str, env: &mut Env) {
+    install_with_protocol(name, params, forms, env, false);
+}
+
+fn install_with_protocol(name: &str, params: &str, forms: &str, env: &mut Env, mapped: bool) {
     crate::cli::read_eval_all_env(
         &format!("(defun {name} {params} {})", &forms[1..forms.len() - 1]),
         env,
@@ -136,7 +142,14 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) {
     let body = compile(name, params, forms, env);
     let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
     registry_put(symbol, Arc::clone(&body));
-    let installed = install_baseline(symbol, Arc::clone(&body)).unwrap_or_else(|| {
+    let installed = if mapped {
+        // Keep explicit coverage of the remaining mapped child protocol.
+        let code = TransferCode::compile_mapped_for_test(Arc::clone(&body)).unwrap();
+        assert!(code.ordinary_entry.is_none() && code.mapped_entry().is_some());
+        install_baseline_code(symbol, code)
+    } else {
+        install_baseline(symbol, Arc::clone(&body))
+    }.unwrap_or_else(|| {
         panic!(
             "{name}: matrix callee must be mapped native code: {:?}",
             body.code
@@ -158,11 +171,30 @@ fn install_collector(env: &mut Env) {
     );
 }
 
+fn observe_ordinary_producer_entry() {
+    let probe = unsafe { &mut *PROBE.with(Cell::get) };
+    let context = CAPTURE.with(Cell::get);
+    assert!(!context.is_null(), "ordinary producer has a retained context");
+    assert_eq!(Some(unsafe { (*context).owner } as usize), probe.ordinary_owner,
+        "the measured ordinary entry must belong to the installed producer");
+    probe.ordinary_entries += 1;
+}
+
 fn run_probe(
     code: &TransferCode,
     env: &mut Env,
     markers: &'static [i64],
+    osr: Option<OsrRoute>,
+) -> EgclVal {
+    run_probe_with_ordinary_owner(code, env, markers, osr, None)
+}
+
+fn run_probe_with_ordinary_owner(
+    code: &TransferCode,
+    env: &mut Env,
+    markers: &'static [i64],
     mut osr: Option<OsrRoute>,
+    ordinary_owner: Option<usize>,
 ) -> EgclVal {
     code.run(&[], env).unwrap();
     env.mv.clear();
@@ -178,13 +210,27 @@ fn run_probe(
         osr,
         observed: false,
         moved: 0,
+        ordinary_owner,
+        ordinary_entries: 0,
     };
     PROBE.with(|slot| slot.set(&mut probe));
     let previous = OBSERVE.with(|slot| slot.replace(Some(observe)));
-    let result = code.run(&[], env);
+    if ordinary_owner.is_some() { take_native_fallback_count(); }
+    // Install after warmup so only the measured invocation can satisfy it.
+    let result = if ordinary_owner.is_some() {
+        with_ordinary_entry_hook_for_test(observe_ordinary_producer_entry,
+            || code.run(&[], env))
+    } else {
+        code.run(&[], env)
+    };
     OBSERVE.with(|slot| slot.set(previous));
     PROBE.with(|slot| slot.set(std::ptr::null_mut()));
     let value = result.unwrap();
+    if ordinary_owner.is_some() {
+        assert_eq!(take_native_fallback_count(), 0, "measured native owners must not fall back");
+        assert_eq!(probe.ordinary_entries, 1,
+            "the measured producer must execute its ordinary native entry");
+    }
     assert!(
         probe.observed,
         "the required native/OSR route must reach the observer"
@@ -237,11 +283,12 @@ fn native_private_root_survives_short_and_wide_calls() {
             36,
         ),
     ] {
-        install(
+        install_with_protocol(
             name,
             params,
             &format!("((publication-matrix-collect) {sum})"),
             &mut env,
+            true,
         );
         let body = compile(
             "PUBLICATION-MATRIX-CALLER",
@@ -283,6 +330,28 @@ fn native_returned_primary_moves_after_becoming_a_caller_private_root() {
         "((cons 314159 nil))",
         &mut env,
     );
+    // The producer now uses ordinary entry, while the lexical-loop collector
+    // retains a mapped child activation. Check both owners explicitly: the
+    // nested-entry counter records only the latter physical protocol.
+    let mut ordinary_producer = None;
+    for (name, ordinary) in [
+        ("PUBLICATION-MATRIX-PRIMARY", true),
+        ("PUBLICATION-MATRIX-COLLECT", false),
+    ] {
+        let symbol = crate::cli::resolve_sym(name).unwrap().as_symbol_index();
+        NATIVE_REGISTRY.with(|registry| {
+            let registry = registry.borrow();
+            let installed = registry.get(&symbol).expect("installed matrix callee");
+            let NativeCodeStorage::Mapped(owner) = &installed._storage else {
+                panic!("{name}: expected native transfer owner");
+            };
+            if ordinary {
+                ordinary_producer = Some(std::ptr::from_ref(owner.as_ref()) as usize);
+            }
+            assert_eq!(owner.ordinary_entry.is_some(), ordinary, "{name}");
+            assert_eq!(owner.mapped_entry().is_some(), !ordinary, "{name}");
+        });
+    }
     let code = TransferCode::compile_nested_protected(compile(
         "PUBLICATION-MATRIX-RETURNS",
         "()",
@@ -290,12 +359,13 @@ fn native_returned_primary_moves_after_becoming_a_caller_private_root() {
         &env,
     ))
     .expect("returned primary must stay in native code");
-    let value = run_probe(&code, &mut env, &[314159], None);
+    let value = run_probe_with_ordinary_owner(&code, &mut env, &[314159], None,
+        Some(ordinary_producer.expect("installed ordinary producer owner")));
     assert_eq!(crate::cli::cp(value), (EgclVal::from_fixnum(314159), NIL));
     assert_eq!(
         take_nested_entries(),
-        2,
-        "measured producer and collector must both run natively"
+        1,
+        "the collector alone enters a mapped child; the producer uses ordinary entry"
     );
 }
 

@@ -1,7 +1,7 @@
 # Default to the fully static musl target so `cargo build`/`cargo run`/`cargo test`
 # produce a statically linked egcl by default (bliss-bca.5). Output lands in
-# target/x86_64-unknown-linux-musl/. The runtime uses direct syscalls and needs
-# no libc; the musl target statically links what std requires.
+# target/x86_64-unknown-linux-musl/. OS services use direct syscalls and static
+# musl pthread wrappers for thread stack bounds; no dynamic loader is needed.
 #
 # Requires the target once per machine:  rustup target add x86_64-unknown-linux-musl
 # For a dynamic glibc build (e.g. to enable the C-ABI FFI):

@@ -7,9 +7,13 @@ use std::process::Command;
 fn public_snapshots_preserve_names_values_and_bounds_across_tiers() {
     for tier in ["interp", "t0", "t1", "t2"] {
         let program = r#"
+          ;; Keep both frames live: tail callers may legitimately disappear.
+          (defvar *snapshot-after* nil)
           (defun snapshot-leaf (value)
-            (egcl-debug:list-backtrace :count 64))
-          (defun snapshot-parent (value) (snapshot-leaf value))
+            (prog1 (egcl-debug:list-backtrace :count 64)
+              (setq *snapshot-after* value)))
+          (defun snapshot-parent (value)
+            (prog1 (snapshot-leaf value) (setq *snapshot-after* value)))
           (defun snapshot-range-inner (count start)
             (mapcar (lambda (frame) (getf frame :function))
                     (egcl-debug:list-backtrace :count count :start start)))
@@ -31,7 +35,7 @@ fn public_snapshots_preserve_names_values_and_bounds_across_tiers() {
               (assert (eq value (first (getf leaf :arguments)))))
             (when (member (egcl-ext:getenv "EGCL_FORCE_TIER") '("interp" "t0") :test #'equal)
               (assert (getf leaf :arguments-available-p)))
-            (assert (member (getf leaf :origin) '(:interpreted :managed)))
+            (assert (member (getf leaf :origin) '(:interpreted :managed :native)))
             (dotimes (i 1000) (list i i i))
             (when (getf leaf :arguments-available-p)
               (assert (equal '("retained argument" 42) (first (getf leaf :arguments))))))

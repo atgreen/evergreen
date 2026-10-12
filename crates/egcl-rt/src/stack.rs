@@ -867,11 +867,11 @@ pub fn native_stack_limit_addr() -> u64 {
 /// A fiber owns a separate downward-growing stack, even after carrier migration.
 /// Preserve the existing 128 KiB host-stack headroom for cleanup and signalling;
 /// the CLI carrier's absolute address is unrelated to this reservation. Native
-/// threads retain the configured process-wide carrier limit (including zero
-/// when uninitialized); obtaining each native thread's actual OS stack bounds
-/// remains a separate limitation. Fiber bounds never depend on CLI setup.
+/// Linux native threads use their own OS stack reservation, cached on that
+/// carrier. Other native targets retain the configured carrier limit. Fiber
+/// bounds never depend on CLI setup.
 ///
-/// This does not allocate, yield, or modify the process-wide setting. A caller
+/// This does not allocate Lisp objects, yield, or modify the process-wide setting. A caller
 /// may retain the result while its execution remains alive: migrating a fiber
 /// changes its carrier, not its native stack allocation.
 pub fn current_native_stack_limit() -> u64 {
@@ -879,7 +879,113 @@ pub fn current_native_stack_limit() -> u64 {
         .and_then(|fiber| fiber.native_stack_bounds()) {
         return low.saturating_add(128 * 1024).min(high) as u64;
     }
-    NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire)
+    #[cfg(target_os = "linux")]
+    {
+        // OS-thread local, deliberately not ExecutionLocal: a mounted fiber
+        // has its own reservation and is handled before consulting this cache.
+        thread_local! {
+            static LIMIT: u64 = linux_native_stack_limit().unwrap_or(u64::MAX);
+        }
+        LIMIT.with(|limit| *limit)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_native_stack_limit() -> Option<u64> {
+    let mut attributes = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+    // Query this carrier, never the thread that constructed its Lisp object.
+    if unsafe { libc::pthread_getattr_np(libc::pthread_self(), attributes.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let mut attributes = unsafe { attributes.assume_init() };
+    let mut base = std::ptr::null_mut();
+    let mut size = 0;
+    let result = unsafe { libc::pthread_attr_getstack(&attributes, &mut base, &mut size) };
+    unsafe { libc::pthread_attr_destroy(&mut attributes) };
+    if result != 0 || base.is_null() || size == 0 {
+        return None;
+    }
+    let low = base as usize;
+    let high = low.checked_add(size)?;
+    let probe = &attributes as *const _ as usize;
+    if !(low..high).contains(&probe) {
+        return None;
+    }
+    if unsafe { libc::syscall(libc::SYS_gettid) == libc::getpid() as libc::c_long } {
+        // musl reports only the main stack's currently mapped pages. Unlike a
+        // pthread reservation, this mapping grows down to RLIMIT_STACK.
+        let limit = crate::syscall::getrlimit(crate::syscall::RLIMIT_STACK).ok()?.rlim_cur;
+        let configured = NATIVE_STACK_LIMIT.load(std::sync::atomic::Ordering::Acquire);
+        if limit == crate::syscall::RLIM_INFINITY {
+            return main_native_stack_limit(probe, high, limit, configured);
+        }
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        let high = maps.lines().find_map(|line| {
+            let range = line.split_whitespace().next()?;
+            let (start, end) = range.split_once('-')?;
+            let start = usize::from_str_radix(start, 16).ok()?;
+            let end = usize::from_str_radix(end, 16).ok()?;
+            (start <= probe && probe < end).then_some(end)
+        })?;
+        return main_native_stack_limit(probe, high, limit, configured);
+    }
+    // Failure to obtain trustworthy bounds fails admission closed above.
+    Some(low.saturating_add(128 * 1024).min(high) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn main_native_stack_limit(probe: usize, high: usize, soft_limit: u64, configured: u64) -> Option<u64> {
+    if soft_limit == crate::syscall::RLIM_INFINITY {
+        // An unlimited grow-down stack has no finite OS lower bound. Preserve
+        // the CLI's deliberate main-thread cap; without one, fail closed.
+        return (configured != 0 && configured < probe as u64).then_some(configured);
+    }
+    let low = high.checked_sub(usize::try_from(soft_limit).ok()?)?;
+    Some(low.saturating_add(128 * 1024).min(high) as u64)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod native_stack_limit_tests {
+    #[test]
+    fn main_stack_reservation_uses_rlimit_not_current_mapping_size() {
+        let high = 32 * 1024 * 1024;
+        let probe = high - 4096;
+        let limit = super::main_native_stack_limit(probe, high, 8 * 1024 * 1024, 0).unwrap();
+        assert_eq!(limit, (high - 8 * 1024 * 1024 + 128 * 1024) as u64);
+        assert!(limit < (high - 128 * 1024) as u64, "grow below initial musl mapping");
+        assert!(limit < probe as u64);
+    }
+
+    #[test]
+    fn unlimited_main_stack_requires_a_valid_configured_cap() {
+        let unlimited = crate::syscall::RLIM_INFINITY;
+        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 500), Some(500));
+        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 0), None);
+        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 1000), None);
+        assert_eq!(super::main_native_stack_limit(1000, 1100, unlimited, 1200), None);
+    }
+
+    #[test]
+    fn worker_limits_belong_to_their_actual_stack_reservations() {
+        let workers: Vec<_> = [512 * 1024, 2 * 1024 * 1024].into_iter().map(|size| {
+            std::thread::Builder::new().stack_size(size).spawn(move || {
+                let local = 0u64;
+                let probe = &local as *const _ as u64;
+                let limit = super::current_native_stack_limit();
+                assert!(limit < probe, "fresh worker must have native call headroom");
+                assert!(probe - limit < size as u64,
+                    "limit must belong to this worker, not the main stack");
+                assert_eq!(limit, super::current_native_stack_limit(), "cached bounds are stable");
+            }).unwrap()
+        }).collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
 }
 
 /// Publish the limit. `reserve_bytes` is how much of the stack below the current

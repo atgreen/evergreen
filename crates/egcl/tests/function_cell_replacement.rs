@@ -30,11 +30,10 @@ fn t2_named_call_uses_current_published_target() {
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("PUBLISHED-CALL-REBIND-OK"), "{stdout}");
     if cfg!(target_os = "linux") {
-        // The installed mapped body calls a per-target veneer; the published
-        // slot load is in that veneer, outside DISASSEMBLE's body bytes.
-        // native_mapped_call::caller_loads_the_current_published_entry_for_each_argument_shape
-        // executes the veneer against changed register and slice entry slots.
-        assert!(stdout.contains("Mapped native transfer ABI"), "{stdout}");
+        // This supported tagged caller uses the ordinary descriptor-selected
+        // entry. The Lisp assertions above exercise replacement and unbinding
+        // through that installed caller without losing its T2 tier.
+        assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
         assert!(!stdout.contains("Legacy checked ABI"), "{stdout}");
         assert!(stdout.contains("+0000:"), "{stdout}");
     } else {
@@ -333,23 +332,25 @@ fn native_slot_callee_preserves_values_after_numeric_phase_changes() {
             (dotimes (i 30)
               (assert (= (phase-slot-caller value) (* value 5))))
             (format t "PHASE ~S ~D ~D~%" value (egcl-ext:function-tier 'phase-slot-leaf) (egcl-ext:function-tier 'phase-slot-caller))
-            (assert (= PHASE-TIER (egcl-ext:function-tier 'phase-slot-leaf)))
+            (assert (= 2 (egcl-ext:function-tier 'phase-slot-leaf)))
             (assert (= 2 (egcl-ext:function-tier 'phase-slot-caller))))
+          (disassemble 'phase-slot-leaf)
+          (disassemble 'phase-slot-caller)
           (format t "NATIVE-SLOT-PHASE-OK~%")
         "#;
-    // Float re-specialization is not yet admitted by the mapped emitter. The
-    // failed optimized replacement retains a generic mapped baseline leaf;
-    // the caller continues through its existing published T2 entry.
-    let phase_tier = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { "1" } else { "2" };
-    let program = program.replace("PHASE-TIER", phase_tier);
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", &program])
+        .args(["--no-init", "--eval", program])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
         .output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     assert!(stdout.contains("NATIVE-SLOT-PHASE-OK"));
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(stdout.matches("Ordinary x86-64 Lisp ABI").count(), 2,
+            "both phase-adapted leaf and caller must retain ordinary T2 entry: {stdout}");
+        assert!(!stdout.contains("Mapped native transfer ABI"), "{stdout}");
+    }
 }
 
 #[test]
