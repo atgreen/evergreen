@@ -24,7 +24,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         ));
         None
     };
-    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true) {
+    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true, false) {
         return decline("unsupported parameter or control-scope shape");
     }
     // Transfer capture currently reconstructs one logical frame. In particular,
@@ -36,13 +36,22 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     {
         return decline("multi-frame reconstruction not admitted");
     }
-    if (0..optimized.num_values())
-        .any(|index| optimized.value(Value(index as u32)).repr != ValueRepresentation::Tagged)
+    let has_raw = (0..optimized.num_values())
+        .any(|index| optimized.value(Value(index as u32)).repr != ValueRepresentation::Tagged);
+    if has_raw && (!packed_f64_native_body(&input.body, optimized)
+        || (0..optimized.num_values()).any(|index| !matches!(
+            optimized.value(Value(index as u32)).repr,
+            ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64)))
     {
-        return decline("unboxed native value map not admitted");
+        return decline("unsupported raw representation or control scope");
     }
     let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&input.body).ok()?;
     let mut mapped = optimized.clone();
+    if has_raw {
+        // Only this full-entry clone has raw homes. The worker retains its
+        // tagged artifact and T1 OSR path; raw imports require separate recipes.
+        mapped.osr_entries.clear();
+    }
     egcl_compiler::t2::build::legalize_transfer_calls(&mut mapped, &scopes).ok()?;
     egcl_compiler::t2::verify::verify(&mapped).ok()?;
     Some(PreparedT2 {
@@ -128,8 +137,11 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
             .flat_map(|&block| prepared.ir.block(block).insts.iter())
             .filter(|&&inst| prepared.ir.inst(inst).opcode == egcl_compiler::t2::ir::Opcode::ClearMv)
             .count();
+        let raw_f64_values = (0..prepared.ir.num_values()).filter(|&index|
+            prepared.ir.value(Value(index as u32)).repr == ValueRepresentation::UnboxedF64
+        ).count();
         t2_log_write(format_args!(
-            "{}: mapped T2 emitted; clear_mv_resets={clear_mv_resets}",
+            "{}: mapped T2 emitted; clear_mv_resets={clear_mv_resets}, raw_f64_values={raw_f64_values}",
             display_fn_name(&body.name)
         ));
     }

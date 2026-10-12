@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compile eligible simple `DOUBLE-FLOAT` array expressions with native unboxed
+  loads, stores, addition, and multiplication on Linux x86-64, with rooted array
+  bases and boxed recovery when guards fail
+  ([#290](https://github.com/atgreen/evergreen/pull/290)).
 - Resume bounded Linux x86-64 T2 ordinary native guard failures without replaying
   completed calls, preserving older callers' roots and the original callable
   across redefinition ([#292](https://github.com/atgreen/evergreen/pull/292)).

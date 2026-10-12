@@ -266,6 +266,10 @@ pub enum Opcode {
     Car,
     Cdr,
     VecRef,
+    /// Guarded simple packed-double load: tagged array/index -> raw F64.
+    PackedF64Ref,
+    /// Guarded simple packed-double store: tagged array/index, raw F64; no result.
+    PackedF64Set,
     SymbolValue,
     /// `#'f` for a global function name — a RUNTIME load of the symbol's
     /// function cell, not a constant: the function may be redefined between

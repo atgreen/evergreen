@@ -22757,6 +22757,17 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             return None;
         }
     };
+    // Preserve the tagged artifact, including its OSR imports. Closed packed
+    // expressions need the original calls before numeric speculation replaces
+    // cold arithmetic with fixnum guesses. Only mapped full-entry code admits
+    // the separate raw representation candidate.
+    let mut packed = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        let mut candidate = f.clone();
+        (egcl_compiler::t2::packed_f64::specialize(&mut candidate) != 0).then_some(candidate)
+    } else { None };
+    if let Some(candidate) = &mut packed {
+        egcl_compiler::t2::speculate::speculate(candidate, &profile);
+    }
     let speculated = egcl_compiler::t2::speculate::speculate(&mut f, &profile);
     let speculations = t2_numeric_speculations(&f, sym);
     // Speculation is an ENHANCEMENT, not the admission test for T2. Even with no
@@ -22780,7 +22791,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // separate callees collapse to one dominating guard.
     // Each pass preserves well-formedness (spec §4.10 R4.60); re-verify before
     // emitting, and decline T2 (fall back to T1) if anything went wrong.
-    {
+    for function in std::iter::once(&mut f).chain(packed.iter_mut()) {
         use egcl_compiler::t2::pass::PassManager;
         let mut pm = PassManager::new();
         pm.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
@@ -22788,7 +22799,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         pm.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
         pm.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
         pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
-        pm.run(&mut f);
+        pm.run(function);
     }
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
@@ -22796,7 +22807,13 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let mapped = native_transfer_entry::prepare_ordinary_t2(input, &f);
+    let (mapped, speculations) = match packed.as_ref().and_then(|candidate| {
+        native_transfer_entry::prepare_ordinary_t2(input, candidate)
+            .map(|prepared| (prepared, t2_numeric_speculations(candidate, sym)))
+    }) {
+        Some((prepared, speculations)) => (Some(prepared), speculations),
+        None => (native_transfer_entry::prepare_ordinary_t2(input, &f), speculations),
+    };
 
     // Linux publishes only mapped code. Do not make a usable mapped worker
     // artifact depend on an emitter for a calling convention we cannot install.
@@ -22830,12 +22847,14 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // from its optimized IR, independently of checked emission. Include the
     // checked emitter's reported slots as well when it is the selected ABI.
     if has_mapped {
-        for &block in f.block_order() {
-            for &instruction in &f.block(block).insts {
-                if let egcl_compiler::t2::ir::AuxData::HeapLiteral { slot } =
-                    &f.inst(instruction).aux
-                {
-                    heap_constant_slots.push(*slot);
+        for function in std::iter::once(&f).chain(packed.iter()) {
+            for &block in function.block_order() {
+                for &instruction in &function.block(block).insts {
+                    if let egcl_compiler::t2::ir::AuxData::HeapLiteral { slot } =
+                        &function.inst(instruction).aux
+                    {
+                        heap_constant_slots.push(*slot);
+                    }
                 }
             }
         }

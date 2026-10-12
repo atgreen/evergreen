@@ -577,6 +577,27 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     ));
                 }
 
+                if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+                    use crate::t2::ir::{TypeBits, ValueRepresentation as Repr};
+                    let load = data.opcode == Opcode::PackedF64Ref;
+                    let valid = data.args.iter().chain(&data.results)
+                        .all(|value| valid_values.contains(&value.0));
+                    let shape = data.args.len() == (if load { 2 } else { 3 })
+                        && data.results.len() == usize::from(load);
+                    let raw_double = |value| f.value(value).repr == Repr::UnboxedF64
+                        && f.value(value).ty.bits == TypeBits::DOUBLE_FLOAT;
+                    if !valid || !shape || !data.flags.guard || !data.flags.effectful
+                        || data.flags.call || data.flags.safepoint || data.flags.terminator
+                        || data.frame_state.is_none() || !matches!(data.aux, AuxData::None)
+                        || (valid && shape && (data.args[..2].iter().any(|&value|
+                            f.value(value).repr != Repr::Tagged)
+                            || !raw_double(if load { data.results[0] } else { data.args[2] })))
+                    {
+                        errors.push(VerifyError::new("V8 packed-f64-contract",
+                            format!("block{bi} {:?} requires tagged array/index, raw double and ordered recovery", data.opcode)));
+                    }
+                }
+
                 // V8 — guard/FrameState well-formedness.
                 if data.flags.guard || matches!(data.opcode, Opcode::Invoke | Opcode::NlxTransfer) {
                     match data.frame_state {

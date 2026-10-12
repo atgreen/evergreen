@@ -65,7 +65,8 @@ pub(in crate::cli::bytecode) fn install(name: &str, params: &str, forms: &str, e
     egcl_rt::rooted!(params = reader::read_from_string(params).unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let symbol = egcl_rt::symbols::intern(name);
-    let body = Arc::new(compile_function(name, *params, *forms, env, false, false).unwrap());
+    let body = Arc::new(compile_function(name, *params, *forms, env, false, false)
+        .unwrap_or_else(|| panic!("{name}: fixture bytecode compilation failed: {:?}", last_bail_reason())));
     install_body(symbol, body)
 }
 
