@@ -62,7 +62,20 @@ unsafe extern "C" fn rejected() {
     core::arch::naked_asm!("mov rax, -8", "clc", "ret");
 }
 unsafe extern "C" fn clear_mv(_primary: u64, _destination: *mut u64, _count: usize) -> u64 {
+    CLEAR_MV_CALLS.with(|calls| calls.set(calls.get() + 1));
     0
+}
+thread_local! {
+    static CLEAR_MV_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn recursive_single_values_do_not_call_the_mv_clear_helper() {
+    CLEAR_MV_CALLS.with(|calls| calls.set(0));
+    execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0], 144 * 8,
+        0, None, true);
+    assert_eq!(CLEAR_MV_CALLS.with(std::cell::Cell::get), 0,
+        "inactive recursive results require no runtime MV reset");
 }
 fn instruction(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
     InstData {

@@ -16748,6 +16748,11 @@ impl Drop for ActiveNativeCode<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static MV_CLEAR_HELPER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// c2i adapter: call the interpreted function named by `sym` with `n` arguments
 /// (SysV registers), returning the result's raw bits. Also the arithmetic
 /// slow path — native code jumps here on fixnum overflow so bignum promotion
@@ -16758,6 +16763,8 @@ impl Drop for ActiveNativeCode<'_> {
 /// stored the primary of a multiple-valued call would leak the extra values to
 /// its caller.
 extern "C" fn c2i_clear_mv() {
+    #[cfg(test)]
+    MV_CLEAR_HELPER_CALLS.with(|calls| calls.set(calls.get() + 1));
     let env_ptr = NATIVE_ENV.with(|e| e.get());
     if env_ptr.is_null() {
         return;

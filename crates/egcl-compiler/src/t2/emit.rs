@@ -3567,6 +3567,8 @@ pub struct NativeRecursiveControl {
     pub depth: *mut u32,
     /// Reserved to keep the native control layout stable.
     pub reserved_counter: u64,
+    /// The current native Env's MV flag. At generated-code boundaries, false
+    /// guarantees an empty buffer, including release of all secondary roots.
     pub mv_active: *const bool,
     pub expected_generation: u64,
     pub seen_carrier: u64,
@@ -6334,6 +6336,19 @@ fn emit_framed_inner(
                     transfer_check,
                 )?);
             } else if d.opcode == Opcode::ClearMv {
+                let cleared = a.label();
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                if ordinary_call.is_some() {
+                    // Env maintains inactive => empty. Read the execution-owned
+                    // flag directly instead of entering the runtime to clear an
+                    // already empty tuple. Active zero/one/many tuples still
+                    // take the helper, including those returned by cold calls.
+                    load_home(&mut a, RAX, native_control_home.unwrap(), 0);
+                    load_mem64_disp(&mut a, RAX, RAX,
+                        std::mem::offset_of!(NativeRecursiveControl, mv_active) as i32);
+                    a.extend_from_slice(&[0x80, 0x38, 0x00]); // cmp byte [rax], 0
+                    a.jcc(Cc::E, cleared);
+                }
                 // A zero count selects the clear operation in the shared T2 MV
                 // helper. Initialise every argument because the same ABI also
                 // serves TakeValuesToLocals.
@@ -6350,6 +6365,7 @@ fn emit_framed_inner(
                 {
                     emit_runtime_helper_call(&mut a, c2i_recovery_toggle_addr, transfer_check);
                 }
+                a.bind(cleared);
             } else if d.opcode == Opcode::TakeValuesToLocals {
                 let (nvars, slot_base) = match d.aux {
                     AuxData::ValuesLocals { nvars, slot_base } => (nvars, slot_base),
