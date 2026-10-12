@@ -152,7 +152,7 @@ pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
 #[path = "ordinary_call.rs"]
 mod ordinary_call;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use ordinary_call::{emit_framed_ordinary_call, OrdinaryCallTarget, OrdinaryCallFlags, OrdinaryColdRequest};
+pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call, OrdinaryCallTarget, OrdinaryCallFlags, OrdinaryColdRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "frame_tests.rs"]
@@ -5756,7 +5756,8 @@ fn emit_framed_inner(
             if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().emit(&mut a, &d, &homes, &const_tagged,
-                    outgoing_area, native_control_home.unwrap())?; }
+                    ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
+                        control_home: native_control_home.unwrap(), emit_epilogue: &emit_epilogue })?; }
             } else if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = *inst_reg
