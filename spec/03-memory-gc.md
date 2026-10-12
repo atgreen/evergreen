@@ -543,6 +543,27 @@ R3.14 remains an outstanding validation obligation tracked by `bliss-vpb8u`.
 Request-to-published-poll observations, complete stop-the-world rendezvous time,
 and collection duration are distinct measurements and need separate evidence.
 
+The current validation coverage is:
+
+| T2 backend | Executed polling evidence | Native timing evidence still needed |
+| --- | --- | --- |
+| x86-64 | Generated idle checks and published slow path; instrumented process-epoch request/acknowledgment fixture | Representative poll-free sequences, uninstrumented runtime measurements, and full rendezvous timing |
+| AArch64 | Selected backward-edge cadence and root handling under QEMU | Native execution and timing on AArch64 hardware |
+| ppc64le | Selected backward-edge cadence and root handling under QEMU | Native execution and timing on POWER hardware |
+| s390x | Selected backward-edge cadence and root handling under QEMU | Native execution and timing on IBM Z hardware |
+| riscv64 | Selected backward-edge cadence and root handling under QEMU | Native execution and timing on RISC-V hardware |
+
+Closing this validation gap requires identifying the emitted sequences between
+polls, including paths through calls and slow helpers, and recording the target
+CPU and cost assumptions behind their execution-time estimates. Dynamic evidence
+also needs the source and binary identity, native execution environment, workload,
+sample count, request/completion accounting, and latency distribution. A missed
+request or timed-out run cannot be discarded from that accounting. Low observed
+latency on one workload does not establish the estimate for other sequences, and
+QEMU timings cannot substitute for native hardware measurements. The current
+cross-platform CI runs emulated targets; its passing tests establish functional
+behavior only.
+
 ### 3.9.3  Safepoint State
 
 At a safepoint, each thread's state is fully walkable:
