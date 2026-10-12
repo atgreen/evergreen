@@ -6,7 +6,7 @@
 //! Structured identically to [`super::emit_s390x`], whose module
 //! documentation describes the activation contract, the home-based emission
 //! strategy over regalloc2's ranges, root synchronisation at runtime calls,
-//! sampled back-edge polls, OSR prologues and deopt exits. Only the
+//! back-edge polls, OSR prologues and deopt exits. Only the
 //! architecture differs:
 //!
 //! | role                                          | register         |
@@ -28,8 +28,7 @@
 //! then saves ra, s1 and s2–s11 in the top 96 bytes. Below them, from `sp`
 //! upwards: spill slots (regalloc2's plus the stable homes added for split
 //! values), the edge parallel-copy buffer, the deopt serialisation buffer,
-//! the remat buffer, and two words holding the saved call result and the
-//! poll countdown. Displacements beyond 12 bits go through the assembler's
+//! the remat buffer, and a word holding the saved call result. Displacements beyond 12 bits go through the assembler's
 //! `t6`, so an oversized frame costs instructions, not a decline.
 //!
 //! # Arithmetic
@@ -112,7 +111,6 @@ struct Emitter<'a> {
     roots: HashMap<Inst, Vec<Value>>,
     root_sites: Vec<RootSyncSite>,
     result_offset: i32,
-    poll_offset: i32,
     polls: HashSet<Inst>,
     transfer_exit: Option<Label>,
 }
@@ -277,8 +275,6 @@ impl Emitter<'_> {
                 .store(register, SP, self.frame_bytes + 8 * index as i32);
         }
         self.asm.mov(SLOTS, A0);
-        self.asm.imm64(A1, 256);
-        self.asm.store(A1, SP, self.poll_offset);
     }
 
     fn epilogue(&mut self) {
@@ -404,15 +400,9 @@ impl Emitter<'_> {
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
         if self.polls.contains(&instruction) {
-            let skip = self.asm.label();
-            self.asm.load(A0, SP, self.poll_offset);
-            self.asm.add_imm(A0, A0, -1);
-            self.asm.store(A0, SP, self.poll_offset);
-            self.asm.branch(Cond::Ne, A0, ZERO, skip);
-            self.asm.imm64(A0, 256);
-            self.asm.store(A0, SP, self.poll_offset);
+            // Every selected backward-edge terminator reaches the existing
+            // root-synchronizing poll before its edge moves.
             self.runtime_call(instruction, None)?;
-            self.asm.bind(skip);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -717,7 +707,7 @@ pub fn emit_framed(
 /// Emit optimized riscv64 code with native roots synchronized through extra
 /// activation slots at runtime calls. Precise guard exits serialize virtual
 /// scopes for the T0 adapter, which must root the stream before allocating.
-/// Every cycle crosses a sampled GC/signal poll before its edge transfers.
+/// Every cycle crosses a GC/signal poll before its edge transfers.
 pub fn emit_framed_with_runtime(
     function: &Function,
     deopt_t2: u64,
@@ -767,7 +757,6 @@ pub fn emit_framed_with_runtime(
         roots: HashMap::new(),
         root_sites: Vec::new(),
         result_offset: 0,
-        poll_offset: 0,
         polls,
         transfer_exit: None,
     };
@@ -939,9 +928,9 @@ pub fn emit_framed_with_runtime(
         .map(|(_, state)| state.remat.len())
         .max()
         .unwrap_or(0);
-    // Two words for the saved call result and the poll countdown, then round
+    // One word for the saved call result, then round
     // to keep sp 16-byte aligned (the save area is 96 bytes, itself aligned).
-    let frame_words = (spill_slots as usize + edge_words + deopt_words + remat_words + 2 + 1) & !1;
+    let frame_words = (spill_slots as usize + edge_words + deopt_words + remat_words + 1 + 1) & !1;
     // Every displacement must fit the assembler's 32-bit wide-offset path.
     if frame_words > (i32::MAX as usize - SAVE_BYTES as usize) / 8 {
         return Err(unsupported());
@@ -951,7 +940,6 @@ pub fn emit_framed_with_runtime(
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.result_offset = emitter.remat_base + remat_words as i32 * 8;
-    emitter.poll_offset = emitter.result_offset + 8;
     if function.block(function.entry()).params.len() > activation_slots as usize {
         return Err(unsupported());
     }

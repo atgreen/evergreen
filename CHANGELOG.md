@@ -5,6 +5,9 @@
 - Support packed `DOUBLE-FLOAT` arrays, including adjustable and displaced arrays,
   sequence operations, printing, and hash keys
   ([#278](https://github.com/atgreen/evergreen/pull/278)).
+- Poll every selected T2 loop back-edge on AArch64, POWER, RISC-V, and System Z
+  instead of sampling one in 256
+  ([#279](https://github.com/atgreen/evergreen/pull/279)).
 - Visit overlapping native GC root slots once per scan while preserving distinct
   copies of live values ([#274](https://github.com/atgreen/evergreen/pull/274)).
 - Keep idle mapped T2 loop polls in generated code on Linux x86-64, avoiding

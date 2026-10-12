@@ -11,7 +11,7 @@
 //! extended by the shadow-root slots this emitter needs at runtime calls. The
 //! module owns instruction selection for the opcode subset listed below, the
 //! native frame layout, GC-root synchronisation around every runtime call,
-//! sampled back-edge safepoint polls, OSR entry prologues, and the
+//! back-edge safepoint polls, OSR entry prologues, and the
 //! guard-failure exits that serialise a `FrameState` for the T0 resume
 //! adapter. It does not own the native transfer protocol: on this target a
 //! runtime call still ends with the checked `transfer_pending` test, and the
@@ -49,8 +49,8 @@
 //! (regalloc2's plus the stable homes added for split values), the edge
 //! parallel-copy buffer (max block-param count), the deopt serialisation buffer
 //! (max over frame states of four header words plus locals plus stack per
-//! scope), the remat buffer (max recipe count), and six words holding the saved
-//! call result, the poll countdown, the `EgclStack` pointer the entry
+//! scope), the remat buffer (max recipe count), and five words holding the saved
+//! call result, the `EgclStack` pointer the entry
 //! received in r3, the caller's frame pointer and stack offset parked
 //! across a direct native call, and the code id stamped by the entry (bit 63
 //! set by the register entry, which owns no frame). Every access must fit a signed 20-bit
@@ -106,9 +106,8 @@
 //! share the transfer check. `EGCL_NO_DIRECT_SELF_CALL` disables the fast path.
 //!
 //! Back-edge polls: a block with a successor at or before itself in block
-//! order polls before its edge moves, decrementing a 256-count frame word and
-//! calling `poll` through the same root-synchronising path when it reaches
-//! zero. A function with a cycle but no `poll` adapter declines.
+//! order calls `poll` before its edge moves through the same root-synchronising
+//! path on every execution. A function with a cycle but no `poll` adapter declines.
 //!
 //! # Supported opcodes
 //!
@@ -236,7 +235,6 @@ struct Emitter<'a> {
     roots: HashMap<Inst, Vec<Value>>,
     root_sites: Vec<RootSyncSite>,
     result_offset: i32,
-    poll_offset: i32,
     /// Frame word holding the `EgclStack` pointer the entry received in r3.
     stack_offset: i32,
     /// Frame words parking the caller's fp and sp_offset across a direct
@@ -615,16 +613,6 @@ impl Emitter<'_> {
         // direct call published): a deopt may resume on it.
         self.asm.imm64(2, self.runtime.code_id);
         self.asm.store(2, 15, self.entry_kind_offset);
-        self.init_poll_word();
-    }
-
-    /// The sampled back-edge poll's countdown; a function without a back
-    /// edge never reads it, so its entry need not write it.
-    fn init_poll_word(&mut self) {
-        if !self.polls.is_empty() {
-            self.asm.imm64(2, 256);
-            self.asm.store(2, 15, self.poll_offset);
-        }
     }
 
     /// The listed native callee for `symbol` at this arity, if any.
@@ -1039,15 +1027,9 @@ impl Emitter<'_> {
     fn instruction(&mut self, instruction: Inst, data: &InstData) -> Result<(), EmitError> {
         use Opcode::*;
         if self.polls.contains(&instruction) {
-            let skip = self.asm.label();
-            self.asm.load(2, 15, self.poll_offset);
-            self.asm.add_imm(2, -1);
-            self.asm.store(2, 15, self.poll_offset);
-            self.asm.branch(6, skip);
-            self.asm.imm64(2, 256);
-            self.asm.store(2, 15, self.poll_offset);
+            // Every selected backward-edge terminator reaches the existing
+            // root-synchronizing poll before its edge moves.
             self.runtime_call(instruction, None)?;
-            self.asm.bind(skip);
         }
         if calls_runtime(data.opcode) {
             return self.runtime_call(instruction, Some(data));
@@ -1476,7 +1458,7 @@ pub fn emit_framed(
 /// Emit optimized System Z code with native roots synchronized through extra
 /// activation slots at runtime calls. Precise guard exits serialize virtual
 /// scopes for the T0 adapter, which must root the stream before allocating.
-/// Every cycle crosses a sampled GC/signal poll before its edge transfers.
+/// Every cycle crosses a GC/signal poll before its edge transfers.
 pub fn emit_framed_with_runtime(
     function: &Function,
     deopt_t2: u64,
@@ -1526,7 +1508,6 @@ pub fn emit_framed_with_runtime(
         roots: HashMap::new(),
         root_sites: Vec::new(),
         result_offset: 0,
-        poll_offset: 0,
         stack_offset: 0,
         saved_fp_offset: 0,
         saved_sp_offset: 0,
@@ -1784,7 +1765,7 @@ pub fn emit_framed_with_runtime(
         0
     };
     let frame_words =
-        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 6;
+        spill_slots as usize + edge_words + deopt_words + remat_words + self_args_words + 5;
     // Every load/store and frame adjustment must fit a signed 20-bit address.
     if frame_words > (524280 - 160) / 8 {
         return Err(unsupported!());
@@ -1794,9 +1775,8 @@ pub fn emit_framed_with_runtime(
     emitter.deopt_base = emitter.edge_base + edge_words as i32 * 8;
     emitter.remat_base = emitter.deopt_base + deopt_words as i32 * 8;
     emitter.self_args_base = emitter.remat_base + remat_words as i32 * 8;
-    emitter.result_offset = 160 + (frame_words as i32 - 6) * 8;
-    emitter.poll_offset = emitter.result_offset + 8;
-    emitter.stack_offset = emitter.poll_offset + 8;
+    emitter.result_offset = 160 + (frame_words as i32 - 5) * 8;
+    emitter.stack_offset = emitter.result_offset + 8;
     emitter.saved_fp_offset = emitter.stack_offset + 8;
     emitter.saved_sp_offset = emitter.saved_fp_offset + 8;
     emitter.entry_kind_offset = emitter.saved_sp_offset + 8;
@@ -1814,8 +1794,8 @@ pub fn emit_framed_with_runtime(
     let mut compiled_entry = 0;
     if has_reg_entry {
         // Register entry: the same frame, but the arguments arrive in r2-r4 and
-        // r13 stays the caller's. Move the arguments home BEFORE the poll word
-        // is initialised, since that initialisation uses r2 as scratch.
+        // r13 stays the caller's. Move the arguments home before writing the
+        // entry-kind word, since that write uses r2 as scratch.
         let label = emitter.asm.label();
         emitter.asm.bind(label);
         emitter.reg_entry = Some(label);
@@ -1828,7 +1808,6 @@ pub fn emit_framed_with_runtime(
         // No frame of its own (r13 is the caller's): a deopt must push one.
         emitter.asm.imm64(2, emitter.runtime.code_id | (1 << 63));
         emitter.asm.store(2, 15, emitter.entry_kind_offset);
-        emitter.init_poll_word();
         emitter.asm.branch(15, emitter.blocks[&function.entry()]);
     }
     let mut bcp_offsets = Vec::new();
