@@ -12,7 +12,7 @@ use crate::t2::x64_unwind::SYSV_PRESERVED_REGISTERS;
 use crate::t2::x64_value_maps::{NativeFrameLayout, NativeValueArea, NativeValueLocation};
 use egcl_rt::gc::TraceHostRoots;
 use egcl_rt::jit::JitBuffer;
-use egcl_rt::{Collector, EgclVal, HeapCollector};
+use egcl_rt::EgclVal;
 use std::cell::Cell;
 
 struct Owner {
@@ -182,7 +182,9 @@ extern "C" fn collect(call_sp: usize, return_pc: usize, captured_rbx: *mut usize
         "A and B have distinct heap values"
     );
     egcl_rt::rooted_ref!(_roots = &mut roots);
-    HeapCollector::new().minor_gc().unwrap();
+    // Allocation stress may have promoted a fixture root into Survivor space.
+    // Collect it too so the measured boundary must relocate both saved values.
+    egcl_rt::gc::full_gc().unwrap();
     check.after = check
         .slots
         .map(|address| unsafe { (address as *const u64).read() });
