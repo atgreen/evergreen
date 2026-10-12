@@ -193,6 +193,20 @@ const LARGE_SIZE_SENTINEL: u16 = 0xFFFF;
 /// Payload offset for large objects: base header (8) + u64 true-size (8).
 const LARGE_OBJECT_PAYLOAD_OFFSET: usize = 16;
 
+/// Bound the aligned footprint as well as the exact body length: heap walkers
+/// return padded body sizes as u32, and region live-byte counters are u32 too.
+const MAX_OBJECT_BODY_SIZE: usize =
+    (u32::MAX as usize & !(OBJECT_ALIGNMENT - 1)) - LARGE_OBJECT_PAYLOAD_OFFSET;
+
+#[inline]
+fn allocation_body_size(size: usize) -> Option<u32> {
+    if size == 0 || size > MAX_OBJECT_BODY_SIZE {
+        None
+    } else {
+        Some(size as u32)
+    }
+}
+
 /// Total object footprint in bytes (header + body, 16-byte aligned) for a
 /// requested `body_size`, plus whether the large-object extension is required.
 fn object_footprint(body_size: usize) -> (usize, bool) {
@@ -509,9 +523,7 @@ impl HeapAllocator {
 
 impl Allocator for HeapAllocator {
     fn alloc_fast(&mut self, size: usize) -> Option<*mut u8> {
-        if size == 0 {
-            return None;
-        }
+        let body_size = allocation_body_size(size)?;
         // Total allocation = header + body, 16-byte aligned (spec §3.3.1), with
         // the large-object extension when the footprint exceeds the size field.
         let (total_size, _) = object_footprint(size);
@@ -522,7 +534,7 @@ impl Allocator for HeapAllocator {
             let header_ptr = self.tlab.cursor;
             self.tlab.cursor = new_cursor as *mut u8;
             // Write the object header (type_id=0 placeholder, caller sets real type).
-            let body_off = unsafe { write_object_header(header_ptr, 0, size as u32) };
+            let body_off = unsafe { write_object_header(header_ptr, 0, body_size) };
             // Update live_bytes on the nursery region.
             self.update_nursery_live_bytes(total_size);
             // Return pointer past the header (to the object body).
@@ -536,6 +548,7 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return Err(EgclError::Internal("zero-size allocation".into()));
         }
+        allocation_body_size(size).ok_or(EgclError::Oom)?;
         // alloc_typed can hold the carrier's T0_ALLOCATOR borrow here. Waiting
         // for collector admission must still acknowledge GC, but must not
         // suspend that borrow or resume it on another carrier.
@@ -576,6 +589,7 @@ impl Allocator for HeapAllocator {
         if size == 0 {
             return Err(EgclError::Internal("zero-size large alloc".into()));
         }
+        let body_size = allocation_body_size(size).ok_or(EgclError::Oom)?;
         let (total_size, _) = object_footprint(size);
 
         let mut guard = heap_state().lock().unwrap();
@@ -598,7 +612,7 @@ impl Allocator for HeapAllocator {
                     state.stats.bytes_allocated += total_size as u64;
                     state.stats.regions_free = state.stats.regions_free.saturating_sub(1);
                     // Write object header.
-                    let body_off = unsafe { write_object_header(ptr, 0, size as u32) };
+                    let body_off = unsafe { write_object_header(ptr, 0, body_size) };
                     return Ok(unsafe { ptr.add(body_off) });
                 }
             }
@@ -627,7 +641,7 @@ impl Allocator for HeapAllocator {
                     .regions_free
                     .saturating_sub(regions_needed as u32);
                 // Write object header.
-                let body_off = unsafe { write_object_header(ptr, 0, size as u32) };
+                let body_off = unsafe { write_object_header(ptr, 0, body_size) };
                 return Ok(unsafe { ptr.add(body_off) });
             }
         }
@@ -5020,10 +5034,11 @@ fn maybe_gc_stress() {
     }
 }
 
+/// Return `None` for an empty body or a footprint that exceeds the runtime's
+/// u32 size metadata, without initializing the heap or attempting collection.
 pub fn alloc_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
-    if body_size == 0 {
-        return None;
-    }
+    // Reject before safepoints, stress collections, or heap initialization.
+    allocation_body_size(body_size)?;
     let _ = crate::thread::current_thread_id();
     crate::safepoint::poll_safepoint();
     maybe_gc_stress();
@@ -5150,10 +5165,10 @@ pub fn alloc_base_string_bytes(bytes: &[u8]) -> EgclVal {
 /// before allocation: stress collections are meant to shake out ordinary
 /// nursery relocation bugs, while allocating a pinned object in the nursery
 /// would promote a whole TLAB/region for each object.
+/// Empty bodies and footprints exceeding the runtime's u32 size metadata are
+/// rejected before heap initialization.
 pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
-    if body_size == 0 {
-        return None;
-    }
+    let header_body_size = allocation_body_size(body_size)?;
     let _ = crate::thread::current_thread_id();
     crate::safepoint::poll_safepoint();
     ensure_heap_initialized();
@@ -5187,7 +5202,7 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
                 .stats
                 .regions_free
                 .saturating_sub(regions_needed as u32);
-            let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
+            let body_off = unsafe { write_object_header(ptr, type_id, header_body_size) };
             let header = ptr as *mut ObjectHeader;
             unsafe {
                 (*header).set_pinned();
@@ -5208,7 +5223,7 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         {
             let (address, _) = state.free_pinned_slots.swap_remove(index);
             let ptr = address as *mut u8;
-            let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
+            let body_off = unsafe { write_object_header(ptr, type_id, header_body_size) };
             unsafe { (*(ptr as *mut ObjectHeader)).set_pinned() };
             let region_index = (address - state.heap_base as usize) / state.config.region_size;
             state.regions[region_index].header.live_bytes += total_size as u32;
@@ -5273,7 +5288,7 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
     let idx = target_idx?;
     let region = &mut state.regions[idx];
     let ptr = region.header.alloc_top;
-    let body_off = unsafe { write_object_header(ptr, type_id, body_size as u32) };
+    let body_off = unsafe { write_object_header(ptr, type_id, header_body_size) };
     let header = ptr as *mut ObjectHeader;
     unsafe {
         (*header).set_pinned();
@@ -7258,6 +7273,72 @@ pub fn restore_gc_metadata(data: &[u8]) -> Result<(), EgclError> {
 }
 
 // ── Object-header helper tests (bliss-jtc.19) ─────────────────────
+
+#[cfg(test)]
+mod allocation_size_tests {
+    use super::*;
+
+    #[test]
+    fn maximum_body_leaves_room_for_header_and_alignment() {
+        for size in [1, MAX_OBJECT_BODY_SIZE - 1, MAX_OBJECT_BODY_SIZE] {
+            assert_eq!(allocation_body_size(size), Some(size as u32));
+            let (total, _) = object_footprint(size);
+            assert!(total <= u32::MAX as usize);
+        }
+        let (total, large) = object_footprint(MAX_OBJECT_BODY_SIZE);
+        assert!(large);
+        assert_eq!(total, u32::MAX as usize & !(OBJECT_ALIGNMENT - 1));
+        assert_eq!(total - LARGE_OBJECT_PAYLOAD_OFFSET, MAX_OBJECT_BODY_SIZE);
+        for size in [0, MAX_OBJECT_BODY_SIZE + 1, u32::MAX as usize, usize::MAX] {
+            assert_eq!(allocation_body_size(size), None);
+        }
+    }
+
+    #[test]
+    fn typed_entry_points_reject_sizes_before_touching_thread_allocator() {
+        // Keeping the TLS allocator borrowed catches a guard placed after
+        // entering the allocating path. No heap allocation or GC is needed.
+        T0_ALLOCATOR.with(|cell| {
+            let _borrow = cell.borrow_mut();
+            let stress_count = GC_STRESS_COUNTER.with(std::cell::Cell::get);
+            for size in [0, MAX_OBJECT_BODY_SIZE + 1, u32::MAX as usize, usize::MAX] {
+                assert!(alloc_typed(size, crate::object::type_id::SIMPLE_ARRAY).is_none());
+                assert!(alloc_pinned_typed(size, crate::object::type_id::SIMPLE_ARRAY).is_none());
+            }
+            assert_eq!(GC_STRESS_COUNTER.with(std::cell::Cell::get), stress_count);
+        });
+    }
+
+    #[test]
+    fn direct_allocator_rejects_oversized_bodies_without_refill_or_collection() {
+        let mut allocator = HeapAllocator {
+            tlab: Tlab {
+                cursor: std::ptr::null_mut(),
+                limit: std::ptr::null(),
+                region_idx: 0,
+            },
+            region_size: 64,
+            tlab_size: 32,
+        };
+        for size in [MAX_OBJECT_BODY_SIZE + 1, u32::MAX as usize, usize::MAX] {
+            assert!(allocator.alloc_fast(size).is_none());
+            assert!(matches!(allocator.alloc_slow(size), Err(EgclError::Oom)));
+            assert!(matches!(allocator.alloc_large(size), Err(EgclError::Oom)));
+            assert!(allocator.tlab.cursor.is_null());
+            assert!(allocator.tlab.limit.is_null());
+            assert_eq!(allocator.tlab.region_idx, 0);
+        }
+        assert!(allocator.alloc_fast(0).is_none());
+        assert!(matches!(
+            allocator.alloc_slow(0),
+            Err(EgclError::Internal(_))
+        ));
+        assert!(matches!(
+            allocator.alloc_large(0),
+            Err(EgclError::Internal(_))
+        ));
+    }
+}
 
 #[cfg(test)]
 mod header_tests {

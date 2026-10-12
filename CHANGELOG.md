@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Reject oversized typed allocations before their body lengths or aligned footprints overflow GC size metadata.
+  ([#302](https://github.com/atgreen/evergreen/pull/302)).
+
 ## 0.0.7 - 2026-10-12
 
 - Use the new x86-64 Linux Lisp register ABI for supported T1/T2 functions,
