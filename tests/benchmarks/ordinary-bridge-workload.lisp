@@ -2,7 +2,8 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 ;;; The initial ordinary ABI admits the identity leaf and the single-call
-;;; bridge. Both accumulation loops retain the same outer runtime call path.
+;;; bridge. Retain this pair as an absolute regression control: a restored
+;;; managed leaf entry can choose a different outer adapter from the bridge.
 (declaim (notinline ordinary-bridge-leaf ordinary-bridge-forward))
 (defun ordinary-bridge-leaf (a b c d)
   (declare (ignore a b c))

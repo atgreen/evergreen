@@ -15,6 +15,18 @@ import time
 NAMES = ('ORDINARY-BRIDGE-LEAF', 'ORDINARY-BRIDGE-FORWARD',
          'ORDINARY-BRIDGE-DIRECT-LOOP', 'ORDINARY-BRIDGE-FORWARD-LOOP')
 ORDINARY = NAMES[:2]
+CHAIN_NAMES = ('ORDINARY-CHAIN-LEAF', 'ORDINARY-CHAIN-ONE', 'ORDINARY-CHAIN-TWO',
+               'ORDINARY-CHAIN-ONE-LOOP', 'ORDINARY-CHAIN-TWO-LOOP')
+CHAIN_ORDINARY = CHAIN_NAMES[:3]
+
+
+def comparison(control):
+    if control == 'leaf':
+        return NAMES, ORDINARY, ('direct', 'forward'), 'ordinary-bridge'
+    if control == 'forwarders':
+        return CHAIN_NAMES, CHAIN_ORDINARY, ('one', 'two'), 'ordinary-chain'
+    raise ValueError(f'unknown control: {control}')
+
 WARM_TEST = ('cli::bytecode::native_transfer_tests::ordinary_t2::'
              'ordinary_register_abi_installs_and_warms_a_four_argument_call')
 
@@ -43,22 +55,33 @@ def match_configuration(before, after):
             raise ValueError(f'unmatched build configuration: {key}')
 
 
-def parse_trial(stdout, log, iterations, samples, ordinary):
+def parse_trial(stdout, log, iterations, samples, ordinary, control='leaf'):
+    names, ordinary_names, sides, _ = comparison(control)
     listings = re.findall(r'BRIDGE-CODE-BEGIN (before|after) ([A-Z-]+)\s*\n(.*?)BRIDGE-CODE-END', stdout, re.S)
     code = {}
     for phase, name, listing in listings:
-        if (phase, name) in code or name not in NAMES or name not in listing or '; T2 —' not in listing:
+        if (phase, name) in code or name not in names or name not in listing or '; T2 —' not in listing:
             raise ValueError('invalid named T2 listing')
-        abi = 'Ordinary x86-64 Lisp ABI' if ordinary and name in ORDINARY else 'Mapped native transfer ABI'
+        abi = 'Ordinary x86-64 Lisp ABI' if ordinary and name in ordinary_names else 'Mapped native transfer ABI'
         if abi not in listing:
             raise ValueError(f'{name} missing expected {abi}')
         code[phase, name] = listing
-    if len(code) != 2 * len(NAMES) or any(code['before', name] != code['after', name] for name in NAMES):
+    if len(code) != 2 * len(names) or any(code['before', name] != code['after', name] for name in names):
         raise ValueError('missing or changed current code listing')
     for line in log.splitlines():
-        if any(name in line.upper() for name in NAMES) and re.search(r'deopt|invalidat|recompil', line, re.I):
+        if any(name in line.upper() for name in names) and re.search(r'deopt|invalidat|recompil', line, re.I):
             raise ValueError('named code deoptimized or changed during trial')
-    rows = re.findall(r'^BRIDGE-SAMPLE (\d+) (direct|forward) (\d+) (\d+)\s*$', stdout, re.M)
+    if ordinary and control == 'forwarders':
+        for name in ('ORDINARY-CHAIN-ONE', 'ORDINARY-CHAIN-TWO'):
+            if not re.search(r'^\s*\+0000:\s+ud2\s*$', code['before', name], re.M):
+                raise ValueError(f'{name} must retain its ordinary-only outer entry path')
+            # The initial ordinary fast CALL is followed by control reloads and
+            # depth retirement. A cold helper CALL alone cannot satisfy this.
+            if not re.search(r'call r11\s*\n[^\n]*mov r11,\[rsp[^\n]*\n'
+                             r'[^\n]*mov r11,\[r11\+8\]\s*\n[^\n]*dec dword \[r11\]',
+                             code['before', name]):
+                raise ValueError(f'{name} missing non-tail ordinary CALL/depth-retirement sequence')
+    rows = re.findall(r'^BRIDGE-SAMPLE (\d+) (' + '|'.join(sides) + r') (\d+) (\d+)\s*$', stdout, re.M)
     expected = iterations * (iterations - 1) // 2
     if len(rows) != 2 * samples:
         raise ValueError('incomplete paired samples')
@@ -69,28 +92,29 @@ def parse_trial(stdout, log, iterations, samples, ordinary):
             if int(index) != pair or side in values or int(checksum) != expected or int(elapsed) <= 0:
                 raise ValueError('invalid pair order, elapsed time or checksum')
             values[side] = int(elapsed)
-        result.append({'pair': pair, 'direct_ns': values['direct'], 'forward_ns': values['forward'],
-                       'increment_ns': values['forward'] - values['direct']})
+        result.append({'pair': pair, f'{sides[0]}_ns': values[sides[0]], f'{sides[1]}_ns': values[sides[1]],
+                       'increment_ns': values[sides[1]] - values[sides[0]]})
     return result
 
 
-def workload(iterations, samples, reverse):
-    definitions = Path(__file__).with_name('ordinary-bridge-workload.lisp').read_text()
+def workload(iterations, samples, reverse, control='leaf'):
+    names, _, sides, prefix = comparison(control)
+    definitions = Path(__file__).with_name(f'{prefix}-workload.lisp').read_text()
     def listings(phase):
         return '\n'.join(f'(format t "BRIDGE-CODE-BEGIN {phase} {name}~%")\n'
-                         f"(disassemble '{name})\n(format t \"BRIDGE-CODE-END~%\")" for name in NAMES)
+                         f"(disassemble '{name})\n(format t \"BRIDGE-CODE-END~%\")" for name in names)
     def measure(side):
         return f'''(let* ((start (egcl-ext:real-time-nanoseconds))
-                  (checksum (ordinary-bridge-{side}-loop {iterations}))
+                  (checksum ({prefix}-{side}-loop {iterations}))
                   (elapsed (- (egcl-ext:real-time-nanoseconds) start)))
              (check-ordinary-bridge-result checksum {iterations})
              (format t "BRIDGE-SAMPLE ~D {side} ~D ~D~%" sample elapsed checksum))'''
-    direct, forward = measure('direct'), measure('forward')
+    direct, forward = measure(sides[0]), measure(sides[1])
     first, second = (forward, direct) if reverse else (direct, forward)
     return definitions + f'''
 (dotimes (warm 3)
-  (check-ordinary-bridge-result (ordinary-bridge-direct-loop {iterations}) {iterations})
-  (check-ordinary-bridge-result (ordinary-bridge-forward-loop {iterations}) {iterations}))
+  (check-ordinary-bridge-result ({prefix}-{sides[0]}-loop {iterations}) {iterations})
+  (check-ordinary-bridge-result ({prefix}-{sides[1]}-loop {iterations}) {iterations}))
 {listings('before')}
 (dotimes (sample {samples})
   (if (evenp sample) (progn {first} {second}) (progn {second} {first})))
@@ -133,6 +157,8 @@ def main():
         parser.add_argument(f'--{side}-root', type=Path, required=True)
         parser.add_argument(f'--{side}-run', required=True, help='immutable CI workflow run ID')
         parser.add_argument(f'--{side}-artifact', required=True, help='immutable CI artifact ID')
+    parser.add_argument('--control', choices=('leaf', 'forwarders'), default='leaf',
+                        help='leaf regression control or matched one-versus-two forwarding entries')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--build-description', required=True,
                         help='matched CI toolchain/configuration and build log references')
@@ -151,7 +177,9 @@ def main():
     limiter = checkout / 'scripts/egcl-limited.sh'
     env = {key: value for key, value in os.environ.items() if not key.startswith('EGCL_')}
     env.update(EGCL_MEM_MAX='1G', EGCL_TIMEOUT='300', EGCL_FORCE_TIER='t2')
-    report = {'metric': 'Forward minus direct loop ns/iteration; includes guards, bookkeeping and return, not a single CALL.',
+    _, _, sides, _ = comparison(args.control)
+    report = {'control': args.control,
+              'metric': f'{sides[1]} minus {sides[0]} loop ns/iteration; includes guards, bookkeeping and return, not a single CALL.',
               'review_required': 'Inspect retained ordinary entry guards/argument movement/CF teardown and matched outer dispatch.',
               'build_description': args.build_description,
               'host': {'platform': platform.platform(), 'cpu': args.cpu,
@@ -171,7 +199,7 @@ def main():
         args.after_root / 'target/ci-tests/manifest.json', output, limiter, env)
     for trial in range(args.trials):
         source = output / f'workload-{trial}.lisp'
-        source.write_text(workload(args.iterations, args.samples, trial % 2))
+        source.write_text(workload(args.iterations, args.samples, trial % 2, args.control))
         for side in (('before', 'after') if trial % 2 == 0 else ('after', 'before')):
             stem = f'{side}-{trial}'
             log = output / f'{stem}.t2.log'
@@ -191,12 +219,12 @@ def main():
                 row.update(returncode=result.returncode, load_after=os.getloadavg())
                 if result.returncode:
                     raise ValueError(f'{stem} process failed')
-                row['pairs'] = parse_trial(result.stdout, log.read_text(), args.iterations, args.samples, side == 'after')
+                row['pairs'] = parse_trial(result.stdout, log.read_text(), args.iterations, args.samples, side == 'after', args.control)
             finally:
                 (output / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     report['summary'] = {side: {metric: summary([pair[metric] for trial in report['trials']
         if trial['side'] == side for pair in trial['pairs']], args.iterations)
-        for metric in ('direct_ns', 'forward_ns', 'increment_ns')} for side in ('before', 'after')}
+        for metric in (f'{sides[0]}_ns', f'{sides[1]}_ns', 'increment_ns')} for side in ('before', 'after')}
     (output / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report['summary'], indent=2))
     print(report['review_required'])

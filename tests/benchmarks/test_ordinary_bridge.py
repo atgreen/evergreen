@@ -37,6 +37,34 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.parse_trial(self.output(), 'ORDINARY-BRIDGE-FORWARD: deoptimized', 10, 1, True)
 
+    def chain_output(self):
+        blocks = []
+        for phase in ('before', 'after'):
+            for name in bench.CHAIN_NAMES:
+                abi = ('Ordinary x86-64 Lisp ABI' if name in bench.CHAIN_ORDINARY
+                       else 'Mapped native transfer ABI')
+                edge = ('+0000: ud2\n+034a: call r11\n+034d: mov r11,[rsp+78h]\n'
+                        '+0352: mov r11,[r11+8]\n+0356: dec dword [r11]\n'
+                        '+0359: lea rsp,[rsp+10h]')
+                blocks.append(f'BRIDGE-CODE-BEGIN {phase} {name}\n; {name}\n'
+                              f'; T2 — code\n; {abi}\n{edge}\nBRIDGE-CODE-END')
+        return '\n'.join(blocks) + '\nBRIDGE-SAMPLE 0 one 100 45\nBRIDGE-SAMPLE 0 two 120 45\n'
+
+    def test_matched_forwarders_keep_distinct_samples_and_non_tail_evidence(self):
+        rows = bench.parse_trial(self.chain_output(), '', 10, 1, True, control='forwarders')
+        self.assertEqual(rows, [{'pair': 0, 'one_ns': 100, 'two_ns': 120, 'increment_ns': 20}])
+        for changed in (self.chain_output().replace('call r11', 'jmp r11'),
+                        self.chain_output().replace('+0000: ud2', '+0000: push rbp')):
+            with self.subTest(output=changed), self.assertRaises(ValueError):
+                bench.parse_trial(changed, '', 10, 1, True, control='forwarders')
+
+    def test_matched_workload_times_only_one_and_two_forwarders(self):
+        source = bench.workload(10, 1, False, control='forwarders')
+        self.assertIn('(ordinary-chain-one-loop 10)', source)
+        self.assertIn('(ordinary-chain-two-loop 10)', source)
+        self.assertNotIn('ordinary-bridge-direct-loop', source)
+        self.assertIn('(declaim (notinline ordinary-chain-leaf ordinary-chain-one ordinary-chain-two))', source)
+
     def test_artifact_hash_and_profile_are_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

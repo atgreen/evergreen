@@ -1,7 +1,7 @@
 # Measuring the initial ordinary call edge
 
-`ordinary-bridge-direct` and `ordinary-bridge-forward` isolate an eligible
-four-argument forwarding edge. Both execute the same counted accumulation loop,
+`ordinary-bridge-direct` and `ordinary-bridge-forward` provide absolute regression
+controls around an eligible four-argument forwarding edge. Both execute the same counted accumulation loop,
 pass `0`, `1`, `2`, and the loop index, and check the result `499999500000` for
 one million iterations. Their call paths are:
 
@@ -17,7 +17,10 @@ body. The existing `native-call4` benchmark's accumulation loop is outside that
 subset; its loop-to-leaf timing alone cannot establish a new ordinary call edge.
 
 Both variants load the same definitions, repeatedly warm both loops, and retain
-one outer runtime call per iteration. `NOTINLINE` prevents either bridge or
+one outer runtime call per iteration. The restored managed leaf entry can select
+a different outer adapter from the forwarding entry, so their difference does
+not isolate an additional native call. Use the [matched forwarding-entry
+control](ordinary-chain.md) for that comparison. `NOTINLINE` prevents either bridge or
 leaf from being substituted into its caller. It does not prohibit another Lisp
 implementation from tail-calling the leaf; inspect SBCL's code separately when
 explaining cross-implementation differences.
