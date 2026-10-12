@@ -24,7 +24,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         ));
         None
     };
-    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true) {
+    if !fixed_tagged_parameters(&input.body) || !local_control_native_body(&input.body, true, true, false) {
         return decline("unsupported parameter or control-scope shape");
     }
     // Transfer capture currently reconstructs one logical frame. In particular,
@@ -38,7 +38,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     }
     let has_raw = (0..optimized.num_values())
         .any(|index| optimized.value(Value(index as u32)).repr != ValueRepresentation::Tagged);
-    if has_raw && (!packed_f64_native_body(&input.body)
+    if has_raw && (!packed_f64_native_body(&input.body, optimized)
         || (0..optimized.num_values()).any(|index| !matches!(
             optimized.value(Value(index as u32)).repr,
             ValueRepresentation::Tagged | ValueRepresentation::UnboxedF64)))

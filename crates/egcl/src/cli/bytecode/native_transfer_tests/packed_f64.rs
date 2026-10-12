@@ -46,7 +46,8 @@ fn public_packed_f64_loop_keeps_raw_values_and_reloads_moved_arrays() {
         "((dotimes (i n)
             (let ((x (aref src i)))
               (packed-f64-collector)
-              (setf (aref dst i) (+ (* x scale) x))))
+              (multiple-value-bind (stored) (+ (* x scale) x)
+                (setf (aref dst i) stored))))
           dst)",
         &mut env,
     );
@@ -123,4 +124,41 @@ fn public_packed_f64_loop_reboxes_loaded_value_on_scalar_guard_failure() {
     for index in 0..4 {
         assert_eq!(egcl_rt::packed_f64::get(*dst, index), Some(3.75));
     }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn packed_f64_store_guard_reboxes_single_value_transport_without_replaying_effect() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(setq *packed-store-effects* 0)
+         (defun packed-store-effect ()
+           (setq *packed-store-effects* (+ *packed-store-effects* 1)))", &mut env,
+    ).unwrap();
+    let (symbol, code) = ordinary_t2::install(
+        "PACKED-F64-STORE-TRANSPORT-GUARD", "(src dst n scale)",
+        "((dotimes (i n)
+            (let ((x (aref src i)))
+              (packed-store-effect)
+              (multiple-value-bind (stored) (+ (* x scale) x)
+                (setf (aref dst i) stored))))
+          dst)", &mut env,
+    );
+    assert_raw_homes(&code);
+    egcl_rt::rooted!(src = egcl_rt::packed_f64::make(4, 1.25).unwrap());
+    egcl_rt::rooted!(dst = super::super::super::read_eval_all_env("(vector nil nil nil nil)", &mut env).unwrap());
+    egcl_rt::rooted!(scale = egcl_rt::gc::alloc_double_float(2.0));
+    egcl_rt::rooted!(args = vec![*src, *dst, EgclVal::from_fixnum(4), *scale]);
+    egcl_rt::rooted!(result = run_native(&code, symbol, &args, &mut env).unwrap());
+    assert_eq!(*result, *dst);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert_eq!(mapped.deopt_count(), 1, "generic destination fails only at packed store");
+    for index in 0..4 {
+        assert_eq!(egcl_stdlib::sequences::aref(*dst, index).unwrap().as_double_float(), 3.75);
+    }
+    assert_eq!(super::super::super::read_eval_all_env("*packed-store-effects*", &mut env).unwrap(),
+        EgclVal::from_fixnum(4), "store recovery must not replay the completed effect");
 }

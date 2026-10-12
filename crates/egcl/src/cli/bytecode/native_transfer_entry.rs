@@ -843,7 +843,7 @@ impl TransferCode {
                 != egcl_compiler::t2::ir::ValueRepresentation::Tagged);
         let storage = if has_raw {
             if !matches!(tier, CompilationTier::T2) || deopt_metadata.is_none()
-                || !ir.osr_entries.is_empty() || !packed_f64_native_body(&body)
+                || !ir.osr_entries.is_empty() || !packed_f64_native_body(&body, ir)
             {
                 return None;
             }
@@ -1454,14 +1454,19 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
-    local_control_native_body(body, allow_values, false)
+    local_control_native_body(body, allow_values, false, false)
 }
 
 // Raw numeric locals use the existing managed activation's local control scopes.
 // Dynamic scopes, escaping control identities and MV still need independent
 // representation-aware contracts before they can share this narrow entry.
-fn packed_f64_native_body(body: &BytecodeFunction) -> bool {
-    local_control_native_body(body, false, true)
+fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::Function) -> bool {
+    // The original boot SETF bytecode retains its primary-value binder. Admit
+    // that transport only when specialization eliminated every live binder; SetValues remains excluded below.
+    let normalized = ir.block_order().iter().all(|&block| ir.block(block).insts.iter().all(|&inst| {
+        ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
+    }));
+    normalized && local_control_native_body(body, false, true, true)
         && !body.code.iter().any(|op| matches!(op,
             Instr::PushCatch { .. } | Instr::Throw
                 | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
@@ -1471,7 +1476,7 @@ fn packed_f64_native_body(body: &BytecodeFunction) -> bool {
                 | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
 }
 
-fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool) -> bool {
+fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
     body.param_types
         .iter()
         .all(|ty| matches!(ty, DeclaredType::Any))
@@ -1484,6 +1489,7 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
             // Nested tagged callees support MV; optimized/direct-recursive
             // admission retains its existing restriction.
             (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
+            || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
             || (allow_local_scopes && matches!(op,
                 Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
                     | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
@@ -2635,7 +2641,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     let Some(entry) = next.osr_entries.get(header).copied() else { return false };
     // Scan body admission only once a replacement is ready, not on every
     // baseline loop poll while the optimizing worker is still compiling.
-    if !local_control_native_body(&code.body, true, true) {
+    if !local_control_native_body(&code.body, true, true, false) {
         return false;
     }
     // An OSR jump keeps this activation's registrations, not new copies.
