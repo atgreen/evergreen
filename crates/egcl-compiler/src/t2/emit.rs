@@ -4066,10 +4066,61 @@ fn emit_transfer_function(
         poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None, None)
 }
 
+/// Derive the element address from a tagged root for this access only. Both
+/// scratch registers are dead on every exit; no interior pointer survives a
+/// collecting call, poll, or cold reconstruction boundary.
+fn packed_f64_element_address(
+    a: &mut Asm,
+    array: u8,
+    index: u8,
+    constant_index: Option<u64>,
+    deopt: egcl_rt::asm::Label,
+) {
+    // Never modify an operand: it may reside in a permanent callee-save home.
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, 7);
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, deopt);
+    mov_rr(a, SCRATCH, array);
+    alu_r_imm(a, 4, SCRATCH, -8);
+    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::SIMPLE_ARRAY]);
+    a.jcc(Cc::Ne, deopt);
+    let small = a.label();
+    let body = a.label();
+    // The low header word is the size class, with FFFF selecting the
+    // extended header. Packed storage exists in both allocation classes.
+    a.extend_from_slice(&[0x66, 0x81, 0x3a, 0xff, 0xff]);
+    a.jcc(Cc::Ne, small);
+    alu_r_imm(a, 0, SCRATCH, 16);
+    a.jmp(body);
+    a.bind(small);
+    alu_r_imm(a, 0, SCRATCH, 8);
+    a.bind(body);
+    a.extend_from_slice(&[0x80, 0x3a, egcl_rt::object::ElementTypeTag::DoubleFloat as u8]);
+    a.jcc(Cc::Ne, deopt);
+    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
+    else { mov_rr(a, RAX, index); }
+    alu_r_imm(a, 4, RAX, 7);
+    alu_r_imm(a, 7, RAX, egcl_rt::value::TAG_FIXNUM as i32);
+    a.jcc(Cc::Ne, deopt);
+    if let Some(bits) = constant_index { mov_imm64(a, RAX, bits as i64); }
+    else { mov_rr(a, RAX, index); }
+    sar_imm(a, RAX, 3);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::L, deopt);
+    // A checked packed allocation has length <= usize::MAX / 8, so its
+    // nonnegative length also fits the signed comparison on x86-64.
+    cmp_mem64_disp8(a, RAX, SCRATCH, egcl_rt::packed_f64::LENGTH_OFFSET as u8);
+    a.jcc(Cc::Ge, deopt);
+    shl_imm(a, RAX, 3);
+    alu_rr(a, 0x01, SCRATCH, RAX);
+}
+
 /// Admit raw F64 transport only where every collecting/cold boundary has an
 /// authoritative representation map. Raw entry arguments, ordinary helper or
 /// return operands, OSR imports, and other unboxed representations remain out
-/// of scope. A guarded unbox is the only raw producer in this initial slice.
+/// of scope. Raw producers are guarded unboxing, packed loads, and explicit
+/// double arithmetic; packed stores consume raw words without boxing.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn native_representations_supported(
     f: &Function,
@@ -4105,6 +4156,25 @@ fn native_representations_supported(
             let data = f.inst(inst);
             // Edges carry raw values only through equally represented block
             // parameters, checked by the ordinary IR verifier.
+            if matches!(data.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+                // The verifier checks the exact operand, representation and
+                // ordered recovery contract for these operations.
+                continue;
+            }
+            if matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                && data.results.iter().copied().any(raw)
+            {
+                if data.args.len() != 2 || data.results.len() != 1
+                    || data.args.iter().chain(&data.results).any(|&value|
+                        f.value(value).repr != Repr::UnboxedF64
+                            || f.value(value).ty.bits != TypeBits::DOUBLE_FLOAT)
+                    || data.flags != crate::t2::ir::InstFlags::default()
+                    || data.frame_state.is_some()
+                {
+                    return false;
+                }
+                continue;
+            }
             if data.args.iter().copied().any(raw) {
                 return false;
             }
@@ -4170,7 +4240,11 @@ fn emit_transfer_function_with_storage(
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
-            if data.opcode == Opcode::UnboxFloat {
+            if matches!(data.opcode, Opcode::UnboxFloat | Opcode::PackedF64Ref | Opcode::PackedF64Set)
+                || (matches!(data.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                    && data.results.len() == 1
+                    && f.value(data.results[0]).repr == crate::t2::ir::ValueRepresentation::UnboxedF64)
+            {
                 // Representation and operand contracts were checked above.
                 continue;
             }
@@ -5357,6 +5431,14 @@ fn emit_framed_inner(
                 {
                     continue;
                 }
+                if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                    && d.results.len() == 1
+                    && f.value(d.results[0]).repr == ValueRepresentation::UnboxedF64
+                {
+                    // Already-unboxed double arithmetic is total and emits no
+                    // guard. Its input layout checks own the recovery states.
+                    continue;
+                }
                 // Reaches emit_arith_inst → may emit a guard → needs a FrameState.
                 if d.frame_state.is_none() {
                     return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
@@ -6020,6 +6102,47 @@ fn emit_framed_inner(
                 a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
                 a.jcc(Cc::Ne, label);
                 load_mem64_disp(&mut a, dst, SCRATCH, 8);
+            } else if matches!(d.opcode, Opcode::PackedF64Ref | Opcode::PackedF64Set) {
+                if !published_native_roots || !native_call_storage {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                // A constant array may use rax until copied to rdx. Constant
+                // indexes are materialized only after that copy and its guards,
+                // so no operand or result temporary can be overwritten.
+                let array = if let Some(&bits) = const_tagged.get(&d.args[0]) {
+                    mov_imm64(&mut a, RAX, bits as i64);
+                    RAX
+                } else { inst_reg[&d.args[0]] };
+                let index = inst_reg.get(&d.args[1]).copied().unwrap_or(RAX);
+                packed_f64_element_address(&mut a, array, index,
+                    const_tagged.get(&d.args[1]).copied(), label);
+                if d.opcode == Opcode::PackedF64Ref {
+                    load_mem64_disp(&mut a, inst_reg[&d.results[0]], SCRATCH,
+                        egcl_rt::packed_f64::DATA_OFFSET as i32);
+                } else {
+                    store_mem64_disp(&mut a, SCRATCH, egcl_rt::packed_f64::DATA_OFFSET as i32,
+                        inst_reg[&d.args[2]]);
+                }
+            } else if matches!(d.opcode, Opcode::FloatAdd | Opcode::FloatMul)
+                && d.results.first().is_some_and(|&value|
+                    f.value(value).repr == ValueRepresentation::UnboxedF64)
+            {
+                if !published_native_roots || !native_call_storage {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                // XMM temporaries die within the instruction. The authoritative
+                // F64 homes remain ordinary eight-byte nonroot frame values.
+                for (xmm, value) in d.args.iter().enumerate() {
+                    let register = inst_reg[value];
+                    a.extend_from_slice(&[0x66, rex_w(xmm as u8, register), 0x0f, 0x6e,
+                        modrm_rr(xmm as u8, register)]);
+                }
+                a.extend_from_slice(&[0xf2, 0x0f,
+                    if d.opcode == Opcode::FloatAdd { 0x58 } else { 0x59 }, 0xc1]);
+                let register = inst_reg[&d.results[0]];
+                a.extend_from_slice(&[0x66, rex_w(0, register), 0x0f, 0x7e, modrm_rr(0, register)]);
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
