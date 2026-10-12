@@ -185,6 +185,7 @@ fn win64_preserves_integer_simd_and_fp_control_for_every_exit() {
         let mut anchor = NativeSegment {
             saved_sp: 0,
             landing_pc: 0,
+            entry_return_pc: 0,
             previous: std::ptr::null_mut(),
             owner: SegmentOwner::Thread(crate::thread::NativeThreadId(0)),
             carrier: crate::thread::NativeThreadId(0),

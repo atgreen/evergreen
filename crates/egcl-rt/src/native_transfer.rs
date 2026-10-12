@@ -22,6 +22,11 @@ use crate::value::EgclVal;
 use crate::value::NIL;
 use std::cell::Cell;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+mod ordinary_x64;
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_x64::{invoke_ordinary_native_segment, OrdinaryNativeOutcome};
+
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(crate) mod migration_tests;
 
@@ -130,6 +135,7 @@ pub enum SegmentOwner {
 pub struct NativeSegment {
     pub saved_sp: usize,
     pub landing_pc: usize,
+    entry_return_pc: usize,
     previous: *mut NativeSegment,
     owner: SegmentOwner,
     carrier: crate::thread::NativeThreadId,
@@ -153,12 +159,17 @@ impl NativeSegment {
         (self.stack_sp, self.stack_fp)
     }
 
-    /// Return address the entry stub's CALL pushed for this segment's generated
-    /// code. Physical frame walks end at this PC with `saved_sp`; cold transfers
-    /// land at `landing_pc`, which follows the stub's 2-byte `xor edx, edx`.
+    /// Return address the entry stub's CALL pushed for generated code. Physical
+    /// walks end at this PC with `saved_sp`. Ordinary entry records this PC
+    /// explicitly before capturing the MV tuple; legacy entry derives it from
+    /// the two-byte instruction preceding its cold-transfer landing.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     pub fn return_pc(&self) -> usize {
-        self.landing_pc - 2
+        if self.entry_return_pc != 0 {
+            self.entry_return_pc
+        } else {
+            self.landing_pc - 2
+        }
     }
 }
 
@@ -347,6 +358,20 @@ pub unsafe fn invoke_native_segment(
     slots: *mut u64,
     stack: &EgclStack,
 ) -> Result<NativeOutcome, SegmentUnavailable> {
+    unsafe { with_native_segment(stack, |anchor, out| enter_platform(entry, slots, stack, anchor, out)) }
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", any(target_os = "linux", windows)),
+    all(target_arch = "powerpc64", target_endian = "little", target_os = "linux"),
+    all(target_arch = "aarch64", unix),
+    all(target_arch = "s390x", unix),
+    all(target_arch = "riscv64", unix),
+))]
+unsafe fn with_native_segment(
+    stack: &EgclStack,
+    enter: impl FnOnce(*mut NativeSegment, *mut NativeOutcome),
+) -> Result<NativeOutcome, SegmentUnavailable> {
     if !is_supported() {
         return Err(SegmentUnavailable);
     }
@@ -359,6 +384,7 @@ pub unsafe fn invoke_native_segment(
     let mut segment = std::pin::pin!(NativeSegment {
         saved_sp: 0,
         landing_pc: 0,
+        entry_return_pc: 0,
         previous,
         owner,
         carrier,
@@ -374,7 +400,7 @@ pub unsafe fn invoke_native_segment(
         value: NIL,
         exit: NativeExit::Returned,
     };
-    unsafe { enter_platform(entry, slots, stack, anchor, &mut outcome) };
+    enter(anchor, &mut outcome);
     Ok(outcome)
 }
 
@@ -536,6 +562,7 @@ mod tests {
             let mut anchor = NativeSegment {
                 saved_sp: 0,
                 landing_pc: 0,
+                entry_return_pc: 0,
                 previous: std::ptr::null_mut(),
                 owner: SegmentOwner::Thread(crate::thread::NativeThreadId(0)),
                 carrier: crate::thread::NativeThreadId(0),
@@ -569,6 +596,7 @@ mod tests {
         let mut segment = std::pin::pin!(NativeSegment {
             saved_sp: 0,
             landing_pc: 0,
+            entry_return_pc: 0,
             previous: std::ptr::null_mut(),
             owner: SegmentOwner::Thread(current),
             carrier: crate::thread::NativeThreadId(current.0.wrapping_add(1)),
