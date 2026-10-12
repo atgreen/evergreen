@@ -60,3 +60,42 @@ would add a separate cost.
 
 No timing or performance claim accompanies this workload. Current-release
 execution and path verification are tracked by `bliss-t8a48.1`.
+
+## Paired CI-artifact runner
+
+`ordinary_bridge.py` consumes unpacked immutable `ci-tests-musl` archives. Retain
+the downloaded archive, its SHA256, workflow run ID and artifact ID before the
+two-day artifact retention expires. Extract each into a separate directory;
+these are runtime artifacts, not shared Cargo build targets. Their included
+`target/ci-tests/manifest.json` records the actual CI merge revision, source
+digest, profile, target, features and executable hashes. A PR branch head is not
+necessarily the compiled merge revision.
+
+```sh
+python3 tests/benchmarks/ordinary_bridge.py \
+  --before-root /tmp/bridge-before --before-run RUN --before-artifact ARTIFACT \
+  --after-root /tmp/bridge-after --after-run RUN --after-artifact ARTIFACT \
+  --build-description 'matched release toolchain/configuration; retained CI log references' \
+  --cpu 4 --iterations 1000000 --samples 9 --trials 5 \
+  --output /tmp/bridge-results
+```
+
+The runner verifies executable hashes and matched release configuration, keeps
+both manifests, and first runs the after artifact's exact four-argument warmed
+ordinary-edge integration test. This is evidence for an equivalent bridge with
+zero cold handoffs after warming, **not a fallback counter for every timed
+process**. It then alternates binary order across trials and direct/forward
+order within each process, recording every paired sample, checksum, host load,
+CPU affinity/governor, T2 log and unchanged pre/post function listings.
+
+The parser rejects missing/changed T2 code and missing after-side ordinary ABI
+entries, but instruction-level guard/argument/return and outer dispatch review
+remains necessary. The distributions include negative forward-minus-direct
+differences; they do not discard noise or imply a speedup. Warmup, disassembly,
+checksum validation and printing are outside each timed call. The timed call
+still includes its common outer dispatch.
+
+Runner validation uses `python3 tests/benchmarks/test_ordinary_bridge.py`.
+The baseline CI release artifact has passed a one-pair, 1000-iteration smoke
+with all four named T2 listings stable; integrated after-artifact smoke and
+quiet-host measurements remain outstanding. No timing result is claimed here.
