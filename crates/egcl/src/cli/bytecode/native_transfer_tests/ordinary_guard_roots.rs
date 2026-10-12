@@ -232,3 +232,51 @@ fn ordinary_caller_guard_resumes_after_native_child_completed_once() {
     assert_eq!(unsafe { &*execution }.active_native_control(), control);
     assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
 }
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_hoisted_entry_guard_resumes_before_child_effect_once() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(setq *ordinary-entry-guard-effects* 0)
+         (defun ordinary-entry-guard-effect (x)
+           (setq *ordinary-entry-guard-effects* (+ *ordinary-entry-guard-effects* 1)) x)
+         (defun ordinary-entry-guard-child (x a b c) (+ (ordinary-entry-guard-effect x) 1))",
+        &mut env).unwrap();
+    let (_, child) = ordinary_t2::install("ORDINARY-ENTRY-GUARD-CHILD", "(x a b c)",
+        "((+ (ordinary-entry-guard-effect x) 1))", &mut env);
+    let (symbol, caller) = ordinary_t2::install("ORDINARY-ENTRY-GUARD-CALLER", "(x n held)",
+        "((ordinary-entry-guard-child x nil nil nil) (+ n 1) held)", &mut env);
+    for code in [&child, &caller] {
+        assert!(mapped(code).ordinary_entry.is_some());
+        assert!(mapped(code).mapped_entry().is_none());
+    }
+    for _ in 0..2 {
+        assert_eq!(run_native(&caller, symbol, &[
+            EgclVal::from_fixnum(10), EgclVal::from_fixnum(7), EgclVal::from_fixnum(99),
+        ], &mut env).unwrap(), EgclVal::from_fixnum(99));
+    }
+    crate::cli::read_eval_all_env("(setq *ordinary-entry-guard-effects* 0)", &mut env).unwrap();
+    egcl_rt::rooted!(number = egcl_rt::gc::alloc_double_float(2.5));
+    egcl_rt::rooted!(held = crate::cli::arena_cons(EgclVal::from_fixnum(967), NIL));
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+    let control = unsafe { &*execution }.active_native_control();
+    let segment = egcl_rt::native_transfer::current_segment();
+    // N's type guard is hoisted before CALL. Its own pre-call bytecode state
+    // must execute B once, unlike a post-call failure which must skip B.
+    let result = run_native(&caller, symbol,
+        &[EgclVal::from_fixnum(10), *number, *held], &mut env).unwrap();
+    assert_eq!(result, *held);
+    assert_eq!(crate::cli::cp(result), (EgclVal::from_fixnum(967), NIL));
+    assert_eq!(mapped(&caller).deopt_count(), 1);
+    assert_eq!(mapped(&child).deopt_count(), 0);
+    assert_eq!(crate::cli::read_eval_all_env("*ordinary-entry-guard-effects*", &mut env).unwrap(),
+        EgclVal::from_fixnum(1), "pre-call recovery must neither skip nor repeat the child effect");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(unsafe { &*execution }.active_native_control(), control);
+    assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
+}
