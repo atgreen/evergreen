@@ -39,9 +39,9 @@ invocation/harness overhead rather than treating the value as instruction cost.
 
 ```sh
 python3 tests/benchmarks/test_packed_kernel.py
-python3 tests/benchmarks/packed_kernel.py --sbcl-only --cpu 4 \
-  --elements 4096 --passes 16 --samples 3 --trials 1 \
-  --output /tmp/packed-sbcl-smoke
+python3 tests/benchmarks/packed_kernel.py --sbcl-only --sbcl-mode typed --cpu 4 \
+  --elements 65536 --passes 256 --samples 3 --trials 1 \
+  --output /tmp/packed-sbcl-typed-smoke
 ```
 
 The SBCL smoke validates tooling and public Lisp behavior. It is not a quiet
@@ -104,13 +104,37 @@ made solely by subtracting a noisy baseline.
 
 ## SBCL comparison scope
 
-The initial comparison runs the **same undeclared public source** on SBCL.
-SBCL can therefore retain generic array/arithmetic operations and box doubles;
-the smoke observed 48 Lisp bytes per element there. This is not a tuned SBCL
-specialized-array benchmark. Any eventual ratio must name that scope and must
-not establish a broad “2× SBCL” goal against an artificially generic comparator.
-A separately labeled typed SBCL reference is needed for such a goal; do not add
-declarations silently on just one side or confuse its results with this pair.
+The runner defaults to `--sbcl-mode typed`, an explicitly optimized SBCL
+reference. It inserts declarations only into SBCL's copy of the **same kernel
+operation**, preserving the shared initialization, checksum, and arithmetic:
+
+```lisp
+(declare (optimize (speed 3) (safety 1) (debug 0))
+         (type (simple-array double-float (*)) src dst)
+         (type (integer 0 20000000) n)
+         (type double-float scale))
+;; Within DOTIMES:
+(declare (type fixnum i))
+```
+
+The index/count bound covers the runner's largest 2n allocation probe. These
+settings, reference mode, complete generated source, and hashes are recorded.
+The typed path must retain native `MOVSD`, `MULSD`, and `ADDSD` in its stable
+pre/post listing. Its correctness smoke at n=65536 returned checksum3244032
+for all three samples; real TIME probes at0/65536/131072 reported0/0/0Lispbytes.
+The inspected 80-byte kernel uses double loads/multiply/add/store and retains
+array bounds traps. This is allocation-counter and code evidence for the tested
+reference, not a quiet throughput measurement. A smaller batch first failed the
+zero elapsed-time guard, so the smoke batch was enlarged rather than accepting
+an unmeasurable sample.
+
+`--sbcl-mode same-source` remains a separately labeled undeclared-source control.
+Its smoke observed48Lispbytes per element from generic array/arithmetic boxing.
+Do not silently mix that control with the typed reference or establish a broad
+“2× SBCL” goal against the generic comparator. EGCL's source remains undeclared
+in **both modes** because the current admission pass uses runtime guards. Any
+future speed comparison must state this asymmetric declaration policy and the
+explicit SBCL safety/optimization settings.
 
 Retain min/median/P95/max and every sample, not just a best time. Quiet repeated
 measurements, EGCL release/path evidence, allocation observations, and explicit

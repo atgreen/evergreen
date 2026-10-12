@@ -26,13 +26,17 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def parse(stdout, log, n, samples, implementation):
+def parse(stdout, log, n, samples, implementation, sbcl_mode='same-source'):
     listings = re.findall(r'PACKED-CODE-BEGIN (before|after)\s*\n(.*?)PACKED-CODE-END', stdout, re.S)
     if len(listings) != 2 or [phase for phase, _ in listings] != ['before', 'after']:
         raise ValueError('missing named pre/post code listings')
     code = listings[0][1]
     if NAME not in code or code != listings[1][1]:
         raise ValueError('missing or changed kernel code')
+    if implementation == 'sbcl' and sbcl_mode == 'typed':
+        if not all(re.search(r'\b' + opcode + r'\b', code, re.I)
+                   for opcode in ('movsd', 'mulsd', 'addsd')):
+            raise ValueError('typed SBCL reference lacks native double load/arithmetic/store evidence')
     if implementation == 'egcl':
         if '; T2 —' not in code or 'Mapped native transfer ABI' not in code:
             raise ValueError('kernel lacks named mapped T2 code')
@@ -45,7 +49,7 @@ def parse(stdout, log, n, samples, implementation):
         installed = [line for line in named.splitlines() if re.search(r'installed|published', line)]
         if not installed or not any('osr_entries=0' in line for line in installed):
             raise ValueError('kernel lacks full-entry installation evidence')
-        if any(re.search(r'osr_entries=[1-9]|deoptimiz|invalidat|recompil', line, re.I)
+        if any(re.search(r'osr_entries=[1-9]|deopt|invalidat|recompil', line, re.I)
                for line in named.splitlines()):
             raise ValueError('kernel changed or claims unsupported raw OSR entry')
     rows = re.findall(r'^PACKED-SAMPLE (\d+) (\d+) (\d+)\s*$', stdout, re.M)
@@ -70,8 +74,22 @@ def parse(stdout, log, n, samples, implementation):
             'incremental_lisp_bytes': [row['bytes_cons'] - baseline for row in allocations[1:]]}
 
 
-def workload(implementation, n, samples, passes):
+def workload(implementation, n, samples, passes, sbcl_mode='typed'):
+    if sbcl_mode not in ('typed', 'same-source'):
+        raise ValueError('unknown SBCL reference mode')
     definitions = Path(__file__).with_name('packed-kernel-workload.lisp').read_text()
+    if implementation == 'sbcl' and sbcl_mode == 'typed':
+        header = '(defun public-packed-bench (src dst n scale)\n  (dotimes (i n)\n'
+        if definitions.count(header) != 1:
+            raise ValueError('kernel source changed; review typed reference insertion')
+        definitions = definitions.replace(header, '''(defun public-packed-bench (src dst n scale)
+  (declare (optimize (speed 3) (safety 1) (debug 0))
+           (type (simple-array double-float (*)) src dst)
+           (type (integer 0 20000000) n)
+           (type double-float scale))
+  (dotimes (i n)
+    (declare (type fixnum i))
+''')
     if implementation == 'egcl':
         clock = '(egcl-ext:real-time-nanoseconds)'
         elapsed = '(- (egcl-ext:real-time-nanoseconds) start)'
@@ -116,6 +134,8 @@ def main():
     parser.add_argument('--egcl-run', help='immutable CI workflow run ID')
     parser.add_argument('--egcl-artifact', help='immutable CI artifact ID')
     parser.add_argument('--sbcl', default='sbcl')
+    parser.add_argument('--sbcl-mode', choices=('typed', 'same-source'), default='typed',
+                        help='explicit optimized reference (default) or undeclared source control')
     parser.add_argument('--sbcl-only', action='store_true', help='portable smoke/tool validation; no EGCL claim')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cpu', type=int, required=True)
@@ -135,8 +155,8 @@ def main():
     env = {key: value for key, value in os.environ.items() if not key.startswith('EGCL_')}
     env.update(EGCL_MEM_MAX='1G', EGCL_TIMEOUT='300', EGCL_FORCE_TIER='t2')
     sbcl = Path(shutil.which(args.sbcl) or args.sbcl).resolve()
-    sbcl_info = subprocess.check_output([str(sbcl), '--noinform', '--non-interactive', '--no-sysinit',
-        '--no-userinit', '--eval', '(format t "~A~%~A~%~D~%" (lisp-implementation-version) sb-ext:*core-pathname* internal-time-units-per-second)'], text=True).splitlines()
+    sbcl_info = subprocess.check_output([str(limiter), str(sbcl), '--noinform', '--non-interactive', '--no-sysinit',
+        '--no-userinit', '--eval', '(format t "~A~%~A~%~D~%" (lisp-implementation-version) sb-ext:*core-pathname* internal-time-units-per-second)'], env=env, text=True).splitlines()
     core = Path(sbcl_info[-2])
     binaries = {'sbcl': {'binary': str(sbcl), 'sha256': digest(sbcl), 'version': sbcl_info[-3],
                          'clock_units_per_second': int(sbcl_info[-1]),
@@ -157,7 +177,11 @@ def main():
         (output / 'egcl-ci-manifest.json').write_bytes(manifest_path.read_bytes())
     report = {'metric': 'ns per processed element including fixed invocation/harness overhead',
               'allocation_scope': 'TIME Lisp bytes consed for one full call at0,n,2n; subtract0 only to inspect size dependence, not Rust allocation or proof by subtraction alone',
-              'path_scope': 'named raw-F64 full entry; no OSR claim; same undeclared public source on both implementations',
+              'path_scope': 'named EGCL raw-F64 full entry; no OSR claim; SBCL reference mode explicitly recorded',
+              'sbcl_reference': {'mode': args.sbcl_mode,
+                  'declarations': ('simple double-float arrays; n integer0..20000000; fixnum i; double-float scale'
+                                   if args.sbcl_mode == 'typed' else 'none'),
+                  'optimization': {'speed': 3, 'safety': 1, 'debug': 0} if args.sbcl_mode == 'typed' else 'implementation defaults'},
               'elements': args.elements, 'passes': args.passes, 'binaries': binaries, 'trials': [],
               'host': {'platform': platform.platform(), 'cpu': args.cpu,
                        'affinity': sorted(os.sched_getaffinity(0)), 'cpuinfo': Path('/proc/cpuinfo').read_text()}}
@@ -168,7 +192,7 @@ def main():
         for implementation in order:
             stem = f'{implementation}-{trial}'
             source = output / f'{stem}.lisp'
-            source.write_text(workload(implementation, args.elements, args.samples, args.passes))
+            source.write_text(workload(implementation, args.elements, args.samples, args.passes, args.sbcl_mode))
             log = output / f'{stem}.t2.log'
             env['EGCL_T2_LOG'] = str(log)
             binary = binaries[implementation]
@@ -187,7 +211,7 @@ def main():
                 if result.returncode:
                     raise ValueError(f'{stem} failed')
                 row.update(parse(result.stdout, log.read_text() if log.exists() else '',
-                                 args.elements, args.samples, implementation))
+                                 args.elements, args.samples, implementation, args.sbcl_mode))
             finally:
                 (output / 'manifest.json').write_text(json.dumps(report, indent=2) + '\n')
     report['summary_ns_per_element'] = {implementation: distribution([

@@ -33,9 +33,29 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.parse(self.output().replace('addsd', 'nop'), log, 32, 2, 'egcl')
         for bad in ('', log.replace('raw_f64_values=4', 'raw_f64_values=0'),
-                    log.replace('osr_entries=0', 'osr_entries=1'), log + 'PUBLIC-PACKED-BENCH deoptimized\n'):
+                    log.replace('osr_entries=0', 'osr_entries=1'), log + 'PUBLIC-PACKED-BENCH deoptimized\n',
+                    log + '[T2] PUBLIC-PACKED-BENCH: native guard deopt #1 => resuming interpreted\n'):
             with self.subTest(log=bad), self.assertRaises(ValueError):
                 bench.parse(self.output(), bad, 32, 2, 'egcl')
+
+    def test_typed_reference_is_explicit_and_never_changes_egcl_source(self):
+        typed = bench.workload('sbcl', 4096, 1, 16, sbcl_mode='typed')
+        generic = bench.workload('sbcl', 4096, 1, 16, sbcl_mode='same-source')
+        egcl = bench.workload('egcl', 4096, 1, 16, sbcl_mode='typed')
+        self.assertIn('(type (simple-array double-float (*)) src dst)', typed)
+        self.assertIn('(optimize (speed 3) (safety 1) (debug 0))', typed)
+        self.assertIn('(type double-float scale)', typed)
+        self.assertIn('(type fixnum i)', typed)
+        self.assertNotIn('(optimize', generic)
+        self.assertNotIn('(optimize', egcl)
+        for source in (typed, generic, egcl):
+            self.assertIn('(setf (aref dst i) (+ (* x scale) x))', source)
+
+    def test_typed_reference_rejects_generic_machine_code(self):
+        with self.assertRaises(ValueError):
+            bench.parse(self.output(), '', 32, 2, 'sbcl', sbcl_mode='typed')
+        packed = self.output().replace('+0000: mulsd', '+0000: movsd xmm0,[rax]\n  +0001: mulsd')
+        bench.parse(packed, '', 32, 2, 'sbcl', sbcl_mode='typed')
 
     def test_rejects_missing_counter_wrong_checksum_or_changed_code(self):
         for bad in (self.output().replace('1200000 1584', '1200000 0'),
