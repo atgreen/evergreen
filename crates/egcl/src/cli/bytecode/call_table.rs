@@ -313,7 +313,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         return None;
     }
     if let NativeCodeStorage::Mapped(mapped) = &code._storage {
-        if mapped.needs_recompile() {
+        if mapped.ordinary_entry.is_some() || mapped.needs_recompile() {
             // The ordinary entry owns refresh/publication; do not rewrite a
             // cell's retained target without its linkage revision transition.
             return None;
@@ -468,8 +468,23 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
             native = version.entries();
             state.versions.borrow_mut().push(version);
         }
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        let ordinary = match target.as_ref() {
+            Some(Target::Native { code, promote: false, .. }) => match &code._storage {
+                NativeCodeStorage::Mapped(code) => code.ordinary_descriptor(revision)
+                    .map(|descriptor| (descriptor, Rc::clone(code))),
+                _ => None,
+            },
+            _ => None,
+        };
         *state.target.borrow_mut() = target;
         linkage::publish(&state.cell, revision, native[0], native[1]);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some((descriptor, code)) = ordinary {
+            // The immutable owner is retained before the revision-checked slot
+            // becomes visible to generated calls in this execution.
+            unsafe { ordinary::publish_ordinary(Arc::as_ptr(&state.cell) as u64, descriptor, code); }
+        }
         #[cfg(all(target_arch = "x86_64", unix))]
         state
             .versions

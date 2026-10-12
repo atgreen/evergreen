@@ -1561,9 +1561,14 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
         assert!(listing.contains("Ordinary x86-64 Lisp ABI"), "{listing}");
     }
     let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);
-    for _ in 0..3 {
+    for iteration in 0..3 {
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
         assert_eq!(run_native(&caller, symbol, &args, &mut env).unwrap(), args[3]);
         assert!(!env.mv_active);
+        let cold = native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        if iteration != 0 {
+            assert_eq!(cold, 0, "warmed ordinary call must use the generated edge");
+        }
     }
     let cell = call_table::resolve(egcl_rt::symbols::find_index("ORDINARY-REGISTER-FOUR").unwrap()).unwrap();
     let descriptor = unsafe { &*cell.ordinary_entry_address() }.load(std::sync::atomic::Ordering::Acquire);

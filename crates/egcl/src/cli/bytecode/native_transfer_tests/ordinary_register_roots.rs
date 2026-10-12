@@ -6,6 +6,7 @@
 use super::ordinary_t2::install;
 use super::*;
 use egcl_rt::debug_stack::FrameOrigin;
+use std::cell::Cell;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
@@ -49,10 +50,18 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
     }
     crate::cli::read_eval_all_env(
         "(defun ordinary-register-roots-leaf (a b c d)
-           (%force-minor-gc-for-test) (error \"ordinary roots failure\"))",
+           (if (consp a)
+               (progn (%force-minor-gc-for-test) (error \"ordinary roots failure\"))
+               d))",
         &mut env,
     )
     .unwrap();
+    // Definition publication currently invalidates every named-call cell.
+    // Warm the middle descriptor again using the nonthrowing scalar branch;
+    // the measured heap-argument call must enter that middle frame directly.
+    for _ in 0..2 {
+        assert_eq!(run_native(&outer, symbol, &warm, &mut env).unwrap(), warm[1]);
+    }
     // Allocate after warming/redefinition so the failing call must cross a
     // moving collection. Stress may promote early values during construction.
     HeapCollector::new().minor_gc().unwrap();
@@ -108,15 +117,21 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
         })
         .collect();
     assert_eq!(frames.len(), 2, "{trace:?}");
-    for (frame, (name, indices)) in frames.iter().zip([
+    for (position, (frame, (name, indices))) in frames.iter().zip([
         ("ORDINARY-REGISTER-ROOTS-MIDDLE", [3, 2, 1, 0]),
         ("ORDINARY-REGISTER-ROOTS-OUTER", [0, 1, 2, 3]),
-    ]) {
+    ]).enumerate() {
         assert!(
             frame.function.as_deref().unwrap().ends_with(name),
             "{trace:?}"
         );
-        assert_eq!(frame.origin, FrameOrigin::Native);
+        // The root call enriches its existing managed segment anchor. Only
+        // the physical-only middle call inserts a new native-origin row.
+        assert_eq!(frame.origin, if position == 0 {
+            FrameOrigin::Native
+        } else {
+            FrameOrigin::Managed
+        });
         let actual = frame
             .arguments
             .as_ref()

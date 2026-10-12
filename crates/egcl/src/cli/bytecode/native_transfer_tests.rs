@@ -21,6 +21,8 @@ pub(super) mod ordinary_condition_osr;
 pub(super) mod ordinary_special_osr;
 mod ordinary_t1;
 pub(super) mod ordinary_t2;
+mod ordinary_register_roots;
+mod ordinary_register_fibers;
 mod payloads;
 mod recursion;
 mod recursive_heat;

@@ -305,8 +305,8 @@ pub(super) unsafe fn published<R>(
 
 /// Link one suspended caller for the extent of `body`. `low` is the lowest
 /// native address the publication owns: its own machine storage, below the
-/// caller's save words and stack slots. `owner` names the code holding
-/// `cursor.pc` when the caller is not the current CAPTURE's own activation.
+/// caller's save words and stack slots. The exact PC selects its retained code
+/// owner independently of the root activation's CAPTURE context.
 unsafe fn publish_with<R>(
     cursor: NativeFrameCursor,
     context: Option<*mut CaptureContext>,
@@ -816,13 +816,17 @@ unsafe fn copy_native_backtrace(
         while !boundary.is_null() && copied < limit {
             let published = unsafe { &*boundary };
             assert_eq!(published.stack, stack, "native backtrace belongs to the protected execution");
-            unsafe { walk_boundary_frames(published, false, &mut |code, context, _, _, body_sp, walk| {
-                let Some(kind_slot) = code.native_entry_kind_slot else { return 0 };
+            unsafe { walk_boundary_frames(published, false, &mut |code, context, _, cursor, body_sp, walk| {
+                let ordinary = code.ordinary_entry.is_some();
+                if !ordinary && code.native_entry_kind_slot.is_none() { return 0; }
+                let context = if ordinary { published.context } else { context };
                 if copied == limit { return 0; }
                 let body_sp = body_sp.expect("live native frame has an owned body SP");
                 if !seen.insert(body_sp) { return 0; }
                 assert!(!context.is_null(), "native backtrace needs its retained context");
-                assert!(std::ptr::eq((*context).owner, code), "native owner/context mismatch");
+                if !ordinary {
+                    assert!(std::ptr::eq((*context).owner, code), "native owner/context mismatch");
+                }
                 let word = |slot: u32| body_sp.checked_add(slot as usize * 8)
                     .and_then(|address| walk.word(address));
                 let control_slot = code.native_control_slot.expect("native control recipe");
@@ -830,7 +834,19 @@ unsafe fn copy_native_backtrace(
                     .map(|control| std::ptr::from_ref(control) as usize)
                     .expect("native recursive anchor control");
                 assert_eq!(word(control_slot), Some(expected_control), "native frame must belong to its exact anchor");
-                let kind = word(kind_slot).expect("owned native entry-kind word");
+                let kind = if ordinary {
+                    // A repeated code owner is not necessarily the root frame.
+                    // Only the physical caller at the segment end enriches the
+                    // managed anchor; every inner frame is a separate call.
+                    let step = code._native_calls.unwind(code.code.as_ptr() as usize,
+                        cursor, walk.bounds.clone(), |address| walk.word(address))
+                        .expect("validated ordinary unwind");
+                    let segment = &*published.segment;
+                    usize::from((step.caller.call_sp, step.caller.pc)
+                        != (segment.saved_sp, segment.return_pc()))
+                } else {
+                    word(code.native_entry_kind_slot.unwrap()).expect("owned native entry-kind word")
+                };
                 assert!(kind <= 1, "known native entry kind");
                 let anchor = (*context).frame;
                 let activation = anchor.add(1).cast::<EgclVal>();

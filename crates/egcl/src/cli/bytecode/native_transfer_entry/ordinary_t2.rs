@@ -9,6 +9,7 @@ use egcl_compiler::t2::ir::{Function, Value, ValueRepresentation};
 
 pub(in crate::cli::bytecode) struct PreparedT2 {
     ir: Function,
+    ordinary_ir: Function,
     call_cells: Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
 }
 
@@ -46,6 +47,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
     egcl_compiler::t2::verify::verify(&mapped).ok()?;
     Some(PreparedT2 {
         ir: mapped,
+        ordinary_ir: optimized.clone(),
         call_cells: input.call_cells.clone(),
     })
 }
@@ -78,10 +80,11 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         deopt_bodies,
     });
     let roots = retain_native_body(body);
-    let Some(mut code) = TransferCode::emit_prepared(
+    let Some(mut code) = TransferCode::emit_prepared_with_ordinary(
         Arc::clone(body),
         roots,
         &prepared.ir,
+        Some(&prepared.ordinary_ir),
         Some(Arc::clone(&metadata)),
         &prepared.call_cells,
         true,
