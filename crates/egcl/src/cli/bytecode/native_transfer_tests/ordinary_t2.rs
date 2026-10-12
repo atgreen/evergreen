@@ -1289,6 +1289,39 @@ fn ordinary_t2_discarded_call_tuples_release_mv_state() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_discarded_many_return_survives_arithmetic_and_deopt() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock().unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(setq *mv-clear-guard-ticks* 0)
+         (defun mv-clear-guard-producer (x)
+           (incf *mv-clear-guard-ticks*)
+           (values x (cons 82 nil)))", &mut env).unwrap();
+    let (symbol, code) = install("MV-CLEAR-GUARDED", "(x)",
+        "((+ (mv-clear-guard-producer x) 1))", &mut env);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped code") };
+    assert!(mapped.ordinary_entry.is_some());
+    assert!(code.has_deopt);
+    for (index, (input, expected)) in [(41, "42"),
+        ((1_i64 << 60) - 1, "1152921504606846976")].into_iter().enumerate() {
+        let deopts = mapped.deopt_count();
+        MV_CLEAR_HELPER_CALLS.with(|calls| calls.set(0));
+        egcl_rt::rooted!(result = run_native(&code, symbol,
+            &[EgclVal::from_fixnum(input)], &mut env).unwrap());
+        assert_eq!(super::super::super::format_val(*result), expected);
+        assert_eq!(MV_CLEAR_HELPER_CALLS.with(Cell::get), 1,
+            "consume the many-value return before arithmetic or guard recovery");
+        assert_eq!(mapped.deopt_count() > deopts, index == 1);
+        assert!(!env.mv_active && env.mv.is_empty());
+        assert_eq!(super::super::super::read_eval_all_env("*mv-clear-guard-ticks*", &mut env).unwrap(),
+            EgclVal::from_fixnum(index as i64 + 1), "guard recovery must not replay the producer");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_return_distinguishes_zero_one_and_many_after_stale_values() {
     let _lock = super::super::super::heap_test_lock()
         .lock().unwrap_or_else(|error| error.into_inner());

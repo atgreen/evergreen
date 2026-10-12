@@ -77,6 +77,32 @@ fn recursive_single_values_do_not_call_the_mv_clear_helper() {
     assert_eq!(CLEAR_MV_CALLS.with(std::cell::Cell::get), 0,
         "inactive recursive results require no runtime MV reset");
 }
+
+#[test]
+fn recursive_scalar_results_consume_return_carry_before_clobbering_it() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+    let code = execute_with_self_calls(&fib(), 1, &[12 * 8, 0, 0, 0, 0, 0, 0],
+        144 * 8, 0, None, true);
+    let instructions: Vec<_> = Decoder::new(64, &code, DecoderOptions::NONE).into_iter().collect();
+    let calls: Vec<_> = instructions.iter().enumerate().filter(|(_, instruction)|
+        instruction.mnemonic() == Mnemonic::Call && instruction.op0_kind() == OpKind::NearBranch64)
+        .map(|(index, _)| index).collect();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        let mut index = call + 1;
+        loop {
+            let instruction = &instructions[index];
+            match instruction.mnemonic() {
+                Mnemonic::Jae => break, // JNC: consume the ordinary result descriptor.
+                Mnemonic::Mov | Mnemonic::Dec | Mnemonic::Lea => index += 1,
+                Mnemonic::Jmp => index = instructions.iter().position(|candidate|
+                    candidate.ip() == instruction.near_branch_target()).unwrap(),
+                unexpected => panic!("{unexpected:?} at {} precedes consumption of return carry",
+                    instruction.ip()),
+            }
+        }
+    }
+}
 fn instruction(opcode: Opcode, args: Vec<Value>, aux: AuxData) -> InstData {
     InstData {
         opcode,
@@ -211,12 +237,12 @@ fn execute_with_heat(f: &Function, arity: usize, args: &[u64; 7], expected: u64,
 }
 #[allow(clippy::too_many_arguments)]
 fn execute_with_self_calls(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool) {
-    execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None);
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool) -> Vec<u8> {
+    execute_with_self_stack_bound(f, arity, args, expected, poll, heat, direct_self, None)
 }
 #[allow(clippy::too_many_arguments)]
 fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], expected: u64, poll: u64,
-    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>) {
+    heat: Option<(&AtomicU32, u32, &AtomicU32, u32, bool)>, direct_self: bool, below_bottom: Option<i64>) -> Vec<u8> {
     let heat_slot = AtomicUsize::new(0);
     let slot = AtomicUsize::new(0);
     let revision = AtomicU64::new(7);
@@ -333,6 +359,7 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
     assert_eq!(out[0], expected);
     assert_eq!(out[3], 0, "exactly one value returns with clear carry");
     assert_eq!(depth, 1, "every recursive child releases native depth");
+    code.code
 }
 
 #[test]
