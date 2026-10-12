@@ -4,6 +4,9 @@
 use super::*;
 use std::cell::Cell;
 
+#[path = "ordinary_t2_poll_latency.rs"]
+mod poll_latency;
+
 thread_local! {
     // An address for comparison only: this deliberately is not a GC root.
     static ALLOCATED_ROOT: Cell<u64> = const { Cell::new(0) };
