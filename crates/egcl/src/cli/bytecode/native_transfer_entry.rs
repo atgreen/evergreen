@@ -226,6 +226,7 @@ pub(super) struct TransferCode {
     // Retired definitions retain their exact value recipes as long as code lives.
     _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
     code_len: usize,
+    frame_entry: Option<usize>,
     pub(super) ordinary_entry: Option<usize>,
     ordinary_stack_required: Option<usize>,
     _ordinary_arity: Option<JitBuffer>,
@@ -512,6 +513,11 @@ pub(super) fn take_nested_entries() -> usize {
 }
 
 impl TransferCode {
+    pub(super) fn mapped_entry(&self) -> Option<*const u8> {
+        let offset = self.frame_entry.filter(|offset| *offset < self.code_len)?;
+        Some(self.code.as_ptr().wrapping_add(offset))
+    }
+
     pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
         use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
         let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
@@ -872,6 +878,9 @@ impl TransferCode {
             }
         }
         let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
+        if emitted.frame_entry.is_some_and(|offset| offset >= emitted.code.len()) {
+            return None;
+        }
         let mut code = JitBuffer::new(&emitted.code)?;
         // Native entries do not receive the managed slots pointer in RDI:
         // private entries receive control; ordinary entries receive argument 1.
@@ -904,6 +913,7 @@ impl TransferCode {
             code,
             code_info,
             code_len: emitted.code.len(),
+            frame_entry: emitted.frame_entry,
             ordinary_entry: emitted.ordinary_entry,
             ordinary_stack_required: emitted.ordinary_stack_required,
             _ordinary_arity: ordinary_arity,

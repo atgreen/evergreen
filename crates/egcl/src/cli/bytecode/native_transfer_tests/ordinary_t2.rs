@@ -1576,8 +1576,8 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
     let descriptor = unsafe { &*(descriptor as *const egcl_rt::call_table::OrdinaryEntryDescriptor) };
     assert_eq!(descriptor.arity, 4);
     assert!(descriptor.is_compatible());
-    assert!(unsafe { call_table::mapped_callee(Arc::as_ptr(&cell) as u64) }.is_none(),
-        "ordinary-only code cannot enter the legacy mapped adapter");
+    assert!(unsafe { call_table::mapped_callee(Arc::as_ptr(&cell) as u64) }.is_some(),
+        "dual-entry leaves retain their managed-slot adapter");
 }
 
 #[test]

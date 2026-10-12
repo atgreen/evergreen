@@ -660,6 +660,8 @@ fn float_operand_to_xmm(
 ///   are already in the argument registers `[rcx, r8, r9, r10]` (arg0..arg3), so
 ///   a compiled caller skips the frame load entirely. Result in rax.
 pub struct FramedCode {
+    /// Managed-slot entry, absent when this artifact only accepts native arguments.
+    pub frame_entry: Option<usize>,
     /// Distinct ordinary Lisp ABI entry; never a legacy or managed adapter.
     /// Installation also requires validated runtime admission and ownership.
     pub ordinary_entry: Option<usize>,
@@ -7035,6 +7037,7 @@ fn emit_framed_inner(
     let ordinary_stack_required = None;
 
     Ok(FramedCode {
+        frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,
         ordinary_stack_required,
         native_recursive_entry,

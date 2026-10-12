@@ -313,9 +313,9 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         return None;
     }
     if let NativeCodeStorage::Mapped(mapped) = &code._storage {
-        if mapped.ordinary_entry.is_some() || mapped.needs_recompile() {
-            // The ordinary entry owns refresh/publication; do not rewrite a
-            // cell's retained target without its linkage revision transition.
+        if mapped.mapped_entry().is_none() || mapped.needs_recompile() {
+            // Only explicitly advertised managed-slot entries accept this adapter.
+            // Refresh still belongs to the linkage revision transition.
             return None;
         }
         let body = code.body.as_ref()?;
@@ -337,7 +337,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         && *cached_key == key
         && entry.code.as_ref().is_none_or(|code| !code.needs_recompile())
     {
-        return entry.code.clone().map(|code| MappedCallee {
+        return entry.code.clone().filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
             code,
             function: *function,
         });
@@ -349,7 +349,7 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         key,
         super::native_segment_cache::SegmentCacheEntry::new(&body, code.clone()),
     ));
-    code.map(|code| MappedCallee {
+    code.filter(|code| code.mapped_entry().is_some()).map(|code| MappedCallee {
         code,
         function: *function,
     })
