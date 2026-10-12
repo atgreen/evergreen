@@ -932,14 +932,25 @@ fn framed_stack_disp(slot: u32) -> i32 {
 fn load_home(a: &mut Asm, dst: u8, home: FramedHome, rsp_adjust: i32) {
     match home {
         FramedHome::Reg(src) => mov_rr(a, dst, src),
-        FramedHome::Stack(slot) => load_from_rsp(a, dst, framed_stack_disp(slot) + rsp_adjust),
+        FramedHome::Stack(slot) => {
+            let displacement = framed_stack_disp(slot) + rsp_adjust;
+            if let Some(source) = a.preceding_rsp_store(displacement) {
+                mov_rr(a, dst, source);
+            } else {
+                load_from_rsp(a, dst, displacement);
+            }
+        }
     }
 }
 
 fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
     match home {
         FramedHome::Reg(dst) => mov_rr(a, dst, src),
-        FramedHome::Stack(slot) => store_to_rsp(a, src, framed_stack_disp(slot) + rsp_adjust),
+        FramedHome::Stack(slot) => {
+            let displacement = framed_stack_disp(slot) + rsp_adjust;
+            store_to_rsp(a, src, displacement);
+            a.remember_rsp_store(displacement, src);
+        }
     }
 }
 
@@ -9430,3 +9441,31 @@ mod poll_map_tests {
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 #[path = "emit_raw_float_tests.rs"]
 mod raw_float_tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod adjacent_home_tests {
+    use super::*;
+    #[test]
+    fn immediately_reloaded_home_uses_stored_register() {
+        let mut a = Asm::new();
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let store_end = a.here();
+        load_home(&mut a, RAX, FramedHome::Stack(3), 0);
+        assert_eq!(a.here(), store_end, "same-register reload must disappear");
+        load_home(&mut a, 11, FramedHome::Stack(3), 0);
+        let code = a.finish().unwrap();
+        assert_eq!(&code[store_end..], &[0x49, 0x89, 0xc3]);
+    }
+    #[test]
+    fn home_reload_after_label_or_stack_change_stays_in_memory() {
+        let mut a = Asm::new();
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let end = a.here(); let label = a.label(); a.bind(label);
+        load_home(&mut a, RAX, FramedHome::Stack(3), 0);
+        assert!(a.here() > end);
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let end = a.here();
+        load_home(&mut a, RAX, FramedHome::Stack(3), 8);
+        assert!(a.here() > end);
+    }
+}
