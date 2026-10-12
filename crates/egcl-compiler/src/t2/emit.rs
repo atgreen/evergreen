@@ -153,6 +153,10 @@ pub use ordinary_leaf::{emit_framed_ordinary_leaf, OrdinaryLispEntryOptions};
 mod ordinary_call;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_prefix.rs"]
+mod ordinary_prefix;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -5711,6 +5715,7 @@ fn emit_framed_inner(
         a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
         a.bind(accepted);
         a.bind(ordinary_self_entry);
+        ordinary_prefix::emit(&mut a, f, options.arity, &single_returns);
         emit_prologue(&mut a);
         let incoming = [7, 6, 2]; // RDI, RSI, RDX; overflow follows return PC.
         let incoming_stack = spill_bytes / 8 + usize::from(pad) + saved.len() + 1;

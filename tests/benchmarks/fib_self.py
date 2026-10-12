@@ -64,19 +64,33 @@ def parse_trial(stdout, side, sample_count=SAMPLES):
             base = int(base_match[1])
             instructions = dict((int(offset, 16), text.strip().lower()) for offset, text in
                                 re.findall(r"^\s*\+([0-9a-fA-F]+):\s*(.*?)\s*$", listing, re.M))
-            # In 64-bit mode a numeric near CALL is RIP-relative. Register and
-            # memory indirect calls do not match. Both targets must be the same
-            # in-body RBP prologue; ordinary self calls skip the arity check.
+            # Identify the accepted public arity branch, rather than assuming
+            # its target starts with PUSH RBP: it may now contain an early return.
+            # This also rejects unrelated internal prologues as self-call proof.
+            ordered = list(instructions.items())
+            accepted = set()
+            for index in range(len(ordered) - 3):
+                gate = [text for _, text in ordered[index:index + 4]]
+                if (re.fullmatch(r"cmp\s+rcx,\s*1h?", gate[0])
+                        and re.match(r"mov\s+r11,", gate[2])
+                        and gate[3] == "jmp r11"):
+                    match = re.fullmatch(r"je\s+(?:near\s+)?(?:0x([0-9a-f]+)|([0-9a-f]+)h)", gate[1])
+                    if match:
+                        target = int(match[1] or match[2], 16) - base
+                        if target in instructions:
+                            accepted.add(target)
+            # Numeric near CALLs are RIP-relative in 64-bit mode. Indirect
+            # calls do not match; both edges must target the accepted entry.
             calls = []
             for offset, instruction in instructions.items():
                 match = re.match(r"call\s+(?:0x([0-9a-f]+)|([0-9a-f]+)h)(?:\s|$)", instruction)
                 if match:
                     target = int(match[1] or match[2], 16) - base
-                    if re.match(r"push\s+rbp(?:\s|$)", instructions.get(target, "")):
+                    if target in accepted:
                         calls.append((offset, target))
             counts = Counter(target for _, target in calls)
-            if len(calls) != 2 or len(counts) != 1:
-                raise ValueError("AFTER must show two relative self calls to one ordinary prologue")
+            if len(accepted) != 1 or len(calls) != 2 or len(counts) != 1:
+                raise ValueError("AFTER must show two relative self calls to the accepted ordinary entry")
             evidence.update(self_call_count=2, self_call_target_offset=calls[0][1],
                             self_call_offsets=[offset for offset, _ in calls], code_base=base)
     rows = re.findall(r"^FIB-SAMPLE (\d+) (\d+) (\d+) (\d+)\s*$", stdout, re.M)
