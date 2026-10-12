@@ -114,3 +114,68 @@ fn ordinary_foreign_guard_uses_retained_callable_after_redefinition() {
     assert_eq!(run_native(&caller, symbol, &[*argument], &mut env).unwrap(),
         EgclVal::from_fixnum(909), "the next invocation must use the new definition");
 }
+
+thread_local! {
+    static RESUME_COLLECTIONS: Cell<u32> = const { Cell::new(0) };
+}
+
+fn collect_during_foreign_guard_resume() {
+    RESUME_COLLECTIONS.with(|count| count.set(count.get() + 1));
+    HeapCollector::new().minor_gc().unwrap();
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_foreign_guard_collection_updates_older_caller_return_home() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(setq *ordinary-guard-home-effects* 0)
+         (defun ordinary-guard-home-effect (x)
+           (setq *ordinary-guard-home-effects* (+ *ordinary-guard-home-effects* 1)) x)
+         (defun ordinary-guard-home-child (x a b c) (+ (ordinary-guard-home-effect x) 1))",
+        &mut env).unwrap();
+    let (_, child) = ordinary_t2::install("ORDINARY-GUARD-HOME-CHILD", "(x a b c)",
+        "((+ (ordinary-guard-home-effect x) 1))", &mut env);
+    let (symbol, caller) = ordinary_t2::install("ORDINARY-GUARD-HOME-CALLER", "(x n held)",
+        "((ordinary-guard-home-child x nil nil nil) (+ n 1) held)", &mut env);
+    for code in [&child, &caller] {
+        assert!(mapped(code).ordinary_entry.is_some());
+        assert!(mapped(code).mapped_entry().is_none());
+    }
+    // A has no incoming overflow capacity for B's fourth argument. Its
+    // post-call arithmetic/return also requires a genuine continuation.
+    assert!(mapped(&caller).value_maps_for_test().iter().next().is_some());
+    for _ in 0..2 {
+        assert_eq!(run_native(&caller, symbol, &[
+            EgclVal::from_fixnum(10), EgclVal::from_fixnum(7), EgclVal::from_fixnum(99),
+        ], &mut env).unwrap(), EgclVal::from_fixnum(99));
+    }
+    crate::cli::read_eval_all_env("(setq *ordinary-guard-home-effects* 0)", &mut env).unwrap();
+    HeapCollector::new().minor_gc().unwrap();
+    egcl_rt::rooted!(input = egcl_rt::gc::alloc_double_float(2.5));
+    egcl_rt::rooted!(held = crate::cli::arena_cons(EgclVal::from_fixnum(941), NIL));
+    let original = held.to_raw();
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    RESUME_COLLECTIONS.with(|count| count.set(0));
+    // The hook runs with B's precise guard payload rooted, before resuming
+    // its generic continuation. A remains physically suspended throughout GC.
+    let result = native_transfer_entry::with_ordinary_guard_resume_observer_for_test(
+        collect_during_foreign_guard_resume,
+        || run_native(&caller, symbol, &[*input, EgclVal::from_fixnum(7), *held], &mut env),
+    ).unwrap();
+    assert_eq!(RESUME_COLLECTIONS.with(Cell::get), 1);
+    assert_ne!(held.to_raw(), original, "the observed guard collection must relocate held");
+    // held is never passed to B. Its external root keeps it live but cannot
+    // rewrite A's separate native return home. Check raw equality before
+    // dereferencing result, so a missing native-root update fails cleanly.
+    assert_eq!(result.to_raw(), held.to_raw(), "A must return its relocated native home");
+    assert_eq!(crate::cli::cp(result), (EgclVal::from_fixnum(941), NIL));
+    assert_eq!(mapped(&child).deopt_count(), 1);
+    assert_eq!(mapped(&caller).deopt_count(), 0, "A must read held in native code, not T0");
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(crate::cli::read_eval_all_env("*ordinary-guard-home-effects*", &mut env).unwrap(),
+        EgclVal::from_fixnum(1));
+}
