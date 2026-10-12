@@ -6922,11 +6922,13 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     // allocator and refills from the restored region state.
     GC_MOVE_EPOCH.fetch_add(1, Ordering::Release);
 
-    // Pass 1: materialize every object, recording old-body → new-body. Pre-size
+    // Pass 1: materialize every object, recording payload and tagged identity
+    // translations separately when an extended header makes them differ. Pre-size
     // to a generous estimate of the object count (each record is a >=13-byte
     // header plus payload) so the per-object inserts never trigger a rehash
     // (bliss-pohq: the rehash storm dominated large restores).
     let mut map = ImageRelocations::with_object_capacity(data.len() / 24 + 16);
+    let mut restored = Vec::new();
     let mut offset = 0usize;
     let mut targets = [None; 2];
     while offset < data.len() {
@@ -6946,9 +6948,18 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
                 "truncated heap object payload".into(),
             ));
         }
+        let header_offset = body_header_offset(size);
+        let old_identity = old_body
+            .checked_sub(header_offset)
+            .and_then(|header| header.checked_add(OBJECT_HEADER_SIZE))
+            .ok_or_else(|| EgclError::InvalidImage("invalid saved object address".into()))?;
         let new_body =
             append_serialized_object(state, type_id, &data[offset..offset + size], &mut targets)?;
         map.insert_object(old_body, new_body);
+        if header_offset != OBJECT_HEADER_SIZE {
+            map.insert_object(old_identity, new_body - header_offset + OBJECT_HEADER_SIZE);
+        }
+        restored.push((new_body, size, header_offset));
         offset += size;
     }
 
@@ -6961,7 +6972,8 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     // holding the heap lock across it is safe (no GC, no heap_state re-entry).
     // `map` holds only GC-heap objects (Pass 1). `full_map` additionally holds the
     // off-heap object addresses; it is used for POINTER LOOKUPS (remap), while the
-    // Pass-2 pin/field-walk below iterates only `map` (real GC-heap objects).
+    // Pass-2 pin/field-walk below uses the actual payload records, not map
+    // targets: extended objects contribute two aliases for one allocation.
     let mut full_map = map.clone();
     let have_offheap = {
         let pend = PENDING_OFFHEAP.lock().unwrap();
@@ -6976,7 +6988,8 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
                 // reference's masked address is the header, body = header +
                 // OBJECT_HEADER_SIZE — the key ImageRelocations::remap looks up for a
                 // TAG_HEAP_OBJECT reference.
-                full_map.insert_object(old_body + OBJECT_HEADER_SIZE, new_body + OBJECT_HEADER_SIZE);
+                full_map
+                    .insert_object(old_body + OBJECT_HEADER_SIZE, new_body + OBJECT_HEADER_SIZE);
             }
         }
     }
@@ -6988,15 +7001,13 @@ pub fn restore_heap(data: &[u8]) -> Result<(), EgclError> {
     // allocation) must never relocate it out from under them. Pinning marks each
     // restored object's header so `region_has_pinned` retains its nursery region
     // in place; fresh mutator garbage still collects normally in other regions.
-    for &new_body in map.object_targets() {
-        let header = (new_body - OBJECT_HEADER_SIZE) as *const u8;
+    for (new_body, body_size, header_offset) in restored {
         unsafe {
-            let hdr = (new_body - OBJECT_HEADER_SIZE) as *mut ObjectHeader;
+            let hdr = (new_body - header_offset) as *mut ObjectHeader;
             (*hdr).set_pinned();
         }
-        let (_type_id, body_size) = unsafe { read_object_header(header) };
         let mut fo = 0usize;
-        while fo + 8 <= body_size as usize {
+        while fo + 8 <= body_size {
             let field = unsafe { (new_body as *mut u8).add(fo) as *mut u64 };
             let raw = unsafe { std::ptr::read_unaligned(field) };
             let new_raw = full_map.remap(raw);
@@ -7943,6 +7954,139 @@ mod restore_target_tests {
 
     thread_local! {
         pub(super) static TARGET_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn extended_objects_restore_real_headers_and_tagged_links() {
+        const CHILD: &str = "EGCL_TEST_EXTENDED_RESTORE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for stress in [false, true] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "gc::restore_target_tests::extended_objects_restore_real_headers_and_tagged_links", "--nocapture"])
+                    .env(CHILD, "1").env_remove("EGCL_GC_STRESS").env_remove("EGCL_GC_STRESS_SKIP")
+                    .env_remove("EGCL_GC_STRESS_AFTER_INIT").env_remove("EGCL_GC_DISABLE")
+                    .env_remove("EGCL_GC_STRESS_AT").env_remove("EGCL_GC_POISON");
+                if stress {
+                    command
+                        .env("EGCL_GC_STRESS", "1")
+                        .env("EGCL_GC_POISON", "1");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "stress={stress}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        }
+        let config = GcConfig {
+            heap_size: 8 << 20,
+            heap_max: 8 << 20,
+            nursery_size: 1 << 20,
+            region_size: 1 << 20,
+            tlab_size: 32 << 10,
+            promotion_threshold: 2,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 64,
+            old_occupancy_trigger: 0.5,
+        };
+        init_heap(&config).unwrap();
+        let small_body = alloc_typed(16, crate::object::type_id::SIMPLE_VECTOR).unwrap();
+        unsafe {
+            *(small_body as *mut u64) = 1;
+            *(small_body.add(8) as *mut EgclVal) = EgclVal::from_fixnum(42);
+        }
+        crate::rooted!(
+            small = unsafe { EgclVal::from_heap_ptr(small_body.sub(OBJECT_HEADER_SIZE)) }
+        );
+        let small_before = *small;
+        const SIZE: usize = 600 << 10;
+        let body = alloc_typed(SIZE, crate::object::type_id::SIMPLE_VECTOR).unwrap();
+        unsafe {
+            std::ptr::write_bytes(body, 0, SIZE);
+            *(body as *mut u64) = ((SIZE - 8) / 8) as u64;
+            *(body.add(8) as *mut EgclVal) = *small;
+            *(body.add(SIZE - 8) as *mut EgclVal) = EgclVal::from_fixnum(73);
+        }
+        crate::rooted!(
+            large = unsafe { EgclVal::from_heap_ptr(body.sub(LARGE_OBJECT_PAYLOAD_OFFSET)) }
+        );
+        if gc_stress_stride() != 0 {
+            assert_ne!(
+                *small, small_before,
+                "stress must actually relocate the nursery child"
+            );
+        }
+        for _ in 0..2 {
+            let old_payload = unsafe { large.as_ptr().add(LARGE_OBJECT_PAYLOAD_OFFSET) } as usize;
+            let before_restore = *large;
+            // Reorder actual serialized records so restore cannot accidentally
+            // validate a missing relocation by reusing the original addresses.
+            let saved = serialize_heap_objects();
+            let mut records = Vec::new();
+            let mut offset = 0;
+            while offset < saved.len() {
+                let size =
+                    u32::from_le_bytes(saved[offset + 9..offset + 13].try_into().unwrap()) as usize;
+                let end = offset + 13 + size;
+                records.push(&saved[offset..end]);
+                offset = end;
+            }
+            let bytes: Vec<u8> = records.into_iter().rev().flatten().copied().collect();
+            restore_heap(&bytes).unwrap();
+            *large = EgclVal(remap_saved_pointer(large.0));
+            *small = EgclVal(remap_saved_pointer(small.0));
+            assert_ne!(
+                *large, before_restore,
+                "large identity must actually relocate"
+            );
+            let header = unsafe { large.as_ptr() };
+            assert_eq!(
+                unsafe { header_at(header) }.type_id(),
+                crate::object::type_id::SIMPLE_VECTOR
+            );
+            assert_eq!(
+                unsafe { header_at(header) }.size_units(),
+                LARGE_SIZE_SENTINEL
+            );
+            assert_eq!(
+                unsafe { header_total_bytes(header) },
+                object_footprint(SIZE).0
+            );
+            assert_eq!(unsafe { header_exact_body_len(header) }, SIZE);
+            assert!(unsafe { header_is_pinned(header) });
+            let payload = unsafe { header.add(LARGE_OBJECT_PAYLOAD_OFFSET) };
+            assert_eq!(
+                remap_saved_address(old_payload),
+                payload as usize,
+                "raw payload alias"
+            );
+            assert_eq!(unsafe { *(payload as *const u64) }, ((SIZE - 8) / 8) as u64);
+            assert_eq!(unsafe { *(payload.add(8) as *const EgclVal) }, *small);
+            assert_eq!(
+                unsafe { *(payload.add(SIZE - 8) as *const EgclVal) },
+                EgclVal::from_fixnum(73)
+            );
+            assert_eq!(
+                unsafe { header_at(small.as_ptr()) }.type_id(),
+                crate::object::type_id::SIMPLE_VECTOR
+            );
+            assert!(unsafe { header_is_pinned(small.as_ptr()) });
+            assert_eq!(
+                unsafe { *(small.as_ptr().add(16) as *const EgclVal) },
+                EgclVal::from_fixnum(42)
+            );
+            let before = *large;
+            collect_t0_minor().unwrap();
+            assert_eq!(*large, before, "restored image address must stay pinned");
+            assert_eq!(
+                unsafe { header_total_bytes(large.as_ptr()) },
+                object_footprint(SIZE).0
+            );
+        }
     }
 
     #[test]

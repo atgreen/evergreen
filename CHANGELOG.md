@@ -8,6 +8,9 @@
 - Convert huge rational values to floating point without intermediate infinity, preserving subnormal values and correct rounding.
   ([#304](https://github.com/atgreen/evergreen/pull/304)).
 
+- Preserve large-object identities, payload references, and true header pinning when restoring and resaving heap images.
+  ([#305](https://github.com/atgreen/evergreen/pull/305)).
+
 ## 0.0.7 - 2026-10-12
 
 - Use the new x86-64 Linux Lisp register ABI for supported T1/T2 functions,

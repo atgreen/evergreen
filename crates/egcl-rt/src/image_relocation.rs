@@ -73,6 +73,8 @@ impl ImageRelocations {
         self.objects.insert(saved_body, restored_body)
     }
 
+    // Restore walks explicit payload/size records; map targets can be aliases.
+    #[cfg(test)]
     pub(crate) fn object_targets(&self) -> impl Iterator<Item = &usize> {
         self.objects.values()
     }
