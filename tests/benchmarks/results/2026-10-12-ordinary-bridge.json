@@ -1,0 +1,1061 @@
+{
+  "metric": "Forward minus direct loop ns/iteration; includes guards, bookkeeping and return, not a single CALL.",
+  "review_required": "Inspect retained ordinary entry guards/argument movement/CF teardown and matched outer dispatch.",
+  "build_description": "Matched GitHub ubuntu24.04 CI Rust1.94.1 e408947bfd200af42db322daf0fadfe7e26d3bd1, --profile release --target x86_64-unknown-linux-musl, empty features, thinLTO codegen-units1 opt-level3. Build logs /tmp/bliss-t8a48-{baseline,after}-ci/build.log. After runtime artifact051fed7b unchanged by standalone image-label test fixef6cdce0; corrected standalone test passed separately, finalCI pending. Quiet window: all agents held builds/tests.",
+  "host": {
+    "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43",
+    "cpu": 4,
+    "cpuinfo": "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1553.243\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 0\ncpu cores\t: 16\napicid\t\t: 0\ninitial apicid\t: 0\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 1\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 2000.020\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 4\ncpu cores\t: 16\napicid\t\t: 8\ninitial apicid\t: 8\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 2\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1373.034\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 16\ncpu cores\t: 16\napicid\t\t: 32\ninitial apicid\t: 32\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 3\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1464.818\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 20\ncpu cores\t: 16\napicid\t\t: 40\ninitial apicid\t: 40\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 4\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 24\ncpu cores\t: 16\napicid\t\t: 48\ninitial apicid\t: 48\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 5\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1531.149\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 28\ncpu cores\t: 16\napicid\t\t: 56\ninitial apicid\t: 56\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 6\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1198.183\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 8\ncpu cores\t: 16\napicid\t\t: 16\ninitial apicid\t: 16\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 7\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 9\ncpu cores\t: 16\napicid\t\t: 18\ninitial apicid\t: 18\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 8\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1395.572\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 10\ncpu cores\t: 16\napicid\t\t: 20\ninitial apicid\t: 20\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 9\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 11\ncpu cores\t: 16\napicid\t\t: 22\ninitial apicid\t: 22\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 10\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1400.565\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 12\ncpu cores\t: 16\napicid\t\t: 24\ninitial apicid\t: 24\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 11\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 13\ncpu cores\t: 16\napicid\t\t: 26\ninitial apicid\t: 26\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 12\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 14\ncpu cores\t: 16\napicid\t\t: 28\ninitial apicid\t: 28\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 13\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1299.330\ncache size\t: 24576 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 15\ncpu cores\t: 16\napicid\t\t: 30\ninitial apicid\t: 30\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 14\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 400.000\ncache size\t: 2048 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 32\ncpu cores\t: 16\napicid\t\t: 64\ninitial apicid\t: 64\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\nprocessor\t: 15\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 197\nmodel name\t: Intel(R) Core(TM) Ultra 7 255H\nstepping\t: 2\nmicrocode\t: 0x122\ncpu MHz\t\t: 1100.001\ncache size\t: 2048 KB\nphysical id\t: 0\nsiblings\t: 16\ncore id\t\t: 33\ncpu cores\t: 16\napicid\t\t: 66\ninitial apicid\t: 66\nfpu\t\t: yes\nfpu_exception\t: yes\ncpuid level\t: 35\nwp\t\t: yes\nflags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nvmx flags\t: vnmi preemption_timer posted_intr invvpid ept_x_only ept_ad ept_1gb flexpriority apicv tsc_offset vtpr mtf vapic ept vpid unrestricted_guest vapic_reg vid ple shadow_vmcs pml ept_violation_ve ept_mode_based_exec tsc_scaling usr_wait_pause notify_vm_exiting ipi_virt\nbugs\t\t: spectre_v1 spectre_v2 spec_store_bypass swapgs bhi spectre_v2_user vmscape\nbogomips\t: 7372.80\nclflush size\t: 64\ncache_alignment\t: 64\naddress sizes\t: 42 bits physical, 48 bits virtual\npower management:\n\n",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "governor": "powersave"
+  },
+  "iterations": 100000,
+  "binaries": {
+    "before": {
+      "revision": "33a09236691db374b96916df453ed8bf38a85ea9",
+      "source_digest": "2bacbeb969d8ceeaa1d2d0c2a93b34753303d537dbe5279fa3fb7b6c03cf9622",
+      "profile": "release",
+      "target": "x86_64-unknown-linux-musl",
+      "features": "",
+      "binary": "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+      "sha256": "0713716cc07ec4f1b7b7323d57c9e34ac4ff8572e987fd55889c4c9d1b152fc7",
+      "manifest": "/tmp/bliss-t8a48-baseline-ci/extracted/target/ci-tests/manifest.json",
+      "manifest_sha256": "8384f9db3a1135bf5186572c25101189bb203c6aa9f12a0700297ad5aec70a42",
+      "run_id": "38190922517",
+      "artifact_id": "11720748549"
+    },
+    "after": {
+      "revision": "051fed7b02018150844d6a078f9f3c75aa5bb9e7",
+      "source_digest": "ab78962088b1d1793f33313c6c366bdf01cef76a8c5f67c4de8f07d4f8c4ee6e",
+      "profile": "release",
+      "target": "x86_64-unknown-linux-musl",
+      "features": "",
+      "binary": "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+      "sha256": "1622240a06b8953e7c3e51d0821b2aef8adc95d3f4ba1feb3950b37c4a77beb9",
+      "manifest": "/tmp/bliss-t8a48-after-ci/extracted/target/ci-tests/manifest.json",
+      "manifest_sha256": "369999c17e586cbcf3525800e1b7c3c8f4ca66e297363fc20e877cacb5692b6a",
+      "run_id": "38191501416",
+      "artifact_id": "11720754431"
+    }
+  },
+  "trials": [
+    {
+      "side": "before",
+      "trial": 0,
+      "started_unix": 1791768613.1925735,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-0.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.71337890625,
+        2.208984375,
+        2.2626953125
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.603515625,
+        2.16845703125,
+        2.2490234375
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 226858444,
+          "forward_ns": 478787562,
+          "increment_ns": 251929118
+        },
+        {
+          "pair": 1,
+          "direct_ns": 226800218,
+          "forward_ns": 478757975,
+          "increment_ns": 251957757
+        },
+        {
+          "pair": 2,
+          "direct_ns": 226544180,
+          "forward_ns": 477642050,
+          "increment_ns": 251097870
+        },
+        {
+          "pair": 3,
+          "direct_ns": 226405906,
+          "forward_ns": 477927101,
+          "increment_ns": 251521195
+        },
+        {
+          "pair": 4,
+          "direct_ns": 226115162,
+          "forward_ns": 478165407,
+          "increment_ns": 252050245
+        },
+        {
+          "pair": 5,
+          "direct_ns": 226550366,
+          "forward_ns": 477789796,
+          "increment_ns": 251239430
+        },
+        {
+          "pair": 6,
+          "direct_ns": 226557876,
+          "forward_ns": 477934952,
+          "increment_ns": 251377076
+        },
+        {
+          "pair": 7,
+          "direct_ns": 226692207,
+          "forward_ns": 479094488,
+          "increment_ns": 252402281
+        },
+        {
+          "pair": 8,
+          "direct_ns": 226550096,
+          "forward_ns": 479095498,
+          "increment_ns": 252545402
+        }
+      ]
+    },
+    {
+      "side": "after",
+      "trial": 0,
+      "started_unix": 1791768623.0364907,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-0.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.603515625,
+        2.16845703125,
+        2.2490234375
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.58447265625,
+        2.14599609375,
+        2.24072265625
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 279744794,
+          "forward_ns": 280535079,
+          "increment_ns": 790285
+        },
+        {
+          "pair": 1,
+          "direct_ns": 280852694,
+          "forward_ns": 279683070,
+          "increment_ns": -1169624
+        },
+        {
+          "pair": 2,
+          "direct_ns": 279269967,
+          "forward_ns": 280550739,
+          "increment_ns": 1280772
+        },
+        {
+          "pair": 3,
+          "direct_ns": 277838467,
+          "forward_ns": 279785426,
+          "increment_ns": 1946959
+        },
+        {
+          "pair": 4,
+          "direct_ns": 277225382,
+          "forward_ns": 279621720,
+          "increment_ns": 2396338
+        },
+        {
+          "pair": 5,
+          "direct_ns": 276938469,
+          "forward_ns": 279933120,
+          "increment_ns": 2994651
+        },
+        {
+          "pair": 6,
+          "direct_ns": 276659936,
+          "forward_ns": 279079976,
+          "increment_ns": 2420040
+        },
+        {
+          "pair": 7,
+          "direct_ns": 277540582,
+          "forward_ns": 279189311,
+          "increment_ns": 1648729
+        },
+        {
+          "pair": 8,
+          "direct_ns": 277709070,
+          "forward_ns": 280550221,
+          "increment_ns": 2841151
+        }
+      ]
+    },
+    {
+      "side": "after",
+      "trial": 1,
+      "started_unix": 1791768631.1007214,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-1.lisp"
+      ],
+      "workload_sha256": "d13915ede221e6f820fc752ab81e3f9e29f08e93af32f068181786b75845f076",
+      "load_before": [
+        1.58447265625,
+        2.14599609375,
+        2.24072265625
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.53759765625,
+        2.126953125,
+        2.23388671875
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 280438726,
+          "forward_ns": 283127333,
+          "increment_ns": 2688607
+        },
+        {
+          "pair": 1,
+          "direct_ns": 278257668,
+          "forward_ns": 281265997,
+          "increment_ns": 3008329
+        },
+        {
+          "pair": 2,
+          "direct_ns": 279879302,
+          "forward_ns": 281714379,
+          "increment_ns": 1835077
+        },
+        {
+          "pair": 3,
+          "direct_ns": 279403862,
+          "forward_ns": 280961004,
+          "increment_ns": 1557142
+        },
+        {
+          "pair": 4,
+          "direct_ns": 278004783,
+          "forward_ns": 280330667,
+          "increment_ns": 2325884
+        },
+        {
+          "pair": 5,
+          "direct_ns": 278190155,
+          "forward_ns": 281129014,
+          "increment_ns": 2938859
+        },
+        {
+          "pair": 6,
+          "direct_ns": 278798044,
+          "forward_ns": 280023146,
+          "increment_ns": 1225102
+        },
+        {
+          "pair": 7,
+          "direct_ns": 279014532,
+          "forward_ns": 280614151,
+          "increment_ns": 1599619
+        },
+        {
+          "pair": 8,
+          "direct_ns": 278614885,
+          "forward_ns": 280181348,
+          "increment_ns": 1566463
+        }
+      ]
+    },
+    {
+      "side": "before",
+      "trial": 1,
+      "started_unix": 1791768639.1874995,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-1.lisp"
+      ],
+      "workload_sha256": "d13915ede221e6f820fc752ab81e3f9e29f08e93af32f068181786b75845f076",
+      "load_before": [
+        1.53759765625,
+        2.126953125,
+        2.23388671875
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.4541015625,
+        2.08935546875,
+        2.22021484375
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 229010939,
+          "forward_ns": 481355731,
+          "increment_ns": 252344792
+        },
+        {
+          "pair": 1,
+          "direct_ns": 229231126,
+          "forward_ns": 480796808,
+          "increment_ns": 251565682
+        },
+        {
+          "pair": 2,
+          "direct_ns": 229007162,
+          "forward_ns": 480627371,
+          "increment_ns": 251620209
+        },
+        {
+          "pair": 3,
+          "direct_ns": 228963885,
+          "forward_ns": 480626502,
+          "increment_ns": 251662617
+        },
+        {
+          "pair": 4,
+          "direct_ns": 229164864,
+          "forward_ns": 480476904,
+          "increment_ns": 251312040
+        },
+        {
+          "pair": 5,
+          "direct_ns": 229403998,
+          "forward_ns": 481335894,
+          "increment_ns": 251931896
+        },
+        {
+          "pair": 6,
+          "direct_ns": 228983865,
+          "forward_ns": 479748352,
+          "increment_ns": 250764487
+        },
+        {
+          "pair": 7,
+          "direct_ns": 228309307,
+          "forward_ns": 480613937,
+          "increment_ns": 252304630
+        },
+        {
+          "pair": 8,
+          "direct_ns": 228706984,
+          "forward_ns": 481138003,
+          "increment_ns": 252431019
+        }
+      ]
+    },
+    {
+      "side": "before",
+      "trial": 2,
+      "started_unix": 1791768649.0855079,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-2.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.4541015625,
+        2.08935546875,
+        2.22021484375
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.4580078125,
+        2.0693359375,
+        2.2119140625
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 224934164,
+          "forward_ns": 474036458,
+          "increment_ns": 249102294
+        },
+        {
+          "pair": 1,
+          "direct_ns": 224818033,
+          "forward_ns": 473767360,
+          "increment_ns": 248949327
+        },
+        {
+          "pair": 2,
+          "direct_ns": 224668045,
+          "forward_ns": 472620152,
+          "increment_ns": 247952107
+        },
+        {
+          "pair": 3,
+          "direct_ns": 224572015,
+          "forward_ns": 472631688,
+          "increment_ns": 248059673
+        },
+        {
+          "pair": 4,
+          "direct_ns": 224663748,
+          "forward_ns": 473583773,
+          "increment_ns": 248920025
+        },
+        {
+          "pair": 5,
+          "direct_ns": 224997280,
+          "forward_ns": 473437493,
+          "increment_ns": 248440213
+        },
+        {
+          "pair": 6,
+          "direct_ns": 224975492,
+          "forward_ns": 473589606,
+          "increment_ns": 248614114
+        },
+        {
+          "pair": 7,
+          "direct_ns": 224727091,
+          "forward_ns": 473050247,
+          "increment_ns": 248323156
+        },
+        {
+          "pair": 8,
+          "direct_ns": 225718207,
+          "forward_ns": 473903236,
+          "increment_ns": 248185029
+        }
+      ]
+    },
+    {
+      "side": "after",
+      "trial": 2,
+      "started_unix": 1791768658.8378432,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-2.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.4580078125,
+        2.0693359375,
+        2.2119140625
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.38671875,
+        2.03369140625,
+        2.1982421875
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 279274012,
+          "forward_ns": 281594399,
+          "increment_ns": 2320387
+        },
+        {
+          "pair": 1,
+          "direct_ns": 279893356,
+          "forward_ns": 280933259,
+          "increment_ns": 1039903
+        },
+        {
+          "pair": 2,
+          "direct_ns": 279725606,
+          "forward_ns": 281058072,
+          "increment_ns": 1332466
+        },
+        {
+          "pair": 3,
+          "direct_ns": 280078799,
+          "forward_ns": 281752394,
+          "increment_ns": 1673595
+        },
+        {
+          "pair": 4,
+          "direct_ns": 279551305,
+          "forward_ns": 281088748,
+          "increment_ns": 1537443
+        },
+        {
+          "pair": 5,
+          "direct_ns": 279851679,
+          "forward_ns": 281563230,
+          "increment_ns": 1711551
+        },
+        {
+          "pair": 6,
+          "direct_ns": 279932999,
+          "forward_ns": 281234016,
+          "increment_ns": 1301017
+        },
+        {
+          "pair": 7,
+          "direct_ns": 279552424,
+          "forward_ns": 280858109,
+          "increment_ns": 1305685
+        },
+        {
+          "pair": 8,
+          "direct_ns": 279189344,
+          "forward_ns": 280467697,
+          "increment_ns": 1278353
+        }
+      ]
+    },
+    {
+      "side": "after",
+      "trial": 3,
+      "started_unix": 1791768666.914972,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-3.lisp"
+      ],
+      "workload_sha256": "d13915ede221e6f820fc752ab81e3f9e29f08e93af32f068181786b75845f076",
+      "load_before": [
+        1.38671875,
+        2.03369140625,
+        2.1982421875
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.40087890625,
+        2.01513671875,
+        2.18994140625
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 278435977,
+          "forward_ns": 281357790,
+          "increment_ns": 2921813
+        },
+        {
+          "pair": 1,
+          "direct_ns": 278676893,
+          "forward_ns": 279820220,
+          "increment_ns": 1143327
+        },
+        {
+          "pair": 2,
+          "direct_ns": 279160162,
+          "forward_ns": 280902208,
+          "increment_ns": 1742046
+        },
+        {
+          "pair": 3,
+          "direct_ns": 278937018,
+          "forward_ns": 280448339,
+          "increment_ns": 1511321
+        },
+        {
+          "pair": 4,
+          "direct_ns": 277208288,
+          "forward_ns": 280005212,
+          "increment_ns": 2796924
+        },
+        {
+          "pair": 5,
+          "direct_ns": 278647991,
+          "forward_ns": 280206983,
+          "increment_ns": 1558992
+        },
+        {
+          "pair": 6,
+          "direct_ns": 280727415,
+          "forward_ns": 279737955,
+          "increment_ns": -989460
+        },
+        {
+          "pair": 7,
+          "direct_ns": 277815234,
+          "forward_ns": 280113925,
+          "increment_ns": 2298691
+        },
+        {
+          "pair": 8,
+          "direct_ns": 277932991,
+          "forward_ns": 279559363,
+          "increment_ns": 1626372
+        }
+      ]
+    },
+    {
+      "side": "before",
+      "trial": 3,
+      "started_unix": 1791768674.9765468,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-3.lisp"
+      ],
+      "workload_sha256": "d13915ede221e6f820fc752ab81e3f9e29f08e93af32f068181786b75845f076",
+      "load_before": [
+        1.40087890625,
+        2.01513671875,
+        2.18994140625
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.3388671875,
+        1.9814453125,
+        2.17626953125
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 225158273,
+          "forward_ns": 474118717,
+          "increment_ns": 248960444
+        },
+        {
+          "pair": 1,
+          "direct_ns": 224983972,
+          "forward_ns": 473030068,
+          "increment_ns": 248046096
+        },
+        {
+          "pair": 2,
+          "direct_ns": 225277196,
+          "forward_ns": 472759300,
+          "increment_ns": 247482104
+        },
+        {
+          "pair": 3,
+          "direct_ns": 225141491,
+          "forward_ns": 473419596,
+          "increment_ns": 248278105
+        },
+        {
+          "pair": 4,
+          "direct_ns": 225206371,
+          "forward_ns": 473529055,
+          "increment_ns": 248322684
+        },
+        {
+          "pair": 5,
+          "direct_ns": 225525864,
+          "forward_ns": 473563916,
+          "increment_ns": 248038052
+        },
+        {
+          "pair": 6,
+          "direct_ns": 225159545,
+          "forward_ns": 473061108,
+          "increment_ns": 247901563
+        },
+        {
+          "pair": 7,
+          "direct_ns": 225291185,
+          "forward_ns": 473261046,
+          "increment_ns": 247969861
+        },
+        {
+          "pair": 8,
+          "direct_ns": 225008694,
+          "forward_ns": 473782541,
+          "increment_ns": 248773847
+        }
+      ]
+    },
+    {
+      "side": "before",
+      "trial": 4,
+      "started_unix": 1791768684.7302425,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-baseline-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-4.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.3388671875,
+        1.9814453125,
+        2.17626953125
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.2861328125,
+        1.94873046875,
+        2.16357421875
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 225152795,
+          "forward_ns": 476768348,
+          "increment_ns": 251615553
+        },
+        {
+          "pair": 1,
+          "direct_ns": 225188602,
+          "forward_ns": 476364420,
+          "increment_ns": 251175818
+        },
+        {
+          "pair": 2,
+          "direct_ns": 225003457,
+          "forward_ns": 475143521,
+          "increment_ns": 250140064
+        },
+        {
+          "pair": 3,
+          "direct_ns": 224827163,
+          "forward_ns": 474764820,
+          "increment_ns": 249937657
+        },
+        {
+          "pair": 4,
+          "direct_ns": 224800690,
+          "forward_ns": 475155307,
+          "increment_ns": 250354617
+        },
+        {
+          "pair": 5,
+          "direct_ns": 224722194,
+          "forward_ns": 474996822,
+          "increment_ns": 250274628
+        },
+        {
+          "pair": 6,
+          "direct_ns": 225288205,
+          "forward_ns": 476722727,
+          "increment_ns": 251434522
+        },
+        {
+          "pair": 7,
+          "direct_ns": 224855889,
+          "forward_ns": 475633481,
+          "increment_ns": 250777592
+        },
+        {
+          "pair": 8,
+          "direct_ns": 224728887,
+          "forward_ns": 475306359,
+          "increment_ns": 250577472
+        }
+      ]
+    },
+    {
+      "side": "after",
+      "trial": 4,
+      "started_unix": 1791768694.5324593,
+      "command": [
+        "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-t8a48-quiet/workload-4.lisp"
+      ],
+      "workload_sha256": "c93cd064550dd7c4dfe5f323bc400ab91c9a10053fa3b49c7e036cbbcd1c9516",
+      "load_before": [
+        1.2861328125,
+        1.94873046875,
+        2.16357421875
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.26318359375,
+        1.9326171875,
+        2.1572265625
+      ],
+      "pairs": [
+        {
+          "pair": 0,
+          "direct_ns": 280145560,
+          "forward_ns": 281059522,
+          "increment_ns": 913962
+        },
+        {
+          "pair": 1,
+          "direct_ns": 279383001,
+          "forward_ns": 281260290,
+          "increment_ns": 1877289
+        },
+        {
+          "pair": 2,
+          "direct_ns": 280039330,
+          "forward_ns": 281968104,
+          "increment_ns": 1928774
+        },
+        {
+          "pair": 3,
+          "direct_ns": 278666264,
+          "forward_ns": 280179791,
+          "increment_ns": 1513527
+        },
+        {
+          "pair": 4,
+          "direct_ns": 279273141,
+          "forward_ns": 280079587,
+          "increment_ns": 806446
+        },
+        {
+          "pair": 5,
+          "direct_ns": 279347517,
+          "forward_ns": 280978080,
+          "increment_ns": 1630563
+        },
+        {
+          "pair": 6,
+          "direct_ns": 279185568,
+          "forward_ns": 281158421,
+          "increment_ns": 1972853
+        },
+        {
+          "pair": 7,
+          "direct_ns": 278937109,
+          "forward_ns": 281331164,
+          "increment_ns": 2394055
+        },
+        {
+          "pair": 8,
+          "direct_ns": 279019087,
+          "forward_ns": 280066094,
+          "increment_ns": 1047007
+        }
+      ]
+    }
+  ],
+  "warmed_edge": {
+    "command": [
+      "/home/green/git/evergreen/target/ordinary-bridge-benchmark/scripts/egcl-limited.sh",
+      "/tmp/bliss-t8a48-after-ci/extracted/target/x86_64-unknown-linux-musl/release/deps/egcl-9420fa6eb18df984",
+      "cli::bytecode::native_transfer_tests::ordinary_t2::ordinary_register_abi_installs_and_warms_a_four_argument_call",
+      "--exact",
+      "--include-ignored",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "sha256": "b0bad94c95c3fa04e2ab3f7b3344ab59ba3940862699d715ef07ce36053b1076",
+    "test": "cli::bytecode::native_transfer_tests::ordinary_t2::ordinary_register_abi_installs_and_warms_a_four_argument_call",
+    "scope": "Equivalent four-argument bridge takes zero cold handoffs after warming. Not a measurement of fallback count in each timed process."
+  },
+  "summary": {
+    "before": {
+      "direct_ns": {
+        "count": 45,
+        "min_ns_per_iteration": 2245.72015,
+        "median_ns_per_iteration": 2252.77196,
+        "p95_ns_per_iteration": 2291.64864,
+        "max_ns_per_iteration": 2294.03998,
+        "percentile_method": "nearest rank"
+      },
+      "forward_ns": {
+        "count": 45,
+        "min_ns_per_iteration": 4726.20152,
+        "median_ns_per_iteration": 4753.06359,
+        "p95_ns_per_iteration": 4811.38003,
+        "max_ns_per_iteration": 4813.55731,
+        "percentile_method": "nearest rank"
+      },
+      "increment_ns": {
+        "count": 45,
+        "min_ns_per_iteration": 2474.82104,
+        "median_ns_per_iteration": 2505.77472,
+        "p95_ns_per_iteration": 2524.02281,
+        "max_ns_per_iteration": 2525.45402,
+        "percentile_method": "nearest rank"
+      }
+    },
+    "after": {
+      "direct_ns": {
+        "count": 45,
+        "min_ns_per_iteration": 2766.59936,
+        "median_ns_per_iteration": 2791.60162,
+        "p95_ns_per_iteration": 2804.38726,
+        "max_ns_per_iteration": 2808.52694,
+        "percentile_method": "nearest rank"
+      },
+      "forward_ns": {
+        "count": 45,
+        "min_ns_per_iteration": 2790.79976,
+        "median_ns_per_iteration": 2805.50739,
+        "p95_ns_per_iteration": 2817.52394,
+        "max_ns_per_iteration": 2831.27333,
+        "percentile_method": "nearest rank"
+      },
+      "increment_ns": {
+        "count": 45,
+        "min_ns_per_iteration": -11.69624,
+        "median_ns_per_iteration": 16.30563,
+        "p95_ns_per_iteration": 29.38859,
+        "max_ns_per_iteration": 30.08329,
+        "percentile_method": "nearest rank"
+      }
+    }
+  },
+  "validation": {
+    "original_after_ci": {
+      "run": 38191501416,
+      "status": "build and lint passed; sole regression failure was mapped-only disassembly label expectation"
+    },
+    "corrected_test": {
+      "commit": "ef6cdce0e4dad189ad5193be32a323e5bcf545f3",
+      "result": "\nrunning 1 test\ntest restored_callable_dispatch_preserves_multiple_values ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.26s\n\n",
+      "scope": "Standalone corrected save/restore/MV test against the original exact measured release binary; only test source changed."
+    },
+    "final_ci": {
+      "run": 38192004707,
+      "head": "ef6cdce0e4dad189ad5193be32a323e5bcf545f3",
+      "required": "passed"
+    },
+    "regression_bead": "bliss-zsz0x"
+  },
+  "ci_archive_provenance": {
+    "before": {
+      "run_id": 38190922517,
+      "artifact_id": 11720748549,
+      "head": "5c636edb",
+      "archive_sha256": "9b4c1907571e688215e4e0976c7654c50cac0b9fa88c8425cec1aac7740d3a55",
+      "build_log_sha256": "37705cb43dcadb659b0a68b84d019befa46a51e23a867bc542ce387301105379",
+      "rustc": "1.94.1 e408947bfd200af42db322daf0fadfe7e26d3bd1",
+      "release": {
+        "lto": "thin",
+        "codegen-units": 1,
+        "opt-level": 3,
+        "target": "x86_64-unknown-linux-musl",
+        "features": ""
+      }
+    },
+    "after": {
+      "run_id": 38191501416,
+      "artifact_id": 11720754431,
+      "head": "8186b5cb53d66ac055242f624355f94c866f77c6",
+      "archive_sha256": "edea41ee704db509f543040dcc9d625641a02ad76b1e315d01bc5d570ce72989",
+      "ci_status": "Original run: build/lint passed; stale mapped-only disassembly-label assertion failed. Corrected test and later CI recorded separately under validation.",
+      "build_log_sha256": "6bab4502ef89c80220dd9107babc33040d1c6711e1084ee3d093659a078eba84"
+    }
+  },
+  "raw_outputs": {
+    "before-0": {
+      "stdout_sha256": "384bceba955f9957933c08dba36a1b52b302a42c2fc380fd4ff5a56def4688c9",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "657c0b3825770875efc884657d7cebcc9aa50416601c843b2482e1c376975f33"
+    },
+    "after-0": {
+      "stdout_sha256": "f3cd830956f57a99e6989af488d9bdd363730537a1b555cb007c24c3bc658f86",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "93dc0ffdce28f069c15b3509101e127f6911d0a3e3b027d26f7f264bbf33c885"
+    },
+    "after-1": {
+      "stdout_sha256": "ff5c76d24c9e7f97335d5c61347526ac38ad1b457b4da0e999bd994ce7f930c8",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "64b5335f7cee53ddcea0c38ceacd9488be6bb6912c4b7e9fe7605cabfa5e62c9"
+    },
+    "before-1": {
+      "stdout_sha256": "8532cdec79e8aad8289781de44b10a57cff2f3a4ccf13e1628beeb3f9bd40c10",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "d9d729131e893b185a927fecb4fa76181159ab3773211d59ef9f63dd002b5372"
+    },
+    "before-2": {
+      "stdout_sha256": "2cf583374539f6e50d4a4729a9b549b3fc1563dfdbda218b8d3116ad8f13b0f3",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "812ed3a2f558fc59dcd53569aa26c619d6d2ec6afa30a375b682ed728cdf828b"
+    },
+    "after-2": {
+      "stdout_sha256": "1a5ad680e3e27ef3494a194a823573720e63734fbd22afa229776e7e4a37a5d1",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "07f9d8e3e8407a415210c5367581c127615089938eec6f733aa36e2cc955337f"
+    },
+    "after-3": {
+      "stdout_sha256": "fa52641712da774d5ab8d1d8c71fc9b8d23f8cee67aa4901de35657ab91d0b16",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "248850be189549d7e8305c1f32107e6747f07cf4cac016522e185bb3e61ffe43"
+    },
+    "before-3": {
+      "stdout_sha256": "c51368f59515d8fdb74a38f33762dbf95ea511cf0318e06e3bacb2e8d7184b91",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "374e734515c671d3d558b55a6a2d476700de0978613c0fd3fda5d9321b48f050"
+    },
+    "before-4": {
+      "stdout_sha256": "f9658543b78af5e779eaa311aeee0de3131e0007daffb0bd9873fab230bf9951",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "2ea0dbce74bc21754aca211bd9aab2b6add8da7a6956233a0b0f0ea0f53ad4e6"
+    },
+    "after-4": {
+      "stdout_sha256": "b7df08a0ec10ee6649b7b5284cf3d347c8d8db76ef9960fc7dad868d1e06492d",
+      "stderr_sha256": "5f6171d01aee9616da25b2805e2020385ff8d5ad52009b53e3cb0978d191518d",
+      "t2.log_sha256": "101151843095b1bd810e3723f91506aff6e1de5c18d1da7ed106e9152a012ac0"
+    }
+  },
+  "manual_review": {
+    "named_publications": "Exactly one per function per process; no named deopt/recompile; identical pre/post listings.",
+    "hot_code_stability": "All five trials per side have matching normalized leaf/bridge instructions and loop hot-prefix instructions through+0562. Absolute addresses normalized; cold deopt stub order differs.",
+    "after_ordinary_leaf_entry": "0x0043",
+    "after_ordinary_bridge_entry": "0x0040",
+    "after_ordinary_bridge_direct_call": "0x034a",
+    "after_ordinary_bridge_cold_call": "0x03ef",
+    "outer_dispatch": "All loops retain common runtime dispatch at+03af; hot sequence matches across binaries except intended callee symbol."
+  }
+}

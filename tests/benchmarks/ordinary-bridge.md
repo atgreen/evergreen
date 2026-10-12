@@ -96,6 +96,9 @@ checksum validation and printing are outside each timed call. The timed call
 still includes its common outer dispatch.
 
 Runner validation uses `python3 tests/benchmarks/test_ordinary_bridge.py`.
-The baseline CI release artifact has passed a one-pair, 1000-iteration smoke
-with all four named T2 listings stable; integrated after-artifact smoke and
-quiet-host measurements remain outstanding. No timing result is claimed here.
+Both preserved CI release artifacts passed paired smoke checks. The
+[initial quiet comparison](results/2026-10-12-ordinary-bridge.md) improved the
+forwarding workload but regressed the direct loop by 23.9%; it retains raw
+samples and the limits of that measurement. Investigation and remeasurement
+are tracked by `bliss-zsz0x` before treating the runtime integration as a
+performance improvement for direct callers.
