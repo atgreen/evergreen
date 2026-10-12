@@ -481,10 +481,48 @@ fn cl_equal(a: EgclVal, b: EgclVal) -> bool {
 ///
 /// Like `EQUAL`, but characters and strings are compared case-insensitively
 /// and numbers of different types are compared by numeric value.
+fn raw_double_equalp(raw: f64, other: EgclVal) -> bool {
+    if other.is_double_float() {
+        raw == other.as_double_float()
+    } else if other.is_single_float() {
+        raw == f64::from(other.as_single_float())
+    } else if other.is_fixnum() {
+        // Check the integer too: conversion to f64 alone rounds large fixnums.
+        raw.is_finite() && raw as i64 == other.as_fixnum()
+            && raw == other.as_fixnum() as f64
+    } else {
+        false
+    }
+}
+
 fn cl_equalp(a: EgclVal, b: EgclVal) -> bool {
     // Fast path: identical bits ⇒ always equal.
     if a.0 == b.0 {
         return true;
+    }
+
+    if egcl_rt::types::md_array_p(a) && egcl_rt::types::md_array_p(b) {
+        return cl_equalp(egcl_rt::types::md_array_dims(a).unwrap(), egcl_rt::types::md_array_dims(b).unwrap())
+            && cl_equalp(egcl_rt::types::md_array_storage(a).unwrap(), egcl_rt::types::md_array_storage(b).unwrap());
+    }
+    let packed_a = crate::sequences::is_double_float_array(a);
+    let packed_b = crate::sequences::is_double_float_array(b);
+    if (packed_a || packed_b) && !egcl_rt::types::md_array_p(a) && !egcl_rt::types::md_array_p(b) {
+        let (Ok(na), Ok(nb)) = (crate::sequences::length(a), crate::sequences::length(b)) else {
+            return false;
+        };
+        if na != nb || !(is_simple_vector(a) || crate::sequences::is_complex_vector(a) || packed_a)
+            || !(is_simple_vector(b) || crate::sequences::is_complex_vector(b) || packed_b) {
+            return false;
+        }
+        return (0..na).all(|i| {
+            match (crate::sequences::double_float_array_element(a, i), crate::sequences::double_float_array_element(b, i)) {
+                (Some(x), Some(y)) => x == y,
+                (Some(x), None) => crate::sequences::elt(b, i).is_ok_and(|y| raw_double_equalp(x, y)),
+                (None, Some(y)) => crate::sequences::elt(a, i).is_ok_and(|x| raw_double_equalp(y, x)),
+                _ => false,
+            }
+        });
     }
 
     // Characters: case-insensitive comparison.
@@ -697,12 +735,17 @@ fn complex_vector_content_hash(object: EgclVal, depth: usize, equalp: bool) -> O
     let n = crate::sequences::cvec_fill_pointer(object);
     let mut h = hash_u64(n as u64);
     for i in 0..n {
+        if let Some(raw) = crate::sequences::double_float_array_element(object, i) {
+            let bits = if raw == 0.0 { if equalp { 0 } else { FLOAT_ZERO_HASH } } else { raw.to_bits() };
+            h = combine_hashes(h, if depth <= 1 { 0 } else { hash_u64(bits) });
+            continue;
+        }
         let e = crate::sequences::elt(object, i).ok()?;
         // A fixnum bit hashes as its integer value, matching bit_vector_content_hash.
-        let eh = if let Some(bits) = e.is_fixnum().then(|| hash_u64(e.as_fixnum() as u64)) {
-            bits
-        } else if equalp {
+        let eh = if equalp {
             equalp_hash(e, depth.saturating_sub(1))
+        } else if let Some(bits) = e.is_fixnum().then(|| hash_u64(e.as_fixnum() as u64)) {
+            bits
         } else {
             equal_hash(e, depth.saturating_sub(1))
         };
@@ -776,6 +819,29 @@ fn equal_hash(object: EgclVal, depth: usize) -> u64 {
 fn equalp_hash(object: EgclVal, depth: usize) -> u64 {
     if depth == 0 {
         return 0;
+    }
+    if object.is_double_float() {
+        let raw = object.as_double_float();
+        return hash_u64(if raw == 0.0 { 0 } else { raw.to_bits() });
+    }
+    if let Some(storage) = egcl_rt::types::md_array_storage(object) {
+        return combine_hashes(
+            equalp_hash(egcl_rt::types::md_array_dims(object).unwrap(), depth - 1),
+            equalp_hash(storage, depth - 1),
+        );
+    }
+    if crate::sequences::is_double_float_array(object) {
+        let n = crate::sequences::length(object).expect("packed vector length");
+        let mut h = hash_u64(n as u64);
+        for i in 0..n {
+            let raw = crate::sequences::double_float_array_element(object, i).unwrap();
+            let element_hash = if depth == 1 { 0 } else { hash_u64(if raw == 0.0 { 0 } else { raw.to_bits() }) };
+            h = combine_hashes(h, element_hash);
+        }
+        return h;
+    }
+    if let Some(h) = complex_vector_content_hash(object, depth, true) {
+        return h;
     }
     if object.is_character() {
         return hash_u64(object.as_char().to_ascii_lowercase() as u64);
@@ -871,6 +937,9 @@ fn key_address_sensitive(object: EgclVal, test: HashTest) -> bool {
     fn structural(object: EgclVal, depth: usize, equalp: bool) -> bool {
         if depth == 0 {
             return false; // hash returns a constant here too — stable
+        }
+        if equalp && crate::sequences::is_double_float_array(object) {
+            return false;
         }
         // Value-hashed leaves never depend on an address.
         if numeric_value_hash(object, depth).is_some() {

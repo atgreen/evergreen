@@ -1867,6 +1867,22 @@ fn resolve(name: &str) -> Option<Handler> {
             resolve_type_spec(env, spec)
         }),
 
+        "EGCL-INTERNAL::%MAKE-DOUBLE-FLOAT-VECTOR"
+        | "EGCL-INTERNAL:%MAKE-DOUBLE-FLOAT-VECTOR"
+        | "%MAKE-DOUBLE-FLOAT-VECTOR" => Some(|_operator, args, _env| {
+            let size = args.first().copied().unwrap_or(NIL);
+            if !size.is_fixnum() || size.as_fixnum() < 0 {
+                return Err(EgclError::TypeError {
+                    datum: size, expected: "non-negative array dimension".into(),
+                });
+            }
+            let fill = args.get(1).copied().unwrap_or(NIL);
+            if !fill.is_double_float() {
+                return Err(EgclError::TypeError { datum: fill, expected: "DOUBLE-FLOAT".into() });
+            }
+            egcl_rt::packed_f64::make(size.as_fixnum() as usize, fill.as_double_float())
+        }),
+
         "EGCL-INTERNAL::%MAKE-SIMPLE-VECTOR"
         | "EGCL-INTERNAL:%MAKE-SIMPLE-VECTOR"
         | "%MAKE-SIMPLE-VECTOR" => Some(|_operator, args, _env| {
@@ -1904,6 +1920,12 @@ fn resolve(name: &str) -> Option<Handler> {
                     }
                     dims.push(d.as_fixnum() as usize);
                     c = rest;
+                }
+                if args.get(2).is_some_and(|v| !v.is_nil()) {
+                    if !fill.is_double_float() {
+                        return Err(EgclError::TypeError { datum: *fill, expected: "DOUBLE-FLOAT".into() });
+                    }
+                    return egcl_stdlib::sequences::build_double_float_md_array(&dims, fill.as_double_float());
                 }
                 Ok(egcl_stdlib::build_md_array(&dims, *fill))
             })
@@ -1946,6 +1968,14 @@ fn resolve(name: &str) -> Option<Handler> {
             let has_fill_pointer = args.len() > 5 && !args[5].is_nil();
             // 7th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
             let element_is_bit = args.len() > 6 && !args[6].is_nil();
+            if args.get(7).is_some_and(|v| !v.is_nil()) {
+                if !iel.is_double_float() {
+                    return Err(EgclError::TypeError { datum: iel, expected: "DOUBLE-FLOAT".into() });
+                }
+                return egcl_stdlib::sequences::build_double_float_complex_vector(
+                    size, fp, adjustable, iel.as_double_float(), has_fill_pointer,
+                );
+            }
             let elems = vec![iel; size];
             Ok(egcl_stdlib::build_complex_vector(
                 &elems,
@@ -1989,7 +2019,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     expected: "array (:displaced-to)".to_string(),
                 });
             };
-            if offset + length > base_total {
+            if offset.checked_add(length).is_none_or(|end| end > base_total) {
                 return Err(EgclError::TypeError {
                     datum: base,
                     expected: format!(
@@ -2007,6 +2037,14 @@ fn resolve(name: &str) -> Option<Handler> {
             let has_fill_pointer = args.len() > 6 && !args[6].is_nil();
             // 8th arg (optional): non-NIL ⇒ element-type BIT (bliss-65nx).
             let element_is_bit = args.len() > 7 && !args[7].is_nil();
+            if args.get(8).is_some_and(|v| !v.is_nil()) {
+                return egcl_stdlib::sequences::build_double_float_displaced_vector(
+                    base, offset, length, fp, adjustable, has_fill_pointer,
+                );
+            }
+            if egcl_stdlib::sequences::is_double_float_array(base) {
+                return Err(EgclError::TypeError { datum: base, expected: "matching displaced array element type".into() });
+            }
             Ok(egcl_stdlib::build_displaced_vector(
                 base,
                 offset,
@@ -2365,8 +2403,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // these Vec-resident values.
             egcl_rt::rooted!(pred = args[0]);
             egcl_rt::rooted!(seqs = Vec::<Vec<EgclVal>>::with_capacity(args.len() - 1));
-            for s in &args[1..] {
-                seqs.push(seq_elements(*s)?);
+            for index in 1..args.len() {
+                seqs.push(seq_elements(args[index])?);
             }
             let minlen = seqs.iter().map(Vec::len).min().unwrap_or(0);
             for i in 0..minlen {

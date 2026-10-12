@@ -790,6 +790,11 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
     if crate::pathnames::registered_string(v).is_some() || crate::pathnames::is_pathname(v) {
         return None;
     }
+    if let Some(length) = egcl_rt::packed_f64::len(v) {
+        let elements: Vec<_> = (0..length).map(|i|
+            double_float_to_string(egcl_rt::packed_f64::get(v, i).unwrap())).collect();
+        return Some(format!("#({})", elements.join(" ")));
+    }
     unsafe {
         let ptr = v.as_ptr();
         // Multidimensional array → `#<rank>A(nested row-major lists)`.
@@ -808,7 +813,7 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
                         .max(0) as usize,
                 );
             }
-            let (nested, _) = md_render(storage.as_ptr(), &dims, 0, escapep);
+            let (nested, _) = md_render(storage, &dims, 0, escapep);
             return Some(format!("#{rank}A{nested}"));
         }
         // A complex vector reads its elements through the displacement-aware
@@ -823,8 +828,12 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
                 if i > 0 {
                     s.push(' ');
                 }
-                let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
-                s.push_str(&egclval_to_print_string(e, escapep));
+                if let Some(raw) = crate::sequences::double_float_array_element(v, i) {
+                    s.push_str(&double_float_to_string(raw));
+                } else {
+                    let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
+                    s.push_str(&egclval_to_print_string(e, escapep));
+                }
             }
             s.push(')');
             return Some(s);
@@ -851,26 +860,37 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
 }
 
 /// Render one axis of a multidimensional array's row-major storage as nested
-/// parenthesised lists (CLHS `#nA` syntax). `base` is the storage SIMPLE_VECTOR
-/// object pointer, `dims` the remaining axes, `start` the flat offset of this
+/// parenthesised lists (CLHS `#nA` syntax). `base` is the row-major storage
+/// vector, `dims` the remaining axes, `start` the flat offset of this
 /// subtree. Returns the rendered subtree and the number of leaf elements it
 /// consumed.
 unsafe fn md_render(
-    base: *const u8,
+    base: EgclVal,
     dims: &[usize],
     start: usize,
     escapep: bool,
 ) -> (String, usize) {
-    if dims.len() <= 1 {
-        let n = dims.first().copied().unwrap_or(0);
-        let boff = unsafe { object_payload_offset(base) };
+    if dims.is_empty() {
+        let text = if let Some(raw) = egcl_rt::packed_f64::get(base, start) {
+            double_float_to_string(raw)
+        } else {
+            egclval_to_print_string(crate::sequences::elt(base, start).unwrap_or(NIL), escapep)
+        };
+        return (text, 1);
+    }
+    if dims.len() == 1 {
+        let n = dims[0];
         let mut s = String::from("(");
         for i in 0..n {
             if i > 0 {
                 s.push(' ');
             }
-            let e = unsafe { *(base.add(boff + 8 + (start + i) * 8) as *const EgclVal) };
-            s.push_str(&egclval_to_print_string(e, escapep));
+            if let Some(raw) = egcl_rt::packed_f64::get(base, start + i) {
+                s.push_str(&double_float_to_string(raw));
+            } else {
+                let e = crate::sequences::elt(base, start + i).unwrap_or(NIL);
+                s.push_str(&egclval_to_print_string(e, escapep));
+            }
         }
         s.push(')');
         (s, n)

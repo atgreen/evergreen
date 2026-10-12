@@ -754,11 +754,12 @@
     (values (float q (%float-quotient-proto number divisor)) r)))
 
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
-;; actually stores. egcl specialises only bit and character arrays; every other
-;; element type upgrades to T.
+;; actually stores. BIT, CHARACTER and DOUBLE-FLOAT have specialized storage;
+;; other element types upgrade to T.
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
-  (cond ((eq type 'bit) 'bit)
+  (cond ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
+        ((eq type 'bit) 'bit)
         ((member type '(character base-char standard-char)) 'character)
         (t t)))
 
@@ -1827,11 +1828,11 @@
          (ic-cell (member :initial-contents keys))
          (et-cell (member :element-type keys))
          (et (%expand-type-spec (if et-cell (car (cdr et-cell)) t)))
-         ;; Numeric storage is currently general storage (upgraded to T), but
-         ;; use numeric zero rather than NIL for common numeric requests. This
+         ;; DOUBLE-FLOAT uses packed storage. Other numeric requests currently
+         ;; upgrade to T, but use numeric zero rather than NIL. This
          ;; lets read-modify-write users such as (SETF LDB) work without an
          ;; explicit initializer. ANSI leaves uninitialized reads undefined;
-         ;; this is an EGCL convenience, not specialized array storage.
+         ;; this zero default is an EGCL convenience.
          (et-kind (if (consp et) (car et) et))
          (iel (cond (iel-cell (car (cdr iel-cell)))
                     ((member et-kind '(short-float single-float float)) 0.0f0)
@@ -1845,6 +1846,7 @@
          ;; MAKE-ARRAY builds string storage, not a general NIL-filled vector.
          (stringp (member et '(character base-char standard-char nil)))
          (bitp (eq et 'bit))
+         (doublep (member et-kind '(double-float long-float)))
          (fp-cell (member :fill-pointer keys))
          (adj-cell (member :adjustable keys))
          (fp (and fp-cell (car (cdr fp-cell))))
@@ -1866,9 +1868,9 @@
                          ((integerp fp) fp)
                          (t size))))
          (%make-displaced-array base offset size fpn (and adjustable t)
-                                (and stringp (not bitp) t) (and fp t) (and bitp t))))
+                                (and stringp (not bitp) t) (and fp t) (and bitp t) (and doublep t))))
       (mdp
-       (let ((arr (%make-md-array dimensions iel)))
+       (let ((arr (%make-md-array dimensions iel (and doublep t))))
          (when ic-cell
            (fill-md-array-from-contents arr dimensions (car (cdr ic-cell))))
          arr))
@@ -1878,7 +1880,7 @@
       ;; universe.lsp builds (make-array nil)).
       ((null dimensions)
        (%make-md-array nil (cond (ic-cell (car (cdr ic-cell)))
-                                 (t iel))))
+                                 (t iel)) (and doublep t)))
       ;; A :fill-pointer or :adjustable request ⇒ a complex (fill-pointer /
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
@@ -1892,12 +1894,20 @@
               ;; tags the complex vector as a bit vector (bliss-65nx).
               (v (%make-complex-vector size fpn (and adjustable t) iel
                                        (and stringp (not bitp) t) (and fp t)
-                                       (and bitp t))))
+                                       (and bitp t) (and doublep t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))
                (setf (aref v i) e)
                (setq i (+ i 1)))))
+         v))
+      (doublep
+       (let ((v (%make-double-float-vector size iel)))
+         (when ic-cell
+           (let ((contents (car (cdr ic-cell))))
+             (unless (= (length contents) size)
+               (error "Initial contents do not match array dimensions"))
+             (dotimes (i size) (setf (aref v i) (elt contents i)))))
          v))
       (ic-cell
        ;; COERCE legitimately returns its ARGUMENT when it is already of the
@@ -1937,7 +1947,8 @@
          (fp-cell (member :fill-pointer keys))
          (iel-cell (member :initial-element keys))
          (fp (and fp-cell (car (cdr fp-cell))))
-         (iel (if iel-cell (car (cdr iel-cell)) nil))
+         (iel (if iel-cell (car (cdr iel-cell))
+                  (if (eq (array-element-type array) 'double-float) 0d0 nil)))
          ;; No :fill-pointer supplied. Per ANSI the array keeps its fill
          ;; pointer if it has one; a plain adjustable array has none, so its
          ;; length simply tracks the new SIZE. ARRAY-HAS-FILL-POINTER-P now
@@ -2072,6 +2083,9 @@
        (if iel-cell (make-string size :initial-element iel) (make-string size)))
       (bitp
        (make-array size :element-type 'bit :initial-element (if iel-cell iel 0)))
+      ((and (member head '(vector array simple-array))
+            (member (if (consp elt) (car elt) elt) '(double-float long-float)))
+       (make-array size :element-type elt :initial-element (if iel-cell iel 0d0)))
       (t
        (if iel-cell (make-array size :initial-element iel) (make-array size))))))
 ;; STRING-EQUAL is case-insensitive STRING=; forward the ANSI bounding keywords

@@ -255,11 +255,12 @@ fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         // stores CHARACTER values here, so collecting the storage prefix is
         // correct for both general and character complex vectors.
         let len = cvec_fill_pointer(sequence);
-        let mut elems = Vec::with_capacity(len);
+        egcl_rt::rooted!(sequence = sequence);
+        egcl_rt::rooted!(elems = Vec::with_capacity(len));
         for i in 0..len {
-            elems.push(cvec_elt(sequence, i)?);
+            elems.push(cvec_elt(*sequence, i)?);
         }
-        return Ok(elems);
+        return Ok(elems.to_vec());
     }
     if let Some(len) = egcl_rt::types::bit_vector_len(sequence) {
         let mut elems = Vec::with_capacity(len);
@@ -553,7 +554,7 @@ fn cvec_storage(v: EgclVal) -> EgclVal {
 #[inline]
 fn cvec_set_storage(v: EgclVal, storage: EgclVal) {
     unsafe {
-        *(v.as_ptr().add(8) as *mut EgclVal) = storage;
+        egcl_rt::gc::store_ref(v.as_ptr().add(8) as *mut EgclVal, storage);
     }
 }
 /// The fill pointer (= active LENGTH) of a complex vector.
@@ -594,6 +595,77 @@ fn element_type_code(element_is_char: bool, element_is_bit: bool) -> i64 {
     } else {
         0
     }
+}
+
+/// Whether an array's actual element storage is packed DOUBLE-FLOAT.
+pub fn is_double_float_array(v: EgclVal) -> bool {
+    if egcl_rt::packed_f64::is_vector(v) {
+        return true;
+    }
+    if is_complex_vector(v) {
+        return unsafe { (*(v.as_ptr().add(32) as *const EgclVal)).as_fixnum() == 11 };
+    }
+    egcl_rt::types::md_array_storage(v)
+        .is_some_and(egcl_rt::packed_f64::is_vector)
+}
+
+/// Read numeric bits without allocating a box or retaining an interior pointer.
+/// Indexes total size, including elements beyond a vector's fill pointer.
+pub fn double_float_array_element(v: EgclVal, index: usize) -> Option<f64> {
+    if is_complex_vector(v) {
+        if index >= cvec_capacity(v) {
+            return None;
+        }
+        return match cvec_displacement(v) {
+            Some((base, offset, _)) => double_float_array_element(base, offset.checked_add(index)?),
+            None => egcl_rt::packed_f64::get(cvec_storage(v), index),
+        };
+    }
+    let storage = egcl_rt::types::md_array_storage(v).unwrap_or(v);
+    egcl_rt::packed_f64::get(storage, index)
+}
+
+fn is_double_float_sequence(v: EgclVal) -> bool {
+    !egcl_rt::types::md_array_p(v) && is_double_float_array(v)
+}
+
+fn set_double_float_array_element(v: EgclVal, index: usize, value: f64) -> bool {
+    if is_complex_vector(v) {
+        if index >= cvec_capacity(v) { return false; }
+        return match cvec_displacement(v) {
+            Some((base, offset, _)) => offset.checked_add(index)
+                .is_some_and(|index| set_double_float_array_element(base, index, value)),
+            None => egcl_rt::packed_f64::set(cvec_storage(v), index, value),
+        };
+    }
+    egcl_rt::packed_f64::set(egcl_rt::types::md_array_storage(v).unwrap_or(v), index, value)
+}
+
+fn double_float_value(v: EgclVal) -> Result<f64, EgclError> {
+    if v.is_double_float() {
+        Ok(v.as_double_float())
+    } else {
+        Err(EgclError::TypeError { datum: v, expected: "DOUBLE-FLOAT".into() })
+    }
+}
+
+fn resize_double_float_complex_vector(
+    v: EgclVal,
+    new_size: usize,
+    fill_pointer: usize,
+    fill: f64,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(v = v);
+    let retained = cvec_capacity(*v).min(new_size);
+    let storage = egcl_rt::packed_f64::make(new_size, fill)?;
+    for index in 0..retained {
+        let value = double_float_array_element(*v, index).expect("packed array element");
+        egcl_rt::packed_f64::set(storage, index, value);
+    }
+    cvec_set_storage(*v, storage);
+    cvec_clear_displacement(*v);
+    cvec_set_fill_pointer_raw(*v, fill_pointer.min(new_size));
+    Ok(*v)
 }
 
 /// Whether a complex vector has element-type BIT — a (fill-pointer /
@@ -664,10 +736,10 @@ fn array_row_major_elt(base: EgclVal, index: usize) -> Result<EgclVal, EgclError
         if let Some((inner, off, _)) = cvec_displacement(base) {
             return array_row_major_elt(inner, off + index);
         }
-        return Ok(vector_elt(cvec_storage(base), index));
+        return elt(cvec_storage(base), index);
     }
     if let Some(storage) = egcl_rt::types::md_array_storage(base) {
-        return Ok(vector_elt(storage, index));
+        return elt(storage, index);
     }
     if is_vector(base) {
         return Ok(vector_elt(base, index));
@@ -685,12 +757,10 @@ fn array_row_major_set_elt(
         if let Some((inner, off, _)) = cvec_displacement(base) {
             return array_row_major_set_elt(inner, off + index, value);
         }
-        vector_set_elt(cvec_storage(base), index, value);
-        return Ok(());
+        return set_elt(cvec_storage(base), index, value);
     }
     if let Some(storage) = egcl_rt::types::md_array_storage(base) {
-        vector_set_elt(storage, index, value);
-        return Ok(());
+        return set_elt(storage, index, value);
     }
     if is_vector(base) {
         vector_set_elt(base, index, value);
@@ -708,7 +778,7 @@ pub fn array_total_size(v: EgclVal) -> Option<usize> {
         return Some(cvec_capacity(v));
     }
     if let Some(storage) = egcl_rt::types::md_array_storage(v) {
-        return Some(vector_length(storage));
+        return array_total_size(storage);
     }
     if is_vector(v) {
         return Some(vector_length(v));
@@ -754,7 +824,7 @@ pub fn cvec_element(v: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
 fn cvec_elt(v: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
     match cvec_displacement(v) {
         Some((base, off, _)) => array_row_major_elt(base, off + index),
-        None => Ok(vector_elt(cvec_storage(v), index)),
+        None => elt(cvec_storage(v), index),
     }
 }
 
@@ -763,10 +833,7 @@ fn cvec_elt(v: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
 fn cvec_set_elt(v: EgclVal, index: usize, value: EgclVal) -> Result<(), EgclError> {
     match cvec_displacement(v) {
         Some((base, off, _)) => array_row_major_set_elt(base, off + index, value),
-        None => {
-            vector_set_elt(cvec_storage(v), index, value);
-            Ok(())
-        }
+        None => set_elt(cvec_storage(v), index, value),
     }
 }
 
@@ -796,7 +863,7 @@ pub fn cvec_char_contents(v: EgclVal) -> Option<String> {
 pub fn cvec_capacity(v: EgclVal) -> usize {
     match cvec_displacement(v) {
         Some((_, _, total)) => total,
-        None => vector_length(cvec_storage(v)),
+        None => array_total_size(cvec_storage(v)).expect("complex array backing storage"),
     }
 }
 
@@ -840,6 +907,55 @@ pub fn build_complex_vector(
     //         (underivable from the base); a non-displaced array stores NIL in
     //         words 5-6.
     build_complex_array_body(*storage, fp, adj, elt, hasfp, NIL, NIL)
+}
+
+/// Build a rank-one DOUBLE-FLOAT array with packed backing storage.
+pub fn build_double_float_complex_vector(
+    capacity: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    fill: f64,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(storage = egcl_rt::packed_f64::make(capacity, fill)?);
+    Ok(build_complex_array_body(
+        *storage,
+        EgclVal::from_fixnum(fill_pointer.min(capacity) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(11),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        NIL,
+        NIL,
+    ))
+}
+
+/// Build a displaced DOUBLE-FLOAT vector after checking the base's storage.
+pub fn build_double_float_displaced_vector(
+    base: EgclVal,
+    offset: usize,
+    length: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    if !is_double_float_array(base) {
+        return Err(EgclError::TypeError {
+            datum: base,
+            expected: "array with DOUBLE-FLOAT elements".into(),
+        });
+    }
+    if offset.checked_add(length).is_none_or(|end| end > array_total_size(base).unwrap()) {
+        return Err(EgclError::ProgramError("displaced array exceeds base storage".into()));
+    }
+    Ok(build_complex_array_body(
+        base,
+        EgclVal::from_fixnum(fill_pointer.min(length) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(11),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        EgclVal::from_fixnum(offset as i64),
+        EgclVal::from_fixnum(length as i64),
+    ))
 }
 
 /// Build a COMPLEX_ARRAY displaced to `base` (CLHS `:displaced-to`):
@@ -929,6 +1045,18 @@ pub fn build_md_array_from_elements(
         ));
     }
     let storage = build_vector(elements);
+    build_md_array_with_storage(dims, storage)
+}
+
+/// Build rank-zero or multidimensional packed DOUBLE-FLOAT storage.
+pub fn build_double_float_md_array(dims: &[usize], fill: f64) -> Result<EgclVal, EgclError> {
+    let total = dims.iter().try_fold(1usize, |n, d| n.checked_mul(*d))
+        .ok_or(EgclError::Oom)?;
+    let storage = egcl_rt::packed_f64::make(total, fill)?;
+    build_md_array_with_storage(dims, storage)
+}
+
+fn build_md_array_with_storage(dims: &[usize], storage: EgclVal) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(storage = storage);
     // Dimensions as a SIMPLE_VECTOR of fixnums.
     let dim_vals: Vec<EgclVal> = dims
@@ -1018,6 +1146,24 @@ pub fn vector_push_extend(
     }
     let fp = cvec_fill_pointer(v);
     let cap = cvec_capacity(v);
+    if is_double_float_array(v) {
+        double_float_value(value)?;
+        egcl_rt::rooted!(v = v);
+        egcl_rt::rooted!(value = value);
+        if fp >= cap {
+            if !cvec_adjustable(*v) {
+                return Err(EgclError::TypeError {
+                    datum: *v, expected: "adjustable vector".into(),
+                });
+            }
+            let new_cap = cap.checked_add(extension.unwrap_or(cap.max(8)).max(1))
+                .ok_or(EgclError::Oom)?;
+            resize_double_float_complex_vector(*v, new_cap, fp, 0.0)?;
+        }
+        cvec_set_elt(*v, fp, *value)?;
+        cvec_set_fill_pointer_raw(*v, fp + 1);
+        return Ok(EgclVal::from_fixnum(fp as i64));
+    }
     if fp >= cap {
         if !cvec_adjustable(v) {
             return Err(EgclError::TypeError {
@@ -1079,6 +1225,10 @@ pub fn adjust_complex_vector(
     }
     let cap = cvec_capacity(v);
     let fp = fill_pointer.unwrap_or(new_size).min(new_size);
+    if is_double_float_array(v) {
+        let fill = double_float_value(initial_element)?;
+        return resize_double_float_complex_vector(v, new_size, fp, fill);
+    }
     if new_size > cap {
         let mut store: Vec<EgclVal> = Vec::with_capacity(new_size);
         for i in 0..cap {
@@ -1121,8 +1271,9 @@ pub fn vector_pop(v: EgclVal) -> Result<EgclVal, EgclError> {
             expected: "non-empty vector".to_string(),
         });
     }
-    let val = cvec_elt(v, fp - 1)?;
-    cvec_set_fill_pointer_raw(v, fp - 1);
+    egcl_rt::rooted!(v = v);
+    let val = cvec_elt(*v, fp - 1)?;
+    cvec_set_fill_pointer_raw(*v, fp - 1);
     Ok(val)
 }
 
@@ -1146,7 +1297,7 @@ fn sort_vector_in_place(
     key: Option<EgclVal>,
     stable: bool,
 ) -> EgclVal {
-    if egcl_rt::packed_f64::is_vector(sequence) {
+    if is_double_float_sequence(sequence) {
         egcl_rt::rooted!(inputs = (sequence, (predicate, key)));
         let mut elems = collect_elements(sequence).expect("packed sequence");
         let compare = |a: &EgclVal, b: &EgclVal| {
@@ -1158,7 +1309,7 @@ fn sort_vector_in_place(
             elems.sort_unstable_by(compare);
         }
         for (index, value) in elems.into_iter().enumerate() {
-            egcl_rt::packed_f64::set(inputs.0, index, value.as_double_float());
+            set_double_float_array_element(inputs.0, index, value.as_double_float());
         }
         return inputs.0;
     }
@@ -1749,7 +1900,7 @@ pub fn set_aref(sequence: EgclVal, index: usize, value: EgclVal) -> Result<(), E
 
 /// Copy a sequence (CL `COPY-SEQ`).
 pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if egcl_rt::packed_f64::is_vector(sequence) {
+    if is_double_float_sequence(sequence) {
         return subseq(sequence, 0, None);
     }
     if sequence.is_nil() {
@@ -1806,7 +1957,8 @@ pub fn subseq(
     start: usize,
     end: Option<usize>,
 ) -> Result<EgclVal, EgclError> {
-    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+    if is_double_float_sequence(sequence) {
+        let len = length(sequence)?;
         let end = end.unwrap_or(len);
         if start > end || end > len {
             return Err(EgclError::TypeError {
@@ -1819,7 +1971,7 @@ pub fn subseq(
         egcl_rt::rooted!(sequence = sequence);
         let result = egcl_rt::packed_f64::make(end - start, 0.0)?;
         for i in start..end {
-            let value = egcl_rt::packed_f64::get(*sequence, i).unwrap();
+            let value = double_float_array_element(*sequence, i).unwrap();
             egcl_rt::packed_f64::set(result, i - start, value);
         }
         return Ok(result);
@@ -1912,7 +2064,7 @@ pub fn subseq(
 
 /// Reverse a sequence (non-destructive, CL `REVERSE`).
 pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if egcl_rt::packed_f64::is_vector(sequence) {
+    if is_double_float_sequence(sequence) {
         return nreverse(subseq(sequence, 0, None)?);
     }
     if sequence.is_nil() {
@@ -1936,12 +2088,13 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
 
 /// Reverse a sequence destructively (CL `NREVERSE`).
 pub fn nreverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
-    if let Some(len) = egcl_rt::packed_f64::len(sequence) {
+    if is_double_float_sequence(sequence) {
+        let len = length(sequence)?;
         for i in 0..len / 2 {
-            let left = egcl_rt::packed_f64::get(sequence, i).unwrap();
-            let right = egcl_rt::packed_f64::get(sequence, len - i - 1).unwrap();
-            egcl_rt::packed_f64::set(sequence, i, right);
-            egcl_rt::packed_f64::set(sequence, len - i - 1, left);
+            let left = double_float_array_element(sequence, i).unwrap();
+            let right = double_float_array_element(sequence, len - i - 1).unwrap();
+            set_double_float_array_element(sequence, i, right);
+            set_double_float_array_element(sequence, len - i - 1, left);
         }
         return Ok(sequence);
     }
@@ -2245,6 +2398,28 @@ fn is_sequence_result_type(result_type: EgclVal) -> bool {
     )
 }
 
+/// Recognize a concrete DOUBLE-FLOAT sequence element type.
+pub fn result_type_is_double_float_vector(result_type: EgclVal) -> bool {
+    if !result_type.is_cons() {
+        return false;
+    }
+    let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+    if cell.car.tag() != egcl_rt::value::TAG_SYMBOL || !cell.cdr.is_cons() {
+        return false;
+    }
+    if !matches!(egcl_compiler::reader::symbol_name(cell.car.as_symbol_index()).as_deref(),
+        Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY")) {
+        return false;
+    }
+    let mut element = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
+    if element.is_cons() {
+        element = unsafe { (*(element.as_ptr() as *const ConsCell)).car };
+    }
+    element.tag() == egcl_rt::value::TAG_SYMBOL
+        && matches!(egcl_compiler::reader::symbol_name(element.as_symbol_index()).as_deref(),
+            Some("DOUBLE-FLOAT" | "LONG-FLOAT"))
+}
+
 pub fn build_result_sequence(
     result_type: EgclVal,
     elems: &[EgclVal],
@@ -2265,6 +2440,9 @@ pub fn build_result_sequence(
             datum: result_type,
             expected: format!("sequence type specifier matching length {}", elems.len()),
         });
+    }
+    if result_type_is_double_float_vector(result_type) {
+        return build_packed_f64(elems);
     }
     if result_type_is_string(result_type) {
         let mut out = String::with_capacity(elems.len());
@@ -2572,7 +2750,7 @@ pub fn remove(
             .map(|(_, &v)| v)
             .collect();
 
-        if egcl_rt::packed_f64::is_vector(sequence) {
+        if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -2598,7 +2776,7 @@ pub fn remove(
             }
             result.push(elem);
         }
-        if egcl_rt::packed_f64::is_vector(sequence) {
+        if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -2650,7 +2828,7 @@ pub fn substitute(
             .map(|(i, &v)| if sub_set.contains(&i) { new_item } else { v })
             .collect();
 
-        if egcl_rt::packed_f64::is_vector(sequence) {
+        if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
@@ -2677,7 +2855,7 @@ pub fn substitute(
             }
             result.push(elem);
         }
-        if egcl_rt::packed_f64::is_vector(sequence) {
+        if is_double_float_sequence(sequence) {
             build_packed_f64(&result)
         } else if is_list(sequence) {
             Ok(build_list(&result))
