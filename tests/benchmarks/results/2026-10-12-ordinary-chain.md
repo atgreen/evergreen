@@ -10,7 +10,7 @@ machine-`CALL` latency or a percentage speedup for the small residual increment.
 
 Both outer loop targets are forwarding entries. The comparison therefore avoids
 the direct-leaf versus forwarder's different outer adapter selection. The
-[direct-leaf benchmark](2026-10-12-ordinary-bridge.md) remains a separate absolute
+[direct-leaf benchmark](2026-10-12-ordinary-bridge-fixed.md) remains a separate absolute
 regression control. These artifacts **predate default tail adoption**: both
 forwarders execute ordinary non-tail calls.
 

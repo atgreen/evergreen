@@ -21,9 +21,8 @@ increment is the within-pair `forward − direct`, not subtraction of medians.
 
 The direct leaf now uses its managed adapter; the forwarder uses the ordinary
 root adapter. Although the loop dispatch instructions match, the selected
-adapters differ. **536.68 ns is not an isolated native-call cost.** A future
-one-forwarder versus two-forwarder comparison with matching outer adapters is
-tracked by `bliss-n9gid`; it does not replace these direct-regression controls.
+adapters differ. **536.68 ns is not an isolated native-call cost.** The [one-forwarder versus two-forwarder comparison](2026-10-12-ordinary-chain.md)
+uses matching outer adapters; it does not replace these direct-regression controls.
 
 Nearest-rank percentiles and observed ranges describe this run, not confidence
 intervals. Process-trial medians show the variation that pooled values hide:
