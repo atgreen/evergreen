@@ -1158,6 +1158,10 @@ impl TransferCode {
             }
             unsafe {
                 execution.with_active_native_control(std::pin::Pin::new_unchecked(&mut *control), || {
+                    // Tests post requests after the real entry poll, so the
+                    // generated CALL admission and cold handler must deliver them.
+                    #[cfg(test)]
+                    if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) { observe(); }
                     native_transfer::invoke_ordinary_native_segment(
                         self.code.as_ptr().add(offset), execution, NIL, &args, stack)
                 })
@@ -3530,4 +3534,21 @@ unsafe fn prepare_transfer(
 #[unsafe(naked)]
 unsafe extern "C" fn dispatch(_packet: *mut u8, _value: u64, _exit: NativeExit) -> ! {
     core::arch::naked_asm!("endbr64", "mov rax, [rdi]", "mov rdi, [rdi + 8]", "jmp rax");
+}
+
+#[cfg(test)]
+thread_local! {
+    static ORDINARY_ENTRY_HOOK: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn with_ordinary_entry_hook_for_test<R>(
+    observe: fn(), body: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<fn()>);
+    impl Drop for Restore {
+        fn drop(&mut self) { ORDINARY_ENTRY_HOOK.with(|hook| hook.set(self.0)); }
+    }
+    let _restore = Restore(ORDINARY_ENTRY_HOOK.with(|hook| hook.replace(Some(observe))));
+    body()
 }
