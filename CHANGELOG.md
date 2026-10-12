@@ -5,6 +5,9 @@
 - Continue through two eligible Linux x86-64 T2 native calls, normalizing
   intermediate multiple-value state and preserving live roots before forwarding
   the final result tuple ([#296](https://github.com/atgreen/evergreen/pull/296)).
+- Reduce native stack-home double addition and multiplication from seven
+  instructions to three on Linux x86-64
+  ([#295](https://github.com/atgreen/evergreen/pull/295)).
 
 - Compile eligible simple `DOUBLE-FLOAT` array expressions with native unboxed
   loads, stores, addition, and multiplication on Linux x86-64, with rooted array
