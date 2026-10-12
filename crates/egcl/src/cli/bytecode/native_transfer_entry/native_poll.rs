@@ -82,18 +82,19 @@ pub(super) fn refresh() {
     }
 }
 
+#[cfg(test)]
+type PollObserver = egcl_rt::execution_local::ExecutionLocal<Cell<Option<fn()>>>;
+
 /// Unlike root_publication::OBSERVE, this observer never forces an idle guard
 /// into the runtime. It runs only after a real slow poll has published roots.
 #[cfg(test)]
-pub(in super::super) static OBSERVE_REQUEST:
-    egcl_rt::execution_local::ExecutionLocal<Cell<Option<fn()>>> =
+pub(in super::super) static OBSERVE_REQUEST: PollObserver =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 /// Completes request handshakes only after runtime consumption and control
 /// refresh, so a requester cannot post its next epoch during the previous drain.
 #[cfg(test)]
-pub(in super::super) static AFTER_REFRESH:
-    egcl_rt::execution_local::ExecutionLocal<Cell<Option<fn()>>> =
+pub(in super::super) static AFTER_REFRESH: PollObserver =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 #[cfg(test)]

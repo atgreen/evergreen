@@ -72,7 +72,7 @@ fn observe_request() {
     let seen = egcl_rt::runtime::current_seen_signal_activity();
     let current = unsafe { &*egcl_rt::runtime::process_signal_activity_address() }
         .load(std::sync::atomic::Ordering::Acquire);
-    if !seen.is_some_and(|seen| seen < pending.epoch) || current < pending.epoch {
+    if seen.is_none_or(|seen| seen >= pending.epoch) || current < pending.epoch {
         state.failure =
             Some("request was already consumed or not yet published at observation".into());
         return;
@@ -131,7 +131,7 @@ fn after_refresh() {
     if pending.observed.is_none() {
         return;
     }
-    if !egcl_rt::runtime::current_seen_signal_activity().is_some_and(|seen| seen >= pending.epoch) {
+    if egcl_rt::runtime::current_seen_signal_activity().is_none_or(|seen| seen < pending.epoch) {
         state.failure = Some("runtime returned without acknowledging the observed epoch".into());
         shared.1.notify_all();
         return;

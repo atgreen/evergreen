@@ -69,3 +69,6 @@ harness tests, 23 neighboring tests, three tests under GC stress and poisoning,
 and five repeated three-test runs. Those instrumented test-profile runs were
 not isolated from concurrent compilation and are correctness evidence for the
 harness, not a release latency benchmark.
+The retained artifact predates the equivalent `is_none_or` condition spelling
+and observer type alias requested by Clippy; its hashes describe that original
+source exactly. CI validates the final source separately.
