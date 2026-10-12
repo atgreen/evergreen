@@ -32,7 +32,7 @@ fn install_chain(env: &mut Env) -> (u32, Rc<NativeCode>, Rc<NativeCode>) {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn ordinary_foreign_guard_error_moves_older_caller_root() {
+fn ordinary_foreign_guard_error_retains_relocated_caller_trace() {
     let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
@@ -51,6 +51,9 @@ fn ordinary_foreign_guard_error_moves_older_caller_root() {
     }] });
     HeapCollector::new().minor_gc().unwrap();
     egcl_rt::rooted!(argument = crate::cli::arena_cons(EgclVal::from_fixnum(713), NIL));
+    // This host root makes the object live independently. Movement plus the
+    // retained managed anchor trace checks recovery ownership, not that an
+    // older native physical home was the sole root or was rewritten.
     let original = argument.to_raw();
     let stack = egcl_rt::current_stack();
     let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
