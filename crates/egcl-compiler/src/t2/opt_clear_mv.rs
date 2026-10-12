@@ -178,8 +178,7 @@ fn transfer(f: &Function, insts: &[Inst], live_out: bool) -> bool {
     live
 }
 
-/// Remove every dead `ClearMv`; returns how many were removed.
-pub fn eliminate(f: &mut Function) -> usize {
+fn live_at_block_entries(f: &Function) -> HashMap<crate::t2::ir::Block, bool> {
     let blocks: Vec<_> = f.block_order().to_vec();
     let mut live_in: HashMap<_, bool> = blocks.iter().map(|&b| (b, false)).collect();
 
@@ -200,6 +199,34 @@ pub fn eliminate(f: &mut Function) -> usize {
         }
     }
 
+    live_in
+}
+
+/// Instructions whose incoming MV state cannot reach a reader before a reset.
+/// Calls and exceptional/control boundaries are conservatively readers, just as
+/// in dead-reset elimination. This permits earlier normalization only when all
+/// successor paths discard the old tuple; it does not infer a single result.
+pub fn unobserved_multiple_value_state(f: &Function) -> HashSet<Inst> {
+    let live_in = live_at_block_entries(f);
+    let mut unobserved = HashSet::new();
+    for &block in f.block_order() {
+        let mut live = f.succs(block).iter().any(|successor| live_in[successor]);
+        for &inst in f.block(block).insts.iter().rev() {
+            if f.inst(inst).opcode == Opcode::ClearMv {
+                live = false;
+            } else if reads_mv(f, inst) {
+                live = true;
+            }
+            if !live { unobserved.insert(inst); }
+        }
+    }
+    unobserved
+}
+
+/// Remove every dead `ClearMv`; returns how many were removed.
+pub fn eliminate(f: &mut Function) -> usize {
+    let blocks: Vec<_> = f.block_order().to_vec();
+    let live_in = live_at_block_entries(f);
     let mut dead: Vec<(_, Inst)> = Vec::new();
     for &b in &blocks {
         let mut live = f.succs(b).iter().any(|s| live_in[s]);
@@ -471,4 +498,43 @@ mod tests {
             assert_eq!(eliminate_redundant(&mut f, true), usize::from(!osr));
         }
     }
+
+    #[test]
+    fn incoming_mv_is_dead_only_when_every_successor_discards_it() {
+        let mut f = Function::new("mv-branches");
+        let entry = f.entry();
+        let left = f.make_block();
+        let right = f.make_block();
+        let (point, _) = f.push_inst(entry, base(Opcode::MemoryFence), &[]);
+        f.set_terminator(entry, brif(left, right));
+        f.push_inst(left, clear_mv(), &[]);
+        f.set_terminator(left, base(Opcode::Return));
+        f.set_terminator(right, base(Opcode::Return));
+        assert!(!unobserved_multiple_value_state(&f).contains(&point),
+            "the right return can still observe the old tuple");
+        let ret = f.block_mut(right).insts.pop().unwrap();
+        f.push_inst(right, clear_mv(), &[]);
+        f.block_mut(right).insts.push(ret);
+        assert!(unobserved_multiple_value_state(&f).contains(&point));
+    }
+
+    #[test]
+    fn incoming_mv_liveness_propagates_through_loop_backedges() {
+        let mut f = Function::new("mv-loop");
+        let entry = f.entry();
+        let loop_body = f.make_block();
+        let exit = f.make_block();
+        let (point, _) = f.push_inst(entry, base(Opcode::MemoryFence), &[]);
+        f.set_terminator(entry, jump(loop_body));
+        f.set_terminator(loop_body, brif(loop_body, exit));
+        f.push_inst(exit, clear_mv(), &[]);
+        f.set_terminator(exit, base(Opcode::Return));
+        assert!(unobserved_multiple_value_state(&f).contains(&point));
+        let branch = f.block_mut(loop_body).insts.pop().unwrap();
+        f.push_inst(loop_body, call(), &[]);
+        f.block_mut(loop_body).insts.push(branch);
+        assert!(!unobserved_multiple_value_state(&f).contains(&point),
+            "a reader on the cycle must keep the incoming tuple live");
+    }
+
 }

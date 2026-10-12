@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Keep eligible T1/T2 callers on the ordinary x86-64 Lisp ABI when earlier
+  calls' extra values are discarded before a primitive operation
+  ([#299](https://github.com/atgreen/evergreen/pull/299)).
+
 - Use the ordinary x86-64 Linux Lisp register ABI by default for supported tagged
   T1 and T2 bodies, including recursive and branching calls, global operations,
   and stack arguments. Extend ordinary entry adapters to interpreted functions,
