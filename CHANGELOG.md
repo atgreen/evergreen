@@ -11,6 +11,9 @@
 - Preserve large-object identities, payload references, and true header pinning when restoring and resaving heap images.
   ([#305](https://github.com/atgreen/evergreen/pull/305)).
 
+- Label native profiler maps with the actual T1, T2, or OSR tier.
+  ([#303](https://github.com/atgreen/evergreen/pull/303)).
+
 ## 0.0.7 - 2026-10-12
 
 - Use the new x86-64 Linux Lisp register ABI for supported T1/T2 functions,
