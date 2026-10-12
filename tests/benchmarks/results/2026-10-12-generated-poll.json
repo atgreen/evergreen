@@ -1,0 +1,535 @@
+{
+  "build_description": "Rust1.94.1 Cargo1.94.1; x86_64-unknown-linux-musl; --locked --release default thin-LTO/codegen-units1; /tmp/bliss-vpbuk-binaries/before-build.json and after-build.json; build logs /tmp/bliss-vpbuk-before-build.log and /tmp/bliss-vpbuk-after-build.log; coordinated no compiler/test activity",
+  "platform": "Linux-7.2.7-200.fc44.x86_64-x86_64-with-glibc2.43",
+  "cpu": 4,
+  "iterations": 1000000,
+  "samples_per_trial": 9,
+  "workload_sha256": "1edc309b059ec637522d4b4ddc1c2537ef5aae356e7d785fc89feac876fce358",
+  "metric": "loop ns/iteration including arithmetic and branches; not isolated poll cost",
+  "binaries": {
+    "before": {
+      "path": "/tmp/bliss-vpbuk-binaries/before-egcl",
+      "revision": "3e326969f83d786674c8d0dcd07be660a295ccb7",
+      "sha256": "7c1af70c1ae7e6a868b03cd43871e724393ef459ef910db5420ef6a1ee795f5c"
+    },
+    "after": {
+      "path": "/tmp/bliss-vpbuk-binaries/after-egcl",
+      "revision": "aec3aa68fff06b0c4571115d7f7f56f88a445213",
+      "sha256": "62c0476300680f38aebb3fb57bc1c5db305720da362505893f01f054c85c3906"
+    }
+  },
+  "trials": [
+    {
+      "side": "before",
+      "trial": 0,
+      "started_unix": 1791764459.0742264,
+      "load_before": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/before-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "elapsed_ns": [
+        183156365,
+        182784479,
+        182402284,
+        182726485,
+        182395066,
+        181965604,
+        182617627,
+        182996145,
+        182560946
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 181.965604,
+        "p05_ns_per_iteration": 182.13738880000002,
+        "median_ns_per_iteration": 182.617627,
+        "p95_ns_per_iteration": 183.092277,
+        "max_ns_per_iteration": 183.156365
+      }
+    },
+    {
+      "side": "after",
+      "trial": 0,
+      "started_unix": 1791764461.6054351,
+      "load_before": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/after-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "elapsed_ns": [
+        4869574,
+        4842489,
+        4922108,
+        4869792,
+        4922576,
+        4882079,
+        4811886,
+        4946925,
+        4843476
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 4.811886,
+        "p05_ns_per_iteration": 4.8241272,
+        "median_ns_per_iteration": 4.869792,
+        "p95_ns_per_iteration": 4.937185400000001,
+        "max_ns_per_iteration": 4.946925
+      }
+    },
+    {
+      "side": "after",
+      "trial": 1,
+      "started_unix": 1791764461.9944532,
+      "load_before": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/after-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "elapsed_ns": [
+        5024353,
+        4832666,
+        4836390,
+        4895777,
+        4855306,
+        4848247,
+        4847601,
+        4822736,
+        4841618
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 4.822736,
+        "p05_ns_per_iteration": 4.826708,
+        "median_ns_per_iteration": 4.847601,
+        "p95_ns_per_iteration": 4.9729225999999995,
+        "max_ns_per_iteration": 5.024353
+      }
+    },
+    {
+      "side": "before",
+      "trial": 1,
+      "started_unix": 1791764462.3723679,
+      "load_before": [
+        1.52734375,
+        2.5849609375,
+        3.021484375
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/before-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "elapsed_ns": [
+        184379849,
+        183760891,
+        184082750,
+        184136505,
+        183560208,
+        183777823,
+        184428638,
+        183510783,
+        183693759
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 183.510783,
+        "p05_ns_per_iteration": 183.530553,
+        "median_ns_per_iteration": 183.777823,
+        "p95_ns_per_iteration": 184.4091224,
+        "max_ns_per_iteration": 184.428638
+      }
+    },
+    {
+      "side": "before",
+      "trial": 2,
+      "started_unix": 1791764464.9189105,
+      "load_before": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/before-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "elapsed_ns": [
+        184142158,
+        183719824,
+        183930520,
+        183798426,
+        183965093,
+        183921586,
+        184528496,
+        184044765,
+        183987928
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 183.719824,
+        "p05_ns_per_iteration": 183.7512648,
+        "median_ns_per_iteration": 183.965093,
+        "p95_ns_per_iteration": 184.3739608,
+        "max_ns_per_iteration": 184.528496
+      }
+    },
+    {
+      "side": "after",
+      "trial": 2,
+      "started_unix": 1791764467.4512448,
+      "load_before": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/after-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "elapsed_ns": [
+        4870507,
+        4960723,
+        4899029,
+        4844209,
+        4952891,
+        4832516,
+        4839117,
+        4887380,
+        4974082
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 4.832516,
+        "p05_ns_per_iteration": 4.8351564,
+        "median_ns_per_iteration": 4.88738,
+        "p95_ns_per_iteration": 4.9687384,
+        "max_ns_per_iteration": 4.974082
+      }
+    },
+    {
+      "side": "after",
+      "trial": 3,
+      "started_unix": 1791764467.8302755,
+      "load_before": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/after-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "elapsed_ns": [
+        4943923,
+        4902838,
+        4870717,
+        4842252,
+        4885620,
+        4888051,
+        4869923,
+        4851545,
+        4860198
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 4.842252,
+        "p05_ns_per_iteration": 4.8459692,
+        "median_ns_per_iteration": 4.870717,
+        "p95_ns_per_iteration": 4.927489,
+        "max_ns_per_iteration": 4.943923
+      }
+    },
+    {
+      "side": "before",
+      "trial": 3,
+      "started_unix": 1791764468.2117732,
+      "load_before": [
+        1.48486328125,
+        2.55859375,
+        3.01025390625
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/before-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.5263671875,
+        2.54931640625,
+        3.00439453125
+      ],
+      "elapsed_ns": [
+        185630561,
+        185383584,
+        185805474,
+        186225189,
+        186215581,
+        186235068,
+        186229512,
+        186334758,
+        186534902
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 185.383584,
+        "p05_ns_per_iteration": 185.4823748,
+        "median_ns_per_iteration": 186.225189,
+        "p95_ns_per_iteration": 186.45484439999998,
+        "max_ns_per_iteration": 186.534902
+      }
+    },
+    {
+      "side": "before",
+      "trial": 4,
+      "started_unix": 1791764470.7600327,
+      "load_before": [
+        1.5263671875,
+        2.54931640625,
+        3.00439453125
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/before-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.5263671875,
+        2.54931640625,
+        3.00439453125
+      ],
+      "elapsed_ns": [
+        182069564,
+        182451883,
+        182884482,
+        182365135,
+        181951037,
+        182531709,
+        182291863,
+        182120108,
+        182086176
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 181.951037,
+        "p05_ns_per_iteration": 181.9984478,
+        "median_ns_per_iteration": 182.291863,
+        "p95_ns_per_iteration": 182.7433728,
+        "max_ns_per_iteration": 182.884482
+      }
+    },
+    {
+      "side": "after",
+      "trial": 4,
+      "started_unix": 1791764473.268855,
+      "load_before": [
+        1.5263671875,
+        2.54931640625,
+        3.00439453125
+      ],
+      "command": [
+        "/home/green/git/evergreen/target/t2-generated-poll/scripts/egcl-limited.sh",
+        "taskset",
+        "-c",
+        "4",
+        "/tmp/bliss-vpbuk-binaries/after-egcl",
+        "--no-init",
+        "--load",
+        "/tmp/bliss-vpbuk-quiet-results/workload.lisp"
+      ],
+      "returncode": 0,
+      "load_after": [
+        1.48388671875,
+        2.5234375,
+        2.9931640625
+      ],
+      "elapsed_ns": [
+        5271436,
+        4940015,
+        4856582,
+        4904423,
+        4838433,
+        4849970,
+        4854976,
+        4871795,
+        4841839
+      ],
+      "summary": {
+        "sample_count": 9,
+        "min_ns_per_iteration": 4.838433,
+        "p05_ns_per_iteration": 4.8397954,
+        "median_ns_per_iteration": 4.856582,
+        "p95_ns_per_iteration": 5.138867599999999,
+        "max_ns_per_iteration": 5.271436
+      }
+    }
+  ],
+  "summary": {
+    "before": {
+      "sample_count": 45,
+      "min_ns_per_iteration": 181.951037,
+      "p05_ns_per_iteration": 182.07288640000002,
+      "median_ns_per_iteration": 183.760891,
+      "p95_ns_per_iteration": 186.23395680000002,
+      "max_ns_per_iteration": 186.534902
+    },
+    "after": {
+      "sample_count": 45,
+      "min_ns_per_iteration": 4.811886,
+      "p05_ns_per_iteration": 4.832546,
+      "median_ns_per_iteration": 4.869792,
+      "p95_ns_per_iteration": 4.9714102,
+      "max_ns_per_iteration": 5.271436
+    }
+  },
+  "host": {
+    "lscpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           42 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Core(TM) Ultra 7 255H\nCPU family:                              6\nModel:                                   197\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                2\nMicrocode version:                       0x122\nCPU(s) scaling MHz:                      68%\nCPU max MHz:                             2000.0000\nCPU min MHz:                             400.0000\nBogoMIPS:                                7372.80\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault epb ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lass lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\nVirtualization:                          VT-x\nL1d cache:                               480 KiB (12 instances)\nL1i cache:                               768 KiB (12 instances)\nL2 cache:                                28 MiB (9 instances)\nL3 cache:                                24 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS Not affected; BHI BHI_DIS_S\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB before exit to userspace\n",
+    "cpu": 4,
+    "thread_siblings": "4",
+    "governor": "powersave",
+    "min_frequency_khz": "400000",
+    "max_frequency_khz": "2000000"
+  },
+  "build_provenance": {
+    "before": {
+      "revision": "3e326969f83d786674c8d0dcd07be660a295ccb7",
+      "sha256": "7c1af70c1ae7e6a868b03cd43871e724393ef459ef910db5420ef6a1ee795f5c",
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+      "command": "cargo build --locked --release -p egcl --bin egcl",
+      "target": "x86_64-unknown-linux-musl",
+      "jobs": 2,
+      "memory_cap": "5G",
+      "build_log": "/tmp/bliss-vpbuk-before-build.log"
+    },
+    "after": {
+      "revision": "aec3aa68fff06b0c4571115d7f7f56f88a445213",
+      "sha256": "62c0476300680f38aebb3fb57bc1c5db305720da362505893f01f054c85c3906",
+      "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+      "cargo": "cargo 1.94.1 (29ea6fb6a 2026-03-24)",
+      "command": "cargo build --locked --release -p egcl --bin egcl",
+      "target": "x86_64-unknown-linux-musl",
+      "jobs": 2,
+      "memory_cap": "5G",
+      "build_log": "/tmp/bliss-vpbuk-after-build.log"
+    }
+  },
+  "validation": {
+    "checksums_all_samples": 499999500000,
+    "mapped_publication_all_trials": true,
+    "mapped_current_disassembly_before_and_after_all_trials": true,
+    "selected_poll_sites_per_iteration": 2,
+    "pre_run_compiler_processes": [],
+    "raw_artifacts": "/tmp/bliss-vpbuk-quiet-results",
+    "host_note": "Agent builds and tests paused; ordinary desktop/browser processes remained. Governor unchanged.",
+    "identical_pre_post_disassembly_all_trials": true,
+    "single_named_mapped_publication_all_trials": true,
+    "named_deopt_or_recompile_log_messages": []
+  }
+}
