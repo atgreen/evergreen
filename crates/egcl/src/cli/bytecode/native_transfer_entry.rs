@@ -328,7 +328,7 @@ pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Opti
     let metadata = code.deopt_metadata.clone();
     let entry = code.code.as_ptr();
     let bytes = unsafe { std::slice::from_raw_parts(entry, code.code_len) };
-    maybe_write_perf_map(entry as usize, code.code_len, symbol);
+    maybe_write_perf_map("T1", entry as usize, code.code_len, symbol);
     maybe_write_jitdump_code_load("T1", entry as usize, bytes, symbol);
     let native = Rc::new(NativeCode {
         _env_names: NativeEnvNames::new(&body),

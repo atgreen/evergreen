@@ -17829,14 +17829,16 @@ pub fn deopt_count() -> u64 {
     DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Append a Linux `perf` symbol-map entry for a freshly installed T1 function
+mod perf_map;
+
+/// Append a Linux `perf` symbol-map entry for freshly installed native code
 /// (bliss-jtc.10). When EGCL_PERF_MAP is set, `perf` symbolicates JIT frames by
 /// reading `/tmp/perf-<pid>.map`, whose lines are `<hex-addr> <hex-size> <name>`
-/// — so `perf top`/`perf report` show `T1:<function>` instead of an unknown
+/// — so `perf top`/`perf report` show `<tier>:<function>` instead of an unknown
 /// address, exactly how HotSpot exposes its compiled code. Setting the variable
 /// to a path (any value containing '/') redirects the file, which the tests use;
 /// "1" (or any non-path value) writes the perf-standard `/tmp/perf-<pid>.map`.
-fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
+fn maybe_write_perf_map(tier: &str, addr: usize, size: usize, sym: u32) {
     let Some(val) = std::env::var_os("EGCL_PERF_MAP") else {
         return;
     };
@@ -17847,19 +17849,12 @@ fn maybe_write_perf_map(addr: usize, size: usize, sym: u32) {
         format!("/tmp/perf-{}.map", std::process::id())
     };
     let raw = sym_label(sym);
-    // perf reads everything after the size as the symbol name; keep it a single
-    // token so tools that split on whitespace stay happy.
-    let name: String = raw
-        .chars()
-        .map(|c| if c.is_whitespace() { '_' } else { c })
-        .collect();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        use std::io::Write;
-        let _ = writeln!(f, "{addr:x} {size:x} T1:{name}");
+        let _ = perf_map::write_entry(&mut f, tier, addr, size, &raw);
     }
 }
 
@@ -20046,7 +20041,7 @@ fn install_t2_completion(done: T2Completion) -> Option<Rc<NativeCode>> {
         .ok()?;
     let code_info = install_stack_map(total_slots, debug_info)?;
     let entry = buf.as_ptr();
-    maybe_write_perf_map(entry as usize, checked.code.len(), done.sym);
+    maybe_write_perf_map("T2", entry as usize, checked.code.len(), done.sym);
     maybe_write_jitdump_code_load("T2", entry as usize, &checked.code, done.sym);
     // EGCL_T2_DISASM=<substring>: print the installed code of matching
     // functions to stderr at install time — the only way to inspect code that
@@ -22537,7 +22532,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     let entry = buf.as_ptr();
     // Emit a Linux perf symbol-map entry so `perf` can symbolicate this T1 frame
     // (bliss-jtc.10) — the same mechanism HotSpot uses for its JIT code.
-    maybe_write_perf_map(entry as usize, code.len(), sym);
+    maybe_write_perf_map("T1", entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("T1", entry as usize, &code, sym);
     let nc = Rc::new(NativeCode {
         _env_names: env_names,
@@ -23300,7 +23295,7 @@ fn compile_osr_code(bf: &Arc<BytecodeFunction>, sym: u32) -> Option<Rc<OsrCode>>
     let debug_info = buf.install_debug_info(&bf.name).ok()?;
     let code_info = install_stack_map(num_slots, debug_info)?;
     let entry = buf.as_ptr();
-    maybe_write_perf_map(entry as usize, code.len(), sym);
+    maybe_write_perf_map("OSR", entry as usize, code.len(), sym);
     maybe_write_jitdump_code_load("OSR", entry as usize, &code, sym);
     Some(Rc::new(OsrCode {
         _env_names: env_names,
