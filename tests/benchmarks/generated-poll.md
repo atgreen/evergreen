@@ -24,14 +24,18 @@ python3 tests/benchmarks/generated_poll.py \
 The output directory must not already exist. The runner pins each process,
 forces T2, excludes warmup/publication and printing from its timed regions,
 checks the sum, and alternates before/after process order across trials. It
-requires the named workload's mapped T2 publication and saves current-code
+requires exactly one named mapped T2 publication and identical current-code
 disassemblies before and after measurement. Inspect those listings to confirm
 the selected backward edge uses the expected unconditional veneer or generated
 guard; forcing T2 alone does not rule out compiler fallback.
 
+The loop intentionally has no checked parameter declarations: the baseline
+revision declines mapped native entry for that shape. Runtime profiling still
+selects guarded fixnum arithmetic, which the saved listings make inspectable.
+
 `manifest.json` records binary and workload hashes, caller-supplied revision and
 build provenance, platform, CPU, load snapshots, every sample, and per-trial and
-pooled p5/median/p95 (linearly interpolated percentiles). Raw stdout, stderr and
+pooled range and p5/median/p95 (linearly interpolated percentiles). Raw stdout, stderr and
 T2 logs remain alongside it. Load snapshots are context, not proof of a quiet
 host: coordinate with other jobs, and report interference rather than selecting
 only favorable trials. The script cannot independently authenticate the supplied

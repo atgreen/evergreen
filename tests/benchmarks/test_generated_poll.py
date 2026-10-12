@@ -9,12 +9,14 @@ class TrialEvidence(unittest.TestCase):
         self.stdout = """POLL-DISASSEMBLY-BEGIN
 ; POLL-GUARD-BENCH — 1 arg(s)
 ; T2 — profile-guided native
+; Mapped native transfer ABI — installed native code.
 POLL-DISASSEMBLY-END
 POLL-SAMPLE 0 100 45
 POLL-SAMPLE 1 200 45
 POLL-DISASSEMBLY-BEGIN
 ; POLL-GUARD-BENCH — 1 arg(s)
 ; T2 — profile-guided native
+; Mapped native transfer ABI — installed native code.
 POLL-DISASSEMBLY-END
 """
         self.log = "[T2] POLL-GUARD-BENCH: optimized worker result installed with mapped T2 ABI; bytes=600"
@@ -32,6 +34,7 @@ POLL-DISASSEMBLY-END
 
     def test_rejects_fallback_or_missing_final_disassembly(self):
         for output in (self.stdout.replace("; T2", "; T1"),
+                       self.stdout.replace("Mapped native transfer ABI", "Legacy ABI"),
                        self.stdout.rsplit("POLL-DISASSEMBLY-BEGIN", 1)[0]):
             with self.assertRaises(ValueError):
                 self.parse(stdout=output)
@@ -43,11 +46,20 @@ POLL-DISASSEMBLY-END
             with self.assertRaises(ValueError):
                 self.parse(stdout=output)
 
+    def test_rejects_changed_current_code_or_republication(self):
+        with self.assertRaises(ValueError):
+            self.parse(stdout=self.stdout.replace("; T2 — profile-guided native",
+                                                   "; T2 — profile-guided native changed", 1))
+        with self.assertRaises(ValueError):
+            self.parse(log=self.log + "\n" + self.log)
+
     def test_reports_distribution_per_iteration(self):
         result = summarize([100, 200, 300], 10)
         self.assertEqual(result["median_ns_per_iteration"], 20)
         self.assertEqual(result["p05_ns_per_iteration"], 11)
         self.assertEqual(result["p95_ns_per_iteration"], 29)
+        self.assertEqual(result["min_ns_per_iteration"], 10)
+        self.assertEqual(result["max_ns_per_iteration"], 30)
 
 
 if __name__ == "__main__":

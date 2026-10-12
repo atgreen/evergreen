@@ -14,12 +14,16 @@ import time
 
 
 def parse_trial(stdout, log, iterations, samples):
-    if not re.search(r"POLL-GUARD-BENCH: optimized worker result installed with mapped T2 ABI", log):
-        raise ValueError("named workload lacks mapped T2 publication")
+    if len(re.findall(r"POLL-GUARD-BENCH: optimized worker result installed with mapped T2 ABI", log)) != 1:
+        raise ValueError("named workload requires exactly one mapped T2 publication")
     listings = re.findall(r"POLL-DISASSEMBLY-BEGIN\s*(.*?)POLL-DISASSEMBLY-END", stdout, re.S)
     if len(listings) != 2 or any("POLL-GUARD-BENCH" not in listing or
-                                "; T2 —" not in listing for listing in listings):
+                                "; T2 —" not in listing or
+                                "; Mapped native transfer ABI — installed native code." not in listing
+                                for listing in listings):
         raise ValueError("both current-code disassemblies must identify workload T2")
+    if listings[0] != listings[1]:
+        raise ValueError("current workload code changed during the trial")
     rows = re.findall(r"^POLL-SAMPLE (\d+) (\d+) (\d+)\s*$", stdout, re.M)
     if len(rows) != samples:
         raise ValueError("incomplete sample set")
@@ -42,9 +46,11 @@ def summarize(samples, iterations):
         return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
     return {"sample_count": len(samples),
+            "min_ns_per_iteration": ordered[0],
             "p05_ns_per_iteration": percentile(.05),
             "median_ns_per_iteration": statistics.median(ordered),
-            "p95_ns_per_iteration": percentile(.95)}
+            "p95_ns_per_iteration": percentile(.95),
+            "max_ns_per_iteration": ordered[-1]}
 
 
 def workload(iterations, samples):
@@ -52,9 +58,7 @@ def workload(iterations, samples):
 (disassemble 'poll-guard-bench)
 (format t "POLL-DISASSEMBLY-END~%")"""
     return f"""(defun poll-guard-bench (n)
-  (declare (type fixnum n))
   (let ((sum 0))
-    (declare (type fixnum sum))
     (dotimes (i n sum) (setq sum (+ sum i)))))
 (dotimes (warm 3) (poll-guard-bench {iterations}))
 {listing}
