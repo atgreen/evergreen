@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Use the ordinary x86-64 Linux Lisp register ABI by default for supported tagged
+  T1 and T2 bodies, including recursive and branching calls, global operations,
+  and stack arguments. Extend ordinary entry adapters to interpreted functions,
+  builtins, and callable objects while preserving GC roots and multiple values
+  ([#298](https://github.com/atgreen/evergreen/pull/298)).
+
 - Continue through two eligible Linux x86-64 T2 native calls, normalizing
   intermediate multiple-value state and preserving live roots before forwarding
   the final result tuple ([#296](https://github.com/atgreen/evergreen/pull/296)).
