@@ -215,15 +215,18 @@ fn ordinary_caller_guard_resumes_after_native_child_completed_once() {
     let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
     let control = unsafe { &*execution }.active_native_control();
     let segment = egcl_rt::native_transfer::current_segment();
-    // Drain ambient requests before counting cold calls; the terminal effect
-    // helper is cold, but the already-warmed A->B edge must execute directly.
+    // Drain ambient requests before measuring the generated A->B edge and
+    // the terminal effect's named adapter independently.
     egcl_rt::poll_safepoint();
     assert_eq!(super::super::native_loop_should_exit(), 0);
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(answer = run_native(&caller, symbol, &[*input], &mut env).unwrap());
     assert_eq!(answer.as_double_float(), 3.5);
-    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
-        "only B's terminal effect call is cold; A must execute its warmed ordinary CALL");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 1,
+        "only B's terminal effect uses the named adapter; A executes its warmed ordinary CALL");
     assert_eq!(mapped(&caller).deopt_count(), 1, "A fails only after B completed");
     assert_eq!(mapped(&child).deopt_count(), 0, "B completes using its ordinary forwarding entry");
     assert_eq!(crate::cli::read_eval_all_env("*ordinary-caller-guard-effects*", &mut env).unwrap(),

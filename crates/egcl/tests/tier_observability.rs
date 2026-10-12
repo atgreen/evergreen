@@ -739,7 +739,7 @@ fn background_t2_loads_a_rooted_movable_literal_from_its_constant_slot() {
     assert!(
         stderr.contains("ROOTED-LITERAL: background T2 result published")
             || stderr
-                .contains("ROOTED-LITERAL: optimized worker result installed with mapped T2 ABI"),
+                .contains("ROOTED-LITERAL: optimized worker result installed with "),
         "heap literal did not reach installed T2 code:\n{stderr}"
     );
     assert!(
@@ -854,10 +854,10 @@ fn t1_calls_non_deopting_t2_callee() {
     if MAPPED_LINUX {
         assert_eq!(
             stdout
-                .matches("Mapped native transfer ABI — installed native code")
+                .matches("Ordinary x86-64 Lisp ABI — installed native code")
                 .count(),
             2,
-            "both the T1 caller and T2 callee must have installed mapped entries: {stdout}"
+            "both the T1 caller and T2 callee must have installed ordinary entries: {stdout}"
         );
         assert!(stdout.contains("; T1 — tagged baseline native"), "{stdout}");
         assert!(stdout.contains("; T2 — profile-guided native"), "{stdout}");
@@ -1382,7 +1382,7 @@ fn body_inlining_eliminates_redundant_layout_guards() {
     if MAPPED_LINUX {
         // These are retained library calls; cloned native proofs remain bliss-shih7.28.
         assert!(
-            out.contains("Mapped native transfer ABI — installed native code"),
+            out.contains("Ordinary x86-64 Lisp ABI — installed native code"),
             "{out}"
         );
         assert!(out.lines().any(|line| line.contains("call ")), "{out}");
@@ -1431,7 +1431,7 @@ fn hot_call_site_inlines_body_above_small_threshold() {
     if MAPPED_LINUX {
         // These are retained library calls; cloned native proofs remain bliss-shih7.28.
         assert!(
-            out.contains("Mapped native transfer ABI — installed native code"),
+            out.contains("Ordinary x86-64 Lisp ABI — installed native code"),
             "{out}"
         );
         assert!(out.lines().any(|line| line.contains("call ")), "{out}");
@@ -2528,7 +2528,7 @@ fn t2_elides_unobservable_multiple_value_resets() {
         assert!(
             stderr
                 .lines()
-                .any(|line| line.ends_with("MV-LOOP: mapped T2 emitted; clear_mv_resets=1")),
+                .any(|line| line.contains("MV-LOOP: mapped T2 emitted; clear_mv_resets=1,")),
             "only the final observable reset may survive in emitted IR: {stderr}"
         );
         return;

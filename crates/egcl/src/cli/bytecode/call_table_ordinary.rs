@@ -6,7 +6,7 @@
 //! call allocates a managed activation or increments a Rust reference count.
 
 use super::{CallCell, linkage};
-use egcl_rt::call_table::OrdinaryEntryDescriptor;
+use egcl_rt::call_table::{OrdinaryEntryDescriptor, OrdinaryCallHeat};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -16,6 +16,9 @@ use super::super::native_transfer_entry::TransferCode;
 
 struct RetainedEntry<C> {
     descriptor: OrdinaryEntryDescriptor,
+    // Past policies can still be loaded by suspended native activations.
+    #[allow(clippy::vec_box)]
+    heat: Vec<Box<OrdinaryCallHeat>>,
     cell: Arc<CallCell>,
     code: Rc<C>,
     callable: Option<Arc<egcl_rt::CrossThreadRoot<egcl_rt::value::EgclVal>>>,
@@ -83,6 +86,7 @@ impl<C> RetainedEntries<C> {
         }
         let entry = Box::new(RetainedEntry {
             descriptor,
+            heat: Vec::new(),
             cell,
             code,
             callable,
@@ -219,11 +223,25 @@ pub(in crate::cli::bytecode) fn enter_ordinary_segment() -> OrdinarySegmentGuard
 /// # Safety
 /// `cell` identifies this execution's live CallCell; descriptor entry/range and
 /// ABI metadata must describe `code` and have passed installation validation.
+#[cfg(test)]
 pub(in crate::cli::bytecode) unsafe fn publish_ordinary(
     cell: u64,
     descriptor: OrdinaryEntryDescriptor,
     code: Rc<TransferCode>,
     function: egcl_rt::value::EgclVal,
+) -> bool {
+    unsafe { publish_ordinary_with_heat(cell, descriptor, code, function, None) }
+}
+
+/// Publish optional heat metadata under the descriptor's same lifetime lease.
+/// Safety requirements are identical to `publish_ordinary`; counters must name
+/// pinned fields of `function`, which this directory retains as a traced root.
+pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
+    cell: u64,
+    descriptor: OrdinaryEntryDescriptor,
+    code: Rc<TransferCode>,
+    function: egcl_rt::value::EgclVal,
+    heat: Option<OrdinaryCallHeat>,
 ) -> bool {
     egcl_rt::rooted!(function = function);
     let state = unsafe { super::state(cell) };
@@ -241,7 +259,21 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary(
                 .retain_with_callable(Arc::clone(&state.cell), descriptor, code, Some(callable));
         let Some(pointer) = pointer else { return false };
         // Retention and publication do not allocate Lisp objects or yield.
-        let published = unsafe { linkage::publish_ordinary(&state.cell, &*pointer) };
+        let heat_pointer = {
+            let mut retained = directory.retained.borrow_mut();
+            let entry = retained.entries.iter_mut()
+                .find(|entry| std::ptr::eq(&entry.descriptor, pointer)).unwrap();
+            if let Some(mut heat) = heat {
+                heat.descriptor = pointer as usize;
+                if entry.heat.last().is_none_or(|current| **current != heat) {
+                    entry.heat.push(Box::new(heat));
+                }
+                std::ptr::from_ref(&**entry.heat.last().unwrap()) as usize
+            } else {
+                0
+            }
+        };
+        let published = unsafe { linkage::publish_ordinary_with_heat(&state.cell, &*pointer, heat_pointer) };
         directory.retained.borrow_mut().sweep();
         published
     })
@@ -303,6 +335,12 @@ pub(in crate::cli::bytecode) fn assert_guarded_callable_publication_for_test(
     linkage::invalidate(symbol);
     linkage::invalidate(other);
     drop(segment);
+}
+
+/// Descriptors loaded by generated code remain borrowed until all native
+/// segments in this execution retire, including suspended Rust callbacks.
+pub(super) fn has_active_segments() -> bool {
+    DIRECTORY.with(|directory| directory.retained.borrow().segments != 0)
 }
 
 #[cfg(test)]

@@ -45,6 +45,10 @@ fn ordinary_two_calls_normalize_zero_and_relocate_a_live_argument_before_second_
     for code in [&zero, &many, &caller] { assert_ordinary(code); }
     let NativeCodeStorage::Mapped(mapped) = &caller._storage else { unreachable!() };
     assert_eq!(mapped.value_maps_for_test().iter().count(), 4, "two actual direct/cold CALL pairs");
+    // Retire unrelated closures before warming the measured cells. The
+    // collector invalidates all call descriptors when it sweeps a dead closure;
+    // that setup work must not mask the two direct continuation edges below.
+    HeapCollector::new().full_gc().unwrap();
     expect_entry(&zero);
     assert_eq!(run_native(&zero, zero_symbol, &[NIL], &mut env).unwrap(), NIL);
     assert!(env.mv_active && env.mv.is_empty(), "first target really returns zero active values");
@@ -62,9 +66,12 @@ fn ordinary_two_calls_normalize_zero_and_relocate_a_live_argument_before_second_
     COLLECTIONS.with(|count| count.set(0));
     expect_entry(&caller);
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(result = run_native(&caller, symbol, &[*payload], &mut env).unwrap());
-    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 2,
-        "only the two terminal helpers are cold; both continuation edges enter native targets");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 2,
+        "exactly two terminal named adapters; both continuation edges enter generated bodies");
     assert_eq!(COLLECTIONS.with(Cell::get), 1);
     assert_ne!(payload.to_raw(), before, "the first callee must relocate the caller's live argument");
     assert_eq!(*result, *payload);

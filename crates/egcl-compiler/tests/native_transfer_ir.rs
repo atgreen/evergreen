@@ -730,3 +730,47 @@ fn full_register_pool_preserves_optimized_transfer_guards() {
     ).expect("the full register pool must retain optimized native admission");
     assert!(emitted.has_deopt, "do not silently replace the guarded body with baseline code");
 }
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn global_operations_after_unknown_mv_keep_an_optimized_mapped_continuation() {
+    use egcl_compiler::t2::{build, emit};
+    use egcl_compiler::control_scope::ScopeMap;
+    let mut source = body();
+    source.code = vec![
+        Instr::CallNamed { sym: 123456, nargs: 0 }, Instr::Pop,
+        Instr::LoadGlobal(123457), Instr::StoreGlobal(123458),
+        Instr::LoadFunction(123459), Instr::Return,
+    ];
+    let ordinary = build::build_for_transfer_optimization(&source, 123455).unwrap();
+    let sites: Vec<_> = ordinary.block_order().iter()
+        .flat_map(|&block| ordinary.block(block).insts.iter().copied())
+        .filter(|&inst| matches!(ordinary.inst(inst).opcode,
+            Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::SymbolFunction))
+        .map(|inst| (inst, ordinary.inst(inst).opcode, ordinary.inst(inst).frame_state,
+            ordinary.inst(inst).source_pos)).collect();
+    assert_eq!(sites.len(), 3);
+    assert!(emit::lower_ordinary_primitives(&mut ordinary.clone(), |_| Some(123460)).is_err(),
+        "the preceding call leaves an unknown MV tuple which primitives must preserve");
+    let mut mapped = ordinary.clone();
+    build::legalize_transfer_calls(&mut mapped, &ScopeMap::analyze_function(&source).unwrap()).unwrap();
+    verify(&mapped).unwrap();
+    for (inst, opcode, state, position) in sites {
+        assert_eq!(ordinary.inst(inst).opcode, opcode, "ordinary candidate remains untouched");
+        let data = mapped.inst(inst);
+        assert_eq!(data.opcode, Opcode::Invoke);
+        assert_eq!(data.frame_state, state, "retain the exact pre-effect continuation");
+        assert_eq!(data.source_pos, position);
+        assert!(matches!((&data.aux, opcode),
+            (AuxData::GlobalValue { symbol: 123457, store: false }, Opcode::SymbolValue)
+            | (AuxData::GlobalValue { symbol: 123458, store: true }, Opcode::SetSymbolValue)
+            | (AuxData::FunctionLookup(123459), Opcode::SymbolFunction)));
+        let cold = mapped.inst(mapped.terminator(data.targets[1].block).unwrap());
+        assert_eq!(cold.opcode, Opcode::NlxTransfer);
+        assert_eq!(cold.frame_state, state);
+    }
+    let (emitted, _) = emit::emit_framed_native_handlers_with_recursion(
+        &mapped, 1, source.num_slots(), 1, 1, 1, 1, 1, 1, None, Some(1),
+    ).expect("mapped fallback must emit the same optimized IR after ordinary rejection");
+    assert!(emitted.frame_entry.is_some());
+}

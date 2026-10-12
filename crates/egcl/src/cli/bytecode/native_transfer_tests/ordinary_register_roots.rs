@@ -86,11 +86,14 @@ fn ordinary_register_foreign_arguments_survive_gc_and_exceptional_retirement() {
     let control = unsafe { &*execution }.active_native_control();
     let segment = egcl_rt::native_transfer::current_segment();
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     egcl_rt::rooted!(error = run_native(&outer, symbol, &arguments, &mut env).unwrap_err());
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
     assert_eq!(
-        native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
         1,
-        "only the terminal call is cold: the middle frame entered through generated code"
+        "only the terminal uses the named adapter; the middle enters its generated body"
     );
     assert!(
         arguments

@@ -37,6 +37,7 @@ mod deopt;
 pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
 mod native_frames;
 pub(super) mod ordinary_calls;
+pub(super) mod ordinary_primitives;
 
 // Two-owner GC fixtures deliberately retain ordinary CALL frames. All other
 // tests use production tail selection; the override follows fiber execution.
@@ -254,6 +255,8 @@ pub(super) struct TransferCode {
     pub(super) has_deopt: bool,
     bcp_offsets: Vec<u32>,
     osr_entries: HashMap<u32, usize>,
+    // OSR imports use managed activation homes, independently of full-call ABI.
+    osr_companion: Option<Box<TransferCode>>,
     osr_polls: HashMap<usize, u32>,
     _veneer: JitBuffer,
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
@@ -316,7 +319,7 @@ pub(super) fn install_t1(
 }
 
 pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Option<Rc<NativeCode>> {
-    code.installed_symbol = Some(symbol);
+    code.set_installed_symbol(symbol);
     let body = Arc::clone(&code.body);
     let code = Rc::new(code);
     let code_info = code.code_info;
@@ -590,6 +593,19 @@ impl TransferCode {
         Self::compile_variant(body, false, false)
     }
 
+    // Protocol fixtures need a real managed-activation caller even when the
+    // same Lisp body is admitted by the production ordinary emitter.
+    #[cfg(test)]
+    pub(super) fn compile_mapped_for_test(body: Arc<BytecodeFunction>) -> Option<Self> {
+        let roots = retain_native_body(&body);
+        let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?;
+        let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
+            let Instr::CallNamed { sym, .. } = instruction else { return None };
+            call_table::resolve(*sym).map(|cell| (*sym, cell))
+        }).collect();
+        Self::emit_prepared(body, roots, &ir, None, &call_cells, false, CompilationTier::T1)
+    }
+
     pub(super) fn compile_nested(body: Arc<BytecodeFunction>) -> Option<Self> {
         if body.has_env
             || body.variadic
@@ -601,6 +617,17 @@ impl TransferCode {
         }
         Self::compile_variant(Arc::clone(&body), true, false)
             .or_else(|| Self::compile_variant(body, false, false))
+    }
+
+    fn set_installed_symbol(&mut self, symbol: u32) {
+        self.installed_symbol = Some(symbol);
+        if let Some(companion) = self.osr_companion.as_mut() {
+            companion.set_installed_symbol(symbol);
+        }
+    }
+
+    fn osr_destination(&self) -> &Self {
+        self.osr_companion.as_deref().unwrap_or(self)
     }
 
     pub(super) fn needs_recompile(&self) -> bool {
@@ -627,7 +654,7 @@ impl TransferCode {
         }
         let roots = retain_native_body(&body);
         let optimize = optimize && scope_free_native_body(&body, false);
-        let (ir, deopt_metadata) = if optimize {
+        let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) {
             let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
             let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
             let profile = |bcp| {
@@ -640,7 +667,9 @@ impl TransferCode {
                     },
                 }
             };
-            egcl_compiler::t2::speculate::speculate(&mut ir, &profile);
+            if optimize {
+                egcl_compiler::t2::speculate::speculate(&mut ir, &profile);
+            }
             let speculations = t2_numeric_speculations(&ir, symbol);
             let mut passes = egcl_compiler::t2::pass::PassManager::new();
             passes.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
@@ -650,21 +679,22 @@ impl TransferCode {
             passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
             passes.run(&mut ir);
             let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+            let ordinary_ir = ir.clone();
             egcl_compiler::t2::build::legalize_transfer_calls(&mut ir, &scopes).ok()?;
             let metadata = Arc::new(T2InstalledMetadata {
                 speculations,
                 _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
                 deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
             });
-            (ir, Some(metadata))
+            (ir, Some(ordinary_ir), Some(metadata))
         } else {
-            (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None)
+            (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None, None)
         };
         let call_cells: Vec<_> = body.code.iter().filter_map(|instruction| {
             let Instr::CallNamed { sym, .. } = instruction else { return None };
             call_table::resolve(*sym).map(|cell| (*sym, cell))
         }).collect();
-        Self::emit_prepared(body, roots, &ir, deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
+        Self::emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
     }
 
     /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
@@ -789,11 +819,16 @@ impl TransferCode {
         } else { None };
         let mut ordinary_arity = None;
         let mut ordinary_cold = None;
-        let ordinary = ordinary_ir.filter(|_| matches!(tier, CompilationTier::T2)
-            && fixed_tagged_parameters(&body) && scope_free_native_body(&body, false))
+        let ordinary = ordinary_ir.filter(|_| fixed_tagged_parameters(&body)
+            && scope_free_native_body(&body, false))
             .and_then(|ir| {
                 use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
                 let mut ir = ir.clone();
+                // Full calls start with inactive multiple values. OSR imports
+                // retain separate descriptors and cannot constrain that proof.
+                ir.osr_entries.clear();
+                let mut call_cells = call_cells.to_vec();
+                ordinary_primitives::lower(&mut ir, &mut call_cells)?;
                 egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ir, true);
                 let arity = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_arity_veneer(
                     ordinary_calls::wrong_arity, usize::from(body.arity)))?;
@@ -819,6 +854,7 @@ impl TransferCode {
                         let emitted = call_cells.iter().find_map(|(symbol, cell)| {
                             let target = OrdinaryCallTarget { symbol: *symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,
+                                    heat_slot: cell.ordinary_heat_address() as u64,
                                     revision_address: cell.revision_address() as u64 };
                             emit_call(&ir, options, target, call_flags, cold.as_ptr() as u64).ok()
                                 .or_else(|| egcl_compiler::t2::emit::emit_framed_ordinary_guarded_call(
@@ -839,11 +875,33 @@ impl TransferCode {
                                 let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
                                 Some(OrdinaryCallTarget { symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,
+                                    heat_slot: cell.ordinary_heat_address() as u64,
                                     revision_address: cell.revision_address() as u64 })
                             };
                             egcl_compiler::t2::emit::emit_framed_ordinary_two_calls(
                                 &ir, options, [target(*calls[0])?, target(*calls[1])?], call_flags,
                                 cold.as_ptr() as u64, c2i_t2_mv as *const () as u64).ok()
+                        }).or_else(|| {
+                            use egcl_compiler::t2::ir::{AuxData, Opcode};
+                            let targets = ir.block_order().iter()
+                                .flat_map(|&block| ir.block(block).insts.iter().copied())
+                                .filter(|&inst| ir.inst(inst).opcode == Opcode::Call)
+                                .map(|inst| {
+                                    let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
+                                    let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
+                                    Some((inst, OrdinaryCallTarget { symbol,
+                                        descriptor_slot: cell.ordinary_entry_address() as u64,
+                                        heat_slot: cell.ordinary_heat_address() as u64,
+                                    revision_address: cell.revision_address() as u64 }))
+                                }).collect::<Option<Vec<_>>>()?;
+                            egcl_compiler::t2::emit::emit_framed_ordinary_function_with_poll(
+                                &ir, options, &targets, call_flags, cold.as_ptr() as u64,
+                                egcl_compiler::t2::emit::OrdinaryGuardOptions {
+                                    veneer: guard.as_ref()?.as_ptr() as u64,
+                                    multiple_values: c2i_t2_mv as *const () as u64,
+                                }, poll.as_ptr() as u64).inspect_err(|error| t2_log_write(format_args!(
+                                    "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
+                                ))).ok()
                         })?;
                         if emitted.has_deopt { deopt_veneer = guard; }
                         ordinary_cold = Some(cold);
@@ -868,6 +926,15 @@ impl TransferCode {
         } else {
             egcl_compiler::t2::emit::NativeCallStorage::ManagedActivation
         };
+        // An ordinary call cannot import a live managed activation. Retain a
+        // distinct mapped owner (including its maps and recovery veneers) for
+        // each existing OSR header. Passing no ordinary IR prevents recursion.
+        let osr_companion = if ordinary.is_some() && !ir.osr_entries.is_empty() {
+            Some(Box::new(Self::emit_prepared(
+                Arc::clone(&body), Arc::clone(&roots), ir, deopt_metadata.clone(),
+                call_cells, allow_recursion, tier,
+            )?))
+        } else { None };
         let (emitted, sites) = ordinary.or(native_frames).or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
             ir,
             veneer.as_ptr() as u64,
@@ -987,6 +1054,7 @@ impl TransferCode {
             has_deopt: emitted.has_deopt,
             bcp_offsets: emitted.bcp_offsets,
             osr_entries: emitted.osr_entries.into_iter().collect(),
+            osr_companion,
             osr_polls,
             _veneer: veneer,
             _call_entries: call_entries,
@@ -1150,8 +1218,12 @@ impl TransferCode {
             // generated child calls check their exact emitted stack bounds.
             let sp: usize;
             unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
+            let overflow_bytes = args.len().saturating_sub(3).checked_mul(8)
+                .and_then(|size| size.checked_add(15)).map(|size| size & !15)
+                .ok_or_else(invalid_capture)?;
             let required = self.ordinary_stack_required.expect("ordinary stack admission bound")
-                .checked_add(4096).ok_or_else(invalid_capture)?;
+                .checked_add(4096).and_then(|size| size.checked_add(overflow_bytes))
+                .ok_or_else(invalid_capture)?;
             if sp.checked_sub(required).is_none_or(|bottom| bottom as u64 <= unsafe { (*control).stack_limit }) {
                 return Err(EgclError::StackOverflow(egcl_rt::current_fiber_id()
                     .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0))));
@@ -1188,6 +1260,7 @@ impl TransferCode {
             let NativeCodeStorage::Mapped(code) = &next._storage else {
                 return Err(invalid_capture());
             };
+            let code = code.osr_destination();
             if let Some(symbol) = code.installed_symbol {
                 OSR_ENTRY_COUNTS.with(|counts| {
                     let mut counts = counts.borrow_mut();
@@ -2659,7 +2732,9 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     {
         return false;
     }
-    let Some(entry) = next.osr_entries.get(header).copied() else { return false };
+    let NativeCodeStorage::Mapped(destination) = &next._storage else { return false };
+    let destination = destination.osr_destination();
+    let Some(entry) = destination.osr_entries.get(header).copied() else { return false };
     // Scan body admission only once a replacement is ready, not on every
     // baseline loop poll while the optimizing worker is still compiling.
     if !local_control_native_body(&code.body, true, true, false) {
@@ -2731,7 +2806,6 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     if FAIL_OSR_PREPARATION.with(|fail| fail.replace(false)) {
         return false;
     }
-    let NativeCodeStorage::Mapped(destination) = &next._storage else { return false };
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
     let Ok(prepared) = ActivationState::prepare(destination, env) else { return false };
     let mut prepared = Box::new(prepared);
@@ -2769,7 +2843,7 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
     true
 }
 
-unsafe fn poll_or_transfer_unpublished(
+pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
@@ -3025,6 +3099,7 @@ struct EntryGuard {
 /// activation; its selected callable and argument buffer are host roots. Every
 /// callback establishes a fresh segment and temporarily hides the enclosing
 /// capture, so a selected transfer cannot jump across live Rust scopes.
+#[cfg(test)]
 pub(super) unsafe fn invoke_outer_callable(
     code: *const u8,
     invocation: *mut u64,
@@ -3054,6 +3129,58 @@ pub(super) unsafe fn invoke_outer_callable(
         _ => Err(invalid_capture()),
     }
 }
+/// Enter an ordinary callable adapter in a fresh root segment. The adapter
+/// may interpret the body, but its machine ingress and return use the Lisp ABI.
+/// Hiding the enclosing capture prevents transfers from crossing Rust frames.
+pub(super) unsafe fn invoke_outer_ordinary(
+    code: *const u8,
+    function: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_env = &mut *env);
+    let mut entry = EntryGuard {
+        env: NATIVE_ENV.with(|slot| slot.replace(env)),
+        capture: CAPTURE.with(|slot| slot.replace(std::ptr::null_mut())),
+        error: NATIVE_ERROR.with(|slot| slot.take()),
+    };
+    egcl_rt::rooted_ref!(_entry = &mut entry);
+    let _recovery = FaultRecoveryGuard {
+        null: egcl_rt::runtime::current_sigsegv_null_guard_recovery_ip(),
+        stack: egcl_rt::runtime::current_sigsegv_stack_guard_recovery_ip(),
+    };
+    egcl_rt::runtime::set_sigsegv_recovery_ips(0, 0);
+    let _ordinary_segment = super::call_table::enter_ordinary_segment();
+    let execution = egcl_rt::thread::current_execution_context_for_native()
+        .ok_or_else(|| EgclError::Internal("ordinary callable has no execution".into()))?;
+    let overflow_bytes = args.len().saturating_sub(3).checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(15)).map(|bytes| bytes & !15)
+        .ok_or_else(invalid_capture)?;
+    let required = overflow_bytes.checked_add(8192).ok_or_else(invalid_capture)?;
+    let sp: usize;
+    unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)); }
+    if sp.checked_sub(required).is_none_or(|bottom| (bottom as u64) <= egcl_rt::stack::current_native_stack_limit()) {
+        return Err(EgclError::StackOverflow(egcl_rt::current_fiber_id()
+            .unwrap_or_else(|| egcl_rt::FiberId(egcl_rt::current_thread_id().0))));
+    }
+    // Rust callers can retain an earlier zero/many-value tuple. The callable
+    // and actuals already have independent roots; establish the ordinary entry
+    // precondition before the machine adapter can poll or execute Lisp code.
+    env.clear_mv();
+    let returned = unsafe {
+        native_transfer::invoke_ordinary_native_segment(
+            code, &*execution, function, args, egcl_rt::current_stack(),
+        )
+    }.map_err(|_| EgclError::Internal("ordinary callable boundary is unavailable".into()))?;
+    egcl_rt::rooted!(primary = returned.outcome.value);
+    egcl_rt::rooted!(error = NATIVE_ERROR.with(|slot| slot.take()));
+    match returned.outcome.exit {
+        NativeExit::Returned if error.is_none() => Ok(*primary),
+        NativeExit::Transfer => Err(error.take().ok_or_else(invalid_capture)?),
+        _ => Err(invalid_capture()),
+    }
+}
+
 impl egcl_rt::gc::TraceHostRoots for EntryGuard {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.error.trace_host_roots(visit);
@@ -3551,4 +3678,60 @@ pub(in crate::cli::bytecode) fn with_ordinary_entry_hook_for_test<R>(
     }
     let _restore = Restore(ORDINARY_ENTRY_HOOK.with(|hook| hook.replace(Some(observe))));
     body()
+}
+
+#[cfg(test)]
+mod ordinary_osr_companion_tests {
+    use super::*;
+    use egcl_compiler::t2::frame_state::{FrameScope, FrameState, ValueSource};
+    use egcl_compiler::t2::ir::{AuxData, Function, IRType, InstData, InstFlags, Opcode, OsrEntry, ValueRepresentation};
+
+    #[test]
+    fn ordinary_full_entry_retains_executable_mapped_osr_import() {
+        let _lock = super::super::super::heap_test_lock()
+            .lock().unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
+        let symbol = egcl_rt::symbols::intern("ORDINARY-OSR-COMPANION");
+        let body = Arc::new(compile_function("ORDINARY-OSR-COMPANION", *params, *forms,
+            &env, false, false).unwrap());
+        // Model the two entry protocols directly: the full call binds X from
+        // RDI, while an OSR import reads X from the retained activation local.
+        let mut ir = Function::new("ordinary-osr-companion");
+        let entry = ir.entry();
+        let value = ir.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let state = ir.frame_states.add(FrameState {
+            scopes: vec![FrameScope { function: symbol, bcp: 0,
+                locals: vec![ValueSource::Value { value, repr: ValueRepresentation::Tagged }],
+                stack: vec![] }], remat: vec![],
+        });
+        ir.set_terminator(entry, InstData { opcode: Opcode::Return,
+            args: vec![value], results: vec![], aux: AuxData::None,
+            flags: InstFlags::default(), targets: vec![], frame_state: Some(state), source_pos: 0 });
+        ir.osr_entries.push(OsrEntry { control_scopes: vec![], bcp: 0,
+            block: entry, frame_state: state, checks: vec![] });
+        egcl_compiler::t2::verify::verify(&ir).unwrap();
+        let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
+            retain_native_body(&body), &ir, Some(&ir), None, &[], false,
+            CompilationTier::T2).expect("both entry protocols emit");
+        code.set_installed_symbol(symbol);
+        assert!(code.ordinary_entry.is_some(), "full calls use the register ABI");
+        assert!(code.osr_entries.is_empty(), "primary offsets describe only primary code");
+        let destination = code.osr_destination();
+        assert!(destination.ordinary_entry.is_none(), "OSR retains mapped entry ABI");
+        assert_eq!(destination.installed_symbol, Some(symbol));
+        let offset = *destination.osr_entries.get(&0).expect("retain the original OSR header");
+        assert!(offset < destination.code_len);
+        assert_eq!(code.run(&[EgclVal::from_fixnum(41)], &mut env).unwrap(), EgclVal::from_fixnum(41));
+        let state = Box::new(ActivationState::prepare(destination, &mut env).unwrap());
+        let stack = egcl_rt::current_stack();
+        let frame = stack.push_frame(EgclVal::from_symbol_index(symbol), destination.code_info,
+            destination.slots, FLAG_CALL).unwrap();
+        unsafe { slot_set(frame, 0, EgclVal::from_fixnum(73)); }
+        let result = destination.run_activation(&[], &mut env,
+            Some(OsrResume { frame, offset, state }), NIL).unwrap();
+        assert_eq!(result, EgclVal::from_fixnum(73), "OSR imports the live activation local");
+    }
 }

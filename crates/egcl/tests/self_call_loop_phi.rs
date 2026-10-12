@@ -66,9 +66,9 @@ fn tak_reaches_t2_with_platform_root_metadata() {
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         assert!(
             log.lines().any(|line| line.contains(
-                "TAK: optimized worker result installed with mapped T2 ABI"
+                "TAK: optimized worker result installed with ordinary x86-64 Lisp T2 ABI"
             )),
-            "TAK must publish the real mapped worker artifact: {log}"
+            "TAK must publish the ordinary register worker artifact: {log}"
         );
     } else {
         let emitted = log

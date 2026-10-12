@@ -93,11 +93,14 @@ fn ordinary_fiber() -> EgclVal {
     egcl_rt::poll_safepoint();
     assert_eq!(super::super::native_loop_should_exit(), 0);
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     let result = run_native(&outer, symbol, &arguments, &mut env).unwrap();
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all generated edges are admitted");
     assert_eq!(
-        native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
         1,
-        "only the terminal suspension call is cold; middle uses the generated edge"
+        "only the terminal suspension uses the named adapter; middle enters its generated body"
     );
     assert_eq!(result, arguments[2]);
     assert!(env.mv_active);

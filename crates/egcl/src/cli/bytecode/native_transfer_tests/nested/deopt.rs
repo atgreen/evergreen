@@ -49,7 +49,7 @@ fn native_v2_optimized_child_guard_returns_and_escapes_without_replay() {
         egcl_rt::rooted!(args = vec![arena_cons(T, NIL), EgclVal::from_single_float(1.5), fail]);
         let address = args[0].to_raw();
         egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
-        assert_eq!(take_nested_entries(), 1);
+        assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
         assert_eq!(mapped.deopt_count(), deopts + 1);
         assert_eq!(*result, args[0]);
         assert_ne!(args[0].to_raw(), address, "child T0 must move caller roots");
@@ -85,6 +85,8 @@ fn install_guarded_child(name: &str, params: &str, forms: &str, env: &Env) -> Rc
     registry_put(symbol, Arc::clone(&body));
     let code = TransferCode::compile(Arc::clone(&body)).expect("optimized mapped child");
     assert!(code.has_deopt, "{:?}", body.code);
+    assert!(code.ordinary_entry.is_some(), "guarded child uses the ordinary register ABI");
+    assert!(code.mapped_entry().is_none(), "no legacy child entry is available");
     let installed =
         super::super::super::native_transfer_entry::install_baseline_code(symbol, code).unwrap();
     mark_fresh_promotion(symbol);
@@ -107,6 +109,10 @@ fn native_v2_published_t2_child_uses_guards_and_relearns_numeric_phase() {
     egcl_rt::rooted_ref!(_env = &mut env);
     read_eval_all_env("(defun child-phase (x) (+ x 1))", &mut env).unwrap();
     install_t2("CHILD-PHASE", "(x)", "((+ x 1))", &env);
+    let installed = NATIVE_REGISTRY.with(|registry| registry.borrow()
+        .get(&egcl_rt::symbols::find_index("CHILD-PHASE").unwrap()).cloned()).unwrap();
+    let NativeCodeStorage::Mapped(owner) = &installed._storage else { unreachable!() };
+    assert!(owner.ordinary_entry.is_some() && owner.mapped_entry().is_none());
     let caller = compile_caller("(x)", "((catch :phase (child-phase x)))", &env);
     caller.run(&[EgclVal::from_fixnum(1)], &mut env).unwrap();
     take_nested_entries();
@@ -117,7 +123,7 @@ fn native_v2_published_t2_child_uses_guards_and_relearns_numeric_phase() {
             .unwrap(),
         EgclVal::from_single_float(2.5)
     );
-    assert_eq!(take_nested_entries(), 1);
+    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
     assert_eq!(
         DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         before + 1,
@@ -271,7 +277,7 @@ fn native_v2_child_guard_signals_with_live_parent_restart() {
     take_nested_entries();
     egcl_rt::rooted!(result = caller.run(&args, &mut env).unwrap());
     assert_eq!(*result, args[0]);
-    assert_eq!(take_nested_entries(), 1);
+    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
     assert_eq!(mapped.deopt_count(), 1);
     assert_ne!(args[0].to_raw(), before);
     assert_eq!(env.mv.len(), 2);
@@ -328,7 +334,7 @@ fn native_v2_child_redefinition_before_guard_keeps_original_result() {
             .unwrap(),
         EgclVal::from_single_float(2.5)
     );
-    assert_eq!(take_nested_entries(), 1);
+    assert_eq!(take_nested_entries(), 0, "ordinary child uses its own segment boundary");
     assert_eq!(old.deopt_count(), 1);
     assert_eq!(env.mv.len(), 2);
     assert_eq!(cp(env.mv[1]), (EgclVal::from_single_float(2.5), NIL));

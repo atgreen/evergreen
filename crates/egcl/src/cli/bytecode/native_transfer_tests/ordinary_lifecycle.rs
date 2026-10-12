@@ -93,6 +93,7 @@ fn ordinary_register_pending_signals_use_real_cold_delivery_and_restore_state() 
         SIGNAL_TO_POST.with(|slot| slot.set(Some(signal)));
         INJECTIONS.with(|count| count.set(0));
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test();
         let error = native_transfer_entry::with_ordinary_entry_hook_for_test(
             post_signal,
             || run_native(&outer, symbol, &args, &mut env),
@@ -104,6 +105,8 @@ fn ordinary_register_pending_signals_use_real_cold_delivery_and_restore_state() 
                 | (egcl_rt::PendingSignal::Timeout, EgclError::Timeout)), "{error:?}");
         assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
             "the generated ordinary edge must invoke the production cold handler");
+        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 0,
+            "pending transfer rejects the edge before entering any named adapter");
         if !matches!(signal, egcl_rt::PendingSignal::Shutdown) {
             let frames = error.backtrace().expect("interrupt/timeout retain their native trace");
             assert!(frames.iter().any(|frame| frame.function.as_deref()
@@ -145,12 +148,16 @@ fn ordinary_register_depth_cap_uses_cold_fallback_once_and_preserves_values() {
         let control = unsafe { &*execution }.active_native_control();
         let segment = egcl_rt::native_transfer::current_segment();
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test();
         assert_eq!(run_native(&outer, symbol, &args, &mut env).unwrap(), args[2]);
         assert!(env.mv_active);
         assert_eq!(env.mv, [args[2], args[0], args[3], args[1]]);
         assert_eq!(effects(counter), EgclVal::from_fixnum(1), "fallback must not replay the callee");
-        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 1,
-            "one cold edge: terminal normally, middle at the depth cap");
+        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
+            usize::from(initial != 0), "only the depth cap rejects a generated edge");
+        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
+            usize::from(initial == 0),
+            "normal entry uses the terminal adapter; depth fallback interprets the middle");
         let observed = LEAF_DEPTH.with(Cell::get).expect("actual terminal execution");
         if initial != 0 {
             assert_eq!(observed.0, cap, "rejected direct child must not exceed native depth cap");

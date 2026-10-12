@@ -43,7 +43,7 @@ fn guarded(clear: bool, resume_bcp: u32, target: u32) -> Function {
 fn emit(f: &Function, target: u32) -> Result<FramedCode, EmitError> {
     emit_framed_ordinary_guarded_call(f,
         OrdinaryLispEntryOptions { arity: 1, arity_error_veneer: 1 },
-        OrdinaryCallTarget { symbol: target, descriptor_slot: 1, revision_address: 1 },
+        OrdinaryCallTarget { symbol: target, descriptor_slot: 1, revision_address: 1 , heat_slot: 0},
         OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
             native_errors: 1, signal_epoch: 1 }, 1,
         OrdinaryGuardOptions { veneer: 1, multiple_values: 1 })
@@ -57,4 +57,18 @@ fn ordinary_guard_requires_post_call_state_and_single_result_continuation() {
     assert!(emit(&guarded(false, 1, 2), 2).is_err(), "do not discard a live MV tuple");
     assert!(emit(&guarded(true, 0, 2), 2).is_err(), "pre-call state would replay effects");
     assert!(emit(&guarded(true, 1, 1), 1).is_err(), "direct recursion stays outside this slice");
+}
+
+#[test]
+fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
+    let f = guarded(true, 1, 1);
+    egcl_compiler::t2::verify::verify(&f).unwrap();
+    let call = f.block(f.entry()).insts[0];
+    let result = emit_framed_ordinary_function(&f,
+        OrdinaryLispEntryOptions { arity: 1, arity_error_veneer: 1 },
+        &[(call, OrdinaryCallTarget { symbol: 1, descriptor_slot: 1, revision_address: 1 , heat_slot: 0})],
+        OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+            native_errors: 1, signal_epoch: 1 }, 1,
+        OrdinaryGuardOptions { veneer: 1, multiple_values: 1 });
+    assert!(result.is_ok(), "ordinary recursion must use the same entry as cross-function calls: {:?}", result.err());
 }

@@ -117,7 +117,7 @@ unsafe extern "C" fn arity_helper(
 ) {
     let request = unsafe { &*request.cast::<OrdinaryArityRequest>() };
     assert_eq!(request.closure.to_raw(), 0xcafe);
-    assert_eq!(request.expected_arity, 2);
+    assert_eq!(request.entry_data, 2);
     assert_eq!(request.nargs, 7);
     assert_eq!(request.register_args.map(EgclVal::to_raw), [11, 22, 33]);
     assert_eq!(

@@ -198,7 +198,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
     let target = OrdinaryCallTarget {
         symbol: 77,
         descriptor_slot: &slot as *const _ as u64,
-        revision_address: &revision as *const _ as u64,
+        revision_address: &revision as *const _ as u64, heat_slot: 0,
     };
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
     let mut depth = 3;

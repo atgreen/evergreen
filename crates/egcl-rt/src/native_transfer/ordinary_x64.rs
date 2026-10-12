@@ -20,18 +20,20 @@ struct Invocation {
     entry: *const u8,
     execution: *const LispExecutionContext,
     closure: EgclVal,
-    arguments: [EgclVal; 4],
+    arguments: *const EgclVal,
     nargs: usize,
+    overflow_bytes: usize,
     values: NativeReturnValues,
 }
 
-/// Enter a bounded ordinary register-ABI root through a native segment anchor.
-/// This first adapter accepts zero through four arguments.
+/// Enter an ordinary register-ABI root through a native segment anchor.
+/// Arguments after the first three occupy a caller-owned, aligned stack area.
 ///
 /// # Safety
 /// `entry` must implement the ordinary x86-64 Lisp ABI and its entry admission
-/// checks must already be satisfied. `execution` belongs to the running Lisp
-/// execution and retains its active native control throughout this call.
+/// checks, including space for the overflow arguments, must already be satisfied.
+/// `execution` belongs to the running Lisp execution and retains its active
+/// native control throughout this call.
 /// Closure and arguments must already be rooted; generated code must publish
 /// their current native homes before collecting or yielding. As with
 /// `invoke_native_segment`, cold exits may discard only generated frames after
@@ -44,16 +46,18 @@ pub unsafe fn invoke_ordinary_native_segment(
     arguments: &[EgclVal],
     stack: &EgclStack,
 ) -> Result<OrdinaryNativeOutcome, SegmentUnavailable> {
-    if arguments.len() > 4 {
-        return Err(SegmentUnavailable);
-    }
+    let overflow_bytes = arguments.len().saturating_sub(3).checked_mul(8)
+        .and_then(|bytes| bytes.checked_add(15))
+        .map(|bytes| bytes & !15)
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or(SegmentUnavailable)?;
     let mut request = Invocation {
         entry, execution, closure,
-        arguments: [crate::value::NIL; 4],
+        arguments: arguments.as_ptr(),
         nargs: arguments.len(),
+        overflow_bytes,
         values: NativeReturnValues::SINGLE,
     };
-    request.arguments[..arguments.len()].copy_from_slice(arguments);
     let outcome = unsafe {
         with_native_segment(stack, |anchor, out| enter(&mut request, anchor, out))
     }?;
@@ -74,31 +78,47 @@ unsafe extern "C" fn enter(
         "push r13", ".cfi_def_cfa_offset 40", ".cfi_offset r13, -40",
         "push r14", ".cfi_def_cfa_offset 48", ".cfi_offset r14, -48",
         "push r15", ".cfi_def_cfa_offset 56", ".cfi_offset r15, -56",
-        // Overflow argument and padding, three private pointers, FP controls,
-        // and alignment. Across-call state is outside the callee's argument area.
-        "sub rsp, 56", ".cfi_def_cfa_offset 112",
-        "mov [rsp + 16], rsi", "mov [rsp + 24], rdx", "mov [rsp + 32], rdi",
-        "stmxcsr [rsp + 40]", "fnstcw [rsp + 44]",
+        // Fixed private storage stays above the variable outgoing arguments.
+        // RBP locates it on normal return; the anchor's separate landing SP
+        // locates it after a cold exit has discarded every callee register.
+        "sub rsp, 40", ".cfi_def_cfa_offset 96",
+        "mov [rsp], rsi", "mov [rsp + 8], rdx", "mov [rsp + 16], rdi",
+        "stmxcsr [rsp + 24]", "fnstcw [rsp + 28]",
+        "mov rbp, rsp", ".cfi_def_cfa rbp, 96",
+        "mov [rsi + {landing_sp}], rsp",
+        // Probe each page instead of jumping over a stack guard for large calls.
+        "mov r10, rsp", "sub r10, [rdi + {overflow_bytes}]",
+        "6:", "mov rax, rsp", "sub rax, r10", "cmp rax, 4096", "jb 7f",
+        "sub rsp, 4096", "test byte ptr [rsp], 0", "jmp 6b",
+        "7:", "mov rsp, r10", "test byte ptr [rsp], 0",
+        // This remains the exact pre-CALL SP used to terminate native walks.
         "mov [rsi + {sp}], rsp",
         "lea rax, [rip + 2f]", "mov [rsi + {landing}], rax",
         "lea rax, [rip + 3f]", "mov [rsi + {entry_pc}], rax",
-        "mov r10, rdi", "mov r11, [r10 + {entry}]",
-        "mov r13, [r10 + {execution}]", "mov rax, [r10 + {closure}]",
-        "mov rcx, [r10 + {nargs}]",
-        "mov rdi, [r10 + {args}]", "mov rsi, [r10 + {args} + 8]",
-        "mov rdx, [r10 + {args} + 24]", "mov [rsp], rdx",
-        "mov rdx, [r10 + {args} + 16]", "call r11",
-        "3:", "mov r10, [rsp + 32]", "jnc 4f",
+        "mov r10, rdi", "mov r11, [r10 + {args}]", "mov rcx, [r10 + {nargs}]",
+        "mov eax, 3", "8:", "cmp rax, rcx", "jae 9f",
+        "mov rdx, [r11 + rax * 8]", "mov [rsp + rax * 8 - 24], rdx",
+        "inc rax", "jmp 8b",
+        // Do not read beyond the supplied slice for absent register arguments.
+        "9:", "mov rdi, {nil}", "mov rsi, rdi", "mov rdx, rdi",
+        "test rcx, rcx", "jz 10f", "mov rdi, [r11]",
+        "cmp rcx, 1", "je 10f", "mov rsi, [r11 + 8]",
+        "cmp rcx, 2", "je 10f", "mov rdx, [r11 + 16]",
+        "10:", "mov r13, [r10 + {execution}]", "mov rax, [r10 + {closure}]",
+        "mov r11, [r10 + {entry}]", "call r11",
+        "3:", "mov rsp, rbp", ".cfi_def_cfa rsp, 96",
+        "mov r10, [rsp + 16]", "jnc 4f",
         "mov [r10 + {count}], rdx", "mov [r10 + {payload}], rcx", "jmp 5f",
         "4:", "mov qword ptr [r10 + {count}], 1",
         "mov qword ptr [r10 + {payload}], 0",
         "5:", "xor edx, edx",
         "2:", "endbr64",
-        "mov rcx, [rsp + 24]", "mov [rcx + {value}], rax", "mov [rcx + {exit}], rdx",
-        "mov rcx, [rsp + 16]", "mov qword ptr [rcx + {sp}], 0",
+        "mov rcx, [rsp + 8]", "mov [rcx + {value}], rax", "mov [rcx + {exit}], rdx",
+        "mov rcx, [rsp]", "mov qword ptr [rcx + {sp}], 0",
         "mov qword ptr [rcx + {landing}], 0", "mov qword ptr [rcx + {entry_pc}], 0",
-        "ldmxcsr [rsp + 40]", "fldcw [rsp + 44]", "cld",
-        "add rsp, 56", ".cfi_def_cfa_offset 56",
+        "mov qword ptr [rcx + {landing_sp}], 0",
+        "ldmxcsr [rsp + 24]", "fldcw [rsp + 28]", "cld",
+        "add rsp, 40", ".cfi_def_cfa_offset 56",
         "pop r15", ".cfi_def_cfa_offset 48", ".cfi_restore r15",
         "pop r14", ".cfi_def_cfa_offset 40", ".cfi_restore r14",
         "pop r13", ".cfi_def_cfa_offset 32", ".cfi_restore r13",
@@ -107,6 +127,9 @@ unsafe extern "C" fn enter(
         "pop rbp", ".cfi_def_cfa_offset 8", ".cfi_restore rbp",
         "ret", ".cfi_endproc",
         sp = const std::mem::offset_of!(NativeSegment, saved_sp),
+        landing_sp = const std::mem::offset_of!(NativeSegment, landing_sp),
+        overflow_bytes = const std::mem::offset_of!(Invocation, overflow_bytes),
+        nil = const crate::value::NIL.0,
         landing = const std::mem::offset_of!(NativeSegment, landing_pc),
         entry_pc = const std::mem::offset_of!(NativeSegment, entry_return_pc),
         entry = const std::mem::offset_of!(Invocation, entry),
@@ -196,10 +219,13 @@ mod tests {
         crate::gc::ensure_heap_initialized();
         crate::thread::current_thread_id();
         let execution = LispExecutionContext::new(ExecutionKind::Fiber, 77, 1);
-        for entry in [ordinary_arguments as *const u8, ordinary_cold_transfer as *const u8] {
+        for (entry, count) in [(ordinary_arguments as *const u8, 4),
+            (ordinary_many_arguments as *const u8, 17), (ordinary_cold_transfer as *const u8, 17)] {
+            let arguments: Vec<_> = (1..=count).map(EgclVal::from_fixnum).collect();
             let mut request = Invocation {
                 entry, execution: &execution, closure: NIL,
-                arguments: [1, 2, 3, 4].map(EgclVal::from_fixnum), nargs: 4,
+                arguments: arguments.as_ptr(), nargs: arguments.len(),
+                overflow_bytes: ((arguments.len() - 3) * 8 + 15) & !15,
                 values: NativeReturnValues::SINGLE,
             };
             let mut mismatch = 1;
@@ -227,6 +253,59 @@ mod tests {
             "call {check}", "pop rbp", "clc", "ret",
             check = sym check_anchor,
         );
+    }
+
+    // The callee verifies the complete overflow slice and entry alignment, then
+    // returns a checksum without retaining any unrooted heap references.
+    #[unsafe(naked)]
+    unsafe extern "C" fn ordinary_many_arguments() {
+        core::arch::naked_asm!(
+            "endbr64", "mov r10, rsp", "and r10, 15", "cmp r10, 8", "jne 4f",
+            "cmp qword ptr [r13 + 8], 77", "jne 4f",
+            "xor eax, eax", "test rcx, rcx", "jz 3f", "add rax, rdi",
+            "cmp rcx, 1", "je 3f", "add rax, rsi",
+            "cmp rcx, 2", "je 3f", "add rax, rdx",
+            "mov r10, 3", "2:", "cmp r10, rcx", "jae 3f",
+            "add rax, [rsp + r10 * 8 - 16]", "inc r10", "jmp 2b",
+            "3:", "clc", "ret", "4:", "mov rax, -1", "clc", "ret",
+        );
+    }
+
+    #[test]
+    fn ordinary_root_marshals_arbitrary_overflow_arguments_and_retires_cold_frames() {
+        crate::gc::ensure_heap_initialized();
+        crate::thread::current_thread_id();
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 77, 1);
+        for count in [0, 1, 2, 3, 4, 5, 6, 7, 8, 17, 1028] {
+            let args: Vec<_> = (1..=count).map(EgclVal::from_fixnum).collect();
+            let returned = unsafe {
+                invoke_ordinary_native_segment(ordinary_many_arguments as *const u8,
+                    &execution, NIL, &args, crate::current_stack())
+            }.expect("ordinary entry must accept all supplied arguments");
+            assert_eq!(returned.outcome.exit, NativeExit::Returned);
+            assert_eq!(returned.outcome.value, EgclVal::from_fixnum(count * (count + 1) / 2));
+            assert_eq!(returned.values.count, 1);
+            assert!(current_segment().is_null());
+            let returned = unsafe {
+                invoke_ordinary_native_segment(ordinary_cold_transfer as *const u8,
+                    &execution, NIL, &args, crate::current_stack())
+            }.unwrap();
+            assert_eq!(returned.outcome.exit, NativeExit::Transfer);
+            assert_eq!(returned.outcome.value, TUPLE[0]);
+            assert!(current_segment().is_null());
+            let anchor = unsafe {
+                invoke_ordinary_native_segment(ordinary_anchor as *const u8,
+                    &execution, NIL, &args, crate::current_stack())
+            }.unwrap();
+            assert_eq!(anchor.outcome.value.0, 1, "walker boundary must match the actual call SP");
+            let many = unsafe {
+                invoke_ordinary_native_segment(ordinary_many_values as *const u8,
+                    &execution, NIL, &args, crate::current_stack())
+            }.unwrap();
+            assert_eq!(many.outcome.value, TUPLE[0]);
+            assert_eq!(many.values.count, 2);
+            assert_eq!(many.values.payload, TUPLE.as_ptr());
+        }
     }
 
     #[test]

@@ -35,6 +35,10 @@ fn native_v2_optimized_recursive_overflow_resumes_without_replay() {
         .as_symbol_index();
     registry_put(symbol, Arc::clone(&body));
     let code = TransferCode::compile(body).expect("compile guarded segment");
+    assert!(code.ordinary_entry.is_some() && code.mapped_entry().is_none());
+    let installed = native_transfer_entry::install_baseline_code(symbol, code).unwrap();
+    publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &installed);
+    let NativeCodeStorage::Mapped(code) = &installed._storage else { unreachable!() };
     assert!(
         code.has_deopt,
         "arithmetic must use native speculative guards"
@@ -62,8 +66,8 @@ fn native_v2_optimized_recursive_overflow_resumes_without_replay() {
         );
         assert_eq!(
             take_recursive_entries(),
-            8,
-            "guard fallback must return through all native callers"
+            0,
+            "ordinary guard recovery must not enter legacy recursive frames"
         );
         assert_eq!(stack.fp(), fp);
         assert_eq!(stack.sp(), sp);

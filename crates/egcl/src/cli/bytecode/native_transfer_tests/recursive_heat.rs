@@ -4,6 +4,27 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 
+thread_local! {
+    static ENTRY_OBSERVER: Cell<Option<fn()>> = const { Cell::new(None) };
+    static EXPECTED_OWNER: Cell<usize> = const { Cell::new(0) };
+    static OBSERVED_ENTRY: Cell<bool> = const { Cell::new(false) };
+}
+
+fn observed_native_capture() -> Option<(usize, bool)> {
+    native_transfer_entry::child_capture_for_test().or_else(|| {
+        native_callable::outer::suspended_callers_for_test()?.last()?.1
+    })
+}
+
+pub(crate) fn recursive_heat_observe_for_test() -> EgclVal {
+    let capture = observed_native_capture();
+    if capture.is_some_and(|(owner, _)| owner == EXPECTED_OWNER.with(Cell::get)) {
+        OBSERVED_ENTRY.with(|slot| slot.set(true));
+    }
+    if let Some(observe) = ENTRY_OBSERVER.with(Cell::get) { observe(); }
+    NIL
+}
+
 #[derive(Default)]
 struct Observation {
     owner: usize,
@@ -20,20 +41,18 @@ thread_local! {
 }
 
 fn observe_recursive_heat() {
-    let Some((owner, _)) = native_transfer_entry::child_capture_for_test() else {
+    let Some((owner, _)) = observed_native_capture() else {
         return;
     };
     let collect = OBSERVATION.with(|state| {
         let mut state = state.borrow_mut();
-        if state.owner != owner {
-            return None;
-        }
         let function = egcl_rt::symbols::symbol_function(state.symbol).unwrap();
         if T2_QUEUED.with(|queued| queued.borrow().contains_key(&state.symbol))
             || egcl_rt::function::tier(function) == 2
         {
             state.queued_while_live = true;
         }
+        if state.owner != owner { return None; }
         let depth = NATIVE_DEPTH.with(Cell::get);
         if !state.moved && depth >= state.minimum_depth {
             state.collection_depth = depth;
@@ -57,17 +76,20 @@ fn observe_recursive_heat() {
 struct ObservationGuard;
 impl Drop for ObservationGuard {
     fn drop(&mut self) {
-        native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(None));
+        ENTRY_OBSERVER.with(|hook| hook.set(None));
         OBSERVATION.with(|state| *state.borrow_mut() = Observation::default());
     }
 }
 
 fn install_fib(name: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
     let source = format!(
-        "(if (< n 2) (+ n (car marker)) (+ ({name} (- n 1) marker) ({name} (- n 2) marker)))"
+        "(progn (recursive-heat-observer) (if (< n 2) (+ n (car marker)) (+ ({name} (- n 1) marker) ({name} (- n 2) marker))))"
     );
-    super::super::super::read_eval_all_env(&format!("(defun {name} (n marker) {source})"), env)
-        .unwrap();
+    // The magic observer is an evaluator fixture. Its ordinary named adapter
+    // interprets this tiny wrapper while the recursive body remains native.
+    super::super::super::read_eval_all_env(&format!(
+        "(defun recursive-heat-observer () (%recursive-heat-observe-for-test))
+         (defun {name} (n marker) {source})"), env).unwrap();
     egcl_rt::rooted!(params = reader::read_from_string("(n marker)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(&format!("({source})")).unwrap().0);
     let symbol = egcl_rt::symbols::intern(name);
@@ -77,6 +99,10 @@ fn install_fib(name: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
     publish_native(symbol, egcl_rt::symbols::symbol_function(symbol), &code);
     assert!(!code.is_t2);
     assert!(matches!(&code._storage, NativeCodeStorage::Mapped(_)));
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some());
+    EXPECTED_OWNER.with(|slot| slot.set(Rc::as_ptr(mapped) as usize));
+    OBSERVED_ENTRY.with(|slot| slot.set(false));
     (symbol, code)
 }
 
@@ -104,12 +130,13 @@ fn native_recursive_heat_counts_one_fib_and_queues_while_live() {
             owner: Rc::as_ptr(mapped) as usize,
             symbol,
             marker: Some(&mut *marker),
-            minimum_depth: NATIVE_DEPTH.with(Cell::get) + 3,
+            // Root + two recursive children + the observer adapter.
+            minimum_depth: NATIVE_DEPTH.with(Cell::get) + 4,
             ..Observation::default()
         }
     });
     let _observation = ObservationGuard;
-    native_transfer_entry::root_publication::OBSERVE
+    ENTRY_OBSERVER
         .with(|hook| hook.set(Some(observe_recursive_heat)));
     native_transfer_entry::take_recursive_entries();
     let stack = egcl_rt::current_stack();
@@ -125,14 +152,16 @@ fn native_recursive_heat_counts_one_fib_and_queues_while_live() {
     );
     assert_eq!(
         native_transfer_entry::take_recursive_entries(),
-        21890,
-        "every non-root logical call uses the direct mapped entry"
+        0,
+        "ordinary recursion never allocates legacy recursive activations"
     );
-    assert_eq!(
-        egcl_rt::function::invoke_count(*function) - before_count,
-        21891,
-        "count actual logical invocations, including the ordinary root call"
-    );
+    let counted = egcl_rt::function::invoke_count(*function) - before_count;
+    assert!(counted >= t2_invoke_threshold().saturating_sub(before_count));
+    assert!(counted <= 21891, "no logical invocation may count twice");
+    if egcl_rt::function::tier(*function) < 2 {
+        assert_eq!(counted, 21891, "all T1 invocations count, including the root");
+    }
+    assert!(OBSERVED_ENTRY.with(Cell::get), "native bodies really execute");
     OBSERVATION.with(|state| {
         let state = state.borrow();
         assert!(state.moved);
@@ -182,8 +211,8 @@ fn native_recursive_heat_does_not_double_count_depth_fallback() {
     );
     assert_eq!(
         native_transfer_entry::take_recursive_entries(),
-        2,
-        "both root branches enter once before their descendants hit the depth cap"
+        0,
+        "depth fallback never uses the legacy recursive adapter"
     );
     assert_eq!(
         egcl_rt::function::invoke_count(*function) - before_count,
@@ -222,7 +251,8 @@ fn native_recursive_heat_obeys_profiling_policy() {
         .unwrap(),
         EgclVal::from_fixnum(21)
     );
-    assert_eq!(native_transfer_entry::take_recursive_entries(), 66);
+    assert_eq!(native_transfer_entry::take_recursive_entries(), 0);
+    assert!(OBSERVED_ENTRY.with(Cell::get));
     assert_eq!(
         egcl_rt::function::invoke_count(*function) - before_count,
         if profiling_disabled() { 0 } else { 66 }
@@ -250,7 +280,7 @@ thread_local! {
     static MUTATION: RefCell<Mutation> = RefCell::new(Mutation::default());
 }
 fn replace_during_recursion() {
-    let Some((owner, _)) = native_transfer_entry::child_capture_for_test() else {
+    let Some((owner, _)) = observed_native_capture() else {
         return;
     };
     let action = MUTATION.with(|state| {
@@ -281,7 +311,7 @@ fn replace_during_recursion() {
 struct MutationGuard;
 impl Drop for MutationGuard {
     fn drop(&mut self) {
-        native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.set(None));
+        ENTRY_OBSERVER.with(|hook| hook.set(None));
         MUTATION.with(|state| *state.borrow_mut() = Mutation::default());
     }
 }
@@ -331,7 +361,7 @@ fn native_recursive_heat_attributes_replacement_and_unbound_fallback() {
             }
         });
         let _mutation = MutationGuard;
-        native_transfer_entry::root_publication::OBSERVE
+        ENTRY_OBSERVER
             .with(|hook| hook.set(Some(replace_during_recursion)));
         native_transfer_entry::take_recursive_entries();
         egcl_rt::rooted!(
@@ -344,8 +374,8 @@ fn native_recursive_heat_attributes_replacement_and_unbound_fallback() {
         assert!(MUTATION.with(|state| state.borrow().done));
         assert_eq!(
             native_transfer_entry::take_recursive_entries(),
-            1,
-            "old body admits only its first child before replacement"
+            0,
+            "replacement does not reintroduce legacy recursive activations"
         );
         assert_eq!(
             egcl_rt::function::invoke_count(*original) - original_before,

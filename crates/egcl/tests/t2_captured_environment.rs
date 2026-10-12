@@ -22,7 +22,7 @@ fn assert_capture_fallback(trace: &str) {
 
 fn is_closure_t2_publication(line: &str) -> bool {
     line.contains("<flet-closure>: background T2 result published")
-        || line.contains("<flet-closure>: optimized worker result installed with mapped T2 ABI")
+        || line.contains("<flet-closure>: optimized worker result installed with ")
 }
 
 #[test]

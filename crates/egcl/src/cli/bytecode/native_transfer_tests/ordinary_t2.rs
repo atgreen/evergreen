@@ -1038,7 +1038,7 @@ fn ordinary_t2_diagnostics_report_sparse_speculation_and_actual_publication() {
     };
     let log_path = std::env::var_os("EGCL_T2_LOG").unwrap();
     let read_log = || std::fs::read_to_string(&log_path).unwrap();
-    let success = format!("[T2] {name}: optimized worker result installed with mapped T2 ABI");
+    let success = format!("[T2] {name}: optimized worker result installed with ordinary x86-64 Lisp T2 ABI");
     let (bcp, mut unpublished) = make_completion();
     assert!(read_log().contains(&format!(
         "[T2] {name}: site bcp={bcp} T0 samples fix=2 float=0 bignum=0 other=0 profile_choice=Some(Fixnum)"
@@ -1131,8 +1131,10 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         unreachable!()
     };
-    assert!(mapped.native_entry_kind_slot.is_some(),
-        "invocation accounting must exercise generated native-child admission");
+    assert!(mapped.ordinary_entry.is_some(), "recursion uses ordinary register entries");
+    assert!(mapped.mapped_entry().is_none(), "no mapped recursive entry is available");
+    assert!(mapped.value_maps_for_test().iter().next().is_some(),
+        "recursive CALL continuations retain exact native frame maps");
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
     assert_eq!(
         egcl_rt::function::tier(*function),
@@ -1147,19 +1149,25 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
     let stack = egcl_rt::current_stack();
     let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
     let deopts = mapped.deopt_count();
-    // This internal run_native entry bypasses apply_function's outer invocation
-    // bump. Only the 464 recursive calls belong to the measured delta.
+    // This internal entry bypasses apply_function's outer invocation bump.
+    // The ordinary recursive tree must execute without runtime call adapters.
     let before_count = egcl_rt::function::invoke_count(*function);
     take_recursive_entries();
     take_native_fallback_count();
     take_recursive_helper_calls();
+    native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     assert_eq!(
         run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
         EgclVal::from_fixnum(144)
     );
     let entries = take_recursive_entries();
     let helpers = take_recursive_helper_calls();
-    assert_eq!(entries, 464, "fib(12) must execute all 464 native self calls");
+    assert_eq!(entries, 0, "ordinary recursion must not enter legacy recursive frames");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "all fib recursive edges must pass direct admission");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 0,
+        "all fib recursive edges must enter generated bodies, not named adapters");
     assert_eq!(egcl_rt::function::invoke_count(*function), before_count,
         "ordinary T2 children must not update invocation heat");
     assert_eq!(take_native_fallback_count(), 0);
@@ -1359,6 +1367,11 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
     )
     .unwrap();
     let _pins = RecursiveFixturePins::new(&["ORDINARY-T2-NATIVE-FRAME-SUM-TICK"]);
+    // Terminal bytecode publication invalidates named-call cells. Complete
+    // that lazy transition before installing and warming the measured caller.
+    for _ in 0..=lazy_compile_threshold() {
+        crate::cli::read_eval_all_env("(ordinary-t2-native-frame-sum-tick)", &mut env).unwrap();
+    }
     let (symbol, code) = install(name, "(n x)", &format!("({form})"), &mut env);
     assert_mapped_t2(&code);
     assert!(code.has_deopt, "worker T2 must retain arithmetic guards");
@@ -1366,9 +1379,15 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         unreachable!()
     };
     assert!(
-        mapped.native_entry_kind_slot.is_some(),
-        "guard recovery must exercise actual native child frames"
+        mapped.ordinary_entry.is_some(),
+        "guard recovery must exercise ordinary native child frames"
     );
+    assert!(mapped.mapped_entry().is_none());
+    assert!(mapped.value_maps_for_test().iter().next().is_some());
+    // Publish the self-call descriptor before resetting the measured counts.
+    assert_eq!(run_native(&code, symbol,
+        &[EgclVal::from_fixnum(8), EgclVal::from_fixnum(10)], &mut env).unwrap(),
+        EgclVal::from_fixnum(19));
     for overflow in [false, true] {
         super::super::super::read_eval_all_env(
             "(setq *ordinary-t2-native-frame-sum-ticks* 0)",
@@ -1381,6 +1400,8 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         let deopts = mapped.deopt_count();
         take_recursive_entries();
         take_recursive_helper_calls();
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        native_transfer_entry::ordinary_calls::take_named_entries_for_test();
         egcl_rt::rooted!(
             result = run_native(
                 &code,
@@ -1392,9 +1413,13 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         );
         assert_eq!(
             take_recursive_entries(),
-            8,
-            "all eight selfcalls must enter native child frames"
+            0,
+            "ordinary selfcalls must not enter legacy recursive frames"
         );
+        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+            "all recursive edges are admitted");
+        assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 9,
+            "only the nine effect ticks use named adapters");
         assert_eq!(
             take_recursive_helper_calls(),
             (0, 0),
@@ -1622,5 +1647,50 @@ fn ordinary_register_chain_preserves_zero_many_and_redefinition() {
     for _ in 0..3 {
         assert_eq!(run_native(&outer, symbol, &[], &mut env).unwrap(), EgclVal::from_fixnum(89));
         assert!(!env.mv_active && env.mv.is_empty(), "normal entry clears the prior tuple");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_global_after_unknown_mv_keeps_mapped_t1_and_t2() {
+    let _lock = crate::cli::heap_test_lock().lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(setq *ordinary-global-mv-value* 73)
+         (defun ordinary-global-mv-producer () (values 11 12))
+         (defun ordinary-global-mv-terminal (first global) (values first global))", &mut env).unwrap();
+    for optimized in [false, true] {
+        let name = if optimized { "ORDINARY-GLOBAL-MV-T2" } else { "ORDINARY-GLOBAL-MV-T1" };
+        let expression = "(ordinary-global-mv-terminal (ordinary-global-mv-producer) *ordinary-global-mv-value*)";
+        crate::cli::read_eval_all_env(&format!("(defun {name} () {expression})"), &mut env).unwrap();
+        egcl_rt::rooted!(forms = reader::read_from_string(&format!("({expression})")).unwrap().0);
+        let symbol = egcl_rt::symbols::intern(name);
+        let body = Arc::new(compile_function(name, NIL, *forms, &env, false, false).unwrap());
+        registry_put(symbol, Arc::clone(&body));
+        let code = if optimized {
+            install_body(symbol, Arc::clone(&body)).1
+        } else {
+            native_transfer_entry::install_t1(symbol, Arc::clone(&body), false)
+                .expect("unknown-MV global read retains native T1 fallback")
+        };
+        egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+        publish_native(symbol, Some(*function), &code);
+        assert_eq!(code.is_t2, optimized);
+        assert!(Arc::ptr_eq(code.body.as_ref().unwrap(), &body), "retain exact source owner");
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+        assert!(mapped.ordinary_entry.is_none(), "global read cannot erase incoming unknown MV state");
+        assert!(mapped.mapped_entry().is_some(), "fallback is an executable managed-activation entry");
+        assert!(mapped.value_maps_for_test().iter().count() >= 3,
+            "both named calls and the global helper retain precise native maps");
+        for expected in [73, 91] {
+            crate::cli::read_eval_all_env(&format!("(setq *ordinary-global-mv-value* {expected})"), &mut env).unwrap();
+            let result = run_native_callable(&code, symbol, *function, &[], &mut env).unwrap();
+            assert_eq!(result, EgclVal::from_fixnum(11));
+            assert!(env.mv_active);
+            assert_eq!(env.mv, vec![EgclVal::from_fixnum(11), EgclVal::from_fixnum(expected)],
+                "global reads stay live and the terminal callable retains its complete tuple");
+        }
     }
 }

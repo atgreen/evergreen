@@ -121,7 +121,7 @@ fn native_v2_callable_slot_reloads_a_moving_builtin_wrapper() {
         // object; the shared builtin-wrapper cache may already be tenured.
         egcl_rt::rooted!(function = super::super::super::super::arena_cons(head, identity));
         egcl_rt::rooted!(args = vec![*function, EgclVal::from_fixnum(42)]);
-        native_callable::collect_next_entry();
+        native_callable::collect_next_wrapped_entry();
         egcl_rt::rooted!(result = code.run(&args, &mut env).unwrap());
         assert!(
             native_callable::take_relocation(),

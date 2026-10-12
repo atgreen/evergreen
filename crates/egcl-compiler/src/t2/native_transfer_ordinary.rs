@@ -25,14 +25,18 @@ pub struct OrdinaryHelperOutcome {
 /// at overflow_args. The runtime must root these writable locations and closure
 /// before allocating a count-dependent copy or building an arity condition.
 #[repr(C)]
-pub struct OrdinaryArityRequest {
+pub struct OrdinaryEntryRequest {
     pub closure: EgclVal,
     pub nargs: usize,
     pub register_args: [EgclVal; 3],
     pub overflow_args: *mut EgclVal,
-    pub expected_arity: usize,
+    /// Immutable entry-specific data: expected arity or named target ordinal.
+    pub entry_data: usize,
     pub reserved: u64,
 }
+
+/// Compatibility name for the arity-checking use of incoming capture.
+pub type OrdinaryArityRequest = OrdinaryEntryRequest;
 
 /// The callback publishes the caller image, roots request-specific incoming
 /// values, and initializes the complete outcome. It must return normally even
@@ -50,7 +54,12 @@ pub fn emit_ordinary_published_veneer(helper: OrdinaryPublishedHelper) -> Vec<u8
 /// unchanged. No callee frame exists; the captured return PC belongs to its
 /// caller (or the outer segment entry shim).
 pub fn emit_ordinary_arity_veneer(helper: OrdinaryPublishedHelper, expected: usize) -> Vec<u8> {
-    emit(helper, Some(expected))
+    emit_ordinary_entry_veneer(helper, expected)
+}
+
+/// Capture every actual argument before a binding or interpreter adapter runs.
+pub fn emit_ordinary_entry_veneer(helper: OrdinaryPublishedHelper, entry_data: usize) -> Vec<u8> {
+    emit(helper, Some(entry_data))
 }
 
 fn stack_address(a: &mut Asm, reg: u8, offset: usize) {
@@ -69,11 +78,11 @@ fn emit(helper: OrdinaryPublishedHelper, expected: Option<usize>) -> Vec<u8> {
     const {
         assert!(OUT == 88);
         assert!(size_of::<OrdinaryHelperOutcome>() == 40);
-        assert!(size_of::<OrdinaryArityRequest>() == 64);
+        assert!(size_of::<OrdinaryEntryRequest>() == 64);
         assert!(offset_of!(OrdinaryHelperOutcome, values) == 16);
         assert!(offset_of!(OrdinaryHelperOutcome, anchor) == 32);
-        assert!(offset_of!(OrdinaryArityRequest, overflow_args) == 40);
-        assert!(offset_of!(OrdinaryArityRequest, expected_arity) == 48);
+        assert!(offset_of!(OrdinaryEntryRequest, overflow_args) == 40);
+        assert!(offset_of!(OrdinaryEntryRequest, entry_data) == 48);
     }
     let size = REQUEST + if expected.is_some() { 64 } else { 0 } + 8;
     let mut a = Asm::new();

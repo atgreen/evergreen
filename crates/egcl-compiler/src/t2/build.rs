@@ -212,16 +212,33 @@ pub fn build_for_native_scope_optimization(
     builder.run()
 }
 
-/// Give every residual call an explicit exceptional successor after optimization.
+/// Give residual calls and runtime symbol access explicit exceptional successors
+/// after optimization. The original ordinary candidate can retain its semantic
+/// operations; this mapped clone preserves their MV-transparent helper protocol.
 /// The supplied scope map must belong to the retained bytecode definition.
 pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<(), BuildError> {
     let calls: Vec<Inst> = f
         .block_order()
         .iter()
         .flat_map(|&b| f.block(b).insts.iter().copied())
-        .filter(|&i| f.inst(i).opcode == Opcode::Call)
+        .filter(|&i| matches!(f.inst(i).opcode,
+            Opcode::Call | Opcode::SymbolValue | Opcode::SetSymbolValue | Opcode::SymbolFunction))
         .collect();
     for call in calls {
+        let operation = f.inst(call).opcode;
+        if operation != Opcode::Call {
+            let AuxData::SymbolRef(symbol) = f.inst(call).aux else {
+                return Err(BuildError::Unsupported("symbol operation without symbol identity"));
+            };
+            let data = f.inst_mut(call);
+            data.opcode = Opcode::Call;
+            data.aux = match operation {
+                Opcode::SymbolValue => AuxData::GlobalValue { symbol, store: false },
+                Opcode::SetSymbolValue => AuxData::GlobalValue { symbol, store: true },
+                Opcode::SymbolFunction => AuxData::FunctionLookup(symbol),
+                _ => unreachable!(),
+            };
+        }
         let data = f.inst(call).clone();
         let state = data
             .frame_state

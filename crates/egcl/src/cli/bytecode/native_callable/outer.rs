@@ -34,8 +34,7 @@ struct Invocation {
 pub(in crate::cli::bytecode) type SuspendedCallers = Vec<(usize, Option<(usize, bool)>)>;
 
 #[cfg(test)]
-pub(in crate::cli::bytecode) fn suspended_callers_for_test()
--> Option<SuspendedCallers> {
+pub(in crate::cli::bytecode) fn suspended_callers_for_test() -> Option<SuspendedCallers> {
     let mut invocation = ACTIVE.with(Cell::get);
     let mut segment = current_segment();
     if invocation.is_null() || segment.is_null() {
@@ -87,8 +86,8 @@ pub(super) fn invoke(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(args = args.to_vec());
-    let entries = entries_for(*function).ok_or_else(|| {
-        EgclError::Internal("published native callable entries are unavailable".into())
+    let entry = ordinary_entry().ok_or_else(|| {
+        EgclError::Internal("ordinary native callable entry is unavailable".into())
     })?;
     let mut invocation = Invocation {
         context: NativeCallContext {
@@ -100,10 +99,7 @@ pub(super) fn invoke(
             nargs: args.len(),
         },
         function: std::ptr::from_mut(&mut *function),
-        // Rust already owns a contiguous rooted buffer, so use the published
-        // slice shape for every arity. This is one calling convention, without
-        // inspecting the target's implementation tier or transfer ABI.
-        entry: entries.slice,
+        entry: entry as usize,
         segment: std::ptr::null_mut(),
         call_sp: 0,
         return_pc: 0,
@@ -115,12 +111,31 @@ pub(super) fn invoke(
         previous_invocation: ACTIVE.with(Cell::get),
     };
     let _active = ActiveInvocation(ACTIVE.with(|active| active.replace(&mut invocation)));
+    unsafe { native_transfer_entry::invoke_outer_ordinary(entry, *function, &args, env) }
+}
+
+// A one-shot, noncollecting observer verifies the machine entry precondition
+// before the callable helper polls or dispatches its body.
+#[cfg(test)]
+type EntryObserver = Cell<Option<fn()>>;
+#[cfg(test)]
+pub(super) static ENTRY_OBSERVER: egcl_rt::execution_local::ExecutionLocal<EntryObserver> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
+
+// The ordinary root shim owns the segment's machine geometry. Keep the
+// invocation chain for diagnostics while no mapped adapter record is involved.
+pub(super) fn observe_ordinary_entry() {
+    #[cfg(test)]
+    if let Some(observe) = ENTRY_OBSERVER.with(|slot| slot.take()) {
+        observe();
+    }
+    let invocation = ACTIVE.with(Cell::get);
+    assert!(
+        !invocation.is_null(),
+        "ordinary outer entry owns its invocation"
+    );
     unsafe {
-        native_transfer_entry::invoke_outer_callable(
-            enter as *const u8,
-            std::ptr::from_mut(&mut invocation).cast(),
-            env,
-        )
+        (*invocation).segment = current_segment();
     }
 }
 
@@ -153,38 +168,4 @@ pub(in crate::cli::bytecode) unsafe fn owns_record(record: *mut MappedCallRecord
     assert_eq!(invocation.call_sp + 16, unsafe { (*segment).saved_sp });
     assert_eq!(invocation.context.request.cast::<NativeSegment>(), segment);
     true
-}
-
-/// `(invocation, stack, anchor)` is the native segment's machine entry shape.
-/// Neither the shim nor its stack slot holds a Lisp value. On selected transfer
-/// the published adapter tail-jumps directly to the segment landing after all
-/// of its Rust helpers have returned; on success this shim returns RAX unchanged.
-#[unsafe(naked)]
-unsafe extern "C" fn enter() {
-    core::arch::naked_asm!(
-        "endbr64",
-        "mov [rdi + {request}], rdx",
-        "mov [rdi + {segment}], rdx",
-        "lea rax, [rip + 2f]",
-        "mov [rdi + {return_pc}], rax",
-        "sub rsp, 8",
-        "mov [rdi + {call_sp}], rsp",
-        "mov r11, rdi",
-        "mov rcx, rdi",
-        "mov rsi, [r11 + {nargs}]",
-        "mov rdx, [r11 + {args}]",
-        "mov rdi, [r11 + {function}]",
-        "call qword ptr [r11 + {entry}]",
-        "2:",
-        "add rsp, 8",
-        "ret",
-        request = const std::mem::offset_of!(NativeCallContext, request),
-        nargs = const std::mem::offset_of!(NativeCallContext, nargs),
-        args = const std::mem::offset_of!(NativeCallContext, args),
-        function = const std::mem::offset_of!(Invocation, function),
-        entry = const std::mem::offset_of!(Invocation, entry),
-        segment = const std::mem::offset_of!(Invocation, segment),
-        call_sp = const std::mem::offset_of!(Invocation, call_sp),
-        return_pc = const std::mem::offset_of!(Invocation, return_pc),
-    )
 }
