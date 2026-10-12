@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Resume bounded Linux x86-64 T2 ordinary native guard failures without replaying
+  completed calls, preserving older callers' roots and the original callable
+  across redefinition ([#292](https://github.com/atgreen/evergreen/pull/292)).
+
 - Use native tail transfers for eligible environment-free Linux x86-64 T2
   forwarders with zero to four fixed tagged arguments when the target fits the
   caller's rounded incoming overflow capacity. Preserve moving-GC roots and
