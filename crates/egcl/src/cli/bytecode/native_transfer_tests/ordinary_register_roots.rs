@@ -3,10 +3,17 @@
 
 //! End-to-end roots and exceptional retirement across ordinary code owners.
 
-use super::ordinary_t2::install;
+use super::ordinary_t2::install as install_ordinary;
 use super::*;
 use egcl_rt::debug_stack::FrameOrigin;
 use std::cell::Cell;
+
+// This fixture specifically needs two simultaneous physical ordinary owners.
+fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
+    native_transfer_entry::with_ordinary_non_tail_emission_for_test(|| {
+        install_ordinary(name, params, forms, env)
+    })
+}
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]

@@ -36,20 +36,20 @@ mod deopt;
 mod native_frames;
 pub(super) mod ordinary_calls;
 
-// Installed tail acceptance is opt-in until runtime owner/GC handoff is proved.
-// The selector follows the execution when test compilation yields on a fiber.
+// Two-owner GC fixtures deliberately retain ordinary CALL frames. All other
+// tests use production tail selection; the override follows fiber execution.
 #[cfg(test)]
 static ORDINARY_TAIL_EMISSION: egcl_rt::execution_local::ExecutionLocal<Cell<bool>> =
-    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(false)) };
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(true)) };
 
 #[cfg(test)]
-pub(super) fn with_ordinary_tail_emission_for_test<R>(body: impl FnOnce() -> R) -> R {
+pub(super) fn with_ordinary_non_tail_emission_for_test<R>(body: impl FnOnce() -> R) -> R {
     ORDINARY_TAIL_EMISSION.with(|enabled| {
         struct Restore<'a>(&'a Cell<bool>, bool);
         impl Drop for Restore<'_> {
             fn drop(&mut self) { self.0.set(self.1); }
         }
-        let _restore = Restore(enabled, enabled.replace(true));
+        let _restore = Restore(enabled, enabled.replace(false));
         body()
     })
 }
@@ -803,11 +803,11 @@ impl TransferCode {
                         let flags = native_frames::flags()?;
                         let cold = JitBuffer::new(&egcl_compiler::t2::native_transfer::emit_ordinary_published_veneer(
                             ordinary_calls::cold_call))?;
-                        let emit_call = egcl_compiler::t2::emit::emit_framed_ordinary_call;
+                        let emit_call = egcl_compiler::t2::emit::emit_framed_ordinary_tail_call;
                         #[cfg(test)]
                         let emit_call = if ORDINARY_TAIL_EMISSION.with(Cell::get) {
-                            egcl_compiler::t2::emit::emit_framed_ordinary_tail_call
-                        } else { emit_call };
+                            emit_call
+                        } else { egcl_compiler::t2::emit::emit_framed_ordinary_call };
                         let emitted = call_cells.iter().find_map(|(symbol, cell)| {
                             emit_call(&ir, options,
                                 OrdinaryCallTarget { symbol: *symbol,

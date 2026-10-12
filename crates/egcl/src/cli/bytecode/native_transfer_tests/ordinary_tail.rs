@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
-//! Opt-in installed tail frames transfer exact roots and retained ownership.
+//! Installed tail frames transfer exact roots and retained ownership by default.
 
 use super::ordinary_t2::install as install_ordinary;
 use super::*;
@@ -10,10 +10,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<NativeCode>) {
-    let result: (u32, Rc<NativeCode>) =
-        native_transfer_entry::with_ordinary_tail_emission_for_test(|| {
-            install_ordinary(name, params, forms, env)
-        });
+    let result = install_ordinary(name, params, forms, env);
     let NativeCodeStorage::Mapped(mapped) = &result.1._storage else {
         panic!("mapped tail owner")
     };
@@ -24,7 +21,7 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<Nat
     assert_eq!(
         mapped.value_maps_for_test().iter().count(),
         1,
-        "opt-in forwarder has only a cold CALL map; the admitted edge is a tail jump"
+        "default forwarder has only a cold CALL map; the admitted edge is a tail jump"
     );
     result
 }
@@ -428,10 +425,8 @@ fn ordinary_tail_descendant_overflow_preserves_suspended_caller_roots() {
     // A has no incoming overflow capacity, so even with tail emission selected
     // it must CALL B. B then overwrites its incoming fourth argument (A.a) with
     // C's fourth argument (A.b), while A remains suspended at that CALL.
-    let (symbol, a) = native_transfer_entry::with_ordinary_tail_emission_for_test(|| {
-        install_ordinary("ORDINARY-TAIL-OVERFLOW-A", "(a b c)",
-            "((ordinary-tail-overflow-b a b c a))", &mut env)
-    });
+    let (symbol, a) = install_ordinary("ORDINARY-TAIL-OVERFLOW-A", "(a b c)",
+        "((ordinary-tail-overflow-b a b c a))", &mut env);
     let NativeCodeStorage::Mapped(mapped) = &a._storage else { panic!("mapped A") };
     assert_eq!(mapped.value_maps_for_test().iter().count(), 2,
         "capacity fallback retains direct and cold CALL maps");
