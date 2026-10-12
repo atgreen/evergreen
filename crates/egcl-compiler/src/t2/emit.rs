@@ -3514,7 +3514,8 @@ pub struct TransferCallRequest {
 }
 
 /// Precise guard continuation serialized on the generated stack. The helper
-/// must copy the stream into scanned interpreter slots before any GC or yield.
+/// must use the exact return-PC representation descriptor to root tagged words
+/// before any GC or yield, rebox raw words, then copy values to interpreter slots.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[repr(C)]
 pub struct TransferDeoptRequest {
@@ -4061,6 +4062,64 @@ fn emit_transfer_function(
         poll_veneer, recursion, deopt_veneer, named_veneers, roots, NativeCallStorage::ManagedActivation, None, None)
 }
 
+/// Admit raw F64 transport only where every collecting/cold boundary has an
+/// authoritative representation map. Raw entry arguments, ordinary helper or
+/// return operands, OSR imports, and other unboxed representations remain out
+/// of scope. A guarded unbox is the only raw producer in this initial slice.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn native_representations_supported(
+    f: &Function,
+    roots: NativeRootPublication,
+    storage: NativeCallStorage,
+    precise_deopt: bool,
+) -> bool {
+    use crate::t2::ir::{Opcode, TypeBits, Value, ValueRepresentation as Repr};
+    let raw = |value| f.value(value).repr != Repr::Tagged;
+    let has_raw = (0..f.num_values()).any(|i| raw(Value(i as u32)));
+    if has_raw && (roots != NativeRootPublication::PublishedHomes
+        || storage != NativeCallStorage::NativeStack || !precise_deopt
+        || !f.osr_entries.is_empty()
+        || f.block(f.entry()).params.iter().copied().any(raw)
+        || (0..f.num_values()).any(|i| !matches!(f.value(Value(i as u32)).repr,
+            Repr::Tagged | Repr::UnboxedF64)))
+    {
+        return false;
+    }
+    for (_, state) in f.frame_states.iter() {
+        let sources = state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
+        for source in sources {
+            if let crate::t2::frame_state::ValueSource::Value { value, repr } = source {
+                if value.0 as usize >= f.num_values() || f.value(*value).repr != *repr {
+                    return false;
+                }
+            }
+        }
+    }
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            // Edges carry raw values only through equally represented block
+            // parameters, checked by the ordinary IR verifier.
+            if data.args.iter().copied().any(raw) {
+                return false;
+            }
+            if data.opcode == Opcode::UnboxFloat {
+                if data.args.len() != 1 || data.results.len() != 1
+                    || f.value(data.results[0]).repr != Repr::UnboxedF64
+                    || f.value(data.results[0]).ty.bits != TypeBits::DOUBLE_FLOAT
+                    || !data.flags.guard || !data.flags.effectful || data.frame_state.is_none()
+                {
+                    return false;
+                }
+            } else if data.results.iter().copied().any(raw) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn emit_transfer_function_with_storage(
@@ -4098,18 +4157,19 @@ fn emit_transfer_function_with_storage(
             ..
         } => save == 0 || complete == 0 || multiple_values == 0,
     }) || call_veneer == 0
-        || (0..f.num_values()).any(|i| {
-            f.value(crate::t2::ir::Value(i as u32)).repr
-                != crate::t2::ir::ValueRepresentation::Tagged
-        })
-        || usize::from(activation_slots) < f.block(f.entry()).params.len()
         || crate::t2::verify::verify(f).is_err()
+        || !native_representations_supported(f, roots, storage, deopt_veneer.is_some())
+        || usize::from(activation_slots) < f.block(f.entry()).params.len()
     {
         return Err(EmitError::UnsupportedOp(0xFA));
     }
     for &block in f.block_order() {
         for &inst in &f.block(block).insts {
             let data = f.inst(inst);
+            if data.opcode == Opcode::UnboxFloat {
+                // Representation and operand contracts were checked above.
+                continue;
+            }
             if data.opcode == Opcode::HandlerLanding {
                 if !matches!(cleanup, Some(CleanupEmission::Native { handler_landing, .. }) if handler_landing != 0)
                 {
@@ -5929,6 +5989,28 @@ fn emit_framed_inner(
                     let dst = *inst_reg.get(value).ok_or(EmitError::UnsupportedOp(0xF2))?;
                     mov_imm64(&mut a, dst, egcl_rt::value::NIL.0 as i64);
                 }
+            } else if d.opcode == Opcode::UnboxFloat {
+                if !published_native_roots || !native_call_storage
+                    || d.args.len() != 1 || d.results.len() != 1
+                    || f.value(d.args[0]).repr != ValueRepresentation::Tagged
+                    || f.value(d.results[0]).repr != ValueRepresentation::UnboxedF64
+                {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                }
+                let label = *inst_deopt.get(&inst)
+                    .ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;
+                let input = inst_reg[&d.args[0]];
+                let dst = inst_reg[&d.results[0]];
+                mov_rr(&mut a, SCRATCH, input);
+                alu_r_imm(&mut a, 4, SCRATCH, 7);
+                alu_r_imm(&mut a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+                a.jcc(Cc::Ne, label);
+                mov_rr(&mut a, SCRATCH, input);
+                alu_r_imm(&mut a, 4, SCRATCH, -8);
+                // Only the exact boxed-double layout admits a raw word load.
+                a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::DOUBLE_FLOAT]);
+                a.jcc(Cc::Ne, label);
+                load_mem64_disp(&mut a, dst, SCRATCH, 8);
             } else if d.opcode == Opcode::GenericEq {
                 emit_generic_eq(&mut a, &d, &mut inst_reg, &mut inst_pool, &const_tagged)?;
             } else if d.opcode == Opcode::TypeCheck {
@@ -6465,8 +6547,8 @@ fn emit_framed_inner(
     }
 
     // Precise per-guard deopt stubs (bliss-mba). Each serialises every logical
-    // FrameState scope — outermost to innermost, locals then live operands, all
-    // still tagged (no unboxing exists yet) — for c2i_deopt_t2 to reconstruct
+    // FrameState scope — outermost to innermost, locals then live operands —
+    // for c2i_deopt_t2 to reconstruct
     // the interpreter activation chain. A side effect committed in an outer
     // scope therefore runs exactly once. The value regs are still live here
     // (read BEFORE the epilogue restores callee-saved). rsp%16==0 after the
@@ -6524,13 +6606,16 @@ fn emit_framed_inner(
             }
         }
         // Serialized virtual-frame stream: for each outer-to-inner scope,
-        // [function, bcp, nlocals, nstack, locals..., stack...].
+        // [function, bcp, nlocals, nstack, locals..., stack...]. Published
+        // native single-scope streams may contain raw F64 words; exact return-PC
+        // metadata tells the runtime which payload words need rooted reboxing.
         let n_words: usize = fs
             .scopes
             .iter()
             .map(|scope| 4 + scope.locals.len() + scope.stack.len())
             .sum();
         let mut srcs: Vec<SlotSrc> = Vec::with_capacity(n_words);
+        let mut f64_slots = Vec::new();
         for scope in &fs.scopes {
             srcs.push(SlotSrc::Imm(scope.function as u64));
             srcs.push(SlotSrc::Imm(scope.bcp as u64));
@@ -6539,7 +6624,13 @@ fn emit_framed_inner(
             for vs in scope.locals.iter().chain(scope.stack.iter()) {
                 let s = match vs {
                     ValueSource::Value { value, repr } => {
-                        if *repr != ValueRepresentation::Tagged {
+                        if *repr == ValueRepresentation::UnboxedF64
+                            && published_native_roots && native_call_storage
+                            && fs.scopes.len() == 1
+                        {
+                            f64_slots.push(u32::try_from(srcs.len() - 4)
+                                .map_err(|_| EmitError::UnsupportedOp(0xF5))?);
+                        } else if *repr != ValueRepresentation::Tagged {
                             return Err(EmitError::UnsupportedOp(0xF5));
                         }
                         if let Some(&bits) = const_tagged.get(value) {
@@ -6639,6 +6730,7 @@ fn emit_framed_inner(
                     call.return_offset,
                     NativeCallValues::Deoptimizing {
                         native_slots: native_spill_slots,
+                        f64_slots: f64_slots.clone().into_boxed_slice(),
                     },
                 );
             }
@@ -6664,6 +6756,7 @@ fn emit_framed_inner(
                     call.return_offset,
                     NativeCallValues::Deoptimizing {
                         native_slots: native_spill_slots,
+                        f64_slots: Box::new([]),
                     },
                 );
             }

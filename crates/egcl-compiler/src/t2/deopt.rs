@@ -430,6 +430,63 @@ fn eval_remat(recipe: &RematDescriptor, mach: &impl MachineState) -> EgclVal {
     }
 }
 
+/// Turn a mixed native deopt payload into interpreter values in place.
+///
+/// `f64_slots` must list the raw F64 words in strictly increasing order; every
+/// other word must already be a valid tagged value. Scope headers are not part
+/// of this slice. The descriptor is checked before any mutation or allocation.
+/// Tagged inputs and completed boxes remain writable roots while `box_double`
+/// runs. Raw numeric bits are never offered to the collector, even when they
+/// happen to look like references. The caller must root the completed payload
+/// before its next allocation, and separately root values outside this slice.
+/// If the boxer unwinds, the payload has mixed old/new representations and must
+/// be discarded; it cannot be retried with the original descriptor.
+///
+/// # Safety
+/// Every word not listed in `f64_slots` must be a valid, live tagged value, and
+/// `box_double` must return a valid, live tagged double-float. The word storage
+/// must remain writable and exclusively owned throughout boxing and collection.
+pub unsafe fn rebox_f64_payload(
+    words: &mut [u64],
+    f64_slots: &[u32],
+    mut box_double: impl FnMut(f64) -> EgclVal,
+) -> Result<(), &'static str> {
+    if f64_slots.iter().any(|&slot| slot as usize >= words.len())
+        || f64_slots.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err("invalid native F64 deopt payload descriptor");
+    }
+    struct Payload<'a> {
+        words: &'a mut [u64],
+        pending: &'a [u32],
+    }
+    impl egcl_rt::gc::TraceHostRoots for Payload<'_> {
+        fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+            let mut raw = self.pending.iter().copied().peekable();
+            for (index, word) in self.words.iter_mut().enumerate() {
+                if raw.peek().is_some_and(|&slot| slot as usize == index) {
+                    raw.next();
+                } else {
+                    visit((word as *mut u64).cast());
+                }
+            }
+        }
+    }
+    let mut payload = Payload {
+        words,
+        pending: f64_slots,
+    };
+    egcl_rt::rooted_ref!(_payload = &mut payload);
+    while let Some((&slot, rest)) = payload.pending.split_first() {
+        let value = box_double(f64::from_bits(payload.words[slot as usize]));
+        payload.words[slot as usize] = value.0;
+        // No allocating operation may separate publishing the box from
+        // changing the root descriptor to include its tagged word.
+        payload.pending = rest;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +494,51 @@ mod tests {
     use crate::t2::frame_state::{FrameScope, FrameState, RematRecipe};
     use crate::t2::mach::{PhysReg, RegClass, StackMap, StackSlot};
     use std::collections::HashMap;
+
+    #[test]
+    fn mixed_f64_payload_reboxes_across_moving_collections() {
+        use egcl_rt::Collector;
+        let original = egcl_rt::gc::alloc_double_float(42.5).0;
+        // One raw double deliberately has the bit pattern of the tagged root.
+        // A conservative scan would relocate and corrupt that numeric value.
+        let mut words = [original, original, (-0.0f64).to_bits(), 7.25f64.to_bits()];
+        let mut boxes = 0;
+        // SAFETY: word zero is the live allocation above; all remaining words
+        // are raw F64, and the boxer returns actual GC-allocated doubles.
+        unsafe {
+            rebox_f64_payload(&mut words, &[1, 2, 3], |value| {
+                egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
+                boxes += 1;
+                egcl_rt::gc::alloc_double_float(value)
+            })
+        }
+        .unwrap();
+        assert_eq!(boxes, 3);
+        assert_ne!(words[0], original, "tagged input must actually relocate");
+        assert_eq!(EgclVal(words[0]).as_double_float(), 42.5);
+        assert_eq!(EgclVal(words[1]).as_double_float().to_bits(), original);
+        assert_eq!(
+            EgclVal(words[2]).as_double_float().to_bits(),
+            (-0.0f64).to_bits()
+        );
+        assert_eq!(EgclVal(words[3]).as_double_float(), 7.25);
+    }
+
+    #[test]
+    fn mixed_f64_payload_rejects_invalid_descriptors_before_boxing() {
+        for slots in [&[2][..], &[0, 0], &[1, 0]] {
+            let mut words = [EgclVal::from_fixnum(1).0, EgclVal::from_fixnum(2).0];
+            let original = words;
+            // SAFETY: every unlisted word is an immediate tagged fixnum.
+            let result = unsafe {
+                rebox_f64_payload(&mut words, slots, |_| {
+                    panic!("invalid descriptor must not allocate or mutate its payload")
+                })
+            };
+            assert!(result.is_err());
+            assert_eq!(words, original);
+        }
+    }
 
     fn gpr(n: u8) -> Location {
         Location::Register(PhysReg {
