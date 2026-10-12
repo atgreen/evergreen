@@ -27,6 +27,7 @@ mod ordinary_mixed_entries;
 mod ordinary_guard;
 mod ordinary_guard_roots;
 mod ordinary_tail;
+mod packed_f64;
 mod payloads;
 mod recursion;
 mod recursive_heat;

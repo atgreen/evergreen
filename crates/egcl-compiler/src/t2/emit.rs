@@ -3963,11 +3963,30 @@ pub fn emit_framed_native_handlers_with_entries_and_poll_fast_path(
     named_veneers: &[(u32, u64)], roots: NativeRootPublication,
     poll_fast_path: Option<NativePollFastPath>,
 ) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
+    emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
+        f, call_veneer, activation_slots, save, complete, multiple_values,
+        catch_landing, handler_landing, poll_veneer, recursion, deopt_veneer,
+        named_veneers, roots, NativeCallStorage::ManagedActivation, poll_fast_path)
+}
+
+/// Published managed entry with explicitly represented native homes and the
+/// same idle-poll control. Raw homes require precise deopt and no OSR imports;
+/// the common emitter validates that representation contract before emission.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
+    f: &Function, call_veneer: u64, activation_slots: u16,
+    save: u64, complete: u64, multiple_values: u64,
+    catch_landing: u64, handler_landing: u64, poll_veneer: u64,
+    recursion: Option<RecursiveTransfer>, deopt_veneer: Option<u64>,
+    named_veneers: &[(u32, u64)], roots: NativeRootPublication,
+    storage: NativeCallStorage, poll_fast_path: Option<NativePollFastPath>,
+) -> Result<(FramedCode, crate::t2::transfer_sites::SysvTransferTable), EmitError> {
     if catch_landing == 0 || handler_landing == 0 { return Err(EmitError::UnsupportedOp(0xFA)); }
     emit_transfer_function_with_storage(f, call_veneer, activation_slots,
         Some(CleanupEmission::Native { save, complete, multiple_values, catch_landing, handler_landing }),
         (poll_veneer != 0).then_some(poll_veneer), recursion, deopt_veneer, named_veneers,
-        roots, NativeCallStorage::ManagedActivation, None, poll_fast_path)
+        roots, storage, None, poll_fast_path)
 }
 
 /// Scope-free fixed-arity worker T2 entry with physical native recursion.

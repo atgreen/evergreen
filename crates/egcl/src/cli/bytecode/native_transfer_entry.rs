@@ -838,7 +838,20 @@ impl TransferCode {
             });
         // A shape not yet admitted by the native-frame emitter retains its
         // existing mapped execution and original recovery veneers.
-        let (emitted, sites) = ordinary.or(native_frames).or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_and_poll_fast_path(
+        let has_raw = (0..ir.num_values()).any(|index| ir.value(
+            egcl_compiler::t2::ir::Value(index as u32)).repr
+                != egcl_compiler::t2::ir::ValueRepresentation::Tagged);
+        let storage = if has_raw {
+            if !matches!(tier, CompilationTier::T2) || deopt_metadata.is_none()
+                || !ir.osr_entries.is_empty() || !packed_f64_native_body(&body)
+            {
+                return None;
+            }
+            egcl_compiler::t2::emit::NativeCallStorage::NativeStack
+        } else {
+            egcl_compiler::t2::emit::NativeCallStorage::ManagedActivation
+        };
+        let (emitted, sites) = ordinary.or(native_frames).or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
             ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -852,6 +865,7 @@ impl TransferCode {
             deopt_veneer.as_ref().map(|code| code.as_ptr() as u64),
             &named_veneers,
             egcl_compiler::t2::emit::NativeRootPublication::PublishedHomes,
+            storage,
             poll_fast_path,
         )
         .inspect_err(|error| t2_log_write(format_args!(
@@ -1441,6 +1455,20 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     local_control_native_body(body, allow_values, false)
+}
+
+// Raw numeric locals use the existing managed activation's local control scopes.
+// Dynamic scopes, escaping control identities and MV still need independent
+// representation-aware contracts before they can share this narrow entry.
+fn packed_f64_native_body(body: &BytecodeFunction) -> bool {
+    local_control_native_body(body, false, true)
+        && !body.code.iter().any(|op| matches!(op,
+            Instr::PushCatch { .. } | Instr::Throw
+                | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
+                | Instr::PushHandlerCase { .. } | Instr::PopHandlerCase
+                | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
+                | Instr::PushRestartCase { .. } | Instr::PopRestartCase
+                | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool) -> bool {

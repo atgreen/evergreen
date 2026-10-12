@@ -113,3 +113,6 @@ pub mod transfer_sites;
 // ── Further passes ────────────────────────────────────────────────
 pub mod opt_escape; // escape analysis + scalar replacement
 pub mod opt_fold; // constant folding + strength reduction
+
+/// Guarded packed-double closed-expression specialization.
+pub mod packed_f64;
