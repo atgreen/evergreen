@@ -42,6 +42,7 @@ fn bytecode_fn(
     arity: u16,
 ) -> BytecodeFunction {
     BytecodeFunction {
+        self_call_sites: Vec::new(),
         code,
         constants,
         load_time_values: vec![],
@@ -1519,6 +1520,7 @@ fn fixnum_profile_speculates_the_call() {
     // CallNamed is at bcp 2.
     let star = egcl_rt::symbols::intern("*");
     let bf = BytecodeFunction {
+        self_call_sites: Vec::new(),
         code: vec![
             Instr::LoadLocal(0),
             Instr::Const(0),

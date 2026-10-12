@@ -2666,8 +2666,10 @@ fn expand_macrolet(mut form: EgclVal, env: &Environment) -> Result<EgclVal, Egcl
     if body_items.len() == 1 {
         Ok(body_items[0])
     } else {
-        let progn_sym = make_symbol("PROGN");
-        Ok(alloc_cons(progn_sym, expanded_body))
+        // DECLARE forms survive expand_body. Keep their lexical extent
+        // visible to later lowering, including whole-function pre-expansion.
+        let locally_sym = make_symbol("LOCALLY");
+        Ok(alloc_cons(locally_sym, expanded_body))
     }
 }
 
@@ -2721,8 +2723,10 @@ fn expand_symbol_macrolet(mut form: EgclVal, env: &Environment) -> Result<EgclVa
     if body_items.len() == 1 {
         Ok(body_items[0])
     } else {
-        let progn_sym = make_symbol("PROGN");
-        Ok(alloc_cons(progn_sym, expanded_body))
+        // DECLARE forms survive expand_body. Keep their lexical extent
+        // visible to later lowering, including whole-function pre-expansion.
+        let locally_sym = make_symbol("LOCALLY");
+        Ok(alloc_cons(locally_sym, expanded_body))
     }
 }
 

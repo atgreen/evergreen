@@ -318,15 +318,18 @@
 ;;; bootstrap evaluator.
 ;;; ---------------------------------------------------------------------------
 
-;; declaim: most declarations (inline/optimize/ftype/type) have no bearing on
-;; the tree-walking interpreter and are ignored, but (special x …) IS honoured
-;; via the proclamation registry so a non-earmuffed special var binds
-;; dynamically (bliss-7na). Emit a %proclaim-special call per (special …) spec.
+;; DECLAIM records global declarations. Inline policy must take effect while
+;; compiling subsequent definitions as well as when loading or evaluating the
+;; form; ordinary PROCLAIM calls alone have no compile-time effect.
 (defmacro declaim (&rest specs)
   (let ((forms nil))
     (dolist (spec specs)
       (when (consp spec)
         (case (car spec)
+          ((inline notinline)
+           (push (list 'eval-when '(:compile-toplevel :load-toplevel :execute)
+                       (list 'proclaim (list 'quote spec)))
+                 forms))
           (special
            (push (list 'egcl-internal::%proclaim-special (list 'quote (cdr spec)))
                  forms))
@@ -344,7 +347,7 @@
     (if forms (cons 'progn (nreverse forms)) nil)))
 
 ;; proclaim: the run-time counterpart (ANSI 3.8). Non-special declarations are
-;; accepted and ignored; (special x …) registers the variables as special.
+;; stored where needed; (special x …) registers the variables as special.
 ;; The parameter is deliberately NOT named DECLARATION-SPECIFIER: boot.lisp is
 ;; read into COMMON-LISP, so every name it mentions mints a bare, home-package-
 ;; less symbol identity, and a qualified read of the same name (e.g.
@@ -353,6 +356,9 @@
 (defun proclaim (decl-spec)
   (when (consp decl-spec)
     (case (car decl-spec)
+      ((inline notinline)
+        (dolist (name (cdr decl-spec))
+          (setf (get name 'egcl-internal::inline-policy) (car decl-spec))))
       (special (egcl-internal::%proclaim-special (cdr decl-spec)))
       (declaration (egcl-internal::%proclaim-declaration (cdr decl-spec)))
       (optimize (egcl-internal::%proclaim-optimize (cdr decl-spec)))))

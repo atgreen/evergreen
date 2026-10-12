@@ -5,13 +5,17 @@
 use super::*;
 use crate::t2::ir::{AuxData, Inst, InstData, Opcode, Value, ValueRepresentation};
 use egcl_rt::call_table::{
-    OrdinaryCallHeat, ORDINARY_ENV_NONE, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, OrdinaryEntryDescriptor,
+    OrdinaryCallHeat, ORDINARY_ENV_NONE, OrdinaryEntryDescriptor,
 };
 use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 pub struct OrdinaryCallTarget {
     pub symbol: u32,
+    /// Address of a slot populated only by checked ordinary publication.
+    /// Descriptors are immutable and retained with their code through every
+    /// active native segment. Publication validates ABI kind/version, owner,
+    /// code bounds and stack requirement; callers check mutable admission.
     pub descriptor_slot: u64,
     pub revision_address: u64,
     /// Atomic pointer to retained profiling metadata; zero disables profiling.
@@ -87,6 +91,8 @@ pub(super) struct OrdinaryCallEmission<'a> {
     tail: bool,
     pub(super) guard: Option<OrdinaryGuardOptions>,
     pub(super) poll_veneer: Option<u64>,
+    self_calls: &'a [Inst],
+    direct_self: bool,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its
@@ -257,7 +263,7 @@ fn emit_ordinary_call_body(
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
             tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
             guard,
-            poll_veneer: None,
+            poll_veneer: None, self_calls: &[], direct_self: false,
         }),
     )
 }
@@ -336,7 +342,7 @@ pub fn emit_framed_ordinary_two_calls(
         Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
         Some(entry), Some(OrdinaryCallEmission {
             target: targets[0], targets: &[], second_target: Some((last, targets[1])),
-            return_policy: OrdinaryReturnPolicy::Call(last), flags, cold, tail: false, guard: None, poll_veneer: None,
+            return_policy: OrdinaryReturnPolicy::Call(last), flags, cold, tail: false, guard: None, poll_veneer: None, self_calls: &[], direct_self: false,
         }))
 }
 
@@ -361,6 +367,19 @@ pub fn emit_framed_ordinary_function_with_poll(
     f: &Function, entry: OrdinaryLispEntryOptions,
     targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
     cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64,
+) -> Result<FramedCode, EmitError> {
+    emit_framed_ordinary_function_with_self_calls(f, entry, targets, flags, cold, guard, poll_veneer, &[])
+}
+
+/// Emit source-proven self calls to this artifact's ordinary entry. The caller
+/// must exclude NOTINLINE and lexically shadowed calls, and preserve the same
+/// callable identity through cold admission and guard recovery. These sites
+/// need no global binding lookup or invocation heat (the body is already T2).
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_ordinary_function_with_self_calls(
+    f: &Function, entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
+    cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     if f.is_variadic() || !f.osr_entries.is_empty() || !f.handler_cases.is_empty()
@@ -420,6 +439,15 @@ pub fn emit_framed_ordinary_function_with_poll(
         }
     }
     if targets.len() != call_count { return Err(bad()); }
+    if self_calls.iter().any(|site| !targets.iter().any(|(inst, target)| {
+        if inst != site { return false; }
+        let data = f.inst(*inst);
+        data.args.len() == entry.arity && data.frame_state.is_some_and(|state| {
+            let scopes = &f.frame_states.get(state).scopes;
+            scopes.len() == 1 && scopes[0].function == target.symbol
+        })
+    })) { return Err(bad()); }
+
     // Calls contain the complete lifecycle poll. A cycle without a call would
     // otherwise suppress signals, collection and fiber yielding indefinitely.
     // Remove call-containing blocks and require the remaining graph acyclic.
@@ -441,6 +469,7 @@ pub fn emit_framed_ordinary_function_with_poll(
             target: unused, targets, second_target: None,
             return_policy: OrdinaryReturnPolicy::Calls(&returns), flags, cold,
             tail: false, guard: Some(guard), poll_veneer: (poll_veneer != 0).then_some(poll_veneer),
+            self_calls, direct_self: false,
         }))
 }
 
@@ -473,6 +502,8 @@ fn retire(a: &mut Asm, bytes: u32) {
 pub(super) struct OrdinaryCallFrame<'a> {
     pub outgoing: NativeValueArea,
     pub control_home: FramedHome,
+    pub self_entry: egcl_rt::asm::Label,
+    pub self_stack_fixups: &'a mut Vec<usize>,
     pub emit_epilogue: &'a dyn Fn(&mut Asm),
 }
 
@@ -486,6 +517,7 @@ impl OrdinaryCallEmission<'_> {
     }
 
     pub(super) fn for_inst(mut self, inst: Inst) -> Self {
+        self.direct_self = self.self_calls.contains(&inst);
         if let Some((_, target)) = self.targets.iter().find(|(site, _)| *site == inst) {
             self.target = *target;
         }
@@ -505,6 +537,8 @@ impl OrdinaryCallEmission<'_> {
         let OrdinaryCallFrame {
             outgoing,
             control_home,
+            self_entry,
+            self_stack_fixups,
             emit_epilogue,
         } = frame;
         let NativeValueArea::NativeStack(base) = outgoing else {
@@ -578,19 +612,18 @@ impl OrdinaryCallEmission<'_> {
             a.jcc(Cc::Ge, cold);
         }
 
+        if self.direct_self {
+            // Patched from the final published bound, including guard/cold
+            // temporary storage and argument moves, after maps are finalized.
+            let at = a.here();
+            mov_imm64(a, SCRATCH, 0);
+            self_stack_fixups.push(at + 2);
+        } else {
         mov_imm64(a, 11, self.target.descriptor_slot as i64);
         load_mem64_disp(a, 11, 11, 0);
         alu_r_imm(a, 7, 11, 0);
         a.jcc(Cc::E, cold);
         for (offset, expected) in [
-            (
-                std::mem::offset_of!(OrdinaryEntryDescriptor, kind),
-                ORDINARY_X64_LISP_KIND,
-            ),
-            (
-                std::mem::offset_of!(OrdinaryEntryDescriptor, version),
-                ORDINARY_X64_LISP_VERSION,
-            ),
             (
                 std::mem::offset_of!(OrdinaryEntryDescriptor, arity),
                 data.args.len() as u64,
@@ -625,52 +658,11 @@ impl OrdinaryCallEmission<'_> {
         a.jcc(Cc::Ne, cold);
         load_mem64_disp(
             a,
-            RAX,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, owner) as i32,
-        );
-        alu_r_imm(a, 7, RAX, 0);
-        a.jcc(Cc::E, cold);
-        load_mem64_disp(
-            a,
-            RAX,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, code_start) as i32,
-        );
-        alu_r_imm(a, 7, RAX, 0);
-        a.jcc(Cc::E, cold);
-        load_mem64_disp(
-            a,
-            SCRATCH,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, code_len) as i32,
-        );
-        alu_rr(a, 0x01, RAX, SCRATCH);
-        unsigned_branch(a, false, cold); // reject range overflow
-        load_mem64_disp(
-            a,
-            SCRATCH,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, entry) as i32,
-        );
-        cmp_rr(a, RAX, SCRATCH);
-        unsigned_branch(a, true, cold); // entry >= end
-        load_mem64_disp(
-            a,
-            RAX,
-            11,
-            std::mem::offset_of!(OrdinaryEntryDescriptor, code_start) as i32,
-        );
-        cmp_rr(a, SCRATCH, RAX);
-        unsigned_branch(a, false, cold); // entry < start
-        load_mem64_disp(
-            a,
             SCRATCH,
             11,
             std::mem::offset_of!(OrdinaryEntryDescriptor, stack_required) as i32,
         );
-        alu_r_imm(a, 7, SCRATCH, 8);
-        a.jcc(Cc::L, cold); // also rejects high-bit bounds
+        }
         if self.tail {
             // Ordinary RBP names the first saved word. Retiring this frame
             // restores entry RSP = RBP+8; no new return word is pushed.
@@ -687,7 +679,7 @@ impl OrdinaryCallEmission<'_> {
         load_mem64_disp(a, SCRATCH, 7, 88);
         cmp_rr(a, RAX, SCRATCH);
         unsigned_branch(a, true, cold);
-        if self.target.heat_slot != 0 {
+        if !self.direct_self && self.target.heat_slot != 0 {
             let no_heat = a.label();
             mov_imm64(a, 10, self.target.heat_slot as i64);
             load_mem64_disp(a, 10, 10, 0);
@@ -725,12 +717,14 @@ impl OrdinaryCallEmission<'_> {
             load_mem64_disp(a, SCRATCH, 7, 8);
             a.extend_from_slice(&[0xff, 0x02]); // inc dword[rdx]
         }
+        if !self.direct_self {
         load_mem64_disp(
             a,
             11,
             11,
             std::mem::offset_of!(OrdinaryEntryDescriptor, entry) as i32,
         );
+        }
         let direct = if self.tail {
             // Every source was copied above before any incoming area is
             // overwritten. The handoff has no safepoint: the target takes
@@ -760,7 +754,11 @@ impl OrdinaryCallEmission<'_> {
             }
             mov_imm64(a, 1, data.args.len() as i64);
             mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
-            a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, genuine ordinary ABI
+            if self.direct_self {
+                a.call(self_entry);
+            } else {
+                a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, genuine ordinary ABI
+            }
             let direct = CallReturn {
                 return_offset: a.here(),
                 stack_adjust: overflow as u32,
@@ -781,7 +779,7 @@ impl OrdinaryCallEmission<'_> {
             (24, egcl_rt::value::NIL.0),
             (40, self.target.descriptor_slot),
             (48, self.target.revision_address),
-            (56, 0),
+            (56, u64::from(self.direct_self)),
         ] {
             mov_imm64(a, RAX, bits as i64);
             store_to_rsp(a, RAX, offset);

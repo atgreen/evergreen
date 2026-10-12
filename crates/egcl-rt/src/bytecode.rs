@@ -252,6 +252,10 @@ impl DeclaredType {
 
 #[derive(Clone, Debug)]
 pub struct BytecodeFunction {
+    /// Source-proven calls to this definition, excluding lexical shadowing and
+    /// NOTINLINE. Instruction indices survive cloning and must follow rewrites.
+    /// Empty for legacy/synthetic bodies without that positive source proof.
+    pub self_call_sites: Vec<u32>,
     pub code: Vec<Instr>,
     pub constants: Vec<EgclVal>,
     /// Compiler-only LOAD-TIME-VALUE initializers: (cell constant slot, form).

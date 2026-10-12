@@ -536,6 +536,11 @@ pub(super) fn take_nested_entries() -> usize {
 }
 
 impl TransferCode {
+    pub(super) fn needs_callable_identity(&self) -> bool {
+        self.ordinary_entry.is_some()
+            && (self.has_deopt || !self.body.self_call_sites.is_empty())
+    }
+
     pub(super) fn mapped_entry(&self) -> Option<*const u8> {
         let offset = self.frame_entry.filter(|offset| *offset < self.code_len)?;
         Some(self.code.as_ptr().wrapping_add(offset))
@@ -851,7 +856,39 @@ impl TransferCode {
                         let call_flags = OrdinaryCallFlags { gc_requested: flags.gc_requested,
                             sigusr1_pending: flags.sigusr1_pending, posted_signal: flags.posted_signal,
                             native_errors: flags.native_errors, signal_epoch: flags.signal_epoch };
-                        let emitted = call_cells.iter().find_map(|(symbol, cell)| {
+                        let self_calls = if matches!(tier, CompilationTier::T2) {
+                            super::super::resolve_sym(&body.name)
+                                .map(|symbol| ordinary_t2::proven_self_calls(&ir, &body, symbol.as_symbol_index()))
+                                .unwrap_or_default()
+                        } else { Vec::new() };
+                        let emit_general = || {
+                            use egcl_compiler::t2::ir::{AuxData, Opcode};
+                            let targets = ir.block_order().iter()
+                                .flat_map(|&block| ir.block(block).insts.iter().copied())
+                                .filter(|&inst| ir.inst(inst).opcode == Opcode::Call)
+                                .map(|inst| {
+                                    let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
+                                    let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
+                                    Some((inst, OrdinaryCallTarget { symbol,
+                                        descriptor_slot: cell.ordinary_entry_address() as u64,
+                                        heat_slot: cell.ordinary_heat_address() as u64,
+                                    revision_address: cell.revision_address() as u64 }))
+                                }).collect::<Option<Vec<_>>>()?;
+                            egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_calls(
+                                &ir, options, &targets, call_flags, cold.as_ptr() as u64,
+                                egcl_compiler::t2::emit::OrdinaryGuardOptions {
+                                    veneer: guard.as_ref()?.as_ptr() as u64,
+                                    multiple_values: c2i_t2_mv as *const () as u64,
+                                }, poll.as_ptr() as u64, &self_calls).inspect_err(|error| t2_log_write(format_args!(
+                                    "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
+                                ))).ok()
+                        };
+                        // Proven self calls must not be swallowed by an earlier
+                        // specialized emitter that still performs dynamic lookup.
+                        let emitted = if !self_calls.is_empty() {
+                            emit_general()
+                        } else {
+                        call_cells.iter().find_map(|(symbol, cell)| {
                             let target = OrdinaryCallTarget { symbol: *symbol,
                                     descriptor_slot: cell.ordinary_entry_address() as u64,
                                     heat_slot: cell.ordinary_heat_address() as u64,
@@ -881,28 +918,8 @@ impl TransferCode {
                             egcl_compiler::t2::emit::emit_framed_ordinary_two_calls(
                                 &ir, options, [target(*calls[0])?, target(*calls[1])?], call_flags,
                                 cold.as_ptr() as u64, c2i_t2_mv as *const () as u64).ok()
-                        }).or_else(|| {
-                            use egcl_compiler::t2::ir::{AuxData, Opcode};
-                            let targets = ir.block_order().iter()
-                                .flat_map(|&block| ir.block(block).insts.iter().copied())
-                                .filter(|&inst| ir.inst(inst).opcode == Opcode::Call)
-                                .map(|inst| {
-                                    let AuxData::CallTarget(symbol) = ir.inst(inst).aux else { return None };
-                                    let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
-                                    Some((inst, OrdinaryCallTarget { symbol,
-                                        descriptor_slot: cell.ordinary_entry_address() as u64,
-                                        heat_slot: cell.ordinary_heat_address() as u64,
-                                    revision_address: cell.revision_address() as u64 }))
-                                }).collect::<Option<Vec<_>>>()?;
-                            egcl_compiler::t2::emit::emit_framed_ordinary_function_with_poll(
-                                &ir, options, &targets, call_flags, cold.as_ptr() as u64,
-                                egcl_compiler::t2::emit::OrdinaryGuardOptions {
-                                    veneer: guard.as_ref()?.as_ptr() as u64,
-                                    multiple_values: c2i_t2_mv as *const () as u64,
-                                }, poll.as_ptr() as u64).inspect_err(|error| t2_log_write(format_args!(
-                                    "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
-                                ))).ok()
-                        })?;
+                        }).or_else(emit_general)
+                        }?;
                         if emitted.has_deopt { deopt_veneer = guard; }
                         ordinary_cold = Some(cold);
                         Some(emitted)
@@ -1209,6 +1226,9 @@ impl TransferCode {
         // with the inherited scopes installed; deliver pending errors there,
         // through normal transfer handling, rather than skipping their cleanup.
         let _ordinary_segment = super::call_table::enter_ordinary_segment();
+        let _ordinary_root = if self.needs_callable_identity() {
+            Some(_ordinary_segment.retain_root(self, *function).ok_or_else(invalid_capture)?)
+        } else { None };
         let outcome = if let Some(offset) = self.ordinary_entry {
             assert!(osr_offset.is_none(), "ordinary entry is not an OSR destination");
             let control = unsafe { native_frames::initialize() };

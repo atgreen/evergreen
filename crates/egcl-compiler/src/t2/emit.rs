@@ -159,7 +159,7 @@ mod ordinary_primitives;
 pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, OrdinaryCallTarget, OrdinaryCallFlags,
+    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, OrdinaryCallTarget, OrdinaryCallFlags,
     OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -5667,6 +5667,10 @@ fn emit_framed_inner(
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_self_entry = a.label();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut ordinary_self_stack_fixups = Vec::new();
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
         let offset = a.here();
@@ -5676,6 +5680,7 @@ fn emit_framed_inner(
         mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
         a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
         a.bind(accepted);
+        a.bind(ordinary_self_entry);
         emit_prologue(&mut a);
         let incoming = [7, 6, 2]; // RDI, RSI, RDX; overflow follows return PC.
         let incoming_stack = spill_bytes / 8 + usize::from(pad) + saved.len() + 1;
@@ -5909,7 +5914,9 @@ fn emit_framed_inner(
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
-                        control_home: native_control_home.unwrap(), emit_epilogue: &emit_epilogue })?; }
+                        control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
+                        self_stack_fixups: &mut ordinary_self_stack_fixups,
+                        emit_epilogue: &emit_epilogue })?; }
             } else if d.opcode == Opcode::ConstHeapObj {
                 let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
                 let dst = *inst_reg
@@ -7199,6 +7206,8 @@ fn emit_framed_inner(
         return Err(EmitError::UnsupportedOp(0xFD));
     }
     let code = a.finish().ok_or(EmitError::BadBranch)?;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut code = code;
     #[cfg(all(target_arch = "x86_64", windows))]
     let windows_unwind = {
         let mut starts = vec![0usize];
@@ -7291,6 +7300,13 @@ fn emit_framed_inner(
     };
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_stack_required = None;
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    for offset in ordinary_self_stack_fixups {
+        let bound = ordinary_stack_required.ok_or(EmitError::BadBranch)? as u64;
+        code.get_mut(offset..offset + 8).ok_or(EmitError::BadBranch)?
+            .copy_from_slice(&bound.to_le_bytes());
+    }
 
     Ok(FramedCode {
         frame_entry: (!ordinary_call_mode).then_some(0),
@@ -8155,6 +8171,7 @@ mod tests {
         use egcl_rt::value::EgclVal;
         let star = egcl_rt::symbols::intern("*");
         let bf = BytecodeFunction {
+            self_call_sites: Vec::new(),
             code: vec![
                 Instr::LoadLocal(0),
                 Instr::Const(0),

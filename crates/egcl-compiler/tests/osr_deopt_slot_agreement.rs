@@ -26,6 +26,7 @@ use egcl_rt::value::EgclVal;
 
 fn bf(name: &str, code: Vec<Instr>, constants: Vec<EgclVal>, n_locals: u16) -> BytecodeFunction {
     BytecodeFunction {
+        self_call_sites: Vec::new(),
         code,
         constants,
         load_time_values: vec![],
