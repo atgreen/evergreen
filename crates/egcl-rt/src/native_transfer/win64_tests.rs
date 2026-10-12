@@ -192,6 +192,7 @@ fn win64_preserves_integer_simd_and_fp_control_for_every_exit() {
             stack_sp: std::ptr::null(),
             stack_fp: std::ptr::null(),
             _pinned: std::marker::PhantomPinned,
+            landing_sp: 0,
         };
         let mut out = NativeOutcome {
             value: NIL,

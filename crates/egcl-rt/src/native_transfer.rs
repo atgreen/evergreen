@@ -142,6 +142,10 @@ pub struct NativeSegment {
     stack_sp: *const u8,
     stack_fp: *const Frame,
     _pinned: std::marker::PhantomPinned,
+    /// Optional fixed recovery SP when outgoing arguments make saved_sp dynamic.
+    /// saved_sp still identifies the precise caller boundary for native walks.
+    /// Zero retains the original fixed-frame landing convention.
+    landing_sp: usize,
 }
 
 impl NativeSegment {
@@ -391,6 +395,7 @@ unsafe fn with_native_segment(
         stack_sp: stack.sp(),
         stack_fp: stack.fp(),
         _pinned: std::marker::PhantomPinned,
+        landing_sp: 0,
     });
     // SAFETY: this pinned stack local outlives the assembly entry and guard.
     let anchor = unsafe { segment.as_mut().get_unchecked_mut() as *mut NativeSegment };
@@ -492,8 +497,10 @@ pub unsafe extern "C" fn leave_native_segment(
 ) -> ! {
     core::arch::naked_asm!(
         "endbr64", "mov rax, rsi",
-        "mov rsp, [rdi + {sp}]", "jmp qword ptr [rdi + {landing}]",
+        "mov rsp, [rdi + {sp}]", "mov r10, [rdi + {landing_sp}]",
+        "test r10, r10", "cmovnz rsp, r10", "jmp qword ptr [rdi + {landing}]",
         sp = const std::mem::offset_of!(NativeSegment, saved_sp),
+        landing_sp = const std::mem::offset_of!(NativeSegment, landing_sp),
         landing = const std::mem::offset_of!(NativeSegment, landing_pc),
     )
 }
@@ -569,6 +576,7 @@ mod tests {
                 stack_sp: std::ptr::null(),
                 stack_fp: std::ptr::null(),
                 _pinned: std::marker::PhantomPinned,
+                landing_sp: 0,
             };
             let mut outcome = NativeOutcome {
                 value: NIL,
@@ -603,6 +611,7 @@ mod tests {
             stack_sp: std::ptr::null(),
             stack_fp: std::ptr::null(),
             _pinned: std::marker::PhantomPinned,
+            landing_sp: 0,
         });
         let pointer = unsafe { segment.as_mut().get_unchecked_mut() as *mut NativeSegment };
         let previous = ACTIVE.with(|active| active.replace(pointer));

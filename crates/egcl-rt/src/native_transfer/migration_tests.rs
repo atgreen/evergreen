@@ -158,6 +158,7 @@ fn rejected_destination_does_not_partially_update_nested_anchors() {
         stack_sp: std::ptr::null(),
         stack_fp: std::ptr::null(),
         _pinned: std::marker::PhantomPinned,
+        landing_sp: 0,
     };
     let mut outer = std::pin::pin!(make(std::ptr::null_mut()));
     let outer = unsafe { outer.as_mut().get_unchecked_mut() as *mut NativeSegment };
