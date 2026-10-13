@@ -264,7 +264,11 @@ pub fn is_supported() -> bool {
         // Older kernels and seccomp-denied queries retain the legacy ABI.
         let result =
             unsafe { crate::syscall::syscall2(158, 0x5005, &mut features as *mut u64 as usize) };
-        result == 0 && features == 0
+        // -EINVAL means the kernel was built without user shadow-stack support
+        // (CONFIG_X86_USER_SHADOW_STACK), so no shadow stack can be enabled for
+        // this process: the legacy ABI applies. Any other failure (e.g. a
+        // seccomp -EPERM) leaves the hardening state unknown and stays a refusal.
+        (result == 0 && features == 0) || result == -22
     }
     #[cfg(all(target_arch = "x86_64", windows))]
     {
