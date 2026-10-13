@@ -2009,7 +2009,13 @@ fn c3_linearize_inner(
             .map(|l| l[0])
             .find(|&h| !lists.iter().any(|l| l[1..].contains(&h)))
             .ok_or_else(|| {
-                EgclError::Internal("C3 linearization failed: inconsistent hierarchy".into())
+                // A Lisp-level error, so a DEFCLASS whose superclasses cannot be
+                // ordered is caught by HANDLER-CASE like any other definition
+                // error (ansi objects defclass.forward-ref.4) rather than
+                // aborting the image.
+                EgclError::ProgramError(
+                    "C3 linearization failed: inconsistent class hierarchy".into(),
+                )
             })?;
 
         result.push(head);
