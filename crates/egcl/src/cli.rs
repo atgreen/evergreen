@@ -35068,6 +35068,10 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     egcl_rt::rooted_ref!(_initargs_root = &mut init_args);
     egcl_rt::rooted!(class_input = eval_form(class_form, env)?);
     let class = resolve_class_metaobject(env, *class_input)?;
+    // Finalizing the class orders its superclasses; an inconsistent hierarchy
+    // must be reported here, where the caller can handle it, not later when
+    // something merely prints the instance (ansi objects defclass.forward-ref.4).
+    egcl_stdlib::compute_class_precedence_list(class)?;
     let class_name = class_name_for_instance_class(class);
     // The initargs as the caller wrote them, for the initialization protocol
     // below; `initargs` itself is keyed by slot name, for filling slots.
