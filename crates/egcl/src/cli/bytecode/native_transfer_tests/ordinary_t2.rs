@@ -147,6 +147,13 @@ fn ordinary_t2_admits_checked_fixnum_self_recursion() {
     assert!(mapped.ordinary_entry.is_some(), "typed root calls use the ordinary ABI");
     assert!(mapped.ordinary_descriptor(0).is_none(),
         "unchecked named callers must use the checked dispatcher");
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
+    let segment = super::super::call_table::enter_ordinary_segment();
+    let root = segment.retain_root(mapped, *function);
+    assert!(root.is_some(),
+        "checked roots retain their callable even though they have no public raw descriptor");
+    drop(root);
+    drop(segment);
     egcl_rt::rooted!(bad_args = vec![NIL]);
     assert!(matches!(run_native(&code, symbol, &bad_args, &mut env),
         Err(EgclError::TypeError { .. })), "typed root ingress must retain TYPE-ERROR");

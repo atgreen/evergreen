@@ -230,11 +230,11 @@ impl OrdinarySegmentGuard {
     ) -> Option<OrdinaryRootGuard<'a>> {
         egcl_rt::rooted!(function = function);
         if !self.directory.accepts_callable(code, *function) { return None; }
-        let descriptor = code.ordinary_descriptor(0)?;
+        let (start, len) = code.ordinary_code_bounds()?;
         let identity = Rc::new(RootIdentity {
             owner: std::ptr::from_ref(code),
-            start: descriptor.code_start,
-            len: descriptor.code_len,
+            start,
+            len,
             callable: Arc::new(egcl_rt::CrossThreadRoot::new(*function)),
         });
         self.directory.roots.borrow_mut().push(Rc::clone(&identity));

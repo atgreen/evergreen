@@ -546,6 +546,15 @@ impl TransferCode {
         Some(self.code.as_ptr().wrapping_add(offset))
     }
 
+    /// Code bounds for an in-flight ordinary segment. Unlike a published
+    /// descriptor, this does not authorize arbitrary named callers to enter
+    /// the register ABI: it is used only to retain the already validated root
+    /// callable while its generated body is executing.
+    pub(super) fn ordinary_code_bounds(&self) -> Option<(usize, usize)> {
+        self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
+        Some((self.code.as_ptr() as usize, self.code_len))
+    }
+
     pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
         use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
         // Root ingress validates declared parameters before entering generated

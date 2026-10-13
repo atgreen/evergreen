@@ -1512,7 +1512,7 @@ fn declared_bounded_integer_parameter_is_checked_and_proven_as_fixnum() {
         (defun declared-bounded-mul5 (x) \
           (declare (type (integer 0 40) x) (optimize (speed 3) (safety 1))) \
           (* x 5)) \
-        (dotimes (k 60) (declared-bounded-mul5 k)) \
+        (dotimes (k 60) (declared-bounded-mul5 9)) \
         (format t \"~a~%\" (declared-bounded-mul5 9)) \
         (disassemble (quote declared-bounded-mul5)) \
         (dolist (bad '(-1 41 1.5)) \
