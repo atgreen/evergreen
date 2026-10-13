@@ -18148,10 +18148,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         j += 2;
                     }
                 }
+                // The leftmost occurrence of a keyword wins (CLHS 3.4.1.4;
+                // read-from-string.11/.12), so each key is taken once.
+                let (mut seen_start, mut seen_end, mut seen_preserve) = (false, false, false);
+                let mut preserve_whitespace = false;
                 let mut j = 0;
                 while j + 1 < key_tail.len() {
                     match sym_bare_name_rc(key_tail[j]).as_ref() {
+                        "START" if seen_start => {}
                         "START" => {
+                            seen_start = true;
                             start = val_as_str(key_tail[j + 1])
                                 .parse()
                                 .ok()
@@ -18162,12 +18168,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 })
                                 .unwrap_or(0)
                         }
-                        "END" if !key_tail[j + 1].is_nil() => {
+                        "END" if seen_end => {}
+                        "END" => {
+                            seen_end = true;
                             if key_tail[j + 1].is_fixnum() {
                                 end = key_tail[j + 1].as_fixnum() as usize;
                             }
                         }
-                        "END" | "PRESERVE-WHITESPACE" | "ALLOW-OTHER-KEYS" => {}
+                        "PRESERVE-WHITESPACE" if seen_preserve => {}
+                        "PRESERVE-WHITESPACE" => {
+                            seen_preserve = true;
+                            preserve_whitespace = !key_tail[j + 1].is_nil();
+                        }
+                        "ALLOW-OTHER-KEYS" => {}
                         _ if allow_other => {}
                         other => {
                             return Err(EgclError::ProgramError(format!(
@@ -18192,7 +18205,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             "end of file on READ-FROM-STRING".into(),
                         ));
                     }
-                    Ok((form, consumed)) => {
+                    Ok((form, mut consumed)) => {
+                        // READ (unlike READ-PRESERVING-WHITESPACE) also consumes
+                        // the single whitespace character that terminated a token
+                        // (CLHS 2.2, 23.1.3; read-from-string.2, syntax.sharp-plus.2).
+                        // A form closed by its own delimiter (`)`, `"`) ends the
+                        // read where that delimiter does.
+                        if !preserve_whitespace
+                            && consumed > 0
+                            && start + consumed < end
+                            && chars[start + consumed].is_whitespace()
+                            && !matches!(chars[start + consumed - 1], ')' | '"')
+                        {
+                            consumed += 1;
+                        }
                         env.set_mv(vec![form, EgclVal::from_fixnum((start + consumed) as i64)]);
                         return Ok(form);
                     }

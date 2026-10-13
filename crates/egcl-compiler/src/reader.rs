@@ -547,8 +547,31 @@ fn apply_custom_macro_handler(
 
 // ── Circular structure label table ────────────────────────────────
 // Thread-local for read_from_string calls
+thread_local! {
+    /// Backquote nesting of the form being read: a comma is legal only while this
+    /// is positive, and each comma spends one level for its own sub-read.
+    static BACKQUOTE_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Adjusts BACKQUOTE_DEPTH for the enclosed sub-read and restores it on drop,
+/// so an error inside a backquote cannot leave the level shifted.
+struct BackquoteLevel(i64);
+
+impl BackquoteLevel {
+    fn enter(delta: i64) -> Self {
+        BACKQUOTE_DEPTH.with(|d| d.set(d.get() + delta));
+        BackquoteLevel(delta)
+    }
+}
+
+impl Drop for BackquoteLevel {
+    fn drop(&mut self) {
+        BACKQUOTE_DEPTH.with(|d| d.set(d.get() - self.0));
+    }
+}
+
 struct CircularLabels {
-    labels: HashMap<u32, EgclVal>,
+    labels: HashMap<u64, EgclVal>,
 }
 
 // The labeled (`#n=`) values live across arbitrarily many subsequent reads,
@@ -1575,6 +1598,9 @@ fn read_token_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            if val == EOF {
+                return Err(EgclError::StreamError("end of file after quote".into()));
+            }
             // intern_symbol can allocate (a fresh SymbolData + name string) and
             // fire a relocating minor GC; `val` — the just-read form, held only
             // in this Rust local — must be rooted across it or the wrapper list
@@ -1586,20 +1612,34 @@ fn read_token_with_base(
             Ok((make_list(&[quote_sym, val]), p))
         }
         '`' => {
-            let (mut val, p) = read_token_with_base(
-                chars,
-                pos + 1,
-                labels,
-                read_base,
-                read_eval,
-                read_circular,
-                depth + 1,
-            )?;
+            let (mut val, p) = {
+                let _nested = BackquoteLevel::enter(1);
+                read_token_with_base(
+                    chars,
+                    pos + 1,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                )?
+            };
+            if val == EOF {
+                return Err(EgclError::StreamError("end of file after backquote".into()));
+            }
             egcl_rt::rooted_ref!(_val_root = &mut val);
             let qq_sym = EgclVal::from_symbol_index(intern_symbol("EGCL::QUASIQUOTE"));
             Ok((make_list(&[qq_sym, val]), p))
         }
         ',' => {
+            // A comma is only meaningful inside a backquote at a matching depth
+            // (CLHS 2.4.7; syntax.comma-error.*).
+            if BACKQUOTE_DEPTH.with(|d| d.get()) == 0 {
+                return Err(EgclError::StreamError(
+                    "illegal comma: not inside a backquote".into(),
+                ));
+            }
+            let _unnested = BackquoteLevel::enter(-1);
             if chars.has(pos + 1)? && (chars.at(pos + 1)? == '@' || chars.at(pos + 1)? == '.') {
                 // `,@` splices; `,.` is the destructive-splice variant (CLHS
                 // 2.4.6) — append semantics are a conforming implementation and
@@ -1613,6 +1653,9 @@ fn read_token_with_base(
                     read_circular,
                     depth + 1,
                 )?;
+                if val == EOF {
+                    return Err(EgclError::StreamError("end of file after comma".into()));
+                }
                 egcl_rt::rooted_ref!(_val_root = &mut val);
                 let uqs_sym = EgclVal::from_symbol_index(intern_symbol("EGCL::UNQUOTE-SPLICING"));
                 Ok((make_list(&[uqs_sym, val]), p))
@@ -1626,6 +1669,9 @@ fn read_token_with_base(
                     read_circular,
                     depth + 1,
                 )?;
+                if val == EOF {
+                    return Err(EgclError::StreamError("end of file after comma".into()));
+                }
                 egcl_rt::rooted_ref!(_val_root = &mut val);
                 let uq_sym = EgclVal::from_symbol_index(intern_symbol("EGCL::UNQUOTE"));
                 Ok((make_list(&[uq_sym, val]), p))
@@ -2098,6 +2144,14 @@ fn parse_token_with_base(
     marker: Option<usize>,
     read_base: u32,
 ) -> Result<EgclVal, EgclError> {
+    // A token of nothing but unescaped dots is a dot context error (CLHS 2.3.3;
+    // syntax.dot-error.*). The consing dot of a list is recognised by the list
+    // reader before any token is collected, so it never arrives here.
+    if !has_escape && !name.is_empty() && name.bytes().all(|b| b == b'.') {
+        return Err(EgclError::StreamError(
+            "dot context error: token consists solely of dots".into(),
+        ));
+    }
     if name.is_empty() {
         if has_escape {
             // `||` — the multiple-escaped empty token IS a symbol whose name is
@@ -2345,8 +2399,8 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<EgclVal>
                     d
                 };
                 if d == 0 {
-                    return Err(EgclError::ArithmeticError(
-                        "division by zero in ratio".into(),
+                    return Err(EgclError::StreamError(
+                        "illegal ratio token: division by zero".into(),
                     ));
                 }
                 // Canonicalize: reduce to lowest terms with a POSITIVE
@@ -2481,8 +2535,8 @@ fn reduced_ratio(nv: EgclVal, dv: EgclVal) -> Result<EgclVal, EgclError> {
         ));
     };
     if d.sign == 0 {
-        return Err(EgclError::ArithmeticError(
-            "division by zero in ratio".into(),
+        return Err(EgclError::StreamError(
+            "illegal ratio token: division by zero".into(),
         ));
     }
     let g = big_gcd(&n, &d);
@@ -2725,9 +2779,10 @@ fn read_sharpsign_with_base(
         if !chars.has(pos)? {
             return Err(EgclError::StreamError("unexpected end after #n".into()));
         }
-        // A `#n…` infix argument that overflows u32 (e.g. a huge radix or label)
-        // is a reader error, not a process-crashing panic (ansi-test reader-aux).
-        let num: u32 = match chars.data()[start..pos].iter().collect::<String>().parse() {
+        // A `#n…` infix argument that overflows u64 is a reader error, not a
+        // process-crashing panic (ansi-test reader-aux). u64 rather than u32 so a
+        // label such as #123456789123456789= reads (syntax.sharp-circle.3).
+        let num: u64 = match chars.data()[start..pos].iter().collect::<String>().parse() {
             Ok(n) => n,
             Err(_) => {
                 return Err(EgclError::StreamError(
@@ -2752,7 +2807,29 @@ fn read_sharpsign_with_base(
         match chars.at(pos)?.to_ascii_uppercase() {
             'R' => {
                 pos += 1;
-                return read_radix_integer(chars, pos, num);
+                // Anything past 36 is rejected by read_radix_integer's range check.
+                return read_radix_integer(chars, pos, u32::try_from(num).unwrap_or(u32::MAX));
+            }
+            // #n* — a bit vector of length n, padded with its last bit
+            // (CLHS 2.4.8.4; syntax.sharp-asterisk.*).
+            '*' => {
+                pos += 1;
+                return read_bit_vector_sized(chars, pos, Some(num));
+            }
+            // #n(…) — a simple vector of length n, padded with its last element
+            // (CLHS 2.4.8.3; syntax.sharp-left-paren.*).
+            '(' => {
+                pos += 1;
+                return read_vector_literal_sized(
+                    chars,
+                    pos,
+                    labels,
+                    read_base,
+                    read_eval,
+                    read_circular,
+                    depth + 1,
+                    Some(num),
+                );
             }
             // #nA(nested-lists) — a rank-`num` array literal (CLHS 2.4.8.12). The
             // printer emits this for multidimensional arrays (bliss-rh0t), so the
@@ -2767,7 +2844,7 @@ fn read_sharpsign_with_base(
                     read_eval,
                     read_circular,
                     depth + 1,
-                    num,
+                    u32::try_from(num).unwrap_or(u32::MAX),
                 );
             }
             '=' => {
@@ -2862,6 +2939,9 @@ fn read_sharpsign_with_base(
                 read_circular,
                 depth + 1,
             )?;
+            if val == EOF {
+                return Err(EgclError::StreamError("end of file after #'".into()));
+            }
             // Root across intern_symbol's possible allocation — see the '
             // handler in read_token_with_base (bliss-wlf).
             egcl_rt::rooted_ref!(_val_root = &mut val);
@@ -2918,7 +2998,15 @@ fn read_sharpsign_with_base(
             let (name, end, _, _) = collect_token(chars, pos)?;
             Ok((make_uninterned_symbol(&name), end))
         }
-        'P' | 'p' => read_pathname_literal(chars, pos),
+        'P' | 'p' => read_pathname_literal(
+            chars,
+            pos,
+            labels,
+            read_base,
+            read_eval,
+            read_circular,
+            depth + 1,
+        ),
         'S' | 's' => read_struct_literal_with_base(
             chars,
             pos,
@@ -3073,12 +3161,29 @@ fn read_vector_literal(
 
 fn read_vector_literal_with_base(
     chars: &mut ReaderInput<'_>,
+    pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    read_vector_literal_sized(chars, pos, labels, read_base, read_eval, read_circular, depth, None)
+}
+
+/// `#(…)` / `#n(…)`. With a length n the elements supplied may not exceed n, at
+/// least one must be supplied when n > 0, and the last one fills the rest
+/// (CLHS 2.4.8.3).
+#[allow(clippy::too_many_arguments)]
+fn read_vector_literal_sized(
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
     labels: &mut CircularLabels,
     read_base: u32,
     read_eval: bool,
     read_circular: bool,
     depth: usize,
+    size: Option<u64>,
 ) -> Result<(EgclVal, usize), EgclError> {
     // Root the accumulated elements across the allocating element reads
     // (bliss-6b2 #2), as in read_list_with_base.
@@ -3089,6 +3194,26 @@ fn read_vector_literal_with_base(
             return Err(EgclError::StreamError("unterminated vector".into()));
         }
         if chars.at(pos)? == ')' {
+            if let Some(n) = size {
+                let n = usize::try_from(n).map_err(|_| {
+                    EgclError::StreamError("illegal #n( length: too large".into())
+                })?;
+                if elements.len() > n {
+                    return Err(EgclError::StreamError(
+                        "illegal #n(: more elements than the length allows".into(),
+                    ));
+                }
+                if elements.is_empty() && n > 0 {
+                    return Err(EgclError::StreamError(
+                        "illegal #n(: a non-zero length needs at least one element".into(),
+                    ));
+                }
+                if let Some(&last) = elements.last() {
+                    while elements.len() < n {
+                        elements.push(last);
+                    }
+                }
+            }
             return Ok((alloc_vector(&elements), pos + 1));
         }
         let (val, p) = read_token_with_base(
@@ -3168,12 +3293,40 @@ fn read_complex_literal_with_base(
 
 fn read_bit_vector(
     chars: &mut ReaderInput<'_>,
+    pos: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    read_bit_vector_sized(chars, pos, None)
+}
+
+/// `#*bits` / `#n*bits`. With a length n the bits supplied may not exceed n,
+/// at least one must be supplied when n > 0, and the last one fills the rest
+/// (CLHS 2.4.8.4).
+fn read_bit_vector_sized(
+    chars: &mut ReaderInput<'_>,
     mut pos: usize,
+    size: Option<u64>,
 ) -> Result<(EgclVal, usize), EgclError> {
     let mut bits = Vec::new();
     while chars.has(pos)? && (chars.at(pos)? == '0' || chars.at(pos)? == '1') {
         bits.push(if chars.at(pos)? == '1' { 1u8 } else { 0u8 });
         pos += 1;
+    }
+    if let Some(n) = size {
+        let n = usize::try_from(n)
+            .map_err(|_| EgclError::StreamError("illegal #n* length: too large".into()))?;
+        if bits.len() > n {
+            return Err(EgclError::StreamError(
+                "illegal #n*: more bits than the length allows".into(),
+            ));
+        }
+        if bits.is_empty() && n > 0 {
+            return Err(EgclError::StreamError(
+                "illegal #n*: a non-zero length needs at least one bit".into(),
+            ));
+        }
+        if let Some(&last) = bits.last() {
+            bits.resize(n, last);
+        }
     }
     Ok((alloc_bit_vector(&bits), pos))
 }
@@ -3666,10 +3819,18 @@ fn skip_sharpsign_once(
             // Suppressed custom dispatch — one-form approximation (bliss-r4mk).
             produced(skip_form(chars, pos + 1, depth + 1))
         }
-        other => Err(EgclError::StreamError(format!(
+        // `#<`, `#)` and `#<whitespace>` are errors even under *read-suppress*
+        // (CLHS 2.4.8.20-22); any other unknown dispatch just consumes its token
+        // (read-suppress.17: "#garbage" → NIL).
+        '<' | ')' => Err(EgclError::StreamError(format!(
+            "unknown # dispatch: {}",
+            dispatch
+        ))),
+        other if other.is_whitespace() => Err(EgclError::StreamError(format!(
             "unknown # dispatch: {}",
             other
         ))),
+        _ => produced(skip_atom(chars, pos + 1)),
     }
 }
 
@@ -3933,12 +4094,32 @@ fn eval_read_time_arithmetic(op: &str, args: EgclVal) -> Result<EgclVal, EgclErr
 fn read_pathname_literal(
     chars: &mut ReaderInput<'_>,
     pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
 ) -> Result<(EgclVal, usize), EgclError> {
-    // #P"string" — parse the string that follows
-    if !chars.has(pos)? || chars.at(pos)? != '"' {
-        return Err(EgclError::StreamError("expected string after #P".into()));
+    // #P"string": the string that follows, possibly after whitespace, or any
+    // form whose value is a string, e.g. #P#.(…) (CLHS 2.4.8.14;
+    // syntax.sharp-p.3/.5).
+    let pos = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(pos)? {
+        return Err(EgclError::StreamError("unexpected end after #P".into()));
     }
-    let (string_val, end) = read_string(chars, pos + 1)?;
+    let (string_val, end) = if chars.at(pos)? == '"' {
+        read_string(chars, pos + 1)?
+    } else {
+        let (val, end) =
+            read_token_with_base(chars, pos, labels, read_base, read_eval, read_circular, depth)?;
+        if val == EOF {
+            return Err(EgclError::StreamError("unexpected end after #P".into()));
+        }
+        if !val.is_string() {
+            return Err(EgclError::StreamError("expected string after #P".into()));
+        }
+        (val, end)
+    };
     Ok((construct_pathname(string_val), end))
 }
 
