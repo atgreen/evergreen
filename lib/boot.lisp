@@ -3911,16 +3911,20 @@
 ;;; Retain the native operations as least-specific methods. Libraries such as
 ;;; Flexi Streams extend these CL functions and call them on an underlying
 ;;; native stream; adding a wrapper method must not discard native support.
+(defun egcl::%check-stream (object)
+  (unless (streamp object)
+    (error 'type-error :datum object :expected-type 'stream))
+  object)
 (defmethod open-stream-p ((stream t))
-  (egcl::%native-open-stream-p stream))
+  (egcl::%native-open-stream-p (egcl::%check-stream stream)))
 (defmethod open-stream-p ((stream fundamental-stream))
   (slot-value stream 'egcl::%gray-open-p))
 (defmethod input-stream-p ((stream t))
-  (egcl::%native-input-stream-p stream))
+  (egcl::%native-input-stream-p (egcl::%check-stream stream)))
 (defmethod input-stream-p ((stream fundamental-stream)) nil)
 (defmethod input-stream-p ((stream fundamental-input-stream)) t)
 (defmethod output-stream-p ((stream t))
-  (egcl::%native-output-stream-p stream))
+  (egcl::%native-output-stream-p (egcl::%check-stream stream)))
 (defmethod output-stream-p ((stream fundamental-stream)) nil)
 (defmethod output-stream-p ((stream fundamental-output-stream)) t)
 (defmethod stream-element-type ((stream t))

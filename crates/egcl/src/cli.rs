@@ -788,8 +788,12 @@ fn is_stream(val: EgclVal) -> bool {
 /// Resolve an output stream designator: `T` and `NIL` both denote the current
 /// `*standard-output*`; any other value is taken to be a stream object.
 fn resolve_output_stream(designator: EgclVal, env: &Env) -> EgclVal {
-    if designator == T || designator.is_nil() {
+    // An output stream designator: NIL is *STANDARD-OUTPUT*, T is
+    // *TERMINAL-IO* (CLHS 21.1; ansi streams terpri.4, write-string.11).
+    if designator.is_nil() {
         env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(NIL)
+    } else if designator == T {
+        env.lookup_var("*TERMINAL-IO*").unwrap_or(NIL)
     } else {
         designator
     }
@@ -4881,7 +4885,7 @@ fn egcl_error_to_condition(
             // Build allocating siblings before copying either value into the
             // initarg array: rooting the error does not repair an earlier copy.
             egcl_rt::rooted!(datum = *datum);
-            egcl_rt::rooted!(expected = arena_str(expected));
+            egcl_rt::rooted!(expected = expected_type_value(expected));
             let datum_key = resolve_sym("DATUM").unwrap_or(NIL);
             let expected_key = resolve_sym("EXPECTED-TYPE").unwrap_or(NIL);
             build_condition_instance(
@@ -13860,8 +13864,70 @@ fn coerce_to_pathname(v: EgclVal) -> Result<EgclVal, EgclError> {
 /// the OS working directory, so the ansi-test harness's `*sandbox-path*`
 /// (`(truename #p"sandbox/")`) came back NIL and bound
 /// `*default-pathname-defaults*` to NIL for the whole run.
+/// A string (simple or not) or a pathname: something a file operation merges
+/// against *DEFAULT-PATHNAME-DEFAULTS*.
+fn is_path_designator(v: EgclVal) -> bool {
+    is_string_value(v) || egcl_stdlib::is_pathname(v)
+}
+
+/// A fill-pointer or displaced string as a simple string, so the pathname
+/// layer (which reads simple strings) accepts it (ansi files *.6/*.7
+/// DO-SPECIAL-STRINGS); anything else unchanged.
+fn simple_path_string(v: EgclVal) -> EgclVal {
+    if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
+        arena_str(&val_as_str(v))
+    } else {
+        v
+    }
+}
+
+/// STREAM designators resolve to streams; anything else is a TYPE-ERROR
+/// (ansi streams *.error.3 over *mini-universe*).
+fn require_stream(v: EgclVal) -> Result<(), EgclError> {
+    if egcl_rt::types::streamp(v) || is_gray_stream(v) {
+        Ok(())
+    } else {
+        Err(EgclError::TypeError {
+            datum: v,
+            expected: "STREAM".into(),
+        })
+    }
+}
+
+/// A pathname component as Lisp sees it: the stdlib's internal wild sentinel
+/// becomes the real `:WILD` keyword (ansi pathname-name.*, directory.*).
+fn lisp_pathname_component(component: EgclVal) -> EgclVal {
+    if egcl_stdlib::pathnames::is_wild_sentinel(component) {
+        resolve_sym(":WILD").unwrap_or(component)
+    } else {
+        component
+    }
+}
+
+/// The EXPECTED-TYPE slot of a TYPE-ERROR built from a Rust `TypeError`: when
+/// the description reads as one type specifier (`STREAM`, `(UNSIGNED-BYTE 8)`),
+/// that specifier, so `(typep datum (type-error-expected-type c))` works (ansi
+/// file-length.error.3 and friends); a prose description stays a string.
+fn expected_type_value(expected: &str) -> EgclVal {
+    let trimmed = expected.trim();
+    let looks_like_spec = !trimmed.is_empty()
+        && (trimmed.starts_with('(')
+            || trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-*&%".contains(c)));
+    if looks_like_spec {
+        if let Ok((val, consumed)) = reader::read_from_string(trimmed) {
+            if consumed >= trimmed.len() && (val.is_symbol() || val.is_cons()) {
+                return val;
+            }
+        }
+    }
+    arena_str(expected)
+}
+
 fn resolve_against_dpd(v: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    let mut pn = coerce_to_pathname(v)?;
+    egcl_rt::rooted!(v = simple_path_string(v));
+    let mut pn = coerce_to_pathname(*v)?;
     egcl_rt::rooted_ref!(_pn = &mut pn);
     if let Some(d) = env.lookup_var("*DEFAULT-PATHNAME-DEFAULTS*") {
         if !d.is_nil() && egcl_stdlib::is_pathname(d) {
@@ -17019,6 +17085,10 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "WRITE-SEQUENCE" | "READ-SEQUENCE" => Some((2, 66)),
         "MAKE-STRING-INPUT-STREAM" => Some((1, 3)),
         "MAKE-STRING-OUTPUT-STREAM" => Some((0, 64)),
+        "GET-OUTPUT-STREAM-STRING" | "PROBE-FILE" | "TRUENAME" | "DELETE-FILE"
+        | "FILE-WRITE-DATE" => Some((1, 1)),
+        "RENAME-FILE" => Some((2, 2)),
+        "ENSURE-DIRECTORIES-EXIST" => Some((1, 3)),
         "CLOSE" => Some((1, 3)),
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
@@ -17923,6 +17993,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     eval_form(args[0], env)?
                 };
                 let out = resolve_output_stream(stream, env);
+                require_stream(out)?;
                 check_pending_sigpipe_for_output()?;
                 if is_gray_stream(out) {
                     let gf = match name.as_str() {
@@ -22025,7 +22096,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (pathname_form, _) = cp(cdr);
                 egcl_rt::rooted!(pathname = eval_form(pathname_form, env)?);
                 // Relative to *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), as OPEN.
-                if pathname.is_string() || egcl_stdlib::is_pathname(*pathname) {
+                if is_path_designator(*pathname) {
                     *pathname = resolve_against_dpd(*pathname, env)?;
                 }
                 return Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL));
@@ -22035,7 +22106,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // (delete-file pathspec) — delete the file, returning T.
                 let (path_form, _) = cp(cdr);
                 egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
-                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                if is_path_designator(*pathspec) {
                     *pathspec = resolve_against_dpd(*pathspec, env)?;
                 }
                 egcl_stdlib::delete_file(*pathspec)?;
@@ -22049,8 +22120,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // Root across the second eval (moving GC; bliss-4bp).
                 egcl_rt::rooted!(to_form = to_form);
                 egcl_rt::rooted!(from = eval_form(from_form, env)?);
-                let to = eval_form(*to_form, env)?;
-                let (defaulted, old_true, new_true) = egcl_stdlib::rename_file(*from, to)?;
+                egcl_rt::rooted!(to = eval_form(*to_form, env)?);
+                // Both names are relative to *DEFAULT-PATHNAME-DEFAULTS*
+                // (ansi files rename-file.*).
+                if is_path_designator(*from) {
+                    *from = resolve_against_dpd(*from, env)?;
+                }
+                if is_path_designator(*to) {
+                    *to = resolve_against_dpd(*to, env)?;
+                }
+                let (defaulted, old_true, new_true) = egcl_stdlib::rename_file(*from, *to)?;
                 env.set_mv(vec![defaulted, old_true, new_true]);
                 return Ok(defaulted);
             }
@@ -22060,7 +22139,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // staleness checks (bliss-lb6.14).
                 let (path_form, _) = cp(cdr);
                 egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
-                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                if is_path_designator(*pathspec) {
                     *pathspec = resolve_against_dpd(*pathspec, env)?;
                 }
                 let path = path_designator_to_string(*pathspec)?;
@@ -22197,6 +22276,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // DELETE-ALL-VERSIONS relies on (directory "tmp.dat") finding
                 // the sandbox file.
                 *pathname = resolve_against_dpd(*pathname, env)?;
+                // A logical pathname lists the files its translation names
+                // (ansi files directory.8/.9: (directory "CLTEST:*.*")).
+                if let Some(physical) = egcl_stdlib::translated_physical(*pathname)? {
+                    *pathname = physical;
+                }
                 let entries = egcl_stdlib::directory(*pathname)?;
                 return Ok(vec_to_list(&entries));
             }
@@ -24179,6 +24263,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Err(EgclError::Internal("FILE-LENGTH requires a stream".into()));
                 }
                 let stream = eval_form(args[0], env)?;
+                require_stream(stream)?;
                 return egcl_stdlib::file_length_fn(stream);
             }
             "FILE-POSITION" => {
@@ -36837,7 +36922,7 @@ fn apply_builtin_fast(
             Some(
                 pathname_accessor_arg("PATHNAME-NAME", args)
                     .and_then(coerce_pathname_designator)
-                    .map(egcl_stdlib::pathname_name),
+                    .map(|p| lisp_pathname_component(egcl_stdlib::pathname_name(p))),
             )
         }
         "PATHNAME-TYPE" if args.len() == 1 => {
@@ -36845,7 +36930,7 @@ fn apply_builtin_fast(
             Some(
                 pathname_accessor_arg("PATHNAME-TYPE", args)
                     .and_then(coerce_pathname_designator)
-                    .map(egcl_stdlib::pathname_type),
+                    .map(|p| lisp_pathname_component(egcl_stdlib::pathname_type(p))),
             )
         }
         // The rest of the measured hot set. A per-name count of detour calls
@@ -38638,6 +38723,11 @@ fn binary_element_type_code(spec: EgclVal) -> Option<i64> {
 }
 
 fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, EgclError> {
+    check_keyword_args(
+        "OPEN",
+        pairs,
+        &["DIRECTION", "ELEMENT-TYPE", "IF-EXISTS", "IF-DOES-NOT-EXIST", "EXTERNAL-FORMAT"],
+    )?;
     let mut direction = egcl_stdlib::StreamDirection::Input;
     let mut element_type = T;
     let mut if_exists = T;
@@ -39160,6 +39250,8 @@ fn val_as_str(val: EgclVal) -> String {
 /// rather than the namestring, so callers that take file paths (LOAD, etc.) must
 /// resolve pathnames through `namestring` first. bliss-lb6.
 fn path_designator_to_string(v: EgclVal) -> Result<String, EgclError> {
+    egcl_rt::rooted!(v = simple_path_string(v));
+    let v = *v;
     // A logical pathname (or logical namestring) reaches the filesystem only
     // through its host's translations (ANSI 19.3.1).
     if let Some(physical) = egcl_stdlib::translated_physical(v)? {

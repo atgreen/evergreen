@@ -566,7 +566,20 @@ impl StreamMutableState {
             StreamInner::Concatenated { .. } => StreamDirection::Input,
             StreamInner::TwoWay => StreamDirection::Io,
             StreamInner::Echo => StreamDirection::Io,
-            StreamInner::Synonym => StreamDirection::Io,
+            // A synonym stream has the direction of the stream its symbol
+            // currently names (ansi make-synonym-stream.1/.3).
+            StreamInner::Synonym => match resolve_synonym(self.components()[0]) {
+                Ok(target) => {
+                    let input = crate::streams::input_stream_p(target);
+                    let output = crate::streams::output_stream_p(target);
+                    match (input, output) {
+                        (true, false) => StreamDirection::Input,
+                        (false, true) => StreamDirection::Output,
+                        _ => StreamDirection::Io,
+                    }
+                }
+                Err(_) => StreamDirection::Io,
+            },
             StreamInner::Stdin { .. } => StreamDirection::Input,
             StreamInner::Stdout { .. } => StreamDirection::Output,
             StreamInner::Stderr { .. } => StreamDirection::Output,
@@ -1742,6 +1755,11 @@ impl GrayStream for StreamMutableState {
 
     fn stream_fresh_line(&mut self) -> Result<bool, EgclError> {
         self.check_output()?;
+        // Nothing has been written to a broadcast stream with no components,
+        // so FRESH-LINE has nothing to do (ansi make-broadcast-stream.4).
+        if matches!(self.inner, StreamInner::Broadcast) && self.components().is_empty() {
+            return Ok(false);
+        }
         if !self.stream_start_line_p() {
             self.stream_terpri()?;
             Ok(true)
@@ -2803,7 +2821,24 @@ pub fn is_byte_stream(stream: EgclVal) -> bool {
 /// over it transfers elements with READ-BYTE / WRITE-BYTE rather than
 /// characters.
 pub fn is_binary_stream(stream: EgclVal) -> bool {
-    with_stream(stream, |guard| Ok(guard.element_type.is_binary())).unwrap_or(false)
+    // A composite stream is binary when the component it reads from or writes
+    // to is (ansi make-two-way-stream.12, make-concatenated-stream.22).
+    let (binary, delegate) = with_stream(stream, |guard| {
+        let comps = guard.components();
+        Ok((
+            guard.element_type.is_binary(),
+            match &guard.inner {
+                StreamInner::TwoWay | StreamInner::Echo => comps.first().copied(),
+                StreamInner::Concatenated { cursor } => {
+                    comps.get(*cursor).copied().or_else(|| comps.first().copied())
+                }
+                StreamInner::Synonym => resolve_synonym(comps[0]).ok(),
+                _ => None,
+            },
+        ))
+    })
+    .unwrap_or((false, None));
+    binary || delegate.is_some_and(is_binary_stream)
 }
 
 pub fn stream_write_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {

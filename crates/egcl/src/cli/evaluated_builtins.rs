@@ -185,6 +185,15 @@ fn resolve(name: &str) -> Option<Handler> {
             // shared structure with #n= labels instead of looping on a circular
             // list, and :pretty/:length/:level/... reach the printer
             // (ansi printer print.cons.5-7).
+            check_keyword_args(
+                "WRITE",
+                &args[1..],
+                &[
+                    "STREAM", "ESCAPE", "ARRAY", "BASE", "CASE", "CIRCLE", "GENSYM", "LENGTH",
+                    "LEVEL", "LINES", "MISER-WIDTH", "PPRINT-DISPATCH", "PRETTY", "RADIX",
+                    "READABLY", "RIGHT-MARGIN",
+                ],
+            )?;
             let mut bindings: Vec<DynBind> = Vec::new();
             let mut i = 1;
             while i + 1 < args.len() {
@@ -333,6 +342,14 @@ fn resolve(name: &str) -> Option<Handler> {
             // each write out to all component streams. eval_args keeps the
             // component streams rooted across the allocating constructor.
 
+            for &component in args.iter() {
+                if !egcl_stdlib::output_stream_p(component) {
+                    return Err(EgclError::TypeError {
+                        datum: component,
+                        expected: "STREAM".into(),
+                    });
+                }
+            }
             egcl_stdlib::make_broadcast_stream(&args)
         }),
 
@@ -342,6 +359,14 @@ fn resolve(name: &str) -> Option<Handler> {
             // (make-concatenated-stream &rest streams) → input stream that
             // reads successively from each component.
 
+            for &component in args.iter() {
+                if !egcl_stdlib::input_stream_p(component) {
+                    return Err(EgclError::TypeError {
+                        datum: component,
+                        expected: "STREAM".into(),
+                    });
+                }
+            }
             egcl_stdlib::make_concatenated_stream(&args)
         }),
 
@@ -1157,6 +1182,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::Internal("READ-BYTE requires a stream".into()));
             }
             let inp = resolve_input_stream(args[0], env);
+            require_stream(inp)?;
             let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
             let gray = is_gray_stream(inp);
             let b = if gray {
@@ -2638,7 +2664,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // probed through the merged pathname were two different files
             // (ansi pathnames enough-namestring.4, file-namestring.3, ...).
             egcl_rt::rooted!(
-                path_val = if path_val.is_string() || egcl_stdlib::is_pathname(path_val) {
+                path_val = if is_path_designator(path_val) {
                     resolve_against_dpd(path_val, env)?
                 } else {
                     path_val
@@ -2783,7 +2809,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-NAME", &args)?)?;
-            Ok(egcl_stdlib::pathname_name(pathname))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_name(pathname)))
         }),
 
         "PATHNAME-TYPE" => Some(|_operator, args, _env| {
@@ -2791,7 +2817,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-TYPE", &args)?)?;
-            Ok(egcl_stdlib::pathname_type(pathname))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_type(pathname)))
         }),
 
         "PATHNAME-DIRECTORY" => Some(|_operator, args, _env| {
@@ -4638,13 +4664,13 @@ fn check_two_way_components(input: EgclVal, output: EgclVal) -> Result<(), EgclE
     if !egcl_stdlib::input_stream_p(input) {
         return Err(EgclError::TypeError {
             datum: input,
-            expected: "input stream".into(),
+            expected: "STREAM".into(),
         });
     }
     if !egcl_stdlib::output_stream_p(output) {
         return Err(EgclError::TypeError {
             datum: output,
-            expected: "output stream".into(),
+            expected: "STREAM".into(),
         });
     }
     Ok(())

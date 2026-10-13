@@ -82,8 +82,10 @@
 (setq *default-pathname-defaults*
       (truename (merge-pathnames "sandbox/" cl-user::*ansi-test-dir*)))
 ;; The streams tests write "scratch/foo.txt" under the sandbox and expect the
-;; directory (which the suite's makefile provisions) to be there.
-(ensure-directories-exist (merge-pathnames "scratch/" *default-pathname-defaults*))
+;; directory (which the suite's makefile provisions) to be there, while the
+;; files chapter (ensure-directories-exist.8) expects to create it itself.
+(unless (string= cl-user::*ansi-chapter* "files")
+  (ensure-directories-exist (merge-pathnames "scratch/" *default-pathname-defaults*)))
 (do-tests)
 (format t "~%passed: ~A~%" (length regression-test::*passed-tests*))
 (format t "failed: ~A~%" (length regression-test::*failed-tests*))
