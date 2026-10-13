@@ -1,0 +1,315 @@
+{
+  "time_utc": "2026-10-13T14:21:32.168444+00:00",
+  "affinity": [
+    0
+  ],
+  "source_revision": "674838c717b8e38ba3da32a79eb272f5bc5401de",
+  "source_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "binaries": {
+    "before": {
+      "path": "/home/green/git/evergreen/target/x86_64-unknown-linux-musl/release/egcl",
+      "sha256": "bba992fb6d3ba0d55e1e39b070e62fb065b7a77bf3e09d214f78ecc8d33105aa"
+    },
+    "after": {
+      "path": "/home/green/git/evergreen/target/hotspot-build/x86_64-unknown-linux-musl/release/egcl",
+      "sha256": "c406ec3270136cb4b14e3c6ec757aea30cde69237f9bceafa5c6fd320d973932"
+    }
+  },
+  "trials": [
+    {
+      "side": "before",
+      "command": [
+        "/home/green/git/evergreen/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-hotspot-fibonacci/capture.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 189,
+          "units_per_second": 1000,
+          "seconds": 0.189,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 199,
+          "units_per_second": 1000,
+          "seconds": 0.199,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 190,
+          "units_per_second": 1000,
+          "seconds": 0.19,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 190,
+          "units_per_second": 1000,
+          "seconds": 0.19,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 192,
+          "units_per_second": 1000,
+          "seconds": 0.192,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 205,
+          "units_per_second": 1000,
+          "seconds": 0.205,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 192,
+          "units_per_second": 1000,
+          "seconds": 0.192,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "1d07814f0399e81aac5c45bcb223a8e81bbdb35a41b40658426ac8369df67b10",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        490,
+        1022
+      ],
+      "code_base": 140139290931200
+    },
+    {
+      "side": "after",
+      "command": [
+        "/home/green/git/evergreen/target/hotspot-build/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-hotspot-fibonacci/capture.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 108,
+          "units_per_second": 1000,
+          "seconds": 0.108,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 108,
+          "units_per_second": 1000,
+          "seconds": 0.108,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "c16e781b01847293f6382980d6d398ef80a98f6575cd25d9f9d31c3191890083",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        315,
+        660
+      ],
+      "code_base": 140351166894080
+    },
+    {
+      "side": "after",
+      "command": [
+        "/home/green/git/evergreen/target/hotspot-build/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-hotspot-fibonacci/capture.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 108,
+          "units_per_second": 1000,
+          "seconds": 0.108,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 106,
+          "units_per_second": 1000,
+          "seconds": 0.106,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 106,
+          "units_per_second": 1000,
+          "seconds": 0.106,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 107,
+          "units_per_second": 1000,
+          "seconds": 0.107,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "12c2f96d89ab7ea4bbbbbfe98ab9ef2d3ed09193c51f67262b7dfd41308cb5c3",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        315,
+        660
+      ],
+      "code_base": 140404696363008
+    },
+    {
+      "side": "before",
+      "command": [
+        "/home/green/git/evergreen/target/x86_64-unknown-linux-musl/release/egcl",
+        "--no-init",
+        "--load",
+        "/tmp/egcl-hotspot-fibonacci/capture.lisp"
+      ],
+      "samples": [
+        {
+          "index": 0,
+          "ticks": 197,
+          "units_per_second": 1000,
+          "seconds": 0.197,
+          "checksum": 9227465
+        },
+        {
+          "index": 1,
+          "ticks": 191,
+          "units_per_second": 1000,
+          "seconds": 0.191,
+          "checksum": 9227465
+        },
+        {
+          "index": 2,
+          "ticks": 193,
+          "units_per_second": 1000,
+          "seconds": 0.193,
+          "checksum": 9227465
+        },
+        {
+          "index": 3,
+          "ticks": 189,
+          "units_per_second": 1000,
+          "seconds": 0.189,
+          "checksum": 9227465
+        },
+        {
+          "index": 4,
+          "ticks": 187,
+          "units_per_second": 1000,
+          "seconds": 0.187,
+          "checksum": 9227465
+        },
+        {
+          "index": 5,
+          "ticks": 187,
+          "units_per_second": 1000,
+          "seconds": 0.187,
+          "checksum": 9227465
+        },
+        {
+          "index": 6,
+          "ticks": 184,
+          "units_per_second": 1000,
+          "seconds": 0.184,
+          "checksum": 9227465
+        }
+      ],
+      "listing_sha256": "9943694728d6c48d99988931c182e9e4b77cbce20b8d7040bb5018f9ff9eca03",
+      "self_call_count": 2,
+      "self_call_target_offset": 62,
+      "self_call_offsets": [
+        490,
+        1022
+      ],
+      "code_base": 140348405215232
+    }
+  ],
+  "before_revision": "54d1f6c1168b9b7831a15da8c838b1e21f78dc2f",
+  "build_profile": "release, default x86_64-unknown-linux-musl target; thin LTO, codegen-units=1; rustc 1.94.1",
+  "before_median_seconds": 0.1905,
+  "after_median_seconds": 0.107,
+  "speedup": 1.780373831775701,
+  "admission": {
+    "before": {
+      "instructions": 41,
+      "conditional_branches": 14,
+      "bytes": 234
+    },
+    "after": {
+      "instructions": 12,
+      "conditional_branches": 4,
+      "bytes": 65
+    },
+    "remaining_checks": "One execution-local poll plus three physical-stack arithmetic/bounds branches. No MV admission guard is needed in these proven-empty sites."
+  },
+  "code_bytes": {
+    "before": 2685,
+    "after": 2311
+  },
+  "frame_bytes": 136
+}
