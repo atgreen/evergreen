@@ -1359,6 +1359,9 @@ fn disasm_header(sym: u32, bf: &BytecodeFunction) -> String {
             let name = match ty {
                 DeclaredType::Any => return None,
                 DeclaredType::Fixnum => "FIXNUM",
+                DeclaredType::FixnumRange { lower, upper } => {
+                    return Some(format!("{parameter}: (INTEGER {lower} {upper})"));
+                }
                 DeclaredType::SingleFloat => "SINGLE-FLOAT",
             };
             Some(format!("{parameter}: {name}"))
@@ -8280,21 +8283,33 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
 }
 
 fn primitive_declared_type(type_form: EgclVal) -> Option<DeclaredType> {
-    if !type_form.is_symbol() {
+    if type_form.is_symbol() {
+        return match sym_bare_name_rc(type_form).as_ref() {
+            "FIXNUM" => Some(DeclaredType::Fixnum),
+            "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
+            _ => None,
+        };
+    }
+
+    let parts = list_to_vec(type_form);
+    let [head, lower, upper] = parts.as_slice() else {
+        return None;
+    };
+    if !head.is_symbol() || sym_bare_name_rc(*head).as_ref() != "INTEGER" {
         return None;
     }
-    match sym_bare_name_rc(type_form).as_ref() {
-        "FIXNUM" => Some(DeclaredType::Fixnum),
-        "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
-        _ => None,
+    if !lower.is_fixnum() || !upper.is_fixnum() {
+        return None;
     }
+    let (lower, upper) = (lower.as_fixnum(), upper.as_fixnum());
+    (lower <= upper).then_some(DeclaredType::FixnumRange { lower, upper })
 }
 
-/// Retain primitive parameter assertions from the declaration prefix of a
+/// Retain supported parameter assertions from the declaration prefix of a
 /// function body. Both `(type fixnum x)` and the standard shorthand
-/// `(fixnum x)` are accepted. Unknown declaration/type specifiers remain
-/// runtime no-ops for now and therefore contribute `Any`, never an unsound
-/// compiler assumption.
+/// `(fixnum x)` are accepted, alongside closed literal fixnum `INTEGER`
+/// ranges. Unknown declaration/type specifiers remain runtime no-ops for now
+/// and therefore contribute `Any`, never an unsound compiler assumption.
 /// Collect the bare names declared `(declare (special …))` in a body's leading
 /// declarations. The bytecode compiler does not yet bind/reference a
 /// non-earmuffed special variable dynamically — it would bind it lexically, so a
@@ -8996,7 +9011,9 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0200: callable-preserving source lowering. Version-1 units may have erased
 // LDB/BYTE, TYPEP, accessor, or memory-fence bindings. Their original callees
 // cannot be reconstructed, so a new major rejects them before installation.
-const BBU_BYTECODE_VERSION: u16 = 0x0200;
+// 0x0201: function metadata gains a tag-3 literal fixnum range, followed by
+// its two i64 endpoints. Older readers must reject the changed record layout.
+const BBU_BYTECODE_VERSION: u16 = 0x0201;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -10050,8 +10067,13 @@ fn serialize_bbu_function_metadata(functions: &[BbuFunction]) -> Vec<u8> {
                     DeclaredType::Any => 0,
                     DeclaredType::Fixnum => 1,
                     DeclaredType::SingleFloat => 2,
+                    DeclaredType::FixnumRange { .. } => 3,
                 },
             );
+            if let DeclaredType::FixnumRange { lower, upper } = declared_type {
+                put_i64(&mut out, lower);
+                put_i64(&mut out, upper);
+            }
         }
     }
     out
@@ -11588,6 +11610,14 @@ fn parse_bbu_function_metadata(
                 0 => DeclaredType::Any,
                 1 => DeclaredType::Fixnum,
                 2 => DeclaredType::SingleFloat,
+                3 => {
+                    let lower = cursor.i64()?;
+                    let upper = cursor.i64()?;
+                    if lower > upper {
+                        return Err(bbu_error("invalid declared fixnum range"));
+                    }
+                    DeclaredType::FixnumRange { lower, upper }
+                }
                 _ => return Err(bbu_error("invalid declared parameter type")),
             };
             params.push((name_ref, location, declared_type));
@@ -14630,17 +14660,23 @@ fn validate_declared_args(func: &BytecodeFunction, args: &[EgclVal]) -> Result<(
         let matches = match ty {
             DeclaredType::Any => true,
             DeclaredType::Fixnum => value.is_fixnum(),
+            DeclaredType::FixnumRange { lower, upper } => {
+                value.is_fixnum() && (lower..=upper).contains(&value.as_fixnum())
+            }
             DeclaredType::SingleFloat => value.is_single_float(),
         };
         if !matches {
             let expected = match ty {
                 DeclaredType::Any => unreachable!(),
-                DeclaredType::Fixnum => "FIXNUM",
-                DeclaredType::SingleFloat => "SINGLE-FLOAT",
+                DeclaredType::Fixnum => "FIXNUM".to_string(),
+                DeclaredType::FixnumRange { lower, upper } => {
+                    format!("(INTEGER {lower} {upper})")
+                }
+                DeclaredType::SingleFloat => "SINGLE-FLOAT".to_string(),
             };
             return Err(EgclError::TypeError {
                 datum: value,
-                expected: expected.to_string(),
+                expected,
             });
         }
     }

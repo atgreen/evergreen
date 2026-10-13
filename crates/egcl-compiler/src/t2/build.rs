@@ -1441,6 +1441,7 @@ impl<'a> Builder<'a> {
             let ty = match declared {
                 DeclaredType::Any => IRType::TOP,
                 DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
+                DeclaredType::FixnumRange { .. } => IRType::of(TypeBits::FIXNUM),
                 DeclaredType::SingleFloat => IRType::of(TypeBits::SINGLE_FLOAT),
             };
             let p = self

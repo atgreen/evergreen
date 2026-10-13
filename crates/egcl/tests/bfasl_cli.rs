@@ -264,7 +264,7 @@ fn memory_fence_call_persists_without_source_fallback() {
         "must not embed legacy source"
     );
     let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
-    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0200);
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0201);
     let start = bbu_action_start(bbu);
     let (_, _, count) = bbu_counts(&bytes);
     for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
@@ -3508,7 +3508,7 @@ fn variadic_lambda_lists_and_declared_types_survive_bbu_round_trip() {
     fs::write(
         &src,
         "(defun bbu-variadic (a &optional (b 2) &rest tail) (list a b tail))
-         (defun bbu-typed (x) (declare (fixnum x)) (+ x 1))
+         (defun bbu-typed (x) (declare (type (integer 0 40) x)) (+ x 1))
          (defmacro bbu-listing (&body forms) (cons 'list forms))\n",
     )
     .unwrap();
@@ -3529,6 +3529,8 @@ fn variadic_lambda_lists_and_declared_types_survive_bbu_round_trip() {
                 (list (bbu-variadic 1)
                       (bbu-variadic 1 3 4 5)
                       (bbu-typed 8)
+                      (handler-case (bbu-typed -1) (type-error () :lower))
+                      (handler-case (bbu-typed 41) (type-error () :upper))
                       (handler-case (bbu-typed \"bad\") (type-error () :typed))
                       (bbu-listing 6 7)))",
         out.display()
@@ -3541,7 +3543,7 @@ fn variadic_lambda_lists_and_declared_types_survive_bbu_round_trip() {
     );
     assert_eq!(
         String::from_utf8_lossy(&loaded.stdout).trim(),
-        "((1 2 NIL) (1 3 (4 5)) 9 :TYPED (6 7))"
+        "((1 2 NIL) (1 3 (4 5)) 9 :LOWER :UPPER :TYPED (6 7))"
     );
 
     let _ = fs::remove_dir_all(&dir);
@@ -3599,7 +3601,7 @@ fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
     );
     let bytes = fs::read(&good).unwrap();
     let image = egcl_rt::bfasl::load(&bytes).unwrap();
-    for version in [0x0100u16, 0x010e, 0x010f, 0x0201, 0x0300] {
+    for version in [0x0100u16, 0x010e, 0x010f, 0x0202, 0x0300] {
         let bad = dir.join(format!("version-{version:04x}.bfasl"));
         let mut builder = egcl_rt::bfasl::BfaslBuilder::new();
         for (kind, section) in image.sections() {

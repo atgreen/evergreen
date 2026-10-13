@@ -1507,6 +1507,35 @@ fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
 }
 
 #[test]
+fn declared_bounded_integer_parameter_is_checked_and_proven_as_fixnum() {
+    let program = "\
+        (defun declared-bounded-mul5 (x) \
+          (declare (type (integer 0 40) x) (optimize (speed 3) (safety 1))) \
+          (* x 5)) \
+        (dotimes (k 60) (declared-bounded-mul5 k)) \
+        (format t \"~a~%\" (declared-bounded-mul5 9)) \
+        (disassemble (quote declared-bounded-mul5)) \
+        (dolist (bad '(-1 41 1.5)) \
+          (format t \"~a~%\" \
+            (handler-case \
+              (progn (declared-bounded-mul5 bad) (quote missed-type-error)) \
+              (type-error () (quote type-error)))))";
+
+    let (out, ok) = run(program, &[("EGCL_T2", "1")]);
+    assert!(ok, "declared bounded T2 function failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "45");
+    assert!(
+        out.contains("checked parameter declarations: X:"),
+        "bounded declaration must reach the native entry: {out}"
+    );
+    assert_eq!(
+        out.lines().filter(|line| *line == "TYPE-ERROR").count(),
+        3,
+        "the lower bound, upper bound, and non-fixnum input must be rejected: {out}"
+    );
+}
+
+#[test]
 fn declared_parameter_validation_is_shared_by_t0_and_t1() {
     let program = "\
         (defun declared-entry (x) (declare (type fixnum x)) x) \
