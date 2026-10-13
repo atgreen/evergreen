@@ -12,7 +12,7 @@ use egcl_rt::bytecode::{BytecodeFunction, Instr};
 use egcl_rt::exec_context::{ExecutionKind, LispExecutionContext};
 use egcl_rt::value::{EgclVal, NIL};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 thread_local! {
     static CONTROL: Cell<*mut NativePollControl> = const { Cell::new(std::ptr::null_mut()) };
@@ -35,6 +35,7 @@ extern "C" fn poll(_: *mut u64) -> u64 {
 #[test]
 fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     let execution = LispExecutionContext::new(ExecutionKind::NativeThread, 1, 1);
+    assert!(execution.begin_poll(), "new execution must enter through a poll");
     let observer = Cell::new(0usize);
     let skips = Cell::new(0usize);
     let mut control = NativePollControl {
@@ -139,6 +140,11 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
                 egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(_)
             ))
     );
+    for address in [fast.gc_requested, fast.sigusr1_pending, fast.posted_signal,
+        fast.native_errors, fast.signal_epoch] {
+        assert!(!framed.code.windows(8).any(|bytes| bytes == address.to_le_bytes()),
+            "generated poll must observe execution-local work, not a process-global source");
+    }
     let buffer = egcl_rt::jit::JitBuffer::new(&framed.code).unwrap();
     let run: extern "C" fn(*mut u64) -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
     egcl_rt::rooted!(
@@ -155,30 +161,23 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     control.test_skips = std::ptr::null_mut();
     check(true);
     control.test_skips = skips.as_ptr();
-    gc.store(true, Ordering::SeqCst);
+    // Other executions' work does not force this execution into the runtime.
+    let other = LispExecutionContext::new(ExecutionKind::NativeThread, 2, 2);
+    assert!(other.poll_pending());
+    check(false);
+    execution.request_poll();
     check(true);
-    gc.store(false, Ordering::SeqCst);
-    sigusr1.store(true, Ordering::Relaxed);
-    check(true);
-    sigusr1.store(false, Ordering::Relaxed);
-    posted.store(1, Ordering::Relaxed);
-    check(true);
-    posted.store(0, Ordering::Relaxed);
-    errors.store(1, Ordering::Relaxed);
-    check(true);
-    errors.store(0, Ordering::Relaxed);
-    epoch.store(1, Ordering::Release);
-    check(true);
-    epoch.store(0, Ordering::Release);
+    assert!(execution.begin_poll());
+    check(false);
+    assert!(other.poll_pending(), "draining this execution cannot acknowledge another");
     execution.request_yield();
     check(true);
     execution.take_yield_request();
+    execution.begin_poll();
     execution.set_carrier_id(2);
     check(true);
-    execution.set_carrier_id(1);
-    control.deadline_armed = 1;
-    check(true);
-    control.deadline_armed = 0;
+    execution.begin_poll();
+    check(false);
     observer.set(1);
     check(true);
     observer.set(0);
@@ -195,7 +194,7 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     egcl_rt::rooted!(expected = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
     activation[0] = *expected;
     let old = expected.to_raw();
-    gc.store(true, Ordering::SeqCst);
+    execution.request_poll();
     COLLECT.with(|slot| slot.set(true));
     let result = run(activation.as_mut_ptr().cast());
     COLLECT.with(|slot| slot.set(false));

@@ -177,6 +177,8 @@ fn emit() -> FramedCode {
 fn execute(code: &FramedCode, argument: u64, nargs: u64) -> [u64; 11] {
     let buffer = JitBuffer::new(&code.code).unwrap();
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 1;
     let active = AtomicBool::new(false);
     let mut control = NativeRecursiveControl {

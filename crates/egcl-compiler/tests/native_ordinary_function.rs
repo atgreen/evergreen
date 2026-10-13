@@ -136,8 +136,8 @@ fn recursive_admission_tests_flags_without_register_round_trips() {
 }
 
 #[test]
-fn recursive_admission_keeps_each_pending_condition_on_the_cold_path() {
-    for pending in 1..=9 {
+fn recursive_admission_observes_execution_poll_requests() {
+    for pending in 1..=3 {
         // Both children of fib(2) are refused and return the cold sentinel -1.
         execute_with_self_stack_bound(&fib(), 1, &[2 * 8, 0, 0, 0, 0, 0, 0],
             (-16_i64) as u64, 0, None, true, None, pending);
@@ -358,6 +358,8 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
         slot.store(&descriptor as *const _ as usize, Ordering::Release);
     }
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 1;
     let active = AtomicBool::new(false);
     let mut control = NativeRecursiveControl {
@@ -378,15 +380,11 @@ fn execute_with_self_stack_bound(f: &Function, arity: usize, args: &[u64; 7], ex
     };
     match pending {
         0 => {},
-        1 => bytes[0].store(1, Ordering::Relaxed),
-        2 => bytes[1].store(1, Ordering::Relaxed),
-        3 => words[0].store(1 << 40, Ordering::Relaxed),
-        4 => words[1].store(1 << 40, Ordering::Relaxed),
-        5 => words[2].store(1, Ordering::Relaxed),
-        6 => control.seen_carrier = 3,
-        7 => control.deadline_armed = 1,
-        8 => control.depth_limit = 1,
-        9 => execution.request_yield(),
+        // Producers are tested in the runtime; generated code sees only this
+        // execution's poll, including requests made by mount and explicit yield.
+        1 => execution.request_poll(),
+        2 => execution.set_carrier_id(3),
+        3 => execution.request_yield(),
         _ => unreachable!(),
     }
     unsafe {

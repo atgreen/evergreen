@@ -52,7 +52,7 @@ pub enum ExecutionKind {
     Fiber = 1,
 }
 
-/// Lisp execution context (§2.3.1). `#[repr(C)]` and all-`u64` because generated
+/// Lisp execution context (§2.3.1). `#[repr(C)]` with word-sized fields because generated
 /// code loads these by fixed byte offset; see [`offsets`] and the test that pins
 /// them. Adding a field is fine; REORDERING one silently changes the ABI, which
 /// is why the offsets are asserted rather than assumed.
@@ -71,6 +71,8 @@ pub struct LispExecutionContext {
     /// Raw address of the owning execution's active native segment control.
     /// Zero outside a segment; the segment owner retains the pointee.
     active_native_control: AtomicU64,
+    /// Stable notification slot; its first word is the generated poll ABI.
+    poll_slot: &'static crate::execution_poll::PollSlot,
 }
 
 /// Byte offsets generated code uses. These are the ABI: the emitters bake them,
@@ -87,6 +89,8 @@ pub mod offsets {
     pub const YIELD_REQUESTED: usize = 24;
     /// `active_native_control`
     pub const ACTIVE_NATIVE_CONTROL: usize = 32;
+    /// Pointer to the process-lifetime execution poll slot.
+    pub const POLL_SLOT: usize = 40;
 }
 
 impl LispExecutionContext {
@@ -97,6 +101,7 @@ impl LispExecutionContext {
             carrier_id: AtomicU64::new(carrier_id),
             yield_requested: AtomicU64::new(0),
             active_native_control: AtomicU64::new(0),
+            poll_slot: crate::execution_poll::register(carrier_id),
         }
     }
 
@@ -121,11 +126,13 @@ impl LispExecutionContext {
     /// what lets a cached pointer stay valid across a fiber switch.
     pub fn set_carrier_id(&self, carrier: u64) {
         self.carrier_id.store(carrier, Ordering::Release);
+        self.poll_slot.set_carrier(carrier);
     }
 
     /// Request cooperative preemption at the next safepoint.
     pub fn request_yield(&self) {
         self.yield_requested.store(1, Ordering::SeqCst);
+        self.request_poll();
     }
 
     /// Take the pending yield request, clearing it. `SeqCst` to match the
@@ -139,6 +146,20 @@ impl LispExecutionContext {
 
     pub fn yield_requested(&self) -> bool {
         self.yield_requested.load(Ordering::Acquire) != 0
+    }
+
+    /// Publish authoritative work before requesting a poll.
+    pub fn request_poll(&self) {
+        self.poll_slot.request();
+    }
+
+    pub fn poll_pending(&self) -> bool {
+        self.poll_slot.pending()
+    }
+
+    /// Clear before draining, never after: a concurrent arrival must survive.
+    pub fn begin_poll(&self) -> bool {
+        self.poll_slot.begin()
     }
 
     /// Read the active segment control address without dereferencing it.
@@ -199,6 +220,12 @@ impl LispExecutionContext {
     }
 }
 
+impl Drop for LispExecutionContext {
+    fn drop(&mut self) {
+        self.poll_slot.retire();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +282,7 @@ mod tests {
             &ctx.active_native_control as *const _ as usize - base,
             offsets::ACTIVE_NATIVE_CONTROL
         );
+        assert_eq!(&ctx.poll_slot as *const _ as usize - base, offsets::POLL_SLOT);
     }
 
     #[test]
@@ -285,14 +313,14 @@ mod tests {
         assert_eq!(first.active_native_control(), 0);
         assert_eq!(second.active_native_control(), 0);
         assert_eq!(offsets::ACTIVE_NATIVE_CONTROL, 32);
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 40);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 48);
     }
 
     /// Every field is one machine word, so generated code can load any of them
     /// with a single `mov` at a fixed displacement.
     #[test]
     fn every_field_is_one_machine_word() {
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 40);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 48);
         assert_eq!(std::mem::align_of::<LispExecutionContext>(), 8);
     }
 
@@ -360,4 +388,115 @@ mod tests {
             });
         }
     }
+}
+
+#[cfg(test)]
+mod execution_poll_tests {
+    use super::*;
+    // Process broadcasts elsewhere in the runtime suite must not turn an idle
+    // assertion into a timing-dependent failure. Each protocol test owns its
+    // notification universe, while its child still uses the real global slots.
+    fn isolated() -> bool {
+        let name = std::thread::current().name().unwrap().to_owned();
+        if std::env::var("EGCL_EXECUTION_POLL_TEST").ok().as_deref() == Some(&name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("EGCL_EXECUTION_POLL_TEST", &name)
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}",
+            String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        true
+    }
+
+    #[test]
+    fn directed_request_does_not_arm_an_unrelated_execution() {
+        if isolated() { return; }
+        let a = LispExecutionContext::new(ExecutionKind::Fiber, 7001, 1);
+        let b = LispExecutionContext::new(ExecutionKind::Fiber, 7002, 1);
+        assert!(a.begin_poll());
+        assert!(b.begin_poll());
+        a.request_poll();
+        assert!(a.poll_pending());
+        assert!(!b.poll_pending());
+        assert!(a.begin_poll());
+        assert!(!a.poll_pending());
+    }
+
+    #[test]
+    fn arrival_after_begin_survives_the_earlier_drain() {
+        if isolated() { return; }
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7003, 1);
+        execution.begin_poll();
+        let payload = AtomicU64::new(0);
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                payload.store(42, Ordering::Release);
+                execution.request_poll();
+                barrier.wait();
+            });
+            execution.begin_poll();
+            assert_eq!(payload.load(Ordering::Acquire), 0);
+            barrier.wait();
+            barrier.wait();
+            assert!(execution.poll_pending());
+            assert_eq!(payload.load(Ordering::Acquire), 42);
+        });
+    }
+
+    #[test]
+    fn migration_and_explicit_yield_arm_the_same_poll() {
+        if isolated() { return; }
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7004, 1);
+        execution.begin_poll();
+        execution.set_carrier_id(2);
+        assert!(execution.begin_poll());
+        execution.request_yield();
+        assert!(execution.poll_pending());
+        assert!(execution.take_yield_request());
+    }
+
+    #[test]
+    fn broadcast_reaches_every_live_slot_and_new_registrations_start_armed() {
+        if isolated() { return; }
+        let a = LispExecutionContext::new(ExecutionKind::NativeThread, 7005, 1);
+        let b = LispExecutionContext::new(ExecutionKind::Fiber, 7006, 2);
+        a.begin_poll(); b.begin_poll();
+        crate::execution_poll::request_all();
+        assert!(a.poll_pending()); assert!(b.poll_pending());
+        let c = LispExecutionContext::new(ExecutionKind::Fiber, 7007, 2);
+        assert!(c.poll_pending());
+    }
+
+    #[test]
+    fn retired_slots_are_reused_and_broadcast_remains_safe_during_recycling() {
+        if isolated() { return; }
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7010, 1);
+        let slot = execution.poll_slot as *const crate::execution_poll::PollSlot;
+        drop(execution);
+        let reused = LispExecutionContext::new(ExecutionKind::Fiber, 7011, 1);
+        assert_eq!(slot, reused.poll_slot as *const _);
+        assert!(reused.poll_pending());
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    crate::execution_poll::request_all();
+                }
+            });
+            for id in 0..1000 {
+                let execution = LispExecutionContext::new(ExecutionKind::Fiber, 7100 + id, 2);
+                assert!(execution.poll_pending());
+                execution.begin_poll();
+            }
+            done.store(true, Ordering::Release);
+        });
+        // A signal reader may retain the slot address across retirement safely.
+        unsafe { &*slot }.request();
+        assert!(reused.poll_pending());
+    }
+
 }

@@ -80,19 +80,29 @@ pub(super) enum OrdinaryReturnPolicy<'a> {
     Calls(&'a [Inst]),
 }
 
+/// Execution invariants proved by the owner of a compiled artifact.
+/// Public standalone emission retains conservative defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrdinarySelfCallFacts {
+    /// Every ingress establishes a live control belonging to R13; callbacks
+    /// restore it before native resumption. The raw ordinary ABI alone does
+    /// not establish this precondition (runtime adapters may have no control).
+    pub trusted_control: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct OrdinaryCallEmission<'a> {
     target: OrdinaryCallTarget,
     targets: &'a [(Inst, OrdinaryCallTarget)],
     second_target: Option<(Inst, OrdinaryCallTarget)>,
     pub(super) return_policy: OrdinaryReturnPolicy<'a>,
-    flags: OrdinaryCallFlags,
     cold: u64,
     tail: bool,
     pub(super) guard: Option<OrdinaryGuardOptions>,
     pub(super) poll_veneer: Option<u64>,
     self_calls: &'a [Inst],
     direct_self: bool,
+    self_facts: OrdinarySelfCallFacts,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its
@@ -258,12 +268,11 @@ fn emit_ordinary_call_body(
             second_target: None,
             return_policy: if guard.is_some() { OrdinaryReturnPolicy::Continuation }
                 else { OrdinaryReturnPolicy::Call(call_inst) },
-            flags,
             cold,
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
             tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
             guard,
-            poll_veneer: None, self_calls: &[], direct_self: false,
+            poll_veneer: None, self_calls: &[], direct_self: false, self_facts: OrdinarySelfCallFacts::default(),
         }),
     )
 }
@@ -342,7 +351,7 @@ pub fn emit_framed_ordinary_two_calls(
         Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
         Some(entry), Some(OrdinaryCallEmission {
             target: targets[0], targets: &[], second_target: Some((last, targets[1])),
-            return_policy: OrdinaryReturnPolicy::Call(last), flags, cold, tail: false, guard: None, poll_veneer: None, self_calls: &[], direct_self: false,
+            return_policy: OrdinaryReturnPolicy::Call(last), cold, tail: false, guard: None, poll_veneer: None, self_calls: &[], direct_self: false, self_facts: OrdinarySelfCallFacts::default(),
         }))
 }
 
@@ -380,6 +389,19 @@ pub fn emit_framed_ordinary_function_with_self_calls(
     f: &Function, entry: OrdinaryLispEntryOptions,
     targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
     cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
+) -> Result<FramedCode, EmitError> {
+    emit_framed_ordinary_function_with_self_call_facts(f, entry, targets, flags,
+        cold, guard, poll_veneer, self_calls, OrdinarySelfCallFacts::default())
+}
+
+/// Emit using invariants established at every ingress by the artifact owner.
+/// Facts apply only to source-proven self calls, never ordinary named calls.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_framed_ordinary_function_with_self_call_facts(
+    f: &Function, entry: OrdinaryLispEntryOptions,
+    targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
+    cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
+    self_facts: OrdinarySelfCallFacts,
 ) -> Result<FramedCode, EmitError> {
     let bad = || EmitError::UnsupportedOp(0xFA);
     if f.is_variadic() || !f.osr_entries.is_empty() || !f.handler_cases.is_empty()
@@ -467,9 +489,9 @@ pub fn emit_framed_ordinary_function_with_self_calls(
         Some(entry.arity as u16), None, &[], 0, EnvironmentCalls::default(), None,
         Some(entry), Some(OrdinaryCallEmission {
             target: unused, targets, second_target: None,
-            return_policy: OrdinaryReturnPolicy::Calls(&returns), flags, cold,
+            return_policy: OrdinaryReturnPolicy::Calls(&returns), cold,
             tail: false, guard: Some(guard), poll_veneer: (poll_veneer != 0).then_some(poll_veneer),
-            self_calls, direct_self: false,
+            self_calls, direct_self: false, self_facts,
         }))
 }
 
@@ -569,48 +591,22 @@ impl OrdinaryCallEmission<'_> {
             store_home(a, FramedHome::Stack(base + i as u32), RAX, 0);
         }
         load_home(a, 7, control_home, 0);
-        alu_r_imm(a, 7, 7, 0);
-        a.jcc(Cc::E, cold);
-        cmp_mem64_disp8(a, 13, 7, 0);
-        a.jcc(Cc::Ne, cold);
-        for (address, byte) in [
-            (self.flags.gc_requested, true),
-            (self.flags.sigusr1_pending, true),
-            (self.flags.posted_signal, false),
-            (self.flags.native_errors, false),
-        ] {
-            mov_imm64(a, 11, address as i64);
-            compare_zero_memory(a, 11, 0, byte);
+        if !(self.direct_self && self.self_facts.trusted_control) {
+            alu_r_imm(a, 7, 7, 0);
+            a.jcc(Cc::E, cold);
+            cmp_mem64_disp8(a, 13, 7, 0);
             a.jcc(Cc::Ne, cold);
         }
-        mov_imm64(a, 11, self.flags.signal_epoch as i64);
-        load_mem64_disp(a, RAX, 11, 0);
-        cmp_mem64_disp8(a, RAX, 7, 48);
-        a.jcc(Cc::Ne, cold);
-        load_mem64_disp(
-            a,
-            RAX,
-            13,
-            egcl_rt::exec_context::offsets::CARRIER_ID as i32,
-        );
-        cmp_mem64_disp8(a, RAX, 7, 40);
-        a.jcc(Cc::Ne, cold);
-        compare_zero_memory(a, 13,
-            egcl_rt::exec_context::offsets::YIELD_REQUESTED as u8, false);
-        a.jcc(Cc::Ne, cold);
-        compare_zero_memory(a, 7, 64, true);
+        load_mem64_disp(a, 11, 13, egcl_rt::exec_context::offsets::POLL_SLOT as i32);
+        compare_zero_memory(a, 11, 0, false);
         a.jcc(Cc::Ne, cold);
         if !mv_known_empty {
             load_mem64_disp(a, 11, 7, 24);
             compare_zero_memory(a, 11, 0, true);
             a.jcc(Cc::Ne, cold);
         }
-        if !self.tail {
-            load_mem64_disp(a, 11, 7, 8);
-            a.extend_from_slice(&[0x41, 0x8b, 0x03, 0x8b, 0x57, 56]); // eax=*depth; edx=limit
-            cmp_rr(a, RAX, SCRATCH);
-            a.jcc(Cc::Ge, cold);
-        }
+        // Ordinary machine frames are bounded by their exact stack budget.
+        // The legacy depth counter bounds Rust/native reentry only.
 
         if self.direct_self {
             // Patched from the final published bound, including guard/cold
@@ -712,10 +708,6 @@ impl OrdinaryCallEmission<'_> {
             a.extend_from_slice(&[0xf0, 0xff, 0x00]); // lock inc dword [rax]
             a.bind(no_heat);
         }
-        if !self.tail {
-            load_mem64_disp(a, SCRATCH, 7, 8);
-            a.extend_from_slice(&[0xff, 0x02]); // inc dword[rdx]
-        }
         if !self.direct_self {
         load_mem64_disp(
             a,
@@ -762,9 +754,6 @@ impl OrdinaryCallEmission<'_> {
                 return_offset: a.here(),
                 stack_adjust: overflow as u32,
             };
-            load_home(a, 11, control_home, overflow);
-            load_mem64_disp(a, 11, 11, 8);
-            a.extend_from_slice(&[0x41, 0xff, 0x0b]); // DEC preserves CF and all result registers
             retire(a, overflow as u32);
             a.jmp(done);
             Some(direct)

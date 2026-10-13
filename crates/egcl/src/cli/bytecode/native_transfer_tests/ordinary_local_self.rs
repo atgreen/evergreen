@@ -10,8 +10,9 @@ thread_local! {
 }
 
 fn request_self_poll() {
-    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
-    unsafe { &*execution }.request_yield();
+    // Arrive after the helper's return poll so the generated self edge
+    // must still publish its caller and take cold admission.
+    ordinary_t2::request_yield_after_return();
 }
 
 fn collect_in_self_cold() {
@@ -26,6 +27,7 @@ fn collect_in_self_cold() {
 struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(0));
         ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(None));
         native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER.with(|hook| hook.set(None));
         MARKER.with(|slot| slot.set(std::ptr::null_mut()));

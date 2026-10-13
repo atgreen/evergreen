@@ -127,7 +127,7 @@ fn ordinary_register_pending_signals_use_real_cold_delivery_and_restore_state() 
 
 #[test]
 #[ignore = "requires installed ordinary register entries"]
-fn ordinary_register_depth_cap_uses_cold_fallback_once_and_preserves_values() {
+fn ordinary_register_calls_do_not_consume_legacy_reentry_depth() {
     let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
@@ -154,19 +154,17 @@ fn ordinary_register_depth_cap_uses_cold_fallback_once_and_preserves_values() {
         assert_eq!(env.mv, [args[2], args[0], args[3], args[1]]);
         assert_eq!(effects(counter), EgclVal::from_fixnum(1), "fallback must not replay the callee");
         assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
-            usize::from(initial != 0), "only the depth cap rejects a generated edge");
+            0, "ordinary machine calls do not use the legacy reentry depth cap");
         assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
-            usize::from(initial == 0),
-            "normal entry uses the terminal adapter; depth fallback interprets the middle");
+            1, "both calls enter the terminal adapter through the same native chain");
         let observed = LEAF_DEPTH.with(Cell::get).expect("actual terminal execution");
-        if initial != 0 {
-            assert_eq!(observed.0, cap, "rejected direct child must not exceed native depth cap");
-        }
+        assert_eq!(observed.0, initial + 1,
+            "only the outer Rust/native boundary consumes reentry depth");
         observations.push(observed);
         assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
         assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
         assert_eq!(unsafe { &*execution }.active_native_control(), control);
     }
-    assert!(observations[1].1 > observations[0].1,
-        "depth fallback must execute the middle function on the managed stack");
+    assert_eq!(observations[1].1, observations[0].1,
+        "ordinary calls remain native even at the legacy boundary depth cap");
 }

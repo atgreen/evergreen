@@ -37,6 +37,7 @@ static SIGUSR1_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 pub(crate) extern "C" fn sigusr1_handler(_signal: i32) {
     SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+    crate::execution_poll::request_all();
 }
 
 use crate::error::EgclError;
@@ -108,6 +109,7 @@ impl SafepointPage {
         })?;
         self.protected.store(true, Ordering::SeqCst);
         self.requested.store(true, Ordering::SeqCst);
+        crate::execution_poll::request_all();
         Ok(())
     }
 
@@ -164,6 +166,7 @@ pub(crate) fn recover_poll_page_sigsegv() -> bool {
     .is_ok();
     if restored {
         SIGUSR1_PENDING.store(true, Ordering::Relaxed);
+        crate::execution_poll::request_all();
     }
     restored
 }
@@ -489,7 +492,7 @@ pub fn poll_safepoint() {
 }
 
 /// Cooperative scheduling is checked at every safepoint, independently of a
-/// GC stop-the-world request. A time-slice expiry only sets this flag; the
+/// GC stop-the-world request. An explicit yield request only sets a flag; the
 /// mounted fiber performs the actual context switch at this safe boundary.
 fn check_preemption() {
     if let Some(fiber) = crate::thread::current_fiber() {

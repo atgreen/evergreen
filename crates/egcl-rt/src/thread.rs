@@ -850,6 +850,8 @@ impl NativeThread {
     fn post_interrupt(&self, condition: EgclVal) {
         *self.interrupt_value.lock().unwrap() = condition;
         self.interrupt_pending.store(true, Ordering::Release);
+        self.execution.request_poll();
+        crate::execution_poll::request_carrier(self.id.0);
     }
 
     fn take_interrupt(&self) -> Option<EgclVal> {
@@ -859,14 +861,15 @@ impl NativeThread {
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        // Only a bit that was not already set adds an untaken signal, or the
-        // count would drift above the number `take_pending_signal` can remove.
-        if previous & signal.bit() == 0 {
-            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        // Reserve before publishing: a concurrent take must not subtract
+        // before the corresponding obligation has been counted.
+        POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        let previous = self.pending_signals.fetch_or(signal.bit(), Ordering::Release);
+        if previous & signal.bit() != 0 {
+            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
         }
+        self.execution.request_poll();
+        crate::execution_poll::request_carrier(self.id.0);
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
@@ -1304,6 +1307,10 @@ pub struct Fiber {
     result: Arc<ThreadResult>,
     /// Flag indicating an interrupt has been requested.
     interrupt_pending: AtomicBool,
+    /// Sticky cooperative cancellation; never consumed by runtime safepoints.
+    cancellation_requested: AtomicBool,
+    /// Guarded by `state`: only explicitly interruptible waits opt in.
+    cancellation_wait: AtomicBool,
     /// The condition value to deliver on interrupt.
     interrupt_value: OrderedMutex<EgclVal>,
     /// Stack pointer / frame pointer this managed fiber published at its last
@@ -1557,17 +1564,18 @@ impl Fiber {
     fn post_interrupt(&self, condition: EgclVal) {
         *self.interrupt_value.lock().unwrap() = condition;
         self.interrupt_pending.store(true, Ordering::Release);
+        self.execution.request_poll();
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
-        let previous = self
-            .pending_signals
-            .fetch_or(signal.bit(), Ordering::Release);
-        // Only a bit that was not already set adds an untaken signal, or the
-        // count would drift above the number `take_pending_signal` can remove.
-        if previous & signal.bit() == 0 {
-            POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        // Reserve before publishing: a concurrent take must not subtract
+        // before the corresponding obligation has been counted.
+        POSTED_PENDING_SIGNALS.fetch_add(1, Ordering::Release);
+        let previous = self.pending_signals.fetch_or(signal.bit(), Ordering::Release);
+        if previous & signal.bit() != 0 {
+            POSTED_PENDING_SIGNALS.fetch_sub(1, Ordering::Release);
         }
+        self.execution.request_poll();
     }
 
     fn take_pending_signal(&self) -> Option<PendingSignal> {
@@ -1858,37 +1866,6 @@ impl WorkerPool {
                     .expect("failed to spawn carrier thread");
                 *carrier.join_handle.lock().unwrap() = Some(handle);
             }
-
-            // HotSpot-style cooperative preemption: a service timer marks the
-            // fibers currently mounted on this pool's carriers. Generated and
-            // interpreted safepoint polls perform the context switch; the timer
-            // thread never suspends a carrier asynchronously.
-            let weak = Arc::downgrade(self);
-            let quantum = std::env::var("EGCL_TIME_SLICE_US")
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(1_000);
-            let _ = std::thread::Builder::new()
-                .name(format!("egcl-preemption-{}", self.id))
-                .spawn(move || {
-                    let interval = std::time::Duration::from_micros(quantum);
-                    loop {
-                        std::thread::sleep(interval);
-                        let Some(pool) = weak.upgrade() else {
-                            return;
-                        };
-                        if pool.shutdown.load(Ordering::Acquire) {
-                            return;
-                        }
-                        for worker in &pool.workers {
-                            let id = worker.current_fiber.load(Ordering::Acquire);
-                            if id != 0 {
-                                request_fiber_yield(FiberId(id));
-                            }
-                        }
-                    }
-                });
         }
     }
 
@@ -2657,7 +2634,7 @@ pub fn start_current_sandbox_cpu_deadline(limit_ms: u64) -> Result<(), EgclError
         .map_err(|errno| EgclError::Internal(format!("clock_gettime failed: {errno}")))?;
     let limit_ns = limit_ms.saturating_mul(1_000_000);
     SANDBOX_CPU_DEADLINE_NS.with(|deadline| deadline.set(now.saturating_add(limit_ns).max(1)));
-    crate::runtime::mark_process_signal_activity();
+    request_current_execution_poll();
     Ok(())
 }
 
@@ -2772,6 +2749,8 @@ pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<F
         ),
         result,
         interrupt_pending: AtomicBool::new(false),
+        cancellation_requested: AtomicBool::new(false),
+        cancellation_wait: AtomicBool::new(false),
         interrupt_value: OrderedMutex::new(
             LockLevel::ExecutionObject,
             fiber_object_order(id, 8),
@@ -2927,6 +2906,49 @@ pub fn current_execution_context_for_native() -> Option<*const crate::exec_conte
         .flatten()
 }
 
+/// Arm the already registered execution without allocation, GC, or TLS borrows
+/// surviving this call. An unregistered execution starts armed when installed.
+#[inline(never)]
+pub fn request_current_execution_poll() {
+    if let Some(execution) = current_execution_context_for_native() {
+        // The current execution cannot retire while this non-yielding call runs.
+        unsafe { &*execution }.request_poll();
+    }
+}
+
+/// Missing execution state conservatively requires the published runtime path.
+#[inline(never)]
+pub fn current_execution_poll_pending() -> bool {
+    current_execution_context_for_native()
+        .is_none_or(|execution| unsafe { &*execution }.poll_pending())
+}
+
+/// Call inside the published runtime boundary, BEFORE draining any source.
+#[inline(never)]
+pub fn begin_current_execution_poll() -> bool {
+    current_execution_context_for_native()
+        .is_none_or(|execution| unsafe { &*execution }.begin_poll())
+}
+
+/// Retain persistent runtime obligations after a drain. Native-error occupancy
+/// belongs to the host and must be rearmed there. This only sets the poll; it
+/// must never clear a notification posted concurrently with the drain.
+#[inline(never)]
+pub fn rearm_current_execution_poll() {
+    let posted = current_fiber()
+        .is_some_and(|fiber| fiber.pending_signals.load(Ordering::Acquire) != 0)
+        || CURRENT_NATIVE_THREAD.try_with(|slot| {
+            slot.try_borrow().ok().is_none_or(|current| current.as_ref()
+                .is_none_or(|current| current.thread.pending_signals.load(Ordering::Acquire) != 0))
+        }).unwrap_or(true);
+    if posted || crate::safepoint::poll_work_pending()
+        || crate::runtime::process_signal_activity_pending()
+        || sandbox_cpu_deadline_armed()
+    {
+        request_current_execution_poll();
+    }
+}
+
 /// Inspect the mounted execution without registering, parking, or consuming
 /// its request. Missing or inaccessible TLS requires a published slow path.
 // Resolve carrier TLS afresh after any possible fiber migration.
@@ -2983,6 +3005,53 @@ fn lookup_fiber(id: FiberId) -> Result<Arc<Fiber>, EgclError> {
         .cloned()
         .ok_or_else(|| EgclError::ProgramError("unknown fiber".into()))
 }
+/// Record cooperative cancellation without injecting an error or forcing a yield.
+/// An interruptible wait is resumed, but its Lisp caller decides how to respond.
+pub fn request_fiber_cancellation(id: FiberId) -> Result<(), EgclError> {
+    let fiber = lookup_fiber(id)?;
+    #[cfg(all(test, egcl_fibers))]
+    cancellation_race_tests::before_state();
+    let enqueue = {
+        let mut state = fiber.state.lock().unwrap();
+        fiber.cancellation_requested.store(true, Ordering::Release);
+        if fiber.cancellation_wait.load(Ordering::Relaxed)
+            && matches!(*state, FiberState::Blocked | FiberState::Waiting)
+        {
+            if fiber.mounted.load(Ordering::Acquire) {
+                fiber.wake_pending.store(true, Ordering::Release);
+                false
+            } else {
+                *state = FiberState::Runnable;
+                true
+            }
+        } else {
+            false
+        }
+    };
+    if enqueue {
+        // An unmounted wait can only belong to an initialized scheduler pool.
+        // Resolve it after observing the wait: cancellation may race the first
+        // submission, so a pool snapshot taken before the state lock can be stale.
+        let pool = fiber.scheduler_pool.lock().unwrap().as_ref().and_then(Weak::upgrade)
+            .ok_or_else(|| EgclError::Internal("cancelled wait has no scheduler".into()))?;
+        pool.submit(WorkerTask {
+            result_cell: Arc::clone(&fiber.result),
+            thread: fiber,
+        });
+    }
+    Ok(())
+}
+
+pub fn fiber_cancellation_requested(id: FiberId) -> Result<bool, EgclError> {
+    Ok(lookup_fiber(id)?
+        .cancellation_requested
+        .load(Ordering::Acquire))
+}
+
+pub fn current_fiber_cancellation_requested() -> bool {
+    current_fiber().is_some_and(|fiber| fiber.cancellation_requested.load(Ordering::Acquire))
+}
+
 pub fn fiber_pin(id: FiberId) -> Result<(), EgclError> {
     lookup_fiber(id)?.pin();
     Ok(())
@@ -3207,7 +3276,7 @@ pub fn fiber_yield() -> Result<(), EgclError> {
 /// scheduler group makes it runnable again.
 pub fn park_current_fiber() -> Result<(), EgclError> {
     prepare_current_fiber_park(FiberState::Blocked)?;
-    park_prepared_current_fiber()
+    park_prepared_current_fiber_cancellable()
 }
 
 /// Publish the mounted fiber's roots and enter a blocked/waiting state while
@@ -3269,6 +3338,28 @@ pub(crate) fn park_prepared_current_fiber() -> Result<(), EgclError> {
     std::thread::yield_now();
 
     Ok(())
+}
+
+/// Opt a prepared sleep/park into cancellation. Locking its state both here
+/// and in the requester closes the request-before-registration and unmount
+/// races; a late request cannot wake a subsequent noninterruptible wait.
+/// The caller checks cancellation after its own wait cleanup is complete.
+pub(crate) fn park_prepared_current_fiber_cancellable() -> Result<(), EgclError> {
+    let fiber = current_fiber()
+        .ok_or_else(|| EgclError::ProgramError("fiber park outside a fiber".into()))?;
+    {
+        let _state = fiber.state.lock().unwrap();
+        fiber.cancellation_wait.store(true, Ordering::Relaxed);
+        if fiber.cancellation_requested.load(Ordering::Acquire) {
+            fiber.wake_pending.store(true, Ordering::Release);
+        }
+    }
+    let result = park_prepared_current_fiber();
+    {
+        let _state = fiber.state.lock().unwrap();
+        fiber.cancellation_wait.store(false, Ordering::Relaxed);
+    }
+    result
 }
 
 /// Undo a prepared park if registration with the blocking subsystem fails.
@@ -3610,5 +3701,110 @@ mod native_context_address_tests {
         })
         .join()
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod execution_poll_producer_tests {
+    use super::*;
+
+    #[test]
+    fn posted_signal_arms_its_owner_and_mounted_carrier_executions() {
+        let thread = NativeThread::new(NativeThreadId(91001), None, false, false,
+            NIL, Arc::new(ThreadResult::new()));
+        let mounted = crate::exec_context::LispExecutionContext::new(
+            crate::exec_context::ExecutionKind::Fiber, 91002, 91001);
+        thread.execution().begin_poll();
+        mounted.begin_poll();
+        thread.post_pending_signal(PendingSignal::Interrupt);
+        assert!(thread.execution().poll_pending());
+        assert!(mounted.poll_pending());
+        assert_eq!(thread.take_pending_signal(), Some(PendingSignal::Interrupt));
+    }
+
+    #[test]
+    fn duplicate_signal_posts_leave_one_consumable_obligation() {
+        let thread = NativeThread::new(NativeThreadId(91003), None, false, false,
+            NIL, Arc::new(ThreadResult::new()));
+        thread.execution().begin_poll();
+        thread.post_pending_signal(PendingSignal::Interrupt);
+        thread.post_pending_signal(PendingSignal::Interrupt);
+        assert!(thread.execution().poll_pending());
+        assert_eq!(thread.take_pending_signal(), Some(PendingSignal::Interrupt));
+        assert_eq!(thread.take_pending_signal(), None);
+    }
+}
+
+#[cfg(all(test, egcl_fibers))]
+mod cancellation_race_tests {
+    use super::*;
+    use crate::value::T;
+
+    mod native_entry {
+        use crate as egcl_rt;
+        include!("../tests/support/native_entry.rs");
+    }
+
+    thread_local! {
+        static BEFORE_STATE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_state() {
+        let hook = BEFORE_STATE.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn parked_entry() -> EgclVal {
+        park_current_fiber().unwrap();
+        assert!(current_fiber_cancellation_requested());
+        T
+    }
+
+    #[test]
+    fn first_submission_during_cancellation_still_wakes_parked_fiber() {
+        const CHILD: &str = "EGCL_TEST_CANCELLATION_SUBMIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "thread::cancellation_race_tests::first_submission_during_cancellation_still_wakes_parked_fiber", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            eprintln!("cancellation failed to resume a newly submitted fiber");
+            std::process::exit(124);
+        });
+        current_thread_id();
+        let pool = Arc::new(CarrierPool::new(1));
+        let fiber = make_fiber(native_entry::entry(parked_entry)).unwrap();
+        let descriptor = lookup_fiber(fiber).unwrap();
+        assert!(descriptor.scheduler_pool.lock().unwrap().is_none());
+        let submitter = Arc::clone(&pool);
+        BEFORE_STATE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                submitter.submit(fiber).unwrap();
+                loop {
+                    let state = descriptor.state.lock().unwrap();
+                    if *state == FiberState::Blocked
+                        && !descriptor.mounted.load(Ordering::Acquire)
+                        && descriptor.cancellation_wait.load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    drop(state);
+                    crate::poll_safepoint();
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        request_fiber_cancellation(fiber).unwrap();
+        assert_eq!(join_fiber(fiber).unwrap(), T);
+        pool.shutdown_and_join().unwrap();
     }
 }

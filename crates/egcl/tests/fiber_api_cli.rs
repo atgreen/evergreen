@@ -448,3 +448,107 @@ fn native_threads_and_fibers_have_distinct_types_and_visible_carriers() {
       (format t "FIBER-API-OK~%")
     "##);
 }
+
+#[test]
+fn cooperative_cancellation_is_sticky_and_runs_lisp_cleanup() {
+    run(r##"
+      (let* ((cleaned nil)
+             (f (egcl-fiber:make-fiber
+                  (lambda ()
+                    (handler-case
+                        (unwind-protect (egcl-fiber:check-fiber-cancellation)
+                          (setf cleaned t))
+                      (egcl-fiber:fiber-cancelled ()
+                        (assert (egcl-fiber:fiber-cancellation-requested-p))
+                        :cancelled))))))
+        (egcl-fiber:cancel-fiber f)
+        (assert (egcl-fiber:fiber-cancellation-requested-p f))
+        (let ((group (egcl-fiber:start-fibers (list f) :carrier-count 1)))
+          (assert (eq (egcl-fiber:fiber-join f) :cancelled))
+          (egcl-fiber:finish-fibers group))
+        (assert cleaned))
+      (write-line "FIBER-API-OK")
+    "##);
+}
+
+#[test]
+fn cooperative_cancellation_wakes_sleeping_fiber() {
+    run(r##"
+      (let* ((entered nil)
+             (f (egcl-fiber:make-fiber
+                  (lambda ()
+                    (handler-case
+                        (progn (setf entered t)
+                               (egcl-fiber:fiber-sleep 60)
+                               :unexpected)
+                      (egcl-fiber:fiber-cancelled () :cancelled)))))
+             (group (egcl-fiber:start-fibers (list f) :carrier-count 1)))
+        (loop until (and entered (eq (egcl-fiber:fiber-state f) :suspended))
+              do (sleep 0.001))
+        (egcl-fiber:cancel-fiber f)
+        (assert (eq (egcl-fiber:fiber-join f :timeout 2) :cancelled))
+        (egcl-fiber:finish-fibers group))
+      (write-line "FIBER-API-OK")
+    "##);
+}
+
+#[test]
+fn cancellation_request_does_not_abort_cpu_bound_fiber() {
+    run(r##"
+      (let* ((started nil)
+             (f (egcl-fiber:make-fiber
+                  (lambda ()
+                    (setf started t)
+                    (loop until (egcl-fiber:fiber-cancellation-requested-p))
+                    :ordinary-return)))
+             (group (egcl-fiber:start-fibers (list f) :carrier-count 1)))
+        (loop until started do (sleep 0.001))
+        (egcl-fiber:cancel-fiber f)
+        (assert (eq (egcl-fiber:fiber-join f :timeout 2) :ordinary-return))
+        (egcl-fiber:finish-fibers group))
+      (write-line "FIBER-API-OK")
+    "##);
+}
+
+#[test]
+fn cancellation_of_join_releases_result_lock_and_preserves_target() {
+    run(r##"
+      (let* ((gate (egcl-thread:make-mutex))
+             (release-target nil)
+             (cleaned nil)
+             (target (egcl-fiber:make-fiber
+                       (lambda ()
+                         (assert
+                           (egcl-fiber:fiber-park
+                             (lambda ()
+                               (egcl-thread:with-mutex (gate) release-target))
+                             :timeout 10))
+                         :target-finished)))
+             (joiner (egcl-fiber:make-fiber
+                       (lambda ()
+                         (handler-case
+                             (unwind-protect
+                                 (egcl-fiber:fiber-join target :timeout 10)
+                               (setf cleaned t))
+                           (egcl-fiber:fiber-cancelled () :cancelled)))))
+             (group (egcl-fiber:start-fibers (list target joiner) :carrier-count 1)))
+        ;; JOINER alone acquires TARGET's result mutex. Observing ownership
+        ;; proves it entered %AWAIT; its 1 ms sleep state is only transient.
+        (let ((deadline (+ (get-internal-real-time)
+                           (* 5 internal-time-units-per-second))))
+          (loop
+            (when (not (egcl-thread:with-mutex
+                         ((egcl-fiber::fiber-lock target) :timeout 0) t))
+              (return))
+            (assert (< (get-internal-real-time) deadline))
+            (sleep 0.001)))
+        (egcl-fiber:cancel-fiber joiner)
+        (assert (eq (egcl-fiber:fiber-join joiner :timeout 2) :cancelled))
+        (assert cleaned)
+        (assert (not (egcl-fiber:fiber-cancellation-requested-p target)))
+        (egcl-thread:with-mutex (gate) (setf release-target t))
+        (assert (eq (egcl-fiber:fiber-join target :timeout 2) :target-finished))
+        (egcl-fiber:finish-fibers group))
+      (write-line "FIBER-API-OK")
+    "##);
+}

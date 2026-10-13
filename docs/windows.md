@@ -26,7 +26,7 @@ T2 functions register unwind ranges for their normal, compiled-register (T2),
 and OSR entries. T2 probes large spill frames and temporary deoptimization buffers.
 
 The runtime scheduler uses Windows-owned fiber stacks for suspension, carrier
-migration, and cooperative preemption. Mutex, condition-variable, semaphore,
+migration, and explicit cooperative yielding. Mutex, condition-variable, semaphore,
 and timer waits release their carrier. Each fiber retains its registered GC
 root list while suspended and after migration. Windows descriptor-readiness
 integration and catchable native stack exhaustion remain unfinished.

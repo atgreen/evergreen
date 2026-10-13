@@ -27,6 +27,7 @@ impl<'a, T> PendingError<'a, T> {
         if value.is_none() {
             self.count.fetch_add(1, Ordering::Relaxed);
             *value = Some(error);
+            egcl_rt::thread::request_current_execution_poll();
         }
     }
 
@@ -41,7 +42,11 @@ impl<'a, T> PendingError<'a, T> {
             }
             _ => {}
         }
-        std::mem::replace(&mut *value, next)
+        let previous = std::mem::replace(&mut *value, next);
+        if value.is_some() {
+            egcl_rt::thread::request_current_execution_poll();
+        }
+        previous
     }
 
     pub(super) fn take(&self) -> Option<T> {

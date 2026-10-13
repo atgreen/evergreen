@@ -163,7 +163,7 @@ mod ordinary_primitives;
 pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, OrdinaryCallTarget, OrdinaryCallFlags,
+    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_function_with_self_call_facts, OrdinarySelfCallFacts, OrdinaryCallTarget, OrdinaryCallFlags,
     OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -1087,6 +1087,18 @@ pub struct NativePollFastPath {
     pub instrument_skips: bool,
 }
 
+/// One acquire observation of the running execution's pending work. The slot
+/// lives longer than generated code and follows a fiber across carrier changes.
+/// Producers publish their payload before arming; only the published runtime
+/// poll clears the notification, before draining its authoritative sources.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_execution_poll_guard(a: &mut Asm, execution: u8, slow: egcl_rt::asm::Label) {
+    load_mem64_disp(a, SCRATCH, execution, egcl_rt::exec_context::offsets::POLL_SLOT as i32);
+    load_mem64_disp(a, RAX, SCRATCH, 0);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+}
+
 /// Only reserved scratch registers are touched before the conditional edge;
 /// the caller has not spilled or published any roots yet. x86 loads provide the
 /// required Acquire/SeqCst load ordering for these runtime atomic cells.
@@ -1096,32 +1108,11 @@ fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
 {
     use std::mem::offset_of;
     let slow = a.label();
-    for (address, byte) in [(fast.gc_requested, true), (fast.sigusr1_pending, true),
-        (fast.posted_signal, false), (fast.native_errors, false)] {
-        mov_imm64(a, SCRATCH, address as i64);
-        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
-        alu_r_imm(a, 7, RAX, 0);
-        a.jcc(Cc::Ne, slow);
-    }
     load_home(a, 7, home, 0);
     alu_r_imm(a, 7, 7, 0);
     a.jcc(Cc::E, slow);
-    mov_imm64(a, SCRATCH, fast.signal_epoch as i64);
-    load_mem64_disp(a, RAX, SCRATCH, 0);
-    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_signal_epoch) as u8);
-    a.jcc(Cc::Ne, slow);
     load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, execution) as i32);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
-    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_carrier) as u8);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
-    mov_rr(a, SCRATCH, 7);
-    alu_r_imm(a, 0, SCRATCH, offset_of!(NativePollControl, deadline_armed) as i32);
-    movzx_mem8(a, RAX, SCRATCH);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
+    emit_execution_poll_guard(a, SCRATCH, slow);
     if fast.observe_forces_cold {
         let no_observer = a.label();
         load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_observer) as i32);
@@ -2143,33 +2134,11 @@ fn emit_native_recursive_call(
     // RDI/RAX/SCRATCH/R11 are not final value homes. The control pointer is raw,
     // execution-owned, and follows a fiber across carrier migration.
     load_home(a, 7, control_home, 0);
-    for (address, byte) in [(recursion.flags.gc_requested, true),
-        (recursion.flags.sigusr1_pending, true), (recursion.flags.posted_signal, false),
-        (recursion.flags.native_errors, false)] {
-        mov_imm64(a, SCRATCH, address as i64);
-        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
-        alu_r_imm(a, 7, RAX, 0); // cmp rax,0
-        a.jcc(Cc::Ne, slow);
-    }
+    load_mem64_disp(a, SCRATCH, 7, 0); // execution
+    emit_execution_poll_guard(a, SCRATCH, slow);
     mov_imm64(a, SCRATCH, recursion.flags.generation as i64);
     load_mem64_disp(a, RAX, SCRATCH, 0);
     cmp_mem64_disp8(a, RAX, 7, 32);
-    a.jcc(Cc::Ne, slow);
-    mov_imm64(a, SCRATCH, recursion.flags.signal_epoch as i64);
-    load_mem64_disp(a, RAX, SCRATCH, 0);
-    cmp_mem64_disp8(a, RAX, 7, 48);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, SCRATCH, 7, 0); // execution
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
-    cmp_mem64_disp8(a, RAX, 7, 40);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
-    mov_rr(a, SCRATCH, 7);
-    alu_r_imm(a, 0, SCRATCH, 64);
-    movzx_mem8(a, RAX, SCRATCH); // deadline_armed
-    alu_r_imm(a, 7, RAX, 0);
     a.jcc(Cc::Ne, slow);
     if recursion.flags.observe_forces_cold {
         let no_observer = a.label();

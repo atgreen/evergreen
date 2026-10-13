@@ -238,9 +238,10 @@ per-fiber generation token and a carrier-consumed pending-wake handshake, so a
 timeout from an old wait cannot wake a new one and an unpark racing with
 unmount cannot mount one continuation on two carriers.
 
-Preemption is cooperative: a running fiber yields at the next safepoint poll
-when the scheduler sets its yield flag (e.g., time-slice expired or a
-higher-priority fiber is ready).
+Scheduling is cooperative: a running fiber yields explicitly, on a supported
+blocking operation, or at a safepoint following an explicit yield request.
+There is no automatic CPU time slice or per-fiber CPU budget. Cancellation is
+observed explicitly or at interruptible blocking boundaries (§13.5.5).
 
 ---
 

@@ -9,10 +9,9 @@ thread_local! {
 }
 
 fn request_cold_self() {
-    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
-    // The observer returns to the native owner with this request pending.
-    // The following self call must publish that owner and use the cold path.
-    unsafe { &*execution }.request_yield();
+    // Arrive after the helper's return poll so the generated self edge
+    // must still publish its caller and take cold admission.
+    ordinary_t2::request_yield_after_return();
 }
 
 fn replace_at_cold_self() {
@@ -32,6 +31,7 @@ struct RestoreHooks {
 
 impl Drop for RestoreHooks {
     fn drop(&mut self) {
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(0));
         ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.observer));
         native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER
             .with(|hook| hook.set(self.cold_self));

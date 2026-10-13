@@ -22,7 +22,7 @@ Source: `crates/egcl-rt/src/{thread,scheduler,safepoint,signal}.rs`,
 | R13.06 | The lock hierarchy MUST be documented as a single total order with numeric levels; every lock in the system MUST be assigned a level. | MUST |
 | R13.07 | Symbol value cells, inline-cache (IC) patch words, and profiling counters MUST be implemented as lock-free data structures. | MUST |
 | R13.08 | The fiber scheduler MUST use a work-stealing deque (Chase-Lev) per exposed OS carrier thread with LIFO push/pop for local work and FIFO steal for cross-carrier balancing. | MUST |
-| R13.09 | The scheduler MUST support cooperative preemption via per-fiber yield flags checked at safepoints; time-slice expiry MUST set the yield flag. | MUST |
+| R13.09 | Fibers MUST yield cooperatively through explicit requests or supported blocking operations; the scheduler MUST NOT impose CPU time slices or automatic per-fiber CPU budgets. Cancellation MUST remain a cooperative request observed explicitly or at interruptible blocking boundaries. | MUST |
 | R13.10 | GC stop-the-world requests MUST be coordinated via the safepoint polling-page mechanism (§2.5, §3.9); no thread MUST be suspended asynchronously. | MUST |
 | R13.11 | Fibers or native threads in the `Native` state (executing FFI calls) MUST be excluded from safepoint handshake; their CL stacks MUST be scannable without cooperation. | MUST |
 | R13.12 | Fibers or native threads in the `Blocked` state MUST publish their stack top before blocking; the GC MUST be able to scan their stacks without waking them. | MUST |
@@ -310,13 +310,22 @@ at most one carrier at a time, and a carrier runs at most one fiber at a time.
 The fiber's current/last carrier reference is updated before its state becomes
 `:RUNNING`, using release ordering; introspection reads it with acquire ordering.
 
-### 13.5.5 Cooperative Preemption (R13.09)
+### 13.5.5 Cooperative Scheduling and Cancellation (R13.09)
 
-A scheduler-group service timer (1 ms by default) reads each carrier's
-atomically published mounted-fiber ID and sets that fiber's `yield_flag`. The
-timer never suspends a carrier. Every safepoint poll checks this flag;
-if set, the fiber is pushed to the back of the local deque and
-the next task is popped. Default time slice: 1 ms (`EGCL_TIME_SLICE_US`).
+Fibers run until they complete, explicitly yield, or enter a supported blocking
+operation. There is no periodic scheduler preemption timer. Safepoints continue
+to service GC and explicit yield requests, but do not grant CPU-bound fibers a
+scheduling quantum. A CPU-bound fiber can occupy a carrier indefinitely.
+
+Cancellation is a sticky, fiber-owned request. It does not asynchronously unwind
+Lisp frames or replace a fiber's result. Code can inspect the request or call
+`EGCL-FIBER:CHECK-FIBER-CANCELLATION` to signal `FIBER-CANCELLED`. Public fiber
+sleep, predicate-park and join observe cancellation at safe boundaries. Only
+interruptible waits are woken: cancellation does not unwind a mutex acquisition,
+condition wait, semaphore wait, foreign call, or arbitrary I/O operation.
+
+Ordinary fibers have no CPU budget. Explicit sandbox CPU limits remain a
+separate opt-in policy, selected by `--sandbox` and `EGCL_SANDBOX_CPU_MS`.
 
 ### 13.5.6 Priority Levels
 
@@ -603,7 +612,6 @@ submitted to a second scheduler group.
 | Parameter | Default | Env Var | Description |
 |-----------|---------|---------|-------------|
 | Carrier threads | `nproc` | `EGCL_WORKERS` | Default scheduler-group carrier count. |
-| Time slice | 1000 µs | `EGCL_TIME_SLICE_US` | Cooperative preemption interval. |
 | Safepoint spin iterations | 1000 | `EGCL_SAFEPOINT_SPIN` | Spin count before parking at safepoint. |
 | Deadlock watchdog interval | 5 s | `EGCL_DEADLOCK_WATCHDOG_MS` | Debug-build only. 0 = disabled. |
 | SIGUSR1 timeout | 100 ms | `EGCL_SIGUSR1_TIMEOUT_MS` | Delay before sending SIGUSR1 fallback. |
@@ -637,7 +645,8 @@ submitted to a second scheduler group.
 | Safepoint liveness | Tight loop in T1 code; request STW; verify all threads reach safepoint within 10 ms. | p99 < 10 ms. |
 | Native-thread GC safety | Thread in FFI call during GC; verify CL stack scanned correctly. | No GC crash. |
 | Blocked-thread GC safety | Thread blocked on mutex during GC; verify stack scanned correctly. | No GC crash. |
-| Cooperative preemption | 100 CPU-bound fibers on 4 exposed carriers; verify all make progress (no starvation) within 100 ms. | All fibers run. |
+| Cooperative scheduling | On one carrier, a CPU-bound fiber that polls safepoints completes before its queued peer; an explicit yield lets the peer run. | No automatic time slicing. |
+| Cooperative cancellation | Request before start, during computation, and during interruptible sleep; check sticky status and Lisp cleanup. | No forced termination; safe waits wake. |
 | SIGUSR1 fallback | Thread blocked in `read(2)` on a pipe; request STW; verify thread reaches safepoint via SIGUSR1 within 200 ms. | Safepoint reached. |
 | WITH-ATOMIC correctness | Verify preemption is suppressed inside `WITH-ATOMIC`; verify GC safepoint is NOT suppressed (compile-time check). | Correct behaviour. |
 | Binding stack isolation | Two threads bind the same special to different values; verify no cross-thread leakage. | Thread-local isolation. |

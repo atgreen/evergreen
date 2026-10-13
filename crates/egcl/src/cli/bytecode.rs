@@ -15066,11 +15066,9 @@ fn run_with_binding(
 }
 
 fn claim_process_signal_flags_for_current_execution() {
-    // Fast path: one relaxed load instead of six locked read-modify-writes.
-    // Draining the flags cost ~15% of every native call (bliss-htff) to answer
-    // a question that is "no" essentially always. SBCL and HotSpot both reduce
-    // this to a single instruction against a poll word; this is the
-    // process-global half of that.
+    // Explicit sandbox deadlines belong to the current execution's slow poll;
+    // their progress must not depend on unrelated process signal activity.
+    let _ = egcl_rt::poll_current_sandbox_cpu_deadline();
     if !egcl_rt::take_process_signal_activity() {
         return;
     }
@@ -15098,12 +15096,7 @@ fn claim_process_signal_flags_for_current_execution() {
     if egcl_rt::check_sigint() {
         post(egcl_rt::PendingSignal::Interrupt);
     }
-    let _ = egcl_rt::poll_current_sandbox_cpu_deadline();
-    // The deadline needs polling on every pass, but the gate above only lets us
-    // through when the summary is raised, so re-raise it while one is armed.
-    if egcl_rt::sandbox_cpu_deadline_armed() {
-        egcl_rt::mark_process_signal_activity();
-    }
+
 }
 
 fn pending_signal_error_for_current_execution() -> Option<EgclError> {

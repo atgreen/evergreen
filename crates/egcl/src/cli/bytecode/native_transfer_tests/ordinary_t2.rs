@@ -49,6 +49,12 @@ pub(crate) fn ordinary_t2_entry_for_test() -> EgclVal {
     NIL
 }
 
+pub(super) fn request_yield_after_return() {
+    let owner = EXPECTED_OWNER.with(Cell::get);
+    assert_ne!(owner, 0);
+    native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(owner));
+}
+
 pub(in crate::cli::bytecode) fn expect_entry(code: &NativeCode) {
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         panic!("mapped caller")
@@ -151,6 +157,48 @@ fn ordinary_t2_installs_published_calls_without_success_return_poll() {
         );
     }
     assert_mapped_t2(&code);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_return_poll_relocates_the_helper_primary_result() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(defun ordinary-return-poll-allocator () (%ordinary-t2-root-for-test))", &mut env,
+    ).unwrap();
+    let (symbol, code) = install("ORDINARY-RETURN-POLL", "()",
+        "((ordinary-return-poll-allocator))", &mut env);
+    assert_mapped_t2(&code);
+    thread_local! { static MOVED: Cell<bool> = const { Cell::new(false) }; }
+    unsafe fn collect_primary(value: *mut EgclVal) {
+        let before = unsafe { value.read() }.to_raw();
+        // Nothing except the new return-boundary root owns this primary word.
+        egcl_rt::HeapCollector::new().minor_gc().unwrap();
+        let after = unsafe { value.read() };
+        assert_ne!(after.to_raw(), before, "return-boundary primary must actually move");
+        assert_eq!(crate::cli::cp(after), (EgclVal::from_fixnum(71), NIL));
+        MOVED.with(|moved| moved.set(true));
+    }
+    struct Restore(Option<fn()>, Option<unsafe fn(*mut EgclVal)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(self.0));
+            native_transfer_entry::ordinary_calls::RETURN_ROOTED_OBSERVER.with(|hook| hook.set(self.1));
+        }
+    }
+    let _restore = Restore(
+        RECURSIVE_LEAF_OBSERVER.with(|hook| hook.replace(Some(egcl_rt::thread::request_current_execution_poll))),
+        native_transfer_entry::ordinary_calls::RETURN_ROOTED_OBSERVER.with(|hook| hook.replace(Some(collect_primary))),
+    );
+    MOVED.with(|moved| moved.set(false));
+    expect_entry(&code);
+    egcl_rt::rooted!(result = run_native(&code, symbol, &[], &mut env).unwrap());
+    assert!(MOVED.with(Cell::get), "the runtime return poll must run");
+    assert_eq!(crate::cli::cp(*result), (EgclVal::from_fixnum(71), NIL));
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert_eq!(mapped.deopt_count(), 0);
 }
 
 #[test]
@@ -1155,6 +1203,18 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
             && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
         .collect();
     assert_eq!(self_calls.len(), 2, "installed Fibonacci must contain both direct self calls");
+    assert!(!instructions.iter().any(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Cmp
+            && instruction.op0_register() == iced_x86::Register::R13
+            && instruction.memory_base() == iced_x86::Register::RDI),
+        "self calls rely on ownership established at native entry");
+    assert!(!instructions.iter().any(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Cmp
+            && instruction.op0_register() == iced_x86::Register::RDI
+            && matches!(instruction.op1_kind(), iced_x86::OpKind::Immediate8to64
+                | iced_x86::OpKind::Immediate32to64)
+            && instruction.immediate(1) == 0),
+        "self calls rely on nonnull control established at native entry");
     assert_eq!(self_calls[0].near_branch_target(), self_calls[1].near_branch_target());
     let start = instructions.iter().position(|instruction|
         instruction.ip() == self_calls[0].near_branch_target()).unwrap();
@@ -1802,4 +1862,38 @@ fn ordinary_global_after_unknown_mv_keeps_mapped_t1_and_t2() {
                 "global reads stay live and the terminal callable retains its complete tuple");
         }
     }
+}
+
+
+#[test]
+#[ignore = "requires installed ordinary register entries"]
+fn ordinary_t2_self_recursion_exceeds_legacy_depth_without_fallback() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-UNCAPPED-COUNTDOWN";
+    let form = "(if (< n 1) n (+ (ordinary-uncapped-countdown (- n 1)) 1))";
+    crate::cli::read_eval_all_env(&format!("(defun {name} (n) {form})"), &mut env).unwrap();
+    let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { panic!("mapped T2") };
+    assert!(mapped.ordinary_entry.is_some(), "must exercise ordinary machine recursion");
+    assert!(mapped.mapped_entry().is_none(), "no legacy recursive entry available");
+    let depth = i64::from(native_depth_cap()) + 16;
+    let stack = egcl_rt::current_stack();
+    let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
+    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+    let control = unsafe { &*execution }.active_native_control();
+    let segment = egcl_rt::native_transfer::current_segment();
+    native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    let deopts = mapped.deopt_count();
+    assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(depth)], &mut env).unwrap(),
+        EgclVal::from_fixnum(depth), "every recursive continuation adds exactly once");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+        "crossing 64 machine frames must not fall back to runtime dispatch");
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 0);
+    assert_eq!(mapped.deopt_count(), deopts);
+    assert_eq!((stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)), before);
+    assert_eq!(unsafe { &*execution }.active_native_control(), control);
+    assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
 }
