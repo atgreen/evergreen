@@ -1015,17 +1015,58 @@
 ;; per-form printer flag also exists but is quiet by default.
 (defvar *compile-verbose* t)
 (defvar *compile-print* nil)
-;; The pretty-printer dispatch table. This interpreter has no user-extensible
-;; pprint dispatch, but the variable must be bound: ASDF's DEFINE-OP saves and
-;; rebinds it around loading a .asd (bliss-lb6.17).
-(defvar *print-pprint-dispatch* nil)
-;; EGCL has no pretty-print dispatch table (the printer ignores it); provide
-;; COPY-PPRINT-DISPATCH so portable code that rebinds *PRINT-PPRINT-DISPATCH*
-;; around output loads and runs. With a NIL table there is nothing to copy, so
-;; return NIL (bordeaux-threads' +STANDARD-IO-BINDINGS+ uses this).
-(defun copy-pprint-dispatch (&optional table)
-  (declare (ignore table))
+;; Pretty-print dispatch tables (CLHS 22.2.1.4).  A table is a cons whose car
+;; is the tag EGCL::%PPRINT-DISPATCH-TABLE and whose cdr is the entry list;
+;; each entry is (TYPE-SPECIFIER PRIORITY FUNCTION).  When *PRINT-PRETTY* is
+;; true the printer asks EGCL::%PPRINT-DISPATCH-STRING for the text of the
+;; highest-priority entry whose type the object satisfies, and prints normally
+;; when there is none.  The standard table has no entries.
+(defun egcl::%make-pprint-dispatch-table (&optional entries)
+  (cons 'egcl::%pprint-dispatch-table entries))
+(defun egcl::%pprint-dispatch-table-p (object)
+  (and (consp object) (eq (car object) 'egcl::%pprint-dispatch-table)))
+(defun egcl::%check-pprint-dispatch-table (table)
+  (unless (egcl::%pprint-dispatch-table-p table)
+    (error 'type-error :datum table :expected-type 'egcl::pprint-dispatch-table))
+  table)
+(defvar egcl::*standard-pprint-dispatch-table* (egcl::%make-pprint-dispatch-table))
+(defvar *print-pprint-dispatch* egcl::*standard-pprint-dispatch-table*)
+(defun copy-pprint-dispatch (&optional (table *print-pprint-dispatch*))
+  (let ((source (if (null table)
+                    egcl::*standard-pprint-dispatch-table*
+                    (egcl::%check-pprint-dispatch-table table))))
+    (egcl::%make-pprint-dispatch-table (mapcar #'copy-list (cdr source)))))
+(defun egcl::%pprint-dispatch-entry (table object)
+  (let ((best nil))
+    (dolist (entry (cdr table) best)
+      (when (and (typep object (first entry))
+                 (or (null best) (> (second entry) (second best))))
+        (setq best entry)))))
+(defun set-pprint-dispatch (type-specifier function
+                            &optional (priority 0) (table *print-pprint-dispatch*))
+  (check-type priority real)
+  (egcl::%check-pprint-dispatch-table table)
+  (setf (cdr table)
+        (remove type-specifier (cdr table) :key #'first :test #'equal))
+  (when function
+    (push (list type-specifier priority function) (cdr table)))
   nil)
+(defun egcl::%pprint-default-printer (stream object)
+  (let ((*print-pprint-dispatch* (egcl::%make-pprint-dispatch-table)))
+    (write object :stream stream)))
+(defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
+  (let ((entry (egcl::%pprint-dispatch-entry
+                (egcl::%check-pprint-dispatch-table
+                 (or table egcl::*standard-pprint-dispatch-table*))
+                object)))
+    (if entry
+        (values (third entry) t)
+        (values #'egcl::%pprint-default-printer nil))))
+(defun egcl::%pprint-dispatch-string (table object)
+  (let ((entry (egcl::%pprint-dispatch-entry table object)))
+    (when entry
+      (with-output-to-string (stream)
+        (funcall (third entry) stream object)))))
 ;; Random-state and readtable copiers. EGCL's RANDOM uses a single global PRNG
 ;; and its readtable is the immutable :STANDARD-READTABLE, so these return
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
@@ -1241,7 +1282,7 @@
          (*print-level* nil)
          (*print-lines* nil)
          (*print-miser-width* nil)
-         (*print-pprint-dispatch* *print-pprint-dispatch*)
+         (*print-pprint-dispatch* egcl::*standard-pprint-dispatch-table*)
          (*print-pretty* nil)
          (*print-radix* nil)
          (*print-readably* t)
@@ -4812,3 +4853,121 @@ a hook error aborts startup.")
     (loop for line in lines for index from start
           do (format (or stream *standard-output*) "~&  ~D: ~A~%" index line)))
   nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Standard functions that have no interactive environment behind them in a
+;;; batch image, plus a few small CLHS accessors (ansi CL-FUNCTION-SYMBOLS.1).
+
+;; BREAK (CLHS 9.2): enter the debugger on a SIMPLE-CONDITION, with
+;; *DEBUGGER-HOOK* disabled so a hook cannot intercept it.
+(defun break (&optional (format-control "Break") &rest format-arguments)
+  (let ((*debugger-hook* nil))
+    (invoke-debugger (make-condition 'simple-condition
+                                     :format-control format-control
+                                     :format-arguments format-arguments)))
+  nil)
+
+;; DRIBBLE (CLHS 25.1): there is no session transcript to record; a no-op.
+(defun dribble (&optional pathname)
+  (declare (ignore pathname))
+  (values))
+
+(defun long-site-name () nil)
+(defun short-site-name () nil)
+
+(defgeneric describe-object (object stream))
+(defmethod describe-object (object stream)
+  (format stream "~&~S is an object of type ~S.~%" object (type-of object))
+  (values))
+
+(defun egcl::%designated-output-stream (stream)
+  (cond ((null stream) *standard-output*)
+        ((eq stream t) *terminal-io*)
+        (t stream)))
+
+(defun describe (object &optional stream)
+  (describe-object object (egcl::%designated-output-stream stream))
+  (values))
+
+(defun inspect (object)
+  (describe object)
+  (values))
+
+(defun egcl::%query-answer (prompt-control prompt-arguments suffix)
+  (let ((stream *query-io*))
+    (when prompt-control
+      (fresh-line stream)
+      (apply #'format stream prompt-control prompt-arguments))
+    (write-string suffix stream)
+    (finish-output stream)
+    (string-trim " " (read-line stream))))
+
+(defun y-or-n-p (&optional control &rest arguments)
+  (loop
+    (let ((answer (egcl::%query-answer control arguments " (y or n) ")))
+      (cond ((string-equal answer "y") (return t))
+            ((string-equal answer "n") (return nil))
+            (t (format *query-io* "~&Please answer y or n.~%"))))))
+
+(defun yes-or-no-p (&optional control &rest arguments)
+  (loop
+    (let ((answer (egcl::%query-answer control arguments " (yes or no) ")))
+      (cond ((string-equal answer "yes") (return t))
+            ((string-equal answer "no") (return nil))
+            (t (format *query-io* "~&Please answer yes or no.~%"))))))
+
+;; Streams carry a single external format in this image.
+(defun stream-external-format (stream)
+  (check-type stream stream)
+  :default)
+
+(defun print-not-readable-object (condition)
+  (slot-value condition 'object))
+
+(defun ensure-generic-function (name &rest options &key lambda-list &allow-other-keys)
+  (declare (ignore options))
+  (cond ((and (fboundp name) (typep (fdefinition name) 'generic-function))
+         (fdefinition name))
+        ((fboundp name)
+         (error 'program-error
+                :format-control "~S already names an ordinary function, macro or special operator."
+                :format-arguments (list name)))
+        (t (eval `(defgeneric ,name ,lambda-list)))))
+
+(defun invalid-method-error (method format-control &rest format-arguments)
+  (error "Invalid method ~S:~%~?" method format-control format-arguments))
+
+(defun method-combination-error (format-control &rest format-arguments)
+  (error "Method combination error:~%~?" format-control format-arguments))
+
+;; MAKE-LOAD-FORM-SAVING-SLOTS (CLHS 7.7): a creation form that allocates an
+;; instance of the object's class and an initialization form that fills the
+;; (bound) slots, defaulting to every slot of the class.
+(defun make-load-form-saving-slots (object &key (slot-names nil slot-names-p) environment)
+  (declare (ignore environment))
+  (let* ((class (class-of object))
+         (names (if slot-names-p
+                    slot-names
+                    (mapcar #'slot-definition-name (class-slots class)))))
+    (values `(allocate-instance (find-class ',(class-name class)))
+            `(progn
+               ,@(loop for name in names
+                       when (slot-boundp object name)
+                         collect `(setf (slot-value ,object ',name)
+                                        ',(slot-value object name)))
+               ,object))))
+
+;; PPRINT-TAB (CLHS 22.4): outside the pretty printer's logical blocks a tab
+;; produces no output; the arguments are still checked.
+(defun pprint-tab (kind colnum colinc &optional stream)
+  (check-type kind (member :line :section :line-relative :section-relative))
+  (check-type colnum (integer 0))
+  (check-type colinc (integer 0))
+  (egcl::%designated-output-stream stream)
+  nil)
+
+;; PPRINT-TABULAR (CLHS 22.4): columns are not laid out yet; the elements are
+;; printed like PPRINT-FILL, which is the non-pretty rendering.
+(defun pprint-tabular (stream list &optional (colon-p t) at-sign-p (tabsize 16))
+  (check-type tabsize (integer 0))
+  (pprint-fill stream list colon-p at-sign-p))

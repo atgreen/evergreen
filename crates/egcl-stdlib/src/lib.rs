@@ -141,6 +141,7 @@ pub use sequences::{
 };
 pub use streams::GrayStream;
 pub use streams::stream_class_name;
+pub use streams::{broadcast_stream_streams, concatenated_stream_streams};
 pub use streams::{
     ExternalFormat, StreamDirection, StreamElementType, close, file_length_fn, file_position,
     get_output_stream_string, input_stream_p, interactive_stream_p, is_byte_stream,

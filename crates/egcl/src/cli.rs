@@ -9675,6 +9675,12 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         out.push_str("#<print depth exhausted>");
         return;
     }
+    // A *PRINT-PPRINT-DISPATCH* entry applying to VAL prints it instead (only
+    // when *PRINT-PRETTY* is true and a table with entries is bound).
+    if let Some(s) = egcl_stdlib::format::dispatch_pprint(val, PRINT_ESCAPE.with(|c| c.get())) {
+        out.push_str(&s);
+        return;
+    }
     if val.is_nil() {
         out.push_str("NIL");
     } else if val == T {
@@ -10083,6 +10089,12 @@ fn format_control_message(control: &str, args: &[EgclVal]) -> Result<String, Egc
 
 #[inline]
 fn princ_val(val: EgclVal, out: &mut String) {
+    // A *PRINT-PPRINT-DISPATCH* entry applying to VAL prints it instead (only
+    // when *PRINT-PRETTY* is true and a table with entries is bound).
+    if let Some(s) = egcl_stdlib::format::dispatch_pprint(val, false) {
+        out.push_str(&s);
+        return;
+    }
     if val.is_heap_object() {
         unsafe {
             let ptr = val.as_ptr();
@@ -11192,6 +11204,34 @@ fn dispatch_print_object(val: EgclVal, escape: bool) -> Option<String> {
 /// Hook installed into the stdlib formatter so its `~A`/`~S` render honour user
 /// `print-object` methods too. Delegates to [`dispatch_print_object`], which
 /// requires a print env to be parked (the FORMAT builtin parks it).
+/// Pretty-print dispatch for the stdlib printer (CLHS 22.2.1.4): when
+/// *PRINT-PPRINT-DISPATCH* holds a table with entries, ask
+/// EGCL::%PPRINT-DISPATCH-STRING (boot.lisp) for the text of the highest-
+/// priority applicable entry, or None to print normally.
+fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
+    let table = egcl_rt::symbols::find_index("*PRINT-PPRINT-DISPATCH*")
+        .and_then(egcl_rt::symbols::symbol_value)?;
+    if table == egcl_rt::value::UNBOUND || !table.is_cons() || cp(table).1.is_nil() {
+        return None;
+    }
+    let ptr = PRINT_ENV.with(|c| c.get());
+    if ptr.is_null() {
+        return None;
+    }
+    egcl_rt::rooted!(val = val);
+    egcl_rt::rooted!(table = table);
+    let dispatch = resolve_sym("EGCL::%PPRINT-DISPATCH-STRING")?;
+    // Safety: the parked pointer is the live print-entry &mut Env (as in
+    // stdlib_print_object_hook); printing is single-threaded.
+    let env = unsafe { &mut *ptr };
+    let result = apply_function(dispatch, &[*table, *val], env).ok()?;
+    if is_string_value(result) {
+        Some(val_as_str(result))
+    } else {
+        None
+    }
+}
+
 fn stdlib_print_object_hook(val: EgclVal, escape: bool) -> Option<String> {
     // Root VAL for the whole hook. `dispatch_print_object` allocates (a string
     // output stream, the applicable-method search) and usually declines, and the
@@ -11689,6 +11729,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     reader::set_struct_constructor(Some(reader_struct_constructor));
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+    egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -18208,6 +18249,41 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (sf, _) = cp(cdr);
                 let s = eval_form(sf, env)?;
                 return Ok(egcl_stdlib::two_way_stream_output_stream(s).unwrap_or(NIL));
+            }
+            "ECHO-STREAM-INPUT-STREAM" | "ECHO-STREAM-OUTPUT-STREAM" => {
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                let component = if name == "ECHO-STREAM-INPUT-STREAM" {
+                    egcl_stdlib::two_way_stream_input_stream(s)
+                } else {
+                    egcl_stdlib::two_way_stream_output_stream(s)
+                };
+                let is_echo = egcl_stdlib::stream_class_name(s) == Some("ECHO-STREAM");
+                return match component {
+                    Some(c) if is_echo => Ok(c),
+                    _ => Err(EgclError::TypeError {
+                        datum: s,
+                        expected: "ECHO-STREAM".into(),
+                    }),
+                };
+            }
+            "BROADCAST-STREAM-STREAMS" | "CONCATENATED-STREAM-STREAMS" => {
+                let (sf, _) = cp(cdr);
+                let s = eval_form(sf, env)?;
+                let (components, expected) = if name == "BROADCAST-STREAM-STREAMS" {
+                    (egcl_stdlib::broadcast_stream_streams(s), "BROADCAST-STREAM")
+                } else {
+                    (egcl_stdlib::concatenated_stream_streams(s), "CONCATENATED-STREAM")
+                };
+                let Some(mut components) = components else {
+                    return Err(EgclError::TypeError {
+                        datum: s,
+                        expected: expected.into(),
+                    });
+                };
+                // Root the component streams across the list allocation.
+                egcl_rt::rooted_ref!(_components_root = &mut components);
+                return Ok(vec_to_list(&components));
             }
             "MACRO-FUNCTION" => return eval_builtin_arguments(&name, cdr, env),
             "SPECIAL-OPERATOR-P" => return eval_builtin_arguments(&name, cdr, env),
@@ -36525,6 +36601,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "SYNONYM-STREAM-SYMBOL" | "TWO-WAY-STREAM-INPUT-STREAM"
             | "TWO-WAY-STREAM-OUTPUT-STREAM" | "USER-HOMEDIR-PATHNAME" | "WRITE-BYTE"
             | "COMPILER-MACRO-FUNCTION" | "MACRO-FUNCTION"
+            | "BROADCAST-STREAM-STREAMS" | "ECHO-STREAM-INPUT-STREAM"
+            | "ECHO-STREAM-OUTPUT-STREAM"
     )
 }
 
@@ -37697,6 +37775,29 @@ fn eval_multiple_value_bind(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
 }
 
 // ── HANDLER-CASE ────────────────────────────────────────────────
+/// Bind a HANDLER-CASE clause variable. Like a LET binding, it is DYNAMIC when
+/// the name is special — proclaimed, or declared `(special v)` at the head of
+/// the clause body (CLHS 3.3.4; ansi HANDLER-CASE.11) — and lexical otherwise.
+fn bind_handler_case_variable(
+    env: &mut Env,
+    name: &str,
+    condition: EgclVal,
+    body: EgclVal,
+    dyn_binds: &mut Vec<DynBind>,
+) {
+    let sym = resolve_sym(name).unwrap_or(NIL);
+    if sym.is_symbol() {
+        let body_specials = let_body_special_decls(body);
+        if let_binding_is_dynamic(sym, &body_specials) {
+            dyn_binds.push(DynBind::establish(sym, condition));
+            expose_locally_special(env, sym);
+            env.locally_specials.extend(body_specials);
+            return;
+        }
+    }
+    env.define_local(name, condition);
+}
+
 fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (protected_form, clauses) = cp(cdr);
     let base_len = env.handlers.len();
@@ -37801,8 +37902,11 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
                             // fired by an allocation in the body must scan it or the
                             // clause variable is left dangling (bliss-5jwg).
                             egcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
+                            egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
                             if let Some(name) = var_name {
-                                handler_env.define_local(&name, *condition);
+                                bind_handler_case_variable(
+                                    &mut handler_env, &name, *condition, body, &mut dyn_binds,
+                                );
                             }
                             let r = eval_progn(body, &mut handler_env)?;
                             // Propagate the handler's multiple-value state to the
@@ -37843,8 +37947,11 @@ fn eval_handler_case(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
                             // frame holds the condition variable, which a body
                             // GC would otherwise leave dangling (bliss-5jwg).
                             egcl_rt::rooted_ref!(_handler_env_root = &mut handler_env);
+                            egcl_rt::rooted!(dyn_binds = Vec::<DynBind>::new());
                             if let Some(name) = var_name {
-                                handler_env.define_local(&name, condition);
+                                bind_handler_case_variable(
+                                    &mut handler_env, &name, condition, body, &mut dyn_binds,
+                                );
                             }
                             let r = eval_progn(body, &mut handler_env)?;
                             // Propagate the handler's multiple-value state to the
@@ -39539,6 +39646,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // A restored entry point can run without reading any source. Its formatter
     // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+    egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
     let ca = if embedded_image_header().is_some_and(|(_, _, app)| app) {
         let mut ca = CliArgs::parse(&[])?;
         ca.cl_args = args.to_vec();
@@ -42746,6 +42854,7 @@ mod error_backtrace_rooting_tests {
         impl Drop for RestorePrinter {
             fn drop(&mut self) {
                 egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
+                egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
             }
         }
         egcl_stdlib::format::set_print_object_hook(Some(collecting_printer));

@@ -35,6 +35,42 @@ fn dispatch_print_object(v: EgclVal, escapep: bool) -> Option<String> {
     hook.and_then(|h| h(v, escapep))
 }
 
+// ── Pretty-print dispatch hook ────────────────────────────────────
+// With *PRINT-PRETTY* true the printer consults *PRINT-PPRINT-DISPATCH*
+// (CLHS 22.2.1.4). The table and its type tests live in Lisp, so the
+// interpreter installs a hook that returns the rendered text when an entry
+// applies. A plain atomic, so the per-object check takes no lock.
+pub type PprintDispatchHook = fn(EgclVal, bool) -> Option<String>;
+static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_pprint_dispatch_hook(hook: Option<PprintDispatchHook>) {
+    PPRINT_DISPATCH_HOOK.store(
+        hook.map_or(0, |h| h as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The text a *PRINT-PPRINT-DISPATCH* entry prints for `v`, when *PRINT-PRETTY*
+/// is true, a dispatch hook is installed and an entry applies. Shared with the
+/// interpreter's own printer so WRITE and FORMAT agree.
+pub fn dispatch_pprint(v: EgclVal, escapep: bool) -> Option<String> {
+    let raw = PPRINT_DISPATCH_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw == 0 || !print_pretty_active() {
+        return None;
+    }
+    // SAFETY: the cell only ever holds 0 or a `PprintDispatchHook` stored above.
+    let hook: PprintDispatchHook = unsafe { std::mem::transmute::<usize, PprintDispatchHook>(raw) };
+    hook(v, escapep)
+}
+
+/// `*PRINT-PRETTY*` is true.
+pub fn print_pretty_active() -> bool {
+    egcl_rt::symbols::find_index("*PRINT-PRETTY*")
+        .and_then(egcl_rt::symbols::symbol_value)
+        .map(|v| v != UNBOUND && !v.is_nil())
+        .unwrap_or(false)
+}
+
 // ── String allocation ─────────────────────────────────────────────
 
 /// Allocate a EgclVal string using the interned string table from the
@@ -1232,6 +1268,11 @@ fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
 }
 
 fn egclval_to_print_inner(v: EgclVal, escapep: bool) -> String {
+    // A *PRINT-PPRINT-DISPATCH* entry applying to V prints it instead
+    // (only when *PRINT-PRETTY* is true and a table with entries is bound).
+    if let Some(s) = dispatch_pprint(v, escapep) {
+        return s;
+    }
     if v.is_nil() {
         return "NIL".into();
     }
