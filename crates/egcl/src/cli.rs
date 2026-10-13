@@ -8941,9 +8941,17 @@ impl Env {
             set_global("*STANDARD-OUTPUT*", *stdout_stream);
             set_global("*ERROR-OUTPUT*", *stderr_stream);
             set_global("*TRACE-OUTPUT*", *stdout_stream);
-            set_global("*TERMINAL-IO*", *stdout_stream);
-            set_global("*QUERY-IO*", *stdout_stream);
-            set_global("*DEBUG-IO*", *stdout_stream);
+            // *TERMINAL-IO* is bidirectional (CLHS 21.1.1.1; ansi streams
+            // input-stream-p.2, make-synonym-stream.4): a two-way stream over
+            // the process's standard input and output, shared by the
+            // interactive *QUERY-IO* and *DEBUG-IO*.
+            egcl_rt::rooted!(
+                terminal_io = egcl_stdlib::make_two_way_stream(*stdin_stream, *stdout_stream)
+                    .unwrap_or(*stdout_stream)
+            );
+            set_global("*TERMINAL-IO*", *terminal_io);
+            set_global("*QUERY-IO*", *terminal_io);
+            set_global("*DEBUG-IO*", *terminal_io);
         }
         // Initialise a special variable's global value cell only if it is not
         // already bound, so re-entering `new_impl` (a fresh top-level env — e.g.
@@ -13925,6 +13933,25 @@ fn expected_type_value(expected: &str) -> EgclVal {
     arena_str(expected)
 }
 
+/// A FILE-ERROR whose FILE-ERROR-PATHNAME is `pathname` (ansi files
+/// file-error.1, probe-file.error.3/.4): the condition is signalled here, so a
+/// HANDLER-CASE sees it with its slot; when nothing handles it the error
+/// propagates as an already-signalled condition.
+fn file_error_with_pathname(env: &mut Env, pathname: EgclVal, message: &str) -> EgclError {
+    egcl_rt::rooted!(pathname = pathname);
+    let pathname_key = resolve_sym("PATHNAME").unwrap_or(NIL);
+    match build_condition_instance(env, "FILE-ERROR", &[pathname_key, *pathname]) {
+        Ok(condition) => {
+            egcl_rt::rooted!(condition = condition);
+            match signal_condition_object(*condition, env) {
+                Err(transfer) => transfer,
+                Ok(_) => EgclError::signalled(*condition, message.to_string(), Vec::new()),
+            }
+        }
+        Err(error) => error,
+    }
+}
+
 fn resolve_against_dpd(v: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(v = simple_path_string(v));
     let mut pn = coerce_to_pathname(*v)?;
@@ -14888,7 +14915,97 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
     }
 }
 
+/// `(INTEGER lo hi)` for the integer shorthands BIT, (MOD n), UNSIGNED-BYTE,
+/// (UNSIGNED-BYTE n), SIGNED-BYTE and (SIGNED-BYTE n), so the numeric range
+/// algebra decides them (ansi streams open.output.6: (subtypep '(integer 0 1)
+/// '(unsigned-byte 1))); None for anything else.
+fn canonical_integer_type(spec: EgclVal) -> Option<EgclVal> {
+    fn power_of_two(n: u32) -> EgclVal {
+        if n < 62 {
+            EgclVal::from_fixnum(1i64 << n)
+        } else {
+            let mut mag = Vec::new();
+            egcl_rt::bignum::mag_set_bit(&mut mag, n as usize);
+            egcl_rt::bignum::BigInt::from_mag(1, mag).to_val()
+        }
+    }
+    fn minus_one(v: EgclVal) -> EgclVal {
+        if v.is_fixnum() {
+            EgclVal::from_fixnum(v.as_fixnum() - 1)
+        } else {
+            let b = egcl_rt::bignum::bigint_from_val(v).unwrap_or_else(egcl_rt::bignum::BigInt::zero);
+            egcl_rt::bignum::BigInt::from_mag(1, egcl_rt::bignum::mag_sub(&b.mag, &[1])).to_val()
+        }
+    }
+    fn negate(v: EgclVal) -> EgclVal {
+        if v.is_fixnum() {
+            EgclVal::from_fixnum(-v.as_fixnum())
+        } else {
+            let b = egcl_rt::bignum::bigint_from_val(v).unwrap_or_else(egcl_rt::bignum::BigInt::zero);
+            egcl_rt::bignum::BigInt::from_mag(-1, b.mag).to_val()
+        }
+    }
+    // Take the specifier apart BEFORE interning anything: resolve_sym may
+    // allocate, and `spec` is a caller's unrooted value (gc-root-lint).
+    let (head, width) = if spec.is_cons() {
+        let (head, rest) = cp(spec);
+        let width = if rest.is_cons() { Some(cp(rest).0) } else { None };
+        (head, width)
+    } else if spec.is_symbol() {
+        (spec, None)
+    } else {
+        return None;
+    };
+    egcl_rt::rooted!(head = head);
+    let mut width = width;
+    egcl_rt::rooted_ref!(_width_root = &mut width);
+    let head = *head;
+    let integer = resolve_sym("INTEGER")?;
+    let star = resolve_sym("*")?;
+    let width_bits = width.filter(|w| w.is_fixnum() && w.as_fixnum() > 0 && w.as_fixnum() < 100_000)
+        .map(|w| w.as_fixnum() as u32);
+    let (lo, hi) = match sym_bare_name_rc(head).as_ref() {
+        "BIT" if width.is_none() => (EgclVal::from_fixnum(0), EgclVal::from_fixnum(1)),
+        "MOD" => {
+            let n = width.filter(|w| w.is_fixnum() && w.as_fixnum() > 0)?;
+            (EgclVal::from_fixnum(0), EgclVal::from_fixnum(n.as_fixnum() - 1))
+        }
+        "UNSIGNED-BYTE" => match width_bits {
+            Some(bits) => {
+                egcl_rt::rooted!(hi = minus_one(power_of_two(bits)));
+                (EgclVal::from_fixnum(0), *hi)
+            }
+            None if width.is_none() || width == Some(star) => (EgclVal::from_fixnum(0), star),
+            None => return None,
+        },
+        "SIGNED-BYTE" => match width_bits {
+            Some(bits) => {
+                egcl_rt::rooted!(half = power_of_two(bits - 1));
+                egcl_rt::rooted!(hi = minus_one(*half));
+                egcl_rt::rooted!(lo = negate(*half));
+                (*lo, *hi)
+            }
+            None if width.is_none() || width == Some(star) => return Some(integer),
+            None => return None,
+        },
+        _ => return None,
+    };
+    egcl_rt::rooted!(lo = lo);
+    egcl_rt::rooted!(hi = hi);
+    Some(vec_to_list(&[integer, *lo, *hi]))
+}
+
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    if let Some(canonical) = canonical_integer_type(t1) {
+        egcl_rt::rooted!(canonical = canonical);
+        egcl_rt::rooted!(t2 = t2);
+        return subtypep_relation(*canonical, *t2);
+    }
+    if let Some(canonical) = canonical_integer_type(t2) {
+        egcl_rt::rooted!(canonical = canonical);
+        egcl_rt::rooted!(t1 = t1);
+        return subtypep_relation(*t1, *canonical);
+    }
     // egcl has no extended characters, so BASE-CHAR and CHARACTER are the same
     // type in both directions (TYPEP already says so; ansi arrays
     // upgraded-array-element-type.2 checks the two SUBTYPEP answers agree).
@@ -17088,7 +17205,8 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "GET-OUTPUT-STREAM-STRING" | "PROBE-FILE" | "TRUENAME" | "DELETE-FILE"
         | "FILE-WRITE-DATE" => Some((1, 1)),
         "RENAME-FILE" => Some((2, 2)),
-        "ENSURE-DIRECTORIES-EXIST" => Some((1, 3)),
+        "ENSURE-DIRECTORIES-EXIST" => Some((1, 65)),
+        "DIRECTORY" => Some((1, 65)),
         "CLOSE" => Some((1, 3)),
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
@@ -22099,6 +22217,17 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if is_path_designator(*pathname) {
                     *pathname = resolve_against_dpd(*pathname, env)?;
                 }
+                if egcl_stdlib::is_pathname(*pathname)
+                    && egcl_stdlib::wild_pathname_p(*pathname, None)
+                {
+                    // A wild pathname names no single file (CLHS PROBE-FILE;
+                    // ansi files probe-file.error.3/.4, file-error.1).
+                    return Err(file_error_with_pathname(
+                        env,
+                        *pathname,
+                        "PROBE-FILE: wild pathname",
+                    ));
+                }
                 return Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL));
             }
             "OPEN" => return eval_builtin_arguments(&name, cdr, env),
@@ -22126,8 +22255,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 if is_path_designator(*from) {
                     *from = resolve_against_dpd(*from, env)?;
                 }
+                // NEW-NAME is merged with FILESPEC (CLHS RENAME-FILE), so a bare
+                // name keeps the old type and directory (ansi rename-file.3).
                 if is_path_designator(*to) {
-                    *to = resolve_against_dpd(*to, env)?;
+                    *to = egcl_stdlib::merge_pathnames(
+                        coerce_to_pathname(simple_path_string(*to))?,
+                        *from,
+                        NIL,
+                    )?;
                 }
                 let (defaulted, old_true, new_true) = egcl_stdlib::rename_file(*from, *to)?;
                 env.set_mv(vec![defaulted, old_true, new_true]);
@@ -22262,7 +22397,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // :resolve-symlinks) are accepted and ignored. Needed by ASDF's
                 // source-registry directory walk (bliss-lb6.14).
                 let (path_form, _) = cp(cdr);
-                let mut pathspec = eval_form(path_form, env)?;
+                let mut pathspec = simple_path_string(eval_form(path_form, env)?);
                 egcl_rt::rooted_ref!(_pathspec_root = &mut pathspec);
                 egcl_rt::rooted!(
                     pathname = if egcl_stdlib::is_pathname(pathspec) {
@@ -22423,11 +22558,29 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "ENSURE-DIRECTORIES-EXIST" => {
                 // (ensure-directories-exist pathspec &key verbose) → pathspec plus
                 // a second value that is true if any directory was created.
-                let (ps_form, _) = cp(cdr);
-                let pathspec = eval_form(ps_form, env)?;
-                let (pn, created) = egcl_stdlib::ensure_directories_exist(pathspec)?;
-                env.set_mv(vec![pn, if created { T } else { NIL }]);
-                return Ok(pn);
+                let args = list_to_vec(cdr);
+                let vals = eval_forms(args.iter().copied(), env)?;
+                check_keyword_args("ENSURE-DIRECTORIES-EXIST", &vals[1..], &["VERBOSE"])?;
+                egcl_rt::rooted!(pathspec = vals[0]);
+                egcl_rt::rooted!(resolved = if is_path_designator(*pathspec) {
+                    resolve_against_dpd(*pathspec, env)?
+                } else {
+                    *pathspec
+                });
+                // A wild pathname names no directory to create (CLHS; ansi
+                // files ensure-directories-exist.error.1).
+                if egcl_stdlib::is_pathname(*resolved)
+                    && egcl_stdlib::wild_pathname_p(*resolved, None)
+                {
+                    return Err(file_error_with_pathname(
+                        env,
+                        *resolved,
+                        "ENSURE-DIRECTORIES-EXIST: wild pathname",
+                    ));
+                }
+                let (_, created) = egcl_stdlib::ensure_directories_exist(*resolved)?;
+                env.set_mv(vec![*pathspec, if created { T } else { NIL }]);
+                return Ok(*pathspec);
             }
             "STRING" => {
                 // (string x): exactly one argument (ansi STRING.ERROR.1/2 →
@@ -39802,9 +39955,14 @@ fn reopen_standard_streams() {
     set_global("*STANDARD-OUTPUT*", *stdout_stream);
     set_global("*ERROR-OUTPUT*", *stderr_stream);
     set_global("*TRACE-OUTPUT*", *stdout_stream);
-    set_global("*TERMINAL-IO*", *stdout_stream);
-    set_global("*QUERY-IO*", *stdout_stream);
-    set_global("*DEBUG-IO*", *stdout_stream);
+    // See Env::new: *TERMINAL-IO* is a two-way stream over stdin and stdout.
+    egcl_rt::rooted!(
+        terminal_io = egcl_stdlib::make_two_way_stream(*stdin_stream, *stdout_stream)
+            .unwrap_or(*stdout_stream)
+    );
+    set_global("*TERMINAL-IO*", *terminal_io);
+    set_global("*QUERY-IO*", *terminal_io);
+    set_global("*DEBUG-IO*", *terminal_io);
 }
 
 /// If the running binary has an image appended by an `:executable` save, return

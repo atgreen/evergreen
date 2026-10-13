@@ -346,7 +346,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 if !egcl_stdlib::output_stream_p(component) {
                     return Err(EgclError::TypeError {
                         datum: component,
-                        expected: "STREAM".into(),
+                        expected: "(AND STREAM (SATISFIES OUTPUT-STREAM-P))".into(),
                     });
                 }
             }
@@ -363,7 +363,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 if !egcl_stdlib::input_stream_p(component) {
                     return Err(EgclError::TypeError {
                         datum: component,
-                        expected: "STREAM".into(),
+                        expected: "(AND STREAM (SATISFIES INPUT-STREAM-P))".into(),
                     });
                 }
             }
@@ -399,6 +399,12 @@ fn resolve(name: &str) -> Option<Handler> {
             // that is the current value of SYMBOL.
 
             let symbol = args.first().copied().unwrap_or(NIL);
+            if !symbol.is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: symbol,
+                    expected: "SYMBOL".into(),
+                });
+            }
             egcl_stdlib::make_synonym_stream(symbol)
         }),
 
@@ -1163,7 +1169,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             let byte = args[0];
-            let out = resolve_output_stream(args[1], env);
+            // A binary output STREAM, not a designator (ansi write-byte.error.4).
+            require_stream(args[1])?;
+            let out = args[1];
             check_pending_sigpipe_for_output()?;
             if is_gray_stream(out) {
                 invoke_generic_function("STREAM-WRITE-BYTE", &[out, byte], env)?;
@@ -1181,8 +1189,10 @@ fn resolve(name: &str) -> Option<Handler> {
             if args.is_empty() {
                 return Err(EgclError::Internal("READ-BYTE requires a stream".into()));
             }
-            let inp = resolve_input_stream(args[0], env);
-            require_stream(inp)?;
+            // READ-BYTE takes a binary input STREAM, not a designator: NIL and
+            // T are TYPE-ERRORs (ansi read-byte.error.5).
+            require_stream(args[0])?;
+            let inp = args[0];
             let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
             let gray = is_gray_stream(inp);
             let b = if gray {
@@ -4664,13 +4674,13 @@ fn check_two_way_components(input: EgclVal, output: EgclVal) -> Result<(), EgclE
     if !egcl_stdlib::input_stream_p(input) {
         return Err(EgclError::TypeError {
             datum: input,
-            expected: "STREAM".into(),
+            expected: "(AND STREAM (SATISFIES INPUT-STREAM-P))".into(),
         });
     }
     if !egcl_stdlib::output_stream_p(output) {
         return Err(EgclError::TypeError {
             datum: output,
-            expected: "STREAM".into(),
+            expected: "(AND STREAM (SATISFIES OUTPUT-STREAM-P))".into(),
         });
     }
     Ok(())
