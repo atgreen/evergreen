@@ -40,6 +40,59 @@ fn dispatch_print_object(v: EgclVal, escapep: bool) -> Option<String> {
 // (CLHS 22.2.1.4). The table and its type tests live in Lisp, so the
 // interpreter installs a hook that returns the rendered text when an entry
 // applies. A plain atomic, so the per-object check takes no lock.
+/// Applies a Lisp function object to arguments, installed by the evaluator so
+/// FORMAT can run a FORMATTER function given as a `~{~}` body or `~/name/`.
+pub type FormatApplyHook = fn(EgclVal, &[EgclVal]) -> Result<EgclVal, EgclError>;
+static FORMAT_APPLY_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_format_apply_hook(hook: Option<FormatApplyHook>) {
+    FORMAT_APPLY_HOOK.store(
+        hook.map_or(0, |h| h as usize),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Call `func` on `args`: through the evaluator's hook when installed (which
+/// handles interpreted closures), else through the compiled entry point.
+fn apply_format_function(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let raw = FORMAT_APPLY_HOOK.load(std::sync::atomic::Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: the cell only ever holds 0 or a `FormatApplyHook` stored above.
+        let hook: FormatApplyHook = unsafe { std::mem::transmute::<usize, FormatApplyHook>(raw) };
+        return hook(func, args);
+    }
+    call_format_dispatch(func, args)
+}
+
+/// One pass over a `~{` body. An empty body takes its control from the first
+/// argument (CLHS 22.3.7.4): a string is formatted in place; a function (a
+/// FORMATTER) is called with a string stream and the remaining arguments and
+/// returns the arguments it did not consume (ansi format.{.17-19).
+fn run_iteration_body(
+    body: &str,
+    body_function: Option<EgclVal>,
+    elements: &[EgclVal],
+    idx: &mut usize,
+    output: &mut String,
+) -> Result<(), EgclError> {
+    let Some(func) = body_function else {
+        return format_impl(body, elements, idx, output);
+    };
+    egcl_rt::rooted!(func = func);
+    egcl_rt::rooted!(stream = crate::streams::make_string_output_stream(NIL)?);
+    let mut call_args: Vec<EgclVal> = Vec::with_capacity(elements.len() - *idx + 1);
+    call_args.push(*stream);
+    call_args.extend_from_slice(&elements[*idx..]);
+    egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
+    let tail = apply_format_function(*func, &call_args)?;
+    let remaining = if tail.is_cons() { cons_list_to_vec(tail).len() } else { 0 };
+    *idx += (elements.len() - *idx).saturating_sub(remaining);
+    if let Some(text) = extract_egcl_string(crate::streams::get_output_stream_string(*stream)?) {
+        output.push_str(&text);
+    }
+    Ok(())
+}
+
 pub type PprintDispatchHook = fn(EgclVal, bool) -> Option<String>;
 static PPRINT_DISPATCH_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -102,6 +155,17 @@ fn extract_egcl_string(v: EgclVal) -> Option<String> {
     }
 }
 
+/// The readtable case the printer folds symbol names for: the current
+/// readtable's, except that *PRINT-READABLY* output must read back under the
+/// STANDARD readtable (CLHS 22.1.3.3.1), i.e. :UPCASE.
+fn effective_readtable_case_mode() -> u8 {
+    if print_readably_active() {
+        0
+    } else {
+        egcl_compiler::reader::current_readtable_case_mode()
+    }
+}
+
 /// The current `*PRINT-BASE*` radix (CLHS 22.1.1.1), read directly from the
 /// special's global value cell — which a dynamic `(let ((*print-base* r)) …)`
 /// save/restores — so BOTH printers (the interpreter's `print_val` and this
@@ -114,32 +178,52 @@ fn extract_egcl_string(v: EgclVal) -> Option<String> {
 /// `:UPCASE` (the default) leaves it unchanged; `:DOWNCASE` lower-cases; and
 /// `:CAPITALIZE` title-cases each alphanumeric word. CLHS 22.1.3.3.
 pub fn apply_print_case(name: &str) -> String {
+    // CLHS 22.1.3.3.2: the readtable case decides which characters
+    // *PRINT-CASE* governs.  :UPCASE -- the uppercase ones; :DOWNCASE -- the
+    // lowercase ones; :PRESERVE -- none; :INVERT -- a name whose letters are
+    // all one case is inverted, a mixed one is left alone.
+    let mode = effective_readtable_case_mode();
+    match mode {
+        2 => return name.to_string(),
+        3 => {
+            let has_upper = name.chars().any(char::is_uppercase);
+            let has_lower = name.chars().any(char::is_lowercase);
+            return if has_upper && !has_lower {
+                name.to_lowercase()
+            } else if has_lower && !has_upper {
+                name.to_uppercase()
+            } else {
+                name.to_string()
+            };
+        }
+        _ => {}
+    }
+    let affected = |c: char| if mode == 1 { c.is_lowercase() } else { c.is_uppercase() };
     let case = egcl_rt::symbols::find_index("*PRINT-CASE*")
         .and_then(egcl_rt::symbols::symbol_value)
         .filter(|v| v.is_symbol())
         .and_then(|v| egcl_compiler::reader::symbol_name(v.as_symbol_index()));
-    match case.as_deref() {
-        Some("KEYWORD:DOWNCASE") => name.to_lowercase(),
-        Some("KEYWORD:CAPITALIZE") => {
-            let mut out = String::with_capacity(name.len());
-            let mut word_start = true;
-            for c in name.chars() {
-                if c.is_alphanumeric() {
+    let mut out = String::with_capacity(name.len());
+    let mut word_start = true;
+    for c in name.chars() {
+        if affected(c) {
+            match case.as_deref() {
+                Some("KEYWORD:DOWNCASE") => out.extend(c.to_lowercase()),
+                Some("KEYWORD:CAPITALIZE") => {
                     if word_start {
                         out.extend(c.to_uppercase());
                     } else {
                         out.extend(c.to_lowercase());
                     }
-                    word_start = false;
-                } else {
-                    out.push(c);
-                    word_start = true;
                 }
+                _ => out.extend(c.to_uppercase()), // :UPCASE or unset
             }
-            out
+        } else {
+            out.push(c);
         }
-        _ => name.to_string(), // :UPCASE or unset
+        word_start = !c.is_alphanumeric();
     }
+    out
 }
 
 /// Would `name` read back as a number rather than a symbol? Such a name must be
@@ -193,9 +277,17 @@ pub fn symbol_name_needs_bars(name: &str) -> bool {
     if name.is_empty() || name.chars().all(|c| c == '.') {
         return true;
     }
+    // Which letters would the reader fold?  Those need bars: lowercase under
+    // an :UPCASE readtable, uppercase under :DOWNCASE, none under :PRESERVE
+    // or :INVERT (the latter round-trips a single-case name).
+    let folded = |c: char| match effective_readtable_case_mode() {
+        0 => c.is_lowercase(),
+        1 => c.is_uppercase(),
+        _ => false,
+    };
     if name.chars().any(|c| {
         c.is_whitespace()
-            || c.is_lowercase()
+            || folded(c)
             || matches!(
                 c,
                 '(' | ')' | '\'' | '"' | ';' | '`' | ',' | '|' | '\\' | '#' | ':'
@@ -630,7 +722,27 @@ pub fn circle_visit(v: EgclVal) -> CircleMark {
     })
 }
 
+thread_local! {
+    /// A radix a `~B`/`~O`/`~X`/`~nR` directive imposes while it prints a
+    /// non-integer argument as `~A` (CLHS 22.3.2.2); 0 when none.
+    static PRINT_BASE_OVERRIDE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Print `val` as `~A` would under `*PRINT-BASE*` = `radix`, padded on the
+/// left to `mincol` with `padchar`: the non-integer case of the radix
+/// directives.
+fn push_non_integer_in_radix(output: &mut String, val: EgclVal, radix: u32, mincol: usize, padchar: char) {
+    let prev = PRINT_BASE_OVERRIDE.with(|c| c.replace(radix));
+    let text = egclval_to_print_string(val, false);
+    PRINT_BASE_OVERRIDE.with(|c| c.set(prev));
+    push_padded_left(output, &text, mincol, padchar);
+}
+
 pub fn print_base() -> u32 {
+    let forced = PRINT_BASE_OVERRIDE.with(|c| c.get());
+    if forced != 0 {
+        return forced;
+    }
     egcl_rt::symbols::find_index("*PRINT-BASE*")
         .and_then(egcl_rt::symbols::symbol_value)
         .filter(|v| v.is_fixnum())
@@ -908,6 +1020,22 @@ fn heap_vector_string(v: EgclVal, escapep: bool) -> Option<String> {
         // sync with cli print_val's COMPLEX_ARRAY branch — the two printers).
         if (*(ptr as *const ObjectHeader)).type_id() == type_id::COMPLEX_ARRAY {
             let count = crate::sequences::cvec_fill_pointer(v);
+            if crate::sequences::cvec_is_bit(v) {
+                // A fill-pointer / adjustable / displaced bit vector prints
+                // like a simple one (ansi print.bit-vector.5-7).
+                if !print_array_active() {
+                    return Some(format!("#<BIT-VECTOR {count}>"));
+                }
+                let mut s = String::from("#*");
+                for i in 0..count {
+                    let e = crate::sequences::cvec_element(v, i).unwrap_or(NIL);
+                    s.push(if e.is_fixnum() && e.as_fixnum() == 1 { '1' } else { '0' });
+                }
+                return Some(s);
+            }
+            if !print_array_active() {
+                return Some(format!("#<VECTOR {count}>"));
+            }
             let mut s = String::from("#(");
             for i in 0..count {
                 if i > 0 {
@@ -1329,10 +1457,10 @@ fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
         return s;
     }
     if v.is_nil() {
-        return "NIL".into();
+        return print_symbol_name("NIL", escapep);
     }
     if v == T {
-        return "T".into();
+        return print_symbol_name("T", escapep);
     }
     // CLOS instances are heap objects; detect them via the liveness registry
     // before the generic heap-object branch. A condition prints as its report
@@ -1672,6 +1800,15 @@ fn format_cons(v: EgclVal, escapep: bool) -> String {
     out
 }
 
+/// Append `text` to `output`, left-padded with `padchar` to `mincol` columns.
+fn push_padded_left(output: &mut String, text: &str, mincol: usize, padchar: char) {
+    let len = text.chars().count();
+    for _ in len..mincol {
+        output.push(padchar);
+    }
+    output.push_str(text);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_integer(
     n: i64,
@@ -1818,11 +1955,18 @@ fn pad_format_field(
     output: &mut String,
     s: &str,
     mincol: usize,
+    colinc: usize,
     minpad: usize,
     padchar: char,
     at_sign: bool,
 ) {
-    let pad = mincol.saturating_sub(s.chars().count()).max(minpad);
+    // MINPAD copies of PADCHAR, then COLINC more at a time until the field
+    // is at least MINCOL wide (CLHS 22.3.4.1; ansi format.a.22).
+    let len = s.chars().count();
+    let mut pad = minpad;
+    while len + pad < mincol {
+        pad += colinc.max(1);
+    }
     if at_sign {
         output.extend(std::iter::repeat_n(padchar, pad));
         output.push_str(s);
@@ -1942,7 +2086,8 @@ fn ordinal(n: i64) -> String {
 }
 
 fn to_roman(n: i64, old: bool) -> String {
-    if n <= 0 || n > 3999 {
+    // Four thousands print as MMMM (ansi format.r.19/20 go to 4999).
+    if n <= 0 || n > 4999 {
         return format!("{}", n);
     }
     let mut result = String::new();
@@ -1987,20 +2132,19 @@ fn to_roman(n: i64, old: bool) -> String {
 /// character itself when it has no name.  The implementation-defined names
 /// match SBCL for compatibility with libraries such as cl-str (bliss-rr9q).
 pub fn character_name(c: char) -> String {
-    match c {
-        ' ' => "Space".into(),
-        '\n' => "Newline".into(),
-        '\t' => "Tab".into(),
-        '\r' => "Return".into(),
-        '\x08' => "Backspace".into(),
-        '\x7f' => "Rubout".into(),
-        '\x0c' => "Page".into(),
-        '\x0b' => "Vt".into(),
-        '\u{0085}' => "Next-Line".into(),
-        '\u{00a0}' => "NO-BREAK_SPACE".into(),
-        '\u{3000}' => "IDEOGRAPHIC_SPACE".into(),
-        _ => format!("{}", c),
+    // CLHS 22.1.3.2: a graphic character other than Space prints as itself;
+    // Space and the non-graphic characters print by name.
+    if c != ' ' && graphic_char_p(c) {
+        return c.to_string();
     }
+    egcl_compiler::reader::char_name(c).unwrap_or_else(|| c.to_string())
+}
+
+/// GRAPHIC-CHAR-P as the printer sees it: the printing ASCII characters and
+/// everything from U+00A0 up (the C0 and C1 controls are not graphic).
+pub fn graphic_char_p(c: char) -> bool {
+    let code = c as u32;
+    (32..127).contains(&code) || code >= 160
 }
 
 // ── Directive parser ──────────────────────────────────────────────
@@ -2008,6 +2152,9 @@ pub fn character_name(c: char) -> String {
 #[derive(Debug, Clone)]
 enum Param {
     Num(i64),
+    /// A quoted character parameter (`~'X`), kept as a character so a
+    /// `~/name/` function receives it as one; numeric sites use its code.
+    Char(char),
     V,
     Hash,
     None,
@@ -2057,7 +2204,7 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
                 } else if c == '\'' {
                     i += 1;
                     if i < chars.len() {
-                        params.push(Param::Num(chars[i] as i64));
+                        params.push(Param::Char(chars[i]));
                         i += 1;
                     }
                     if i < chars.len() && chars[i] == ',' {
@@ -2073,7 +2220,13 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
                         num_str.push(chars[i]);
                         i += 1;
                     }
-                    params.push(Param::Num(num_str.parse::<i64>().unwrap_or(0)));
+                    // A literal too large for an i64 saturates: it is still "out
+                // of range" for ~[ and "pad everything" for widths.
+                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(if num_str.starts_with('-') {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                })));
                     if i < chars.len() && chars[i] == ',' {
                         i += 1;
                     }
@@ -2137,6 +2290,12 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
 // (CLHS 22.2.1.3), which only the directive interpreter knows.
 thread_local! {
     static LAST_CONSUMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Raised by `~^` (1) or `~:^` (2).  `format_impl` returns at its next
+    /// step, and the enclosing iteration, `~?` or `~<` decides what ends.
+    static FORMAT_ESCAPE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Inside `~:{` / `~:@{`: how many sublists remain after the current
+    /// pass, which is what a parameterless `~:^` tests.
+    static OUTER_REMAINING: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// How many arguments the last completed `format` call consumed.
@@ -2145,6 +2304,15 @@ pub fn last_consumed_arg_count() -> usize {
 }
 
 /// Execute a FORMAT directive string. R5.40.
+/// Clear and return the pending `~^` escape level (0 when none).
+fn take_escape() -> u8 {
+    FORMAT_ESCAPE.with(|c| c.replace(0))
+}
+
+fn escape_pending() -> bool {
+    FORMAT_ESCAPE.with(|c| c.get()) != 0
+}
+
 pub fn format(
     destination: EgclVal,
     control_string: &str,
@@ -2182,10 +2350,20 @@ pub fn format(
 
     // Validate matching brackets/braces/parens before executing
     validate_matching(control_string)?;
+    if control_has_overflow_justification(control_string) {
+        if let Some(d) = clause_directive_among(control_string, &['W', 'I', '_']) {
+            return Err(EgclError::ControlError(format!(
+                "~{d} is not allowed in a control string with a ~<...~:;...~> justification"
+            )));
+        }
+    }
 
     let mut output = String::new();
     let mut arg_idx: usize = 0;
+    take_escape();
     let result = format_impl(control_string, &args, &mut arg_idx, &mut output);
+    // A top-level `~^` ends the whole control string; nothing is left pending.
+    take_escape();
     if let Err(e) = &result {
         if std::env::var_os("EGCL_FMT_DBG").is_some() {
             eprintln!(
@@ -2345,6 +2523,9 @@ fn format_impl(
     let chars: Vec<char> = control.chars().collect();
     let mut i = 0;
     while i < chars.len() {
+        if escape_pending() {
+            return Ok(());
+        }
         if chars[i] != '~' {
             output.push(chars[i]);
             i += 1;
@@ -2376,7 +2557,7 @@ fn format_impl(
             } else if c == '\'' {
                 i += 1;
                 if i < chars.len() {
-                    params.push(Param::Num(chars[i] as i64));
+                    params.push(Param::Char(chars[i]));
                     i += 1;
                 }
                 if i < chars.len() && chars[i] == ',' {
@@ -2394,7 +2575,13 @@ fn format_impl(
                     num_str.push(chars[i]);
                     i += 1;
                 }
-                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(0)));
+                // A literal too large for an i64 saturates: it is still "out
+                // of range" for ~[ and "pad everything" for widths.
+                params.push(Param::Num(num_str.parse::<i64>().unwrap_or(if num_str.starts_with('-') {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                })));
                 if i < chars.len() && chars[i] == ',' {
                     i += 1;
                 }
@@ -2424,14 +2611,13 @@ fn format_impl(
         let directive = chars[i].to_ascii_uppercase();
         i += 1;
 
-        let remaining = args.len().saturating_sub(*arg_idx);
-
         let resolve_param = |p: &Param,
                              default: i64,
                              aidx: &mut usize|
          -> Result<i64, EgclError> {
             match p {
                 Param::Num(n) => Ok(*n),
+                Param::Char(c) => Ok(*c as i64),
                 Param::V => {
                     if *aidx >= args.len() {
                         return Err(EgclError::ControlError("too few args for V param".into()));
@@ -2447,6 +2633,10 @@ fn format_impl(
                         // `~v,vd` with #\0) is a character; hand back its code
                         // point, which the padchar sites turn back into a char.
                         Ok(v.as_char() as i64)
+                    } else if let Some((negative, _)) = integer_magnitude(v, 10) {
+                        // A bignum parameter is a legal integer; clamp it, so a
+                        // hugely negative MINCOL pads nothing (ansi format.d.29).
+                        Ok(if negative { i64::MIN } else { i64::MAX })
                     } else {
                         Err(EgclError::TypeError {
                             datum: v,
@@ -2454,7 +2644,10 @@ fn format_impl(
                         })
                     }
                 }
-                Param::Hash => Ok(remaining as i64),
+                // `#` counts the arguments remaining when IT is resolved, so
+                // a `v` before it has already taken its argument
+                // (ansi format.:^.:{.20: `~V,#:^`).
+                Param::Hash => Ok(args.len().saturating_sub(*aidx) as i64),
                 Param::None => Ok(default),
             }
         };
@@ -2468,9 +2661,10 @@ fn format_impl(
                     .first()
                     .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
                     .max(0) as usize;
-                let _colinc = params
+                let colinc = params
                     .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .max(1) as usize;
                 let minpad = params
                     .get(2)
                     .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
@@ -2499,7 +2693,7 @@ fn format_impl(
                 } else {
                     egclval_to_print_string(val, false)
                 };
-                pad_format_field(output, &s, mincol, minpad, padchar, at_sign);
+                pad_format_field(output, &s, mincol, colinc, minpad, padchar, at_sign);
             }
             'S' => {
                 // ~mincol,colinc,minpad,padchar S — same padding as ~A (bliss-znib).
@@ -2507,9 +2701,10 @@ fn format_impl(
                     .first()
                     .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
                     .max(0) as usize;
-                let _colinc = params
+                let colinc = params
                     .get(1)
-                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?;
+                    .map_or(Ok(1), |p| resolve_param(p, 1, arg_idx))?
+                    .max(1) as usize;
                 let minpad = params
                     .get(2)
                     .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
@@ -2530,7 +2725,7 @@ fn format_impl(
                 } else {
                     egclval_to_print_string(val, true)
                 };
-                pad_format_field(output, &s, mincol, minpad, padchar, at_sign);
+                pad_format_field(output, &s, mincol, colinc, minpad, padchar, at_sign);
             }
             'D' | 'B' | 'O' | 'X' => {
                 let radix = match directive {
@@ -2580,10 +2775,10 @@ fn format_impl(
                 let (negative, digits) = match integer_magnitude(val, radix) {
                     Some(parts) => parts,
                     None => {
-                        return Err(EgclError::TypeError {
-                            datum: val,
-                            expected: "integer".into(),
-                        });
+                        // CLHS 22.3.2.2: a non-integer prints as by ~A in the
+                        // directive's radix, padded on the left to MINCOL.
+                        push_non_integer_in_radix(output, val, radix, mincol, padchar);
+                        continue;
                     }
                 };
                 output.push_str(&format_integer_parts(
@@ -2600,7 +2795,14 @@ fn format_impl(
             }
             'R' => {
                 // Resolve V/# params BEFORE consuming the main argument
-                let radix_param = if !params.is_empty() {
+                // An omitted radix, or a `v` whose argument is NIL, selects the
+                // English / roman spellings instead (ansi format.r.8).
+                let radix_given = match params.first() {
+                    None | Some(Param::None) => false,
+                    Some(Param::V) => !args.get(*arg_idx).is_some_and(|v| v.is_nil()),
+                    Some(_) => true,
+                };
+                let radix_param = if radix_given {
                     let radix = resolve_param(&params[0], 10, arg_idx)?;
                     // CLHS 22.3.2.2: radix is an integer between 2 and 36.
                     // Out-of-range values used to reach from_digit / `% 0` and
@@ -2613,6 +2815,11 @@ fn format_impl(
                     }
                     Some(radix as u32)
                 } else {
+                    // An omitted (or NIL `v`) radix: still consume the `v`
+                    // argument, then print in English or roman numerals.
+                    if let Some(p @ Param::V) = params.first() {
+                        resolve_param(p, 10, arg_idx)?;
+                    }
                     None
                 };
                 // ~radix,mincol,padchar,commachar,comma-intervalR: the
@@ -2643,10 +2850,8 @@ fn format_impl(
                     let (negative, digits) = match integer_magnitude(val, radix) {
                         Some(parts) => parts,
                         None => {
-                            return Err(EgclError::TypeError {
-                                datum: val,
-                                expected: "integer".into(),
-                            });
+                            push_non_integer_in_radix(output, val, radix, mincol, padchar);
+                            continue;
                         }
                     };
                     output.push_str(&format_integer_parts(
@@ -2680,81 +2885,110 @@ fn format_impl(
                 }
             }
             'F' => {
-                // ~w,d,k,overflowchar,padcharF. Resolve the prefix params in
-                // left-to-right order (each `v`/`#` consumes the next arg) BEFORE
-                // reading the value, so `~v,vF` binds width and digit-count to the
-                // parameter args rather than mis-binding the value as a param
-                // (CLHS 22.3.1; bliss-8rs1). w = minimum width, d = fraction digits.
-                let w = params
-                    .first()
-                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
-                    .max(0) as usize;
-                let d = match params.get(1) {
-                    Some(p) => {
-                        let dd = resolve_param(p, -1, arg_idx)?;
-                        if dd >= 0 { Some(dd as usize) } else { None }
+                // ~w,d,k,overflowchar,padcharF (CLHS 22.3.3.1).  Parameters are
+                // resolved left to right BEFORE the value so `~v,vF` binds them
+                // to the right arguments (bliss-8rs1); a NIL `v` is an omitted
+                // parameter.
+                let mut fixed_params: Vec<Option<i64>> = Vec::with_capacity(5);
+                for p in params.iter().take(5) {
+                    let omitted = matches!(p, Param::None)
+                        || (matches!(p, Param::V)
+                            && args.get(*arg_idx).is_some_and(|v| v.is_nil()));
+                    if omitted {
+                        if matches!(p, Param::V) {
+                            *arg_idx += 1;
+                        }
+                        fixed_params.push(None);
+                    } else {
+                        fixed_params.push(Some(resolve_param(p, 0, arg_idx)?));
                     }
-                    None => None,
-                };
-                // k (scale factor), overflowchar and padchar are not yet applied,
-                // but still resolve them so any `v` param consumes its arg and the
-                // value (and later directives) stay correctly aligned.
-                for p in params.iter().skip(2) {
-                    let _ = resolve_param(p, -1, arg_idx)?;
                 }
+                let param = |k: usize| fixed_params.get(k).copied().flatten();
+                let w_opt = param(0).map(|w| w.max(0) as usize);
+                let d_opt = param(1).map(|d| d.max(0) as usize);
+                let scale = param(2).unwrap_or(0).clamp(-300, 300) as i32;
+                let overflow_char = param(3).and_then(|c| char::from_u32(c as u32));
+                let pad_char = param(4).and_then(|c| char::from_u32(c as u32)).unwrap_or(' ');
                 if *arg_idx >= args.len() {
                     return Err(EgclError::ControlError("too few args for ~F".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
+                // A non-number prints as ~wD (CLHS 22.3.3.1).
+                if !egcl_rt::types::numberp(val) || egcl_rt::types::complexp(val) {
+                    push_padded_left(output, &egclval_to_print_string(val, false), w_opt.unwrap_or(0), pad_char);
+                    continue;
+                }
                 let f = real_format_value(val)?;
-                let shortest = if val.is_single_float() {
-                    format!("{}", val.as_single_float())
+                // The scale factor multiplies in the value's own precision, so
+                // a single float keeps its short decimal (0.1 * 100 is 10.0).
+                let (scaled, shortest_abs) = if val.is_single_float() {
+                    let v = val.as_single_float() * 10f32.powi(scale);
+                    (v as f64, format!("{}", v.abs()))
                 } else {
-                    format!("{f}")
+                    let v = f * 10f64.powi(scale);
+                    (v, format!("{}", v.abs()))
                 };
-                // With an explicit digit count there are two regimes, and CL
-                // uses both (verified against SBCL):
-                //
-                //  * asking for MORE fraction digits than the shortest decimal
-                //    carries is just padding — the extra digits are not
-                //    information the float has. ~,3F of 3.4028235e38 is
-                //    ...350000000000000000000000000000000.000, NOT the exact
-                //    binary value ...346638528859811704183484516925440.000.
-                //  * asking for FEWER means rounding, and that rounds the
-                //    float's EXACT value. f32 -> f64 is lossless and a binary
-                //    fraction always terminates in decimal, so `{:.150}` is the
-                //    exact expansion (150 places covers the smallest subnormal).
-                //    ~,2F of 1.005 is 1.00 because that f32 is really
-                //    1.00499999523162841796875 — rounding the shortest decimal
-                //    "1.005" would wrongly give 1.01. Ties go away from zero
-                //    (~,1F of 0.25 is 0.3); Rust's `{:.1}` rounds half to even
-                //    and would give 0.2.
-                let shortest_frac = shortest.split_once('.').map_or(0, |(_, fr)| fr.len());
-                let mut s = match d {
-                    Some(dd) if shortest_frac <= dd => round_decimal_string(&shortest, dd),
-                    Some(dd) => round_decimal_string(&format!("{f:.150}"), dd),
-                    None => {
-                        // No fraction-digit count: the shortest decimal as-is.
-                        // Going via the widened f64 exposed binary32 noise, so
-                        // ~F of 1.0e-10 printed 0.0000000001000000013351432
-                        // (the trap bliss-8zrb fixed for ~E/~G). Rust's `{}`
-                        // never switches to an exponent, which is what ~F
-                        // wants; CL still requires the point.
-                        let mut t = shortest.clone();
+                // Scaling by a power of ten never changes the sign.
+                let negative = f.is_sign_negative();
+                let sign = if negative { "-" } else if at_sign { "+" } else { "" };
+                let abs = scaled.abs();
+                // Fixed digits after the point: D when given; otherwise, with a
+                // width, as many of the shortest decimal's as fit (at least the
+                // point); otherwise the shortest decimal itself.
+                let shortest_frac = shortest_abs.split_once('.').map_or(0, |(_, fr)| fr.len());
+                let int_len = shortest_abs.split_once('.').map_or(shortest_abs.len(), |(i, _)| i.len());
+                let fixed_digits = |dd: usize| -> String {
+                    // More digits than the shortest decimal carries is padding;
+                    // fewer means rounding the float's EXACT value, ties away
+                    // from zero (verified against SBCL; see round_decimal_string).
+                    if shortest_frac <= dd {
+                        round_decimal_string(&shortest_abs, dd)
+                    } else {
+                        round_decimal_string(&format!("{abs:.150}"), dd)
+                    }
+                };
+                let mut digits = match (w_opt, d_opt) {
+                    (_, Some(dd)) => fixed_digits(dd),
+                    (Some(w), None) => {
+                        let room = (w as i64 - sign.len() as i64 - int_len as i64 - 1).max(0) as usize;
+                        fixed_digits(room.min(shortest_frac.max(1)))
+                    }
+                    (None, None) => {
+                        let mut t = shortest_abs.clone();
                         if !t.contains('.') {
                             t.push_str(".0");
                         }
                         t
                     }
                 };
-                // ~@F prints a leading + on a non-negative value (CLHS 22.3.3.1).
-                if at_sign && !f.is_sign_negative() {
-                    s.insert(0, '+');
+                // A width too small for the leading zero drops it ("0.50" ->
+                // ".50"); a bare trailing point always gets a zero ("1." ->
+                // "1.0"), even past the width.
+                if let Some(w) = w_opt {
+                    if sign.len() + digits.len() > w && digits.starts_with("0.") && digits.len() > 2 {
+                        digits.remove(0);
+                    }
+                    if digits == "0." {
+                        digits = ".".into();
+                    }
                 }
-                if s.len() < w {
-                    let pad: String = std::iter::repeat_n(' ', w - s.len()).collect();
-                    s = format!("{pad}{s}");
+                // ...except when D is explicitly 0: `~,0F` of 2.5 is "3.".
+                if digits.ends_with('.') && d_opt != Some(0) {
+                    digits.push('0');
+                }
+                let mut s = format!("{sign}{digits}");
+                if let Some(w) = w_opt {
+                    let len = s.chars().count();
+                    if len > w {
+                        if let Some(oc) = overflow_char {
+                            output.extend(std::iter::repeat_n(oc, w));
+                            continue;
+                        }
+                    } else {
+                        let pad: String = std::iter::repeat_n(pad_char, w - len).collect();
+                        s = format!("{pad}{s}");
+                    }
                 }
                 output.push_str(&s);
             }
@@ -3039,13 +3273,16 @@ fn format_impl(
                 }
             }
             '*' => {
+                // ~n* skips n (default 1); ~n:* backs up n; ~n@* goes to
+                // argument n (default 0).
+                let default = if at_sign { 0 } else { 1 };
                 let n = if !params.is_empty() {
-                    resolve_param(&params[0], 1, arg_idx)? as usize
+                    resolve_param(&params[0], default, arg_idx)?.max(0) as usize
                 } else {
-                    1
+                    default as usize
                 };
                 if at_sign {
-                    *arg_idx = n;
+                    *arg_idx = n.min(args.len());
                 } else if colon {
                     if *arg_idx >= n {
                         *arg_idx -= n;
@@ -3069,10 +3306,18 @@ fn format_impl(
                     });
                 }
                 let c = val.as_char();
-                if at_sign {
-                    output.push_str(&format!("#\\{}", c));
-                } else if colon {
+                if colon {
+                    // ~:C spells out a non-graphic character's name; ~:@C adds
+                    // nothing here (no key-name information to give).
                     output.push_str(&character_name(c));
+                } else if at_sign {
+                    // ~@C prints the character as the reader would read it.
+                    output.push_str("#\\");
+                    if c == ' ' && !print_readably_active() {
+                        output.push(' ');
+                    } else {
+                        output.push_str(&character_name(c));
+                    }
                 } else {
                     output.push(c);
                 }
@@ -3104,6 +3349,8 @@ fn format_impl(
                 if at_sign {
                     // ~@? — use the enclosing argument list from current position
                     format_impl(&sub_control, args, arg_idx, output)?;
+                    // A `~^` inside ends the ~? control string only.
+                    take_escape();
                 } else {
                     // ~? — consume a separate list argument for the sub-format's args
                     if *arg_idx >= args.len() {
@@ -3118,6 +3365,7 @@ fn format_impl(
                     };
                     let mut sub_idx = 0;
                     format_impl(&sub_control, &sub_args, &mut sub_idx, output)?;
+                    take_escape();
                 }
             }
             'P' => {
@@ -3153,8 +3401,35 @@ fn format_impl(
                 }
             }
             '^' => {
-                // ~^ up-and-out: in iteration context, terminates if no more args
-                if *arg_idx >= args.len() {
+                // ~^ (CLHS 22.3.9.2): with no parameters, terminate when no
+                // arguments remain (`~:^`: when no sublists remain); with one,
+                // when it is zero; with two, when they are equal; with three,
+                // when they are in ascending order.  The enclosing iteration,
+                // `~?` or `~<` sees the flag and decides what it ends.
+                // A `v` parameter whose argument is NIL counts as omitted
+                // (ansi format.^.{.25/33), so `~1,1,v^` with NIL compares two.
+                let mut vals: Vec<i64> = Vec::with_capacity(params.len());
+                for p in &params {
+                    if matches!(p, Param::V) && args.get(*arg_idx).is_some_and(|v| v.is_nil()) {
+                        *arg_idx += 1;
+                        continue;
+                    }
+                    if matches!(p, Param::None) {
+                        continue;
+                    }
+                    vals.push(resolve_param(p, 0, arg_idx)?);
+                }
+                let terminate = match vals.len() {
+                    0 if colon => OUTER_REMAINING
+                        .with(|c| c.get())
+                        .map_or(*arg_idx >= args.len(), |n| n == 0),
+                    0 => *arg_idx >= args.len(),
+                    1 => vals[0] == 0,
+                    2 => vals[0] == vals[1],
+                    _ => vals[0] <= vals[1] && vals[1] <= vals[2],
+                };
+                if terminate {
+                    FORMAT_ESCAPE.with(|c| c.set(if colon { 2 } else { 1 }));
                     return Ok(());
                 }
             }
@@ -3162,75 +3437,181 @@ fn format_impl(
                 // Find matching ~}
                 let body_start = i;
                 let body_end = find_matching_close(&chars, i, '{')?;
-                let body: String = chars[body_start..body_end].iter().collect();
+                let mut body: String = chars[body_start..body_end].iter().collect();
+                // `~:}` runs the body at least once even over no arguments.
+                let at_least_once = {
+                    let mut k = body_end + 1;
+                    let mut found = false;
+                    while k < chars.len() && chars[k] != '}' {
+                        if chars[k] == ':' {
+                            found = true;
+                        }
+                        k += 1;
+                    }
+                    found
+                };
                 i = skip_close_directive(&chars, body_end);
-                // The prefix parameter of ~{ is the maximum iteration count:
-                // `~2{...~}` runs the body at most twice (CLHS 22.3.5.2).
-                // Resolved before the list argument is consumed (a `~V{` count
-                // comes from an argument). None = unlimited.
-                let max_iter: Option<i64> = if !params.is_empty() {
+                // The prefix parameter of ~{ is the maximum iteration count; a
+                // NIL `v` argument means no limit (ansi format.{.33).
+                let count_given = match params.first() {
+                    None | Some(Param::None) => false,
+                    Some(Param::V) => {
+                        let is_nil = args.get(*arg_idx).is_some_and(|v| v.is_nil());
+                        if is_nil {
+                            *arg_idx += 1;
+                        }
+                        !is_nil
+                    }
+                    Some(_) => true,
+                };
+                let max_iter: Option<i64> = if count_given {
                     Some(resolve_param(&params[0], 0, arg_idx)?)
                 } else {
                     None
                 };
+                // An empty body takes the control -- a string or a FORMATTER
+                // function -- from the next argument (CLHS 22.3.7.4).
+                let mut body_function: Option<EgclVal> = None;
+                if body.is_empty() {
+                    if *arg_idx >= args.len() {
+                        return Err(EgclError::ControlError("too few args for ~{~}".into()));
+                    }
+                    let control = args[*arg_idx];
+                    *arg_idx += 1;
+                    match extract_egcl_string(control) {
+                        Some(text) => body = text,
+                        None => body_function = Some(control),
+                    }
+                }
                 let reached = |n: i64| max_iter.is_some_and(|m| n >= m);
                 if at_sign && colon {
-                    // ~:@{...~} — each remaining arg is itself a list (cons cell)
+                    // ~:@{ : each remaining argument is a sublist for one pass.
                     let mut iters = 0i64;
+                    let saved_outer = OUTER_REMAINING.with(|c| c.get());
+                    if at_least_once && *arg_idx >= args.len() && !reached(0) {
+                        let mut sub_idx = 0;
+                        OUTER_REMAINING.with(|c| c.set(Some(0)));
+                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        take_escape();
+                    }
                     while *arg_idx < args.len() && !reached(iters) {
                         let sub = args[*arg_idx];
                         *arg_idx += 1;
                         iters += 1;
-                        if sub.is_nil() {
-                            continue;
-                        } // empty sublist
-                        let sub_args = cons_list_to_vec(sub);
+                        if !sub.is_nil() && !sub.is_cons() {
+                            return Err(EgclError::TypeError {
+                                datum: sub,
+                                expected: "LIST".into(),
+                            });
+                        }
+                        let sub_args = proper_list_elements(sub)?;
                         let mut sub_idx = 0;
-                        format_impl(&body, &sub_args, &mut sub_idx, output)?;
+                        OUTER_REMAINING.with(|c| c.set(Some(args.len() - *arg_idx)));
+                        run_iteration_body(&body, body_function, &sub_args, &mut sub_idx, output)?;
+                        // `~^` ends this sublist's pass; `~:^` the iteration.
+                        if take_escape() == 2 {
+                            break;
+                        }
                     }
+                    OUTER_REMAINING.with(|c| c.set(saved_outer));
                 } else if at_sign {
-                    // ~@{...~} — remaining args form the iteration list
+                    // ~@{ : iterate over the remaining arguments themselves.
                     let mut iters = 0i64;
+                    if at_least_once && *arg_idx >= args.len() && !reached(0) {
+                        run_iteration_body(&body, body_function, args, arg_idx, output)?;
+                        take_escape();
+                    }
                     while *arg_idx < args.len() && !reached(iters) {
-                        format_impl(&body, args, arg_idx, output)?;
+                        let before = *arg_idx;
+                        run_iteration_body(&body, body_function, args, arg_idx, output)?;
+                        if take_escape() != 0 {
+                            break;
+                        }
                         iters += 1;
+                        // A pass that consumed nothing would never end.
+                        if *arg_idx == before && max_iter.is_none() {
+                            break;
+                        }
                     }
                 } else if colon {
-                    // ~:{...~} — arg is a list of sublists; apply body to each sublist
+                    // ~:{ : the argument is a list of sublists, one per pass.
                     if *arg_idx >= args.len() {
                         return Err(EgclError::ControlError("too few args for ~:{".into()));
                     }
                     let list_val = args[*arg_idx];
                     *arg_idx += 1;
+                    if !list_val.is_nil() && !list_val.is_cons() {
+                        return Err(EgclError::TypeError {
+                            datum: list_val,
+                            expected: "LIST".into(),
+                        });
+                    }
+                    if list_val.is_nil() && at_least_once && !reached(0) {
+                        let saved_outer = OUTER_REMAINING.with(|c| c.get());
+                        OUTER_REMAINING.with(|c| c.set(Some(0)));
+                        let mut sub_idx = 0;
+                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        take_escape();
+                        OUTER_REMAINING.with(|c| c.set(saved_outer));
+                    }
                     if !list_val.is_nil() {
-                        let sublists = cons_list_to_vec(list_val);
+                        let mut sublists = proper_list_elements(list_val)?;
+                        egcl_rt::rooted_ref!(_sublists_root = &mut sublists);
+                        let saved_outer = OUTER_REMAINING.with(|c| c.get());
                         for (iters, sublist) in sublists.iter().enumerate() {
                             if reached(iters as i64) {
                                 break;
                             }
-                            let sub_args = if sublist.is_nil() {
-                                Vec::new()
-                            } else {
-                                cons_list_to_vec(*sublist)
-                            };
+                            if !sublist.is_nil() && !sublist.is_cons() {
+                                return Err(EgclError::TypeError {
+                                    datum: *sublist,
+                                    expected: "LIST".into(),
+                                });
+                            }
+                            let sub_args = proper_list_elements(*sublist)?;
                             let mut sub_idx = 0;
-                            format_impl(&body, &sub_args, &mut sub_idx, output)?;
+                            OUTER_REMAINING.with(|c| c.set(Some(sublists.len() - iters - 1)));
+                            run_iteration_body(&body, body_function, &sub_args, &mut sub_idx, output)?;
+                            if take_escape() == 2 {
+                                break;
+                            }
                         }
+                        OUTER_REMAINING.with(|c| c.set(saved_outer));
                     }
                 } else {
-                    // ~{...~} — arg is a list; iterate body over list elements
+                    // ~{ : the argument is the list of arguments for the passes.
                     if *arg_idx >= args.len() {
                         return Err(EgclError::ControlError("too few args for ~{".into()));
                     }
                     let list_val = args[*arg_idx];
                     *arg_idx += 1;
+                    if !list_val.is_nil() && !list_val.is_cons() {
+                        return Err(EgclError::TypeError {
+                            datum: list_val,
+                            expected: "LIST".into(),
+                        });
+                    }
+                    if list_val.is_nil() && at_least_once && !reached(0) {
+                        let mut sub_idx = 0;
+                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        take_escape();
+                    }
                     if !list_val.is_nil() {
-                        let list_elements = cons_list_to_vec(list_val);
+                        let mut list_elements = proper_list_elements(list_val)?;
+                        egcl_rt::rooted_ref!(_list_elements_root = &mut list_elements);
                         let mut sub_idx = 0;
                         let mut iters = 0i64;
                         while sub_idx < list_elements.len() && !reached(iters) {
-                            format_impl(&body, &list_elements, &mut sub_idx, output)?;
+                            let before = sub_idx;
+                            run_iteration_body(&body, body_function, &list_elements, &mut sub_idx, output)?;
+                            if take_escape() != 0 {
+                                break;
+                            }
                             iters += 1;
+                            // A pass that consumed nothing would never end.
+                            if sub_idx == before && max_iter.is_none() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -3277,7 +3658,15 @@ fn format_impl(
                     // `~#[none~;one~:;many~]` dispatches on the arg count (CLHS
                     // 22.3.7.2). Otherwise the next argument is the selector, which
                     // must be an integer (bliss-qzxu).
-                    let idx_i64 = if params.first().is_some_and(|p| !matches!(p, Param::None)) {
+                    // A `v` whose argument is NIL counts as no parameter
+                    // (ansi format.cond.14): consume it and use the next
+                    // argument as the selector.
+                    let nil_v = matches!(params.first(), Some(Param::V))
+                        && args.get(*arg_idx).is_some_and(|v| v.is_nil());
+                    if nil_v {
+                        *arg_idx += 1;
+                    }
+                    let idx_i64 = if !nil_v && params.first().is_some_and(|p| !matches!(p, Param::None)) {
                         resolve_param(&params[0], 0, arg_idx)?
                     } else {
                         if *arg_idx >= args.len() {
@@ -3285,13 +3674,17 @@ fn format_impl(
                         }
                         let val = args[*arg_idx];
                         *arg_idx += 1;
-                        if !val.is_fixnum() {
+                        if val.is_fixnum() {
+                            val.as_fixnum()
+                        } else if let Some((negative, _)) = integer_magnitude(val, 10) {
+                            // A bignum selects no clause (ansi format.cond.4).
+                            if negative { i64::MIN } else { i64::MAX }
+                        } else {
                             return Err(EgclError::TypeError {
                                 datum: val,
                                 expected: "integer".into(),
                             });
                         }
-                        val.as_fixnum()
                     };
                     // A negative selector wraps to a huge usize -> out of range ->
                     // the ~:; default clause (if any), matching an unmatched index.
@@ -3391,6 +3784,7 @@ fn format_impl(
                     if at_sign {
                         emit_const(&prefix, output)?;
                         format_impl(&body_seg, args, arg_idx, output)?;
+                        take_escape();
                         emit_const(&suffix, output)?;
                     } else {
                         if *arg_idx >= args.len() {
@@ -3403,6 +3797,7 @@ fn format_impl(
                             let mut sub_idx = 0;
                             emit_const(&prefix, output)?;
                             format_impl(&body_seg, &sub_args, &mut sub_idx, output)?;
+                            take_escape();
                             emit_const(&suffix, output)?;
                         } else {
                             output.push_str(&egclval_to_print_string(val, true));
@@ -3426,11 +3821,39 @@ fn format_impl(
                         resolve_param(p, ' ' as i64, arg_idx)
                             .map(|c| char::from_u32(c as u32).unwrap_or(' '))
                     })?;
-                    let clauses = split_clauses(&body);
+                    let mut clauses = split_clauses(&body);
+                    // ~W, ~I and ~_ belong to the pretty printer and are
+                    // errors inside a justification (CLHS 22.3.6.2).
+                    for clause in &clauses {
+                        if let Some(d) = clause_directive_among(clause, &['W', 'I', '_']) {
+                            return Err(EgclError::ControlError(format!(
+                                "~{d} is not allowed inside ~<...~> justification"
+                            )));
+                        }
+                    }
+                    // `~n,m:;` after the first segment makes it an overflow
+                    // prefix: printed only when the justified text plus `n`
+                    // spare columns would not fit in a line of `m` columns.
+                    let overflow = justify_overflow_params(&body);
+                    let mut overflow_text: Option<String> = None;
+                    if overflow.is_some() && !clauses.is_empty() {
+                        let first = clauses.remove(0);
+                        let mut text = String::new();
+                        format_impl(&first, args, arg_idx, &mut text)?;
+                        if take_escape() != 0 {
+                            clauses.clear();
+                        }
+                        overflow_text = Some(text);
+                    }
                     let mut parts = Vec::new();
                     for clause in &clauses {
                         let mut part = String::new();
                         format_impl(clause, args, arg_idx, &mut part)?;
+                        // `~^` in a segment discards that segment and ends the
+                        // clause; the segments so far are justified.
+                        if take_escape() != 0 {
+                            break;
+                        }
                         parts.push(part);
                     }
                     let total_len: usize = parts.iter().map(|p| p.chars().count()).sum();
@@ -3464,27 +3887,45 @@ fn format_impl(
                         |g: usize| -> usize { minpad + per_gap + usize::from(g + rem >= gaps) };
 
                     let mut g = 0usize;
+                    let mut justified = String::new();
                     if pad_before {
-                        output.extend(std::iter::repeat_n(padchar, gap_width(g)));
+                        justified.extend(std::iter::repeat_n(padchar, gap_width(g)));
                         g += 1;
                     }
                     for (j, part) in parts.iter().enumerate() {
-                        output.push_str(part);
+                        justified.push_str(part);
                         if j + 1 < parts.len() {
-                            output.extend(std::iter::repeat_n(padchar, gap_width(g)));
+                            justified.extend(std::iter::repeat_n(padchar, gap_width(g)));
                             g += 1;
                         }
                     }
                     if pad_after {
-                        output.extend(std::iter::repeat_n(padchar, gap_width(g)));
+                        justified.extend(std::iter::repeat_n(padchar, gap_width(g)));
                     }
+                    if let (Some((spare, line_width)), Some(text)) = (overflow, overflow_text) {
+                        let column = output.rsplit('\n').next().map_or(0, |l| l.chars().count());
+                        let line_width = line_width.unwrap_or_else(|| {
+                            egcl_rt::symbols::find_index("*PRINT-RIGHT-MARGIN*")
+                                .and_then(egcl_rt::symbols::symbol_value)
+                                .filter(|v| v.is_fixnum())
+                                .map_or(72, |v| v.as_fixnum().max(0) as usize)
+                        });
+                        if column + justified.chars().count() + spare > line_width {
+                            output.push_str(&text);
+                        }
+                    }
+                    output.push_str(&justified);
                 }
             }
             '>' => {
                 return Err(EgclError::Internal("unmatched ~>".into()));
             }
             '/' => {
-                // ~/name/ — user dispatch function. Consume one argument.
+                // ~/name/ — call the function NAME names (CLHS 22.3.5.4) with
+                // (stream arg colon-p at-sign-p . params).  NAME is read as a
+                // symbol in COMMON-LISP-USER unless it carries a package prefix;
+                // the function writes to a string stream whose text goes into
+                // the output.  Consumes one argument.
                 let name_start = i;
                 while i < chars.len() && chars[i] != '/' {
                     i += 1;
@@ -3493,7 +3934,29 @@ fn format_impl(
                 if i < chars.len() {
                     i += 1;
                 } // skip closing /
-                // Consume one argument as per CL spec
+                // Prefix parameters come first in the argument list, so a `v`
+                // parameter takes its value before the directive's own argument.
+                let mut param_vals: Vec<EgclVal> = Vec::with_capacity(params.len());
+                for p in &params {
+                    param_vals.push(match p {
+                        Param::Num(n) => EgclVal::from_fixnum(*n),
+                        Param::Char(c) => EgclVal::from_char(*c),
+                        Param::V => {
+                            if *arg_idx >= args.len() {
+                                return Err(EgclError::ControlError(
+                                    "too few args for V param".into(),
+                                ));
+                            }
+                            let v = args[*arg_idx];
+                            *arg_idx += 1;
+                            v
+                        }
+                        Param::Hash => {
+                            EgclVal::from_fixnum(args.len().saturating_sub(*arg_idx) as i64)
+                        }
+                        Param::None => NIL,
+                    });
+                }
                 if *arg_idx >= args.len() {
                     return Err(EgclError::Internal(format!(
                         "too few args for ~/{}/",
@@ -3502,58 +3965,42 @@ fn format_impl(
                 }
                 let arg = args[*arg_idx];
                 *arg_idx += 1;
-                // Look up the registered format function
-                if let Some(func) = lookup_format_function(&name) {
-                    // Call the registered format function with the CL-specified
-                    // arguments: (stream, arg, colon-p, at-sign-p, &rest params).
-                    // We create a string-output-stream proxy for the output
-                    // buffer, and pass colon/at_sign as T or NIL.
-                    let colon_val = if colon { T } else { NIL };
-                    let at_val = if at_sign { T } else { NIL };
-                    // Build argument list: stream (NIL = string accumulator),
-                    // arg, colon-p, at-sign-p, then any prefix parameters.
-                    let mut call_args: Vec<EgclVal> = Vec::with_capacity(4 + params.len());
-                    call_args.push(NIL); // stream placeholder (output goes to buffer)
-                    call_args.push(arg);
-                    call_args.push(colon_val);
-                    call_args.push(at_val);
-                    for p in &params {
-                        match p {
-                            Param::Num(n) => call_args.push(EgclVal::from_fixnum(*n)),
-                            _ => call_args.push(NIL),
-                        }
-                    }
-                    // Invoke the function. For compiled functions with an
-                    // entry point we call directly; otherwise fall back to
-                    // the aesthetic representation of the argument.
-                    let result = call_format_dispatch(func, &call_args);
-                    match result {
-                        Ok(val) => {
-                            // If the function returned a string, append it.
-                            if let Some(s) = extract_egcl_string(val) {
-                                output.push_str(&s);
-                            }
-                            // Otherwise the function wrote to the stream
-                            // directly (which we don't capture yet), so
-                            // fall back to aesthetic printing.
-                            else if !val.is_nil() {
-                                output.push_str(&egclval_to_print_string(val, false));
-                            }
-                        }
-                        Err(_) => {
-                            // Function call failed; fall back to aesthetic
-                            // representation so FORMAT itself doesn't crash.
-                            output.push_str(&egclval_to_print_string(arg, false));
-                        }
-                    }
-                } else {
-                    // No registered function — return an error with the function name
-                    return Err(EgclError::UndefinedFunction(make_egcl_string(&name)));
+                let Some(func) = lookup_format_function(&name)
+                    .or_else(|| format_function_designator(&name))
+                else {
+                    return Err(EgclError::UndefinedFunction(
+                        egcl_compiler::reader::read_symbol_token(&name.to_uppercase())
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| make_egcl_string(&name)),
+                    ));
+                };
+                egcl_rt::rooted!(func = func);
+                egcl_rt::rooted!(arg = arg);
+                egcl_rt::rooted_ref!(_param_vals_root = &mut param_vals);
+                egcl_rt::rooted!(stream = crate::streams::make_string_output_stream(NIL)?);
+                let mut call_args: Vec<EgclVal> = Vec::with_capacity(4 + param_vals.len());
+                call_args.push(*stream);
+                call_args.push(*arg);
+                call_args.push(if colon { T } else { NIL });
+                call_args.push(if at_sign { T } else { NIL });
+                call_args.extend_from_slice(&param_vals);
+                egcl_rt::rooted_ref!(_call_args_root = &mut call_args);
+                apply_format_function(*func, &call_args)?;
+                if let Some(text) =
+                    extract_egcl_string(crate::streams::get_output_stream_string(*stream)?)
+                {
+                    output.push_str(&text);
                 }
             }
             '\n' => {
-                // ~\n — ignored newline (with optional whitespace eating)
-                if !at_sign {
+                // ~<newline>: the newline and the following whitespace are
+                // skipped; `~:` keeps the whitespace, `~@` keeps the newline
+                // (CLHS 22.3.9.3; ansi format.newline.2/3).
+                if at_sign {
+                    output.push('\n');
+                }
+                if !colon {
                     while i < chars.len() && chars[i].is_whitespace() {
                         i += 1;
                     }
@@ -3693,6 +4140,152 @@ fn conditional_default_index(body: &str) -> Option<usize> {
         } else {
             i += 1;
         }
+    }
+    None
+}
+
+/// The elements of a proper list; a dotted tail is a TYPE-ERROR (what `~{`
+/// signals for `(x y . z)`, ansi format.{.error.5).
+fn proper_list_elements(list: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    let mut elements = Vec::new();
+    let mut cur = list;
+    while cur.is_cons() {
+        // SAFETY: `cur` is a cons, so its payload is a ConsCell.
+        unsafe {
+            let ptr = cur.as_ptr() as *const egcl_rt::object::ConsCell;
+            elements.push((*ptr).car);
+            cur = (*ptr).cdr;
+        }
+    }
+    if !cur.is_nil() {
+        // The offending datum is the dotted tail, as SBCL reports it.
+        return Err(EgclError::TypeError {
+            datum: cur,
+            expected: "LIST".into(),
+        });
+    }
+    Ok(elements)
+}
+
+/// Does `control` contain a justification with a `~:;` overflow clause?
+/// CLHS 22.3.6.2 forbids `~W`, `~I` and `~_` anywhere in such a control
+/// string (ansi format.justify.error.*).
+fn control_has_overflow_justification(control: &str) -> bool {
+    let chars: Vec<char> = control.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '~' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+        {
+            if chars[i] == '\'' {
+                i += 1;
+            }
+            i += 1;
+        }
+        if i < chars.len() && chars[i] == '<' {
+            let body_start = i + 1;
+            let Ok(body_end) = find_matching_close(&chars, body_start, '<') else {
+                return false;
+            };
+            let mut k = body_end + 1;
+            let mut close_colon = false;
+            while k < chars.len() && chars[k] != '>' {
+                if chars[k] == ':' {
+                    close_colon = true;
+                }
+                k += 1;
+            }
+            let body: String = chars[body_start..body_end].iter().collect();
+            if !close_colon && justify_overflow_params(&body).is_some() {
+                return true;
+            }
+            i = k;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Scan `clause` for a directive whose character (upper-cased) is one of
+/// `wanted`, skipping prefix parameters and modifiers; `~~` and `~'x`
+/// parameters do not count.
+fn clause_directive_among(clause: &str, wanted: &[char]) -> Option<char> {
+    let chars: Vec<char> = clause.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '~' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+        {
+            if chars[i] == '\'' {
+                i += 1;
+            }
+            i += 1;
+        }
+        if i < chars.len() {
+            let d = chars[i].to_ascii_uppercase();
+            if wanted.contains(&d) {
+                return Some(d);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// For a justification body whose FIRST top-level separator is `~n,m:;`,
+/// the `(n, m)` parameters (n defaults to 0, m to the right margin): the
+/// first segment is then an overflow prefix (CLHS 22.3.6.2).
+fn justify_overflow_params(body: &str) -> Option<(usize, Option<usize>)> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '~' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        i += 1;
+        let mut colon = false;
+        while i < chars.len()
+            && (chars[i].is_ascii_digit() || matches!(chars[i], ',' | '\'' | 'v' | 'V' | '#' | ':' | '@' | '-' | '+'))
+        {
+            if chars[i] == '\'' {
+                i += 1;
+            } else if chars[i] == ':' {
+                colon = true;
+            }
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        match chars[i] {
+            '{' | '[' | '(' | '<' => depth += 1,
+            '}' | ']' | ')' | '>' => depth -= 1,
+            ';' if depth == 0 => {
+                if !colon {
+                    return None;
+                }
+                let params: String = chars[start..i].iter().filter(|c| **c != ':' && **c != '@').collect();
+                let mut fields = params.split(',');
+                let spare = fields.next().and_then(|f| f.parse::<usize>().ok()).unwrap_or(0);
+                let width = fields.next().and_then(|f| f.parse::<usize>().ok());
+                return Some((spare, width));
+            }
+            _ => {}
+        }
+        i += 1;
     }
     None
 }
@@ -4099,6 +4692,23 @@ pub fn register_format_function(name: &str, function: EgclVal) {
         .as_mut()
         .unwrap()
         .insert(name.to_uppercase(), function);
+}
+
+/// The function a `~/name/` directive names: NAME read as a symbol in
+/// COMMON-LISP-USER unless it carries a package prefix (CLHS 22.3.5.4).  The
+/// symbol itself is returned; applying it selects its global function, and an
+/// unbound one signals UNDEFINED-FUNCTION with that symbol.
+fn format_function_designator(name: &str) -> Option<EgclVal> {
+    let upper = name.to_uppercase();
+    let qualified = if upper.contains(':') {
+        upper
+    } else {
+        format!("COMMON-LISP-USER::{}", upper)
+    };
+    egcl_compiler::reader::read_symbol_token(&qualified)
+        .ok()
+        .flatten()
+        .filter(|v| v.is_symbol())
 }
 
 /// Look up a registered format function by name.

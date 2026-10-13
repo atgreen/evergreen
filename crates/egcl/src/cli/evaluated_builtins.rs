@@ -3869,6 +3869,80 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(name_form)
         }),
 
+        // (character): CHAR-NAME's table, shared with the reader and printer so
+        // every `#\` the printer emits reads back (ansi format.c.*, char-name.*).
+        "EGCL-INTERNAL::%CHAR-NAME" | "EGCL-INTERNAL:%CHAR-NAME" => Some(|_operator, args, _env| {
+            if args.len() != 1 || !args[0].is_character() {
+                return Err(EgclError::TypeError {
+                    datum: args.first().copied().unwrap_or(NIL),
+                    expected: "CHARACTER".into(),
+                });
+            }
+            Ok(match egcl_compiler::reader::char_name(args[0].as_char()) {
+                Some(name) => egcl_stdlib::make_lisp_string_fresh(&name),
+                None => NIL,
+            })
+        }),
+        // (dims-list storage): a multidimensional array over an existing
+        // row-major storage vector.  MAKE-ARRAY (boot.lisp) uses it for a
+        // :displaced-to array of rank >= 2, the storage being a vector
+        // displaced onto the base, so AREF and the printer read the base.
+        "EGCL-INTERNAL::%MAKE-MD-ARRAY-WITH-STORAGE"
+        | "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE requires dimensions and storage".into(),
+                ));
+            }
+            let mut dims = Vec::new();
+            let mut c = args[0];
+            while c.is_cons() {
+                let (d, rest) = cp(c);
+                if !d.is_fixnum() || d.as_fixnum() < 0 {
+                    return Err(EgclError::TypeError {
+                        datum: d,
+                        expected: "non-negative array dimension".into(),
+                    });
+                }
+                dims.push(d.as_fixnum() as usize);
+                c = rest;
+            }
+            let total: usize = dims.iter().product();
+            if egcl_stdlib::array_total_size(args[1]) != Some(total) {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: format!("row-major storage of {total} elements"),
+                });
+            }
+            egcl_stdlib::sequences::build_md_array_with_storage(&dims, args[1])
+        }),
+        // (string-designator): NAME-CHAR over the same table.
+        "EGCL-INTERNAL::%NAME-CHAR" | "EGCL-INTERNAL:%NAME-CHAR" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%NAME-CHAR requires one string designator".into(),
+                ));
+            }
+            let name = if is_string_value(args[0]) {
+                val_as_str(args[0])
+            } else if args[0].is_character() {
+                args[0].as_char().to_string()
+            } else if args[0].is_symbol() {
+                sym_bare_name_rc(args[0]).to_string()
+            } else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "(OR STRING SYMBOL CHARACTER)".into(),
+                });
+            };
+            Ok(match egcl_compiler::reader::char_from_name(&name) {
+                Some(c) => EgclVal::from_char(c),
+                None if name.chars().count() == 1 => EgclVal::from_char(name.chars().next().unwrap()),
+                None => NIL,
+            })
+        }),
+
         // (instance initargs): the CLHS 7.1.2 validity check REINITIALIZE-INSTANCE
         // performs before SHARED-INITIALIZE runs (ansi reinitialize-instance.error.1).
         "EGCL-INTERNAL::%CHECK-INITARGS"

@@ -10384,6 +10384,9 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         out.push_str(&egcl_stdlib::format::double_float_to_string(
             val.as_double_float(),
         ));
+    } else if val.is_character() && !PRINT_ESCAPE.with(|c| c.get()) {
+        // princ: the character itself.
+        out.push(val.as_char());
     } else if val.is_character() {
         out.push_str("#\\");
         // Space is a graphic character: `#\ ` unless printing readably
@@ -10395,17 +10398,23 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         }
     } else if val.is_symbol() {
         let name = sym_name(val);
+        // Without *PRINT-ESCAPE* (princ, ~A, and every symbol nested in a
+        // list they print) only the name's characters appear: no package
+        // prefix, keyword colon, `#:` or bars (ansi print.cons.1, print-length.5).
+        let escape = PRINT_ESCAPE.with(|c| c.get());
         if let Some(bare) = name.strip_prefix("KEYWORD:") {
-            out.push(':');
+            if escape {
+                out.push(':');
+            }
             // *PRINT-CASE* applies to symbol names, and a name that would not
-            // read back is wrapped in bars (CLHS 22.1.3.3). print_val_inner is
-            // the escaping (prin1) printer; princ goes through print_val_env.
-            out.push_str(&egcl_stdlib::format::print_symbol_name(bare, true));
+            // read back is wrapped in bars (CLHS 22.1.3.3).
+            out.push_str(&egcl_stdlib::format::print_symbol_name(bare, escape));
         } else {
             // Uninterned symbols (make-symbol/gensym) print with the `#:` prefix
             // under prin1/~S so they read back as fresh uninterned symbols, unless
             // *PRINT-GENSYM* is NIL (CLHS 22.1.3.3).
-            if egcl_compiler::reader::is_uninterned(val.as_symbol_index())
+            if escape
+                && egcl_compiler::reader::is_uninterned(val.as_symbol_index())
                 && egcl_stdlib::format::print_gensym()
             {
                 out.push_str("#:");
@@ -10416,9 +10425,9 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
             // outside the bars — PKG::|has space|, not |PKG::has space|
             // (bliss-10cf).
             if egcl_compiler::reader::is_uninterned(val.as_symbol_index()) {
-                out.push_str(&egcl_stdlib::format::print_symbol_name(&name, true));
+                out.push_str(&egcl_stdlib::format::print_symbol_name(&name, escape));
             } else {
-                out.push_str(&egcl_stdlib::format::print_symbol_for_output(val, true));
+                out.push_str(&egcl_stdlib::format::print_symbol_for_output(val, escape));
             }
         }
     } else if egcl_rt::function::is_interpreted_function(val) || is_closure_cons(val) {
@@ -10509,6 +10518,11 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
             match hdr.type_id() {
                 type_id::SIMPLE_BASE_STRING | type_id::SIMPLE_CHARACTER_STRING => {
                     let s = egcl_rt::object::read_simple_string(ptr);
+                    if !PRINT_ESCAPE.with(|c| c.get()) {
+                        // princ: the characters themselves, also inside a list.
+                        out.push_str(&s);
+                        return;
+                    }
                     out.push('"');
                     for c in s.chars() {
                         if c == '"' || c == '\\' {
@@ -10575,6 +10589,20 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                             out.push('"');
                         } else {
                             out.push_str(&text);
+                        }
+                        return;
+                    }
+                    if egcl_stdlib::cvec_is_bit(val) {
+                        // A fill-pointer / adjustable / displaced bit vector
+                        // prints like a simple one (ansi print.bit-vector.5-7).
+                        if !egcl_stdlib::format::print_array_active() {
+                            out.push_str(&format!("#<BIT-VECTOR {fp}>"));
+                            return;
+                        }
+                        out.push_str("#*");
+                        for i in 0..fp {
+                            let e = egcl_stdlib::cvec_element(val, i).unwrap_or(NIL);
+                            out.push(if e.is_fixnum() && e.as_fixnum() == 1 { '1' } else { '0' });
                         }
                         return;
                     }
@@ -11890,6 +11918,23 @@ fn dispatch_print_object(val: EgclVal, escape: bool) -> Option<String> {
 /// *PRINT-PPRINT-DISPATCH* holds a table with entries, ask
 /// EGCL::%PPRINT-DISPATCH-STRING (boot.lisp) for the text of the highest-
 /// priority applicable entry, or None to print normally.
+/// FORMAT's hook for applying a function object (a FORMATTER given as a
+/// `~{~}` body, a `~/name/` function) through the parked print-entry Env.
+fn stdlib_format_apply_hook(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    let ptr = PRINT_ENV.with(|c| c.get());
+    if ptr.is_null() {
+        return Err(EgclError::ControlError(
+            "FORMAT cannot call a function outside an evaluation".into(),
+        ));
+    }
+    egcl_rt::rooted!(func = func);
+    let args = RootedVals::new(args.to_vec());
+    // Safety: the parked pointer is the live print-entry &mut Env (as in
+    // stdlib_print_object_hook); printing is single-threaded.
+    let env = unsafe { &mut *ptr };
+    apply_function(*func, &args, env)
+}
+
 fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
     let table = egcl_rt::symbols::find_index("*PRINT-PPRINT-DISPATCH*")
         .and_then(egcl_rt::symbols::symbol_value)?;
@@ -12412,6 +12457,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_struct_constructor(Some(reader_struct_constructor));
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
+    egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     let chars: Vec<char> = source.chars().collect();
     register_declared_packages(&chars);
     // Nesting is checked once for the whole buffer; each form is then read from
@@ -22361,6 +22407,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // otherwise (bliss-7o4y).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
+                // A displaced multidimensional array keeps its displacement in
+                // its row-major storage vector (MAKE-ARRAY, boot.lisp).
+                let v = match egcl_rt::types::md_array_storage(v) {
+                    Some(storage) if egcl_stdlib::is_complex_vector(storage) => storage,
+                    _ => v,
+                };
                 if egcl_stdlib::is_complex_vector(v) {
                     if let Some((base, offset, _)) = egcl_stdlib::cvec_displacement(v) {
                         let off = EgclVal::from_fixnum(offset as i64);
@@ -24418,7 +24470,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
             | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS"
             | "EGCL-INTERNAL::%CHECK-INITARGS"
-            | "EGCL-INTERNAL:%CHECK-INITARGS" => {
+            | "EGCL-INTERNAL:%CHECK-INITARGS"
+            | "EGCL-INTERNAL::%CHAR-NAME"
+            | "EGCL-INTERNAL:%CHAR-NAME"
+            | "EGCL-INTERNAL::%NAME-CHAR"
+            | "EGCL-INTERNAL:%NAME-CHAR"
+            | "EGCL-INTERNAL::%MAKE-MD-ARRAY-WITH-STORAGE"
+            | "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
             // CHANGE-CLASS is the generic function boot.lisp defines, so user
@@ -26393,6 +26451,34 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         resolve_sym("CHARACTER").unwrap_or(NIL),
                         EgclVal::from_fixnum(size as i64),
                     ]));
+                }
+                // A general vector's TYPE-OF is (SIMPLE-VECTOR n), or
+                // (VECTOR T n) for an adjustable / fill-pointered / displaced
+                // one (ansi make-array.*, type-of.*).
+                if egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_is_bit(v) {
+                    // A fill-pointer / adjustable / displaced bit vector.
+                    return Ok(resolve_sym("BIT-VECTOR").unwrap_or(NIL));
+                }
+                if v.is_heap_object()
+                    && !is_string_value(v)
+                    && !egcl_rt::types::bit_vector_p(v)
+                    && (egcl_stdlib::is_complex_vector(v)
+                        || unsafe { (*(v.as_ptr() as *const ObjectHeader)).type_id() }
+                            == type_id::SIMPLE_VECTOR)
+                {
+                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    return Ok(if egcl_stdlib::is_complex_vector(v) {
+                        vec_to_list(&[
+                            resolve_sym("VECTOR").unwrap_or(NIL),
+                            T,
+                            EgclVal::from_fixnum(size as i64),
+                        ])
+                    } else {
+                        vec_to_list(&[
+                            resolve_sym("SIMPLE-VECTOR").unwrap_or(NIL),
+                            EgclVal::from_fixnum(size as i64),
+                        ])
+                    });
                 }
                 let type_name = if v.is_nil() {
                     "NULL"
@@ -38651,6 +38737,12 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
             | "EGCL-INTERNAL:%CHECK-INITARGS"
             | "EGCL-INTERNAL::%CHECK-INITARGS"
+            | "EGCL-INTERNAL:%CHAR-NAME"
+            | "EGCL-INTERNAL::%CHAR-NAME"
+            | "EGCL-INTERNAL:%NAME-CHAR"
+            | "EGCL-INTERNAL::%NAME-CHAR"
+            | "EGCL-INTERNAL:%MAKE-MD-ARRAY-WITH-STORAGE"
+            | "EGCL-INTERNAL::%MAKE-MD-ARRAY-WITH-STORAGE"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
@@ -42008,6 +42100,7 @@ pub fn run(args: &[String]) -> Result<i32, EgclError> {
     // still needs to dispatch saved PRINT-OBJECT methods and condition reports.
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
     egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
+    egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
     let ca = if embedded_image_header().is_some_and(|(_, _, app)| app) {
         let mut ca = CliArgs::parse(&[])?;
         ca.cl_args = args.to_vec();
@@ -45218,6 +45311,7 @@ mod error_backtrace_rooting_tests {
             fn drop(&mut self) {
                 egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
                 egcl_stdlib::format::set_pprint_dispatch_hook(Some(stdlib_pprint_dispatch_hook));
+                egcl_stdlib::format::set_format_apply_hook(Some(stdlib_format_apply_hook));
             }
         }
         egcl_stdlib::format::set_print_object_hook(Some(collecting_printer));

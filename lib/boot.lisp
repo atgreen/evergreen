@@ -2133,6 +2133,18 @@
                          (t size))))
          (%make-displaced-array base offset size fpn (and adjustable t)
                                 (and stringp (not bitp) t) (and fp t) (and bitp t) (and doublep t))))
+      ;; :displaced-to (rank >= 2): the row-major storage is itself a vector
+      ;; displaced onto BASE, so AREF, ROW-MAJOR-AREF and the printer read
+      ;; and write BASE's elements (ansi print.array.2.*).
+      ((and dt-cell (car (cdr dt-cell)) mdp)
+       (let* ((base (car (cdr dt-cell)))
+              (offset (if dio-cell (car (cdr dio-cell)) 0))
+              (total 1))
+         (dolist (d dimensions) (setq total (* total d)))
+         (egcl-internal::%make-md-array-with-storage
+          dimensions
+          (%make-displaced-array base offset total total nil
+                                 (and stringp (not bitp) t) nil (and bitp t) (and doublep t)))))
       (mdp
        (let ((arr (%make-md-array dimensions iel (and doublep t))))
          (when ic-cell
@@ -2182,9 +2194,12 @@
        ;; interned string literal" (ansi EVERY/SOME/NOTANY/NOTEVERY.22;
        ;; bliss-4fbq). COPY-SEQ guarantees a new array. The bit-vector branch
        ;; already constructs a fresh one.
+       ;; An element-type of T gets a general vector even when the contents
+       ;; are a bit vector or string (ansi make-array.2d): COERCE to VECTOR
+       ;; would hand those back as they are.
        (cond (bitp (%bit-vector-from-bits (coerce (car (cdr ic-cell)) 'list)))
              (stringp (copy-seq (coerce (car (cdr ic-cell)) 'string)))
-             (t (copy-seq (coerce (car (cdr ic-cell)) 'vector)))))
+             (t (copy-seq (coerce (car (cdr ic-cell)) 'simple-vector)))))
       (stringp
        (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
       ;; A BIT array is a real SIMPLE-BIT-VECTOR (egcl builds these immutably,
@@ -3216,45 +3231,13 @@
       nil))
 
 (defun char-name (c)
-  (let ((code (char-code c)))
-    (cond ((= code 32) "Space")
-          ((= code 10) "Newline")
-          ((= code 9) "Tab")
-          ((= code 13) "Return")
-          ((= code 12) "Page")
-          ((= code 11) "Vt")
-          ((= code 8) "Backspace")
-          ((= code 127) "Rubout")
-          ((= code 133) "Next-Line")
-          ((= code 160) "NO-BREAK_SPACE")
-          ((= code 12288) "IDEOGRAPHIC_SPACE")
-          ((= code 0) "Null")
-          ((= code 7) "Bell")
-          ((= code 26) "Sub")
-          ((= code 27) "Escape")
-          (t nil))))
+  ;; The table lives in the reader (CONTROL_CHAR_NAMES), shared with the
+  ;; printer, so every `#\` the printer writes reads back.
+  (egcl-internal::%char-name c))
 
 (defun name-char (name)
-  (let ((n (string name)))
-    (cond ((string-equal n "Space") #\Space)
-          ((string-equal n "Newline") #\Newline)
-          ((string-equal n "Linefeed") #\Newline)
-          ((string-equal n "Tab") (code-char 9))
-          ((string-equal n "Return") (code-char 13))
-          ((string-equal n "Page") (code-char 12))
-          ((string-equal n "Vt") (code-char 11))
-          ((string-equal n "Backspace") (code-char 8))
-          ((string-equal n "Rubout") (code-char 127))
-          ((string-equal n "Delete") (code-char 127))
-          ((string-equal n "Next-Line") (code-char 133))
-          ((string-equal n "No-break_space") (code-char 160))
-          ((string-equal n "Ideographic_space") (code-char 12288))
-          ((string-equal n "Null") (code-char 0))
-          ((string-equal n "Nul") (code-char 0))
-          ((string-equal n "Bell") (code-char 7))
-          ((string-equal n "Sub") (code-char 26))
-          ((or (string-equal n "Escape") (string-equal n "Esc")) (code-char 27))
-          (t nil))))
+  ;; STRING does the designator coercion (and its type checking).
+  (egcl-internal::%name-char (string name)))
 
 ;;; --- string builders and STRING-CAPITALIZE / N-string ops ------------------
 
@@ -5108,8 +5091,11 @@ a hook error aborts startup.")
 ;; PPRINT-TABULAR (CLHS 22.2.2): each element starts at a column that is a
 ;; multiple of TABSIZE from the start of the block; elements that would pass
 ;; *PRINT-RIGHT-MARGIN* continue on a new line (ansi pprint-tabular.*).
-(defun pprint-tabular (stream list &optional (colon-p t) at-sign-p (tabsize 16))
+(defun pprint-tabular (stream list &optional (colon-p t) at-sign-p tabsize)
   (declare (ignore at-sign-p))
+  ;; A NIL tabsize (what `~v/pprint-tabular/` passes for a NIL argument)
+  ;; selects the default of 16.
+  (setf tabsize (or tabsize 16))
   (check-type tabsize (integer 0))
   (let ((stream (cond ((null stream) *standard-output*)
                       ((eq stream t) *terminal-io*)
@@ -5120,25 +5106,36 @@ a hook error aborts startup.")
                (suffix (if colon-p ")" ""))
                (items (mapcar #'write-to-string list))
                (margin (or *print-right-margin* 72))
-               (start (length prefix))
+               ;; Columns are absolute: the block starts wherever the stream
+               ;; already is, and continuation lines indent to the first item.
+               (origin (or (egcl::%pprint-native-column stream) 0))
+               (start (+ origin (length prefix)))
                (lines '())
                (line (copy-seq prefix))
                (col start))
-          (loop for (item . rest) on items
-                do (when (and (> col start)
-                              (> (+ col (length item) (if rest 0 (length suffix))) margin))
-                     (push line lines)
-                     (setf line (make-string start :initial-element #\Space)
-                           col start))
-                   (setf line (concatenate 'string line item))
-                   (incf col (length item))
-                   (when rest
-                     (let ((next (if (zerop tabsize)
-                                     (1+ col)
-                                     (+ start (* tabsize (ceiling (- (1+ col) start) tabsize))))))
-                       (setf line (concatenate 'string line
-                                               (make-string (- next col) :initial-element #\Space))
-                             col next))))
+          (flet ((next-tab (c)
+                   (if (zerop tabsize)
+                       (1+ c)
+                       (+ start (* tabsize (ceiling (- (1+ c) start) tabsize))))))
+            (loop for (item . rest) on items
+                  ;; A fill-style break: the section after ITEM (its tab
+                  ;; padding, or the suffix) must also fit on the line.
+                  do (when (and (> col start)
+                                (> (if rest
+                                       (next-tab (+ col (length item)))
+                                       (+ col (length item) (length suffix)))
+                                   margin))
+                       ;; The tab padding never ends a broken line.
+                       (push (string-right-trim " " line) lines)
+                       (setf line (make-string start :initial-element #\Space)
+                             col start))
+                     (setf line (concatenate 'string line item))
+                     (incf col (length item))
+                     (when rest
+                       (let ((next (next-tab col)))
+                         (setf line (concatenate 'string line
+                                                 (make-string (- next col) :initial-element #\Space))
+                               col next)))))
           (push (concatenate 'string line suffix) lines)
           (format stream "~{~a~^~%~}" (nreverse lines))))
     nil))

@@ -1056,7 +1056,7 @@ pub fn build_double_float_md_array(dims: &[usize], fill: f64) -> Result<EgclVal,
     build_md_array_with_storage(dims, storage)
 }
 
-fn build_md_array_with_storage(dims: &[usize], storage: EgclVal) -> Result<EgclVal, EgclError> {
+pub fn build_md_array_with_storage(dims: &[usize], storage: EgclVal) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(storage = storage);
     // Dimensions as a SIMPLE_VECTOR of fixnums.
     let dim_vals: Vec<EgclVal> = dims
