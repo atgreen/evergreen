@@ -22642,9 +22642,18 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // random-state eval (moving GC; bliss-4bp).
                 egcl_rt::rooted!(rest = rest);
                 egcl_rt::rooted!(limit_r = eval_form(limit_form, env)?);
-                if rest.is_cons() {
-                    eval_form(cp(*rest).0, env)?;
-                }
+                // The optional RANDOM-STATE argument, else *RANDOM-STATE*; the
+                // draws below advance that object, so a copy made by
+                // MAKE-RANDOM-STATE yields the same sequence (CLHS RANDOM; ansi
+                // numbers make-random-state.1-3).
+                egcl_rt::rooted!(
+                    state = if rest.is_cons() {
+                        eval_form(cp(*rest).0, env)?
+                    } else {
+                        env.lookup_var("*RANDOM-STATE*").unwrap_or(NIL)
+                    }
+                );
+                let draw = || random_state_draw(*state);
                 let limit = *limit_r;
                 if limit.is_fixnum() {
                     let bound = limit.as_fixnum();
@@ -22658,7 +22667,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             expected: "(REAL (0))".into(),
                         });
                     }
-                    let r = (next_random_u64() % bound as u64) as i64;
+                    let r = (draw() % bound as u64) as i64;
                     return Ok(EgclVal::from_fixnum(r));
                 }
                 if limit.is_single_float() {
@@ -22674,7 +22683,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         });
                     }
                     // 24 random mantissa bits give a uniform unit float in [0,1).
-                    let unit = (next_random_u64() >> 40) as f32 / (1u64 << 24) as f32;
+                    let unit = (draw() >> 40) as f32 / (1u64 << 24) as f32;
                     return Ok(EgclVal::from_single_float(unit * bound));
                 }
                 if limit.is_double_float() {
@@ -22690,7 +22699,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         });
                     }
                     // 53 random mantissa bits give a uniform unit double in [0,1).
-                    let unit = (next_random_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                    let unit = (draw() >> 11) as f64 / (1u64 << 53) as f64;
                     return Ok(egcl_rt::gc::alloc_double_float(unit * bound));
                 }
                 // Bignum limit: draw a random magnitude with the same limb count
@@ -22708,7 +22717,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                     let mut limbs = Vec::with_capacity(b.mag.len());
                     for _ in 0..b.mag.len() {
-                        limbs.push(next_random_u64());
+                        limbs.push(draw());
                     }
                     let r = BigInt::from_mag(1, limbs);
                     let (_, rem) = big_divmod(&r, &b);
@@ -22934,6 +22943,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let name = *name_r;
                 if let Some(class) = egcl_stdlib::find_class(name) {
                     return Ok(class);
+                }
+                // RESTART is defined on first use by the restart machinery;
+                // FIND-CLASS must see it before any restart exists (CLHS 4.3.7;
+                // ansi objects find-class.1).
+                if name.is_symbol()
+                    && sym_bare_name_rc(name).as_ref() == "RESTART"
+                    && symbol_home_package_name(name) == "COMMON-LISP"
+                {
+                    return ensure_restart_class(env);
                 }
                 if let Ok(class) = resolve_class_metaobject(env, name)
                     && class != name
@@ -27961,11 +27979,20 @@ fn cl_rationalize(v: EgclVal) -> Result<EgclVal, EgclError> {
         // adjacent representable floats. (af > 0, so bits±1 stay same-signed.)
         let x = f32_to_bigrat(af);
         let lower = f32_to_bigrat(f32::from_bits(bits - 1));
-        let upper = f32_to_bigrat(f32::from_bits(bits + 1));
+        // Past the largest finite float the upper neighbour is infinite, so
+        // the value itself bounds the interval.
+        let above = f32::from_bits(bits + 1);
+        let upper = if above.is_finite() { f32_to_bigrat(above) } else { x.clone() };
         let two = BigRat::from_i64(2);
         let lo = bigrat_div(&bigrat_add(&x, &lower), &two);
         let hi = bigrat_div(&bigrat_add(&x, &upper), &two);
         let mut r = simplest_between(&lo, &hi);
+        // (float (rationalize x) x) must be x (CLHS RATIONALIZE); an interval
+        // endpoint that rounds the other way falls back to the exact value
+        // (ansi numbers rationalize.1/.3).
+        if r.to_f64() as f32 != af {
+            r = x;
+        }
         if neg {
             r = bigrat_neg(&r);
         }
@@ -27983,11 +28010,15 @@ fn cl_rationalize(v: EgclVal) -> Result<EgclVal, EgclError> {
         // adjacent representable floats. (af > 0, so bits±1 stay same-signed.)
         let x = f64_to_bigrat(af);
         let lower = f64_to_bigrat(f64::from_bits(bits - 1));
-        let upper = f64_to_bigrat(f64::from_bits(bits + 1));
+        let above = f64::from_bits(bits + 1);
+        let upper = if above.is_finite() { f64_to_bigrat(above) } else { x.clone() };
         let two = BigRat::from_i64(2);
         let lo = bigrat_div(&bigrat_add(&x, &lower), &two);
         let hi = bigrat_div(&bigrat_add(&x, &upper), &two);
         let mut r = simplest_between(&lo, &hi);
+        if r.to_f64() != af {
+            r = x;
+        }
         if neg {
             r = bigrat_neg(&r);
         }
@@ -38789,6 +38820,34 @@ fn path_designator_to_string(v: EgclVal) -> Result<String, EgclError> {
 /// once from OS entropy via `RandomState` (no external RNG dependency). Backs the
 /// RANDOM builtin; a fresh, unreproducible sequence per process, like a default
 /// CL *RANDOM-STATE*.
+/// One SplitMix64 draw from a RANDOM-STATE object `(:random-state . seed)`,
+/// advancing the seed kept as a fixnum in its cdr. A state whose seed is NIL
+/// (the initial *RANDOM-STATE*, or one made with (make-random-state t)) is
+/// seeded from OS entropy on its first use. Anything that is not such an
+/// object falls back to the per-thread generator.
+fn random_state_draw(state: EgclVal) -> u64 {
+    if !state.is_cons() {
+        return next_random_u64();
+    }
+    let cell = unsafe { state.as_ptr() as *mut ConsCell };
+    let seed = unsafe { (*cell).cdr };
+    let mut s: u64 = if seed.is_fixnum() {
+        seed.as_fixnum() as u64
+    } else {
+        next_random_u64() >> 3
+    };
+    // 61 bits keep the seed a fixnum; the mix below runs on the full word.
+    s = s.wrapping_add(0x9E37_79B9_7F4A_7C15) & ((1u64 << 61) - 1);
+    // A fixnum is an immediate, so storing it needs no GC write barrier.
+    unsafe {
+        (*cell).cdr = EgclVal::from_fixnum(s as i64);
+    }
+    let mut z = s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 fn next_random_u64() -> u64 {
     use std::cell::Cell;
     use std::collections::hash_map::RandomState;

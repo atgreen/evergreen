@@ -1029,18 +1029,24 @@
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
 ;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
 ;; copies around a computation.
-(defvar *random-state* (list :random-state))
+;; A random state is (:RANDOM-STATE . seed); RANDOM advances the seed in place
+;; and seeds a NIL one from OS entropy on first use. Copying the cons copies
+;; the sequence, which is what MAKE-RANDOM-STATE promises (CLHS 12.2).
+(defvar *random-state* (cons :random-state nil))
 (defun make-random-state (&optional state)
-  ;; CLHS: STATE is a RANDOM-STATE, T, or NIL. The argument was simply IGNORED,
-  ;; so (make-random-state 0) handed back a fresh state instead of signalling
-  ;; (ansi MAKE-RANDOM-STATE.ERROR.4). The placeholder RESULT is unchanged --
-  ;; egcl has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
-  ;; wants a real independent copy and still fails).
+  ;; CLHS: STATE is a RANDOM-STATE, T (a fresh, randomly seeded state), or
+  ;; NIL (a copy of the current state).
   (unless (or (null state) (eq state t) (random-state-p state))
     (error 'type-error
            :datum state
            :expected-type '(or (member nil t) random-state)))
-  (list :random-state))
+  (if (eq state t)
+      (cons :random-state nil)
+      (let ((source (or state *random-state*)))
+        ;; A state never drawn from has no seed yet; one draw fixes it so the
+        ;; copy and the original continue identically.
+        (unless (cdr source) (random 2 source))
+        (cons :random-state (cdr source)))))
 (defun random-state-p (object)
   (and (consp object) (eq (car object) :random-state)))
 (defun copy-readtable (&optional from-readtable to-readtable)
