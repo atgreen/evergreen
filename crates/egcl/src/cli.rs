@@ -21721,15 +21721,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "PROBE-FILE" => {
                 // (probe-file pathspec) — truename if the file exists, else NIL.
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
-                return Ok(egcl_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+                egcl_rt::rooted!(pathname = eval_form(pathname_form, env)?);
+                // Relative to *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), as OPEN.
+                if pathname.is_string() || egcl_stdlib::is_pathname(*pathname) {
+                    *pathname = resolve_against_dpd(*pathname, env)?;
+                }
+                return Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL));
             }
             "OPEN" => return eval_builtin_arguments(&name, cdr, env),
             "DELETE-FILE" => {
                 // (delete-file pathspec) — delete the file, returning T.
                 let (path_form, _) = cp(cdr);
-                let pathspec = eval_form(path_form, env)?;
-                egcl_stdlib::delete_file(pathspec)?;
+                egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
+                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                    *pathspec = resolve_against_dpd(*pathspec, env)?;
+                }
+                egcl_stdlib::delete_file(*pathspec)?;
                 return Ok(T);
             }
             "RENAME-FILE" => {
@@ -21750,8 +21757,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // CL universal time (seconds since 1900-01-01). ASDF uses it for
                 // staleness checks (bliss-lb6.14).
                 let (path_form, _) = cp(cdr);
-                let pathspec = eval_form(path_form, env)?;
-                let path = path_designator_to_string(pathspec)?;
+                egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
+                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                    *pathspec = resolve_against_dpd(*pathspec, env)?;
+                }
+                let path = path_designator_to_string(*pathspec)?;
                 if let Some(date) = egcl_stdlib::embedded_files::write_date(&path) {
                     return Ok(EgclVal::from_fixnum(date));
                 }
