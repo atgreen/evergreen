@@ -16891,6 +16891,28 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME" | "GET-UNIVERSAL-TIME" => {
             Some((0, 0))
         }
+        // Stream functions (ansi streams *.error.*).
+        "FILE-LENGTH" | "STREAMP" | "OPEN-STREAM-P" | "INPUT-STREAM-P" | "OUTPUT-STREAM-P"
+        | "INTERACTIVE-STREAM-P" | "STREAM-ELEMENT-TYPE" | "STREAM-EXTERNAL-FORMAT"
+        | "MAKE-SYNONYM-STREAM" | "SYNONYM-STREAM-SYMBOL" | "TWO-WAY-STREAM-INPUT-STREAM"
+        | "TWO-WAY-STREAM-OUTPUT-STREAM" | "ECHO-STREAM-INPUT-STREAM"
+        | "ECHO-STREAM-OUTPUT-STREAM" | "BROADCAST-STREAM-STREAMS"
+        | "CONCATENATED-STREAM-STREAMS" => Some((1, 1)),
+        "MAKE-TWO-WAY-STREAM" | "MAKE-ECHO-STREAM" | "WRITE-BYTE" | "FILE-STRING-LENGTH" => {
+            Some((2, 2))
+        }
+        "WRITE-SEQUENCE" | "READ-SEQUENCE" => Some((2, 6)),
+        "MAKE-STRING-INPUT-STREAM" => Some((1, 3)),
+        "MAKE-STRING-OUTPUT-STREAM" => Some((0, 2)),
+        "CLOSE" => Some((1, 3)),
+        "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
+        "READ-BYTE" => Some((1, 3)),
+        "PEEK-CHAR" => Some((0, 5)),
+        "READ-CHAR" | "READ-LINE" | "READ-PRESERVING-WHITESPACE" | "READ" => Some((0, 4)),
+        "WRITE-STRING" | "WRITE-LINE" => Some((1, 5)),
+        "TERPRI" | "FRESH-LINE" | "FINISH-OUTPUT" | "FORCE-OUTPUT" | "CLEAR-OUTPUT" => {
+            Some((0, 1))
+        }
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -22006,12 +22028,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (path_form, _) = cp(cdr);
                 let mut pathspec = eval_form(path_form, env)?;
                 egcl_rt::rooted_ref!(_pathspec_root = &mut pathspec);
-                let pathname = if egcl_stdlib::is_pathname(pathspec) {
-                    pathspec
-                } else {
-                    egcl_stdlib::parse_namestring(pathspec, None, None)?.0
-                };
-                let entries = egcl_stdlib::directory(pathname)?;
+                egcl_rt::rooted!(
+                    pathname = if egcl_stdlib::is_pathname(pathspec) {
+                        pathspec
+                    } else {
+                        egcl_stdlib::parse_namestring(pathspec, None, None)?.0
+                    }
+                );
+                // A relative pathspec names files under *DEFAULT-PATHNAME-
+                // DEFAULTS*, as for PROBE-FILE (CLHS 19.2.3); ansi-aux's
+                // DELETE-ALL-VERSIONS relies on (directory "tmp.dat") finding
+                // the sandbox file.
+                *pathname = resolve_against_dpd(*pathname, env)?;
+                let entries = egcl_stdlib::directory(*pathname)?;
                 return Ok(vec_to_list(&entries));
             }
             "TRUENAME" => {

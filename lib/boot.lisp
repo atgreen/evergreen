@@ -1141,6 +1141,37 @@
 ;;; knows how to poll a pipe or socket without blocking; it cannot be written
 ;;; here in terms of READ-CHAR, which blocks.
 
+;;; INTERACTIVE-STREAM-P: true for a stream connected to the terminal (CLHS
+;;; 21.2): *TERMINAL-IO* itself, a synonym stream resolving to an interactive
+;;; stream, or a two-way/echo stream whose input side is interactive.
+(defun interactive-stream-p (stream)
+  (unless (streamp stream)
+    (error 'type-error :datum stream :expected-type 'stream))
+  (cond ((eq stream *terminal-io*) t)
+        ((typep stream 'synonym-stream)
+         (let ((target (symbol-value (synonym-stream-symbol stream))))
+           (and (streamp target) (not (eq target stream))
+                (interactive-stream-p target))))
+        ((typep stream 'two-way-stream)
+         (interactive-stream-p (two-way-stream-input-stream stream)))
+        ((typep stream 'echo-stream)
+         (interactive-stream-p (echo-stream-input-stream stream)))
+        (t nil)))
+
+;;; LISTEN: true when a character is immediately available on STREAM (CLHS
+;;; 21.2). A non-interactive stream has a character available unless it is at
+;;; end of file; an interactive one cannot be polled without blocking, so it
+;;; answers NIL.
+(defun listen (&optional (stream *standard-input*))
+  (let ((stream (cond ((eq stream t) *terminal-io*)
+                      ((null stream) *standard-input*)
+                      (t stream))))
+    (unless (streamp stream)
+      (error 'type-error :datum stream :expected-type 'stream))
+    (if (interactive-stream-p stream)
+        nil
+        (and (peek-char nil stream nil nil) t))))
+
 ;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
 ;;; the stream itself holds, so this only checks the designator and returns NIL.
 (defun clear-input (&optional (stream *standard-input*))
