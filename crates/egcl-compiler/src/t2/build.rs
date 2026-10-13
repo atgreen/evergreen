@@ -109,8 +109,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
 use crate::t2::inlining::{
-    body_cost, body_cost_with_bounded_self, decide, metadata_for_symbol, InlineDecision,
-    InlineOptions, InlinePolicy, IntrinsicId,
+    body_cost, decide, metadata_for_symbol, InlineDecision, InlineOptions, InlinePolicy,
+    IntrinsicId,
 };
 use crate::t2::ir::{
     AuxData, Block, Function, IRType, Inst, InstData, InstFlags, Opcode, TypeBits, Value,
@@ -359,25 +359,15 @@ fn build_with_saved_bodies(
         let hot = current_symbol
             .is_some_and(|caller| options.call_site_is_hot(caller, current_scope.bcp));
 
-        let source_proven_self =
-            current_symbol == Some(symbol) && body.self_call_sites.contains(&current_scope.bcp);
         if policy == InlinePolicy::NotInline
             || nargs != body.arity
             || depth >= options.config.max_depth
-            || (active.contains(&symbol) && !source_proven_self)
+            || active.contains(&symbol)
         {
             continue;
         }
         let mut eligibility_stack = active.clone();
-        let cost = if source_proven_self {
-            // The active root is expected here.  Re-check the body while
-            // treating only its source-proven self edges as finite leaf calls.
-            eligibility_stack.remove(&symbol);
-            body_cost_with_bounded_self(symbol, options, &mut eligibility_stack, Some(symbol))
-        } else {
-            body_cost(symbol, options, &mut eligibility_stack)
-        };
-        let Ok(cost) = cost else {
+        let Ok(cost) = body_cost(symbol, options, &mut eligibility_stack) else {
             continue;
         };
         if cost > *remaining_budget
@@ -386,7 +376,7 @@ fn build_with_saved_bodies(
             continue;
         }
 
-        let inserted = active.insert(symbol);
+        active.insert(symbol);
         let mut callee_budget = *remaining_budget;
         let callee = build_with_saved_bodies(
             &body,
@@ -397,9 +387,7 @@ fn build_with_saved_bodies(
             active,
             false,
         )?;
-        if inserted {
-            active.remove(&symbol);
-        }
+        active.remove(&symbol);
 
         // The outer activation is suspended immediately after the invoke: its
         // arguments have been consumed and the callee's eventual Return will
@@ -3990,46 +3978,5 @@ mod tests {
             .block_order()
             .iter()
             .any(|&b| has_opcode(&f, b, Opcode::Call)));
-    }
-
-    #[test]
-    fn source_proven_self_call_inlines_to_the_configured_depth() {
-        let self_symbol = egcl_rt::symbols::intern("BODY-INLINE-PROVEN-SELF");
-        let mut body = bf(
-            "BODY-INLINE-PROVEN-SELF",
-            vec![
-                Instr::LoadLocal(0),
-                Instr::CallNamed {
-                    sym: self_symbol,
-                    nargs: 1,
-                },
-                Instr::Return,
-            ],
-            vec![],
-            1,
-            1,
-            1,
-        );
-        body.self_call_sites = vec![1];
-        let body = Arc::new(body);
-        let mut options = InlineOptions::default()
-            .with_root_symbol(self_symbol)
-            .with_body(self_symbol, Arc::clone(&body));
-        options.config.max_depth = 1;
-
-        let f = build_from_bytecode_with_inline_options(&body, options)
-            .expect("source-proven self body builds");
-
-        assert!(
-            f.num_blocks() > 1,
-            "the proven root self call must clone one callee body"
-        );
-        assert!(
-            f.block_order()
-                .iter()
-                .any(|&block| has_opcode(&f, block, Opcode::Call)),
-            "the depth-limited recursive leaf remains an ordinary call"
-        );
-        crate::t2::verify::verify(&f).expect("bounded self-inline IR verifies");
     }
 }
