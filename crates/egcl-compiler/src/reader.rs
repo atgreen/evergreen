@@ -3192,6 +3192,9 @@ fn read_char_literal_input(
             "tab" => return Ok((EgclVal::from_char('\t'), end)),
             "return" => return Ok((EgclVal::from_char('\r'), end)),
             "backspace" => return Ok((EgclVal::from_char('\u{08}'), end)),
+            // CHAR-NAME of code 7 is "Bell", so #\Bell must read back
+            // (syntax.sharp-backslash.6).
+            "bell" => return Ok((EgclVal::from_char('\u{07}'), end)),
             "rubout" | "delete" => return Ok((EgclVal::from_char('\u{7F}'), end)),
             "page" => return Ok((EgclVal::from_char('\u{0C}'), end)),
             "linefeed" => return Ok((EgclVal::from_char('\n'), end)),

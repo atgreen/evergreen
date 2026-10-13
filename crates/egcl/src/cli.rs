@@ -14933,7 +14933,12 @@ fn typep_matches(
     // `(typep thread-instance 'thread)` wrongly NIL (bliss-66ny). The STANDARD-
     // OBJECT / STRUCTURE-OBJECT / CONDITION distinctions are left to the general
     // instance handling below.
-    if type_spec.is_symbol() && egcl_stdlib::is_instance(object) {
+    if type_spec.is_symbol()
+        && egcl_stdlib::is_instance(object)
+        // A Gray stream is an instance whose stream-ness the stream-type check
+        // below decides, not the STREAM class registered for FIND-CLASS.
+        && !is_stream_type_specifier(type_spec)
+    {
         let orig = sym_bare_name_rc(type_spec);
         if orig.as_ref() != "T"
             && orig.as_ref() != "STANDARD-OBJECT"
@@ -17440,6 +17445,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (val_form, _) = cp(r);
                 let value = eval_form(val_form, env)?;
                 let type_form = *type_form;
+                // (THE (VALUES ...) form) declares the shape of the multiple
+                // values, which a single-value check cannot judge; the primary
+                // value passes through unchecked (CLHS THE; ansi the.1-17).
+                if type_form.is_cons()
+                    && cp(type_form).0.is_symbol()
+                    && sym_bare_name_rc(cp(type_form).0).as_ref() == "VALUES"
+                {
+                    return Ok(value);
+                }
                 // The quick primitive check handles the common declared types;
                 // fall back to full TYPEP so user DEFTYPEs (e.g. babel's
                 // `(the array-index ...)` → alexandria's ARRAY-INDEX) and
