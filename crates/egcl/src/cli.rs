@@ -23900,6 +23900,23 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             }
                         }
                     }
+                } else if seq.is_cons() {
+                    // A list destination: store into the conses from START on
+                    // (CLHS READ-SEQUENCE takes any sequence; ansi streams
+                    // read-sequence.list.*).
+                    egcl_rt::rooted!(elements = egcl_stdlib::stream_read_sequence(inp, count)?);
+                    egcl_rt::rooted!(cursor = seq);
+                    for _ in 0..start {
+                        *cursor = cp(*cursor).1;
+                    }
+                    for i in 0..elements.len() {
+                        if !cursor.is_cons() {
+                            break;
+                        }
+                        store_cons_field(*cursor, elements[i], true)?;
+                        *cursor = cp(*cursor).1;
+                        pos += 1;
+                    }
                 } else {
                     for el in egcl_stdlib::stream_read_sequence(inp, count)? {
                         seq_set_elt(seq, pos, el)?;
