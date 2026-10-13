@@ -14703,6 +14703,16 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 }
 
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    // egcl has no extended characters, so BASE-CHAR and CHARACTER are the same
+    // type in both directions (TYPEP already says so; ansi arrays
+    // upgraded-array-element-type.2 checks the two SUBTYPEP answers agree).
+    if t1.is_symbol()
+        && t2.is_symbol()
+        && matches!(sym_bare_name_rc(t1).as_ref(), "CHARACTER" | "BASE-CHAR")
+        && matches!(sym_bare_name_rc(t2).as_ref(), "CHARACTER" | "BASE-CHAR")
+    {
+        return (true, true);
+    }
     if t1.is_cons() && t2.is_cons() {
         let (head1, args1) = cp(t1);
         let (head2, args2) = cp(t2);
@@ -16862,6 +16872,19 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         "HASH-TABLE-WEAKNESS" => Some((1, 1)),
+        // Array functions (ansi arrays *.error.*: a wrong argument count is a
+        // PROGRAM-ERROR, not a TYPE-ERROR about a missing argument).
+        "ARRAY-RANK" | "ARRAY-DIMENSIONS" | "ARRAY-TOTAL-SIZE" | "ARRAY-ELEMENT-TYPE"
+        | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT" | "ADJUSTABLE-ARRAY-P"
+        | "FILL-POINTER" | "VECTOR-POP" | "ARRAYP" | "VECTORP" | "SIMPLE-VECTOR-P"
+        | "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" | "STRINGP" | "SIMPLE-STRING-P" => Some((1, 1)),
+        "ARRAY-DIMENSION" | "VECTOR-PUSH" => Some((2, 2)),
+        "VECTOR-PUSH-EXTEND" => Some((2, 3)),
+        "UPGRADED-ARRAY-ELEMENT-TYPE" => Some((1, 2)),
+        "ARRAY-IN-BOUNDS-P" | "ARRAY-ROW-MAJOR-INDEX" => Some((1, usize::MAX)),
+        "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME" | "GET-UNIVERSAL-TIME" => {
+            Some((0, 0))
+        }
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -38264,8 +38287,26 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
     };
 
     // Input defaults to an error on a missing file; probe defaults to NIL.
-    if !if_dne_supplied && matches!(direction, egcl_stdlib::StreamDirection::Input) {
-        if_does_not_exist = T;
+    // CLHS OPEN: :IF-DOES-NOT-EXIST defaults to :ERROR for :INPUT, or when
+    // :IF-EXISTS is :OVERWRITE or :APPEND; to :CREATE for :OUTPUT and :IO
+    // otherwise; and to NIL for :PROBE (ansi streams open.io.*, open.output.*).
+    if !if_dne_supplied {
+        let exists_keeps = matches!(
+            sym_bare_name_rc(if_exists).as_ref(),
+            "APPEND" | "OVERWRITE"
+        ) || if_exists == egcl_stdlib::streams::IF_EXISTS_APPEND_VAL
+            || if_exists == egcl_stdlib::streams::IF_EXISTS_OVERWRITE_VAL;
+        if_does_not_exist = match direction {
+            egcl_stdlib::StreamDirection::Input => T,
+            egcl_stdlib::StreamDirection::Output | egcl_stdlib::StreamDirection::Io => {
+                if exists_keeps {
+                    T
+                } else {
+                    egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL
+                }
+            }
+            _ => NIL,
+        };
     }
     if_does_not_exist = match sym_bare_name_rc(if_does_not_exist).as_ref() {
         "CREATE" => egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL,
