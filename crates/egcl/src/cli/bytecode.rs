@@ -3416,7 +3416,16 @@ impl<'e> Lowerer<'e> {
         // Establish body declarations before expansion so both macro environments
         // and source-call proofs see them. Restore their lexical extent after
         // lowering, including an expansion failure (ansi MACROLET.47; bliss-vmge).
-        let (_operator, rest) = cp(form);
+        let (operator, rest) = cp(form);
+        // A SYMBOL-MACROLET that binds a constant or special variable, or
+        // declares a symbol macro SPECIAL, is a PROGRAM-ERROR: hand it to the
+        // tree-walker, which signals it (ansi symbol-macrolet.error.1-3).
+        if operator.is_symbol()
+            && sym_bare_name_rc(operator).as_ref() == "SYMBOL-MACROLET"
+            && super::check_symbol_macrolet_bindings(rest).is_err()
+        {
+            return Err(Bail);
+        }
         let (_definitions, body) = cp(rest);
         let decl_special = body_declared_special(body);
         let declarations = self.enter_body_declarations(body);

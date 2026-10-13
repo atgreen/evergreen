@@ -354,6 +354,14 @@
 ;; EGCL-EXT:DECLARATION-SPECIFIER) then resolves to that bare identity instead
 ;; of the extension package's symbol.
 (defun proclaim (decl-spec)
+  ;; A declaration specifier is a proper list headed by a symbol (CLHS 3.3.2;
+  ;; ansi proclaim.error.3-11 feed dotted lists).
+  (unless (and (consp decl-spec)
+               (symbolp (car decl-spec))
+               (loop for tail = decl-spec then (cdr tail)
+                     while (consp tail)
+                     finally (return (null tail))))
+    (error 'type-error :datum decl-spec :expected-type '(cons symbol list)))
   (when (consp decl-spec)
     (case (car decl-spec)
       ((inline notinline)
@@ -5219,3 +5227,47 @@ no parameter names take their defaults."
        ,@(nreverse forms)
        (setf (get ',name 'egcl::%typed-struct) ',layout)
        ',name)))
+
+;;; ---------------------------------------------------------------------------
+;;; TRACE / UNTRACE (CLHS 25.1): a traced function's global definition is
+;;; replaced by a wrapper that reports the call and its values on
+;;; *TRACE-OUTPUT*; UNTRACE restores the original.  (TRACE) lists the traced
+;;; names, (UNTRACE) untraces everything.
+(defvar egcl::*traced-functions* '()
+  "Alist of (FUNCTION-NAME . ORIGINAL-DEFINITION) for the traced functions.")
+
+(defun egcl::%traced-names ()
+  (mapcar #'car egcl::*traced-functions*))
+
+(defun egcl::%trace-functions (names)
+  (dolist (name names (egcl::%traced-names))
+    (cond ((assoc name egcl::*traced-functions* :test #'equal)
+           (warn "~S is already traced." name))
+          ((not (fboundp name))
+           (warn "~S is not a defined function; not traced." name))
+          (t
+           (let ((original (fdefinition name)))
+             (push (cons name original) egcl::*traced-functions*)
+             (setf (fdefinition name)
+                   (lambda (&rest arguments)
+                     (format *trace-output* "~&0: (~S~{ ~S~})~%" name arguments)
+                     (let ((results (multiple-value-list (apply original arguments))))
+                       (format *trace-output* "~&0: ~S returned~{ ~S~}~%" name results)
+                       (values-list results)))))))))
+
+(defun egcl::%untrace-functions (names)
+  (dolist (name (or names (egcl::%traced-names)))
+    (let ((entry (assoc name egcl::*traced-functions* :test #'equal)))
+      (cond (entry
+             (setf (fdefinition name) (cdr entry))
+             (setq egcl::*traced-functions* (remove entry egcl::*traced-functions*)))
+            (t (warn "~S is not traced." name)))))
+  (egcl::%traced-names))
+
+(defmacro trace (&rest names)
+  (if names
+      `(egcl::%trace-functions ',names)
+      '(egcl::%traced-names)))
+
+(defmacro untrace (&rest names)
+  `(egcl::%untrace-functions ',names))

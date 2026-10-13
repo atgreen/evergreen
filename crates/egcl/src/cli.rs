@@ -17311,6 +17311,11 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "RENAME-FILE" => Some((2, 2)),
         "ENSURE-DIRECTORIES-EXIST" => Some((1, 65)),
         "DIRECTORY" => Some((1, 65)),
+        "MACROEXPAND" | "MACROEXPAND-1" | "MACRO-FUNCTION" | "CONSTANTP" | "COMPILE"
+        | "DECODE-UNIVERSAL-TIME" => Some((1, 2)),
+        "SLEEP" | "DISASSEMBLE" => Some((1, 1)),
+        "ROOM" | "USER-HOMEDIR-PATHNAME" => Some((0, 1)),
+        "ENCODE-UNIVERSAL-TIME" => Some((6, 7)),
         "CLOSE" => Some((1, 3)),
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
@@ -19210,7 +19215,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // Conservative for other symbols/compound forms (NIL).
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                let is_const = if v.is_nil() || v == T {
+                let is_const = if v.is_nil() || v == T || is_function_value(v) {
+                    // A function object is physically a cons here but is a
+                    // self-evaluating FUNCTION (ansi constantp.1).
                     true
                 } else if v.is_cons() {
                     let (h, _) = cp(v);
@@ -22507,7 +22514,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     g.regions_total,
                     g.regions_free,
                 );
-                write_trace_output(env, &report)?;
+                // CLHS ROOM: the report goes to *STANDARD-OUTPUT* (ansi room.1).
+                egcl_rt::rooted!(out = resolve_output_stream(NIL, env));
+                write_str_to(*out, &report, env)?;
                 return Ok(NIL);
             }
             "ENCODE-UNIVERSAL-TIME" => return eval_builtin_arguments(&name, cdr, env),
@@ -32090,8 +32099,21 @@ fn bump_gensym_counter(env: &mut Env, mut current: EgclVal) -> Result<(), EgclEr
 
 // ── DEFMACRO ─────────────────────────────────────────────────────
 fn eval_defmacro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
-    let (name_form, rest) = cp(cdr);
-    let (params_form, body) = cp(rest);
+    let (mut name_form, rest) = cp(cdr);
+    let (mut params_form, mut body) = cp(rest);
+    egcl_rt::rooted_ref!(_name_root = &mut name_form);
+    egcl_rt::rooted_ref!(_params_root = &mut params_form);
+    egcl_rt::rooted_ref!(_body_root = &mut body);
+    // CLHS DEFMACRO: the body is enclosed in an implicit BLOCK named after the
+    // macro, so RETURN-FROM that name exits the expander (ansi defmacro.2).
+    // The same wrap DEFUN and DEFINE-SETF-EXPANDER perform at definition time.
+    // A leading docstring and declarations stay outside the block: the
+    // special-declaration scan looks through the implicit block, as for DEFUN.
+    if name_form.is_symbol() {
+        egcl_rt::rooted!(block_body = arena_cons(name_form, body));
+        egcl_rt::rooted!(block_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *block_body));
+        body = arena_cons(*block_form, NIL);
+    }
     let name = sym_name(name_form);
     // Register the name present INTERNAL in CL-USER (bliss-v15i / bliss-4n3h).
     home_defined_symbol(env, name_form);
@@ -34086,6 +34108,44 @@ fn eval_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     __r
 }
 
+/// CLHS SYMBOL-MACROLET: binding a constant or a special variable, or declaring
+/// a symbol macro SPECIAL in the body, is a PROGRAM-ERROR (ansi
+/// symbol-macrolet.error.1-3).
+fn check_symbol_macrolet_bindings(cdr: EgclVal) -> Result<(), EgclError> {
+    let (bindings, body) = cp(cdr);
+    let body_specials = let_body_special_decls(body);
+    let mut cursor = bindings;
+    while cursor.is_cons() {
+        let (binding, rest) = cp(cursor);
+        cursor = rest;
+        if !binding.is_cons() {
+            continue;
+        }
+        let symbol = cp(binding).0;
+        if !symbol.is_symbol() {
+            continue;
+        }
+        let constant = symbol.is_nil()
+            || symbol == T
+            || is_keyword_arg(symbol)
+            || egcl_rt::symbols::symbol_is_constant(symbol.as_symbol_index());
+        if constant || is_special_var(symbol) {
+            return Err(EgclError::ProgramError(format!(
+                "SYMBOL-MACROLET cannot bind {} {}",
+                if constant { "the constant" } else { "the special variable" },
+                sym_name(symbol)
+            )));
+        }
+        if body_specials.contains(&symbol.as_symbol_index()) {
+            return Err(EgclError::ProgramError(format!(
+                "SYMBOL-MACROLET: {} cannot be declared SPECIAL",
+                sym_name(symbol)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn eval_symbol_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // Eagerly expand the symbol-macros through the whole body (respecting quote,
     // lexical shadowing, and lambda params) so a closure created in the body and
@@ -34095,6 +34155,7 @@ fn eval_symbol_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclErro
     // Fall back to the lazy path if the compiler macroexpander can't handle the
     // body (its result is then evaluated with the runtime symbol-macro table).
     egcl_rt::rooted!(cdr = cdr);
+    check_symbol_macrolet_bindings(*cdr)?;
     if let Some(sm_sym) = resolve_sym("SYMBOL-MACROLET") {
         egcl_rt::rooted!(form = arena_cons(sm_sym, *cdr));
         let menv = macroexpand_environment_from_cli(env);
