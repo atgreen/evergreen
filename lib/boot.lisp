@@ -1153,11 +1153,38 @@
 ;;; WITH-OUTPUT-TO-STRING: bind VAR to a fresh string-output-stream, run BODY,
 ;;; and return the accumulated string. (A supplied target string with a fill
 ;;; pointer is not supported; the stream form is used regardless.)
+(defun egcl::%split-body-declarations (body)
+  "BODY as (DECLARATIONS . FORMS): the leading DECLARE forms and the rest."
+  (let ((declarations '()))
+    (loop while (and (consp body) (consp (car body)) (eq (caar body) 'declare))
+          do (push (pop body) declarations))
+    (cons (nreverse declarations) body)))
+
+;; WITH-OUTPUT-TO-STRING (CLHS 22.4): with a STRING-FORM the output is appended
+;; to that string (which must have a fill pointer) when the body finishes, and
+;; the body's values are returned; otherwise the collected output string is the
+;; value.  An :ELEMENT-TYPE form is evaluated, before the body, for effect.
 (defmacro with-output-to-string ((var &optional string-form &rest keys) &rest body)
-  (declare (ignore string-form keys))
-  `(let ((,var (make-string-output-stream)))
-     ,@body
-     (get-output-stream-string ,var)))
+  (let* ((split (egcl::%split-body-declarations body))
+         (declarations (car split))
+         (forms (cdr split))
+         (element-type-form (getf keys :element-type))
+         (element-type-forms (when (member :element-type keys) (list element-type-form))))
+    (if string-form
+        (let ((target (gensym "STRING")) (out (gensym "OUT")) (ch (gensym "CHAR")))
+          `(let ((,target ,string-form))
+             ,@element-type-forms
+             (let ((,var (make-string-output-stream)))
+               ,@declarations
+               (multiple-value-prog1 (progn ,@forms)
+                 (let ((,out (get-output-stream-string ,var)))
+                   (loop for ,ch across ,out do (vector-push-extend ,ch ,target)))))))
+        `(progn
+           ,@element-type-forms
+           (let ((,var (make-string-output-stream)))
+             ,@declarations
+             ,@forms
+             (get-output-stream-string ,var))))))
 
 (defmacro print-unreadable-object ((object stream &key type identity) &body body)
   (let ((obj (gensym "OBJECT"))
@@ -1257,9 +1284,17 @@
 
 ;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
 (defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
-  (declare (ignore index))
-  `(let ((,var (make-string-input-stream ,string ,start ,end)))
-     ,@body))
+  (let* ((split (egcl::%split-body-declarations body))
+         (declarations (car split))
+         (forms (cdr split)))
+    `(let ((,var (make-string-input-stream ,string ,start ,end)))
+       ,@declarations
+       ,(if index
+            ;; :INDEX names a place that receives the index of the first
+            ;; unread character when the body finishes normally.
+            `(multiple-value-prog1 (progn ,@forms)
+               (setf ,index (file-position ,var)))
+            `(progn ,@forms)))))
 
 ;;; WITH-OPEN-STREAM: bind VAR to STREAM for BODY, closing it on exit.
 (defmacro with-open-stream ((var stream) &rest body)
@@ -3892,6 +3927,10 @@
   (let ((element-type (egcl::%native-stream-element-type stream)))
     (cond ((eq element-type t) 'character)
           ((eql element-type 8) '(unsigned-byte 8))
+          ;; The native code is the bit width, negated for a signed type.
+          ((and (integerp element-type) (plusp element-type))
+           `(unsigned-byte ,element-type))
+          ((integerp element-type) `(signed-byte ,(- element-type)))
           (t (error 'type-error :datum stream :expected-type 'stream)))))
 (defmethod stream-element-type ((stream fundamental-stream))
   (gray-stream-element-type stream))
@@ -4920,6 +4959,21 @@ a hook error aborts startup.")
 (defun stream-external-format (stream)
   (check-type stream stream)
   :default)
+
+;; FILE-STRING-LENGTH (CLHS 21.2): the octets OBJECT occupies on STREAM, whose
+;; external format is UTF-8; 1 for a broadcast stream (CLHS BROADCAST-STREAM).
+(defun file-string-length (stream object)
+  (check-type stream stream)
+  (let ((text (if (characterp object) (string object) object)))
+    (check-type text string)
+    (if (typep stream 'broadcast-stream)
+        1
+        (loop for ch across text
+              sum (let ((code (char-code ch)))
+                    (cond ((< code #x80) 1)
+                          ((< code #x800) 2)
+                          ((< code #x10000) 3)
+                          (t 4)))))))
 
 (defun print-not-readable-object (condition)
   (slot-value condition 'object))

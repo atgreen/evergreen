@@ -352,6 +352,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let input = args.first().copied().unwrap_or(NIL);
             let output = args.get(1).copied().unwrap_or(NIL);
+            check_two_way_components(input, output)?;
             egcl_stdlib::make_two_way_stream(input, output)
         }),
 
@@ -362,6 +363,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let input = args.first().copied().unwrap_or(NIL);
             let output = args.get(1).copied().unwrap_or(NIL);
+            check_two_way_components(input, output)?;
             egcl_stdlib::make_echo_stream(input, output)
         }),
 
@@ -1346,7 +1348,15 @@ fn resolve(name: &str) -> Option<Handler> {
                     "MAKE-STRING-INPUT-STREAM requires a string".into(),
                 ));
             }
-            let string = args[0];
+            // A fill-pointer or displaced string is read through its elements
+            // into a simple copy (ansi make-string-input-stream.7-9).
+            egcl_rt::rooted!(string = if is_string_value(args[0])
+                && egcl_stdlib::is_complex_vector(args[0])
+            {
+                arena_str(&val_as_str(args[0]))
+            } else {
+                args[0]
+            });
             let start = if args.len() > 1 && args[1].is_fixnum() {
                 args[1].as_fixnum() as usize
             } else {
@@ -1357,7 +1367,7 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 None
             };
-            egcl_stdlib::make_string_input_stream(string, start, end)
+            egcl_stdlib::make_string_input_stream(*string, start, end)
         }),
 
         "READ-CHAR" => Some(|_operator, args, env| {
@@ -4115,7 +4125,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // regex-replace stitches output with `(write-string s :start :end)`
             // and produced garbage when these were ignored).
             let chars: Vec<char> = full.chars().collect();
-            let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+            let (kstart, kend) =
+                read_start_end_keys_checked("WRITE-STRING", &args[kv_from..], chars.len())?;
             let s: String = chars[kstart..kend].iter().collect();
             let mut out = resolve_output_stream(stream, env);
             egcl_rt::rooted_ref!(_output_root = &mut out);
@@ -4153,7 +4164,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 (NIL, 1)
             };
             let chars: Vec<char> = full.chars().collect();
-            let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+            let (kstart, kend) = read_start_end_keys_checked("WRITE-LINE", &args[kv_from..], chars.len())?;
             let s: String = chars[kstart..kend].iter().collect();
             let mut out = resolve_output_stream(stream, env);
             egcl_rt::rooted_ref!(_output_root = &mut out);
@@ -4619,4 +4630,22 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         _ => None,
     }
+}
+
+/// MAKE-TWO-WAY-STREAM / MAKE-ECHO-STREAM take an input stream and an output
+/// stream; anything else is a TYPE-ERROR (ansi make-two-way-stream.error.5-7).
+fn check_two_way_components(input: EgclVal, output: EgclVal) -> Result<(), EgclError> {
+    if !egcl_stdlib::input_stream_p(input) {
+        return Err(EgclError::TypeError {
+            datum: input,
+            expected: "input stream".into(),
+        });
+    }
+    if !egcl_stdlib::output_stream_p(output) {
+        return Err(EgclError::TypeError {
+            datum: output,
+            expected: "output stream".into(),
+        });
+    }
+    Ok(())
 }

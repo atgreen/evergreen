@@ -1983,21 +1983,94 @@ fn reject_assignment_to_constant(target: EgclVal) -> Result<(), EgclError> {
 /// Parse trailing (already-evaluated) `:start`/`:end` keyword pairs for a bounded
 /// sequence op, clamped to `[0, len]` with `start <= end`. Defaults: start 0,
 /// end len.
-fn read_start_end_keys(kv: &[EgclVal], len: usize) -> (usize, usize) {
-    let mut start = 0usize;
-    let mut end = len;
-    let mut i = 0;
-    while i + 1 < kv.len() {
-        match sym_bare_name_rc(kv[i]).as_ref() {
-            "START" if kv[i + 1].is_fixnum() => start = kv[i + 1].as_fixnum() as usize,
-            "END" if kv[i + 1].is_fixnum() => end = kv[i + 1].as_fixnum() as usize,
+/// Validate the &KEY portion of a builtin call (CLHS 3.4.1.4): an odd number of
+/// arguments, a non-symbol key, or a key outside ALLOWED is a PROGRAM-ERROR,
+/// unless `:allow-other-keys` with a true value appears (its leftmost
+/// occurrence decides). `:allow-other-keys` itself is always accepted.
+fn check_keyword_args(name: &str, kv: &[EgclVal], allowed: &[&str]) -> Result<(), EgclError> {
+    if kv.len() % 2 != 0 {
+        return Err(EgclError::ProgramError(format!(
+            "{}: odd number of keyword arguments",
+            name
+        )));
+    }
+    let mut allow_other: Option<bool> = None;
+    for pair in kv.chunks(2) {
+        if !pair[0].is_symbol() {
+            return Err(EgclError::ProgramError(format!(
+                "{}: keyword argument name is not a symbol",
+                name
+            )));
+        }
+        if allow_other.is_none() && sym_bare_name_rc(pair[0]).as_ref() == "ALLOW-OTHER-KEYS" {
+            allow_other = Some(!pair[1].is_nil());
+        }
+    }
+    if allow_other == Some(true) {
+        return Ok(());
+    }
+    for pair in kv.chunks(2) {
+        let key = sym_bare_name_rc(pair[0]);
+        if key.as_ref() != "ALLOW-OTHER-KEYS" && !allowed.contains(&key.as_ref()) {
+            return Err(EgclError::ProgramError(format!(
+                "{}: unknown keyword argument :{}",
+                name, key
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `read_start_end_keys` with the checks CLHS requires of a bounding-index
+/// designator pair: unknown keywords are PROGRAM-ERRORs, START must be a
+/// non-negative integer no greater than LEN, END NIL or an integer in
+/// START..=LEN, else TYPE-ERROR (ansi streams write-sequence.error.*,
+/// read-sequence.error.*). The leftmost occurrence of a keyword wins.
+fn read_start_end_keys_checked(
+    name: &str,
+    kv: &[EgclVal],
+    len: usize,
+) -> Result<(usize, usize), EgclError> {
+    check_keyword_args(name, kv, &["START", "END"])?;
+    let mut start: Option<EgclVal> = None;
+    let mut end: Option<EgclVal> = None;
+    for pair in kv.chunks(2) {
+        match sym_bare_name_rc(pair[0]).as_ref() {
+            "START" if start.is_none() => start = Some(pair[1]),
+            "END" if end.is_none() => end = Some(pair[1]),
             _ => {}
         }
-        i += 2;
     }
-    let start = start.min(len);
-    let end = end.min(len).max(start);
-    (start, end)
+    let start_index = match start {
+        None => 0,
+        Some(v) if v.is_fixnum() && v.as_fixnum() >= 0 && v.as_fixnum() as usize <= len => {
+            v.as_fixnum() as usize
+        }
+        Some(v) => {
+            return Err(EgclError::TypeError {
+                datum: v,
+                expected: format!("(INTEGER 0 {})", len),
+            });
+        }
+    };
+    let end_index = match end {
+        None => len,
+        Some(v) if v.is_nil() => len,
+        Some(v)
+            if v.is_fixnum()
+                && v.as_fixnum() >= start_index as i64
+                && v.as_fixnum() as usize <= len =>
+        {
+            v.as_fixnum() as usize
+        }
+        Some(v) => {
+            return Err(EgclError::TypeError {
+                datum: v,
+                expected: format!("(OR NULL (INTEGER {} {}))", start_index, len),
+            });
+        }
+    };
+    Ok((start_index, end_index))
 }
 
 /// Destructively set element `i` of a mutable sequence, dispatching on strings
@@ -16939,18 +17012,19 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         | "TWO-WAY-STREAM-OUTPUT-STREAM" | "ECHO-STREAM-INPUT-STREAM"
         | "ECHO-STREAM-OUTPUT-STREAM" | "BROADCAST-STREAM-STREAMS"
         | "CONCATENATED-STREAM-STREAMS" => Some((1, 1)),
-        "MAKE-TWO-WAY-STREAM" | "MAKE-ECHO-STREAM" | "WRITE-BYTE" | "FILE-STRING-LENGTH" => {
+        "MAKE-TWO-WAY-STREAM" | "MAKE-ECHO-STREAM" | "WRITE-BYTE" => {
             Some((2, 2))
         }
-        "WRITE-SEQUENCE" | "READ-SEQUENCE" => Some((2, 6)),
+        // &KEY arguments: the keyword checker bounds them, not the arity table.
+        "WRITE-SEQUENCE" | "READ-SEQUENCE" => Some((2, 66)),
         "MAKE-STRING-INPUT-STREAM" => Some((1, 3)),
-        "MAKE-STRING-OUTPUT-STREAM" => Some((0, 2)),
+        "MAKE-STRING-OUTPUT-STREAM" => Some((0, 64)),
         "CLOSE" => Some((1, 3)),
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
         "PEEK-CHAR" => Some((0, 5)),
         "READ-CHAR" | "READ-LINE" | "READ-PRESERVING-WHITESPACE" | "READ" => Some((0, 4)),
-        "WRITE-STRING" | "WRITE-LINE" => Some((1, 5)),
+        "WRITE-STRING" | "WRITE-LINE" => Some((1, 65)),
         "TERPRI" | "FRESH-LINE" | "FINISH-OUTPUT" | "FORCE-OUTPUT" | "CLEAR-OUTPUT" => {
             Some((0, 1))
         }
@@ -17874,7 +17948,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "WRITE-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING-OUTPUT-STREAM" => {
-                // (make-string-output-stream &key element-type)
+                // (make-string-output-stream &key element-type): the element
+                // type is accepted (strings here hold any character) and the
+                // keywords are validated (ansi make-string-output-stream.*).
+                let args = list_to_vec(cdr);
+                let vals = eval_forms(args.iter().copied(), env)?;
+                check_keyword_args("MAKE-STRING-OUTPUT-STREAM", &vals[..], &["ELEMENT-TYPE"])?;
                 return egcl_stdlib::make_string_output_stream(NIL);
             }
             "MAKE-BROADCAST-STREAM" => return eval_builtin_arguments(&name, cdr, env),
@@ -23943,7 +24022,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let mut inp = resolve_input_stream(vals[1], env);
                 egcl_rt::rooted_ref!(_input_root = &mut inp);
                 let seq_len = egcl_stdlib::length(seq)?;
-                let (start, end) = read_start_end_keys(&vals[2..], seq_len);
+                let (start, end) = read_start_end_keys_checked("READ-SEQUENCE", &vals[2..], seq_len)?;
                 let count = end - start;
                 let mut pos = start;
                 if is_gray_stream(inp) {
@@ -23977,6 +24056,28 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 pos += 1;
                             }
                         }
+                    }
+                } else if egcl_stdlib::is_binary_stream(inp) {
+                    // A wider integer element type: one READ-BYTE per element.
+                    egcl_rt::rooted!(elements =
+                        egcl_stdlib::streams::stream_read_byte_sequence(inp, count)?);
+                    egcl_rt::rooted!(cursor = seq);
+                    for _ in 0..start {
+                        if cursor.is_cons() {
+                            *cursor = cp(*cursor).1;
+                        }
+                    }
+                    for i in 0..elements.len() {
+                        if seq.is_cons() {
+                            if !cursor.is_cons() {
+                                break;
+                            }
+                            store_cons_field(*cursor, elements[i], true)?;
+                            *cursor = cp(*cursor).1;
+                        } else {
+                            seq_set_elt(seq, pos, elements[i])?;
+                        }
+                        pos += 1;
                     }
                 } else if seq.is_cons() {
                     // A list destination: store into the conses from START on
@@ -24019,7 +24120,8 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted_ref!(_output_root = &mut out);
                 check_pending_sigpipe_for_output()?;
                 let seq_len = egcl_stdlib::length(seq)?;
-                let (start, end) = read_start_end_keys(&vals[2..], seq_len);
+                let (start, end) =
+                    read_start_end_keys_checked("WRITE-SEQUENCE", &vals[2..], seq_len)?;
                 // Bulk path first, so a byte stream never materializes the
                 // Vec<EgclVal> below: that cost a sequence dispatch per element
                 // to build, and then stream_write_byte took the stream lock and
@@ -24055,7 +24157,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 for i in start..end {
                     elems.push(egcl_stdlib::elt(seq, i)?);
                 }
-                if egcl_stdlib::is_byte_stream(out) {
+                if egcl_stdlib::is_binary_stream(out) {
                     // GC can update the rooted vector during a child call; do not
                     // retain an iterator borrow across that call.
                     #[allow(clippy::needless_range_loop)]
@@ -36587,7 +36689,7 @@ fn is_builtin_function(name: &str) -> bool {
             // Standard functions implemented as eval_form arms that FBOUNDP
             // and SYMBOL-FUNCTION must also recognize (CL-FUNCTION-SYMBOLS.1).
             | "APROPOS" | "APROPOS-LIST" | "ARRAY-ELEMENT-TYPE" | "COMPLEX"
-            | "CONCATENATED-STREAM-STREAMS" | "DELETE-FILE" | "FILE-STRING-LENGTH"
+            | "CONCATENATED-STREAM-STREAMS" | "DELETE-FILE"
             | "GET-DISPATCH-MACRO-CHARACTER" | "GET-MACRO-CHARACTER"
             | "GET-OUTPUT-STREAM-STRING" | "INVOKE-RESTART-INTERACTIVELY"
             | "LIST-ALL-PACKAGES" | "LOAD" | "MACROEXPAND" | "MACROEXPAND-1"
@@ -38479,6 +38581,62 @@ struct OpenOptions {
 ///
 /// Expanding an element-type alias can allocate. Keep copied option values
 /// rooted during expansion; callers must root their pathname across this call.
+/// The stdlib's element-type code for a binary stream type specifier: the bit
+/// width, negated for a signed type (so 8 is `(unsigned-byte 8)`); None for a
+/// character stream. BIT, (UNSIGNED-BYTE n), (SIGNED-BYTE n), (MOD n) and
+/// bounded (INTEGER lo hi) are binary (ansi streams open.*, file-length.3/4).
+fn binary_element_type_code(spec: EgclVal) -> Option<i64> {
+    fn bit_length(n: i64) -> i64 {
+        if n <= 0 { 0 } else { 64 - i64::from(n.leading_zeros()) }
+    }
+    if spec == EgclVal::from_fixnum(8) {
+        return Some(8);
+    }
+    if spec.is_symbol() {
+        return match sym_bare_name_rc(spec).as_ref() {
+            "BIT" => Some(1),
+            "UNSIGNED-BYTE" => Some(8),
+            "SIGNED-BYTE" => Some(-8),
+            _ => None,
+        };
+    }
+    if !spec.is_cons() {
+        return None;
+    }
+    let (head, rest) = cp(spec);
+    let arg = |i: usize| -> Option<EgclVal> {
+        let mut r = rest;
+        for _ in 0..i {
+            r = cp(r).1;
+        }
+        if r.is_cons() { Some(cp(r).0) } else { None }
+    };
+    let width = |v: Option<EgclVal>| -> i64 {
+        v.filter(|v| v.is_fixnum() && v.as_fixnum() > 0)
+            .map_or(8, |v| v.as_fixnum())
+    };
+    match sym_bare_name_rc(head).as_ref() {
+        "UNSIGNED-BYTE" => Some(width(arg(0))),
+        "SIGNED-BYTE" => Some(-width(arg(0))),
+        "MOD" => arg(0)
+            .filter(|v| v.is_fixnum() && v.as_fixnum() > 1)
+            .map(|v| bit_length(v.as_fixnum() - 1).max(1)),
+        "INTEGER" => {
+            let (lo, hi) = (arg(0)?, arg(1)?);
+            if !lo.is_fixnum() || !hi.is_fixnum() {
+                return None;
+            }
+            let (lo, hi) = (lo.as_fixnum(), hi.as_fixnum());
+            if lo >= 0 {
+                Some(bit_length(hi).max(1))
+            } else {
+                Some(-(bit_length(hi).max(bit_length(-lo - 1)) + 1))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, EgclError> {
     let mut direction = egcl_stdlib::StreamDirection::Input;
     let mut element_type = T;
@@ -38553,10 +38711,10 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
     egcl_rt::rooted_ref!(_if_exists_root = &mut if_exists);
     egcl_rt::rooted_ref!(_if_dne_root = &mut if_does_not_exist);
     let expanded = resolve_type_spec(env, element_type)?;
-    let is_byte = expanded == EgclVal::from_fixnum(8)
-        || (expanded.is_cons()
-            && sym_bare_name_rc(cp(expanded).0).as_ref() == "UNSIGNED-BYTE");
-    element_type = if is_byte { EgclVal::from_fixnum(8) } else { T };
+    element_type = match binary_element_type_code(expanded) {
+        Some(code) => EgclVal::from_fixnum(code),
+        None => T,
+    };
 
     Ok(OpenOptions {
         direction,
