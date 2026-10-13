@@ -2654,6 +2654,9 @@ struct GenericDef {
     /// `(:method-combination NAME :most-specific-last)`: a short-form
     /// combination runs its primary methods least specific first.
     most_specific_last: bool,
+    /// The methods the DEFGENERIC's own :method options defined; a later
+    /// DEFGENERIC of the same name removes them (CLHS DEFGENERIC).
+    option_methods: Vec<EgclVal>,
 }
 
 #[derive(Clone, Debug)]
@@ -4304,6 +4307,7 @@ fn drain_pending_host_generics(env: &Env) {
                 generic_function: EgclVal::from_raw(gf_raw),
                 combination: u8_to_combination(comb),
                 most_specific_last: false,
+                option_methods: Vec::new(),
             },
         );
     }
@@ -6076,6 +6080,72 @@ fn slots_for_initarg(env: &Env, class_name: &str, initarg: &str) -> Vec<String> 
     out
 }
 
+/// CLHS 7.1.2 initargument validity for a user-defined class: the list must be
+/// keyword/value pairs with symbol keys, and each key must be a slot initarg or
+/// a &KEY parameter of a method on one of `generic_names` (any such method with
+/// &ALLOW-OTHER-KEYS, or :ALLOW-OTHER-KEYS T in the list, accepts everything).
+/// A class the evaluator does not know (built-in, condition) is not checked.
+/// Violations are PROGRAM-ERRORs (ansi make-instance.error.2-4,
+/// shared-initialize.error.3/4, change-class.1.11, reinitialize-instance.error.1).
+fn check_initargs_valid(
+    env: &Env,
+    class_name: &str,
+    initargs: &[EgclVal],
+    generic_names: &[&str],
+) -> Result<(), EgclError> {
+    if initargs.len() % 2 != 0 {
+        return Err(EgclError::ProgramError(
+            "initialization arguments must come in keyword/value pairs".into(),
+        ));
+    }
+    for pair in initargs.chunks_exact(2) {
+        if !pair[0].is_symbol() {
+            return Err(EgclError::ProgramError(format!(
+                "initialization argument name is not a symbol: {}",
+                format_val(pair[0])
+            )));
+        }
+    }
+    if !env.classes.borrow().contains_key(class_name) {
+        return Ok(());
+    }
+    for pair in initargs.chunks_exact(2) {
+        if sym_bare_name_rc(pair[0]).as_ref() == "ALLOW-OTHER-KEYS" {
+            if !pair[1].is_nil() {
+                return Ok(());
+            }
+            break;
+        }
+    }
+    let mut valid: Vec<String> = effective_slots_for_class(env, class_name)
+        .into_iter()
+        .flat_map(|slot| slot.initargs)
+        .collect();
+    {
+        let methods = env.methods.borrow();
+        for generic_name in generic_names {
+            for def in methods.get(*generic_name).into_iter().flatten() {
+                let info = lambda_list_key_info(def.lambda_list);
+                if info.allow_other_keys {
+                    return Ok(());
+                }
+                valid.extend(info.keys);
+            }
+        }
+    }
+    for pair in initargs.chunks_exact(2) {
+        let bare = sym_bare_name_rc(pair[0]);
+        if bare.as_ref() != "ALLOW-OTHER-KEYS" && !valid.iter().any(|k| k.as_str() == bare.as_ref()) {
+            return Err(EgclError::ProgramError(format!(
+                "{} is not a valid initialization argument for class {}",
+                format_val(pair[0]),
+                symbol_bare_name(class_name)
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The slot symbols an initarg fills, or the initarg's own symbol when no slot
 /// declares it (see `resolve_slot_symbol`).
 fn resolve_slot_symbols(
@@ -7337,11 +7407,18 @@ fn invoke_short_form_methods(
             }),
         );
     }
-    // Each result lives across the next method's evaluation (moving GC).
+    // Each result lives across the next method's evaluation (moving GC). AND
+    // and OR stop at the first NIL / non-NIL value, like the operators they
+    // are named after (ansi defgeneric-method-combination.and.*, or.*).
     egcl_rt::rooted!(results = Vec::<EgclVal>::new());
     for method in primary {
         let value = invoke_method(env, method, args, None)?;
         results.push(value);
+        match combination {
+            egcl_stdlib::MethodCombinationType::And if value.is_nil() => break,
+            egcl_stdlib::MethodCombinationType::Or if !value.is_nil() => break,
+            _ => {}
+        }
     }
     combine_short_form_results(combination, &results)
 }
@@ -7354,11 +7431,22 @@ fn combine_short_form_results(
         egcl_stdlib::MethodCombinationType::List => Ok(vec_to_list(results)),
         egcl_stdlib::MethodCombinationType::Append
         | egcl_stdlib::MethodCombinationType::Nconc => {
-            let mut combined = Vec::new();
-            for result in results {
-                combined.extend(list_to_vec(*result));
+            // As APPEND does, the last value becomes the tail as it is, so a
+            // dotted or atomic last result is kept (ansi
+            // defgeneric-method-combination.append.5, nconc.5).
+            let Some((last, heads)) = results.split_last() else {
+                return Ok(NIL);
+            };
+            let mut elements = Vec::new();
+            for result in heads {
+                elements.extend(list_to_vec(*result));
             }
-            Ok(vec_to_list(&combined))
+            egcl_rt::rooted!(tail = *last);
+            egcl_rt::rooted!(elements = elements);
+            for i in (0..elements.len()).rev() {
+                *tail = arena_cons(elements[i], *tail);
+            }
+            Ok(*tail)
         }
         egcl_stdlib::MethodCombinationType::Progn
         | egcl_stdlib::MethodCombinationType::Standard => {
@@ -8627,6 +8715,9 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
         if root_definitions {
             for generic in GENERIC_DEFINITIONS.borrow_mut().values_mut() {
                 visit(&mut generic.generic_function);
+                for method_id in generic.option_methods.iter_mut() {
+                    visit(method_id);
+                }
             }
             for methods in METHOD_DEFINITIONS.borrow_mut().values_mut() {
                 for method in methods {
@@ -17593,6 +17684,9 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "SLEEP" | "DISASSEMBLE" => Some((1, 1)),
         "SLOT-VALUE" | "SLOT-BOUNDP" | "SLOT-EXISTS-P" | "SLOT-MAKUNBOUND" => Some((2, 2)),
         "FIND-METHOD" => Some((3, 4)),
+        "CLASS-OF" => Some((1, 1)),
+        "FIND-CLASS" => Some((1, 3)),
+        "ALLOCATE-INSTANCE" => Some((1, usize::MAX)),
         "ROOM" | "USER-HOMEDIR-PATHNAME" => Some((0, 1)),
         "ENCODE-UNIVERSAL-TIME" => Some((6, 7)),
         "REMOVE-METHOD" | "ADD-METHOD" | "COMPUTE-APPLICABLE-METHODS" => Some((2, 2)),
@@ -23903,10 +23997,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
-            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS" => {
+            | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
+            | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
+            | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
-            "CHANGE-CLASS" => return eval_builtin_arguments(&name, cdr, env),
+            // CHANGE-CLASS is the generic function boot.lisp defines, so user
+            // :before/:after methods take part (ansi change-class.7.*/8.*); the
+            // built-in behaviour is its standard method.
             "CALL-NEXT-METHOD" | "EGCL::%CALL-NEXT-METHOD" => {
                 let mut context = env.method_context.last().cloned().ok_or_else(|| {
                     EgclError::UndefinedFunction(resolve_sym("CALL-NEXT-METHOD").unwrap_or(NIL))
@@ -34673,6 +34771,24 @@ fn check_defclass_syntax(
     Ok(())
 }
 
+/// A slot initform whose value cannot depend on the lexical environment: a
+/// self-evaluating atom, a keyword or constant symbol, or a QUOTE form.
+fn is_constant_initform(form: EgclVal) -> bool {
+    if form.is_cons() {
+        let (head, _) = cp(form);
+        return head.is_symbol() && sym_bare_name_rc(head).as_ref() == "QUOTE";
+    }
+    if form.is_symbol() {
+        return form.is_nil()
+            || form == T
+            || is_keyword_arg(form)
+            || form
+                .symbol_index()
+                .is_some_and(|_| egcl_rt::symbols::symbol_is_constant(form.as_symbol_index()));
+    }
+    true
+}
+
 fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // A new/redefined class can change class-of results and precedence, so every
     // cached dispatch decision may be stale (bliss-x5y.20).
@@ -34913,6 +35029,41 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             initform: None,
             allocation: SlotAllocation::Instance,
         });
+    }
+
+    // CLHS DEFCLASS: initforms and :default-initargs forms are evaluated in the
+    // lexical environment of the DEFCLASS. A DEFCLASS nested in a binding form
+    // (ansi class-11/12/28, shared-initialize.2.*) therefore closes each form
+    // over the current environment, and the stored form calls that closure.
+    // A top-level DEFCLASS keeps the bare forms, which serialize into images.
+    let nested_in_lexical_environment = TOPLEVEL_FRAME_BASE.with(|s| {
+        s.borrow()
+            .last()
+            .is_some_and(|&base| base != frame_addr(&env.frame))
+    }) || !env.funs.borrow().is_empty();
+    if nested_in_lexical_environment {
+        let lambda_sym = resolve_sym("LAMBDA").unwrap_or(NIL);
+        let funcall_sym = resolve_sym("FUNCALL").unwrap_or(NIL);
+        for slot_i in 0..slots.len() {
+            let Some(form) = slots[slot_i].initform else {
+                continue;
+            };
+            if is_constant_initform(form) {
+                continue;
+            }
+            egcl_rt::rooted!(lambda_form = vec_to_list(&[lambda_sym, NIL, form]));
+            egcl_rt::rooted!(closure = eval_form(*lambda_form, env)?);
+            slots[slot_i].initform = Some(vec_to_list(&[funcall_sym, *closure]));
+        }
+        for i in 0..default_initarg_forms.len() {
+            let form = default_initarg_forms[i];
+            if is_constant_initform(form) {
+                continue;
+            }
+            egcl_rt::rooted!(lambda_form = vec_to_list(&[lambda_sym, NIL, form]));
+            egcl_rt::rooted!(closure = eval_form(*lambda_form, env)?);
+            default_initarg_forms[i] = vec_to_list(&[funcall_sym, *closure]);
+        }
     }
 
     let mut class_slot_values = HashMap::new();
@@ -36390,6 +36541,31 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     }
     // Reject a malformed precedence order before anything is defined.
     let precedence = parse_argument_precedence_order(name_form, lambda_list, precedence_names)?;
+    // CLHS DEFGENERIC on an existing generic function: the methods its earlier
+    // :method options defined are removed, and every other method must be
+    // congruent with the new lambda list (ansi defgeneric.31/32,
+    // defgeneric.error.22).
+    let previous = env.generics.borrow().get(&name).cloned();
+    if let Some(previous) = previous {
+        egcl_rt::rooted!(previous_option_methods = previous.option_methods.clone());
+        for i in 0..previous_option_methods.len() {
+            remove_method_by_id(env, &name, previous.generic_function, previous_option_methods[i]);
+        }
+        let remaining: Vec<EgclVal> = env
+            .methods
+            .borrow()
+            .get(&name)
+            .map(|list| list.iter().map(|method| method.lambda_list).collect())
+            .unwrap_or_default();
+        for method_lambda_list in remaining {
+            if !method_lambda_list_congruent(lambda_list, method_lambda_list) {
+                return Err(EgclError::ProgramError(format!(
+                    "DEFGENERIC {name}: an existing method's lambda list is not congruent with {}",
+                    format_val(lambda_list)
+                )));
+            }
+        }
+    }
     let generic_function = egcl_stdlib::make_generic_function(name_form, NIL)?;
     env.generics.borrow_mut().insert(
         name.clone(),
@@ -36397,23 +36573,46 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             generic_function,
             combination,
             most_specific_last,
+            option_methods: Vec::new(),
         },
     );
-    env.methods.borrow_mut().entry(name).or_default();
+    env.methods.borrow_mut().entry(name.clone()).or_default();
     store_argument_precedence_order(name_form, &precedence);
     store_generic_lambda_list(name_form, lambda_list);
 
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
     // once the generic-function name is consed on the front.
+    egcl_rt::rooted!(option_method_ids = Vec::<EgclVal>::new());
     for i in 0..method_options.len() {
         let defmethod_cdr = arena_cons(name_form, method_options[i]);
-        eval_defmethod(defmethod_cdr, env)?;
+        let method_id = eval_defmethod(defmethod_cdr, env)?;
+        option_method_ids.push(method_id);
+    }
+    if let Some(generic) = env.generics.borrow_mut().get_mut(&name) {
+        generic.option_methods = option_method_ids.clone();
     }
     // DEFGENERIC returns the generic function object (CLHS), as `#'name`
     // reifies it (ansi defgeneric.1-).
     egcl_rt::rooted!(function_form = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_form]));
     eval_form(*function_form, env)
+}
+
+/// Drop the method `method_id` from generic function `name`, in both the
+/// evaluator's method table and the CLOS core, invalidating cached dispatch.
+fn remove_method_by_id(env: &mut Env, name: &str, generic_function: EgclVal, method_id: EgclVal) {
+    let removed = {
+        let mut methods = env.methods.borrow_mut();
+        methods.get_mut(name).and_then(|list| {
+            list.iter()
+                .position(|method| method.method_id == method_id)
+                .map(|position| list.remove(position))
+        })
+    };
+    if removed.is_some() {
+        let _ = egcl_stdlib::clos::remove_method(generic_function, method_id);
+        invalidate_gf_dispatch_cache();
+    }
 }
 
 // ── DEFMETHOD ────────────────────────────────────────────────────
@@ -36557,6 +36756,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 generic_function: gf,
                 combination: egcl_stdlib::MethodCombinationType::Standard,
                 most_specific_last: false,
+                option_methods: Vec::new(),
             },
         );
         gf
@@ -36756,8 +36956,19 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     // The initargs as the caller wrote them, for the initialization protocol
     // below; `initargs` itself is keyed by slot name, for filling slots.
     egcl_rt::rooted!(supplied_initargs = Vec::<EgclVal>::new());
+    if list_to_vec(init_args).len() % 2 != 0 {
+        return Err(EgclError::ProgramError(
+            "MAKE-INSTANCE: initialization arguments must come in keyword/value pairs".into(),
+        ));
+    }
     let mut initargs =
         evaluated_initargs(&class_name, init_args, env, Some(&mut supplied_initargs))?;
+    check_initargs_valid(
+        env,
+        &class_name,
+        &supplied_initargs,
+        &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
+    )?;
 
     // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
     // initarg the caller did NOT supply, evaluate its value form and append it
@@ -37903,6 +38114,8 @@ fn is_builtin_function(name: &str) -> bool {
         name,
         "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
+            | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS"
+            | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
@@ -42448,6 +42661,7 @@ mod env_gc_root_tests {
                 generic_function: marker(14),
                 combination: egcl_stdlib::MethodCombinationType::Standard,
                 most_specific_last: false,
+                option_methods: Vec::new(),
             },
         );
         env.methods

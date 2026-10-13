@@ -3597,6 +3597,22 @@ fn resolve(name: &str) -> Option<Handler> {
                     .find(|(_, d)| d.generic_function == gf)
                     .map(|(n, _)| n.clone())
             };
+            // CLHS FIND-METHOD: the specializer list must be as long as the
+            // generic function's required parameter list (ansi find-method.error.9/10).
+            if let Some(generic_lambda_list) = gf_name
+                .as_deref()
+                .and_then(egcl_rt::symbols::find_index)
+                .map(EgclVal::from_symbol_index)
+                .and_then(stored_generic_lambda_list)
+            {
+                let (required, ..) = lambda_list_shape(generic_lambda_list);
+                if spec_args.len() != required {
+                    return Err(EgclError::ProgramError(format!(
+                        "FIND-METHOD: {} specializers given for a generic function with {required} required parameters",
+                        spec_args.len()
+                    )));
+                }
+            }
             let not_found = |env: &mut Env, msg: String| -> Result<EgclVal, EgclError> {
                 if errorp {
                     let condition = make_simple_error_condition(arena_str(&msg), env)?;
@@ -3639,7 +3655,9 @@ fn resolve(name: &str) -> Option<Handler> {
             )
         }),
 
-        "CHANGE-CLASS" => Some(|_operator, args, env| {
+        "CHANGE-CLASS"
+        | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
+        | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS" => Some(|_operator, args, env| {
             egcl_rt::rooted!(args = args.to_vec());
             if args.len() < 2 || (args.len() - 2) % 2 != 0 {
                 return Err(EgclError::ProgramError(
@@ -3647,6 +3665,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             egcl_rt::rooted!(class = resolve_class_metaobject(env, args[1])?);
+            check_initargs_valid(
+                env,
+                &class_name_for_instance_class(*class),
+                &args[2..],
+                &["UPDATE-INSTANCE-FOR-DIFFERENT-CLASS", "SHARED-INITIALIZE"],
+            )?;
             egcl_rt::rooted!(previous =
                 egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
             let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
@@ -3733,6 +3757,18 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
             egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
+            check_initargs_valid(
+                env,
+                &class_name,
+                &raw_initargs,
+                &[
+                    "SHARED-INITIALIZE",
+                    "INITIALIZE-INSTANCE",
+                    "REINITIALIZE-INSTANCE",
+                    "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS",
+                    "UPDATE-INSTANCE-FOR-REDEFINED-CLASS",
+                ],
+            )?;
             egcl_rt::rooted!(initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?);
             // Explicit initargs apply regardless of SLOT-NAMES. That argument
             // only selects unbound slots whose initforms may run afterwards.

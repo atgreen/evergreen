@@ -582,6 +582,24 @@
   (declare (ignore environment))
   (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
 
+;; CHANGE-CLASS is a generic function so :before/:after/:around methods take
+;; part; the standard method is the built-in class change.
+(defmethod change-class ((instance standard-object) new-class &rest initargs)
+  (apply #'egcl-internal::%standard-change-class instance new-class initargs))
+
+;; MAKE-INSTANCES-OBSOLETE returns the class; instances keep their slots and
+;; are brought up to date lazily by a class redefinition.
+(defgeneric make-instances-obsolete (class))
+(defmethod make-instances-obsolete ((class t))
+  (if (symbolp class) (find-class class) class))
+
+(defgeneric update-instance-for-redefined-class
+    (instance added-slots discarded-slots property-list &rest initargs))
+(defmethod update-instance-for-redefined-class
+    ((instance standard-object) added-slots discarded-slots property-list &rest initargs)
+  (declare (ignore discarded-slots property-list))
+  (apply #'shared-initialize instance added-slots initargs))
+
 ;; ED has no editor to invoke; it accepts its argument and does nothing.
 (defun ed (&optional x)
   (declare (ignore x))
