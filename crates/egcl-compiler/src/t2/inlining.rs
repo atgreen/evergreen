@@ -367,6 +367,19 @@ pub(crate) fn body_cost(
     options: &InlineOptions,
     active: &mut HashSet<u32>,
 ) -> Result<u32, DeclineReason> {
+    body_cost_with_bounded_self(symbol, options, active, None)
+}
+
+/// Like [`body_cost`], but permits source-proven calls to `bounded_self` to
+/// remain leaf calls while estimating the enclosing body.  The builder still
+/// applies its depth and node limits before it expands such a call; this only
+/// lets the finite expansion be considered in the first place.
+pub(crate) fn body_cost_with_bounded_self(
+    symbol: u32,
+    options: &InlineOptions,
+    active: &mut HashSet<u32>,
+    bounded_self: Option<u32>,
+) -> Result<u32, DeclineReason> {
     if !active.insert(symbol) {
         return Err(DeclineReason::Recursive);
     }
@@ -384,7 +397,7 @@ pub(crate) fn body_cost(
         }
 
         let mut cost = 0u32;
-        for op in &body.code {
+        for (bcp, op) in body.code.iter().enumerate() {
             cost = cost.saturating_add(1);
             match op {
                 Instr::Const(_)
@@ -412,7 +425,21 @@ pub(crate) fn body_cost(
                         if *nargs != nested.arity {
                             return Err(DeclineReason::WrongArity);
                         }
-                        cost = cost.saturating_add(body_cost(*sym, options, active)?);
+                        if bounded_self == Some(*sym)
+                            && body.self_call_sites.contains(&(bcp as u32))
+                        {
+                            // The recursive edge itself is represented by this
+                            // instruction's cost.  Its body is deliberately not
+                            // added again: each expansion is accounted for by
+                            // the builder's depth and node budgets.
+                            continue;
+                        }
+                        cost = cost.saturating_add(body_cost_with_bounded_self(
+                            *sym,
+                            options,
+                            active,
+                            bounded_self,
+                        )?);
                     }
                 }
                 _ => return Err(DeclineReason::UnsupportedBody),
