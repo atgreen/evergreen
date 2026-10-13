@@ -551,6 +551,24 @@ thread_local! {
     /// Backquote nesting of the form being read: a comma is legal only while this
     /// is positive, and each comma spends one level for its own sub-read.
     static BACKQUOTE_DEPTH: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// True while a #+/#- feature expression is being read: CLHS 2.4.8.17 binds
+    /// *PACKAGE* to KEYWORD there, so a bare symbol in it is a keyword.
+    static FEATURE_EXPRESSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the span of a feature-expression read and clears the mark on drop.
+struct FeatureExpressionRead(bool);
+
+impl FeatureExpressionRead {
+    fn enter() -> Self {
+        FeatureExpressionRead(FEATURE_EXPRESSION.with(|f| f.replace(true)))
+    }
+}
+
+impl Drop for FeatureExpressionRead {
+    fn drop(&mut self) {
+        FEATURE_EXPRESSION.with(|f| f.set(self.0));
+    }
 }
 
 /// Adjusts BACKQUOTE_DEPTH for the enclosed sub-read and restores it on drop,
@@ -759,14 +777,12 @@ fn nd_collect(
         flat.push(node);
         return Ok(());
     }
-    // Collect this level's elements (a proper list).
-    let mut items = Vec::new();
-    let mut cur = node;
-    while cur.is_cons() {
-        let (car, cdr) = cons_parts(cur);
-        items.push(car);
-        cur = cdr;
-    }
+    // Collect this level's elements: any sequence may supply a level of a #nA
+    // literal (CLHS 2.4.8.12), so #1a"abcd" and #1a#(1 2) read as well as a
+    // proper list (syntax.sharp-a.4-26).
+    let items = sequence_items(node).ok_or_else(|| {
+        EgclError::StreamError("#nA array literal contents must be sequences".into())
+    })?;
     if dims.len() <= level {
         dims.push(items.len());
     } else if dims[level] != items.len() {
@@ -778,6 +794,40 @@ fn nd_collect(
         nd_collect(item, rank - 1, level + 1, dims, flat)?;
     }
     Ok(())
+}
+
+/// The elements of a list, simple vector or string, in order; None for a
+/// non-sequence.
+fn sequence_items(node: EgclVal) -> Option<Vec<EgclVal>> {
+    if node == NIL {
+        return Some(Vec::new());
+    }
+    if node.is_cons() {
+        let mut items = Vec::new();
+        let mut cur = node;
+        while cur.is_cons() {
+            let (car, cdr) = cons_parts(cur);
+            items.push(car);
+            cur = cdr;
+        }
+        return Some(items);
+    }
+    if node.is_string() {
+        return Some(node.as_string().chars().map(EgclVal::from_char).collect());
+    }
+    if node.is_heap_object() {
+        unsafe {
+            let ptr = node.as_ptr();
+            let header = *(ptr as *const ObjectHeader);
+            if header.type_id() == type_id::SIMPLE_VECTOR {
+                let offset = if header.is_large_object() { 16 } else { 8 };
+                let body = ptr.add(offset) as *const EgclVal;
+                let length = *(body as *const u64) as usize;
+                return Some((0..length).map(|i| *body.add(1 + i)).collect());
+            }
+        }
+    }
+    None
 }
 
 fn alloc_ratio(num: EgclVal, den: EgclVal) -> EgclVal {
@@ -2228,6 +2278,12 @@ fn parse_token_with_base(
     if name == "T" {
         return Ok(T);
     }
+    // Inside a #+/#- feature expression a bare symbol is read in KEYWORD
+    // (CLHS 2.4.8.17), so #+X names :X, not <current-package>::X.
+    if FEATURE_EXPRESSION.with(|f| f.get()) {
+        let full = format!("KEYWORD:{}", name);
+        return Ok(EgclVal::from_symbol_index(intern_symbol(&full)));
+    }
     // Route a bare symbol through the interpreter's current *PACKAGE* so that a
     // symbol read bare inside package P shares identity (and its value cell) with
     // the same symbol written P:NAME (bliss-lb6.12). Falls back to plain
@@ -2994,8 +3050,14 @@ fn read_sharpsign_with_base(
             )
         }
         ':' => {
-            // Uninterned symbol
-            let (name, end, _, _) = collect_token(chars, pos)?;
+            // Uninterned symbol. Its token may not contain an unescaped package
+            // marker (CLHS 2.4.8.5; syntax.sharp-colon.error.1).
+            let (name, end, _, marker) = collect_token(chars, pos)?;
+            if marker.is_some() {
+                return Err(EgclError::StreamError(
+                    "illegal package marker in #: uninterned symbol".into(),
+                ));
+            }
             Ok((make_uninterned_symbol(&name), end))
         }
         'P' | 'p' => read_pathname_literal(
@@ -3311,6 +3373,13 @@ fn read_bit_vector_sized(
         bits.push(if chars.at(pos)? == '1' { 1u8 } else { 0u8 });
         pos += 1;
     }
+    // The token ends at a delimiter; any other character is not a bit
+    // (syntax.sharp-asterisk.error.3: #*012).
+    if chars.has(pos)? && !is_delimiter(chars.at(pos)?) {
+        return Err(EgclError::StreamError(
+            "illegal character in #* bit vector".into(),
+        ));
+    }
     if let Some(n) = size {
         let n = usize::try_from(n)
             .map_err(|_| EgclError::StreamError("illegal #n* length: too large".into()))?;
@@ -3525,16 +3594,19 @@ fn read_feature_expr_with_base(
     options: ReaderOptions,
 ) -> Result<(EgclVal, usize), EgclError> {
     // Read the feature expression, which may be a symbol or a compound form
-    // such as (or sbcl ccl).
-    let (feature, p) = read_token_with_base(
-        chars,
-        pos,
-        labels,
-        options.read_base,
-        options.read_eval,
-        options.read_circular,
-        options.depth + 1,
-    )?;
+    // such as (or sbcl ccl), with bare symbols interned in KEYWORD.
+    let (feature, p) = {
+        let _keyword_package = FeatureExpressionRead::enter();
+        read_token_with_base(
+            chars,
+            pos,
+            labels,
+            options.read_base,
+            options.read_eval,
+            options.read_circular,
+            options.depth + 1,
+        )?
+    };
     pos = p;
     let feature_present = eval_feature_expression(feature);
 
@@ -3563,7 +3635,7 @@ fn eval_feature_expression(feature: EgclVal) -> bool {
         return false;
     }
     if feature.is_symbol() {
-        return runtime_feature_present(&feature_symbol_bare_name(feature));
+        return runtime_feature_present(feature);
     }
     if !feature.is_cons() {
         return false;
@@ -3614,17 +3686,22 @@ fn eval_feature_expression(feature: EgclVal) -> bool {
 /// consult it directly — reader conditionals (`#+`/`#-`) then honour every
 /// feature the running image has, not just EGCL. Before `*FEATURES*` is bound
 /// (early bootstrap) only EGCL is recognised.
-fn runtime_feature_present(name: &str) -> bool {
+/// Is `feature` (a symbol, normally a keyword) a member of *FEATURES*? Membership
+/// is by symbol identity, as (member feature *features*) would decide: a
+/// CL-TEST::X in *FEATURES* does not satisfy #+X, which names :X
+/// (syntax.sharp-plus.8).
+fn runtime_feature_present(feature: EgclVal) -> bool {
+    let name = feature_symbol_name(feature);
     let features =
         egcl_rt::symbols::find_index("*FEATURES*").and_then(egcl_rt::symbols::symbol_value);
     let mut list = match features {
         Some(l) if l == NIL || l.is_cons() => l,
-        _ => return name.eq_ignore_ascii_case("EGCL"),
+        _ => return name == "KEYWORD:EGCL",
     };
     while list.is_cons() {
         let (item, next) = cons_parts(list);
-        if item.tag() == egcl_rt::value::TAG_SYMBOL
-            && feature_symbol_bare_name(item).eq_ignore_ascii_case(name)
+        if item == feature
+            || (item.tag() == egcl_rt::value::TAG_SYMBOL && feature_symbol_name(item) == name)
         {
             return true;
         }

@@ -1071,8 +1071,11 @@
   (declare (ignore stream char))
   (error "The standard reader macro cannot be invoked directly."))
 (defun readtable-case (readtable)
+  ;; A non-readtable argument is a TYPE-ERROR (ansi readtable-case.error.3).
+  (check-type readtable readtable)
   (egcl::%readtable-case readtable))
 (defun (setf readtable-case) (mode readtable)
+  (check-type readtable readtable)
   (unless (member mode '(:upcase :downcase :preserve :invert))
     (error 'type-error :datum mode
                        :expected-type '(member :upcase :downcase :preserve :invert)))

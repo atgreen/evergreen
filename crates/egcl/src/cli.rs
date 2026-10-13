@@ -7049,6 +7049,31 @@ fn combine_short_form_results(
     }
 }
 
+/// The standard behaviour of a built-in generic function when no user method
+/// applies. A DEFMETHOD on MAKE-INSTANCE for one class turns the name into a
+/// user generic, and without this every other class lost its construction:
+/// rt's own COPY-ENTRY copier calls MAKE-INSTANCE, so loading the ansi objects
+/// chapter died at its first DEFTEST. The built-in path takes forms, so the
+/// evaluated arguments are passed quoted.
+fn builtin_generic_fallback(
+    name: &str,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    if symbol_bare_name(name) != "MAKE-INSTANCE" {
+        return None;
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len()));
+    let quote = quote_sym();
+    for i in 0..args.len() {
+        let quoted = vec_to_list(&[quote, args[i]]);
+        items.push(quoted);
+    }
+    let form_cdr = vec_to_list(&items);
+    Some(eval_make_instance(form_cdr, env))
+}
+
 /// Build and signal a catchable error condition for a failed generic-function
 /// dispatch (`no-applicable-method`, R5.??). Returns the terminal error when no
 /// handler transfers control.
@@ -7507,6 +7532,9 @@ fn invoke_generic_function_inner(
 
     let mut methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
+        if let Some(result) = builtin_generic_fallback(name, args, env) {
+            return result;
+        }
         return Err(no_applicable_method_error(env, name));
     }
     egcl_rt::rooted_ref!(_methods_root = &mut methods);
@@ -7531,6 +7559,9 @@ fn invoke_generic_function_inner(
             && generic_is_slot_reader(env, name)
         {
             return Ok(NIL);
+        }
+        if let Some(result) = builtin_generic_fallback(name, args, env) {
+            return result;
         }
         return Err(no_applicable_method_error(env, name));
     }
@@ -11406,6 +11437,29 @@ fn reader_struct_constructor(name: EgclVal, slots: &[EgclVal]) -> Option<EgclVal
     let class = egcl_stdlib::find_class(name)?;
     if !egcl_stdlib::is_structure_class(class) {
         return None;
+    }
+    // #S calls the structure's constructor (CLHS 2.4.8.13), so slots the
+    // literal leaves out take their initforms. Go through the full
+    // MAKE-INSTANCE protocol when a load environment is available (the same
+    // channel #. and custom reader macros use); the raw slot fill below leaves
+    // omitted slots unbound (ansi syntax.sharp-s.1).
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if !ptr.is_null() {
+        // Safety: as for read_time_eval — the pointer refers to the load loop's
+        // live `&mut Env` for exactly the span of the enclosing read.
+        let env = unsafe { &mut *ptr };
+        let quote = quote_sym();
+        egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(slots.len() + 1));
+        let quoted_name = vec_to_list(&[quote, name]);
+        items.push(quoted_name);
+        for slot in slots.iter() {
+            let quoted = vec_to_list(&[quote, *slot]);
+            items.push(quoted);
+        }
+        let form_cdr = vec_to_list(&items);
+        if let Ok(instance) = eval_make_instance(form_cdr, env) {
+            return Some(instance);
+        }
     }
     egcl_stdlib::make_instance(class, slots).ok()
 }
