@@ -7060,18 +7060,37 @@ fn builtin_generic_fallback(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
-    if symbol_bare_name(name) != "MAKE-INSTANCE" {
+    if !is_builtin_function(&symbol_bare_name(name)) || builtin_fallback_active(name) {
         return None;
     }
+    egcl_rt::rooted!(op = resolve_sym(name)?);
     egcl_rt::rooted!(args = args.to_vec());
-    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len()));
+    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len() + 1));
+    items.push(*op);
     let quote = quote_sym();
     for i in 0..args.len() {
         let quoted = vec_to_list(&[quote, args[i]]);
         items.push(quoted);
     }
-    let form_cdr = vec_to_list(&items);
-    Some(eval_make_instance(form_cdr, env))
+    let form = vec_to_list(&items);
+    // While the synthesized call evaluates, operator-position dispatch must
+    // take the built-in path for this name rather than the user methods that
+    // just failed to apply.
+    let previous = BUILTIN_FALLBACK_NAME.with(|cell| cell.replace(Some(name.to_string())));
+    let result = eval_form(form, env);
+    BUILTIN_FALLBACK_NAME.with(|cell| *cell.borrow_mut() = previous);
+    Some(result)
+}
+
+thread_local! {
+    /// The generic-function name whose built-in behaviour is currently being
+    /// applied by [`builtin_generic_fallback`].
+    static BUILTIN_FALLBACK_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn builtin_fallback_active(name: &str) -> bool {
+    BUILTIN_FALLBACK_NAME.with(|cell| cell.borrow().as_deref() == Some(name))
 }
 
 /// Build and signal a catchable error condition for a failed generic-function
@@ -13690,6 +13709,9 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "ARRAY" => &["ATOM", "T"],
         "SEQUENCE" => &["T"],
         "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" => &["ATOM", "T"],
+        "LOGICAL-PATHNAME" => &["PATHNAME", "ATOM", "T"],
+        "FILE-STREAM" | "STRING-STREAM" | "BROADCAST-STREAM" | "CONCATENATED-STREAM"
+        | "TWO-WAY-STREAM" | "ECHO-STREAM" | "SYNONYM-STREAM" => &["STREAM", "ATOM", "T"],
         "STANDARD-OBJECT" => &["T"],
         "ATOM" => &["T"],
         "T" => &[],
@@ -15138,10 +15160,12 @@ fn typep_matches(
                     || (object.is_symbol()
                         && sym_bare_name_rc(object).as_ref() == "STANDARD-READTABLE")
             }
-            "STREAM" | "FILE-STREAM" => is_stream(object),
-            "SYNONYM-STREAM" => egcl_stdlib::synonym_stream_symbol(object).is_some(),
-            "TWO-WAY-STREAM" | "ECHO-STREAM" => {
-                egcl_stdlib::two_way_stream_input_stream(object).is_some()
+            "STREAM" => is_stream(object),
+            // Each native stream kind is exactly one of the standard stream
+            // classes (CLHS 21.2; ansi streams make-broadcast-stream.1, ...).
+            "FILE-STREAM" | "STRING-STREAM" | "BROADCAST-STREAM" | "CONCATENATED-STREAM"
+            | "TWO-WAY-STREAM" | "ECHO-STREAM" | "SYNONYM-STREAM" => {
+                egcl_stdlib::stream_class_name(object) == Some(type_name.as_ref())
             }
             "SIMPLE-VECTOR" => is_simple_vector_value(object),
             // A string is a (vector character); an ARRAY includes general
@@ -24989,7 +25013,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // Installed reader methods participate in ordinary generic dispatch,
         // including around methods and later method redefinitions. A slot-name
         // mapping alone cannot justify bypassing the applicable methods.
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+        if (env.generics.contains_key(&name) || env.methods.contains_key(&name))
+            && !builtin_fallback_active(&name)
+        {
             let args = eval_args(cdr, env)?;
             return invoke_generic_function(&name, &args, env);
         }

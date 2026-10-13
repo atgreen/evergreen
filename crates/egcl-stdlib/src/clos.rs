@@ -1741,6 +1741,34 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     if crate::hash_table_p(object) {
         return EgclVal::from_fixnum(-23);
     }
+    // Arrays, streams, packages and pathnames belong to their standard
+    // classes (CLHS 4.3.7), so (typep "abc" (find-class 'string)) and
+    // (class-of (make-array 3)) answer as ANSI requires (ansi arrays
+    // make-array.*, types-and-classes). The classes are registered under their
+    // name symbols by the bootstrap hierarchy. Decide the name here: the stream
+    // state lock sits below the CLOS definitions lock, and interning (a lookup
+    // for these bootstrap names) must not happen under with_state either.
+    let standard_name = if egcl_rt::types::stringp(object) {
+        Some("STRING")
+    } else if egcl_rt::types::bit_vector_p(object) {
+        Some("BIT-VECTOR")
+    } else if egcl_rt::types::vectorp(object) {
+        Some("VECTOR")
+    } else if egcl_rt::types::arrayp(object) || egcl_rt::types::md_array_p(object) {
+        Some("ARRAY")
+    } else if egcl_rt::types::streamp(object) {
+        Some(crate::streams::stream_class_name(object).unwrap_or("STREAM"))
+    } else if egcl_rt::types::packagep(object) {
+        Some("PACKAGE")
+    } else if crate::is_logical_pathname(object) {
+        Some("LOGICAL-PATHNAME")
+    } else if crate::is_pathname(object) {
+        Some("PATHNAME")
+    } else {
+        None
+    };
+    let standard_sym =
+        standard_name.map(|name| EgclVal::from_symbol_index(egcl_rt::symbols::intern(name)));
     with_state(|st| {
         if object == NIL {
             return st.null_class;
@@ -1765,6 +1793,9 @@ pub fn class_of(object: EgclVal) -> EgclVal {
         }
         if object.is_function() {
             return st.function_class;
+        }
+        if let Some(class) = standard_sym.and_then(|sym| st.class_registry.get(&sym).copied()) {
+            return class;
         }
         if object.is_heap_object() {
             return st.heap_object_class;

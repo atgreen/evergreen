@@ -2215,12 +2215,20 @@ pub fn directory(pathname: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         let path_str = extract_path_string(pathname)?;
         let base = Path::new(&path_str);
         // A directory pathname lists that directory even when only the image
-        // holds it (bliss-vmqe0); a file pathname lists its directory.
-        let root = if base.is_dir() || path_str.ends_with(std::path::is_separator) {
-            base.to_path_buf()
-        } else {
-            base.parent().unwrap_or(base).to_path_buf()
-        };
+        // holds it (bliss-vmqe0). A non-wild file pathname matches only itself:
+        // its truename when the file exists, nothing otherwise (CLHS DIRECTORY;
+        // ansi files directory.1: (directory "nonexistent") is NIL).
+        if !(base.is_dir() || path_str.ends_with(std::path::is_separator)) {
+            if crate::embedded_files::is_embedded(&path_str) {
+                return Ok(vec![pathname_from_embedded(&path_str)?]);
+            }
+            return if base.exists() {
+                Ok(vec![pathname_from_fs_path(base)?])
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let root = base.to_path_buf();
         let mut result = Vec::new();
         let embedded = embedded_entries_in(&root)?;
         match std::fs::read_dir(&root) {

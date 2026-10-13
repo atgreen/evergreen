@@ -75,6 +75,12 @@
                            "/load.lsp")
   (common-lisp:symbol-value 'common-lisp-user::*ansi-test-dir*)))
 
+;; ansi-test's own doit.lsp runs the tests with *DEFAULT-PATHNAME-DEFAULTS*
+;; set to sandbox/: the file fixtures ("truename.txt", "file-length.txt",
+;; "compile-file-test-file.lsp", ...) live there and the tests name them
+;; relative to the default directory.
+(setq *default-pathname-defaults*
+      (truename (merge-pathnames "sandbox/" cl-user::*ansi-test-dir*)))
 (do-tests)
 (format t "~%passed: ~A~%" (length regression-test::*passed-tests*))
 (format t "failed: ~A~%" (length regression-test::*failed-tests*))

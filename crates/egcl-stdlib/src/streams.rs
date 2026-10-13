@@ -2472,6 +2472,28 @@ pub fn open_stream_p(stream: EgclVal) -> bool {
     with_stream(stream, |guard| Ok(guard.open)).unwrap_or(false)
 }
 
+/// The standard class a native stream belongs to (CLHS 21.2), by name, for
+/// TYPEP and CLASS-OF; None for a value that is not a native stream.
+pub fn stream_class_name(stream: EgclVal) -> Option<&'static str> {
+    let guard = lock_stream(stream).ok()?;
+    Some(match &guard.inner {
+        StreamInner::StringInput { .. } | StreamInner::StringOutput { .. } => "STRING-STREAM",
+        StreamInner::FileInput { .. }
+        | StreamInner::FileOutput { .. }
+        | StreamInner::FileIo { .. }
+        | StreamInner::Stdin { .. }
+        | StreamInner::Stdout { .. }
+        | StreamInner::Stderr { .. } => "FILE-STREAM",
+        StreamInner::Broadcast => "BROADCAST-STREAM",
+        StreamInner::Concatenated { .. } => "CONCATENATED-STREAM",
+        StreamInner::TwoWay => "TWO-WAY-STREAM",
+        StreamInner::Echo => "ECHO-STREAM",
+        StreamInner::Synonym => "SYNONYM-STREAM",
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    })
+}
+
 pub fn input_stream_p(stream: EgclVal) -> bool {
     with_stream(stream, |guard| Ok(guard.is_input())).unwrap_or(false)
 }

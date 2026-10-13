@@ -1139,6 +1139,34 @@
         ((char= c char) (read-char stream t nil t) (nreverse result))
       (push (read stream t nil t) result))))
 
+;;; READ-CHAR-NO-HANG: like READ-CHAR, but NIL when no character is available
+;;; yet (CLHS 21.2). Every stream here has its input available or is at end,
+;;; so this is READ-CHAR with the EOF conventions passed through.
+(defun read-char-no-hang (&optional (stream *standard-input*) (eof-error-p t)
+                                    eof-value recursive-p)
+  (read-char stream eof-error-p eof-value recursive-p))
+
+;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
+;;; the stream itself holds, so this only checks the designator and returns NIL.
+(defun clear-input (&optional (stream *standard-input*))
+  (let ((stream (cond ((eq stream t) *terminal-io*)
+                      ((null stream) *standard-input*)
+                      (t stream))))
+    (unless (streamp stream)
+      (error 'type-error :datum stream :expected-type 'stream))
+    (unless (input-stream-p stream)
+      (error 'stream-error :stream stream))
+    nil))
+
+;;; FILE-AUTHOR: the file's author is not recorded in a portable way; NIL is
+;;; the permitted answer when it cannot be determined (CLHS 20.2). The file
+;;; must exist, else a FILE-ERROR.
+(defun file-author (pathspec)
+  (let ((truename (probe-file pathspec)))
+    (unless truename
+      (error 'file-error :pathname (pathname pathspec)))
+    nil))
+
 ;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
 (defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
   (declare (ignore index))
