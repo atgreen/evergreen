@@ -8895,7 +8895,7 @@ impl Env {
         ensure_global("*TYPE-EXPANDERS*", NIL);
         ensure_global("*CONDITION-TYPES*", NIL);
         ensure_global("*CONDITION-DEFINITIONS*", NIL);
-        env.define_local("*BREAK-ON-SIGNALS*", NIL);
+        ensure_global("*BREAK-ON-SIGNALS*", NIL);
 
         drop(env_guard);
         env
