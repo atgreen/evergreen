@@ -64,6 +64,9 @@ struct ClassMeta {
     direct_subs: Vec<EgclVal>,
     /// Direct :instance-allocated slot names (as passed to `define_class`).
     slots: Vec<EgclVal>,
+    /// Direct :class-allocated slot names: an inherited instance slot of the
+    /// same name is not part of this class's instance layout (CLHS 7.5.3).
+    shared_slots: Vec<EgclVal>,
     /// Frozen, process-lifetime descriptor shared with instances. Built-in
     /// (never-instantiated) classes have no wrapper.
     wrapper: Option<&'static ClassWrapper>,
@@ -938,6 +941,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         st.class_meta.insert(
             class,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name,
                 direct_supers,
                 direct_subs,
@@ -1337,6 +1341,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             t_cls,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name: t_nm,
                 direct_supers: vec![],
                 direct_subs: vec![],
@@ -1350,6 +1355,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             std_obj,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name: std_nm,
                 direct_supers: vec![t_cls],
                 direct_subs: vec![],
@@ -1374,6 +1380,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 *cls,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name: *nm,
                     direct_supers: vec![std_obj],
                     direct_subs: vec![],
@@ -1433,6 +1440,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 cls,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name: nm,
                     direct_supers: supers,
                     direct_subs: vec![],
@@ -1570,6 +1578,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
             st.class_meta.insert(
                 class,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name,
                     direct_supers: default_supers,
                     direct_subs: vec![],
@@ -1626,6 +1635,20 @@ pub fn define_class(
     direct_supers: &[EgclVal],
     slots: &[EgclVal],
 ) -> Result<(), EgclError> {
+    define_class_with_shared_slots(name, class, direct_supers, slots, &[])
+}
+
+/// [`define_class`] for a class that also declares `shared_slots` with
+/// `:allocation :class`: those names are left out of the instance layout even
+/// when a superclass has an instance slot of the same name (CLHS 7.5.3; ansi
+/// class-0211, class-0215, slot-value.2).
+pub fn define_class_with_shared_slots(
+    name: EgclVal,
+    class: EgclVal,
+    direct_supers: &[EgclVal],
+    slots: &[EgclVal],
+    shared_slots: &[EgclVal],
+) -> Result<(), EgclError> {
     let key = class_name_key(name);
     with_state_mut(|st| {
         // Track handle-id registration order (for diamond-hierarchy inference)
@@ -1669,6 +1692,7 @@ pub fn define_class(
         st.class_meta.insert(
             class,
             ClassMeta {
+                shared_slots: shared_slots.to_vec(),
                 name,
                 direct_supers: supers,
                 direct_subs: vec![],
@@ -1705,14 +1729,21 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
     let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
     let mut order: Vec<EgclVal> = Vec::new();
     let mut index: HashMap<EgclVal, usize> = HashMap::new();
+    // A slot a more specific class declares :allocation :class shadows the
+    // instance slot of the same name in a less specific class (CLHS 7.5.3).
+    let mut shadowed: HashSet<EgclVal> = HashSet::new();
     for c in &cpl {
         if let Some(meta) = st.class_meta.get(c) {
             for &slot_name in &meta.slots {
+                if shadowed.contains(&slot_name) {
+                    continue;
+                }
                 if let std::collections::hash_map::Entry::Vacant(e) = index.entry(slot_name) {
                     e.insert(order.len());
                     order.push(slot_name);
                 }
             }
+            shadowed.extend(meta.shared_slots.iter().copied());
         }
     }
     let slot_count = order.len() as u32;

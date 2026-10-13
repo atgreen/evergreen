@@ -1447,7 +1447,9 @@ fn setf_writer_function_object(env: &mut Env, place: EgclVal) -> Option<EgclVal>
     let key = format!("(SETF {})", sym_name(place));
     if env.generics.contains_key(&key) || env.methods.contains_key(&key) {
         let writer = EgclVal::from_symbol_index(reader::intern_symbol(&key));
-        return Some(builtin_fn_wrapper(env, writer, &key));
+        // A generic wrapper, so TYPEP GENERIC-FUNCTION and FIND-METHOD recognise
+        // it (ansi class-04.5, class-26, defmethod.4).
+        return Some(generic_fn_wrapper(env, writer, &key));
     }
     None
 }
@@ -6087,12 +6089,7 @@ fn slots_for_initarg(env: &Env, class_name: &str, initarg: &str) -> Vec<String> 
 /// A class the evaluator does not know (built-in, condition) is not checked.
 /// Violations are PROGRAM-ERRORs (ansi make-instance.error.2-4,
 /// shared-initialize.error.3/4, change-class.1.11, reinitialize-instance.error.1).
-fn check_initargs_valid(
-    env: &Env,
-    class_name: &str,
-    initargs: &[EgclVal],
-    generic_names: &[&str],
-) -> Result<(), EgclError> {
+fn check_initarg_pairs(initargs: &[EgclVal]) -> Result<(), EgclError> {
     if initargs.len() % 2 != 0 {
         return Err(EgclError::ProgramError(
             "initialization arguments must come in keyword/value pairs".into(),
@@ -6106,6 +6103,16 @@ fn check_initargs_valid(
             )));
         }
     }
+    Ok(())
+}
+
+fn check_initargs_valid(
+    env: &Env,
+    class_name: &str,
+    initargs: &[EgclVal],
+    generic_names: &[&str],
+) -> Result<(), EgclError> {
+    check_initarg_pairs(initargs)?;
     if !env.classes.borrow().contains_key(class_name) {
         return Ok(());
     }
@@ -6122,9 +6129,26 @@ fn check_initargs_valid(
         .flat_map(|slot| slot.initargs)
         .collect();
     {
+        // Only methods applicable to an instance of the class count: one whose
+        // first parameter is unspecialized, or specialized on a class in the
+        // precedence list. An EQL specializer is accepted as applicable.
+        let precedence: Vec<String> = class_precedence_names(env, class_name)
+            .iter()
+            .map(|name| symbol_bare_name(name))
+            .collect();
+        let applies = |def: &MethodDef| match def.specializers.first() {
+            None | Some(MethodSpecializer::Any) | Some(MethodSpecializer::Eql(_)) => true,
+            Some(MethodSpecializer::Class(name)) => {
+                let bare = symbol_bare_name(name);
+                bare == "T" || bare == "STANDARD-OBJECT" || precedence.contains(&bare)
+            }
+        };
         let methods = env.methods.borrow();
         for generic_name in generic_names {
             for def in methods.get(*generic_name).into_iter().flatten() {
+                if !applies(def) {
+                    continue;
+                }
                 let info = lambda_list_key_info(def.lambda_list);
                 if info.allow_other_keys {
                     return Ok(());
@@ -6585,6 +6609,23 @@ fn write_slot_value(
 /// over the `env.classes` superclass links (deduped). Used to compute effective
 /// slots so inherited slot definitions participate in instance initialization.
 fn class_precedence_names(env: &Env, class_name: &str) -> Vec<String> {
+    // The CLOS core's C3 linearization decides which class's slot specifier is
+    // most specific (ansi class-0304..0311); the preorder walk below is the
+    // fallback for a class the core does not know.
+    if let Some(class_sym) = resolve_sym(class_name) {
+        if let Ok(cpl) = resolve_class_metaobject(env, class_sym)
+            .and_then(egcl_stdlib::compute_class_precedence_list)
+        {
+            let names: Vec<String> = cpl
+                .iter()
+                .map(|class| class_name_for_instance_class(*class))
+                .filter(|name| env.classes.borrow().contains_key(name))
+                .collect();
+            if !names.is_empty() {
+                return names;
+            }
+        }
+    }
     fn visit(
         env: &Env,
         name: &str,
@@ -6622,6 +6663,13 @@ fn effective_slots_for_class(env: &Env, class_name: &str) -> Vec<SlotDef> {
             if let Some(&i) = index.get(&slot.name) {
                 if result[i].initform.is_none() && slot.initform.is_some() {
                     result[i].initform = slot.initform;
+                }
+                // CLHS 7.5.3: the initargs of an effective slot are the union
+                // of the initargs of its slot specifiers (ansi class-0215).
+                for initarg in &slot.initargs {
+                    if !result[i].initargs.contains(initarg) {
+                        result[i].initargs.push(initarg.clone());
+                    }
                 }
             } else {
                 index.insert(slot.name.clone(), result.len());
@@ -6857,6 +6905,18 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
             || (egcl_rt::types::vectorp(arg) && egcl_rt::types::md_array_rank(arg).is_none()))
         .then_some(4),
         "HASH-TABLE" => egcl_stdlib::hash_table_p(arg).then_some(1),
+        // Class metaobjects: a DEFCLASS class is its name symbol, a DEFSTRUCT
+        // class a structure class, a built-in class a handle (see TYPEP).
+        "STANDARD-CLASS" => class_metaobject_of(arg)
+            .filter(|class| !egcl_stdlib::is_structure_class(*class) && class.is_symbol())
+            .map(|_| 1),
+        "STRUCTURE-CLASS" => class_metaobject_of(arg)
+            .filter(|class| egcl_stdlib::is_structure_class(*class))
+            .map(|_| 1),
+        "BUILT-IN-CLASS" => class_metaobject_of(arg)
+            .filter(|class| !class.is_symbol())
+            .map(|_| 1),
+        "CLASS" | "METAOBJECT" => class_metaobject_of(arg).map(|_| 2),
         "PACKAGE" => egcl_rt::types::packagep(arg).then_some(1),
         "STREAM" => egcl_rt::types::streamp(arg).then_some(1),
         "ATOM" => (!arg.is_cons() || is_function_value(arg)).then_some(6),
@@ -15438,7 +15498,23 @@ fn canonical_integer_type(spec: EgclVal) -> Option<EgclVal> {
     Some(vec_to_list(&[integer, *lo, *hi]))
 }
 
+/// A class metaobject used as a type specifier stands for the type it names
+/// (ansi class-27.1: `(subtypep 'c (find-class 'standard-object))`).
+fn class_object_type_name(v: EgclVal) -> Option<EgclVal> {
+    if v.is_symbol() || v.is_cons() {
+        return None;
+    }
+    let name = egcl_stdlib::class_name(v);
+    (name.is_symbol() && !name.is_nil()).then_some(name)
+}
+
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    if let Some(name) = class_object_type_name(t1) {
+        return subtypep_relation(name, t2);
+    }
+    if let Some(name) = class_object_type_name(t2) {
+        return subtypep_relation(t1, name);
+    }
     if let Some(canonical) = canonical_integer_type(t1) {
         egcl_rt::rooted!(canonical = canonical);
         egcl_rt::rooted!(t2 = t2);
@@ -21442,7 +21518,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "DEFSTRUCT" => return eval_defstruct(cdr, env),
             "DEFGENERIC" => return eval_defgeneric(cdr, env),
             "DEFMETHOD" => return eval_defmethod(cdr, env),
-            "MAKE-INSTANCE" => return eval_make_instance(cdr, env),
+            "MAKE-INSTANCE" => {
+                // User methods on MAKE-INSTANCE take part in dispatch (ansi
+                // make-instance.1/2 and :around methods); the built-in
+                // instantiation is the fallback for other classes.
+                if env.methods.contains_key(&name) && !builtin_fallback_active(&name) {
+                    let args = eval_args(cdr, env)?;
+                    return invoke_generic_function(&name, &args, env);
+                }
+                return eval_make_instance(cdr, env);
+            }
             "FUNCTION" => {
                 let (mut name_form, _) = cp(cdr);
                 egcl_rt::rooted_ref!(_name_root = &mut name_form);
@@ -23999,7 +24084,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "EGCL-INTERNAL::%CLASS-CHANGE-ADDED-SLOTS"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
             | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
-            | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS" => {
+            | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS"
+            | "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
+            | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS"
+            | "EGCL-INTERNAL::%CHECK-INITARGS"
+            | "EGCL-INTERNAL:%CHECK-INITARGS" => {
                 return eval_builtin_arguments(&name, cdr, env);
             }
             // CHANGE-CLASS is the generic function boot.lisp defines, so user
@@ -34937,8 +35026,13 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     }
                 } else if opt_bare == "WRITER" {
                     if i + 1 < opts.len() {
+                        // A writer is a symbol or a `(setf name)` function name
+                        // (ansi class-26/27).
                         if opts[i + 1].is_symbol() {
                             writers.push(sym_name(opts[i + 1]));
+                            writer_syms.push(opts[i + 1]);
+                        } else if opts[i + 1].is_cons() {
+                            writers.push(function_name_key(opts[i + 1]));
                             writer_syms.push(opts[i + 1]);
                         }
                         i += 2;
@@ -35113,7 +35207,25 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         .iter()
         .map(|name| resolve_sym(name).unwrap_or(NIL))
         .collect();
-    egcl_stdlib::define_class(name_form, name_form, &direct_supers, &slot_names)?;
+    // Collect the names first: resolve_sym takes the symbol registry lock,
+    // which must not be requested while the class table is borrowed.
+    let shared_slot_name_strings: Vec<String> = env.classes.borrow()[&name]
+        .slots
+        .iter()
+        .filter(|slot| slot.allocation == SlotAllocation::Class)
+        .map(|slot| slot.name.clone())
+        .collect();
+    let shared_slot_names: Vec<EgclVal> = shared_slot_name_strings
+        .iter()
+        .map(|name| resolve_sym(name).unwrap_or(NIL))
+        .collect();
+    egcl_stdlib::clos::define_class_with_shared_slots(
+        name_form,
+        name_form,
+        &direct_supers,
+        &slot_names,
+        &shared_slot_names,
+    )?;
 
     // Install real generic methods for slot readers/writers/accessors so they
     // work as function values (`#'reader`, funcall/apply/map), not only in
@@ -36963,12 +37075,6 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
     }
     let mut initargs =
         evaluated_initargs(&class_name, init_args, env, Some(&mut supplied_initargs))?;
-    check_initargs_valid(
-        env,
-        &class_name,
-        &supplied_initargs,
-        &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
-    )?;
 
     // Apply :default-initargs (CLHS 7.1.4): for each effective default whose
     // initarg the caller did NOT supply, evaluate its value form and append it
@@ -37026,6 +37132,14 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
         }
         initargs = std::mem::take(&mut *rooted);
     }
+    // Validity is judged on the defaulted initarg list, so a class whose
+    // :default-initargs say :allow-other-keys t accepts anything (ansi class-24.2).
+    check_initargs_valid(
+        env,
+        &class_name,
+        &supplied_initargs,
+        &["INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE"],
+    )?;
 
     // Keep initargs rooted across make_instance, the initforms, and the user
     // :after methods below — all of which allocate (bliss-6b2 #2).
@@ -38116,6 +38230,10 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS"
             | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
+            | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS"
+            | "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
+            | "EGCL-INTERNAL:%CHECK-INITARGS"
+            | "EGCL-INTERNAL::%CHECK-INITARGS"
             | "EGCL-INTERNAL:%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
             | "EGCL-INTERNAL:%CLASS-CHANGE-ADDED-SLOTS"
@@ -40727,11 +40845,14 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (ff, fa) = cp(*r);
     egcl_rt::rooted!(fa = fa);
     egcl_rt::rooted!(fv = eval_form(ff, env)?);
+    // A FORMATTER result is an interpreted closure, physically a cons; it is a
+    // function control all the same (ansi formatter.* via FORMAT).
+    let control_is_function = is_function_value(*fv);
     // A function control (from FORMATTER, or any function) is applied to the
     // output stream and the format arguments (CLHS 22.3; ERROR.5/9-12, CERROR.*,
     // WARN.19). With a NIL destination it prints into a fresh string stream and
     // returns the string.
-    if (*fv).is_function() {
+    if control_is_function {
         let av = eval_args(*fa, env)?;
         if (*dest).is_nil() {
             egcl_rt::rooted!(stream = egcl_stdlib::make_string_output_stream(NIL)?);

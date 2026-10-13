@@ -606,6 +606,7 @@
   nil)
 
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
+  (egcl-internal::%check-initargs instance initargs)
   (apply #'shared-initialize instance nil initargs))
 
 (defmethod update-instance-for-different-class
@@ -5042,15 +5043,24 @@ a hook error aborts startup.")
 (defun print-not-readable-object (condition)
   (slot-value condition 'object))
 
-(defun ensure-generic-function (name &rest options &key lambda-list &allow-other-keys)
+(defun ensure-generic-function (name &rest options
+                                &key (lambda-list nil lambda-list-p)
+                                     (argument-precedence-order nil precedence-p)
+                                &allow-other-keys)
   (declare (ignore options))
   (cond ((and (fboundp name) (typep (fdefinition name) 'generic-function))
+         ;; The existing generic function keeps its methods; a new lambda list
+         ;; must be congruent with them, a new precedence order re-sorts dispatch.
+         (egcl-internal::%ensure-generic-options
+          name lambda-list lambda-list-p argument-precedence-order precedence-p)
          (fdefinition name))
         ((fboundp name)
          (error 'program-error
                 :format-control "~S already names an ordinary function, macro or special operator."
                 :format-arguments (list name)))
-        (t (eval `(defgeneric ,name ,lambda-list)))))
+        (t (eval `(defgeneric ,name ,lambda-list
+                    ,@(when precedence-p
+                        `((:argument-precedence-order ,@argument-precedence-order))))))))
 
 (defun invalid-method-error (method format-control &rest format-arguments)
   (error "Invalid method ~S:~%~?" method format-control format-arguments))

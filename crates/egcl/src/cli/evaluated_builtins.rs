@@ -3757,18 +3757,10 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
             egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
-            check_initargs_valid(
-                env,
-                &class_name,
-                &raw_initargs,
-                &[
-                    "SHARED-INITIALIZE",
-                    "INITIALIZE-INSTANCE",
-                    "REINITIALIZE-INSTANCE",
-                    "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS",
-                    "UPDATE-INSTANCE-FOR-REDEFINED-CLASS",
-                ],
-            )?;
+            // SHARED-INITIALIZE itself checks only the list's shape; initarg
+            // validity belongs to its callers (CLHS 7.1.2; ansi
+            // shared-initialize.6.8 passes :foo through).
+            check_initarg_pairs(&raw_initargs)?;
             egcl_rt::rooted!(initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?);
             // Explicit initargs apply regardless of SLOT-NAMES. That argument
             // only selects unbound slots whose initforms may run afterwards.
@@ -3778,6 +3770,71 @@ fn resolve(name: &str) -> Option<Handler> {
                 .collect::<Vec<_>>();
             apply_class_initforms(
                 args[0], &class_name, env, eligible.as_deref(), &explicit_slots,
+            )?;
+            Ok(args[0])
+        }),
+
+        // (name lambda-list lambda-list-p precedence-order precedence-p): the
+        // ENSURE-GENERIC-FUNCTION options for an existing generic function. A
+        // new lambda list must be congruent with every existing method; a new
+        // :argument-precedence-order re-sorts dispatch (ansi
+        // ensure-generic-function.6/8).
+        "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
+        | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 5 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS requires 5 arguments".into(),
+                ));
+            }
+            let name_form = args[0];
+            let name = function_name_key(name_form);
+            if !args[2].is_nil() {
+                let lambda_list = args[1];
+                let existing: Vec<EgclVal> = env
+                    .methods
+                    .borrow()
+                    .get(&name)
+                    .map(|list| list.iter().map(|method| method.lambda_list).collect())
+                    .unwrap_or_default();
+                for method_lambda_list in existing {
+                    if !method_lambda_list_congruent(lambda_list, method_lambda_list) {
+                        return Err(EgclError::ProgramError(format!(
+                            "ENSURE-GENERIC-FUNCTION {name}: an existing method's lambda list is not congruent with {}",
+                            format_val(lambda_list)
+                        )));
+                    }
+                }
+                if name_form.is_symbol() {
+                    store_generic_lambda_list(name_form, lambda_list);
+                }
+            }
+            if !args[4].is_nil() && name_form.is_symbol() {
+                let lambda_list = stored_generic_lambda_list(name_form).unwrap_or(args[1]);
+                let precedence = parse_argument_precedence_order(name_form, lambda_list, args[3])?;
+                store_argument_precedence_order(name_form, &precedence);
+                invalidate_gf_dispatch_cache();
+            }
+            Ok(name_form)
+        }),
+
+        // (instance initargs): the CLHS 7.1.2 validity check REINITIALIZE-INSTANCE
+        // performs before SHARED-INITIALIZE runs (ansi reinitialize-instance.error.1).
+        "EGCL-INTERNAL::%CHECK-INITARGS"
+        | "EGCL-INTERNAL:%CHECK-INITARGS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%CHECK-INITARGS requires an instance and an initarg list".into(),
+                ));
+            }
+            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let initargs = list_to_vec(args[1]);
+            check_initargs_valid(
+                env,
+                &class_name,
+                &initargs,
+                &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
             )?;
             Ok(args[0])
         }),
@@ -3795,6 +3852,12 @@ fn resolve(name: &str) -> Option<Handler> {
             let instance = args[0];
             let raw_initargs = list_to_vec(args[1]);
             let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+            check_initargs_valid(
+                env,
+                &class_name,
+                &raw_initargs,
+                &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
+            )?;
             let initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?;
             reinitialize_instance_values(instance, &initargs, env)
         }),
