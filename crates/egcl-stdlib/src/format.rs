@@ -1634,7 +1634,10 @@ fn format_integer_parts(
     commachar: char,
     comma_interval: usize,
 ) -> String {
-    let with_commas = if colon && radix == 10 {
+    // The colon modifier groups digits in every radix (~:B, ~:X, ~:R too),
+    // not only decimal.
+    let _ = radix;
+    let with_commas = if colon {
         insert_commas(digits, commachar, comma_interval)
     } else {
         digits.to_string()
@@ -2033,6 +2036,18 @@ fn parse_directives(control: &str) -> Result<Vec<Directive>, EgclError> {
 
 // ── Main format engine ────────────────────────────────────────────
 
+// Number of arguments the most recent top-level `format` call consumed.
+// FORMATTER functions return the unconsumed tail of their arguments
+// (CLHS 22.2.1.3), which only the directive interpreter knows.
+thread_local! {
+    static LAST_CONSUMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many arguments the last completed `format` call consumed.
+pub fn last_consumed_arg_count() -> usize {
+    LAST_CONSUMED.with(|c| c.get())
+}
+
 /// Execute a FORMAT directive string. R5.40.
 pub fn format(
     destination: EgclVal,
@@ -2086,6 +2101,7 @@ pub fn format(
         }
     }
     result?;
+    LAST_CONSUMED.with(|c| c.set(arg_idx.min(args.len())));
 
     if to_stdout {
         print!("{}", output);
@@ -2428,8 +2444,11 @@ fn format_impl(
                     _ => 10,
                 };
                 // Resolve V/# params BEFORE consuming the main argument
+                // A negative mincol pads nothing (FORMAT.X.28): `as usize` on a
+                // negative i64 wrapped to a huge width and panicked in
+                // repeat_n with "capacity overflow".
                 let mincol = if !params.is_empty() {
-                    resolve_param(&params[0], 0, arg_idx)? as usize
+                    resolve_param(&params[0], 0, arg_idx)?.max(0) as usize
                 } else {
                     0
                 };
@@ -2447,7 +2466,7 @@ fn format_impl(
                     ','
                 };
                 let comma_interval = if params.len() > 3 {
-                    resolve_param(&params[3], 3, arg_idx)? as usize
+                    resolve_param(&params[3], 3, arg_idx)?.max(0) as usize
                 } else {
                     3
                 };
@@ -2486,15 +2505,67 @@ fn format_impl(
             'R' => {
                 // Resolve V/# params BEFORE consuming the main argument
                 let radix_param = if !params.is_empty() {
-                    Some(resolve_param(&params[0], 10, arg_idx)? as u32)
+                    let radix = resolve_param(&params[0], 10, arg_idx)?;
+                    // CLHS 22.3.2.2: radix is an integer between 2 and 36.
+                    // Out-of-range values used to reach from_digit / `% 0` and
+                    // panic; signal a FORMAT error instead.
+                    if !(2..=36).contains(&radix) {
+                        return Err(EgclError::ControlError(format!(
+                            "~R radix must be between 2 and 36, got {}",
+                            radix
+                        )));
+                    }
+                    Some(radix as u32)
                 } else {
                     None
                 };
+                // ~radix,mincol,padchar,commachar,comma-intervalR: the
+                // remaining prefix parameters mean what they do for ~D.
+                let mincol = params
+                    .get(1)
+                    .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
+                    .max(0) as usize;
+                let padchar = params
+                    .get(2)
+                    .map_or(Ok(' ' as i64), |p| resolve_param(p, ' ' as i64, arg_idx))?
+                    as u8 as char;
+                let commachar = params
+                    .get(3)
+                    .map_or(Ok(',' as i64), |p| resolve_param(p, ',' as i64, arg_idx))?
+                    as u8 as char;
+                let comma_interval = params
+                    .get(4)
+                    .map_or(Ok(3), |p| resolve_param(p, 3, arg_idx))?
+                    .max(0) as usize;
                 if *arg_idx >= args.len() {
                     return Err(EgclError::ControlError("too few args for ~R".into()));
                 }
                 let val = args[*arg_idx];
                 *arg_idx += 1;
+                if let Some(radix) = radix_param {
+                    // Fixnums and bignums alike, through the ~D machinery.
+                    let (negative, digits) = match integer_magnitude(val, radix) {
+                        Some(parts) => parts,
+                        None => {
+                            return Err(EgclError::TypeError {
+                                datum: val,
+                                expected: "integer".into(),
+                            });
+                        }
+                    };
+                    output.push_str(&format_integer_parts(
+                        negative,
+                        &digits,
+                        radix,
+                        colon,
+                        at_sign,
+                        mincol,
+                        padchar,
+                        commachar,
+                        comma_interval,
+                    ));
+                    continue;
+                }
                 if !val.is_fixnum() {
                     return Err(EgclError::TypeError {
                         datum: val,
@@ -2502,9 +2573,7 @@ fn format_impl(
                     });
                 }
                 let n = val.as_fixnum();
-                if let Some(radix) = radix_param {
-                    output.push_str(&format_integer(n, radix, colon, at_sign, 0, ' ', ',', 3));
-                } else if colon && at_sign {
+                if colon && at_sign {
                     output.push_str(&to_roman(n, true));
                 } else if at_sign {
                     output.push_str(&to_roman(n, false));
@@ -2523,7 +2592,7 @@ fn format_impl(
                 let w = params
                     .first()
                     .map_or(Ok(0), |p| resolve_param(p, 0, arg_idx))?
-                    as usize;
+                    .max(0) as usize;
                 let d = match params.get(1) {
                     Some(p) => {
                         let dd = resolve_param(p, -1, arg_idx)?;
