@@ -1938,13 +1938,29 @@ fn collect_token(
     while chars.has(pos)? {
         let c = chars.at(pos)?;
         if in_multiple_escape {
-            let closes = if overrides {
-                effective_char_syntax(rt, c).0 == 5
+            let (closes, single_escape) = if overrides {
+                let code = effective_char_syntax(rt, c).0;
+                (code == 5, code == 4)
             } else {
-                c == '|'
+                (c == '|', c == '\\')
             };
             if closes {
                 in_multiple_escape = false;
+                pos += 1;
+                continue;
+            }
+            if single_escape {
+                // CLHS 2.2: inside a multiple escape a single escape still
+                // quotes the next character, so |a\|b| names a|b and |a\\b|
+                // names a\b.
+                pos += 1;
+                if !chars.has(pos)? {
+                    return Err(EgclError::StreamError("trailing single escape".into()));
+                }
+                name.push(chars.at(pos)?);
+                if case_mode == 3 {
+                    invert_eligible.push(false);
+                }
                 pos += 1;
                 continue;
             }
@@ -2149,11 +2165,13 @@ fn parse_token_with_base(
         }
     }
 
-    // It's a symbol
-    if name == "NIL" && !has_escape {
+    // It's a symbol. An escape only suppresses case folding and number
+    // interpretation (CLHS 2.3.1.1), so \T, |T| and T are the same symbol T;
+    // the exact-case comparison already keeps |t| a different symbol.
+    if name == "NIL" {
         return Ok(NIL);
     }
-    if name == "T" && !has_escape {
+    if name == "T" {
         return Ok(T);
     }
     // Route a bare symbol through the interpreter's current *PACKAGE* so that a

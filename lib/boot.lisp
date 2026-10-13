@@ -1138,7 +1138,9 @@
 
 (defmacro with-standard-io-syntax (&rest body)
   `(let ((*readtable* :standard-readtable)
-         (*package* "COMMON-LISP-USER")
+         ;; The package object itself, not its name: the binding must be EQ
+         ;; to (find-package "CL-USER") (ansi with-standard-io-syntax.1).
+         (*package* (find-package "COMMON-LISP-USER"))
          (*print-array* t)
          (*print-base* 10)
          (*print-case* :upcase)
