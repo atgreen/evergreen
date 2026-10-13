@@ -22867,8 +22867,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         c = cdr2;
                     }
                     if !c.is_nil() {
+                        // The datum is the improper tail when the argument is
+                        // a dotted list: the list itself satisfies LIST, and
+                        // ansi mapcar.error.8 checks that the datum does not.
                         return Err(EgclError::TypeError {
-                            datum: *lst,
+                            datum: if lst.is_cons() { c } else { *lst },
                             expected: "list".into(),
                         });
                     }
