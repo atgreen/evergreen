@@ -2535,6 +2535,16 @@ pub fn generic_function_name(gf: EgclVal) -> Option<EgclVal> {
 /// its own method table (cli.rs env.methods), so this map only tracks methods,
 /// and a generic function reaching add-method without a prior make_generic_function
 /// entry (e.g. one restored from an image) must not be an error (bliss-lb6).
+/// True for a method handle registered through `set_method_specializers`.
+pub fn is_method_object(value: EgclVal) -> bool {
+    value.is_meta_handle() && with_state(|st| st.method_meta.contains_key(&value))
+}
+
+/// True for a generic function object made by `make_generic_function`.
+pub fn is_generic_function_object(value: EgclVal) -> bool {
+    value.is_meta_handle() && with_state(|st| st.generic_functions.contains_key(&value))
+}
+
 pub fn add_method(generic_function: EgclVal, method: EgclVal) -> Result<(), EgclError> {
     with_state_mut(|st| {
         st.generic_functions

@@ -3423,6 +3423,152 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_stdlib::clos::allocate_instance(class)
         }),
 
+        "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST"
+        | "METHOD-GENERIC-FUNCTION" => Some(|operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some((owner, def)) = method_def_by_id(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "METHOD".into(),
+                });
+            };
+            egcl_rt::rooted!(def = def);
+            match operator {
+                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(def.qualifier)),
+                "METHOD-SPECIALIZERS" => Ok(method_specializer_list(&def.specializers)),
+                "METHOD-LAMBDA-LIST" => Ok(def.lambda_list),
+                _ => {
+                    // The generic function as `#'name` reifies it, so it is EQ
+                    // to what the program holds (ansi method-generic-function.*).
+                    if owner == DETACHED_METHODS_KEY {
+                        return Ok(NIL);
+                    }
+                    let Some(name_sym) = resolve_sym(&owner) else {
+                        return Ok(NIL);
+                    };
+                    egcl_rt::rooted!(function_form =
+                        vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_sym]));
+                    eval_form(*function_form, env)
+                }
+            }
+        }),
+
+        "COMPUTE-APPLICABLE-METHODS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            egcl_rt::rooted!(call_args = list_to_vec(args[1]));
+            let mut ordered = applicable_method_defs(env, &gf_name, &call_args);
+            egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
+            let ids: Vec<EgclVal> = ordered.iter().map(|method| method.method_id).collect();
+            Ok(vec_to_list(&ids))
+        }),
+
+        "REMOVE-METHOD" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            // CLHS REMOVE-METHOD: a method the generic function does not have
+            // leaves it unchanged; the generic function is returned.
+            let removed = {
+                let mut map = env.methods.borrow_mut();
+                let Some(list) = map.get_mut(&gf_name) else {
+                    return Ok(args[0]);
+                };
+                match list.iter().position(|m| m.method_id == args[1]) {
+                    Some(position) => Some(list.remove(position)),
+                    None => None,
+                }
+            };
+            if let Some(def) = removed {
+                let generic_function = env
+                    .generics
+                    .borrow()
+                    .get(&gf_name)
+                    .map(|generic| generic.generic_function);
+                if let Some(generic_function) = generic_function {
+                    egcl_stdlib::clos::remove_method(generic_function, args[1])?;
+                }
+                env.methods
+                    .borrow_mut()
+                    .entry(DETACHED_METHODS_KEY.to_string())
+                    .or_default()
+                    .push(def);
+                invalidate_gf_dispatch_cache();
+            }
+            Ok(args[0])
+        }),
+
+        "ADD-METHOD" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            let Some((owner, def)) = method_def_by_id(env, args[1]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "METHOD".into(),
+                });
+            };
+            egcl_rt::rooted!(def = def);
+            if owner == gf_name {
+                return Ok(args[0]);
+            }
+            // CLHS ADD-METHOD: a method already belonging to another generic
+            // function, or with an incongruent lambda list, is an error.
+            if owner != DETACHED_METHODS_KEY {
+                return Err(EgclError::ProgramError(format!(
+                    "ADD-METHOD: the method already belongs to {owner}"
+                )));
+            }
+            let name_sym = resolve_sym(&gf_name).unwrap_or(NIL);
+            if let Some(generic_lambda_list) = stored_generic_lambda_list(name_sym) {
+                if !lambda_lists_congruent(generic_lambda_list, def.lambda_list) {
+                    return Err(EgclError::ProgramError(format!(
+                        "ADD-METHOD: the method's lambda list is not congruent with {gf_name}"
+                    )));
+                }
+            }
+            let generic_function = env
+                .generics
+                .borrow()
+                .get(&gf_name)
+                .map(|generic| generic.generic_function);
+            let Some(generic_function) = generic_function else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            {
+                let mut map = env.methods.borrow_mut();
+                if let Some(detached) = map.get_mut(DETACHED_METHODS_KEY) {
+                    detached.retain(|m| m.method_id != args[1]);
+                }
+                let list = map.entry(gf_name.clone()).or_default();
+                // A method with the same qualifiers and specializers is replaced.
+                list.retain(|m| {
+                    !(m.qualifier == def.qualifier
+                        && specializers_equal(&m.specializers, &def.specializers))
+                });
+                list.push((*def).clone());
+            }
+            egcl_stdlib::clos::add_method(generic_function, args[1])?;
+            invalidate_gf_dispatch_cache();
+            Ok(args[0])
+        }),
+
         "FIND-METHOD" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
             // (find-method generic-function qualifiers specializers &optional

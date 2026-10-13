@@ -10201,6 +10201,13 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                 _ => out.push_str(&format!("#<heap-object type={}>", hdr.type_id())),
             }
         }
+    } else if val.is_meta_handle() && egcl_stdlib::clos::is_method_object(val) {
+        out.push_str(&format!("#<STANDARD-METHOD {}>", val.as_meta_handle_id()));
+    } else if val.is_meta_handle() && egcl_stdlib::clos::is_generic_function_object(val) {
+        let name = egcl_stdlib::clos::generic_function_name(val).unwrap_or(NIL);
+        out.push_str("#<STANDARD-GENERIC-FUNCTION ");
+        print_val_inner(name, out);
+        out.push('>');
     } else {
         out.push_str(&format!("#<unknown {:#x}>", val.0));
     }
@@ -15350,6 +15357,27 @@ fn typep_matches(
         }
         return Ok(false);
     }
+    // A method object (a DEFMETHOD handle) is a STANDARD-METHOD; a generic
+    // function object is a STANDARD-GENERIC-FUNCTION (ansi defmethod.1/.2).
+    if type_spec.is_symbol() && object.is_meta_handle() {
+        if egcl_stdlib::clos::is_method_object(object) {
+            return Ok(matches!(
+                sym_bare_name_rc(type_spec).as_ref(),
+                "T" | "ATOM" | "METHOD" | "STANDARD-METHOD" | "STANDARD-OBJECT"
+            ));
+        }
+        if egcl_stdlib::clos::is_generic_function_object(object) {
+            return Ok(matches!(
+                sym_bare_name_rc(type_spec).as_ref(),
+                "T" | "ATOM"
+                    | "FUNCTION"
+                    | "GENERIC-FUNCTION"
+                    | "STANDARD-GENERIC-FUNCTION"
+                    | "FUNCALLABLE-STANDARD-OBJECT"
+                    | "STANDARD-OBJECT"
+            ));
+        }
+    }
     // A closure's physical cons representation must not enter the CLOS
     // instance/class-of path below, where it would inherit CONS and LIST.
     // Resolve only unknown names later so DEFTYPE aliases still work.
@@ -17316,6 +17344,10 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "SLEEP" | "DISASSEMBLE" => Some((1, 1)),
         "ROOM" | "USER-HOMEDIR-PATHNAME" => Some((0, 1)),
         "ENCODE-UNIVERSAL-TIME" => Some((6, 7)),
+        "REMOVE-METHOD" | "ADD-METHOD" | "COMPUTE-APPLICABLE-METHODS" => Some((2, 2)),
+        "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST"
+        | "METHOD-GENERIC-FUNCTION" => Some((1, 1)),
+        "MAKE-INSTANCE" => Some((1, usize::MAX)),
         "CLOSE" => Some((1, 3)),
         "FILE-POSITION" | "UNREAD-CHAR" | "WRITE-CHAR" => Some((1, 2)),
         "READ-BYTE" => Some((1, 3)),
@@ -23534,7 +23566,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let class = eval_form(class_form, env)?;
                 return Ok(egcl_stdlib::class_name(class));
             }
-            "FIND-METHOD" => return eval_builtin_arguments(&name, cdr, env),
+            "FIND-METHOD" | "REMOVE-METHOD" | "ADD-METHOD" | "METHOD-QUALIFIERS"
+            | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST" | "METHOD-GENERIC-FUNCTION"
+            | "COMPUTE-APPLICABLE-METHODS" => return eval_builtin_arguments(&name, cdr, env),
             "SUBTYPEP" => return eval_builtin_arguments(&name, cdr, env),
             "CLASS-PRECEDENCE-LIST" | "COMPUTE-CLASS-PRECEDENCE-LIST" => {
                 let (class_form, _) = cp(cdr);
@@ -35437,6 +35471,181 @@ fn precedence_ordered_key(key: Vec<usize>, precedence: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+// ── Method objects ───────────────────────────────────────────────
+//
+// A method is identified by its `method_id` meta handle, which DEFMETHOD
+// returns and FIND-METHOD, COMPUTE-APPLICABLE-METHODS and friends hand back,
+// so the standard method API works on it (ansi objects remove-method.*,
+// add-method.*, method-qualifiers.*, compute-applicable-methods.*). A method
+// removed from its generic function is parked under DETACHED_METHODS_KEY in
+// `env.methods` (traced like every other MethodDef) so ADD-METHOD can attach
+// it again.
+const DETACHED_METHODS_KEY: &str = "%DETACHED-METHODS%";
+
+/// The generic function (registry key) holding `id`, with the definition.
+fn method_def_by_id(env: &Env, id: EgclVal) -> Option<(String, MethodDef)> {
+    let map = env.methods.borrow();
+    for (name, defs) in map.iter() {
+        if let Some(def) = defs.iter().find(|m| m.method_id == id) {
+            return Some((name.clone(), def.clone()));
+        }
+    }
+    None
+}
+
+/// The registry key of a generic function designator: a name symbol, a `#'gf`
+/// wrapper, or the generic function object itself.
+fn generic_function_name_of(env: &Env, gf: EgclVal) -> Option<String> {
+    if gf.is_symbol() && !gf.is_nil() {
+        return Some(sym_name(gf));
+    }
+    if gf.is_cons() && !is_closure_cons(gf) {
+        // A `(setf name)` function name.
+        return Some(function_name_key(gf));
+    }
+    if let Some(name) = generic_wrapper_name(gf) {
+        return Some(name);
+    }
+    env.generics
+        .borrow()
+        .iter()
+        .find(|(_, d)| d.generic_function == gf)
+        .map(|(n, _)| n.clone())
+}
+
+/// The methods of `gf_name` applicable to `args`, most specific first, in the
+/// generic function's argument precedence order.
+fn applicable_method_defs(env: &mut Env, gf_name: &str, args: &[EgclVal]) -> Vec<MethodDef> {
+    let mut methods = env.methods.borrow().get(gf_name).cloned().unwrap_or_default();
+    egcl_rt::rooted_ref!(_methods_root = &mut methods);
+    let precedence = egcl_rt::symbols::find_index(gf_name)
+        .map(|idx| egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx)))
+        .unwrap_or_default();
+    let mut applicable: Vec<(usize, Vec<usize>)> = Vec::new();
+    #[allow(clippy::needless_range_loop)]
+    for index in 0..methods.len() {
+        let mut method = methods[index].clone();
+        egcl_rt::rooted_ref!(_method_root = &mut method);
+        if let Some(key) = method_specificity_vector(env, &method, args) {
+            applicable.push((index, precedence_ordered_key(key, &precedence)));
+        }
+    }
+    applicable.sort_by(|a, b| a.1.cmp(&b.1));
+    applicable
+        .into_iter()
+        .map(|(index, _)| methods[index].clone())
+        .collect()
+}
+
+fn method_qualifier_list(qualifier: egcl_stdlib::MethodQualifier) -> EgclVal {
+    use egcl_stdlib::MethodQualifier as Q;
+    let keyword = match qualifier {
+        Q::Primary => return NIL,
+        Q::Before => ":BEFORE",
+        Q::After => ":AFTER",
+        Q::Around => ":AROUND",
+    };
+    vec_to_list(&[resolve_sym(keyword).unwrap_or(NIL)])
+}
+
+/// The specializers of a method as class metaobjects, an unspecialized
+/// parameter being the class T; an EQL specializer is rendered `(EQL object)`.
+fn method_specializer_list(specializers: &[MethodSpecializer]) -> EgclVal {
+    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(specializers.len()));
+    for specializer in specializers {
+        let value = match specializer {
+            MethodSpecializer::Any => resolve_sym("T")
+                .and_then(egcl_stdlib::find_class)
+                .unwrap_or(T),
+            MethodSpecializer::Class(name) => resolve_sym(name)
+                .and_then(egcl_stdlib::find_class)
+                .unwrap_or(NIL),
+            MethodSpecializer::Eql(object) => {
+                egcl_rt::rooted!(object = *object);
+                vec_to_list(&[resolve_sym("EQL").unwrap_or(NIL), *object])
+            }
+        };
+        items.push(value);
+    }
+    vec_to_list(&items)
+}
+
+/// `(required, optional, rest-or-key, key)` of an ordinary lambda list, the
+/// parts CLHS 7.6.4 compares for congruence.
+fn lambda_list_shape(lambda_list: EgclVal) -> (usize, usize, bool, bool) {
+    let (mut required, mut optional, mut rest, mut key) = (0usize, 0usize, false, false);
+    let mut section = 0u8;
+    let mut cursor = lambda_list;
+    while cursor.is_cons() {
+        let (item, next) = cp(cursor);
+        cursor = next;
+        if item.is_symbol() {
+            match sym_bare_name_rc(item).as_ref() {
+                "&OPTIONAL" => {
+                    section = 1;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    section = 2;
+                    rest = true;
+                    continue;
+                }
+                "&KEY" => {
+                    section = 3;
+                    key = true;
+                    continue;
+                }
+                "&AUX" => {
+                    section = 4;
+                    continue;
+                }
+                "&ALLOW-OTHER-KEYS" | "&WHOLE" | "&ENVIRONMENT" => continue,
+                _ => {}
+            }
+        }
+        match section {
+            0 => required += 1,
+            1 => optional += 1,
+            _ => {}
+        }
+    }
+    (required, optional, rest || key, key)
+}
+
+/// CLHS 7.6.4: same number of required and optional parameters, and both or
+/// neither taking &REST/&KEY.
+fn lambda_lists_congruent(a: EgclVal, b: EgclVal) -> bool {
+    let (r1, o1, rk1, _) = lambda_list_shape(a);
+    let (r2, o2, rk2, _) = lambda_list_shape(b);
+    r1 == r2 && o1 == o2 && rk1 == rk2
+}
+
+const GENERIC_LAMBDA_LIST_PROPERTY: &str = "EGCL::%GENERIC-LAMBDA-LIST";
+
+fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
+    if let Some(indicator) = resolve_sym(GENERIC_LAMBDA_LIST_PROPERTY) {
+        symbol_plist_put(name_form, indicator, lambda_list);
+    }
+}
+
+fn stored_generic_lambda_list(name_form: EgclVal) -> Option<EgclVal> {
+    let idx = name_form.symbol_index()?;
+    let indicator = resolve_sym(GENERIC_LAMBDA_LIST_PROPERTY)?;
+    let mut cursor = egcl_rt::symbols::symbol_plist(idx).unwrap_or(NIL);
+    while cursor.is_cons() {
+        let (key, after_key) = cp(cursor);
+        if !after_key.is_cons() {
+            break;
+        }
+        let (value, rest) = cp(after_key);
+        if key == indicator {
+            return Some(value);
+        }
+        cursor = rest;
+    }
+    None
+}
+
 // ── DEFGENERIC ───────────────────────────────────────────────────
 fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     invalidate_gf_dispatch_cache(); // generic (re)definition (bliss-x5y.20)
@@ -35460,13 +35669,47 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // method; collect their tails so they can be registered after the generic
     // function exists (with its method combination already known).
     egcl_rt::rooted!(method_options = Vec::<EgclVal>::new());
+    // CLHS DEFGENERIC: the name must not name an ordinary function, macro or
+    // special operator (ansi defgeneric.error.1-3) ...
+    {
+        let bare = symbol_bare_name(&name);
+        let already_generic =
+            env.generics.borrow().contains_key(&name) || env.methods.borrow().contains_key(&name);
+        if is_special_operator_name(&name)
+            || is_ansi_standard_macro(&bare)
+            || macro_defined(env, &name)
+            || (!already_generic && global_fn(&name).is_some())
+        {
+            return Err(EgclError::ProgramError(format!(
+                "DEFGENERIC: {name} already names a function, macro or special operator"
+            )));
+        }
+    }
+    // ... and the single-valued options appear at most once (defgeneric.error.5-).
+    let mut seen_options: Vec<String> = Vec::new();
     let mut opts = option_forms;
     while opts.is_cons() {
         let (option, rest) = cp(opts);
         if option.is_cons() {
             let (option_name, option_rest) = cp(option);
             if option_name.is_symbol() {
-                match sym_bare_name_rc(option_name).as_ref() {
+                let option_bare = sym_bare_name_rc(option_name).to_string();
+                if matches!(
+                    option_bare.as_str(),
+                    "DOCUMENTATION"
+                        | "ARGUMENT-PRECEDENCE-ORDER"
+                        | "METHOD-COMBINATION"
+                        | "GENERIC-FUNCTION-CLASS"
+                        | "METHOD-CLASS"
+                ) {
+                    if seen_options.contains(&option_bare) {
+                        return Err(EgclError::ProgramError(format!(
+                            "DEFGENERIC {name}: option :{option_bare} given more than once"
+                        )));
+                    }
+                    seen_options.push(option_bare.clone());
+                }
+                match option_bare.as_str() {
                     "METHOD-COMBINATION" => {
                         let method_combination = cp(option_rest).0;
                         combination = method_combination_from_name(&sym_name(method_combination))
@@ -35492,6 +35735,7 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     );
     env.methods.borrow_mut().entry(name).or_default();
     store_argument_precedence_order(name_form, &precedence);
+    store_generic_lambda_list(name_form, lambda_list);
 
     // Register each :method option by delegating to DEFMETHOD: the option tail
     // `(qualifier* specialized-lambda-list body...)` is exactly a DEFMETHOD cdr
@@ -35500,7 +35744,10 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let defmethod_cdr = arena_cons(name_form, method_options[i]);
         eval_defmethod(defmethod_cdr, env)?;
     }
-    Ok(name_form)
+    // DEFGENERIC returns the generic function object (CLHS), as `#'name`
+    // reifies it (ansi defgeneric.1-).
+    egcl_rt::rooted!(function_form = vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_form]));
+    eval_form(*function_form, env)
 }
 
 // ── DEFMETHOD ────────────────────────────────────────────────────
@@ -35610,6 +35857,19 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
     }
     egcl_rt::rooted!(lambda_list = vec_to_list(&plain_params));
+    // CLHS 7.6.4: the method's lambda list must be congruent with the generic
+    // function's (ansi defmethod.error.*, defgeneric.error.12/13). An implicit
+    // generic function takes the first method's lambda list.
+    match stored_generic_lambda_list(name_form) {
+        Some(generic_lambda_list) => {
+            if !lambda_lists_congruent(generic_lambda_list, *lambda_list) {
+                return Err(EgclError::ProgramError(format!(
+                    "DEFMETHOD {name}: lambda list is not congruent with the generic function's"
+                )));
+            }
+        }
+        None => store_generic_lambda_list(name_form, *lambda_list),
+    }
 
     let generic_function = if let Some(generic) = env.generics.borrow().get(&name).cloned() {
         generic.generic_function
@@ -35674,7 +35934,9 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
         }
     }
-    Ok(name_form)
+    // DEFMETHOD returns the method object (CLHS), the handle every method
+    // function understands (ansi defmethod.1/.2).
+    Ok(method_id)
 }
 
 /// Structural equality of two method specializer lists, for CLHS 7.6.2 method
@@ -37141,6 +37403,8 @@ fn is_builtin_function(name: &str) -> bool {
             | "ERROR" | "WARN" | "SIGNAL" | "CERROR" | "MAKE-CONDITION" | "MUFFLE-WARNING"
             | "INVOKE-RESTART" | "FIND-RESTART" | "COMPUTE-RESTARTS" | "ABORT" | "CONTINUE"
             | "CLASS-OF" | "CLASS-NAME" | "FIND-CLASS" | "FIND-METHOD" | "SLOT-VALUE" | "SLOT-BOUNDP"
+            | "REMOVE-METHOD" | "ADD-METHOD" | "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS"
+            | "METHOD-LAMBDA-LIST" | "METHOD-GENERIC-FUNCTION" | "COMPUTE-APPLICABLE-METHODS"
             | "ALLOCATE-INSTANCE" | "SLOT-MAKUNBOUND"
             | "MAKE-INSTANCE" | "COPY-STRUCTURE"
             // Debug introspection (bliss-zz6w)
