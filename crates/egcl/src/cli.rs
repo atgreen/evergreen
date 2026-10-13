@@ -10386,7 +10386,13 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
         ));
     } else if val.is_character() {
         out.push_str("#\\");
-        out.push_str(&egcl_stdlib::format::character_name(val.as_char()));
+        // Space is a graphic character: `#\ ` unless printing readably
+        // (CLHS 22.1.3.2; ansi print.char.4).
+        if val.as_char() == ' ' && !egcl_stdlib::format::print_readably_active() {
+            out.push(' ');
+        } else {
+            out.push_str(&egcl_stdlib::format::character_name(val.as_char()));
+        }
     } else if val.is_symbol() {
         let name = sym_name(val);
         if let Some(bare) = name.strip_prefix("KEYWORD:") {
@@ -10517,14 +10523,30 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                     // header, not +8 (bliss-tjru; same family as bliss-31x8).
                     let off = if hdr.is_large_object() { 16 } else { 8 };
                     let len = *(ptr.add(off) as *const u64) as usize;
+                    if !egcl_stdlib::format::print_array_active() {
+                        out.push_str(&format!("#<SIMPLE-VECTOR {len}>"));
+                        return;
+                    }
+                    let depth = PRINT_DEPTH.with(|d| d.get());
+                    if egcl_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
+                        out.push('#');
+                        return;
+                    }
+                    let limit = egcl_stdlib::format::print_length();
+                    PRINT_DEPTH.with(|d| d.set(depth + 1));
                     out.push_str("#(");
                     for i in 0..len {
                         if i > 0 {
                             out.push(' ');
                         }
+                        if limit.is_some_and(|n| i >= n) {
+                            out.push_str("...");
+                            break;
+                        }
                         print_val(*(ptr.add(off + 8 + i * 8) as *const EgclVal), out);
                     }
                     out.push(')');
+                    PRINT_DEPTH.with(|d| d.set(depth));
                 }
                 type_id::COMPLEX_ARRAY => {
                     // A fill-pointer / adjustable vector prints as #(...) over
@@ -10534,10 +10556,47 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                     // and walking a bit-vector/string base's internal words as
                     // values printed garbage and segfaulted (bliss-v9nb).
                     let fp = egcl_stdlib::cvec_fill_pointer(val);
+                    if is_string_value(val) {
+                        // A string with a fill pointer prints as a string of
+                        // its active characters (ansi print.string.9).
+                        let text: String = (0..fp)
+                            .map(|i| egcl_stdlib::cvec_element(val, i).unwrap_or(NIL))
+                            .filter(|c| c.is_character())
+                            .map(|c| c.as_char())
+                            .collect();
+                        if PRINT_ESCAPE.with(|c| c.get()) {
+                            out.push('"');
+                            for c in text.chars() {
+                                if c == '"' || c == '\\' {
+                                    out.push('\\');
+                                }
+                                out.push(c);
+                            }
+                            out.push('"');
+                        } else {
+                            out.push_str(&text);
+                        }
+                        return;
+                    }
+                    if !egcl_stdlib::format::print_array_active() {
+                        out.push_str(&format!("#<VECTOR {fp}>"));
+                        return;
+                    }
+                    let depth = PRINT_DEPTH.with(|d| d.get());
+                    if egcl_stdlib::format::print_level().is_some_and(|lvl| depth >= lvl) {
+                        out.push('#');
+                        return;
+                    }
+                    let limit = egcl_stdlib::format::print_length();
+                    PRINT_DEPTH.with(|d| d.set(depth + 1));
                     out.push_str("#(");
                     for i in 0..fp {
                         if i > 0 {
                             out.push(' ');
+                        }
+                        if limit.is_some_and(|n| i >= n) {
+                            out.push_str("...");
+                            break;
                         }
                         if let Some(raw) = egcl_stdlib::sequences::double_float_array_element(val, i) {
                             out.push_str(&egcl_stdlib::format::double_float_to_string(raw));
@@ -10547,6 +10606,7 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                         }
                     }
                     out.push(')');
+                    PRINT_DEPTH.with(|d| d.set(depth));
                 }
                 type_id::RATIO => {
                     let num = *(ptr.add(8) as *const EgclVal);
@@ -10603,6 +10663,10 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                 type_id::SIMPLE_ARRAY if egcl_rt::types::bit_vector_p(val) => {
                     // A bit-vector prints in `#*bits` syntax (bliss-zg9).
                     let len = egcl_rt::types::bit_vector_len(val).unwrap_or(0);
+                    if !egcl_stdlib::format::print_array_active() {
+                        out.push_str(&format!("#<BIT-VECTOR {len}>"));
+                        return;
+                    }
                     out.push_str("#*");
                     for i in 0..len {
                         out.push(match egcl_rt::types::bit_vector_ref(val, i) {
@@ -10610,6 +10674,9 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
                             _ => '0',
                         });
                     }
+                }
+                type_id::MD_ARRAY if !egcl_stdlib::format::print_array_active() => {
+                    out.push_str("#<ARRAY>");
                 }
                 type_id::MD_ARRAY => {
                     // #<rank>A(nested row-major lists) (bliss-rh0t).
@@ -10716,8 +10783,19 @@ fn princ_val(val: EgclVal, out: &mut String) {
         return;
     }
     if val.is_symbol() {
-        // For ~A, print the symbol name without its package prefix.
-        out.push_str(&symbol_name_of(val));
+        // PRINC prints a symbol without escapes: no package prefix, no bars,
+        // and *PRINT-CASE* applied (ansi print.symbol.1, print-length.5).
+        let name = sym_name(val);
+        if let Some(bare) = name.strip_prefix("KEYWORD:") {
+            out.push_str(&egcl_stdlib::format::print_symbol_name(bare, false));
+        } else if val
+            .symbol_index()
+            .is_some_and(egcl_compiler::reader::is_uninterned)
+        {
+            out.push_str(&egcl_stdlib::format::print_symbol_name(&name, false));
+        } else {
+            out.push_str(&egcl_stdlib::format::print_symbol_for_output(val, false));
+        }
         return;
     }
     // A pathname prints as its bare namestring under PRINC/~A (no `#P"…"`

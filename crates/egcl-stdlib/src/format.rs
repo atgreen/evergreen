@@ -391,6 +391,34 @@ pub fn print_level() -> Option<usize> {
 
 /// `*PRINT-CIRCLE*`: when non-NIL, shared and circular structure is printed
 /// with `#N=`/`#N#` labels instead of looping forever.
+/// `*PRINT-ARRAY*`: whether arrays other than strings print readably as
+/// `#(...)` / `#*...` / `#nA(...)`; NIL prints them as `#<...>`. True under
+/// *PRINT-READABLY*, and when the variable is unbound.
+pub fn print_array_active() -> bool {
+    if print_readably_active() {
+        return true;
+    }
+    egcl_rt::symbols::find_index("*PRINT-ARRAY*")
+        .and_then(egcl_rt::symbols::symbol_value)
+        .map(|v| v == UNBOUND || !v.is_nil())
+        .unwrap_or(true)
+}
+
+/// Whether `*READ-DEFAULT-FLOAT-FORMAT*` names DOUBLE-FLOAT or LONG-FLOAT, so a
+/// double prints without an exponent marker and a single float needs `f`.
+fn default_float_format_is_double() -> bool {
+    egcl_rt::symbols::find_index("*READ-DEFAULT-FLOAT-FORMAT*")
+        .and_then(egcl_rt::symbols::symbol_value)
+        .filter(|v| v.is_symbol() && *v != UNBOUND)
+        .and_then(|v| egcl_compiler::reader::symbol_name(v.as_symbol_index()))
+        .is_some_and(|name| {
+            let bare = egcl_rt::symbols::split_registry_key(&name)
+                .map(|(_, bare)| bare.to_string())
+                .unwrap_or(name);
+            bare == "DOUBLE-FLOAT" || bare == "LONG-FLOAT"
+        })
+}
+
 pub fn print_circle_active() -> bool {
     egcl_rt::symbols::find_index("*PRINT-CIRCLE*")
         .and_then(egcl_rt::symbols::symbol_value)
@@ -1182,24 +1210,25 @@ fn egclval_to_print_string(v: EgclVal, escapep: bool) -> String {
 /// have drifted before (bliss-i608).
 pub fn single_float_to_string(x: f32) -> String {
     if x.is_nan() || x.is_infinite() {
-        // Leave the existing non-finite spellings alone; they are not CL
-        // external representations and nothing reads them back.
         return format!("{x}");
     }
+    // A single float carries an explicit `f` marker when the default format
+    // is a double format (CLHS 22.1.3.1.3; ansi print.single-float.3).
+    let marker = if default_float_format_is_double() { 'f' } else { 'e' };
     let a = x.abs();
     if a != 0.0 && !(1e-3..1e7).contains(&a) {
-        // `{:e}` gives the shortest round-tripping mantissa, but spells a whole
-        // mantissa without a point ("1e10"); CL wants a digit on each side.
         let s = format!("{x:e}");
         return match s.split_once('e') {
             Some((mantissa, exp)) if !mantissa.contains('.') => {
-                format!("{mantissa}.0e{exp}")
+                format!("{mantissa}.0{marker}{exp}")
             }
-            _ => s,
+            Some((mantissa, exp)) => format!("{mantissa}{marker}{exp}"),
+            None => s,
         };
     }
     let s = format!("{x}");
-    if s.contains('.') { s } else { format!("{s}.0") }
+    let s = if s.contains('.') { s } else { format!("{s}.0") };
+    if marker == 'f' { format!("{s}f0") } else { s }
 }
 
 /// Print a DOUBLE-FLOAT in CL external syntax. Because egcl's
@@ -1212,23 +1241,24 @@ pub fn double_float_to_string(x: f64) -> String {
     if x.is_nan() || x.is_infinite() {
         return format!("{x}");
     }
+    // A double prints without a marker when the default format is a double
+    // format, else with `d` (CLHS 22.1.3.1.3; ansi print.double-float.*).
+    let default_double = default_float_format_is_double();
     let a = x.abs();
     if a != 0.0 && !(1e-3..1e7).contains(&a) {
+        let marker = if default_double { 'e' } else { 'd' };
         let s = format!("{x:e}");
         return match s.split_once('e') {
             Some((mantissa, exp)) if !mantissa.contains('.') => {
-                format!("{mantissa}.0d{exp}")
+                format!("{mantissa}.0{marker}{exp}")
             }
-            Some((mantissa, exp)) => format!("{mantissa}d{exp}"),
+            Some((mantissa, exp)) => format!("{mantissa}{marker}{exp}"),
             None => s,
         };
     }
     let s = format!("{x}");
-    if s.contains('.') {
-        format!("{s}d0")
-    } else {
-        format!("{s}.0d0")
-    }
+    let s = if s.contains('.') { s } else { format!("{s}.0") };
+    if default_double { s } else { format!("{s}d0") }
 }
 
 fn rational_format_value(rational: &egcl_rt::bignum::BigRat) -> f64 {

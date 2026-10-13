@@ -2533,7 +2533,30 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<EgclVal>
     // `1.5d0` (double-float syntax) and `1d0` must read as a float, not a
     // symbol. parse_decimal_float validates the grammar so hex-like symbols
     // (e.g. `FACE` in a base-16 context) are not misread as floats.
-    if read_base == 10 {
+    // `123.` with a trailing decimal point is a DECIMAL integer whatever the
+    // read base (CLHS 2.3.2.1.1; ansi print.complex.random with *print-radix*).
+    if let Some(body) = s.strip_suffix('.') {
+        let digits = body.trim_start_matches(['+', '-']);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = body.trim_start_matches('+').parse::<i64>() {
+                if fits_fixnum(n) {
+                    return Ok(Some(EgclVal::from_fixnum(n)));
+                }
+                return Ok(Some(alloc_bignum_from_i64(n)));
+            }
+            if let Some(big) = parse_bignum(body, 10) {
+                return Ok(Some(big));
+            }
+        }
+    }
+    // Float syntax is always decimal (CLHS 2.3.1.1); a token that is a valid
+    // integer in the current base reads as that integer first, so `1E5` stays
+    // an integer in base 16 (ansi print.double-float.random under *print-base*).
+    let integer_in_base = {
+        let digits = s.trim_start_matches(['+', '-']);
+        !digits.is_empty() && digits.chars().all(|c| c.is_digit(read_base))
+    };
+    if !integer_in_base {
         if let Some((f, is_double)) = parse_decimal_float(s) {
             // CLHS 2.3.2.2: a literal outside the target format's range must
             // signal an error, not read as infinity (bliss-37sr; SBCL signals

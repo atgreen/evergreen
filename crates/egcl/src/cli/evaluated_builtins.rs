@@ -217,6 +217,11 @@ fn resolve(name: &str) -> Option<Handler> {
             // otherwise prin1 (readable) semantics. Render before resolving the
             // stream from the rooted args so an allocating render cannot stale
             // it (bliss-6b2 #2).
+            // *PRINT-READABLY* true implies escaping (CLHS 22.1.3; ansi
+            // print.symbol.random).
+            if egcl_stdlib::format::print_readably_active() {
+                escape = true;
+            }
             let rendered = if escape {
                 format_val_env(args[0], env, true)
             } else {

@@ -5105,9 +5105,43 @@ a hook error aborts startup.")
 
 ;; PPRINT-TABULAR (CLHS 22.4): columns are not laid out yet; the elements are
 ;; printed like PPRINT-FILL, which is the non-pretty rendering.
+;; PPRINT-TABULAR (CLHS 22.2.2): each element starts at a column that is a
+;; multiple of TABSIZE from the start of the block; elements that would pass
+;; *PRINT-RIGHT-MARGIN* continue on a new line (ansi pprint-tabular.*).
 (defun pprint-tabular (stream list &optional (colon-p t) at-sign-p (tabsize 16))
+  (declare (ignore at-sign-p))
   (check-type tabsize (integer 0))
-  (pprint-fill stream list colon-p at-sign-p))
+  (let ((stream (cond ((null stream) *standard-output*)
+                      ((eq stream t) *terminal-io*)
+                      (t stream))))
+    (if (not (listp list))
+        (write list :stream stream)
+        (let* ((prefix (if colon-p "(" ""))
+               (suffix (if colon-p ")" ""))
+               (items (mapcar #'write-to-string list))
+               (margin (or *print-right-margin* 72))
+               (start (length prefix))
+               (lines '())
+               (line (copy-seq prefix))
+               (col start))
+          (loop for (item . rest) on items
+                do (when (and (> col start)
+                              (> (+ col (length item) (if rest 0 (length suffix))) margin))
+                     (push line lines)
+                     (setf line (make-string start :initial-element #\Space)
+                           col start))
+                   (setf line (concatenate 'string line item))
+                   (incf col (length item))
+                   (when rest
+                     (let ((next (if (zerop tabsize)
+                                     (1+ col)
+                                     (+ start (* tabsize (ceiling (- (1+ col) start) tabsize))))))
+                       (setf line (concatenate 'string line
+                                               (make-string (- next col) :initial-element #\Space))
+                             col next))))
+          (push (concatenate 'string line suffix) lines)
+          (format stream "~{~a~^~%~}" (nreverse lines))))
+    nil))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Typed structures: DEFSTRUCT with (:TYPE LIST) or (:TYPE VECTOR) (CLHS
