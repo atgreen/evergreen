@@ -1138,6 +1138,8 @@ impl GrayStream for StreamMutableState {
             return self.read_integer_element(bits, signed);
         }
         let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
+        let mut comps = self.components().to_vec();
+        egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileInput {
                 element_type,
@@ -1158,6 +1160,30 @@ impl GrayStream for StreamMutableState {
                 buf_fill,
                 ..
             } if byte_stream => file_read_byte_raw(file, read_buf, buf_pos, buf_fill),
+            // Composite streams read bytes from their binary components (ansi
+            // make-two-way-stream.12/.13, make-concatenated-stream.22).
+            StreamInner::TwoWay => crate::streams::stream_read_byte(comps[0]),
+            StreamInner::Echo => {
+                let byte = crate::streams::stream_read_byte(comps[0])?;
+                if byte != EOF {
+                    crate::streams::stream_write_byte(comps[1], byte)?;
+                }
+                Ok(byte)
+            }
+            StreamInner::Concatenated { cursor } => {
+                while *cursor < comps.len() {
+                    let result = crate::streams::stream_read_byte(comps[*cursor])?;
+                    if result != EOF {
+                        return Ok(result);
+                    }
+                    *cursor += 1;
+                }
+                Ok(EOF)
+            }
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                crate::streams::stream_read_byte(target)
+            }
             _ => {
                 // Character stream fallback: read char, return codepoint.
                 let ch = self.stream_read_char()?;
@@ -3289,7 +3315,7 @@ pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
             | StreamInner::FileIo { file, .. } => {
                 // In elements, not octets, for wide binary element types.
                 if let Some(len) = file.memory_len() {
-                    return Ok(EgclVal::from_fixnum((len as u64 / per_element as u64) as i64));
+                    return Ok(EgclVal::from_fixnum((len / per_element as u64) as i64));
                 }
                 let metadata = file
                     .metadata()

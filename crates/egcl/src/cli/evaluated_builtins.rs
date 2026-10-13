@@ -434,6 +434,14 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%NATIVE-INTERACTIVE-STREAM-P" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "%NATIVE-INTERACTIVE-STREAM-P requires one stream".into(),
+                ));
+            }
+            Ok(if egcl_stdlib::interactive_stream_p(args[0]) { T } else { NIL })
+        }),
         "EGCL::%NATIVE-STREAM-ELEMENT-TYPE" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

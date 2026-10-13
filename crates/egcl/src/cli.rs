@@ -2887,6 +2887,68 @@ fn bump_macro_env_generation() {
     MACRO_ENV_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+// ── Tree-walker macro expansion cache ────────────────────────────────
+//
+// The tree-walker re-expanded a macro call every time it evaluated the form:
+// an interpreted loop body paid a full expansion per iteration, and ASSERT
+// (whose expansion contains a LOOP, ~4 ms to expand) made the ansi printer
+// tests crawl. Expansions of GLOBAL macro calls are memoized EQ on the call
+// form in a weak-key Lisp hash table kept in a symbol's value cell, so the GC
+// traces, relocates and eventually drops the entries with their forms. The
+// cache is emptied whenever the macro environment generation changes (any
+// DEFMACRO / macro removal). MACROLET macros and expanders taking
+// &ENVIRONMENT are never cached: their expansion depends on the lexical scope.
+const MACRO_EXPANSION_CACHE_VAR: &str = "EGCL::*MACROEXPANSION-CACHE*";
+static MACRO_EXPANSION_CACHE_GENERATION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn macro_expansion_cache_table() -> Option<EgclVal> {
+    let idx = egcl_rt::symbols::intern(MACRO_EXPANSION_CACHE_VAR);
+    let generation = MACRO_ENV_GENERATION.load(AtomicOrdering::Acquire);
+    let current = egcl_rt::symbols::symbol_value(idx)
+        .filter(|v| *v != egcl_rt::value::UNBOUND && egcl_stdlib::hash_table_p(*v));
+    if let Some(table) = current {
+        if MACRO_EXPANSION_CACHE_GENERATION.load(AtomicOrdering::Acquire) != generation {
+            egcl_stdlib::clrhash(table).ok()?;
+            MACRO_EXPANSION_CACHE_GENERATION.store(generation, AtomicOrdering::Release);
+        }
+        return Some(table);
+    }
+    let table = egcl_stdlib::make_hash_table(&egcl_stdlib::MakeHashTableOptions {
+        test: egcl_stdlib::HashTest::Eq,
+        size: 256,
+        rehash_size: 1.5,
+        rehash_threshold: 0.75,
+        synchronized: true,
+        weakness: Some(egcl_stdlib::Weakness::Key),
+    })
+    .ok()?;
+    egcl_rt::symbols::set_symbol_value(idx, table);
+    MACRO_EXPANSION_CACHE_GENERATION.store(generation, AtomicOrdering::Release);
+    Some(table)
+}
+
+/// Whether the expansion of a call to this macro may be memoized on the form.
+fn macro_expansion_cacheable(lexical: bool, mdef: &MacroDef) -> bool {
+    !lexical && !params_form_uses_environment(mdef.params_form)
+}
+
+fn cached_macro_expansion(form: EgclVal) -> Option<EgclVal> {
+    egcl_rt::rooted!(form = form);
+    let table = macro_expansion_cache_table()?;
+    match egcl_stdlib::gethash(*form, table, NIL) {
+        Ok((expansion, true)) => Some(expansion),
+        _ => None,
+    }
+}
+
+fn remember_macro_expansion(form: EgclVal, expansion: EgclVal) {
+    egcl_rt::rooted!(form = form);
+    egcl_rt::rooted!(expansion = expansion);
+    if let Some(table) = macro_expansion_cache_table() {
+        let _ = egcl_stdlib::set_gethash(*form, table, *expansion);
+    }
+}
+
 /// Address-identity of an `EnvFrame`, for comparing whether the current frame is
 /// the top-level base or a genuinely nested binding frame (bliss-sdd).
 fn frame_addr(frame: &Arc<SharedCell<EnvFrame>>) -> usize {
@@ -4331,21 +4393,32 @@ fn global_macro_remove(name: &str) {
 /// Look up a macro visible in `env`: a lexical MACROLET macro shadows a global
 /// one; a package-qualified name also matches by its bare leaf name.
 fn lookup_macro(env: &Env, name: &str) -> Option<MacroDef> {
+    lookup_macro_with_scope(env, name).map(|(def, _)| def)
+}
+
+/// `lookup_macro`, also saying whether the definition is a lexical (MACROLET)
+/// one rather than a global macro.
+fn lookup_macro_with_scope(env: &Env, name: &str) -> Option<(MacroDef, bool)> {
     if let Some(def) = env.macros.borrow().get(name).cloned() {
-        return Some(def);
+        return Some((def, true));
     }
     let alias = extension_operator_alias(name);
     if let Some(alias) = &alias {
         if let Some(def) = env.macros.borrow().get(alias).cloned() {
-            return Some(def);
+            return Some((def, true));
         }
     }
     let leaf = symbol_leaf_name(name);
     if leaf != name {
         if let Some(def) = env.macros.borrow().get(leaf).cloned() {
-            return Some(def);
+            return Some((def, true));
         }
     }
+    lookup_global_macro_def(name, alias.as_deref(), leaf).map(|def| (def, false))
+}
+
+fn lookup_global_macro_def(name: &str, alias: Option<&str>, leaf: &str) -> Option<MacroDef> {
+    let alias = alias.map(str::to_string);
     {
         let g = GLOBAL_MACROS.lock().unwrap();
         g.get(name)
@@ -14132,6 +14205,13 @@ fn num_bound_f64(v: EgclVal) -> Option<f64> {
     if v.is_fixnum() {
         return Some(v.as_fixnum() as f64);
     }
+    if v.is_heap_object() {
+        // A bignum bound ((unsigned-byte 64) and wider): the f64 approximation
+        // decides the containment the same way adjacent widths need.
+        if let Some(b) = egcl_rt::bignum::bigint_from_val(v) {
+            return Some(b.to_f64());
+        }
+    }
     if v.is_single_float() {
         return Some(v.as_single_float() as f64);
     }
@@ -17658,8 +17738,18 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         ) {
             return eval_atomic_update_form(&name, cdr, env);
         }
-        if !shadowed_by_lexical_function && let Some(mdef) = lookup_macro(env, &name) {
+        if !shadowed_by_lexical_function
+            && let Some((mdef, lexical)) = lookup_macro_with_scope(env, &name)
+        {
+            let cacheable = macro_expansion_cacheable(lexical, &mdef);
+            if cacheable && let Some(hit) = cached_macro_expansion(form) {
+                egcl_rt::rooted!(hit = hit);
+                return eval_form(*hit, env);
+            }
             egcl_rt::rooted!(expanded = expand_macro(&mdef, cdr, env, form)?);
+            if cacheable {
+                remember_macro_expansion(form, *expanded);
+            }
             return eval_form(*expanded, env);
         }
 
@@ -18156,7 +18246,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             {
                 return eval_builtin_arguments(&name, cdr, env);
             }
-            "EGCL::%NATIVE-STREAM-ELEMENT-TYPE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%NATIVE-STREAM-ELEMENT-TYPE" | "EGCL::%NATIVE-INTERACTIVE-STREAM-P" => {
+                return eval_builtin_arguments(&name, cdr, env)
+            }
             "OUTPUT-STREAM-P" | "EGCL::%NATIVE-OUTPUT-STREAM-P"
                 if !env.generics.contains_key(&name) =>
             {
@@ -36693,7 +36785,8 @@ fn is_builtin_function(name: &str) -> bool {
         return !cfg!(egcl_no_disassembly);
     }
     if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
-        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%FORMAT-CONSUMED") {
+        | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%FORMAT-CONSUMED"
+        | "EGCL::%NATIVE-INTERACTIVE-STREAM-P") {
         return true;
     }
     // EGCL-THREAD is an extension package, not COMMON-LISP. Its names must be

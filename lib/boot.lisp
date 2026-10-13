@@ -1232,7 +1232,10 @@
 (defun interactive-stream-p (stream)
   (unless (streamp stream)
     (error 'type-error :datum stream :expected-type 'stream))
-  (cond ((eq stream *terminal-io*) t)
+  ;; The process's standard streams are interactive; composite streams are
+  ;; as interactive as the stream they read from (so a *TERMINAL-IO* rebound
+  ;; to a two-way stream over a string is not; ansi streams listen.8).
+  (cond ((egcl::%native-interactive-stream-p stream) t)
         ((typep stream 'synonym-stream)
          (let ((target (symbol-value (synonym-stream-symbol stream))))
            (and (streamp target) (not (eq target stream))
