@@ -9669,6 +9669,12 @@ fn print_val(val: EgclVal, out: &mut String) {
 }
 
 fn print_val_inner(val: EgclVal, out: &mut String) {
+    // See egclval_to_print_string: unbounded recursion on circular structure
+    // printed without *PRINT-CIRCLE* ends at the stack budget, not the guard page.
+    if egcl_rt::host_stack_budget_exhausted() {
+        out.push_str("#<print depth exhausted>");
+        return;
+    }
     if val.is_nil() {
         out.push_str("NIL");
     } else if val == T {

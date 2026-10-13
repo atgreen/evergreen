@@ -317,9 +317,24 @@ pub fn symbol_print_parts(symbol: EgclVal) -> (Option<(String, &'static str)>, S
     (None, name)
 }
 
+/// `*PRINT-READABLY*`: when true the output must read back as a similar
+/// object, so *PRINT-LENGTH*, *PRINT-LEVEL* and *PRINT-LINES* are treated as
+/// NIL and *PRINT-ESCAPE*, *PRINT-GENSYM* and *PRINT-ARRAY* as T (CLHS
+/// 22.1.3.5; ansi printer print.cons.random.*).
+pub fn print_readably_active() -> bool {
+    egcl_rt::symbols::find_index("*PRINT-READABLY*")
+        .and_then(egcl_rt::symbols::symbol_value)
+        .map(|v| v != UNBOUND && !v.is_nil())
+        .unwrap_or(false)
+}
+
 /// `*PRINT-LENGTH*`: the max number of elements of a list/vector to print before
-/// `...`, or `None` (unbounded) when the variable is NIL/unset.
+/// `...`, or `None` (unbounded) when the variable is NIL/unset or
+/// *PRINT-READABLY* is true.
 pub fn print_length() -> Option<usize> {
+    if print_readably_active() {
+        return None;
+    }
     egcl_rt::symbols::find_index("*PRINT-LENGTH*")
         .and_then(egcl_rt::symbols::symbol_value)
         .filter(|v| v.is_fixnum())
@@ -327,8 +342,11 @@ pub fn print_length() -> Option<usize> {
 }
 
 /// `*PRINT-LEVEL*`: the max nesting depth to print before `#`, or `None`
-/// (unbounded) when the variable is NIL/unset.
+/// (unbounded) when the variable is NIL/unset or *PRINT-READABLY* is true.
 pub fn print_level() -> Option<usize> {
+    if print_readably_active() {
+        return None;
+    }
     egcl_rt::symbols::find_index("*PRINT-LEVEL*")
         .and_then(egcl_rt::symbols::symbol_value)
         .filter(|v| v.is_fixnum())
@@ -348,6 +366,9 @@ pub fn print_circle_active() -> bool {
 /// `#:` prefix under escape printing so it reads back as a fresh symbol; NIL
 /// suppresses the prefix (CLHS 22.1.3.3).
 pub fn print_gensym() -> bool {
+    if print_readably_active() {
+        return true;
+    }
     egcl_rt::symbols::find_index("*PRINT-GENSYM*")
         .and_then(egcl_rt::symbols::symbol_value)
         .map(|v| !v.is_nil())
@@ -1081,6 +1102,13 @@ fn escape_string_body(s: &str) -> String {
 }
 
 fn egclval_to_print_string(v: EgclVal, escapep: bool) -> String {
+    // Printing circular structure without *PRINT-CIRCLE* is unbounded (CLHS
+    // 22.1.3.5 leaves it undefined); stop at the native stack budget with a
+    // marker rather than faulting through the guard page, which took the ansi
+    // printer chapter down with it (print.cons.random.2 reported through rt).
+    if egcl_rt::host_stack_budget_exhausted() {
+        return "#<print depth exhausted>".to_string();
+    }
     // Establish (at the outermost level) the *print-circle* label table, so
     // shared/circular structure prints with #N=/#N# instead of looping.
     circle_enter(v);
