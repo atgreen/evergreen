@@ -2969,7 +2969,10 @@ fn format_impl(
                     if sign.len() + digits.len() > w && digits.starts_with("0.") && digits.len() > 2 {
                         digits.remove(0);
                     }
-                    if digits == "0." {
+                    // Only a width-chosen zero fraction loses its zero ("~0F"
+                    // of 0.01 is ".0"); an explicit D of 0 keeps it ("~0,0F"
+                    // is "0.", ansi format.f.46b).
+                    if digits == "0." && d_opt.is_none() {
                         digits = ".".into();
                     }
                 }
