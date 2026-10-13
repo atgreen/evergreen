@@ -35107,7 +35107,17 @@ fn check_symbol_macrolet_bindings(cdr: EgclVal) -> Result<(), EgclError> {
             || symbol == T
             || is_keyword_arg(symbol)
             || egcl_rt::symbols::symbol_is_constant(symbol.as_symbol_index());
-        if constant || is_special_var(symbol) {
+        // "Special" here means proclaimed (DEFVAR, DEFPARAMETER, DECLAIM) or an
+        // earmuffed name with a global value.  The earmuff convention alone is
+        // not enough: a global symbol macro such as CFFI's DEFCVAR `*place*` is
+        // an ordinary symbol macro that SYMBOL-MACROLET may shadow
+        // (tests/symbol_macro_scope_cli.rs).
+        let bound = symbol
+            .symbol_index()
+            .and_then(egcl_rt::symbols::symbol_value)
+            .is_some_and(|v| v != egcl_rt::value::UNBOUND);
+        let special = is_proclaimed_special(&sym_name_rc(symbol)) || (is_special_var(symbol) && bound);
+        if constant || special {
             return Err(EgclError::ProgramError(format!(
                 "SYMBOL-MACROLET cannot bind {} {}",
                 if constant { "the constant" } else { "the special variable" },
