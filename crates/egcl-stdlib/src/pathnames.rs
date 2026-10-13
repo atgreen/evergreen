@@ -7,7 +7,7 @@
 
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
-use egcl_rt::object::{ObjectHeader, type_id};
+use egcl_rt::object::{ConsCell, ObjectHeader, type_id};
 use egcl_rt::value::{NIL, T, TAG_HEAP_OBJECT, EgclVal};
 
 use std::collections::{HashMap, HashSet};
@@ -1674,24 +1674,71 @@ fn translate_pathname_with_patterns(
     from_pattern: &PathnameRecord,
     to_pattern: &PathnameRecord,
 ) -> Result<PathnameRecord, EgclError> {
-    let captures = pathname_match_with_captures(source, from_pattern).ok_or_else(|| {
+    let mut captures = pathname_match_with_captures(source, from_pattern).ok_or_else(|| {
         EgclError::FileError("source pathname does not match translation".to_string())
     })?;
+    // ANSI 19.3.1.1.7: a logical pathname's components are canonical uppercase;
+    // translating one to a physical pathname renders them in the physical
+    // host's customary case, which is lowercase here. Only text carried over
+    // from the logical source changes; the TO wildcard's own literals stay.
+    let to_customary_case = source.parsed.is_logical && !to_pattern.parsed.is_logical;
+    let fold = |text: &String| -> String {
+        if to_customary_case {
+            text.to_lowercase()
+        } else {
+            text.clone()
+        }
+    };
+    if to_customary_case {
+        captures.name = captures.name.as_ref().map(fold);
+        captures.type_field = captures.type_field.as_ref().map(fold);
+        captures.name_fragments = captures.name_fragments.iter().map(fold).collect();
+        captures.type_fragments = captures.type_fragments.iter().map(fold).collect();
+        captures.directory_wilds = captures.directory_wilds.iter().map(fold).collect();
+        captures.directory_inferiors = captures.directory_inferiors.iter().map(fold).collect();
+    }
+    // ANSI 19.2.2.4.3 (TRANSLATE-PATHNAME): a piece the TO wildcard leaves out
+    // (NIL) is copied from SOURCE, so a directory-only target such as
+    // #P"/x/auxiliary/" yields /x/auxiliary/<source name>.<source type>.
+    let fold_component = |component: &Option<ComponentSpec>| -> Option<ComponentSpec> {
+        component.as_ref().map(|spec| match spec {
+            ComponentSpec::Literal(text) => ComponentSpec::Literal(fold(text)),
+            ComponentSpec::Wild => ComponentSpec::Wild,
+        })
+    };
+    let fold_directory = |dir: &Option<DirectorySpec>| -> Option<DirectorySpec> {
+        dir.as_ref().map(|dir| DirectorySpec {
+            absolute: dir.absolute,
+            parts: dir
+                .parts
+                .iter()
+                .map(|part| match part {
+                    DirPart::Literal(text) => DirPart::Literal(fold(text)),
+                    other => other.clone(),
+                })
+                .collect(),
+        })
+    };
     let parsed = ParsedPathname {
         is_logical: to_pattern.parsed.is_logical,
         host_name: to_pattern.parsed.host_name.clone(),
         device_name: to_pattern.parsed.device_name.clone(),
-        directory: apply_directory_capture(&to_pattern.parsed.directory, &captures),
-        name: apply_component_capture(
-            &to_pattern.parsed.name,
-            captures.name.as_ref(),
-            &captures.name_fragments,
-        ),
-        type_field: apply_component_capture(
-            &to_pattern.parsed.type_field,
-            captures.type_field.as_ref(),
-            &captures.type_fragments,
-        ),
+        directory: match &to_pattern.parsed.directory {
+            None => fold_directory(&source.parsed.directory),
+            some => apply_directory_capture(some, &captures),
+        },
+        name: match &to_pattern.parsed.name {
+            None => fold_component(&source.parsed.name),
+            some => apply_component_capture(some, captures.name.as_ref(), &captures.name_fragments),
+        },
+        type_field: match &to_pattern.parsed.type_field {
+            None => fold_component(&source.parsed.type_field),
+            some => apply_component_capture(
+                some,
+                captures.type_field.as_ref(),
+                &captures.type_fragments,
+            ),
+        },
     };
     Ok(build_record_from_namestring(
         parsed,
@@ -1710,15 +1757,110 @@ pub fn translate_pathname(
     from_wildcard: EgclVal,
     to_wildcard: EgclVal,
 ) -> Result<EgclVal, EgclError> {
-    let get = |v: EgclVal| {
-        get_record(v).ok_or(EgclError::TypeError {
+    // Each argument is a pathname designator: a pathname, or a namestring.
+    let get = |v: EgclVal| -> Result<PathnameRecord, EgclError> {
+        if let Some(rec) = get_record(v) {
+            return Ok(rec);
+        }
+        if let Some(text) = component_string(v) {
+            return Ok(build_record_from_namestring(
+                parse_namestring_model(&text, None)?,
+                None,
+            ));
+        }
+        Err(EgclError::TypeError {
             datum: v,
-            expected: "pathname".to_string(),
+            expected: "pathname designator".to_string(),
         })
     };
     let translated =
         translate_pathname_with_patterns(&get(source)?, &get(from_wildcard)?, &get(to_wildcard)?)?;
     Ok(make_record_value(translated))
+}
+
+/// A translation's FROM or TO wildcard as a record. ANSI 19.3.1.1 lets each be
+/// a pathname designator: a pathname object is used as is; a string is parsed as
+/// a namestring, on the logical host for the FROM side (so "AUX;*.*.*" is
+/// complete without a host prefix) and as a physical namestring for the TO side.
+fn translation_wildcard_record(
+    host: &str,
+    value: EgclVal,
+    from_side: bool,
+) -> Result<PathnameRecord, EgclError> {
+    if let Some(rec) = get_record(value) {
+        return Ok(rec);
+    }
+    let text = component_string(value).ok_or_else(|| EgclError::TypeError {
+        datum: value,
+        expected: "pathname designator in logical pathname translation".to_string(),
+    })?;
+    let supplied_host = from_side.then(|| make_string_bv(host));
+    Ok(build_record_from_namestring(
+        parse_namestring_model(&text, supplied_host)?,
+        supplied_host,
+    ))
+}
+
+/// The `(from-wildcard to-wildcard)` pairs stored for `host` (R5.189), in
+/// order. The ANSI shape is a list of two-element lists; a single string of
+/// quoted `"from" "to"` pairs is the pre-list representation and still reads.
+fn translation_pairs(
+    host: &str,
+    translations: EgclVal,
+) -> Result<Vec<(PathnameRecord, PathnameRecord)>, EgclError> {
+    let mut pairs = Vec::new();
+    if translations.is_cons() || translations.is_nil() {
+        // Walk the list without allocating, then root the collected designators:
+        // building a record allocates (strings, pathname objects) and a minor GC
+        // may move the list and its elements under raw cons pointers.
+        let mut designators: Vec<EgclVal> = Vec::new();
+        let mut cursor = translations;
+        while cursor.is_cons() {
+            let cell = unsafe { &*(cursor.as_ptr() as *const ConsCell) };
+            let pair = cell.car;
+            cursor = cell.cdr;
+            if !pair.is_cons() {
+                return Err(EgclError::TypeError {
+                    datum: pair,
+                    expected: "(from-wildcard to-wildcard) translation".to_string(),
+                });
+            }
+            let pair_cell = unsafe { &*(pair.as_ptr() as *const ConsCell) };
+            if !pair_cell.cdr.is_cons() {
+                return Err(EgclError::TypeError {
+                    datum: pair,
+                    expected: "(from-wildcard to-wildcard) translation".to_string(),
+                });
+            }
+            designators.push(pair_cell.car);
+            designators.push(unsafe { &*(pair_cell.cdr.as_ptr() as *const ConsCell) }.car);
+        }
+        egcl_rt::rooted_ref!(_designators = &mut designators);
+        for index in (0..designators.len()).step_by(2) {
+            pairs.push((
+                translation_wildcard_record(host, designators[index], true)?,
+                translation_wildcard_record(host, designators[index + 1], false)?,
+            ));
+        }
+        return Ok(pairs);
+    }
+    let source = component_string(translations).ok_or_else(|| {
+        EgclError::FileError(format!(
+            "logical host {:?} has unreadable translations",
+            host
+        ))
+    })?;
+    for (from, to) in parse_translation_pairs(&source) {
+        let from_host = make_string_bv(host);
+        pairs.push((
+            build_record_from_namestring(
+                parse_namestring_model(&from, Some(from_host))?,
+                Some(from_host),
+            ),
+            build_record_from_namestring(parse_namestring_model(&to, None)?, None),
+        ));
+    }
+    Ok(pairs)
 }
 
 pub fn translate_logical_pathname(pathname: EgclVal) -> Result<EgclVal, EgclError> {
@@ -1738,23 +1880,10 @@ pub fn translate_logical_pathname(pathname: EgclVal) -> Result<EgclVal, EgclErro
         with_logical_translations(|map| map.get(&host).copied()).ok_or_else(|| {
             EgclError::FileError(format!("no translations for logical host {:?}", host))
         })?;
-    let translations_src = component_string(translations_val).ok_or_else(|| {
-        EgclError::FileError(format!(
-            "logical host {:?} has unreadable translations",
-            host
-        ))
-    })?;
-
-    for (from, to) in parse_translation_pairs(&translations_src) {
-        let from_host = make_string_bv(&host);
-        let from_rec = build_record_from_namestring(
-            parse_namestring_model(&from, Some(from_host))?,
-            Some(from_host),
-        );
+    for (from_rec, to_rec) in translation_pairs(&host, translations_val)? {
         if pathname_match_with_captures(&rec, &from_rec).is_none() {
             continue;
         }
-        let to_rec = build_record_from_namestring(parse_namestring_model(&to, None)?, None);
         let translated = translate_pathname_with_patterns(&rec, &from_rec, &to_rec)?;
         if translated.parsed.is_logical {
             let translated_val = make_record_value(translated);
@@ -1805,7 +1934,48 @@ fn resolve_relative_path(path_str: &str) -> String {
     path_str.to_string()
 }
 
+/// A logical pathname, or a namestring that parses as one on a defined logical
+/// host, resolved to its physical pathname through the host's translations
+/// (ANSI 19.3.1). `None` when `val` is already physical, names an undefined
+/// host (left for the caller to report as given), or is not a pathname
+/// designator at all.
+pub fn translated_physical(val: EgclVal) -> Result<Option<EgclVal>, EgclError> {
+    if let Some(rec) = get_record(val) {
+        return if rec.parsed.is_logical {
+            translate_logical_pathname(val).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+    let Some(text) = component_string(val) else {
+        return Ok(None);
+    };
+    // Cheap pre-check mirroring parse_namestring_model's logical syntax test.
+    if text.starts_with('/') || !text.contains(':') {
+        return Ok(None);
+    }
+    let Ok(parsed) = parse_namestring_model(&text, None) else {
+        return Ok(None);
+    };
+    if !parsed.is_logical {
+        return Ok(None);
+    }
+    let Some(host) = parsed.host_name.clone() else {
+        return Ok(None);
+    };
+    if !with_logical_translations(|map| map.contains_key(&host)) {
+        return Ok(None);
+    }
+    let logical = make_record_value(build_record_from_namestring(parsed, None));
+    translate_logical_pathname(logical).map(Some)
+}
+
 pub(crate) fn extract_path_string(val: EgclVal) -> Result<String, EgclError> {
+    // A logical pathname names a file only through its translations, so every
+    // filesystem operation sees the physical pathname (ANSI 19.3.1).
+    if let Some(physical) = translated_physical(val)? {
+        return extract_path_string(physical);
+    }
     if let Some(s) = lookup_string(val) {
         return Ok(s);
     }

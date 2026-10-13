@@ -5384,6 +5384,15 @@ fn funcallable_instance_function(v: EgclVal) -> Option<EgclVal> {
     egcl_stdlib::slot_value(v, slot).ok()
 }
 
+/// A retained generic-function value: the cached `(EGCL::CLOSURE . id)` wrapper
+/// `#'gf` / SYMBOL-FUNCTION hand out for a DEFGENERIC name. ANSI makes every
+/// such object a GENERIC-FUNCTION (and a STANDARD-GENERIC-FUNCTION), a subtype
+/// of FUNCTION; ansi-test's universe.lsp asserts exactly that before any
+/// chapter can load.
+fn is_generic_function_value(v: EgclVal) -> bool {
+    generic_wrapper_name(v).is_some()
+}
+
 fn is_function_value(v: EgclVal) -> bool {
     if v.is_function() {
         return true;
@@ -6420,6 +6429,9 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         // `(create-scanner (scanner function))` method was skipped and a scanner
         // closure fell through to the `(parse-tree t)` method (bliss-5ir).
         "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(1),
+        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+            is_generic_function_value(arg).then_some(1)
+        }
         "CONS" => (arg.is_cons() && !is_function_value(arg)).then_some(1),
         "LIST" => (arg.is_list() && !is_function_value(arg)).then_some(2),
         // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
@@ -13579,7 +13591,8 @@ fn builtin_condition_supertypes(name: &str) -> Option<Vec<String>> {
 
 fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
     let chain: &'static [&'static str] = match name {
-        "COMPILED-FUNCTION" => &["FUNCTION", "ATOM", "T"],
+        "COMPILED-FUNCTION" | "GENERIC-FUNCTION" => &["FUNCTION", "ATOM", "T"],
+        "STANDARD-GENERIC-FUNCTION" => &["GENERIC-FUNCTION", "FUNCTION", "ATOM", "T"],
         "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "INTEGER" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "RATIO" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
@@ -14850,6 +14863,9 @@ fn typep_matches(
     if type_spec.is_symbol() && is_function_value(object) {
         match sym_bare_name_rc(type_spec).as_ref() {
             "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => return Ok(true),
+            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+                return Ok(is_generic_function_value(object))
+            }
             "CONS" | "LIST" => return Ok(false),
             _ => {}
         }
@@ -14890,10 +14906,13 @@ fn typep_matches(
         // LIST.  Handle them before the generic CLOS/class-of route, which can
         // otherwise observe their representation and report the cons classes.
         if is_function_value(object) {
-            return Ok(matches!(
-                type_name.as_ref(),
-                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION"
-            ));
+            return Ok(match type_name.as_ref() {
+                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => true,
+                "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+                    is_generic_function_value(object)
+                }
+                _ => false,
+            });
         }
         // A class metaobject tested against a metaclass type. egcl represents a
         // user/struct class as its name symbol, so `(find-class 'foo)` is that
@@ -15045,6 +15064,7 @@ fn typep_matches(
             "EXTENDED-CHAR" => false,
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
+            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(object),
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => egcl_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => egcl_stdlib::is_pathname(object),
@@ -16358,6 +16378,7 @@ fn value_satisfies_declared_type(type_form: EgclVal, value: EgclVal) -> Result<b
         // `(the function (encoder mapping))`, where the encoder is exactly such
         // a closure.
         "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(value),
+        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(value),
         "CONS" => value.is_cons() && !is_function_value(value),
         "ATOM" => !value.is_cons() || is_function_value(value),
         other => {
@@ -21904,6 +21925,26 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 });
             }
             "TRANSLATE-LOGICAL-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
+            "LOGICAL-PATHNAME-TRANSLATIONS" => {
+                // (logical-pathname-translations host) → the host's list of
+                // (from-wildcard to-wildcard) pairs as stored by SETF (R5.189);
+                // an undefined host is a TYPE-ERROR per ANSI 19.3.1.
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(EgclError::ProgramError(format!(
+                        "LOGICAL-PATHNAME-TRANSLATIONS requires exactly 1 argument, got {n}"
+                    )));
+                }
+                let (host_form, _) = cp(cdr);
+                let host = eval_form(host_form, env)?;
+                let host_str = val_as_str(host);
+                return egcl_stdlib::logical_pathname_translations(&host_str).map_err(|_| {
+                    EgclError::TypeError {
+                        datum: host,
+                        expected: "defined logical host".to_string(),
+                    }
+                });
+            }
             "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" => {
                 // (load-logical-pathname-translations host) → NIL when the host's
                 // translations are already defined (nothing to load); an ERROR
@@ -36176,7 +36217,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "PROBE-FILE" | "TRUENAME" | "DIRECTORY" | "WILD-PATHNAME-P"
             | "PATHNAME-MATCH-P" | "TRANSLATE-PATHNAME" | "ENSURE-DIRECTORIES-EXIST"
             | "LOGICAL-PATHNAME" | "TRANSLATE-LOGICAL-PATHNAME"
-            | "LOAD-LOGICAL-PATHNAME-TRANSLATIONS"
+            | "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" | "LOGICAL-PATHNAME-TRANSLATIONS"
             | "FILE-NAMESTRING" | "DIRECTORY-NAMESTRING" | "ENOUGH-NAMESTRING"
             | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
             // Time
@@ -38556,6 +38597,11 @@ fn val_as_str(val: EgclVal) -> String {
 /// rather than the namestring, so callers that take file paths (LOAD, etc.) must
 /// resolve pathnames through `namestring` first. bliss-lb6.
 fn path_designator_to_string(v: EgclVal) -> Result<String, EgclError> {
+    // A logical pathname (or logical namestring) reaches the filesystem only
+    // through its host's translations (ANSI 19.3.1).
+    if let Some(physical) = egcl_stdlib::translated_physical(v)? {
+        return path_designator_to_string(physical);
+    }
     if egcl_stdlib::is_pathname(v) {
         return Ok(val_as_str(egcl_stdlib::namestring(v)?));
     }
