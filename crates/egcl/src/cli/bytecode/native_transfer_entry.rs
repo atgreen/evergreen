@@ -548,6 +548,14 @@ impl TransferCode {
 
     pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
         use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
+        // Root ingress validates declared parameters before entering generated
+        // code, and source-proven self calls preserve those established facts.
+        // A named ordinary caller has no per-parameter validator at its raw
+        // machine boundary yet, so do not publish this entry as a general
+        // descriptor. It will take the checked dispatcher instead.
+        if self.body.param_types.iter().any(|ty| !ty.is_any()) {
+            return None;
+        }
         let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
         Some(OrdinaryEntryDescriptor {
             kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision,
@@ -1574,10 +1582,6 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
             .param_layout
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
-        && body
-            .param_types
-            .iter()
-            .all(|ty| matches!(ty, DeclaredType::Any))
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
@@ -1604,10 +1608,7 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
-    body.param_types
-        .iter()
-        .all(|ty| matches!(ty, DeclaredType::Any))
-        && body.param_layout.len() == usize::from(body.arity)
+    body.param_layout.len() == usize::from(body.arity)
         && body
             .param_layout
             .iter()

@@ -289,10 +289,6 @@ fn validate_entry(
         || entry.arity > 4
         || entry.arity_error_veneer == 0
         || f.block(f.entry()).params.len() != entry.arity
-        || f.block(f.entry())
-            .params
-            .iter()
-            .any(|&v| f.is_entry_param_checked(v))
         || [
             cold,
             flags.gc_requested,
@@ -407,7 +403,6 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
     if f.is_variadic() || !f.osr_entries.is_empty() || !f.handler_cases.is_empty()
         || entry.arity > u16::MAX as usize || entry.arity_error_veneer == 0
         || f.block(f.entry()).params.len() != entry.arity
-        || f.block(f.entry()).params.iter().any(|&v| f.is_entry_param_checked(v))
         || [cold, guard.veneer, guard.multiple_values, flags.gc_requested,
             flags.sigusr1_pending, flags.posted_signal, flags.native_errors,
             flags.signal_epoch].contains(&0)

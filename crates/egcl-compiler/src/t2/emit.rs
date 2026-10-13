@@ -5425,8 +5425,12 @@ fn emit_framed_inner(
     let mut a = Asm::new();
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-                                    // Variadic and activation-backed functions require the frame entry.
-    if native_frame_mode && has_declared_params { return Err(EmitError::UnsupportedOp(0xFA)); }
+    // The legacy native-frame ABI has no checked parameter ingress. Ordinary
+    // entries do: their root dispatcher validates declarations before jumping
+    // into generated code, and only source-proven self calls share that entry.
+    if native_frame_mode && has_declared_params && !ordinary_call_mode {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     let has_reg_entry = !ordinary_call_mode && (native_frame_mode || (!has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()

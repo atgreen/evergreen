@@ -123,6 +123,37 @@ fn assert_mapped_t2(code: &NativeCode) {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_admits_checked_fixnum_self_recursion() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(defun ordinary-t2-checked-fixnum-self (n)
+            (declare (type fixnum n))
+            (progn (ordinary-t2-checked-fixnum-self n) n))",
+        &mut env,
+    )
+    .unwrap();
+    let (symbol, code) = install(
+        "ORDINARY-T2-CHECKED-FIXNUM-SELF",
+        "(n)",
+        "((declare (type fixnum n))
+          (progn (ordinary-t2-checked-fixnum-self n) n))",
+        &mut env,
+    );
+    assert_mapped_t2(&code);
+    assert_proven_self_call(&code, symbol);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some(), "typed root calls use the ordinary ABI");
+    assert!(mapped.ordinary_descriptor(0).is_none(),
+        "unchecked named callers must use the checked dispatcher");
+    egcl_rt::rooted!(bad_args = vec![NIL]);
+    assert!(matches!(run_native(&code, symbol, &bad_args, &mut env),
+        Err(EgclError::TypeError { .. })), "typed root ingress must retain TYPE-ERROR");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_installs_published_calls_without_success_return_poll() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
