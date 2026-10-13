@@ -846,9 +846,18 @@
 ;; keeps its float type and everything else upgrades to RATIONAL (CL default).
 (defun upgraded-complex-part-type (type &optional environment)
   (declare (ignore environment))
-  (if (member type '(single-float double-float short-float long-float float))
-      type
-      'rational))
+  ;; A class metaobject stands for its name. Rationals share one part type,
+  ;; each float format is its own, FLOAT and REAL stay as they are
+  ;; (ansi numbers upgraded-complex-part-type.*).
+  (let ((type (if (typep type 'class) (class-name type) type)))
+    (cond ((member type '(single-float short-float)) 'single-float)
+          ((member type '(double-float long-float)) 'double-float)
+          ((member type '(float real)) type)
+          ((subtypep type 'rational) 'rational)
+          ((subtypep type 'single-float) 'single-float)
+          ((subtypep type 'double-float) 'double-float)
+          ((subtypep type 'float) 'float)
+          (t 'real))))
 
 ;; Early bootstrap REMOVE-DUPLICATES: EQL only, keeps first occurrence. Used by
 ;; the package machinery loaded before the full definition (further below, after

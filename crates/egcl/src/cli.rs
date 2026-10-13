@@ -6553,7 +6553,12 @@ fn slot_value_or_signal(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
     egcl_rt::rooted!(slot = slot);
-    if slot_is_missing(env, *instance, *slot) {
+    // An object of a built-in class has no slots at all; SLOT-MISSING reports
+    // it (ansi slot-value.error.5). Conditions and structures, whose classes
+    // are name symbols, keep their own slot access below.
+    let built_in = !egcl_stdlib::is_instance(*instance)
+        && !egcl_stdlib::class_of(*instance).is_symbol();
+    if built_in || slot_is_missing(env, *instance, *slot) {
         return invoke_slot_missing(env, *instance, *slot, "SLOT-VALUE", None);
     }
     match read_slot_value(*instance, *slot, env) {
@@ -6872,12 +6877,30 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         // FUNCTION class — and must NOT match CONS/LIST, else cl-ppcre's
         // `(create-scanner (scanner function))` method was skipped and a scanner
         // closure fell through to the `(parse-tree t)` method (bliss-5ir).
-        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(1),
-        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
-            is_generic_function_value(arg).then_some(1)
+        "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(3),
+        "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(arg).then_some(1),
+        "GENERIC-FUNCTION" => is_generic_function_value(arg).then_some(2),
+        // Method objects, readtables and the numeric leaf types, so a method
+        // specialized on them applies and the specificity order follows the
+        // class precedence list (ansi types-and-classes *-cpl).
+        "STANDARD-METHOD" => egcl_stdlib::clos::is_method_object(arg).then_some(1),
+        "METHOD" => egcl_stdlib::clos::is_method_object(arg).then_some(2),
+        "STANDARD-OBJECT" => (egcl_stdlib::clos::is_method_object(arg)
+            || egcl_stdlib::clos::is_generic_function_object(arg)
+            || is_generic_function_value(arg)
+            || class_metaobject_of(arg).is_some())
+        .then_some(4),
+        "RANDOM-STATE" => is_random_state_value(arg).then_some(1),
+        "STRING-STREAM" | "SYNONYM-STREAM" | "TWO-WAY-STREAM" | "ECHO-STREAM"
+        | "BROADCAST-STREAM" | "CONCATENATED-STREAM" | "FILE-STREAM" => {
+            (egcl_rt::types::streamp(arg) && egcl_stdlib::stream_class_name(arg) == Some(name))
+                .then_some(1)
         }
+        "READTABLE" => egcl_rt::types::readtablep(arg).then_some(1),
+        "RATIO" => egcl_rt::bignum::ratio_parts_val(arg).is_some().then_some(1),
+        "BIGNUM" => (egcl_rt::types::integerp(arg) && !arg.is_fixnum()).then_some(1),
         "CONS" => (arg.is_cons() && !is_function_value(arg)).then_some(1),
-        "LIST" => (arg.is_list() && !is_function_value(arg)).then_some(2),
+        "LIST" => (arg.is_list() && !is_function_value(arg)).then_some(3),
         // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
         // source-registry dispatches methods on it (bliss-lb6.14).
         "PATHNAME" => egcl_stdlib::is_pathname(arg).then_some(1),
@@ -6908,7 +6931,7 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         // Class metaobjects: a DEFCLASS class is its name symbol, a DEFSTRUCT
         // class a structure class, a built-in class a handle (see TYPEP).
         "STANDARD-CLASS" => class_metaobject_of(arg)
-            .filter(|class| !egcl_stdlib::is_structure_class(*class) && class.is_symbol())
+            .filter(|class| is_standard_class_metaobject(*class))
             .map(|_| 1),
         "STRUCTURE-CLASS" => class_metaobject_of(arg)
             .filter(|class| egcl_stdlib::is_structure_class(*class))
@@ -6916,9 +6939,9 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         "BUILT-IN-CLASS" => class_metaobject_of(arg)
             .filter(|class| !class.is_symbol())
             .map(|_| 1),
-        "CLASS" | "METAOBJECT" => class_metaobject_of(arg).map(|_| 2),
+        "CLASS" | "METAOBJECT" => class_metaobject_of(arg).map(|_| 3),
         "PACKAGE" => egcl_rt::types::packagep(arg).then_some(1),
-        "STREAM" => egcl_rt::types::streamp(arg).then_some(1),
+        "STREAM" => egcl_rt::types::streamp(arg).then_some(2),
         "ATOM" => (!arg.is_cons() || is_function_value(arg)).then_some(6),
         "T" => Some(usize::MAX / 4),
         _ => None,
@@ -13833,8 +13856,10 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
                 ("FORMAT-ARGUMENTS".into(), "FORMAT-ARGUMENTS".into()),
             ],
         )),
-        "SIMPLE-ERROR" => Some((vec!["ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
-        "SIMPLE-WARNING" => Some((vec!["WARNING".into(), "SIMPLE-CONDITION".into()], vec![])),
+        // Direct superclasses in CLHS order, which fixes the precedence list
+        // (ansi simple-error-cpl: simple-condition before error).
+        "SIMPLE-ERROR" => Some((vec!["SIMPLE-CONDITION".into(), "ERROR".into()], vec![])),
+        "SIMPLE-WARNING" => Some((vec!["SIMPLE-CONDITION".into(), "WARNING".into()], vec![])),
         "ARITHMETIC-ERROR" => Some((
             vec!["ERROR".into()],
             vec![
@@ -13861,7 +13886,7 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
                 ("EXPECTED-TYPE".into(), "EXPECTED-TYPE".into()),
             ],
         )),
-        "SIMPLE-TYPE-ERROR" => Some((vec!["TYPE-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
+        "SIMPLE-TYPE-ERROR" => Some((vec!["SIMPLE-CONDITION".into(), "TYPE-ERROR".into()], vec![])),
         "CONTROL-ERROR" => Some((vec!["ERROR".into()], vec![])),
         "FILE-ERROR" => Some((
             vec!["ERROR".into()],
@@ -13909,7 +13934,7 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
             vec![("STREAM".into(), "STREAM".into())],
         )),
         "END-OF-FILE" => Some((vec!["STREAM-ERROR".into()], vec![])),
-        "READER-ERROR" => Some((vec!["STREAM-ERROR".into(), "PARSE-ERROR".into()], vec![])),
+        "READER-ERROR" => Some((vec!["PARSE-ERROR".into(), "STREAM-ERROR".into()], vec![])),
         _ => None,
     }
 }
@@ -14285,15 +14310,21 @@ fn builtin_condition_supertypes(name: &str) -> Option<Vec<String>> {
         }
         seen.push(parent);
     }
-    // Every condition is a T; CONDITION itself has no parents but is still one.
+    // Condition classes are standard objects here (ansi
+    // all-standard-classes-are-subtypes-of-standard-object) and atoms (types.6).
+    seen.push("STANDARD-OBJECT".to_string());
+    seen.push("ATOM".to_string());
     seen.push("T".to_string());
     Some(seen)
 }
 
 fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
     let chain: &'static [&'static str] = match name {
-        "COMPILED-FUNCTION" | "GENERIC-FUNCTION" => &["FUNCTION", "ATOM", "T"],
-        "STANDARD-GENERIC-FUNCTION" => &["GENERIC-FUNCTION", "FUNCTION", "ATOM", "T"],
+        "COMPILED-FUNCTION" => &["FUNCTION", "ATOM", "T"],
+        "GENERIC-FUNCTION" => &["FUNCTION", "STANDARD-OBJECT", "ATOM", "T"],
+        "STANDARD-GENERIC-FUNCTION" => {
+            &["GENERIC-FUNCTION", "FUNCTION", "STANDARD-OBJECT", "ATOM", "T"]
+        }
         "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "INTEGER" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "RATIO" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
@@ -14314,7 +14345,8 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "EXTENDED-CHAR" => &["CHARACTER", "ATOM", "T"],
         "SYMBOL" => &["ATOM", "T"],
         "KEYWORD" => &["SYMBOL", "ATOM", "T"],
-        "NULL" => &["SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"],
+        "BOOLEAN" => &["SYMBOL", "ATOM", "T"],
+        "NULL" => &["BOOLEAN", "SYMBOL", "LIST", "SEQUENCE", "ATOM", "T"],
         "CONS" => &["LIST", "SEQUENCE", "T"],
         "LIST" => &["SEQUENCE", "T"],
         "SIMPLE-BASE-STRING" => &[
@@ -14336,11 +14368,20 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "SIMPLE-ARRAY" => &["ARRAY", "ATOM", "T"],
         "ARRAY" => &["ATOM", "T"],
         "SEQUENCE" => &["T"],
-        "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" => &["ATOM", "T"],
+        "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" | "READTABLE"
+        | "RANDOM-STATE" | "RESTART" | "STRUCTURE-OBJECT" => &["ATOM", "T"],
+        // Condition classes are standard objects here (ansi
+        // all-standard-classes-are-subtypes-of-standard-object).
+        "CONDITION" => &["STANDARD-OBJECT", "ATOM", "T"],
+        "CLASS" | "METHOD" | "METHOD-COMBINATION" => &["STANDARD-OBJECT", "ATOM", "T"],
+        "STANDARD-CLASS" | "BUILT-IN-CLASS" | "STRUCTURE-CLASS" => {
+            &["CLASS", "STANDARD-OBJECT", "ATOM", "T"]
+        }
+        "STANDARD-METHOD" => &["METHOD", "STANDARD-OBJECT", "ATOM", "T"],
         "LOGICAL-PATHNAME" => &["PATHNAME", "ATOM", "T"],
         "FILE-STREAM" | "STRING-STREAM" | "BROADCAST-STREAM" | "CONCATENATED-STREAM"
         | "TWO-WAY-STREAM" | "ECHO-STREAM" | "SYNONYM-STREAM" => &["STREAM", "ATOM", "T"],
-        "STANDARD-OBJECT" => &["T"],
+        "STANDARD-OBJECT" => &["ATOM", "T"],
         "ATOM" => &["T"],
         "T" => &[],
         _ => return None,
@@ -14464,11 +14505,104 @@ fn resolve_against_dpd(v: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> 
 /// user/struct class as its name symbol, so `(find-class 'foo)` yields the symbol
 /// FOO; built-in classes are handle values. Returns None for anything not
 /// registered as a class.
+/// A random state is the cons `(:RANDOM-STATE . seed)`.
+fn is_random_state_value(v: EgclVal) -> bool {
+    v.is_cons() && {
+        let (car, _) = cp(v);
+        is_keyword_arg(car) && sym_bare_name_rc(car).as_ref() == "RANDOM-STATE"
+    }
+}
+
+/// CLASS-OF as the user sees it: the CLOS core's answer, refined for values it
+/// files under a catch-all class (ansi types-and-classes *-cpl, type-of.4):
+/// class metaobjects, method and generic-function objects, closures, ratios,
+/// bignums, readtables and random states.
+fn class_of_value(object: EgclVal) -> EgclVal {
+    let refined = if let Some(class) = class_metaobject_of(object) {
+        if egcl_stdlib::is_structure_class(class) {
+            "STRUCTURE-CLASS"
+        } else if is_standard_class_metaobject(class) {
+            "STANDARD-CLASS"
+        } else {
+            "BUILT-IN-CLASS"
+        }
+    } else if egcl_stdlib::clos::is_method_object(object) {
+        "STANDARD-METHOD"
+    } else if egcl_stdlib::clos::is_generic_function_object(object) || is_generic_function_value(object)
+    {
+        "STANDARD-GENERIC-FUNCTION"
+    } else if is_function_value(object) {
+        "FUNCTION"
+    } else if is_random_state_value(object) {
+        "RANDOM-STATE"
+    } else if egcl_rt::bignum::ratio_parts_val(object).is_some() {
+        "RATIO"
+    } else if egcl_rt::types::integerp(object) && !object.is_fixnum() {
+        "INTEGER"
+    } else if egcl_rt::types::readtablep(object) {
+        "READTABLE"
+    } else if object.is_double_float() {
+        "FLOAT"
+    } else if egcl_rt::types::complexp(object) {
+        "COMPLEX"
+    } else {
+        return egcl_stdlib::class_of(object);
+    };
+    resolve_sym(refined)
+        .and_then(egcl_stdlib::find_class)
+        .unwrap_or_else(|| egcl_stdlib::class_of(object))
+}
+
+/// Whether `class` is CONDITION or one of its subclasses.
+fn is_condition_class(class: EgclVal) -> bool {
+    egcl_stdlib::compute_class_precedence_list(class)
+        .map(|cpl| {
+            cpl.iter().any(|c| {
+                let name = egcl_stdlib::class_name(*c);
+                name.is_symbol() && sym_bare_name_rc(name).as_ref() == "CONDITION"
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a class metaobject's metaclass is STANDARD-CLASS: every DEFCLASS
+/// class, and the standard classes CLHS Figure 4-8 lists under it (ansi
+/// standard-object-is-in-standard-class).
+fn is_standard_class_metaobject(class: EgclVal) -> bool {
+    if egcl_stdlib::is_structure_class(class) {
+        return false;
+    }
+    if class.is_symbol() {
+        return true;
+    }
+    // Condition classes are standard classes here, not built-in ones (ansi
+    // defclass.error.24 would otherwise redefine PROGRAM-ERROR).
+    if is_condition_class(class) {
+        return true;
+    }
+    let name = egcl_stdlib::class_name(class);
+    name.is_symbol()
+        && matches!(
+            sym_bare_name_rc(name).as_ref(),
+            "STANDARD-OBJECT"
+                | "CLASS"
+                | "STANDARD-CLASS"
+                | "BUILT-IN-CLASS"
+                | "STRUCTURE-CLASS"
+                | "GENERIC-FUNCTION"
+                | "STANDARD-GENERIC-FUNCTION"
+                | "METHOD"
+                | "STANDARD-METHOD"
+                | "METHOD-COMBINATION"
+        )
+}
+
 fn class_metaobject_of(object: EgclVal) -> Option<EgclVal> {
     if object.is_symbol() && object != NIL && object != T {
-        if let Some(class) = egcl_stdlib::find_class(object) {
-            return Some(class);
-        }
+        // A DEFCLASS/DEFSTRUCT class is its own name symbol; the name of a
+        // built-in class is only a designator, not the metaobject (ansi
+        // type-of.1: (typep 'cons 'class) is false).
+        return egcl_stdlib::find_class(object).filter(|class| *class == object);
     }
     if !egcl_stdlib::class_name(object).is_nil() {
         return Some(object);
@@ -14682,8 +14816,18 @@ fn parse_num_type(t: EgclVal) -> Option<NumType> {
         let elems = list_to_vec(t);
         let head_name = sym_bare_name_rc(*elems.first()?);
         let head = num_head_from_name(&head_name)?;
-        let lo = parse_num_bound(elems.get(1).copied())?;
-        let hi = parse_num_bound(elems.get(2).copied())?;
+        let mut lo = parse_num_bound(elems.get(1).copied())?;
+        let mut hi = parse_num_bound(elems.get(2).copied())?;
+        // For integers an exclusive bound names the adjacent integer, so
+        // (INTEGER (9)) is (INTEGER 10) (ansi subtypep.integer.23/24).
+        if head == NumHead::Integer {
+            if let Bnd::Excl(x) = lo {
+                lo = Bnd::Incl(x.floor() + 1.0);
+            }
+            if let Bnd::Excl(x) = hi {
+                hi = Bnd::Incl(x.ceil() - 1.0);
+            }
+        }
         Some(NumType { head, lo, hi })
     } else if t.is_symbol() {
         let name = sym_bare_name_rc(t);
@@ -15399,15 +15543,34 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
     let c1 = is_complex_type(t1);
     let c2 = is_complex_type(t2);
     if c1 && c2 {
-        // `(complex e1)` ⊆ `(complex e2)`. `(complex *)` (any element) as the
-        // supertype always contains it. Equal concrete element specs are also a
-        // subtype. Mixed concrete elements need upgrading rules we don't model —
-        // leave undetermined.
+        // Part types compare as their upgraded complex part types: every
+        // rational subtype upgrades to RATIONAL, the float types to themselves
+        // (ansi subtypep-complex.8).
+        fn upgraded(name: &str) -> Option<&'static str> {
+            Some(match name {
+                "INTEGER" | "FIXNUM" | "BIGNUM" | "BIT" | "RATIO" | "RATIONAL" | "MOD"
+                | "UNSIGNED-BYTE" | "SIGNED-BYTE" => "RATIONAL",
+                "SINGLE-FLOAT" | "SHORT-FLOAT" => "SINGLE-FLOAT",
+                "DOUBLE-FLOAT" | "LONG-FLOAT" => "DOUBLE-FLOAT",
+                "FLOAT" => "FLOAT",
+                "REAL" | "*" | "T" => "REAL",
+                _ => return None,
+            })
+        }
         match complex_elt_name(t2) {
             None => Some((true, true)),
             Some(e2) => match complex_elt_name(t1) {
                 Some(e1) if e1 == e2 => Some((true, true)),
-                _ => Some((false, false)),
+                Some(e1) => match (upgraded(&e1), upgraded(&e2)) {
+                    (Some(u1), Some(u2)) if u1 == u2 => Some((true, true)),
+                    (Some(u1), Some(u2)) => {
+                        let s1 = resolve_sym(u1).unwrap_or(NIL);
+                        let s2 = resolve_sym(u2).unwrap_or(NIL);
+                        Some(subtypep_relation(s1, s2))
+                    }
+                    _ => Some((false, false)),
+                },
+                None => Some((false, true)),
             },
         }
     } else if (c1 && is_real_numeric_type(t2)) || (c2 && is_real_numeric_type(t1)) {
@@ -15424,7 +15587,9 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 /// '(unsigned-byte 1))); None for anything else.
 fn canonical_integer_type(spec: EgclVal) -> Option<EgclVal> {
     fn power_of_two(n: u32) -> EgclVal {
-        if n < 62 {
+        // Fixnums are 61-bit: 2^60 already needs a bignum (ansi
+        // subtypep-complex.4/5 at (unsigned-byte 61)).
+        if n < 60 {
             EgclVal::from_fixnum(1i64 << n)
         } else {
             let mut mag = Vec::new();
@@ -15469,6 +15634,12 @@ fn canonical_integer_type(spec: EgclVal) -> Option<EgclVal> {
         .map(|w| w.as_fixnum() as u32);
     let (lo, hi) = match sym_bare_name_rc(head).as_ref() {
         "BIT" if width.is_none() => (EgclVal::from_fixnum(0), EgclVal::from_fixnum(1)),
+        // FIXNUM is exactly the integers egcl stores immediately (ansi
+        // subtypep.fixnum.integer, types.3).
+        "FIXNUM" if width.is_none() => (
+            EgclVal::from_fixnum(-(1_i64 << 60)),
+            EgclVal::from_fixnum((1_i64 << 60) - 1),
+        ),
         "MOD" => {
             let n = width.filter(|w| w.is_fixnum() && w.as_fixnum() > 0)?;
             (EgclVal::from_fixnum(0), EgclVal::from_fixnum(n.as_fixnum() - 1))
@@ -15508,7 +15679,46 @@ fn class_object_type_name(v: EgclVal) -> Option<EgclVal> {
     (name.is_symbol() && !name.is_nil()).then_some(name)
 }
 
+/// `(INTEGER lo hi)` lies within BIGNUM when it is entirely below or entirely
+/// above the fixnums; FIXNUM and ranges touching them are not bignum subtypes.
+fn integer_range_within_bignum(t1: EgclVal) -> Option<(bool, bool)> {
+    let num = parse_num_type(t1)?;
+    if num.head != NumHead::Integer {
+        return None;
+    }
+    // Decide on the bound objects themselves: f64 cannot tell 2^60 from
+    // 2^60 - 1. A bound that is itself a bignum lies outside the fixnums.
+    let elems = list_to_vec(t1);
+    let bound = |index: usize| -> Option<EgclVal> {
+        let raw = *elems.get(index)?;
+        let raw = if raw.is_cons() { cp(raw).0 } else { raw };
+        (!raw.is_symbol()).then_some(raw)
+    };
+    let sign_of = |v: EgclVal| -> Option<i8> {
+        if v.is_fixnum() {
+            return None;
+        }
+        egcl_rt::bignum::bigint_from_val(v).map(|big| big.sign)
+    };
+    let above = bound(1).and_then(sign_of).is_some_and(|sign| sign > 0);
+    let below = bound(2).and_then(sign_of).is_some_and(|sign| sign < 0);
+    Some((below || above, true))
+}
+
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    // egcl has no extended characters: EXTENDED-CHAR is the empty type, a
+    // subtype of everything (ansi subtypep.extended-char.1, types.9).
+    if t1.is_symbol() && !t1.is_nil() && sym_bare_name_rc(t1).as_ref() == "EXTENDED-CHAR" {
+        return (true, true);
+    }
+    if t2.is_symbol() && !t2.is_nil() && sym_bare_name_rc(t2).as_ref() == "BIGNUM" {
+        if let Some(answer) = canonical_integer_type(t1)
+            .or_else(|| t1.is_cons().then_some(t1))
+            .and_then(integer_range_within_bignum)
+        {
+            return answer;
+        }
+    }
     if let Some(name) = class_object_type_name(t1) {
         return subtypep_relation(name, t2);
     }
@@ -15735,6 +15945,19 @@ fn typep_matches(
     mut object: EgclVal,
     mut type_spec: EgclVal,
 ) -> Result<bool, EgclError> {
+    // NIL names the empty type: nothing is of type NIL (ansi type-of.1).
+    if type_spec.is_nil() {
+        return Ok(false);
+    }
+    // A class metaobject stands for the type it names (ansi the.9/10 with
+    // CLASS-OF). The CLOS core's catch-all HEAP-OBJECT class covers every heap
+    // object it does not file more precisely.
+    if let Some(name) = class_object_type_name(type_spec) {
+        type_spec = name;
+    }
+    if type_spec.is_symbol() && sym_bare_name_rc(type_spec).as_ref() == "HEAP-OBJECT" {
+        return Ok(object.is_heap_object());
+    }
     // Resolving DEFTYPEs and compound type specifiers can allocate.  These
     // callee-local copies must therefore be roots in their own right; a root in
     // the caller updates only the caller's slot when the nursery moves.
@@ -15863,16 +16086,23 @@ fn typep_matches(
         // STANDARD-OBJECT any class metaobject — ansi-test STRUCT-TEST-NN/14.
         if matches!(
             type_name.as_ref(),
-            "STRUCTURE-CLASS" | "STANDARD-CLASS" | "CLASS" | "METAOBJECT"
+            "STRUCTURE-CLASS" | "STANDARD-CLASS" | "BUILT-IN-CLASS" | "CLASS" | "METAOBJECT"
         ) {
             if let Some(class) = class_metaobject_of(object) {
                 let is_struct = egcl_stdlib::is_structure_class(class);
                 return Ok(match type_name.as_ref() {
-                    "STRUCTURE-CLASS" => is_struct,
+                    "STRUCTURE-CLASS" => {
+                        is_struct || {
+                            let name = egcl_stdlib::class_name(class);
+                            name.is_symbol()
+                                && sym_bare_name_rc(name).as_ref() == "STRUCTURE-OBJECT"
+                        }
+                    }
                     // Built-in classes are handle-valued (non-symbol); a
                     // symbol-valued metaobject that is not a struct is a
                     // DEFCLASS standard class.
-                    "STANDARD-CLASS" => !is_struct && class.is_symbol(),
+                    "STANDARD-CLASS" => is_standard_class_metaobject(class),
+                    "BUILT-IN-CLASS" => !is_struct && !is_standard_class_metaobject(class),
                     _ => true, // CLASS / METAOBJECT
                 });
             }
@@ -15881,7 +16111,7 @@ fn typep_matches(
         // immediate-type predicates below (INTEGER/FIXNUM/NUMBER, …) would alias
         // them. Route instances exclusively through their class hierarchy.
         if egcl_stdlib::is_instance(object) {
-            if type_name.as_ref() == "T" {
+            if matches!(type_name.as_ref(), "T" | "ATOM") {
                 return Ok(true);
             }
             let hierarchy = instance_class_hierarchy_names(object);
@@ -17481,6 +17711,22 @@ fn named_apply_wrapper(env: &mut Env, name_sym: EgclVal) -> EgclVal {
 
 /// Reify (and cache) one canonical function object for the builtin named
 /// `bare` (interned symbol `name_sym`). Its body dispatches by name through APPLY.
+/// The CLHS standard generic functions egcl implements as builtins.
+fn is_standard_generic_function_name(bare: &str) -> bool {
+    matches!(
+        bare,
+        "ADD-METHOD"
+            | "ALLOCATE-INSTANCE"
+            | "CLASS-NAME"
+            | "COMPUTE-APPLICABLE-METHODS"
+            | "FIND-METHOD"
+            | "MAKE-INSTANCE"
+            | "METHOD-QUALIFIERS"
+            | "PRINT-OBJECT"
+            | "REMOVE-METHOD"
+    )
+}
+
 fn builtin_fn_wrapper(env: &mut Env, name_sym: EgclVal, bare: &str) -> EgclVal {
     {
         let mut cache = builtin_wrapper_cache().borrow_mut();
@@ -17637,6 +17883,12 @@ fn symbol_function_object_ex(
     if is_builtin_function(&fn_name) {
         // Cached bare name too, and only on the branch that needs it.
         let bare = sym_bare_name_rc(name_sym);
+        // A standard generic function implemented as a builtin still reifies as
+        // a generic-function object (ansi standard-generic-function.1,
+        // all-standard-generic-functions-are-instances-of-that-class).
+        if is_standard_generic_function_name(&bare) {
+            return Some(generic_fn_wrapper(env, name_sym, &fn_name));
+        }
         return Some(builtin_fn_wrapper(env, name_sym, &bare));
     }
     if fn_bound(env, &fn_name) {
@@ -23907,7 +24159,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "CLASS-OF" => {
                 let (object_form, _) = cp(cdr);
                 let object = eval_form(object_form, env)?;
-                return Ok(egcl_stdlib::class_of(object));
+                return Ok(class_of_value(object));
             }
             // (COPY-STRUCTURE structure) — a fresh instance of the same class
             // with every bound slot shallow-copied (CLHS). Works for any
@@ -26018,6 +26270,51 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         *dims_list,
                     ];
                     return Ok(vec_to_list(&spec));
+                }
+                // CLHS TYPE-OF: the most specific recognizable type. 0 and 1
+                // are BITs, other non-negative fixnums (INTEGER 0 mpf), bignums
+                // the open ranges beyond the fixnums (ansi type-of.1/4).
+                if v.is_fixnum() {
+                    let n = v.as_fixnum();
+                    if n == 0 || n == 1 {
+                        return Ok(resolve_sym("BIT").unwrap_or(NIL));
+                    }
+                    if n > 1 {
+                        return Ok(vec_to_list(&[
+                            resolve_sym("INTEGER").unwrap_or(NIL),
+                            EgclVal::from_fixnum(0),
+                            EgclVal::from_fixnum((1_i64 << 60) - 1),
+                        ]));
+                    }
+                } else if egcl_rt::types::integerp(v) {
+                    let negative = egcl_rt::bignum::bigint_from_val(v)
+                        .map(|big| big.sign < 0)
+                        .unwrap_or(false);
+                    let integer = resolve_sym("INTEGER").unwrap_or(NIL);
+                    // The bounds just outside the fixnum range are bignums.
+                    let mut magnitude = Vec::new();
+                    egcl_rt::bignum::mag_set_bit(&mut magnitude, 60);
+                    return Ok(if negative {
+                        let below = egcl_rt::bignum::mag_add(&magnitude, &[1]);
+                        egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(-1, below).to_val());
+                        vec_to_list(&[integer, resolve_sym("*").unwrap_or(NIL), *bound])
+                    } else {
+                        egcl_rt::rooted!(bound = egcl_rt::bignum::BigInt::from_mag(1, magnitude).to_val());
+                        vec_to_list(&[integer, *bound])
+                    });
+                } else if egcl_rt::bignum::ratio_parts_val(v).is_some() {
+                    return Ok(resolve_sym("RATIO").unwrap_or(NIL));
+                } else if egcl_rt::types::readtablep(v) {
+                    return Ok(resolve_sym("READTABLE").unwrap_or(NIL));
+                } else if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
+                    // An adjustable or fill-pointered string is not a
+                    // SIMPLE-STRING (ansi coerce.1).
+                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    return Ok(vec_to_list(&[
+                        resolve_sym("VECTOR").unwrap_or(NIL),
+                        resolve_sym("CHARACTER").unwrap_or(NIL),
+                        EgclVal::from_fixnum(size as i64),
+                    ]));
                 }
                 let type_name = if v.is_nil() {
                     "NULL"
@@ -30094,6 +30391,17 @@ fn coerce_evaluated(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(value = value);
     egcl_rt::rooted!(type_val = resolve_type_spec(env, raw_type)?);
+    if let Some(name) = class_object_type_name(*type_val) {
+        *type_val = name;
+    }
+    // CLHS COERCE: an object already of the result type is returned as is
+    // (ansi coerce.1/3); a function designator still goes through the
+    // FUNCTION arm below so a symbol coerces to its function.
+    if !(type_val.is_symbol() && sym_bare_name_rc(*type_val).as_ref() == "FUNCTION")
+        && typep_matches(env, *value, *type_val)?
+    {
+        return Ok(*value);
+    }
     if type_val.is_symbol() && sym_bare_name_rc(*type_val).as_ref() == "FUNCTION" {
         if is_function_value(*value) {
             return Ok(*value);
@@ -34891,6 +35199,37 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
 
     let name = sym_name(name_form);
     check_defclass_syntax(&name, slots_form, class_options)?;
+    // CLHS DEFCLASS: a built-in or condition class is not redefined as a
+    // standard class, nor used as a direct superclass of one (ansi
+    // defclass.error.23/24). A DEFCLASS class is its own name symbol; any
+    // other metaobject the core knows for the name is a system class.
+    if !env.classes.borrow().contains_key(&name)
+        && egcl_stdlib::find_class(name_form).is_some_and(|class| !class.is_symbol())
+    {
+        return Err(EgclError::ProgramError(format!(
+            "DEFCLASS {name}: a system class cannot be redefined"
+        )));
+    }
+    for super_form in list_to_vec(supers_form) {
+        if !super_form.is_symbol() {
+            continue;
+        }
+        let bare = sym_bare_name_rc(super_form);
+        if matches!(bare.as_ref(), "STANDARD-OBJECT" | "T" | "FUNCALLABLE-STANDARD-OBJECT") {
+            continue;
+        }
+        // The standard classes whose metaclass is STANDARD-CLASS (such as
+        // STANDARD-GENERIC-FUNCTION) may be subclassed; built-in and
+        // structure classes may not.
+        if egcl_stdlib::find_class(super_form)
+            .is_some_and(|class| !class.is_symbol() && !is_standard_class_metaobject(class))
+        {
+            return Err(EgclError::ProgramError(format!(
+                "DEFCLASS {name}: {} is a system class and cannot be a direct superclass",
+                format_val(super_form)
+            )));
+        }
+    }
 
     // Class options follow the slots list. Parse (:default-initargs initarg
     // value-form …); other options (:documentation, :metaclass, …) are ignored.
@@ -38583,7 +38922,7 @@ fn apply_builtin_fast(
         }
         "CLASS-OF" if args.len() == 1 => {
             env.clear_mv();
-            Some(Ok(egcl_stdlib::class_of(args[0])))
+            Some(Ok(class_of_value(args[0])))
         }
         "CLASS-NAME" if args.len() == 1 => {
             env.clear_mv();

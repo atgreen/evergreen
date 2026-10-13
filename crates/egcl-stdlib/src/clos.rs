@@ -1376,13 +1376,28 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             (hpo_nm, hpo_cls),
         ];
         for (nm, cls) in &builtins {
+            // CLHS 4.3.7 / Figure 4-8: the built-in classes are not subclasses
+            // of STANDARD-OBJECT; each sits under its own type (FIXNUM under
+            // INTEGER, NULL under SYMBOL and LIST, CONS under LIST, FLOAT under
+            // REAL) and the rest directly under T (ansi *-cpl, types.6).
+            let supers = if *cls == fix_cls {
+                vec![int_cls]
+            } else if *cls == nul_cls {
+                vec![sym_cls, list_cls]
+            } else if *cls == con_cls {
+                vec![list_cls]
+            } else if *cls == flt_cls {
+                vec![real_cls]
+            } else {
+                vec![t_cls]
+            };
             st.class_registry.insert(*nm, *cls);
             st.class_meta.insert(
                 *cls,
                 ClassMeta {
                     shared_slots: Vec::new(),
                     name: *nm,
-                    direct_supers: vec![std_obj],
+                    direct_supers: supers,
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: None,

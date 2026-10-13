@@ -3665,6 +3665,20 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             egcl_rt::rooted!(class = resolve_class_metaobject(env, args[1])?);
+            // Only a standard instance changes class, and only to a standard
+            // class (ansi change-class.error.5/6).
+            if !egcl_stdlib::is_instance(args[0]) {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "STANDARD-OBJECT".into(),
+                });
+            }
+            if !is_standard_class_metaobject(*class) {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "STANDARD-CLASS".into(),
+                });
+            }
             check_initargs_valid(
                 env,
                 &class_name_for_instance_class(*class),
