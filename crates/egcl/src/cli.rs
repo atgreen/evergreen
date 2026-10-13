@@ -15335,12 +15335,20 @@ fn typep_matches(
         if obj_class == type_spec {
             return Ok(true);
         }
-        return Ok(
-            match egcl_stdlib::compute_class_precedence_list(obj_class) {
-                Ok(cpl) => cpl.contains(&type_spec),
-                Err(_) => false,
-            },
-        );
+        if let Ok(cpl) = egcl_stdlib::compute_class_precedence_list(obj_class) {
+            if cpl.contains(&type_spec) {
+                return Ok(true);
+            }
+        }
+        // A built-in class whose precedence list the registry does not model
+        // (FIXNUM under INTEGER, CONS under LIST, ...): decide by the class's
+        // NAME as a type specifier instead (ansi arrays array-as-class.*,
+        // make-array-with-checks' (typep a (find-class 'array))).
+        egcl_rt::rooted!(class_name = egcl_stdlib::class_name(type_spec));
+        if class_name.is_symbol() && !class_name.is_nil() {
+            return typep_matches(env, object, *class_name);
+        }
+        return Ok(false);
     }
     // A closure's physical cons representation must not enter the CLOS
     // instance/class-of path below, where it would inherit CONS and LIST.
@@ -29059,8 +29067,9 @@ fn return_list_values(list: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError
         cursor = cdr;
     }
     if !cursor.is_nil() {
+        // The improper tail, not the list, is what is not a LIST.
         return Err(EgclError::TypeError {
-            datum: list,
+            datum: cursor,
             expected: "LIST".into(),
         });
     }
@@ -29466,8 +29475,10 @@ fn seq_elements(seq: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
             cur = tail;
         }
         if !cur.is_nil() {
+            // The improper TAIL is the datum: the list itself is TYPEP LIST,
+            // and ansi's SIGNALS-ERROR rejects a self-contradicting TYPE-ERROR.
             return Err(EgclError::TypeError {
-                datum: seq,
+                datum: cur,
                 expected: "LIST".to_string(),
             });
         }
@@ -34561,9 +34572,39 @@ fn typed_struct_constructor(call: EgclVal, representation: EgclVal) -> EgclVal {
 
 /// Define structure constructors, accessors, predicates and copiers. Ordinary
 /// structures use CLOS storage; unnamed :TYPE structures use sequence storage.
+/// Whether a DEFSTRUCT option list carries a `(:type ...)` option.
+fn defstruct_has_type_option(options: EgclVal) -> bool {
+    let mut cursor = options;
+    while cursor.is_cons() {
+        let (option, rest) = cp(cursor);
+        if option.is_cons() {
+            let head = cp(option).0;
+            if head.is_symbol() && sym_bare_name_rc(head).as_ref() == "TYPE" {
+                return true;
+            }
+        }
+        cursor = rest;
+    }
+    false
+}
+
 fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     invalidate_gf_dispatch_cache(); // new struct class (bliss-x5y.20)
     let (name_spec, slots_form) = cp(cdr);
+    // A structure with a (:TYPE LIST) / (:TYPE VECTOR) representation is a
+    // plain sequence, not a class: EGCL::%DEFTYPEDSTRUCT (boot.lisp) defines
+    // its constructors, accessors, predicate and copier, including :NAMED,
+    // :INITIAL-OFFSET and :INCLUDE (ansi structures struct-test-37..70).
+    if name_spec.is_cons() && defstruct_has_type_option(cp(name_spec).1) {
+        egcl_rt::rooted!(name_spec = name_spec);
+        egcl_rt::rooted!(slots_form = slots_form);
+        let op = resolve_sym("EGCL::%DEFTYPEDSTRUCT").ok_or_else(|| {
+            EgclError::Internal("typed DEFSTRUCT support is not loaded".into())
+        })?;
+        egcl_rt::rooted!(tail = arena_cons(*name_spec, *slots_form));
+        egcl_rt::rooted!(form = arena_cons(op, *tail));
+        return eval_form(*form, env);
+    }
     let name_sym = if name_spec.is_cons() {
         cp(name_spec).0
     } else {

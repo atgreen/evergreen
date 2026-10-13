@@ -5032,3 +5032,190 @@ a hook error aborts startup.")
 (defun pprint-tabular (stream list &optional (colon-p t) at-sign-p (tabsize 16))
   (check-type tabsize (integer 0))
   (pprint-fill stream list colon-p at-sign-p))
+
+;;; ---------------------------------------------------------------------------
+;;; Typed structures: DEFSTRUCT with (:TYPE LIST) or (:TYPE VECTOR) (CLHS
+;;; DEFSTRUCT).  The evaluator hands such a definition to %DEFTYPEDSTRUCT.  The
+;;; structure is a plain list or vector, so no class or type is defined; the
+;;; layout is kept on the name's plist under EGCL::%TYPED-STRUCT so a later
+;;; (:INCLUDE parent) can build on it:
+;;;   (:type REP :length N
+;;;    :slots ((NAME INDEX DEFAULT-FORM TYPE READ-ONLY) ...)
+;;;    :names ((STRUCTURE-NAME . INDEX) ...))     ; the :NAMED markers
+(defun egcl::%typed-struct-option (options key)
+  "The option whose head is KEY, a bare KEY counting as (KEY); NIL when absent."
+  (dolist (option options nil)
+    (cond ((eq option key) (return (list key)))
+          ((and (consp option) (eq (car option) key)) (return option)))))
+
+(defun egcl::%typed-struct-list-name-p (list index name)
+  "True when LIST has NAME at INDEX (the :NAMED marker of a list structure)."
+  (loop repeat index
+        do (if (consp list) (setq list (cdr list)) (return-from egcl::%typed-struct-list-name-p nil)))
+  (and (consp list) (eq (car list) name)))
+
+(defun egcl::%typed-struct-build-form (rep element-type total names slots values)
+  "A form building the sequence: NAMES mark the :NAMED positions, VALUES is an
+alist from slot name to the form supplying it."
+  (let ((elements (make-list total :initial-element nil)))
+    (dolist (entry names)
+      (setf (nth (cdr entry) elements) `',(car entry)))
+    (dolist (slot slots)
+      (setf (nth (second slot) elements) (cdr (assoc (first slot) values))))
+    (if (eq rep 'list)
+        `(list ,@elements)
+        `(make-array ,total :element-type ',element-type
+                            :initial-contents (list ,@elements)))))
+
+(defun egcl::%typed-struct-boa-constructor (ctor-name lambda-list rep element-type
+                                            total names slots)
+  "A BOA constructor (CLHS 3.4.6): a parameter naming a slot supplies it; an
+&optional or &key parameter without a default takes the slot's default; slots
+no parameter names take their defaults."
+  (let ((section '&required) (new-lambda-list '()) (bound '()))
+    (flet ((slot-default (var)
+             (third (find var slots :key #'first))))
+      (dolist (item lambda-list)
+        (cond ((member item '(&optional &rest &key &aux &allow-other-keys))
+               (setq section item)
+               (push item new-lambda-list))
+              ((eq section '&required)
+               (push item bound)
+               (push item new-lambda-list))
+              ((eq section '&rest)
+               (push item bound)
+               (push item new-lambda-list))
+              ((eq section '&aux)
+               (let ((var (if (consp item) (car item) item)))
+                 (push var bound)
+                 (push (if (consp item) item (list var nil)) new-lambda-list)))
+              (t ;; &optional / &key
+               (let* ((spec (if (consp item) item (list item)))
+                      (var (let ((v (car spec)))
+                             (if (consp v) (second v) v)))
+                      (has-default (cdr spec)))
+                 (push var bound)
+                 (push (if has-default
+                           spec
+                           (list (car spec) (slot-default var)))
+                       new-lambda-list)))))
+      `(defun ,ctor-name ,(nreverse new-lambda-list)
+         ,(egcl::%typed-struct-build-form
+           rep element-type total names slots
+           (mapcar (lambda (slot)
+                     (cons (first slot)
+                           (if (member (first slot) bound) (first slot) (third slot))))
+                   slots))))))
+
+(defmacro egcl::%deftypedstruct (name-and-options &rest slot-descriptions)
+  (let* ((name (if (consp name-and-options) (car name-and-options) name-and-options))
+         (options (if (consp name-and-options) (cdr name-and-options) nil))
+         (slot-descriptions (if (stringp (car slot-descriptions))
+                                (cdr slot-descriptions)
+                                slot-descriptions))
+         (type-spec (second (egcl::%typed-struct-option options :type)))
+         (rep (if (consp type-spec) (car type-spec) type-spec))
+         (element-type (if (consp type-spec) (second type-spec) t))
+         (named (not (null (egcl::%typed-struct-option options :named))))
+         (initial-offset (or (second (egcl::%typed-struct-option options :initial-offset)) 0))
+         (include-option (egcl::%typed-struct-option options :include))
+         (parent (second include-option))
+         (parent-layout (and parent (get parent 'egcl::%typed-struct)))
+         (conc-option (egcl::%typed-struct-option options :conc-name))
+         (conc-prefix (cond ((null conc-option) (concatenate 'string (string name) "-"))
+                            ((null (second conc-option)) "")
+                            (t (string (second conc-option)))))
+         (predicate-option (egcl::%typed-struct-option options :predicate))
+         (copier-option (egcl::%typed-struct-option options :copier))
+         (constructor-options
+           (remove-if-not (lambda (option)
+                            (or (eq option :constructor)
+                                (and (consp option) (eq (car option) :constructor))))
+                          options))
+         (base-length (if parent-layout (getf parent-layout :length) 0))
+         (prefix (+ base-length initial-offset))
+         (name-index (and named prefix))
+         (first-slot (+ prefix (if named 1 0)))
+         (inherited
+           (when parent-layout
+             (mapcar (lambda (slot)
+                       (let ((override (find (first slot) (cddr include-option)
+                                             :key (lambda (o) (if (consp o) (car o) o)))))
+                         (if override
+                             (list (first slot) (second slot)
+                                   (if (consp override) (second override) nil)
+                                   (fourth slot) (fifth slot))
+                             slot)))
+                     (getf parent-layout :slots))))
+         (own (loop for description in slot-descriptions
+                    for index from first-slot
+                    collect (if (consp description)
+                                (list (first description) index (second description)
+                                      (getf (cddr description) :type t)
+                                      (getf (cddr description) :read-only))
+                                (list description index nil t nil))))
+         (slots (append inherited own))
+         (total (+ first-slot (length own)))
+         (names (append (and parent-layout (getf parent-layout :names))
+                        (and named (list (cons name name-index)))))
+         (layout (list :type type-spec :length total :slots slots :names names))
+         (forms '()))
+    (unless (member rep '(list vector))
+      (error "DEFSTRUCT ~S: :TYPE must be LIST or VECTOR, not ~S" name type-spec))
+    (when (and parent (null parent-layout))
+      (error "DEFSTRUCT ~S: included structure ~S is not a typed structure" name parent))
+    (when (and (not named) (second predicate-option))
+      (error "DEFSTRUCT ~S: an unnamed typed structure cannot have a predicate" name))
+    ;; Constructors: the default MAKE-NAME, each (:constructor name [boa]),
+    ;; none for (:constructor nil).
+    (let ((constructors
+            (if (null constructor-options)
+                (list (list (intern (concatenate 'string "MAKE-" (string name)))))
+                (loop for option in constructor-options
+                      unless (and (consp option) (cdr option) (null (second option)))
+                        collect (if (or (eq option :constructor) (null (cdr option)))
+                                    (list (intern (concatenate 'string "MAKE-" (string name))))
+                                    (cdr option))))))
+      (dolist (constructor constructors)
+        (if (cdr constructor)
+            (push (egcl::%typed-struct-boa-constructor
+                   (first constructor) (second constructor) rep element-type total names slots)
+                  forms)
+            (push `(defun ,(first constructor)
+                       (&key ,@(mapcar (lambda (slot) (list (first slot) (third slot))) slots))
+                     ,(egcl::%typed-struct-build-form
+                       rep element-type total names slots
+                       (mapcar (lambda (slot) (cons (first slot) (first slot))) slots)))
+                  forms))))
+    ;; Accessors read and write the slot's position in the sequence.
+    (dolist (slot slots)
+      (let ((accessor (intern (concatenate 'string conc-prefix (symbol-name (first slot)))))
+            (index (second slot)))
+        (push `(defun ,accessor (object) (elt object ,index)) forms)
+        (unless (fifth slot)
+          (push `(defun (setf ,accessor) (value object) (setf (elt object ,index) value))
+                forms))))
+    ;; The predicate exists only for a :NAMED structure.
+    (let ((predicate (cond ((not named) nil)
+                           ((or (null predicate-option) (null (cdr predicate-option)))
+                            (intern (concatenate 'string (string name) "-P")))
+                           (t (second predicate-option)))))
+      (when predicate
+        (push (if (eq rep 'list)
+                  `(defun ,predicate (object)
+                     (and (listp object)
+                          (egcl::%typed-struct-list-name-p object ,name-index ',name)))
+                  `(defun ,predicate (object)
+                     (and (vectorp object)
+                          (> (length object) ,name-index)
+                          (eq (aref object ,name-index) ',name))))
+              forms)))
+    (let ((copier (cond ((or (null copier-option) (null (cdr copier-option)))
+                         (intern (concatenate 'string "COPY-" (string name))))
+                        (t (second copier-option)))))
+      (when copier
+        (push `(defun ,copier (object) (copy-seq object)) forms)))
+    `(progn
+       ,@(nreverse forms)
+       (setf (get ',name 'egcl::%typed-struct) ',layout)
+       ',name)))

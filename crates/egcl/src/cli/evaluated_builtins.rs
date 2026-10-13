@@ -3298,7 +3298,16 @@ fn resolve(name: &str) -> Option<Handler> {
             // (WARN.14).
             let warning_sym = resolve_sym("WARNING").unwrap_or(NIL);
             let is_warning = typep_matches(env, *cond, warning_sym)?;
-            if !is_warning || (datum_is_instance && !rest_args.is_empty()) {
+            if datum_is_instance && !rest_args.is_empty() {
+                // The offending value is the argument list, which must be
+                // empty for a condition datum (WARN.14).
+                egcl_rt::rooted!(extra = vec_to_list(rest_args));
+                return Err(EgclError::TypeError {
+                    datum: *extra,
+                    expected: "NULL".into(),
+                });
+            }
+            if !is_warning {
                 return Err(EgclError::TypeError {
                     datum: *datum,
                     expected: "WARNING".into(),
