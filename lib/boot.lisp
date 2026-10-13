@@ -34,10 +34,15 @@
 (setq egcl-internal::*documentation* (make-hash-table :test 'equal))
 
 (defun documentation (object &optional doc-type)
-  ;; GETHASH returns two values; DOCUMENTATION returns one.
+  ;; A function object documented under T is documented as a FUNCTION
+  ;; (ansi defgeneric.2). GETHASH returns two values; DOCUMENTATION returns one.
+  (when (and (eq doc-type t) (functionp object))
+    (setq doc-type 'function))
   (values (gethash (cons object doc-type) egcl-internal::*documentation*)))
 
 (defun (setf documentation) (new object &optional doc-type)
+  (when (and (eq doc-type t) (functionp object))
+    (setq doc-type 'function))
   (setf (gethash (cons object doc-type) egcl-internal::*documentation*) new)
   new)
 
@@ -562,6 +567,20 @@
 (defmethod slot-missing (class instance slot-name operation &optional new-value)
   (declare (ignore class new-value))
   (error "~S: the slot ~S is missing from ~S" operation slot-name instance))
+
+;; CLHS MAKE-LOAD-FORM: the default methods for standard objects, structures
+;; and conditions signal an error; a program defines its own methods, usually
+;; through MAKE-LOAD-FORM-SAVING-SLOTS.
+(defgeneric make-load-form (object &optional environment))
+(defmethod make-load-form ((object standard-object) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+(defmethod make-load-form ((object structure-object) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+(defmethod make-load-form ((object condition) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
 
 ;; ED has no editor to invoke; it accepts its argument and does nothing.
 (defun ed (&optional x)

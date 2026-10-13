@@ -296,10 +296,17 @@ fn bare_symbol_name(sym: EgclVal) -> Option<String> {
 /// Qualifier for a method (for method combination).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodQualifier {
+    /// An unqualified method.
     Primary,
     Before,
     After,
     Around,
+    /// The qualifier that names a short-form method combination (`+`, `AND`,
+    /// `PROGN`, ...): the "primary" methods of such a generic function.
+    Combination,
+    /// A qualifier the generic function's method combination does not know;
+    /// calling the generic function with the method applicable is an error.
+    Other,
 }
 
 /// Metadata for a method: specializers and qualifier.
@@ -711,6 +718,8 @@ fn qualifier_to_u8(q: MethodQualifier) -> u8 {
         MethodQualifier::Before => 1,
         MethodQualifier::After => 2,
         MethodQualifier::Around => 3,
+        MethodQualifier::Combination => 4,
+        MethodQualifier::Other => 5,
     }
 }
 
@@ -719,6 +728,8 @@ fn u8_to_qualifier(b: u8) -> MethodQualifier {
         1 => MethodQualifier::Before,
         2 => MethodQualifier::After,
         3 => MethodQualifier::Around,
+        4 => MethodQualifier::Combination,
+        5 => MethodQualifier::Other,
         _ => MethodQualifier::Primary,
     }
 }
@@ -2829,6 +2840,7 @@ pub fn compute_effective_method(
             // returned directly. When there are auxiliary methods, we build
             // an EffectiveMethod descriptor.
 
+            let mut invalid_qualifier = false;
             let (around, before, primary, after) = with_state(|st| {
                 let mut around = Vec::new();
                 let mut before = Vec::new();
@@ -2842,6 +2854,11 @@ pub fn compute_effective_method(
                             MethodQualifier::Before => before.push(m),
                             MethodQualifier::Primary => primary.push(m),
                             MethodQualifier::After => after.push(m),
+                            // CLHS 7.6.6.2: the standard method combination
+                            // signals an error for any other qualifier.
+                            MethodQualifier::Combination | MethodQualifier::Other => {
+                                invalid_qualifier = true
+                            }
                         },
                         None => primary.push(m), // no metadata = primary
                     }
@@ -2852,6 +2869,11 @@ pub fn compute_effective_method(
 
                 (around, before, primary, after)
             });
+            if invalid_qualifier {
+                return Err(EgclError::ProgramError(
+                    "an applicable method has a qualifier the standard method combination does not accept".into(),
+                ));
+            }
 
             if primary.is_empty() {
                 return Err(EgclError::Internal(
@@ -2881,22 +2903,37 @@ pub fn compute_effective_method(
             // These apply an operator to the results of all primary methods.
             // We store the method list and combination type for later invocation.
 
+            // CLHS 7.6.6.4: a short-form combination's primary methods carry the
+            // combination's name as their one qualifier; :AROUND methods are run
+            // by the caller around the combined result; an unqualified method or
+            // any other qualifier is an error when such a method is applicable.
+            let mut invalid_qualifier = false;
             let primary_methods: Vec<EgclVal> = with_state(|st| {
                 methods
                     .iter()
                     .copied()
-                    .filter(|m| {
-                        match st.method_meta.get(m) {
-                            Some(meta) => meta.qualifier == MethodQualifier::Primary,
-                            None => true, // no metadata = primary
-                        }
+                    .filter(|m| match st.method_meta.get(m) {
+                        Some(meta) => match meta.qualifier {
+                            MethodQualifier::Combination => true,
+                            MethodQualifier::Around => false,
+                            _ => {
+                                invalid_qualifier = true;
+                                false
+                            }
+                        },
+                        None => true, // no metadata = primary
                     })
                     .collect()
             });
+            if invalid_qualifier {
+                return Err(EgclError::ProgramError(
+                    "an applicable method has a qualifier its method combination does not accept".into(),
+                ));
+            }
 
             if primary_methods.is_empty() {
-                return Err(EgclError::Internal(
-                    "no primary methods for short-form combination".into(),
+                return Err(EgclError::ProgramError(
+                    "no applicable primary method for the method combination".into(),
                 ));
             }
 

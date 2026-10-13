@@ -3430,7 +3430,7 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             egcl_rt::rooted!(def = def);
             match operator {
-                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(def.qualifier)),
+                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(env, &owner, def.qualifier)),
                 "METHOD-SPECIALIZERS" => Ok(method_specializer_list(&def.specializers)),
                 "METHOD-LAMBDA-LIST" => Ok(def.lambda_list),
                 _ => {

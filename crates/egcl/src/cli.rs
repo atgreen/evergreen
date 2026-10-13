@@ -2651,6 +2651,9 @@ struct MethodDef {
 struct GenericDef {
     generic_function: EgclVal,
     combination: egcl_stdlib::MethodCombinationType,
+    /// `(:method-combination NAME :most-specific-last)`: a short-form
+    /// combination runs its primary methods least specific first.
+    most_specific_last: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -2675,6 +2678,13 @@ enum NextMethod {
         after: Vec<MethodDef>,
     },
     Primary {
+        primary: Vec<MethodDef>,
+    },
+    /// Inside an :AROUND method of a short-form combination: the remaining
+    /// around methods, then the combined primary methods.
+    ShortForm {
+        around: Vec<MethodDef>,
+        combination: egcl_stdlib::MethodCombinationType,
         primary: Vec<MethodDef>,
     },
 }
@@ -3718,6 +3728,8 @@ fn qualifier_to_u8(q: egcl_stdlib::MethodQualifier) -> u8 {
         Q::Before => 1,
         Q::After => 2,
         Q::Around => 3,
+        Q::Combination => 4,
+        Q::Other => 5,
     }
 }
 
@@ -3727,6 +3739,8 @@ fn u8_to_qualifier(b: u8) -> egcl_stdlib::MethodQualifier {
         1 => Q::Before,
         2 => Q::After,
         3 => Q::Around,
+        4 => Q::Combination,
+        5 => Q::Other,
         _ => Q::Primary,
     }
 }
@@ -4289,6 +4303,7 @@ fn drain_pending_host_generics(env: &Env) {
             GenericDef {
                 generic_function: EgclVal::from_raw(gf_raw),
                 combination: u8_to_combination(comb),
+                most_specific_last: false,
             },
         );
     }
@@ -6025,6 +6040,59 @@ fn resolve_class_metaobject(env: &Env, class: EgclVal) -> Result<EgclVal, EgclEr
     Ok(class)
 }
 
+/// Every slot of `class_name` (own and inherited, most specific class first)
+/// that declares `initarg`: CLHS 7.1.4 fills all of them from one initarg
+/// (ansi shared-initialize.6.*, class-21).
+fn slots_for_initarg(env: &Env, class_name: &str, initarg: &str) -> Vec<String> {
+    fn walk(
+        env: &Env,
+        class_name: &str,
+        initarg: &str,
+        seen: &mut Vec<String>,
+        out: &mut Vec<String>,
+    ) {
+        if seen.iter().any(|name| name == class_name) {
+            return;
+        }
+        seen.push(class_name.to_string());
+        let Some(class_def) = env.classes.borrow().get(class_name).cloned() else {
+            return;
+        };
+        for slot in &class_def.slots {
+            if slot.initargs.iter().any(|slot_initarg| slot_initarg == initarg)
+                && !out
+                    .iter()
+                    .any(|name| symbol_bare_name(name) == symbol_bare_name(&slot.name))
+            {
+                out.push(slot.name.clone());
+            }
+        }
+        for super_name in &class_def.supers {
+            walk(env, super_name, initarg, seen, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(env, class_name, initarg, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The slot symbols an initarg fills, or the initarg's own symbol when no slot
+/// declares it (see `resolve_slot_symbol`).
+fn resolve_slot_symbols(
+    class_name: &str,
+    key: EgclVal,
+    env: &Env,
+) -> Result<Vec<EgclVal>, EgclError> {
+    let names = slots_for_initarg(env, class_name, &sym_bare_name_rc(key));
+    if names.is_empty() {
+        return Ok(vec![resolve_slot_symbol(class_name, key, env)?]);
+    }
+    Ok(names
+        .iter()
+        .map(|name| resolve_sym(name).unwrap_or(NIL))
+        .collect())
+}
+
 fn resolve_slot_symbol(class_name: &str, key: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
     let key_name = sym_bare_name_rc(key);
     if let Some(slot) = lookup_slot_by_initarg(env, class_name, &key_name) {
@@ -6588,12 +6656,13 @@ fn evaluated_initargs(
     let mut i = 0;
     while i + 1 < args_vec.len() {
         egcl_rt::rooted!(key = eval_form(args_vec[i], env)?);
-        // Resolve the slot key before the value eval so neither the key nor
-        // the resolved symbol is held bare across an allocating call.
-        egcl_rt::rooted!(resolved = resolve_slot_symbol(class_name, *key, env)?);
+        // Symbols are not relocated, so the slot-symbol list needs no root.
+        let resolved = resolve_slot_symbols(class_name, *key, env)?;
         let value = eval_form(args_vec[i + 1], env)?;
-        initargs.push(*resolved);
-        initargs.push(value);
+        for slot in &resolved {
+            initargs.push(*slot);
+            initargs.push(value);
+        }
         if let Some(supplied) = supplied.as_deref_mut() {
             supplied.push(*key);
             supplied.push(value);
@@ -6612,13 +6681,17 @@ fn resolved_initarg_values(
     initargs: &[EgclVal],
     env: &Env,
 ) -> Result<Vec<EgclVal>, EgclError> {
-    let mut resolved = initargs.to_vec();
-    egcl_rt::rooted_ref!(_resolved_root = &mut resolved);
+    egcl_rt::rooted!(resolved = Vec::<EgclVal>::with_capacity(initargs.len()));
     let mut i = 0;
-    while i + 1 < resolved.len() {
-        resolved[i] = resolve_slot_symbol(class_name, resolved[i], env)?;
+    while i + 1 < initargs.len() {
+        for slot in resolve_slot_symbols(class_name, initargs[i], env)? {
+            resolved.push(slot);
+            resolved.push(initargs[i + 1]);
+        }
         i += 2;
     }
+    let mut resolved = std::mem::take(&mut *resolved);
+    egcl_rt::rooted_ref!(_resolved_root = &mut resolved);
     // CLHS 7.1.4: when several initargs fill the same slot, the leftmost wins
     // (ansi reinitialize-instance.5, shared-initialize.1.3, change-class.1.6).
     let mut first_for_slot: Vec<EgclVal> = Vec::new();
@@ -7181,6 +7254,9 @@ fn method_context_has_next(context: &MethodContext) -> bool {
             after,
         } => !around.is_empty() || !before.is_empty() || !primary.is_empty() || !after.is_empty(),
         NextMethod::Primary { primary } => !primary.is_empty(),
+        NextMethod::ShortForm {
+            around, primary, ..
+        } => !around.is_empty() || !primary.is_empty(),
     }
 }
 
@@ -7230,7 +7306,44 @@ fn invoke_next_method(
             after,
         } => invoke_standard_methods(env, around, before, primary, after, args),
         NextMethod::Primary { primary } => invoke_primary_chain(env, primary, args),
+        NextMethod::ShortForm {
+            around,
+            combination,
+            primary,
+        } => invoke_short_form_methods(env, around, *combination, primary, args),
     }
+}
+
+/// Run a short-form method combination: the :AROUND methods most specific
+/// first, each able to CALL-NEXT-METHOD into the rest, and innermost the
+/// primary methods combined by `combination` (CLHS 7.6.6.4). `primary` is
+/// already in the order the generic function asked for.
+fn invoke_short_form_methods(
+    env: &mut Env,
+    around: &[MethodDef],
+    combination: egcl_stdlib::MethodCombinationType,
+    primary: &[MethodDef],
+    args: &[EgclVal],
+) -> Result<EgclVal, EgclError> {
+    if let Some((method, rest)) = around.split_first() {
+        return invoke_method(
+            env,
+            method,
+            args,
+            Some(NextMethod::ShortForm {
+                around: rest.to_vec(),
+                combination,
+                primary: primary.to_vec(),
+            }),
+        );
+    }
+    // Each result lives across the next method's evaluation (moving GC).
+    egcl_rt::rooted!(results = Vec::<EgclVal>::new());
+    for method in primary {
+        let value = invoke_method(env, method, args, None)?;
+        results.push(value);
+    }
+    combine_short_form_results(combination, &results)
 }
 
 fn combine_short_form_results(
@@ -7553,6 +7666,10 @@ fn qualifiers_to_method_qualifier(qualifiers: EgclVal) -> Option<egcl_stdlib::Me
             "BEFORE" => Some(Q::Before),
             "AFTER" => Some(Q::After),
             "AROUND" => Some(Q::Around),
+            // A short-form combination's own name (`+`, `AND`, `PROGN`, ...).
+            name if name != "STANDARD" && method_combination_from_name(name).is_some() => {
+                Some(Q::Combination)
+            }
             _ => None,
         },
         _ => None,
@@ -7939,7 +8056,12 @@ fn invoke_generic_function_inner(
                 ));
             };
             debug_assert_eq!(other, short_combination);
-            let mut results = Vec::new();
+            let most_specific_last = env
+                .generics
+                .borrow()
+                .get(name)
+                .is_some_and(|generic| generic.most_specific_last);
+            let mut primary: Vec<MethodDef> = Vec::new();
             for method_id in method_ids {
                 let method = ordered
                     .iter()
@@ -7947,9 +8069,19 @@ fn invoke_generic_function_inner(
                     .ok_or_else(|| {
                         EgclError::Internal("short-form method lookup failed".into())
                     })?;
-                results.push(invoke_method(env, method, args, None)?);
+                primary.push(method.clone());
             }
-            combine_short_form_results(short_combination, &results)
+            if most_specific_last {
+                primary.reverse();
+            }
+            let mut around: Vec<MethodDef> = ordered
+                .iter()
+                .filter(|method| method.qualifier == egcl_stdlib::MethodQualifier::Around)
+                .cloned()
+                .collect();
+            egcl_rt::rooted_ref!(_primary_root = &mut primary);
+            egcl_rt::rooted_ref!(_around_root = &mut around);
+            invoke_short_form_methods(env, &around, short_combination, &primary, args)
         }
     }
 }
@@ -8237,6 +8369,12 @@ fn visit_next_method_roots(
             visit_methods(after);
         }
         NextMethod::Primary { primary } => visit_methods(primary),
+        NextMethod::ShortForm {
+            around, primary, ..
+        } => {
+            visit_methods(around);
+            visit_methods(primary);
+        }
     }
 }
 
@@ -23690,6 +23828,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 return Err(signal_and_raise(env, condition, msg));
             }
             "CLASS-NAME" => {
+                // A user method on CLASS-NAME takes part in dispatch; the built-in
+                // behaviour is the fallback for classes without one (ansi class-name.2).
+                if env.methods.contains_key(&name) && !builtin_fallback_active(&name) {
+                    let args = eval_args(cdr, env)?;
+                    return invoke_generic_function(&name, &args, env);
+                }
                 let (class_form, _) = cp(cdr);
                 let class = eval_form(class_form, env)?;
                 return Ok(egcl_stdlib::class_name(class));
@@ -25958,6 +26102,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         } else {
             NIL
         };
+        check_disassemble_designator(arg)?;
         // NIL and T report is_symbol()=true but have no symbol index —
         // as_symbol_index() aborts on them (recurring NIL/T guard bug). Exclude
         // them: neither names a disassemblable function.
@@ -35810,15 +35955,45 @@ fn applicable_method_defs(env: &mut Env, gf_name: &str, args: &[EgclVal]) -> Vec
         .collect()
 }
 
-fn method_qualifier_list(qualifier: egcl_stdlib::MethodQualifier) -> EgclVal {
+fn method_qualifier_list(
+    env: &Env,
+    generic_name: &str,
+    qualifier: egcl_stdlib::MethodQualifier,
+) -> EgclVal {
     use egcl_stdlib::MethodQualifier as Q;
-    let keyword = match qualifier {
-        Q::Primary => return NIL,
+    let name = match qualifier {
+        Q::Primary | Q::Other => return NIL,
         Q::Before => ":BEFORE",
         Q::After => ":AFTER",
         Q::Around => ":AROUND",
+        Q::Combination => {
+            let combination = env
+                .generics
+                .borrow()
+                .get(generic_name)
+                .map(|generic| generic.combination)
+                .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
+            method_combination_name(combination)
+        }
     };
-    vec_to_list(&[resolve_sym(keyword).unwrap_or(NIL)])
+    vec_to_list(&[resolve_sym(name).unwrap_or(NIL)])
+}
+
+/// The symbol name of a method combination, as DEFGENERIC spells it.
+fn method_combination_name(combination: egcl_stdlib::MethodCombinationType) -> &'static str {
+    use egcl_stdlib::MethodCombinationType as C;
+    match combination {
+        C::Standard => "STANDARD",
+        C::Plus => "+",
+        C::And => "AND",
+        C::Or => "OR",
+        C::List => "LIST",
+        C::Append => "APPEND",
+        C::Nconc => "NCONC",
+        C::Min => "MIN",
+        C::Max => "MAX",
+        C::Progn => "PROGN",
+    }
 }
 
 /// The specializers of a method as class metaobjects, an unspecialized
@@ -36122,6 +36297,7 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (mut lambda_list, option_forms) = cp(options);
     egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
     let mut combination = egcl_stdlib::MethodCombinationType::Standard;
+    let mut most_specific_last = false;
     // `(:argument-precedence-order p...)`: the parameters, in the order method
     // ordering must compare them (bliss-nj6id).
     let mut precedence_names = NIL;
@@ -36195,9 +36371,14 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 match option_bare.as_str() {
                     "METHOD-COMBINATION" => {
-                        let method_combination = cp(option_rest).0;
+                        let (method_combination, order) = cp(option_rest);
                         combination = method_combination_from_name(&sym_name(method_combination))
                             .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
+                        // (:method-combination NAME [:most-specific-first |
+                        // :most-specific-last]) (ansi defgeneric-method-combination.*.3).
+                        let order = cp(order).0;
+                        most_specific_last = order.is_symbol()
+                            && sym_bare_name_rc(order).as_ref() == "MOST-SPECIFIC-LAST";
                     }
                     "ARGUMENT-PRECEDENCE-ORDER" => precedence_names = option_rest,
                     "METHOD" => method_options.push(option_rest),
@@ -36215,6 +36396,7 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         GenericDef {
             generic_function,
             combination,
+            most_specific_last,
         },
     );
     env.methods.borrow_mut().entry(name).or_default();
@@ -36258,14 +36440,24 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         if !head.is_symbol() {
             break;
         }
+        // NIL in qualifier position is an empty lambda list, not a qualifier.
+        if head.is_nil() {
+            break;
+        }
         match sym_bare_name_rc(head).as_ref() {
             "AROUND" => qualifier = egcl_stdlib::MethodQualifier::Around,
             "BEFORE" => qualifier = egcl_stdlib::MethodQualifier::Before,
             "AFTER" => qualifier = egcl_stdlib::MethodQualifier::After,
             qualifier_name
                 if combination != egcl_stdlib::MethodCombinationType::Standard
-                    && method_combination_from_name(qualifier_name) == Some(combination) => {}
-            _ => break,
+                    && method_combination_from_name(qualifier_name) == Some(combination) =>
+            {
+                qualifier = egcl_stdlib::MethodQualifier::Combination
+            }
+            // Any other qualifier is kept so that calling the generic function
+            // with this method applicable signals the CLHS 7.6.6 error
+            // (ansi defgeneric-method-combination.*.11).
+            _ => qualifier = egcl_stdlib::MethodQualifier::Other,
         }
         cursor = tail;
     }
@@ -36364,6 +36556,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             GenericDef {
                 generic_function: gf,
                 combination: egcl_stdlib::MethodCombinationType::Standard,
+                most_specific_last: false,
             },
         );
         gf
@@ -36599,19 +36792,22 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
             egcl_rt::rooted!(initarg_kw_root = resolve_sym(&format!(":{}", initarg)).unwrap_or(NIL));
             // resolve_slot_symbol interns (allocates); root the slot symbol
             // before the value form's eval_form can GC.
-            egcl_rt::rooted!(slot_root = resolve_slot_symbol(&class_name, *initarg_kw_root, env)?);
+            // Symbols are not relocated, so the slot-symbol list needs no root.
+            let slots = resolve_slot_symbols(&class_name, *initarg_kw_root, env)?;
+            let value = eval_form(*form, env)?;
             // CLHS 7.1.4: the leftmost initarg that fills a slot wins, so a
             // default whose slot the caller, or an earlier default naming the
             // same slot, already filled still reaches the initialization
             // protocol but does not overwrite the slot (ansi class-07.*,
-            // class-18).
-            let slot_filled = rooted
-                .chunks_exact(2)
-                .any(|pair| sym_name(pair[0]) == sym_name(*slot_root));
-            let value = eval_form(*form, env)?;
-            if !slot_filled {
-                rooted.push(*slot_root);
-                rooted.push(value);
+            // class-18, class-21).
+            for slot in &slots {
+                let slot_filled = rooted
+                    .chunks_exact(2)
+                    .any(|pair| sym_name(pair[0]) == sym_name(*slot));
+                if !slot_filled {
+                    rooted.push(*slot);
+                    rooted.push(value);
+                }
             }
             // A default-initarg reaches the protocol under its own name too.
             supplied_initargs.push(*initarg_kw_root);
@@ -37662,12 +37858,37 @@ fn apply_function_impl(
 /// keyed by its full name and is consulted before this predicate, so
 /// `(defun somepkg:length (x) ...)` is called correctly in both tiers. The hazard is
 /// specific to registering a *builtin* here.
+/// DISASSEMBLE takes an extended function designator or a lambda expression;
+/// anything else is a TYPE-ERROR (ansi disassemble.error.3).
+fn check_disassemble_designator(designator: EgclVal) -> Result<(), EgclError> {
+    let named_list = designator.is_cons() && {
+        let (head, tail) = cp(designator);
+        head.is_symbol()
+            && match sym_bare_name_rc(head).as_ref() {
+                "SETF" => tail.is_cons() && cp(tail).0.is_symbol() && cp(tail).1.is_nil(),
+                "LAMBDA" => true,
+                _ => false,
+            }
+    };
+    if designator.is_symbol() || is_function_value(designator) || named_list {
+        return Ok(());
+    }
+    Err(EgclError::TypeError {
+        datum: designator,
+        expected: "(OR FUNCTION SYMBOL (CONS (EQL SETF) (CONS SYMBOL NULL)))".to_string(),
+    })
+}
+
 fn is_builtin_function(name: &str) -> bool {
     if cfg!(egcl_no_dynamic_code) && crate::runtime_contract::opens_code_world(name) {
         return false;
     }
     if name == "DISASSEMBLE" {
         return !cfg!(egcl_no_disassembly);
+    }
+    // The system PRINT-OBJECT method is dispatched by name; it is fbound.
+    if name == "PRINT-OBJECT" {
+        return true;
     }
     if matches!(name, "EGCL::%STANDARD-CHARACTER-READER" | "EGCL::SET-FILL-POINTER"
         | "EGCL::%PPRINT-CIRCLE" | "EGCL::%PPRINT-NATIVE-COLUMN" | "EGCL::%FORMAT-CONSUMED"
@@ -38767,25 +38988,7 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
         #[cfg(not(egcl_no_disassembly))]
         "DISASSEMBLE" => {
-            // The argument is an extended function designator or a lambda
-            // expression; anything else is a TYPE-ERROR (ansi disassemble.error.3).
-            let designator = args.first().copied().unwrap_or(NIL);
-            let named_list = designator.is_cons() && {
-                let (head, tail) = cp(designator);
-                head.is_symbol()
-                    && match sym_bare_name_rc(head).as_ref() {
-                        "SETF" => tail.is_cons() && cp(tail).0.is_symbol() && cp(tail).1.is_nil(),
-                        "LAMBDA" => true,
-                        _ => false,
-                    }
-            };
-            if !(designator.is_symbol() || is_function_value(designator) || named_list) {
-                return Err(EgclError::TypeError {
-                    datum: designator,
-                    expected: "(OR FUNCTION SYMBOL (CONS (EQL SETF) (CONS SYMBOL NULL)))"
-                        .to_string(),
-                });
-            }
+            check_disassemble_designator(args.first().copied().unwrap_or(NIL))?;
             let listing = args.first().copied().and_then(|a| {
                 if a.is_symbol() && a != NIL && a != T {
                     bytecode::disassemble_symbol_with_lisp(a.as_symbol_index(), _env)
@@ -42244,6 +42447,7 @@ mod env_gc_root_tests {
             GenericDef {
                 generic_function: marker(14),
                 combination: egcl_stdlib::MethodCombinationType::Standard,
+                most_specific_last: false,
             },
         );
         env.methods
