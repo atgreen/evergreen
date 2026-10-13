@@ -28737,6 +28737,25 @@ fn is_ansi_standard_macro(bare: &str) -> bool {
             | "RESTART-CASE"
             | "CHECK-TYPE"
             | "ASSERT"
+            // Standard macros the evaluator implements natively (special-form
+            // arms in eval_form). MACRO-FUNCTION must still report them as
+            // macros (CL-MACRO-SYMBOLS.1); synthesize_macro_expander covers
+            // the expansion.
+            | "DEFCLASS"
+            | "DEFGENERIC"
+            | "DEFINE-COMPILER-MACRO"
+            | "DEFINE-SYMBOL-MACRO"
+            | "DEFMETHOD"
+            | "DEFPACKAGE"
+            | "DEFSTRUCT"
+            | "IN-PACKAGE"
+            | "LAMBDA"
+            | "RESTART-BIND"
+            | "STEP"
+            | "TIME"
+            | "TRACE"
+            | "UNTRACE"
+            | "WITH-CONDITION-RESTARTS"
     )
 }
 
@@ -36487,6 +36506,23 @@ fn is_builtin_function(name: &str) -> bool {
             // Debug introspection (bliss-zz6w)
             | "EGCL::%INVOKE-COMPILER-MACRO" | "EGCL::%INVOKE-REGISTERED-MACRO"
             | "EGCL::%FN-BODY" | "EGCL::%FN-LAMBDA-LIST"
+            // Standard functions implemented as eval_form arms that FBOUNDP
+            // and SYMBOL-FUNCTION must also recognize (CL-FUNCTION-SYMBOLS.1).
+            | "APROPOS" | "APROPOS-LIST" | "ARRAY-ELEMENT-TYPE" | "COMPLEX"
+            | "CONCATENATED-STREAM-STREAMS" | "DELETE-FILE" | "FILE-STRING-LENGTH"
+            | "GET-DISPATCH-MACRO-CHARACTER" | "GET-MACRO-CHARACTER"
+            | "GET-OUTPUT-STREAM-STRING" | "INVOKE-RESTART-INTERACTIVELY"
+            | "LIST-ALL-PACKAGES" | "LOAD" | "MACROEXPAND" | "MACROEXPAND-1"
+            | "MAKE-BROADCAST-STREAM" | "MAKE-CONCATENATED-STREAM"
+            | "MAKE-DISPATCH-MACRO-CHARACTER" | "MAKE-ECHO-STREAM"
+            | "MAKE-STRING-INPUT-STREAM" | "MAKE-STRING-OUTPUT-STREAM"
+            | "MAKE-SYNONYM-STREAM" | "MAKE-TWO-WAY-STREAM" | "PROVIDE" | "READ-BYTE"
+            | "READ-PRESERVING-WHITESPACE" | "RENAME-FILE" | "REQUIRE" | "RESTART-NAME"
+            | "SET-DISPATCH-MACRO-CHARACTER" | "SET-MACRO-CHARACTER"
+            | "SET-SYNTAX-FROM-CHAR" | "SLOT-EXISTS-P" | "SLEEP" | "STREAMP"
+            | "SYNONYM-STREAM-SYMBOL" | "TWO-WAY-STREAM-INPUT-STREAM"
+            | "TWO-WAY-STREAM-OUTPUT-STREAM" | "USER-HOMEDIR-PATHNAME" | "WRITE-BYTE"
+            | "COMPILER-MACRO-FUNCTION" | "MACRO-FUNCTION"
     )
 }
 
