@@ -6312,6 +6312,78 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
 }
 
 /// Read a slot through the user-extensible unbound-slot protocol.
+/// True when `instance` is a standard instance whose class has no slot named
+/// `slot`, neither in the instance layout nor among class-allocated slots: the
+/// case CLHS hands to SLOT-MISSING.
+fn slot_is_missing(env: &Env, instance: EgclVal, slot: EgclVal) -> bool {
+    if !egcl_stdlib::is_instance(instance) || egcl_stdlib::slot_present_p(instance, slot) {
+        return false;
+    }
+    // `lookup_slot_def` walks the superclasses and covers class-allocated slots
+    // too. `class_slot_owner` is deliberately not consulted: its whole-image
+    // fallback would find a same-named class slot of an unrelated class and
+    // report the slot present (ansi slot-missing.5 after slot-value.lsp).
+    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+    lookup_slot_def(env, &class_name, &sym_bare_name_rc(slot)).is_none()
+}
+
+/// Call the SLOT-MISSING generic function for `operation` (SLOT-VALUE, SETF,
+/// SLOT-BOUNDP or SLOT-MAKUNBOUND) and return its primary value.
+fn invoke_slot_missing(
+    env: &mut Env,
+    instance: EgclVal,
+    slot: EgclVal,
+    operation: &str,
+    new_value: Option<EgclVal>,
+) -> Result<EgclVal, EgclError> {
+    let _call_depth = CallDepthGuard::enter()?;
+    let class = egcl_stdlib::class_of(instance);
+    let operation = resolve_sym(operation).unwrap_or(NIL);
+    let mut values = vec![class, instance, slot, operation];
+    values.extend(new_value);
+    let args = RootedVals::new(values);
+    let result = invoke_generic_function("SLOT-MISSING", &args, env);
+    env.clear_mv();
+    result
+}
+
+/// SLOT-BOUNDP through the SLOT-MISSING protocol: a missing slot answers with
+/// the generalized boolean SLOT-MISSING returns.
+fn slot_boundp_protocol(
+    instance: EgclVal,
+    slot: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    if slot_is_missing(env, instance, slot) {
+        let answer = invoke_slot_missing(env, instance, slot, "SLOT-BOUNDP", None)?;
+        return Ok(if answer.is_nil() { NIL } else { T });
+    }
+    Ok(if slot_is_bound(instance, slot, env)? { T } else { NIL })
+}
+
+/// SLOT-MAKUNBOUND through the SLOT-MISSING protocol; returns the instance.
+fn slot_makunbound_protocol(
+    instance: EgclVal,
+    slot: EgclVal,
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(instance = instance);
+    if slot_is_missing(env, *instance, slot) {
+        invoke_slot_missing(env, *instance, slot, "SLOT-MAKUNBOUND", None)?;
+        return Ok(*instance);
+    }
+    // A `:allocation :class` slot lives in the owning class's cell, not in the
+    // instance layout (ansi slot-makunbound.2).
+    let class_name = class_name_for_instance_class(egcl_stdlib::class_of(*instance));
+    let slot_name = sym_bare_name_rc(slot);
+    if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
+        write_class_slot_value(env, &owner, &sym_name(slot), None);
+        return Ok(*instance);
+    }
+    egcl_stdlib::slot_makunbound(*instance, slot)?;
+    Ok(*instance)
+}
+
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
@@ -6319,6 +6391,9 @@ fn slot_value_or_signal(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
     egcl_rt::rooted!(slot = slot);
+    if slot_is_missing(env, *instance, *slot) {
+        return invoke_slot_missing(env, *instance, *slot, "SLOT-VALUE", None);
+    }
     match read_slot_value(*instance, *slot, env) {
         Ok(value) => Ok(value),
         Err(EgclError::UnboundVariable(_)) if egcl_stdlib::is_instance(*instance) => {
@@ -6543,6 +6618,18 @@ fn resolved_initarg_values(
     while i + 1 < resolved.len() {
         resolved[i] = resolve_slot_symbol(class_name, resolved[i], env)?;
         i += 2;
+    }
+    // CLHS 7.1.4: when several initargs fill the same slot, the leftmost wins
+    // (ansi reinitialize-instance.5, shared-initialize.1.3, change-class.1.6).
+    let mut first_for_slot: Vec<EgclVal> = Vec::new();
+    let mut i = 0;
+    while i + 1 < resolved.len() {
+        if first_for_slot.contains(&resolved[i]) {
+            resolved.drain(i..i + 2);
+        } else {
+            first_for_slot.push(resolved[i]);
+            i += 2;
+        }
     }
     Ok(resolved)
 }
@@ -7104,6 +7191,13 @@ fn store_slot_value(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(value = value);
+    if slot_is_missing(env, instance, slot) {
+        // (setf slot-value) on a missing slot reaches SLOT-MISSING with the new
+        // value, and still returns that value (ansi slot-missing.2/6).
+        egcl_rt::rooted!(instance = instance);
+        invoke_slot_missing(env, *instance, slot, "SETF", Some(*value))?;
+        return Ok(*value);
+    }
     write_slot_value(instance, slot, *value, env)?;
     Ok(*value)
 }
@@ -7609,6 +7703,7 @@ fn invoke_generic_function_inner(
     }
 
     let gf_idx = egcl_rt::symbols::find_index(name);
+    check_generic_call_arguments(env, gf_idx, name, args, None)?;
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
     // pure function of the generic's definition + its method set, both of which
@@ -7698,6 +7793,21 @@ fn invoke_generic_function_inner(
                 .map(|e| Rc::clone(&e.methods))
         });
         if let Some(m) = cached {
+            check_generic_call_arguments(
+                env,
+                gf_idx,
+                name,
+                args,
+                Some(
+                    &mut m
+                        .around
+                        .iter()
+                        .chain(m.before.iter())
+                        .chain(m.primary.iter())
+                        .chain(m.after.iter())
+                        .copied(),
+                ),
+            )?;
             // Single-primary fast path (bliss-fy37 #2): the common case skips the
             // general standard-combination machinery entirely.
             if let Some(fast) =
@@ -7758,6 +7868,7 @@ fn invoke_generic_function_inner(
     egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
     let mut method_ids: Vec<EgclVal> = ordered.iter().map(|method| method.method_id).collect();
     egcl_rt::rooted_ref!(_method_ids_root = &mut method_ids);
+    check_generic_call_arguments(env, gf_idx, name, args, Some(&mut method_ids.iter().copied()))?;
 
     let effective = egcl_stdlib::compute_effective_method(NIL, combination, &method_ids)?;
     match combination {
@@ -17342,6 +17453,8 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "MACROEXPAND" | "MACROEXPAND-1" | "MACRO-FUNCTION" | "CONSTANTP" | "COMPILE"
         | "DECODE-UNIVERSAL-TIME" => Some((1, 2)),
         "SLEEP" | "DISASSEMBLE" => Some((1, 1)),
+        "SLOT-VALUE" | "SLOT-BOUNDP" | "SLOT-EXISTS-P" | "SLOT-MAKUNBOUND" => Some((2, 2)),
+        "FIND-METHOD" => Some((3, 4)),
         "ROOM" | "USER-HOMEDIR-PATHNAME" => Some((0, 1)),
         "ENCODE-UNIVERSAL-TIME" => Some((6, 7)),
         "REMOVE-METHOD" | "ADD-METHOD" | "COMPUTE-APPLICABLE-METHODS" => Some((2, 2)),
@@ -17751,6 +17864,14 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (mut car, mut cdr) = cp(form);
     egcl_rt::rooted_ref!(_car_root = &mut car);
     egcl_rt::rooted_ref!(_cdr_root = &mut cdr);
+    // A function object is physically the cons `(EGCL::CLOSURE . descriptor)`,
+    // and its Common Lisp type is FUNCTION, which is self-evaluating: a function
+    // spliced into a form, as `(eval `(the function ,f))` does, is itself, not a
+    // call of EGCL::CLOSURE (ansi the.8/9). The cheap dotted-tail test keeps the
+    // check off every ordinary call form.
+    if car.is_symbol() && !cdr.is_cons() && !cdr.is_nil() && is_function_value(form) {
+        return Ok(form);
+    }
     let _diag_frame = eval_diag_frame(car);
     if car.is_symbol() {
         // A `egcl-ext:` / `egcl-internal:` builtin referenced from a source-free
@@ -19245,8 +19366,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // evaluates to the same value: a self-evaluating object, a
                 // constant variable (keyword / T / NIL), or a (quote …) form.
                 // Conservative for other symbols/compound forms (NIL).
-                let (af, _) = cp(cdr);
-                let v = eval_form(af, env)?;
+                let (af, rest) = cp(cdr);
+                egcl_rt::rooted!(v = eval_form(af, env)?);
+                // The environment argument is evaluated (for its effects) even
+                // though only the null environment is supported
+                // (ansi constantp.order.2).
+                if rest.is_cons() {
+                    eval_form(cp(rest).0, env)?;
+                }
+                let v = *v;
                 let is_const = if v.is_nil() || v == T || is_function_value(v) {
                     // A function object is physically a cons here but is a
                     // self-evaluating FUNCTION (ansi constantp.1).
@@ -20613,7 +20741,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 egcl_rt::rooted!(instance = eval_form(tgt_form, env)?);
                                 let (slot_form, _) = cp(cp(*aargs).1);
                                 let slot = eval_form(slot_form, env)?;
-                                write_slot_value(*instance, slot, *val, env)?;
+                                store_slot_value(*instance, slot, *val, env)?;
                             }
                             "SYMBOL-VALUE" => {
                                 // (setf (symbol-value sym) val) — assign the
@@ -23585,8 +23713,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(slot_form = slot_form);
                 egcl_rt::rooted!(instance = eval_form(instance_form, env)?);
                 let slot = eval_form(*slot_form, env)?;
-                egcl_stdlib::slot_makunbound(*instance, slot)?;
-                return Ok(*instance);
+                return slot_makunbound_protocol(*instance, slot, env);
             }
             "SLOT-EXISTS-P" => {
                 let (instance_form, rest) = cp(cdr);
@@ -23624,13 +23751,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 apply_class_initforms(instance, &class_name, env, None, &explicit_slots)?;
                 return Ok(instance);
             }
-            "REINITIALIZE-INSTANCE" => {
-                let (instance_form, init_args) = cp(cdr);
-                let instance = eval_form(instance_form, env)?;
-                let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
-                let initargs = evaluated_initargs(&class_name, init_args, env, None)?;
-                return reinitialize_instance_values(instance, &initargs, env);
-            }
+            // REINITIALIZE-INSTANCE is the generic function boot.lisp defines, so
+            // user :before/:after/:around methods take part (ansi
+            // reinitialize-instance.9/10); no operator-position shortcut here.
             "EGCL-INTERNAL::%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL:%STANDARD-REINITIALIZE-INSTANCE"
             | "EGCL-INTERNAL::%STANDARD-SHARED-INITIALIZE"
@@ -30158,9 +30281,9 @@ fn body_custom_declarations(body: EgclVal) -> Vec<EgclVal> {
             // report the policy in force, and no proclamation introduces it.
             let retain = matches!(sym_bare_name_rc(name).as_ref(), "OPTIMIZE" | "INLINE" | "NOTINLINE")
                 || (any_proclaimed_declarations()
-                    && PROCLAIMED_DECLARATIONS
-                        .borrow()
-                        .contains(&name.as_symbol_index()));
+                    && name
+                        .symbol_index()
+                        .is_some_and(|idx| PROCLAIMED_DECLARATIONS.borrow().contains(&idx)));
             if retain {
                 found.push(specifier);
             }
@@ -32878,9 +33001,20 @@ fn eval_define_symbol_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, Egcl
 
 fn eval_define_compiler_macro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let (name, rest) = cp(cdr);
-    let (params_form, body) = cp(rest);
+    let (mut params_form, mut body) = cp(rest);
     if !name.is_symbol() {
         return Ok(name);
+    }
+    egcl_rt::rooted_ref!(_params_root = &mut params_form);
+    egcl_rt::rooted_ref!(_body_root = &mut body);
+    // CLHS DEFINE-COMPILER-MACRO: the body is enclosed in an implicit BLOCK
+    // named after the function, so RETURN-FROM that name exits the expander
+    // (ansi define-compiler-macro.2) -- the same wrap DEFMACRO performs. The
+    // special-declaration scan looks through the implicit block, as for DEFUN.
+    {
+        egcl_rt::rooted!(block_body = arena_cons(name, body));
+        egcl_rt::rooted!(block_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *block_body));
+        body = arena_cons(*block_form, NIL);
     }
     egcl_rt::rooted!(
         descriptor = register_tree_closure(Closure {
@@ -34256,6 +34390,144 @@ fn eval_symbol_macrolet(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclErro
 }
 
 // ── DEFCLASS ─────────────────────────────────────────────────────
+/// CLHS DEFCLASS: a repeated slot name, a repeated single-valued slot option
+/// (:INITFORM :TYPE :DOCUMENTATION :ALLOCATION), a repeated :DEFAULT-INITARGS
+/// key, a repeated class option, or an unknown slot or class option is a
+/// PROGRAM-ERROR (ansi defclass.error.*). Unknown options are tolerated when a
+/// :METACLASS is named, since a metaclass may define options of its own.
+fn check_defclass_syntax(
+    name: &str,
+    slots_form: EgclVal,
+    class_options: EgclVal,
+) -> Result<(), EgclError> {
+    let program_error = |msg: String| EgclError::ProgramError(format!("DEFCLASS {name}: {msg}"));
+    // The bare name of a KEYWORD option designator; None for anything else.
+    let option_bare = |option: EgclVal| -> Option<String> {
+        if !option.is_symbol() || option.is_nil() {
+            return None;
+        }
+        sym_name_rc(option)
+            .strip_prefix("KEYWORD:")
+            .map(|bare| bare.to_string())
+    };
+    let options = list_to_vec(class_options);
+    let has_metaclass = options
+        .iter()
+        .any(|option| option.is_cons() && option_bare(cp(*option).0).as_deref() == Some("METACLASS"));
+
+    let mut slot_names: Vec<String> = Vec::new();
+    for slot_spec in list_to_vec(slots_form) {
+        let (slot_name, slot_opts) = if slot_spec.is_cons() {
+            cp(slot_spec)
+        } else {
+            (slot_spec, NIL)
+        };
+        if !slot_name.is_symbol() {
+            return Err(program_error(format!(
+                "slot name {} is not a symbol",
+                format_val(slot_name)
+            )));
+        }
+        let slot_key = sym_name(slot_name);
+        if slot_names.contains(&slot_key) {
+            return Err(program_error(format!(
+                "slot {slot_key} is specified more than once"
+            )));
+        }
+        slot_names.push(slot_key.clone());
+        let opts = list_to_vec(slot_opts);
+        if opts.len() % 2 != 0 {
+            return Err(program_error(format!(
+                "slot {slot_key} has an odd number of option elements"
+            )));
+        }
+        let mut seen_single: Vec<String> = Vec::new();
+        for pair in opts.chunks_exact(2) {
+            let Some(option) = option_bare(pair[0]) else {
+                if has_metaclass {
+                    continue;
+                }
+                return Err(program_error(format!(
+                    "slot {slot_key}: {} is not a slot option",
+                    format_val(pair[0])
+                )));
+            };
+            match option.as_str() {
+                "READER" | "WRITER" | "ACCESSOR" | "INITARG" => {}
+                "INITFORM" | "TYPE" | "DOCUMENTATION" | "ALLOCATION" => {
+                    if seen_single.contains(&option) {
+                        return Err(program_error(format!(
+                            "slot {slot_key}: option :{option} given more than once"
+                        )));
+                    }
+                    seen_single.push(option);
+                }
+                _ if has_metaclass => {}
+                _ => {
+                    return Err(program_error(format!(
+                        "slot {slot_key}: unknown slot option :{option}"
+                    )))
+                }
+            }
+        }
+    }
+
+    let mut seen_class_options: Vec<String> = Vec::new();
+    for option in options {
+        if !option.is_cons() {
+            return Err(program_error(format!(
+                "{} is not a class option",
+                format_val(option)
+            )));
+        }
+        let (option_key, option_rest) = cp(option);
+        let Some(option_name) = option_bare(option_key) else {
+            if has_metaclass {
+                continue;
+            }
+            return Err(program_error(format!(
+                "{} is not a class option",
+                format_val(option_key)
+            )));
+        };
+        match option_name.as_str() {
+            "DEFAULT-INITARGS" | "DOCUMENTATION" | "METACLASS" => {
+                if seen_class_options.contains(&option_name) {
+                    return Err(program_error(format!(
+                        "option :{option_name} given more than once"
+                    )));
+                }
+                seen_class_options.push(option_name.clone());
+            }
+            _ if has_metaclass => {}
+            _ => {
+                return Err(program_error(format!(
+                    "unknown class option :{option_name}"
+                )))
+            }
+        }
+        if option_name == "DEFAULT-INITARGS" {
+            let pairs = list_to_vec(option_rest);
+            if pairs.len() % 2 != 0 {
+                return Err(program_error(
+                    "odd number of :DEFAULT-INITARGS elements".to_string(),
+                ));
+            }
+            let mut seen: Vec<String> = Vec::new();
+            for pair in pairs.chunks_exact(2) {
+                let key = sym_name(pair[0]);
+                if seen.contains(&key) {
+                    return Err(program_error(format!(
+                        ":DEFAULT-INITARGS names {key} more than once"
+                    )));
+                }
+                seen.push(key);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // A new/redefined class can change class-of results and precedence, so every
     // cached dispatch decision may be stale (bliss-x5y.20).
@@ -34268,6 +34540,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     home_defined_symbol(env, name_form);
 
     let name = sym_name(name_form);
+    check_defclass_syntax(&name, slots_form, class_options)?;
 
     // Class options follow the slots list. Parse (:default-initargs initarg
     // value-form …); other options (:documentation, :metaclass, …) are ignored.
@@ -35620,6 +35893,194 @@ fn lambda_lists_congruent(a: EgclVal, b: EgclVal) -> bool {
     r1 == r2 && o1 == o2 && rk1 == rk2
 }
 
+/// Keyword facts of a lambda list: the number of positional (required plus
+/// optional) parameters, whether &KEY, &REST and &ALLOW-OTHER-KEYS appear, and
+/// the bare keyword names the list accepts.
+struct LambdaKeyInfo {
+    positional: usize,
+    has_key: bool,
+    has_rest: bool,
+    allow_other_keys: bool,
+    keys: Vec<String>,
+}
+
+fn lambda_list_key_info(lambda_list: EgclVal) -> LambdaKeyInfo {
+    let mut info = LambdaKeyInfo {
+        positional: 0,
+        has_key: false,
+        has_rest: false,
+        allow_other_keys: false,
+        keys: Vec::new(),
+    };
+    let mut section = 0u8;
+    let mut cursor = lambda_list;
+    while cursor.is_cons() {
+        let (item, next) = cp(cursor);
+        cursor = next;
+        if item.is_symbol() {
+            match sym_bare_name_rc(item).as_ref() {
+                "&OPTIONAL" => {
+                    section = 1;
+                    continue;
+                }
+                "&REST" | "&BODY" => {
+                    section = 2;
+                    info.has_rest = true;
+                    continue;
+                }
+                "&KEY" => {
+                    section = 3;
+                    info.has_key = true;
+                    continue;
+                }
+                "&AUX" => {
+                    section = 4;
+                    continue;
+                }
+                "&ALLOW-OTHER-KEYS" => {
+                    info.allow_other_keys = true;
+                    continue;
+                }
+                "&WHOLE" | "&ENVIRONMENT" => continue,
+                _ => {}
+            }
+        }
+        match section {
+            0 | 1 => info.positional += 1,
+            3 => {
+                // VAR, (VAR default), or ((:KEYWORD VAR) default).
+                let spec = if item.is_cons() { cp(item).0 } else { item };
+                let key = if spec.is_cons() { cp(spec).0 } else { spec };
+                if key.is_symbol() {
+                    info.keys.push(sym_bare_name_rc(key).to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    info
+}
+
+/// CLHS 7.6.4 for a method: a congruent shape, and when the generic function
+/// mentions &KEY names, the method accepts each of them explicitly, through
+/// &ALLOW-OTHER-KEYS, or through &REST without &KEY (ansi defmethod.error.10,
+/// defgeneric.error.18/19).
+fn method_lambda_list_congruent(generic: EgclVal, method: EgclVal) -> bool {
+    if !lambda_lists_congruent(generic, method) {
+        return false;
+    }
+    let generic = lambda_list_key_info(generic);
+    if !generic.has_key || generic.keys.is_empty() {
+        return true;
+    }
+    let method = lambda_list_key_info(method);
+    if method.allow_other_keys || (method.has_rest && !method.has_key) {
+        return true;
+    }
+    generic.keys.iter().all(|key| method.keys.contains(key))
+}
+
+/// CLHS 7.6.5 at call time. The argument count must fit the generic function's
+/// lambda list (ansi defmethod.error.13), and when that list mentions &KEY the
+/// call may pass only keyword names the generic function or some applicable
+/// method accepts, unless one of them has &ALLOW-OTHER-KEYS or the call says
+/// :ALLOW-OTHER-KEYS T (ansi defgeneric.error.20, defmethod.error.14/15).
+/// `method_ids` are the applicable methods; `None` checks only the arity.
+fn check_generic_call_arguments(
+    env: &Env,
+    gf_idx: Option<u32>,
+    name: &str,
+    args: &[EgclVal],
+    method_ids: Option<&mut dyn Iterator<Item = EgclVal>>,
+) -> Result<(), EgclError> {
+    // An interned name's registry index is its symbol. An uninterned (gensym)
+    // name has no reliable registry entry, so the generic-function object is
+    // asked for its own name instead (ansi defmethod.error.13-15).
+    let generic_symbol = match gf_idx {
+        Some(idx) if !reader::is_uninterned(idx) => Some(EgclVal::from_symbol_index(idx)),
+        _ => {
+            let generic_function = env
+                .generics
+                .borrow()
+                .get(name)
+                .map(|generic| generic.generic_function);
+            generic_function.and_then(egcl_stdlib::clos::generic_function_name)
+        }
+    };
+    let Some(generic_symbol) = generic_symbol else {
+        return Ok(());
+    };
+    let Some(generic_lambda_list) = stored_generic_lambda_list(generic_symbol) else {
+        return Ok(());
+    };
+    let Some(method_ids) = method_ids else {
+        let (required, optional, rest_or_key, _) = lambda_list_shape(generic_lambda_list);
+        if args.len() < required || (!rest_or_key && args.len() > required + optional) {
+            return Err(EgclError::ProgramError(format!(
+                "{name}: called with {} arguments, but its lambda list {} takes {}",
+                args.len(),
+                format_val(generic_lambda_list),
+                if rest_or_key {
+                    format!("at least {required}")
+                } else if optional == 0 {
+                    format!("{required}")
+                } else {
+                    format!("{required} to {}", required + optional)
+                }
+            )));
+        }
+        return Ok(());
+    };
+    let generic = lambda_list_key_info(generic_lambda_list);
+    if !generic.has_key || generic.allow_other_keys || args.len() <= generic.positional {
+        return Ok(());
+    }
+    let tail = &args[generic.positional..];
+    // The first :ALLOW-OTHER-KEYS pair governs (CLHS 3.4.1.4.1.1).
+    for pair in tail.chunks(2) {
+        if pair[0].is_symbol() && sym_bare_name_rc(pair[0]).as_ref() == "ALLOW-OTHER-KEYS" {
+            if pair.get(1).is_some_and(|value| !value.is_nil()) {
+                return Ok(());
+            }
+            break;
+        }
+    }
+    let mut valid = generic.keys;
+    {
+        let methods = env.methods.borrow();
+        let defs = methods.get(name);
+        for id in method_ids {
+            let Some(def) = defs.and_then(|defs| defs.iter().find(|def| def.method_id == id))
+            else {
+                continue;
+            };
+            let info = lambda_list_key_info(def.lambda_list);
+            if info.allow_other_keys || (info.has_rest && !info.has_key) {
+                return Ok(());
+            }
+            valid.extend(info.keys);
+        }
+    }
+    for pair in tail.chunks(2) {
+        let key = pair[0];
+        if !key.is_symbol() {
+            return Err(EgclError::ProgramError(format!(
+                "{name}: keyword argument name is not a symbol: {}",
+                format_val(key)
+            )));
+        }
+        let bare = sym_bare_name_rc(key);
+        if bare.as_ref() != "ALLOW-OTHER-KEYS" && !valid.iter().any(|k| k.as_str() == bare.as_ref())
+        {
+            return Err(EgclError::ProgramError(format!(
+                "{name}: invalid keyword argument {}",
+                format_val(key)
+            )));
+        }
+    }
+    Ok(())
+}
+
 const GENERIC_LAMBDA_LIST_PROPERTY: &str = "EGCL::%GENERIC-LAMBDA-LIST";
 
 fn store_generic_lambda_list(name_form: EgclVal, lambda_list: EgclVal) {
@@ -35690,10 +36151,33 @@ fn eval_defgeneric(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let mut opts = option_forms;
     while opts.is_cons() {
         let (option, rest) = cp(opts);
+        if !option.is_cons() || !cp(option).0.is_symbol() {
+            return Err(EgclError::ProgramError(format!(
+                "DEFGENERIC {name}: {} is not an option",
+                format_val(option)
+            )));
+        }
         if option.is_cons() {
             let (option_name, option_rest) = cp(option);
             if option_name.is_symbol() {
                 let option_bare = sym_bare_name_rc(option_name).to_string();
+                // CLHS DEFGENERIC: an option it does not list is a PROGRAM-ERROR
+                // (ansi defgeneric.error.6).
+                if !matches!(
+                    option_bare.as_str(),
+                    "DOCUMENTATION"
+                        | "ARGUMENT-PRECEDENCE-ORDER"
+                        | "METHOD-COMBINATION"
+                        | "GENERIC-FUNCTION-CLASS"
+                        | "METHOD-CLASS"
+                        | "METHOD"
+                        | "DECLARE"
+                ) {
+                    return Err(EgclError::ProgramError(format!(
+                        "DEFGENERIC {name}: unknown option {}",
+                        format_val(option_name)
+                    )));
+                }
                 if matches!(
                     option_bare.as_str(),
                     "DOCUMENTATION"
@@ -35862,7 +36346,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // generic function takes the first method's lambda list.
     match stored_generic_lambda_list(name_form) {
         Some(generic_lambda_list) => {
-            if !lambda_lists_congruent(generic_lambda_list, *lambda_list) {
+            if !method_lambda_list_congruent(generic_lambda_list, *lambda_list) {
                 return Err(EgclError::ProgramError(format!(
                     "DEFMETHOD {name}: lambda list is not congruent with the generic function's"
                 )));
@@ -36116,9 +36600,19 @@ fn eval_make_instance(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError>
             // resolve_slot_symbol interns (allocates); root the slot symbol
             // before the value form's eval_form can GC.
             egcl_rt::rooted!(slot_root = resolve_slot_symbol(&class_name, *initarg_kw_root, env)?);
+            // CLHS 7.1.4: the leftmost initarg that fills a slot wins, so a
+            // default whose slot the caller, or an earlier default naming the
+            // same slot, already filled still reaches the initialization
+            // protocol but does not overwrite the slot (ansi class-07.*,
+            // class-18).
+            let slot_filled = rooted
+                .chunks_exact(2)
+                .any(|pair| sym_name(pair[0]) == sym_name(*slot_root));
             let value = eval_form(*form, env)?;
-            rooted.push(*slot_root);
-            rooted.push(value);
+            if !slot_filled {
+                rooted.push(*slot_root);
+                rooted.push(value);
+            }
             // A default-initarg reaches the protocol under its own name too.
             supplied_initargs.push(*initarg_kw_root);
             supplied_initargs.push(value);
@@ -37521,7 +38015,7 @@ fn apply_builtin_fast(
         }
         "SLOT-BOUNDP" if args.len() == 2 => {
             env.clear_mv();
-            Some(slot_is_bound(args[0], args[1], env).map(|b| if b { T } else { NIL }))
+            Some(slot_boundp_protocol(args[0], args[1], env))
         }
         // Reachable through FUNCALL/APPLY/MAPCAR, not only operator position.
         "ALLOCATE-INSTANCE" if !args.is_empty() => {
@@ -37533,7 +38027,7 @@ fn apply_builtin_fast(
         }
         "SLOT-MAKUNBOUND" if args.len() == 2 => {
             env.clear_mv();
-            Some(egcl_stdlib::clos::slot_makunbound(args[0], args[1]).map(|()| args[0]))
+            Some(slot_makunbound_protocol(args[0], args[1], env))
         }
         "CLASS-OF" if args.len() == 1 => {
             env.clear_mv();
@@ -38273,6 +38767,25 @@ fn apply_builtin(name: &str, args: &[EgclVal], _env: &mut Env) -> Result<EgclVal
         // while interpreted (T0), decoded x86-64 once promoted to native (T1).
         #[cfg(not(egcl_no_disassembly))]
         "DISASSEMBLE" => {
+            // The argument is an extended function designator or a lambda
+            // expression; anything else is a TYPE-ERROR (ansi disassemble.error.3).
+            let designator = args.first().copied().unwrap_or(NIL);
+            let named_list = designator.is_cons() && {
+                let (head, tail) = cp(designator);
+                head.is_symbol()
+                    && match sym_bare_name_rc(head).as_ref() {
+                        "SETF" => tail.is_cons() && cp(tail).0.is_symbol() && cp(tail).1.is_nil(),
+                        "LAMBDA" => true,
+                        _ => false,
+                    }
+            };
+            if !(designator.is_symbol() || is_function_value(designator) || named_list) {
+                return Err(EgclError::TypeError {
+                    datum: designator,
+                    expected: "(OR FUNCTION SYMBOL (CONS (EQL SETF) (CONS SYMBOL NULL)))"
+                        .to_string(),
+                });
+            }
             let listing = args.first().copied().and_then(|a| {
                 if a.is_symbol() && a != NIL && a != T {
                     bytecode::disassemble_symbol_with_lisp(a.as_symbol_index(), _env)

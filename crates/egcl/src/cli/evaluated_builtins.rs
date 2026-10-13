@@ -3401,11 +3401,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let instance = args.first().copied().unwrap_or(NIL);
             let slot = args.get(1).copied().unwrap_or(NIL);
-            Ok(if slot_is_bound(instance, slot, env)? {
-                T
-            } else {
-                NIL
-            })
+            slot_boundp_protocol(instance, slot, env)
         }),
 
         "ALLOCATE-INSTANCE" => Some(|_operator, args, env| {
@@ -3483,10 +3479,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 let Some(list) = map.get_mut(&gf_name) else {
                     return Ok(args[0]);
                 };
-                match list.iter().position(|m| m.method_id == args[1]) {
-                    Some(position) => Some(list.remove(position)),
-                    None => None,
-                }
+                list.iter()
+                    .position(|m| m.method_id == args[1])
+                    .map(|position| list.remove(position))
             };
             if let Some(def) = removed {
                 let generic_function = env
@@ -3534,7 +3529,7 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             let name_sym = resolve_sym(&gf_name).unwrap_or(NIL);
             if let Some(generic_lambda_list) = stored_generic_lambda_list(name_sym) {
-                if !lambda_lists_congruent(generic_lambda_list, def.lambda_list) {
+                if !method_lambda_list_congruent(generic_lambda_list, def.lambda_list) {
                     return Err(EgclError::ProgramError(format!(
                         "ADD-METHOD: the method's lambda list is not congruent with {gf_name}"
                     )));

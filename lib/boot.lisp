@@ -556,6 +556,18 @@
   (declare (ignore class))
   (error 'unbound-slot :name slot-name :instance instance))
 
+;; CLHS SLOT-MISSING: the default method signals an error; SLOT-VALUE, (SETF
+;; SLOT-VALUE), SLOT-BOUNDP and SLOT-MAKUNBOUND call it for a slot the class
+;; does not have.
+(defmethod slot-missing (class instance slot-name operation &optional new-value)
+  (declare (ignore class new-value))
+  (error "~S: the slot ~S is missing from ~S" operation slot-name instance))
+
+;; ED has no editor to invoke; it accepts its argument and does nothing.
+(defun ed (&optional x)
+  (declare (ignore x))
+  nil)
+
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
   (apply #'shared-initialize instance nil initargs))
 

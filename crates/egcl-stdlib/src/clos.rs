@@ -2286,6 +2286,9 @@ pub fn shared_initialize_with_list(
     if !is_instance(instance) {
         return Err(EgclError::Internal("not an instance".into()));
     }
+    // CLHS 7.1.4: when several initargs name the same slot, the leftmost wins
+    // (ansi reinitialize-instance.5/10, shared-initialize.1.3).
+    let mut filled: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + 1 < initargs.len() {
         let slot_name = initargs[i];
@@ -2301,7 +2304,10 @@ pub fn shared_initialize_with_list(
         if is_eligible {
             unsafe {
                 if let Some(idx) = instance_slot_index(instance, slot_name) {
-                    *slot_cell(instance, idx) = value;
+                    if !filled.contains(&idx) {
+                        filled.push(idx);
+                        *slot_cell(instance, idx) = value;
+                    }
                 }
             }
         }
