@@ -5,6 +5,71 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn deopt_scope_headers_match_retained_bodies() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env("(defun deopt-header-target (x) x)", &mut env).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("((deopt-header-target x))").unwrap().0);
+    let symbol = egcl_rt::symbols::intern("DEOPT-HEADER-OWNER");
+    let body = Arc::new(
+        compile_function("DEOPT-HEADER-OWNER", *params, *forms, &env, false, false).unwrap(),
+    );
+    assert_eq!(body.n_locals, 1);
+    let after_call = body.code.iter().position(|op| matches!(op, Instr::CallNamed { .. }))
+        .expect("fixture must have a suspended call") as u64 + 1;
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+    });
+    let scope = |function, bcp, locals, depth| {
+        let mut words = vec![function, bcp, locals, depth];
+        words.resize(4 + (locals + depth) as usize, NIL.0);
+        words
+    };
+    let owner = u64::from(symbol);
+    let mut full_parent = scope(owner, after_call, 1, u64::from(body.max_stack));
+    full_parent.extend(scope(owner, 0, 1, 0));
+    let mut valid_parent = scope(owner, after_call, 1, 0);
+    valid_parent.extend(scope(owner, 0, 1, 0));
+    let cases = [
+        ("valid root", scope(owner, 0, 1, 0), 1, true),
+        ("valid suspended parent", valid_parent, 2, true),
+        ("missing local", scope(owner, 0, 0, 0), 1, false),
+        ("extra local", scope(owner, 0, 2, 0), 1, false),
+        ("truncated function id", scope(owner + (1u64 << 32), 0, 1, 0), 1, false),
+        ("truncated resume position", scope(owner, 1u64 << 32, 1, 0), 1, false),
+        ("resume past body", scope(owner, body.code.len() as u64, 1, 0), 1, false),
+        ("excess operand depth", scope(owner, 0, 1, u64::from(body.max_stack) + 1), 1, false),
+        ("no room for child result", full_parent, 2, false),
+    ];
+    let stack = egcl_rt::current_stack();
+    let parent = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (name, words, count, accepted) in cases {
+        // Never resume malformed activations. All writes are into fresh frames
+        // allocated from the retained body, so this probes rejection safely.
+        let result = materialize_t2_deopt_scopes(
+            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted {
+            mismatches.push(name);
+        }
+        if let Ok((scopes, _)) = result {
+            for _ in scopes { stack.pop_frame(); }
+        }
+        assert_eq!(stack.fp(), parent, "{name}: frame rollback");
+        assert_eq!(stack.sp(), before_sp, "{name}: stack rollback");
+    }
+    assert!(mismatches.is_empty(), "incorrect frame-header acceptance: {mismatches:?}");
+}
+
+#[test]
 fn malformed_inner_deopt_scope_preserves_outer_frame() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);

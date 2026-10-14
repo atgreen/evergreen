@@ -18366,18 +18366,36 @@ fn materialize_t2_deopt_scopes(
             error = Some("truncated T2 virtual-frame header");
             break;
         }
-        let function = words[at] as u32;
-        let bcp = words[at + 1] as u32;
-        let n_locals = words[at + 2] as usize;
-        let sp_top = words[at + 3] as usize;
-        at += 4;
-        let n_slots = n_locals.saturating_add(sp_top);
+        let (Ok(function), Ok(bcp)) = (
+            u32::try_from(words[at]),
+            u32::try_from(words[at + 1]),
+        ) else {
+            error = Some("invalid T2 virtual-frame identity or resume position");
+            break;
+        };
         let entry = metadata.deopt_bodies.get(&function).cloned();
         let Some(entry) = entry else {
             error = Some("T2 deopt function is absent from its compiled metadata");
             break;
         };
-        if at + n_slots > words.len() || n_slots > entry.num_slots() as usize {
+        let n_locals = words[at + 2];
+        let sp_top = words[at + 3];
+        if n_locals != u64::from(entry.n_locals)
+            || sp_top > u64::from(entry.max_stack)
+            || bcp as usize >= entry.code.len()
+            // Suspended callers have consumed arguments but not yet received
+            // the child's result. T0 Return must be able to push that value.
+            || (scope_index + 1 < n_scopes as usize && sp_top == u64::from(entry.max_stack))
+        {
+            error = Some("T2 virtual-frame header disagrees with its retained body");
+            break;
+        }
+        // Both counts now fit the retained body's u16 bounds.
+        let n_locals = n_locals as usize;
+        let sp_top = sp_top as usize;
+        let n_slots = n_locals + sp_top;
+        at += 4;
+        if n_slots > words.len() - at || n_slots > entry.num_slots() as usize {
             error = Some("invalid T2 virtual-frame slot count");
             break;
         }
