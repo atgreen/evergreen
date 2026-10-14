@@ -5,6 +5,48 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn malformed_inner_deopt_scope_preserves_outer_frame() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
+    let symbol = egcl_rt::symbols::intern("DEOPT-VALIDATE-BEFORE-WRITE");
+    let body = Arc::new(
+        compile_function("DEOPT-VALIDATE-BEFORE-WRITE", *params, *forms, &env, false, false)
+            .unwrap(),
+    );
+    assert_eq!(body.n_locals, 1);
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+    });
+    let stack = egcl_rt::current_stack();
+    let parent = stack.fp();
+    let frame = stack
+        .push_frame(EgclVal::from_symbol_index(symbol), std::ptr::null(), body.num_slots(), FLAG_CALL)
+        .unwrap();
+    let original = EgclVal::from_fixnum(17);
+    unsafe { slot_set(frame, 0, original) };
+    // The second scope is structurally complete but has no retained body.
+    let absent = egcl_rt::symbols::intern("DEOPT-MISSING-INNER-BODY");
+    let words = [u64::from(symbol), 0, 1, 0, NIL.0, u64::from(absent), 0, 0, 0];
+    let result = materialize_t2_deopt_scopes(
+        2, words.len() as u64, words.as_ptr(), Some(frame), Some(metadata),
+    );
+    let after = unsafe { slot_get(frame, 0) };
+    let restored_fp = stack.fp();
+    stack.pop_frame();
+    assert!(result.is_err(), "an unknown retained body must be rejected");
+    assert_eq!(restored_fp, frame);
+    assert_eq!(stack.fp(), parent);
+    assert_eq!(after, original, "reject the whole stream before writing outer slots");
+}
+
+#[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_optimized_child_guard_returns_and_escapes_without_replay() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());

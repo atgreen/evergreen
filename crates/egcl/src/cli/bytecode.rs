@@ -18332,7 +18332,8 @@ extern "C" fn c2i_deopt_t2_inline(
 /// header words per scope (function, bcp, locals, stack depth) then the
 /// slots. `outer` is the frame to write scope 0 into; `None` pushes a fresh
 /// frame for it too. `metadata` is the deopting code's; `None` takes the
-/// active code's. Pushed frames are popped again on any error.
+/// active code's. Pushed frames are popped again on any error; existing
+/// frame slots are not changed until the whole stream has been accepted.
 fn materialize_t2_deopt_scopes(
     n_scopes: u64,
     n_words: u64,
@@ -18358,6 +18359,7 @@ fn materialize_t2_deopt_scopes(
     let mut at = 0usize;
     let mut pushed = 0usize;
     let mut scopes = Vec::with_capacity(n_scopes as usize);
+    let mut payloads = Vec::with_capacity(n_scopes as usize);
     let mut error: Option<&'static str> = None;
     for scope_index in 0..n_scopes as usize {
         if at + 4 > words.len() {
@@ -18409,9 +18411,7 @@ fn materialize_t2_deopt_scopes(
                 );
             }
         }
-        for (slot, &bits) in words[at..at + n_slots].iter().enumerate() {
-            unsafe { slot_set(frame, slot as u16, EgclVal(bits)) };
-        }
+        payloads.push(&words[at..at + n_slots]);
         at += n_slots;
         // Metadata is keyed by the compilation owner; only the outermost
         // activation uses the calling closure's identity and captures.
@@ -18438,6 +18438,14 @@ fn materialize_t2_deopt_scopes(
             stack.pop_frame();
         }
         return Err(error.unwrap_or("truncated T2 virtual-frame stream"));
+    }
+    // Delay all writes, including to the reused outer frame, until malformed
+    // later scopes and stack exhaustion can no longer cause a partial restore.
+    // EgclStack frame allocation above does not collect or move the payload.
+    for (scope, payload) in scopes.iter().zip(payloads) {
+        for (slot, &bits) in payload.iter().enumerate() {
+            unsafe { slot_set(scope.frame, slot as u16, EgclVal(bits)) };
+        }
     }
     Ok((scopes, metadata))
 }
