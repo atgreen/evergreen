@@ -216,11 +216,15 @@ pub(super) fn select(f: &Function, arity: usize, single: &HashSet<Inst>) -> Opti
         || !f.handler_cases.is_empty()
         || f.frame_states
             .iter()
-            .any(|(_, state)| state.scopes.len() != 1)
+            .any(|(_, state)| state.scopes.is_empty()
+                || state.scopes.iter().any(|scope| scope.function != state.scopes[0].function))
         || f.block(f.entry()).params.len() != arity
     {
         return None;
     }
+    // Same-body nested recovery elsewhere does not affect this entry proof:
+    // walk admits only pure register paths and falls back to framed execution
+    // on a failed check, without interpreting any recovery metadata itself.
     let values = f
         .block(f.entry())
         .params
@@ -322,9 +326,37 @@ pub(super) fn emit_selected(a: &mut Asm, prefix: &Prefix, continuation: Option<e
 /// These are only used after a direct self-call's poll and MV checks, never at
 /// public entry. All work is done at compile time; no expression tree, virtual
 /// frame, or partially executed call survives into the generated shortcut.
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Specialization {
     argument: u64,
     result: u64,
+}
+
+/// Exact-input results proved before recursive expansion. The owner may reuse
+/// these only for the same retained body's source-proven self calls, after the
+/// normal poll and multiple-value admission checks.
+#[derive(Clone, Copy, Debug)]
+pub struct OrdinarySelfSpecializations {
+    cases: [Option<Specialization>; 4],
+}
+
+impl OrdinarySelfSpecializations {
+    pub fn prove(f: &Function, arity: usize, self_calls: &[Inst]) -> Self {
+        let mut cases = [None; 4];
+        // Keep the evaluator's three logical edges and instruction budget in
+        // terms of the original body, never expanded physical invocations.
+        if f.frame_states.iter().all(|(_, state)| state.scopes.len() == 1) {
+            let single = crate::t2::opt_clear_mv::single_value_state(f, true);
+            for (slot, case) in cases.iter_mut().zip(specialize(f, arity, &single, self_calls)) {
+                *slot = Some(case);
+            }
+        }
+        Self { cases }
+    }
+
+    pub(super) fn cases(self) -> Vec<Specialization> {
+        self.cases.into_iter().flatten().collect()
+    }
 }
 
 fn evaluate_pure(
@@ -533,6 +565,27 @@ mod tests {
         f
     }
 
+    #[test]
+    fn pure_prefix_retains_same_body_nested_recovery_metadata() {
+        use crate::t2::frame_state::{FrameScope, FrameState};
+        for (functions, admitted) in [
+            (vec![17, 17, 17], true),
+            (vec![], false),
+            (vec![17, 18], false),
+        ] {
+            let mut f = identity();
+            f.frame_states.add(FrameState {
+                scopes: functions.into_iter().map(|function| FrameScope {
+                    function, bcp: 0, locals: vec![], stack: vec![],
+                }).collect(),
+                remat: vec![],
+            });
+            let returns = f.block(f.entry()).insts.iter().copied().collect();
+            assert_eq!(select(&f, 1, &returns).is_some(), admitted,
+                "unrelated nested recovery metadata must not disable a pure entry return");
+        }
+    }
+
     fn counter(reverse: bool) -> (Function, Inst) {
         use crate::t2::frame_state::{FrameScope, FrameState};
         let mut f = identity();
@@ -683,10 +736,16 @@ mod tests {
             let cases = specialize(&f, 1, &single, &[call]);
             let cases: Vec<_> = cases.iter()
                 .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3)).collect();
+            let retained: Vec<_> = OrdinarySelfSpecializations::prove(&f, 1, &[call]).cases()
+                .iter().map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3))
+                .collect();
+            assert_eq!(retained, cases, "retained proofs preserve the original logical-depth limit");
             assert_eq!(cases, if reverse { vec![(-1, 2), (-2, 4), (-3, 6)] }
                 else { vec![(0, 1), (1, 3), (2, 5)] });
             assert!(specialize(&f, 1, &single, &[]).is_empty(), "source proof is required");
             assert!(specialize(&f, 2, &single, &[call]).is_empty(), "all inputs must be known");
+            assert!(OrdinarySelfSpecializations::prove(&f, 1, &[]).cases().is_empty());
+            assert!(OrdinarySelfSpecializations::prove(&f, 2, &[call]).cases().is_empty());
         }
     }
 
@@ -724,6 +783,8 @@ mod tests {
         assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), None);
         let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
         assert!(specialize(&f, 1, &single, &[call]).is_empty());
+        assert!(OrdinarySelfSpecializations::prove(&f, 1, &[call]).cases().is_empty(),
+            "retained proofs must not erase a recursive declaration failure");
         f.refine_type(parameter, IRType {
             range: Some(Range { lo: -1, hi: 2 }),
             ..IRType::of(TypeBits::FIXNUM)

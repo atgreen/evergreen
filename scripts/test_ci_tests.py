@@ -65,16 +65,17 @@ class RunnerTests(unittest.TestCase):
 
     def test_native_ignored_cases_require_explicit_supported_admission(self):
         runner = self.load()
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            harness = self.fixture(root)
-            executable = root / harness["executable"]
-            executable.write_text(executable.read_text().replace("ignored: test", runner.NATIVE + "boundary: test"))
-            ordinary = runner.discover(root, harness, False)
-            admitted = runner.discover(root, harness, True)
-            self.assertEqual(len(ordinary), 1)
-            self.assertEqual(len(admitted), 2)
-            self.assertTrue(next(case for case in admitted if case["test"].startswith(runner.NATIVE))["ignored"])
+        for prefix in (runner.NATIVE, "cli::bytecode::native_transfer_entry::"):
+            with self.subTest(prefix=prefix), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                harness = self.fixture(root)
+                executable = root / harness["executable"]
+                executable.write_text(executable.read_text().replace("ignored: test", prefix + "boundary: test"))
+                ordinary = runner.discover(root, harness, False)
+                admitted = runner.discover(root, harness, True)
+                self.assertEqual(len(ordinary), 1)
+                self.assertEqual(len(admitted), 2)
+                self.assertTrue(next(case for case in admitted if case["test"].startswith(prefix))["ignored"])
 
     def test_shard_rejects_modified_artifact_and_wrong_provenance(self):
         runner = self.load()

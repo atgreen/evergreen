@@ -721,7 +721,7 @@ impl TransferCode {
             let Instr::CallNamed { sym, .. } = instruction else { return None };
             call_table::resolve(*sym).map(|cell| (*sym, cell))
         }).collect();
-        Self::emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
+        Self::emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1, None)
     }
 
     /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
@@ -735,7 +735,7 @@ impl TransferCode {
         allow_recursion: bool,
         tier: CompilationTier,
     ) -> Option<Self> {
-        Self::emit_prepared_with_ordinary(body, roots, ir, None, deopt_metadata, call_cells, allow_recursion, tier)
+        Self::emit_prepared_with_ordinary(body, roots, ir, None, deopt_metadata, call_cells, allow_recursion, tier, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -748,6 +748,7 @@ impl TransferCode {
         call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
         allow_recursion: bool,
         tier: CompilationTier,
+        self_specializations: Option<egcl_compiler::t2::emit::OrdinarySelfSpecializations>,
     ) -> Option<Self> {
         // Every normal mapped entry clears the complete MV buffer before
         // admission (outer, nested, and recursive). OSR deliberately preserves
@@ -908,6 +909,7 @@ impl TransferCode {
                                     // re-enter run, and callbacks restore the
                                     // enclosing control before native resume.
                                     trusted_control: true,
+                                    specializations: self_specializations,
                                 }).inspect_err(|error| t2_log_write(format_args!(
                                     "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
                                 ))).ok()
@@ -3779,7 +3781,7 @@ mod ordinary_osr_companion_tests {
         egcl_compiler::t2::verify::verify(&ir).unwrap();
         let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
             retain_native_body(&body), &ir, Some(&ir), None, &[], false,
-            CompilationTier::T2).expect("both entry protocols emit");
+            CompilationTier::T2, None).expect("both entry protocols emit");
         code.set_installed_symbol(symbol);
         assert!(code.ordinary_entry.is_some(), "full calls use the register ABI");
         assert!(code.osr_entries.is_empty(), "primary offsets describe only primary code");

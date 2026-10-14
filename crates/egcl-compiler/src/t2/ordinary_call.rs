@@ -88,6 +88,8 @@ pub struct OrdinarySelfCallFacts {
     /// restore it before native resumption. The raw ordinary ABI alone does
     /// not establish this precondition (runtime adapters may have no control).
     pub trusted_control: bool,
+    /// Bounded exact-input proofs from this retained body's unexpanded IR.
+    pub specializations: Option<ordinary_prefix::OrdinarySelfSpecializations>,
 }
 
 #[derive(Clone, Copy)]
@@ -102,7 +104,7 @@ pub(super) struct OrdinaryCallEmission<'a> {
     pub(super) poll_veneer: Option<u64>,
     pub(super) self_calls: &'a [Inst],
     direct_self: bool,
-    self_facts: OrdinarySelfCallFacts,
+    pub(super) self_facts: OrdinarySelfCallFacts,
 }
 
 /// Emit a single named ordinary call followed immediately by returning its

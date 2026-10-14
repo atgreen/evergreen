@@ -157,6 +157,9 @@ mod ordinary_call;
 mod ordinary_prefix;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use ordinary_prefix::OrdinarySelfSpecializations;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[path = "ordinary_primitives.rs"]
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1363,6 +1366,7 @@ fn parallel_home_move_snapshot(a: &mut Asm, moves: &[(FramedHome, HomeMoveSrc)])
 fn emit_arith_inst(
     a: &mut Asm,
     f: &Function,
+    inference: &crate::t2::infer::InferenceResult,
     data: &crate::t2::ir::InstData,
     reg: &mut std::collections::HashMap<crate::t2::ir::Value, u8>,
     pool: &mut Vec<u8>,
@@ -1458,7 +1462,7 @@ fn emit_arith_inst(
             let (a0, b0) = (data.args[0], data.args[1]);
             let range = |v| consts.get(&v)
                 .map(|&n| crate::t2::ir::Range { lo: n, hi: n })
-                .or(f.value(v).ty.range);
+                .or_else(|| inference.range(v));
             let needs_overflow_check = !add_sub_cannot_overflow(range(a0), range(b0), !is_add);
             // Fold a constant right operand (add/sub var, const), or a constant left
             // operand for the commutative add.
@@ -5753,7 +5757,9 @@ fn emit_framed_inner(
         ordinary_prefix::select(f, options.arity, &single_returns));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_self_specializations = ordinary.zip(ordinary_call).map_or_else(Vec::new,
-        |(options, calls)| ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls));
+        |(options, calls)| calls.self_facts.specializations.map_or_else(
+            || ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls),
+            |proof| if calls.self_calls.is_empty() { Vec::new() } else { proof.cases() }));
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
@@ -6486,6 +6492,7 @@ fn emit_framed_inner(
                 emit_arith_inst(
                     &mut a,
                     f,
+                    &inference,
                     &d,
                     &mut inst_reg,
                     &mut inst_pool,
@@ -8758,6 +8765,53 @@ mod tests {
     fn has_overflow_branch(code: &[u8]) -> bool {
         iced_x86::Decoder::new(64, code, iced_x86::DecoderOptions::NONE)
             .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Jo)
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_subtraction_uses_inferred_intermediate_bounds() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{IRType, Opcode, Range, TypeBits, ValueRepresentation};
+        for bounded in [true, false] {
+            let mut f = build_mul_ranged(1, bounded.then_some(Range { lo: 0, hi: 40 }));
+            let entry = f.entry();
+            let first = f.block(entry).insts[1];
+            f.inst_mut(first).opcode = Opcode::FixnumSub;
+            let parameter = f.block(entry).params[0];
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope { function: 17, bcp: 0,
+                    locals: vec![ValueSource::Value { value: parameter,
+                        repr: ValueRepresentation::Tagged }], stack: vec![] }],
+                remat: vec![],
+            });
+            f.inst_mut(first).frame_state = Some(state);
+            let intermediate = f.inst(first).results[0];
+            assert_eq!(f.value(intermediate).ty.range, None);
+            if bounded {
+                assert_eq!(crate::t2::infer::infer(&f).range(intermediate),
+                    Some(Range { lo: -1, hi: 39 }));
+            }
+            let ret = f.block_mut(entry).insts.pop().unwrap();
+            let mut second = f.inst(first).clone();
+            second.args[0] = intermediate;
+            second.results.clear();
+            let (_, result) = f.push_inst(entry, second,
+                &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)]);
+            f.inst_mut(ret).args[0] = result[0];
+            f.block_mut(entry).insts.push(ret);
+            crate::t2::verify::verify(&f).unwrap();
+            let emitted = emit_framed(&f, mock_c2i_deopt as *const () as usize as u64,
+                0, 0, 0, 0, 0, 0, 0, None).unwrap();
+            assert_eq!(has_overflow_branch(&emitted.code), !bounded,
+                "inferred operands may discharge overflow only when their bounds prove it");
+            let buffer = egcl_rt::jit::JitBuffer::new(&emitted.code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            for x in [0, 40] {
+                let mut frame = [egcl_rt::EgclVal::from_fixnum(x).0, 0, 0, 0];
+                assert_eq!(egcl_rt::EgclVal(function(frame.as_mut_ptr())).as_fixnum(), x - 2);
+            }
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", unix))]

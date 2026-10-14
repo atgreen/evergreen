@@ -9,6 +9,14 @@
   ([#331](https://github.com/atgreen/evergreen/pull/331)). The matched typed
   Fibonacci comparison measured a small slowdown from 30 ms to 31 ms median;
   see the [checked-result report](tests/benchmarks/results/2026-10-14-fib-checked-results.md).
+- Support recovery from failed native guards across retained, self-inlined
+  recursive frames. Validate each reconstructed frame and preserve the executing
+  definition and its argument contracts across function redefinition, including
+  recovery through native child calls
+  ([#332](https://github.com/atgreen/evergreen/pull/332),
+  [#333](https://github.com/atgreen/evergreen/pull/333),
+  [#334](https://github.com/atgreen/evergreen/pull/334)). These changes provide
+  recovery support; they do not by themselves enable automatic recursive inlining.
 
 ## 0.0.8 - 2026-10-14
 
