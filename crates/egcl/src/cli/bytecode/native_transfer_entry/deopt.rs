@@ -305,21 +305,64 @@ unsafe fn validate_guard_stream_slots(
         return Err(invalid_capture());
     }
     let words = unsafe { std::slice::from_raw_parts(request.words, request.n_words as usize) };
-    let function = u32::try_from(words[0]).map_err(|_| invalid_capture())?;
-    let bcp = u32::try_from(words[1]).map_err(|_| invalid_capture())?;
-    let Some(body) = metadata.deopt_bodies.get(&function) else {
-        return Err(invalid_capture());
-    };
-    if !Arc::ptr_eq(body, &code.body)
-        || words[2] != u64::from(code.body.n_locals)
-        || words[3] > u64::from(code.body.max_stack)
-        || words[2] + words[3] + 4 != request.n_words
-        || words[2] + words[3] > u64::from(slots)
-        || code.control_scopes.before(bcp).is_none()
+    validate_guard_scope_chain(words, request.n_scopes, code, slots, metadata)
+}
+
+/// Validate retained logical self frames without changing slots or native state.
+/// The production wrapper still admits one frame until nested resumption is wired.
+fn validate_guard_scope_chain(
+    words: &[u64],
+    count: u64,
+    code: &TransferCode,
+    slots: u16,
+    metadata: &T2InstalledMetadata,
+) -> Result<u32, EgclError> {
+    let ranges = deopt_payload_ranges(words, count)?;
+    let nested = ranges.len() > 1;
+    if slots < code.body.num_slots()
+        || (nested && (code.ordinary_entry.is_none() || code.body.has_env
+            || !code.body.params_form.is_nil() || !scope_free_native_body(&code.body, false)))
     {
         return Err(invalid_capture());
     }
-    Ok(bcp)
+    let depths = verified_operand_stack_depths(&code.body).map_err(|_| invalid_capture())?;
+    for (index, range) in ranges.iter().enumerate() {
+        let header = &words[range.start - 4..range.start];
+        let function = u32::try_from(header[0]).map_err(|_| invalid_capture())?;
+        let bcp = u32::try_from(header[1]).map_err(|_| invalid_capture())?;
+        let body = metadata.deopt_bodies.get(&function).ok_or_else(invalid_capture)?;
+        if !Arc::ptr_eq(body, &code.body) || header[2] != u64::from(body.n_locals)
+            || header[3] > u64::from(body.max_stack)
+        {
+            return Err(invalid_capture());
+        }
+        let active = code.control_scopes.before(bcp).ok_or_else(invalid_capture)?;
+        if nested && active.iter().any(|scope| scope.ownership != Ownership::Local
+            || !matches!(scope.kind, ScopeKind::Block { register: false, .. }))
+        {
+            return Err(invalid_capture());
+        }
+        let suspended = index + 1 < ranges.len();
+        let saved = header[3] as u32;
+        if depths.get(bcp as usize).copied().flatten() != Some(saved + u32::from(suspended)) {
+            return Err(invalid_capture());
+        }
+        if suspended {
+            let call_pc = bcp.checked_sub(1).ok_or_else(invalid_capture)?;
+            let Some(Instr::CallNamed { sym, nargs }) = body.code.get(call_pc as usize) else {
+                return Err(invalid_capture());
+            };
+            if *sym != function || *nargs != body.arity
+                || !body.self_call_sites.contains(&call_pc)
+                || depths.get(call_pc as usize).copied().flatten()
+                    .and_then(|depth| depth.checked_sub(u32::from(*nargs))) != Some(saved)
+                || words[ranges[index + 1].start - 4] != u64::from(*sym)
+            {
+                return Err(invalid_capture());
+            }
+        }
+    }
+    u32::try_from(words[1]).map_err(|_| invalid_capture())
 }
 
 /// The top deoptimizing native map deliberately omits its old SSA homes.
@@ -365,6 +408,165 @@ fn deopt_payload_ranges(words: &[u64], n_scopes: u64) -> Result<Vec<std::ops::Ra
     }
     if offset != words.len() { return Err(invalid_capture()); }
     Ok(ranges)
+}
+
+#[cfg(test)]
+mod retained_guard_chain_tests {
+    use super::*;
+
+    fn fixture(env: &mut Env) -> (u32, Rc<NativeCode>) {
+        crate::cli::read_eval_all_env(
+            "(defun retained-guard-chain (n)
+               (declare (type fixnum n))
+               (if (< n 1) n (+ 1 (retained-guard-chain (- n 1)))))",
+            env,
+        ).expect("install the source identity before proving recursive calls");
+        crate::cli::bytecode::native_transfer_tests::ordinary_t2::install(
+            "RETAINED-GUARD-CHAIN", "(n)",
+            "((declare (type fixnum n))
+              (if (< n 1) n (+ 1 (retained-guard-chain (- n 1)))))", env,
+        )
+    }
+
+    fn mapped(code: &NativeCode) -> &TransferCode {
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+            panic!("fixture must install ordinary mapped T2");
+        };
+        assert!(code.is_t2);
+        assert!(mapped.ordinary_entry.is_some());
+        mapped
+    }
+
+    fn frame_words(symbol: u32, body: &BytecodeFunction, bcp: u32, depth: u32) -> Vec<u64> {
+        let mut words = vec![u64::from(symbol), u64::from(bcp),
+            u64::from(body.n_locals), u64::from(depth)];
+        words.resize(4 + usize::from(body.n_locals) + depth as usize,
+            EgclVal::from_fixnum(1).to_raw());
+        words
+    }
+
+    fn validate(words: &[u64], count: u64, code: &TransferCode) -> Result<u32, EgclError> {
+        validate_guard_scope_chain(words, count, code, code.body.num_slots(),
+            code.deopt_metadata.as_ref().expect("retained deopt metadata"))
+    }
+
+    fn validate_native(words: &[u64], count: u64, code: &TransferCode) -> Result<u32, EgclError> {
+        let request = TransferDeoptRequest {
+            n_scopes: count,
+            n_words: words.len() as u64,
+            words: words.as_ptr(),
+            activation: std::ptr::null_mut(),
+        };
+        unsafe { validate_guard_stream_slots(&request, code, code.body.num_slots(),
+            code.deopt_metadata.as_ref().expect("retained deopt metadata")) }
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn retained_self_guard_chain_validates_every_logical_frame() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let (symbol, owner) = fixture(&mut env);
+        let code = mapped(&owner);
+        let body = &code.body;
+        let depths = verified_operand_stack_depths(body).expect("verified fixture bytecode");
+        let &[call_pc] = body.self_call_sites.as_slice() else {
+            panic!("fixture must contain exactly one source-proven self call");
+        };
+        let Instr::CallNamed { sym, nargs } = body.code[call_pc as usize] else {
+            panic!("retained source site must be a named call");
+        };
+        assert_eq!(sym, symbol);
+        assert_eq!(nargs, body.arity);
+        let parent_pc = call_pc + 1;
+        let pending_depth = depths[call_pc as usize].unwrap() - u32::from(nargs);
+        assert_eq!(depths[parent_pc as usize], Some(pending_depth + 1));
+        assert!(pending_depth > 0, "fixture retains a live left operand across recursion");
+        let child = frame_words(symbol, body, 0, depths[0].unwrap());
+        assert_eq!(validate(&child, 1, code).unwrap(), 0, "single-frame control");
+        let parent = frame_words(symbol, body, parent_pc, pending_depth);
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        for count in [2usize, 3] {
+            let mut words = parent.repeat(count - 1);
+            words.extend_from_slice(&child);
+            let original = words.clone();
+            let result = validate(&words, count as u64, code);
+            assert_eq!(words, original, "validation must not rewrite payloads");
+            assert_eq!((stack.fp(), stack.sp()), before, "validation must not materialize frames");
+            assert_eq!(result.unwrap_or_else(|error| panic!(
+                "valid {count}-frame retained self chain rejected: {error:?}")), parent_pc);
+            assert!(validate_native(&words, count as u64, code).is_err(),
+                "production must keep nested recovery gated until resumption is supported");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn retained_guard_rejects_wrong_reachable_operand_depth() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let (symbol, owner) = fixture(&mut env);
+        let code = mapped(&owner);
+        let depths = verified_operand_stack_depths(&code.body).unwrap();
+        assert_eq!(depths[0], Some(0));
+        let valid = frame_words(symbol, &code.body, 0, 0);
+        assert_eq!(validate(&valid, 1, code).unwrap(), 0);
+        let wrong = frame_words(symbol, &code.body, 0, 1);
+        assert!(code.body.max_stack > 1, "wrong depth must still fit declared capacity");
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        let result = validate(&wrong, 1, code);
+        assert_eq!((stack.fp(), stack.sp()), before);
+        assert!(result.is_err(), "capacity alone does not establish the bytecode continuation depth");
+        assert!(validate_native(&wrong, 1, code).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn retained_guard_chain_rejects_malformed_headers_and_capacity() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let (symbol, owner) = fixture(&mut env);
+        let code = mapped(&owner);
+        let body = &code.body;
+        let depths = verified_operand_stack_depths(body).unwrap();
+        let call_pc = body.self_call_sites[0];
+        let pending = depths[call_pc as usize].unwrap() - u32::from(body.arity);
+        let mut words = frame_words(symbol, body, call_pc + 1, pending);
+        let child_header = words.len();
+        words.extend(frame_words(symbol, body, 0, 0));
+        assert!(validate(&words, 2, code).is_ok());
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        for (offset, value) in [
+            (0, u64::MAX), (1, 0), (2, u64::MAX), (3, u64::MAX),
+            (child_header, u64::from(u32::MAX)),
+            (child_header + 1, u64::MAX), (child_header + 2, u64::MAX),
+        ] {
+            let mut invalid = words.clone();
+            invalid[offset] = value;
+            assert!(validate(&invalid, 2, code).is_err(), "header word {offset}");
+        }
+        for count in [0, 1, 3, u64::MAX] {
+            assert!(validate(&words, count, code).is_err(), "scope count {count}");
+        }
+        for end in 0..words.len() {
+            assert!(validate(&words[..end], 2, code).is_err(), "truncated at {end}");
+        }
+        let mut trailing = words.clone();
+        trailing.push(NIL.to_raw());
+        assert!(validate(&trailing, 2, code).is_err());
+        let metadata = code.deopt_metadata.as_ref().unwrap();
+        let single = frame_words(symbol, body, 0, 0);
+        assert!(validate_guard_scope_chain(&single, 1, code,
+            body.num_slots() - 1, metadata).is_err(),
+            "saved values fitting is insufficient for future interpreter execution");
+        assert_eq!((stack.fp(), stack.sp()), before);
+    }
 }
 
 #[cfg(test)]
