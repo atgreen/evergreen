@@ -2104,9 +2104,11 @@ mod tests {
             ACTIVE.with(|slot| slot.set(real));
             assert_eq!(boundary.visited.get(), 0, "{label}: the walk must stop without guessing");
             let mut expected = [0; BAIL_KINDS];
-            // Exactly the malformed head in the mark and relocation scans;
+            // Exactly the malformed head in mark and relocation, plus the
+            // optional post-relocation verification scan. Keep exact counts:
             // an unrelated bad publication cannot hide behind this allowance.
-            expected[*reason as usize] = 2;
+            expected[*reason as usize] = 2
+                + usize::from(std::env::var_os("EGCL_GC_VERIFY").is_some());
             assert_eq!(bails, expected,
                 "{label}: only the deliberate malformed publication may decline");
             eprintln!("  {label}: bails=[{}]", describe_bails(bails));

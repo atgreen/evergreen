@@ -54,11 +54,11 @@ fn exercise(notinline: bool) {
     egcl_rt::rooted_ref!(_env = &mut env);
     let name = if notinline { "ORDINARY-DYNAMIC-SELF-GC" } else { "ORDINARY-DIRECT-SELF-GC" };
     let declaration = if notinline { format!("(declare (notinline {name}))") } else { String::new() };
-    let forms = format!("({declaration} (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))");
+    let forms = format!("({declaration} (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} (- n 1) marker) 0))))");
     super::super::super::read_eval_all_env(&format!(
         "(defun self-cold-observer () (%ordinary-t2-entry-for-test))
          (defun {name} (n marker) {declaration}
-           (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} 0 marker) 0))))"), &mut env).unwrap();
+           (if (= n 0) (car marker) (progn (self-cold-observer) (+ ({name} (- n 1) marker) 0))))"), &mut env).unwrap();
     let (symbol, code) = ordinary_t2::install(name, "(n marker)", &forms, &mut env);
     assert!(code.is_t2);
     let body = code.body.as_ref().expect("installed bytecode body");
@@ -76,7 +76,9 @@ fn exercise(notinline: bool) {
     assert!(mapped.ordinary_entry.is_some());
     ordinary_t2::expect_entry(&code);
     egcl_rt::rooted!(marker = super::super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
-    egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(1), *marker]);
+    // Reach a residual call beyond the two worker inline levels so replacement
+    // and moving GC actually happen in cold admission, not a removed call.
+    egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(3), *marker]);
     MARKER.with(|slot| slot.set(&mut *marker));
     REPLACEMENT.with(|source| *source.borrow_mut() = format!("(defun {name} (n marker) 99)"));
     REPLACED.with(|flag| flag.set(false));

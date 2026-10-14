@@ -151,7 +151,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         specializations,
     );
     let mut emitted = emit(&prepared.ordinary_ir, prepared.self_specializations);
-    if !emitted.as_ref().is_some_and(|code| code.ordinary_entry.is_some()) {
+    if emitted.as_ref().is_none_or(|code| code.ordinary_entry.is_none()) {
         if let Some(fallback) = &prepared.ordinary_fallback {
             // Expansion is optional: an unsupported expanded shape must not
             // discard the ordinary ABI that the original candidate could use.
