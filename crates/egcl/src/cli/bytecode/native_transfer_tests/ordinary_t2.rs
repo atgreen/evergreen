@@ -161,6 +161,59 @@ fn ordinary_t2_admits_checked_fixnum_self_recursion() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-BOUNDED-FIBONACCI";
+    let form = "(if (< n 2) n
+        (+ (ordinary-t2-bounded-fibonacci (- n 1))
+           (ordinary-t2-bounded-fibonacci (- n 2))))";
+    crate::cli::read_eval_all_env(
+        &format!("(defun {name} (n) (declare (type (integer 0 40) n)) {form})"),
+        &mut env,
+    )
+    .unwrap();
+    let (symbol, code) = install(
+        name,
+        "(n)",
+        &format!("((declare (type (integer 0 40) n)) {form})"),
+        &mut env,
+    );
+    assert_mapped_t2(&code);
+    let body = code.body.as_ref().expect("installed source body");
+    let calls: Vec<_> = body.code.iter().enumerate().filter_map(|(pc, instruction)| {
+        matches!(instruction, Instr::CallNamed { sym, .. } if *sym == symbol)
+            .then_some(pc as u32)
+    }).collect();
+    assert_eq!(calls.len(), 2, "fibonacci retains both non-tail recursive calls");
+    assert_eq!(body.self_call_sites, calls,
+        "both Fibonacci calls must remain source-proven direct-self sites");
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some(),
+        "bounded recursion must use the ordinary register ABI");
+    let bytes = unsafe { std::slice::from_raw_parts(code.entry, code.code_len) };
+    let direct_calls = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
+        iced_x86::DecoderOptions::NONE).into_iter().filter(|instruction|
+        instruction.code() == iced_x86::Code::Call_rel32_64
+            && instruction.near_branch_target() >= code.entry as u64
+            && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
+        .count();
+    assert_eq!(direct_calls, 2, "both recursive edges must call generated code directly");
+    native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
+        EgclVal::from_fixnum(144));
+    assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0);
+    assert_eq!(native_transfer_entry::ordinary_calls::take_named_entries_for_test(), 0);
+    egcl_rt::rooted!(bad_args = vec![NIL]);
+    assert!(matches!(run_native(&code, symbol, &bad_args, &mut env),
+        Err(EgclError::TypeError { .. })),
+        "the public Fibonacci entry must retain its checked parameter contract");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_installs_published_calls_without_success_return_poll() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
