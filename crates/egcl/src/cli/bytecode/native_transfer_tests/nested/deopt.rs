@@ -5,6 +5,58 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn deopt_outer_frame_has_room_for_the_resumed_body() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
+    let owner = egcl_rt::symbols::intern("DEOPT-OUTER-CAPACITY");
+    let body = Arc::new(
+        compile_function("DEOPT-OUTER-CAPACITY", *params, *forms, &env, false, false)
+            .expect("compile retained identity"),
+    );
+    assert_eq!(body.n_locals, 1);
+    assert_eq!(body.max_stack, 1);
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(owner, Arc::clone(&body))].into_iter().collect(),
+    });
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (capacity, accepted) in [(1, false), (2, true), (3, true)] {
+        let frame = stack.push_frame(
+            EgclVal::from_symbol_index(owner), std::ptr::null(), capacity, FLAG_CALL,
+        ).unwrap();
+        let original = EgclVal::from_fixnum(17);
+        unsafe { slot_set(frame, 0, original) };
+        let frame_sp = stack.sp();
+        // The saved local fits even in the undersized frame, so probing the
+        // old acceptance is safe. Never execute that frame: LoadLocal needs
+        // a second slot despite the empty saved operand stack.
+        let words = [u64::from(owner), 0, 1, 0, EgclVal::from_fixnum(23).0];
+        let result = materialize_t2_deopt_scopes(
+            1, words.len() as u64, words.as_ptr(), Some(frame), Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted { mismatches.push(capacity); }
+        if result.is_err() {
+            assert_eq!(unsafe { slot_get(frame, 0) }, original, "rejection preserves locals");
+        }
+        assert_eq!(stack.fp(), frame);
+        assert_eq!(stack.sp(), frame_sp);
+        stack.pop_frame();
+        assert_eq!(stack.fp(), before_fp);
+        assert_eq!(stack.sp(), before_sp);
+    }
+    assert!(mismatches.is_empty(), "incorrect outer-frame capacity acceptance: {mismatches:?}");
+}
+
+#[test]
 fn deopt_scope_chain_matches_call_continuations() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
@@ -70,6 +122,8 @@ fn deopt_scope_chain_matches_call_continuations() {
     let three = EgclVal::from_fixnum(3);
     let mut valid = scope(parent_symbol, call_pc + 1, &[three]);
     valid.extend(scope(child_symbol, 0, &[]));
+    let mut trailing_word = valid.clone();
+    trailing_word.push(0);
     let mut wrong_target = scope(parent_symbol, call_pc + 1, &[three]);
     wrong_target.extend(scope(other_symbol, 0, &[]));
     let mut wrong_parent_pc = scope(parent_symbol, 0, &[three]);
@@ -89,6 +143,7 @@ fn deopt_scope_chain_matches_call_continuations() {
         ("wrong child guard depth", wrong_child_depth, 2, false),
         ("wrong root guard depth", scope(child_symbol, 0, &[three]), 1, false),
         ("unreachable suspended call", unreachable_call, 2, false),
+        ("trailing word after valid chain", trailing_word, 2, false),
     ];
     let stack = egcl_rt::current_stack();
     let before_fp = stack.fp();

@@ -18448,6 +18448,13 @@ fn materialize_t2_deopt_scopes(
             }
         }
         let frame = if let (0, Some(outer)) = (scope_index, outer) {
+            // The saved payload may be smaller than the operand stack needed
+            // by subsequent T0 instructions. Frame::num_locals records the
+            // full allocated slot extent, including native spill/root homes.
+            if outer.is_null() || unsafe { (*outer).num_locals } < entry.num_slots() {
+                error = Some("T2 outer frame cannot hold its retained interpreter body");
+                break;
+            }
             outer
         } else {
             let Some(frame) = stack.push_frame(
