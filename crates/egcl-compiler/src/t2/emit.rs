@@ -3065,9 +3065,9 @@ fn emit_cons_guard(
 
 /// A speculated fixnum operand proof reified as an SSA guard value
 /// (speculate.rs materialize_fixnum_operand_guards, egcl-x5y.25b): test the
-/// low three tag bits are zero, deopt otherwise, and pass the value through to
-/// its result register. Downstream typed ops skip their own operand re-check
-/// because the result's inferred type is FIXNUM.
+/// low three tag bits are zero and enforce any inclusive range, deopt otherwise,
+/// then pass the value through to its result register. The result's type facts
+/// must be true before downstream typed operations can rely on them.
 fn emit_fixnum_value_guard(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -3089,6 +3089,28 @@ fn emit_fixnum_value_guard(
         .get(&data.args[0])
         .ok_or(EmitError::UnsupportedOp(0xF2))?;
     guard_fixnum(a, xr, deopt);
+    if let AuxData::TypeTag(ty) = data.aux {
+        if let Some(range) = ty.range {
+            // Intersect with the tag's representable domain before shifting
+            // bounds. Tagged fixnums preserve signed integer ordering.
+            let lo = range.lo.max(FIXNUM_MIN);
+            let hi = range.hi.min(FIXNUM_MAX);
+            if lo > hi {
+                a.jmp(deopt);
+            } else {
+                if lo > FIXNUM_MIN {
+                    mov_imm64(a, SCRATCH, lo << 3);
+                    cmp_rr(a, xr, SCRATCH);
+                    a.jcc(Cc::L, deopt);
+                }
+                if hi < FIXNUM_MAX {
+                    mov_imm64(a, SCRATCH, hi << 3);
+                    cmp_rr(a, xr, SCRATCH);
+                    a.jcc(Cc::G, deopt);
+                }
+            }
+        }
+    }
     let dst = framed_alloc(reg, pool, data.results[0])?;
     mov_rr(a, dst, xr);
     Ok(())
@@ -8473,6 +8495,92 @@ mod tests {
             let _ = char_at(char_frame.as_mut_ptr());
             assert!(DEOPTED.load(Ordering::SeqCst), "{why} must deopt");
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn fixnum_guard_enforces_inclusive_declared_ranges() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, Range, TypeBits,
+            ValueRepresentation,
+        };
+        use egcl_rt::value::{EgclVal, NIL};
+        std::thread_local! {
+            static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn reject() { REJECTED.with(|seen| seen.set(true)); }
+        let mut missed = Vec::new();
+        for range in [
+            Range { lo: -3, hi: 5 },
+            Range { lo: 1 << 40, hi: (1 << 40) + 5 },
+            Range { lo: FIXNUM_MIN, hi: FIXNUM_MIN + 1 },
+            Range { lo: FIXNUM_MAX - 1, hi: FIXNUM_MAX },
+            Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX },
+            Range { lo: i64::MIN, hi: i64::MAX },
+            Range { lo: FIXNUM_MIN - 2, hi: FIXNUM_MIN - 1 },
+            Range { lo: FIXNUM_MAX + 1, hi: FIXNUM_MAX + 2 },
+            Range { lo: 5, hi: -3 },
+            Range { lo: 0, hi: 0 },
+        ] {
+            let mut f = Function::new("checked-inline-argument");
+            let entry = f.entry();
+            let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope { function: 0, bcp: 7,
+                    locals: vec![ValueSource::Value { value: input, repr: ValueRepresentation::Tagged }],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let checked_type = IRType { bits: TypeBits::FIXNUM, range: Some(range), class_id: None };
+            // A dominating tag proof must not erase the narrower range guard.
+            let (_, tagged) = f.push_inst(entry, InstData {
+                opcode: Opcode::Guard, args: vec![input], results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: Some(state), source_pos: 0,
+            }, &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)]);
+            let (_, checked) = f.push_inst(entry, InstData {
+                opcode: Opcode::Guard, args: vec![tagged[0]], results: vec![],
+                aux: AuxData::TypeTag(checked_type),
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: Some(state), source_pos: 0,
+            }, &[(checked_type, ValueRepresentation::Tagged)]);
+            f.set_terminator(entry, InstData {
+                opcode: Opcode::Return, args: vec![checked[0]], results: vec![],
+                aux: AuxData::None, flags: InstFlags { terminator: true, ..Default::default() }, targets: vec![],
+                frame_state: None, source_pos: 0,
+            });
+            crate::t2::verify::verify(&f).expect("bounded guard IR");
+            crate::t2::pass::Pass::run(&mut crate::t2::opt_guard::GuardElim,
+                &mut f, &mut crate::t2::pass::Analyses::new());
+            crate::t2::verify::verify(&f).expect("optimized bounded guard IR");
+            let code = emit_framed(&f, reject as *const () as usize as u64,
+                0, 0, 0, 0, 0, 0, 0, None).expect("emit bounded guard");
+            let buffer = egcl_rt::jit::JitBuffer::new(&code.code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut values = vec![EgclVal::from_fixnum(FIXNUM_MIN), EgclVal::from_fixnum(FIXNUM_MAX),
+                EgclVal::from_fixnum(0), NIL, EgclVal::from_single_float(1.0)];
+            for number in [Some(range.lo), Some(range.hi), range.lo.checked_sub(1), range.hi.checked_add(1)]
+                .into_iter().flatten()
+            {
+                if (FIXNUM_MIN..=FIXNUM_MAX).contains(&number) {
+                    values.push(EgclVal::from_fixnum(number));
+                }
+            }
+            for value in values {
+                REJECTED.with(|seen| seen.set(false));
+                let mut frame = [value.0, 0, 0];
+                let result = function(frame.as_mut_ptr());
+                let accepted = value.is_fixnum()
+                    && (range.lo..=range.hi).contains(&value.as_fixnum());
+                if REJECTED.with(|seen| seen.get()) == accepted { missed.push((range, value)); }
+                if accepted { assert_eq!(result, value.0, "guard preserves the argument"); }
+            }
+        }
+        assert!(missed.is_empty(), "incorrect bounded guard decisions: {missed:?}");
     }
 
     /// The framed-emitter milestone: a T2-emitted `(* x 5)` runs via the
