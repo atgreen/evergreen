@@ -228,13 +228,15 @@ pub enum InlinePolicy {
     NotInline,
 }
 
-/// Profitability limits. The 500-node budget is the current T2 post-inline
-/// cap; a larger budget needs a separate decision before arbitrary body
-/// cloning lands.
+/// Profitability limits. The growth budget charges estimated body costs, not
+/// exact emitted IR nodes; intrinsic lowering can expand individual bytecodes.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InlineConfig {
     pub small_threshold: u32,
     pub max_depth: u8,
+    /// Opt-in bound for source-proven self expansion. Zero keeps it disabled
+    /// until the embedding runtime admits nested recovery for this compilation.
+    pub self_inline_depth: u8,
     pub node_budget: u32,
     /// Minimum calls per 100 profiled caller invocations for a call site to
     /// receive the larger, budget-limited hot-site allowance.
@@ -246,6 +248,7 @@ impl Default for InlineConfig {
         Self {
             small_threshold: 30,
             max_depth: 6,
+            self_inline_depth: 0,
             node_budget: 500,
             hot_frequency_percent: 80,
         }
