@@ -54,6 +54,29 @@ fn parameter_initialization_waits_until_loading() {
 }
 
 #[test]
+fn setf_inline_policies_remain_distinct_through_compile_and_load() {
+    compile_and_load(
+        "(proclaim '(inline policy-cell))
+         (assert (null (proclaim '(notinline (setf policy-cell)))))
+         (assert (eq (get 'policy-cell 'egcl-internal::inline-policy) 'inline))
+         (assert (eq (get 'policy-cell 'egcl-internal::setf-inline-policy) 'notinline))
+         (declaim (notinline policy-cell) (inline (setf policy-cell)))
+         (assert (eq (get 'policy-cell 'egcl-internal::inline-policy) 'notinline))
+         (assert (eq (get 'policy-cell 'egcl-internal::setf-inline-policy) 'inline))",
+        "(declaim (inline policy-cell) (notinline (setf policy-cell)))
+         (eval-when (:compile-toplevel)
+           (assert (eq (get 'policy-cell 'egcl-internal::inline-policy) 'inline))
+           (assert (eq (get 'policy-cell 'egcl-internal::setf-inline-policy) 'notinline)))",
+        "(assert (eq (get 'policy-cell 'egcl-internal::inline-policy) 'inline))
+         (assert (eq (get 'policy-cell 'egcl-internal::setf-inline-policy) 'notinline))
+         (proclaim '(notinline policy-cell))
+         (proclaim '(inline (setf policy-cell)))",
+        "(assert (eq (get 'policy-cell 'egcl-internal::inline-policy) 'inline))
+         (assert (eq (get 'policy-cell 'egcl-internal::setf-inline-policy) 'notinline))",
+    );
+}
+
+#[test]
 fn compilation_preserves_an_existing_parameter_value() {
     compile_and_load(
         "(defparameter *compiled-parameter* :before)",

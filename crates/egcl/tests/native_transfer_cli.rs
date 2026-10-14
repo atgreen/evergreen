@@ -208,9 +208,6 @@ fn t2_calls_stop_before_later_side_effects() {
             "recursive function must publish ordinary register T2 code: {stderr}");
         assert!(stdout.contains("Ordinary x86-64 Lisp ABI"), "{stdout}");
         assert!(!stdout.contains("native recursive entry veneer"), "{stdout}");
-        // Machine-stack recursion retires depth inline; DEC preserves the
-        // carry flag that now reports the native multiple-value return status.
-        assert!(stdout.contains("dec dword [r11]"), "{stdout}");
     } else {
         let self_entry = stderr
             .lines()

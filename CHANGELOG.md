@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Accept global `INLINE` and `NOTINLINE` declarations for SETF function names
+  without confusing their policies with the corresponding getters, fixing
+  ASDF loading ([#326](https://github.com/atgreen/evergreen/pull/326)).
+
 - Forward immediately reloaded native frame slots from their just-stored
   registers while retaining the memory stores needed for garbage collection
   and recovery ([#326](https://github.com/atgreen/evergreen/pull/326), carried

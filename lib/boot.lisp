@@ -358,7 +358,13 @@
     (case (car decl-spec)
       ((inline notinline)
         (dolist (name (cdr decl-spec))
-          (setf (get name 'egcl-internal::inline-policy) (car decl-spec))))
+          ;; The setter and getter are distinct function names. Keep their
+          ;; policies separate rather than applying GET to a SETF name list.
+          (if (and (consp name) (eq (car name) 'setf)
+                   (consp (cdr name)) (symbolp (cadr name)) (null (cddr name)))
+              (setf (get (cadr name) 'egcl-internal::setf-inline-policy)
+                    (car decl-spec))
+              (setf (get name 'egcl-internal::inline-policy) (car decl-spec)))))
       (ftype
         ;; Retain the raw type, including VALUES cardinality syntax. This is
         ;; declaration metadata, not yet a proof about a compiled call result.
