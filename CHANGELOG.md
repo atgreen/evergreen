@@ -2,64 +2,76 @@
 
 ## Unreleased
 
-- Accept global `INLINE` and `NOTINLINE` declarations for SETF function names
-  without confusing their policies with the corresponding getters, fixing
-  ASDF loading ([#326](https://github.com/atgreen/evergreen/pull/326)).
-
-- Forward immediately reloaded native frame slots from their just-stored
-  registers while retaining the memory stores needed for garbage collection
-  and recovery ([#326](https://github.com/atgreen/evergreen/pull/326), carried
-  forward from [#311](https://github.com/atgreen/evergreen/pull/311)).
-
-- Preserve bounded integer parameter ranges in T2, and retain declared argument
-  checks on direct recursive calls, including calls replaced by pure return
-  shortcuts. Use dominating numeric comparisons to prove recursive argument
-  bounds without redundant checks, and omit add/subtract overflow checks when
-  checked operand ranges prove the result fits a fixnum. Correct constant-left
-  subtraction when the result reuses the right operand's register. Retain global
-  `FTYPE` declaration metadata during compilation and source-free BFASL loading;
-  result-type enforcement and optimization from these declarations are not yet enabled
-  ([#326](https://github.com/atgreen/evergreen/pull/326)).
-
-- Replace repeated native runtime checks with an execution-local poll and remove
-  redundant ownership/depth checks from trusted ordinary self-calls. Reduce
-  measured warmed `fib(35)` time from 190.5 ms to 107 ms on the benchmark host
-  ([#312](https://github.com/atgreen/evergreen/pull/312)).
-
-- Schedule fibers cooperatively without automatic CPU time slices or per-fiber
-  CPU budgets. Add cooperative cancellation with explicit checkpoints and
-  interruptible public sleep, park, and join; retain opt-in sandbox CPU limits
-  ([#312](https://github.com/atgreen/evergreen/pull/312)).
-
-- Let eligible ordinary T2 functions return from bounded, noncollecting entry
-  paths before constructing a native frame, including simple recursive base
-  cases ([#310](https://github.com/atgreen/evergreen/pull/310)).
-
-- Reduce ordinary T2 call overhead with direct pending-flag comparisons,
-  proven-empty multiple-value admission and smaller frames. Improve measured
-  untyped `fib(35)` time from 212 ms to 204 ms on the benchmark host
-  ([#309](https://github.com/atgreen/evergreen/pull/309)).
-
-- Use the x86-64 return carry flag to skip redundant multiple-value cleanup in
-  ordinary T2 calls. Reduce measured untyped `fib(35)` time from 390 ms to 211 ms
-  on the benchmark host ([#308](https://github.com/atgreen/evergreen/pull/308)).
+### Native compilation and performance
 
 - Compile eligible recursive self-calls directly through the x86-64 Lisp ABI,
   preserving `NOTINLINE`, lexical function bindings, and the executing definition
   across redefinition and garbage collection. Retain this behavior in source-free
   BFASL files ([#307](https://github.com/atgreen/evergreen/pull/307)).
+- Reduce ordinary T2 call overhead with cheaper multiple-value handling,
+  smaller frames, execution-local polling, and fewer redundant checks. Let
+  proven noncollecting entry paths, including simple recursive base cases,
+  return before constructing a native frame
+  ([#308](https://github.com/atgreen/evergreen/pull/308),
+  [#309](https://github.com/atgreen/evergreen/pull/309),
+  [#310](https://github.com/atgreen/evergreen/pull/310),
+  [#326](https://github.com/atgreen/evergreen/pull/326)).
+- Preserve bounded integer parameter ranges in T2. Use proven numeric bounds
+  to remove redundant recursive argument checks and add/subtract overflow
+  checks, while retaining checks where safety cannot be proved. Optimize
+  eligible pure return paths with bounded partial evaluation
+  ([#326](https://github.com/atgreen/evergreen/pull/326)).
+- Eliminate redundant native frame-slot reloads while retaining the stores
+  needed for garbage collection and recovery
+  ([#326](https://github.com/atgreen/evergreen/pull/326), incorporating the reload
+  optimization from [#311](https://github.com/atgreen/evergreen/pull/311)).
 
-- Reject oversized typed allocations before their body lengths or aligned footprints overflow GC size metadata.
+Benchmark details and caveats are recorded in the
+[checked-range recursion report](tests/benchmarks/results/2026-10-14-fib-range-proofs.md).
+Its measured release revision ran warmed, bounded-integer `fib(35)` in a median
+30 ms on the benchmark host, versus 33 ms for an implementation-specifically
+tuned SBCL version. This is a workload-specific comparison, not a general
+performance claim or a matched v0.0.7-to-v0.0.8 comparison.
+
+### Fiber scheduling and cancellation
+
+- Schedule fibers cooperatively without automatic CPU time slices or per-fiber
+  CPU budgets. Add cooperative cancellation with explicit checkpoints and
+  interruptible public sleep, park, and join; retain opt-in sandbox CPU limits
+  ([#326](https://github.com/atgreen/evergreen/pull/326), incorporating
+  [#312](https://github.com/atgreen/evergreen/pull/312)).
+
+### Correctness and compatibility
+
+- Accept global `INLINE` and `NOTINLINE` declarations for SETF function names
+  without confusing their policies with the corresponding getters, fixing
+  ASDF loading ([#326](https://github.com/atgreen/evergreen/pull/326)).
+- Enforce declared argument bounds on direct recursive calls, including calls
+  replaced by pure return shortcuts. Correct constant-left subtraction when
+  the result reuses the right operand's register
+  ([#326](https://github.com/atgreen/evergreen/pull/326)).
+- Retain global `FTYPE` declaration metadata during compilation and source-free
+  BFASL loading ([#326](https://github.com/atgreen/evergreen/pull/326)).
+- Reject oversized typed allocations before their body lengths or aligned
+  footprints overflow GC size metadata
   ([#302](https://github.com/atgreen/evergreen/pull/302)).
-
-- Convert huge rational values to floating point without intermediate infinity, preserving subnormal values and correct rounding.
+- Convert huge rational values to floating point without intermediate infinity,
+  preserving subnormal values and correct rounding
   ([#304](https://github.com/atgreen/evergreen/pull/304)).
-
-- Preserve large-object identities, payload references, and true header pinning when restoring and resaving heap images.
+- Preserve large-object identities, payload references, and true header pinning
+  when restoring and resaving heap images
   ([#305](https://github.com/atgreen/evergreen/pull/305)).
 
-- Label native profiler maps with the actual T1, T2, or OSR tier.
+### Tooling
+
+- Label native profiler maps with the actual T1, T2, or OSR tier
   ([#303](https://github.com/atgreen/evergreen/pull/303)).
+
+### Scope limits
+
+Retaining `FTYPE` metadata does not yet enable result-type enforcement or
+optimization based on declared result types. General recursive inlining with
+nested deoptimization and a private unboxed local-call ABI remain separate work.
 
 ## 0.0.7 - 2026-10-12
 
