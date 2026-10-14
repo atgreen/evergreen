@@ -9463,6 +9463,7 @@ fn eval_lambda_call_ex(
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
     rooted_args!(args = args);
+    let result_contract = bytecode::retained_primary_result(*body);
     // Install the callee's lexical BLOCK/TAGBODY scope for the body (bliss-4u5u),
     // saving the caller's to restore afterward. `Inherit` leaves them as-is.
     let saved: Option<LexicalExitNames> = match control {
@@ -9478,6 +9479,7 @@ fn eval_lambda_call_ex(
     };
     let result = with_child_frame(env, parent, |env| {
         bind_lambda_list(*params_form, args, env)?;
+        bytecode::validate_declared_lambda_args(*params_form, *body, args)?;
         // Arguments are a single-value context; a producer evaluated as an
         // argument (or an &optional/&key default) must not leak its extra values
         // into the body. The body's tail form establishes this call's values.
@@ -9517,7 +9519,11 @@ fn eval_lambda_call_ex(
         env.block_stack = blocks;
         env.tag_stack = tags;
     }
-    result
+    let value = result?;
+    if let Some(contract) = result_contract {
+        bytecode::validate_declared_value(contract, value)?;
+    }
+    Ok(value)
 }
 
 fn with_eval_context<T>(
@@ -29853,6 +29859,10 @@ fn eval_defun(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         } else {
             body = arena_cons(*declaration, body);
         }
+    }
+
+    if name_form.is_symbol() {
+        body = bytecode::capture_primary_result_body(name_form.as_symbol_index(), body);
     }
 
     // A defun body is wrapped in an implicit block named after the function

@@ -676,7 +676,12 @@ impl TransferCode {
         }
         let roots = retain_native_body(&body);
         let optimize = optimize && scope_free_native_body(&body, false);
-        let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) {
+        // Mandatory result guards also need exact recovery metadata in the
+        // baseline tier, including when VALUES produced the checked primary.
+        // This does not enable speculation for multiple-value bodies.
+        let result_recovery = scope_free_native_body(&body, true)
+            && body.code.iter().any(|op| matches!(op, Instr::CheckResult(_)));
+        let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) || result_recovery {
             let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
             let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
             let profile = |bcp| {
@@ -1643,6 +1648,9 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
                     | Instr::Pop
                     | Instr::Dup
                     | Instr::ClearMv
+                    // A result assertion preserves the primary and MV tuple;
+                    // unsupported assertion types still decline in T2 lowering.
+                    | Instr::CheckResult(_)
                     | Instr::Br(_)
                     | Instr::BrIfFalse(_)
                     | Instr::BrIfTrue(_)
@@ -1785,6 +1793,17 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
         return;
     }
     let context = unsafe { &mut *context };
+    let body = unsafe { &*context.body };
+    // This recursive entry bypasses run_activation's checked ingress. Validate
+    // the retained body's contract before allocating or publishing a child.
+    for (index, ty) in body.param_types.iter().copied().enumerate() {
+        let value = unsafe { request.call.args.add(index).read() };
+        if let Err(error) = validate_declared_value(ty, value) {
+            NATIVE_ERROR.with(|slot| slot.set_first(error));
+            unsafe { out.write(NativeOutcome { value: NIL, exit: NativeExit::Transfer }); }
+            return;
+        }
+    }
     let function = unsafe { (*context.frame).function };
     let stack = egcl_rt::current_stack();
     let Some(frame) = stack.push_frame(
@@ -1796,7 +1815,6 @@ unsafe fn prepare_recursive_unpublished(request: *mut u8, out: *mut NativeOutcom
         unsafe { c2i_call_legacy_v2(std::ptr::from_mut(&mut request.call).cast(), out); }
         return;
     };
-    let body = unsafe { &*context.body };
     for (index, (_, location)) in body.param_layout.iter().enumerate() {
         let VarLoc::Slot(slot) = location else { unreachable!("admitted slot parameter") };
         unsafe { slot_set(frame, *slot, request.call.args.add(index).read()); }

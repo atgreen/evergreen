@@ -1049,7 +1049,7 @@ impl<'a> Builder<'a> {
                 | Instr::Dup => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
-                Instr::TypeP(_) => {
+                Instr::TypeP(_) | Instr::CheckResult(_) => {
                     push(i + 1, d, &mut depth_at, &mut work);
                 }
                 Instr::MemoryFence(_) => {
@@ -2128,6 +2128,36 @@ impl<'a> Builder<'a> {
                     // its normal continuation; an actual error takes the call's
                     // existing exceptional path before this value is consumed.
                     stack.push(results[0]);
+                }
+                Instr::CheckResult(declaration) => {
+                    let checked_type = match declaration {
+                        DeclaredType::Any => continue,
+                        DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
+                        DeclaredType::FixnumRange { lower, upper } => IRType {
+                            bits: TypeBits::FIXNUM,
+                            range: Some(crate::t2::ir::Range { lo: *lower, hi: *upper }),
+                            class_id: None,
+                        },
+                        DeclaredType::SingleFloat => {
+                            return Err(BuildError::Unsupported("single-float result guard"));
+                        }
+                    };
+                    // The producer has already completed. Recover at this
+                    // assertion with its primary still on the stack, never at
+                    // the producer call. Unlike TYPEP, this preserves MV state.
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let value = stack.pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (CheckResult)"))?;
+                    let checked = self.emit(
+                        block,
+                        Opcode::Guard,
+                        vec![value],
+                        AuxData::TypeTag(checked_type),
+                        InstFlags { effectful: true, guard: true, ..Default::default() },
+                        Some(fs),
+                        checked_type,
+                    ).ok_or(BuildError::Unsupported("result guard has a result"))?;
+                    stack.push(checked);
                 }
                 Instr::TypeP(class) => {
                     if !matches!(
@@ -3221,6 +3251,32 @@ mod tests {
         let parameter = f.block(f.entry()).params[0];
         assert_eq!(f.value(parameter).ty, IRType::of(TypeBits::FIXNUM));
         assert!(f.is_entry_param_checked(parameter));
+    }
+
+    #[test]
+    fn result_check_refines_only_its_result_and_recovers_at_the_assertion() {
+        let body = bf("checked-result", vec![
+            Instr::LoadLocal(0),
+            Instr::CheckResult(DeclaredType::FixnumRange { lower: 0, upper: 10 }),
+            Instr::Return,
+        ], vec![], 1, 1, 1);
+        let f = build_from_bytecode(&body).expect("build result assertion");
+        let entry = f.entry();
+        let input = f.block(entry).params[0];
+        let guard = f.block(entry).insts.iter().copied()
+            .find(|&inst| f.inst(inst).opcode == Opcode::Guard).expect("result guard");
+        let data = f.inst(guard);
+        assert_eq!(data.args, vec![input]);
+        assert_eq!(f.value(input).ty, IRType::TOP);
+        assert_eq!(f.value(data.results[0]).ty.range,
+            Some(crate::t2::ir::Range { lo: 0, hi: 10 }));
+        let state = f.frame_states.get(data.frame_state.expect("recovery state"));
+        assert_eq!(state.scopes[0].bcp, 1);
+        assert!(matches!(state.scopes[0].stack.as_slice(),
+            [ValueSource::Value { value, .. }] if *value == input));
+        assert!(!has_opcode(&f, entry, Opcode::ClearMv));
+        let ret = f.inst(f.terminator(entry).unwrap());
+        assert_eq!(ret.args, data.results);
     }
 
     #[test]

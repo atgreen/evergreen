@@ -142,6 +142,9 @@ pub enum Instr {
     /// of tag-checkable types to avoid a c2i `CallNamed` to TYPEP on the hot
     /// package-machinery path (bliss-gq5).
     TypeP(u16),
+    /// Check the primary result without consuming it or changing the pending
+    /// multiple-value tuple. Failure signals TYPE-ERROR, even at safety zero.
+    CheckResult(DeclaredType),
     /// Execute a native memory-ordering fence and push NIL.
     MemoryFence(MemoryFenceKind),
     /// Return the top of the operand stack to the caller.

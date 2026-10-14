@@ -25,6 +25,7 @@ enum Expression {
 #[derive(Clone)]
 enum Check {
     Fixnum(Atom),
+    Range(Atom, i64, i64),
     Less(Atom, Atom, bool),
 }
 pub(super) struct Prefix {
@@ -113,7 +114,6 @@ fn walk(
                     return None;
                 };
                 if ty.bits != TypeBits::FIXNUM
-                    || ty.range.is_some()
                     || ty.class_id.is_some()
                     || d.args.len() != 1
                     || d.results.len() > 1
@@ -122,6 +122,14 @@ fn walk(
                 }
                 let value = atom(&values, d.args[0])?;
                 checks.push(Check::Fixnum(value));
+                if let Some(range) = ty.range {
+                    let lo = range.lo.max(-(1_i64 << 60));
+                    let hi = range.hi.min((1_i64 << 60) - 1);
+                    if lo > hi { return None; }
+                    // Keep type bounds distinct from source branch conditions:
+                    // only the latter choose recursive specialization inputs.
+                    checks.push(Check::Range(value, lo, hi));
+                }
                 if d.results.is_empty() {
                     continue;
                 }
@@ -245,6 +253,27 @@ pub(super) fn emit(a: &mut Asm, f: &Function, arity: usize, single: &HashSet<Ins
     emit_selected(a, &prefix, None);
 }
 
+fn emit_less_check(
+    a: &mut Asm, lhs: Atom, rhs: Atom, accepted: bool, miss: egcl_rt::asm::Label,
+) {
+    let register = match lhs {
+        Atom::Argument(register) => register,
+        Atom::Constant(_) => {
+            load(a, 10, lhs);
+            10
+        }
+    };
+    if let Atom::Constant(bits) = rhs
+        && let Ok(immediate) = i32::try_from(bits as i64)
+    {
+        alu_r_imm(a, 7, register, immediate); // CMP never writes the input.
+    } else {
+        load(a, 11, rhs);
+        cmp_rr(a, register, 11);
+    }
+    a.jcc(if accepted { Cc::Ge } else { Cc::L }, miss);
+}
+
 /// A call-site prefix joins its caller's result continuation without creating
 /// or retiring a frame. The caller has already checked poll and MV state.
 pub(super) fn emit_selected(a: &mut Asm, prefix: &Prefix, continuation: Option<egcl_rt::asm::Label>) {
@@ -266,23 +295,16 @@ pub(super) fn emit_selected(a: &mut Asm, prefix: &Prefix, continuation: Option<e
                 }
             }
             Check::Fixnum(Atom::Constant(_)) => {}
-            Check::Less(lhs, rhs, accepted) => {
-                let register = match lhs {
-                    Atom::Argument(register) => register,
-                    Atom::Constant(_) => {
-                        load(a, 10, lhs);
-                        10
-                    }
-                };
-                if let Atom::Constant(bits) = rhs
-                    && let Ok(immediate) = i32::try_from(bits as i64)
-                {
-                    alu_r_imm(a, 7, register, immediate); // CMP, never writes the input.
-                } else {
-                    load(a, 11, rhs);
-                    cmp_rr(a, register, 11);
+            Check::Range(value, lo, hi) => {
+                if lo > -(1_i64 << 60) {
+                    emit_less_check(a, value, Atom::Constant((lo as u64) << 3), false, framed);
                 }
-                a.jcc(if accepted { Cc::Ge } else { Cc::L }, framed);
+                if hi < (1_i64 << 60) - 1 {
+                    emit_less_check(a, Atom::Constant((hi as u64) << 3), value, false, framed);
+                }
+            }
+            Check::Less(lhs, rhs, accepted) => {
+                emit_less_check(a, lhs, rhs, accepted, framed);
             }
         }
     }
@@ -371,10 +393,14 @@ fn evaluate_pure(
                 Opcode::ConstT => egcl_rt::value::T.0,
                 Opcode::Guard => {
                     let AuxData::TypeTag(ty) = d.aux else { return None };
-                    if ty.bits != TypeBits::FIXNUM || ty.range.is_some()
+                    if ty.bits != TypeBits::FIXNUM
                         || ty.class_id.is_some() || args.len() != 1 || args[0] & 7 != 0
                         || d.results.len() > 1
                     { return None; }
+                    let value = (args[0] as i64) >> 3;
+                    if ty.range.is_some_and(|range| value < range.lo || value > range.hi) {
+                        return None;
+                    }
                     if d.results.is_empty() { continue; }
                     args[0]
                 }
@@ -544,6 +570,109 @@ mod tests {
             instruction(Opcode::FixnumAdd, vec![result[0], two], AuxData::None), &tagged).1[0];
         f.set_terminator(recur, instruction(Opcode::Return, vec![result], AuxData::None));
         (f, call)
+    }
+
+    #[test]
+    fn pure_evaluation_checks_ranged_results() {
+        const MIN: i64 = -(1_i64 << 60);
+        const MAX: i64 = (1_i64 << 60) - 1;
+        for (lo, hi, inputs) in [
+            (-5, -2, vec![-6, -5, -4, -2, -1]),
+            (-2, 3, vec![-3, -2, -1, 0, 3, 4]),
+            (5, 5, vec![4, 5, 6]),
+            (MIN, MIN + 1, vec![MIN, MIN + 1, MIN + 2]),
+            (MAX - 1, MAX, vec![MAX - 2, MAX - 1, MAX]),
+        ] {
+            let mut f = identity();
+            let entry = f.entry();
+            guard_return(&mut f, entry, lo, hi);
+            for input in inputs {
+                let bits = (input as u64) << 3;
+                assert_eq!(evaluate_pure(&f, bits, &[], 3, &mut 512, &mut false),
+                    (lo..=hi).contains(&input).then_some(bits),
+                    "range [{lo}, {hi}], input {input}");
+            }
+            assert_eq!(evaluate_pure(&f, egcl_rt::value::NIL.0,
+                &[], 3, &mut 512, &mut false), None);
+        }
+    }
+
+    fn guard_return(f: &mut Function, block: Block, lo: i64, hi: i64) {
+        let ret = f.block_mut(block).insts.pop().unwrap();
+        assert_eq!(f.inst(ret).opcode, Opcode::Return);
+        let value = f.inst(ret).args[0];
+        let ty = IRType {
+            range: Some(crate::t2::ir::Range { lo, hi }),
+            ..IRType::of(TypeBits::FIXNUM)
+        };
+        let mut guard = instruction(Opcode::Guard, vec![value], AuxData::TypeTag(ty));
+        guard.flags.guard = true;
+        guard.flags.effectful = true;
+        let checked = f.push_inst(block, guard, &[(ty, ValueRepresentation::Tagged)]).1[0];
+        f.inst_mut(ret).args = vec![checked];
+        f.block_mut(block).insts.push(ret);
+    }
+
+    #[test]
+    fn ranged_prefix_guards_preserve_signed_bounds() {
+        const MIN: i64 = -(1_i64 << 60);
+        const MAX: i64 = (1_i64 << 60) - 1;
+        for (lo, hi, inputs) in [
+            (-5, -2, vec![-6, -5, -4, -2, -1, 0]),
+            (-2, 3, vec![-3, -2, -1, 0, 3, 4]),
+            (5, 5, vec![4, 5, 6]),
+            (MIN, MIN + 1, vec![MIN, MIN + 1, MIN + 2, 0]),
+            (MAX - 1, MAX, vec![0, MAX - 2, MAX - 1, MAX]),
+        ] {
+            let mut f = identity();
+            let entry = f.entry();
+            guard_return(&mut f, entry, lo, hi);
+            let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
+            let prefix = select(&f, 1, &single).expect("bounded guard permits a prefix");
+            let mut a = Asm::new();
+            let accepted = a.label();
+            emit_selected(&mut a, &prefix, Some(accepted));
+            mov_imm64(&mut a, 0, 0);
+            a.push(0xc3);
+            a.bind(accepted);
+            mov_imm64(&mut a, 0, 1);
+            a.push(0xc3);
+            let code = egcl_rt::jit::JitBuffer::new(&a.finish().unwrap()).unwrap();
+            let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.as_ptr()) };
+            for input in inputs {
+                assert_eq!(run((input as u64) << 3), u64::from((lo..=hi).contains(&input)),
+                    "range [{lo}, {hi}], input {input}");
+            }
+            assert_eq!(run(egcl_rt::value::NIL.0), 0);
+        }
+    }
+
+    #[test]
+    fn specialization_preserves_ranged_guards_and_branch_boundary() {
+        for reverse in [false, true] {
+            let (mut f, call) = counter(reverse);
+            let entry = f.entry();
+            let parameter = f.block(entry).params[0];
+            let mut guard = instruction(Opcode::Guard, vec![parameter], AuxData::TypeTag(IRType {
+                range: Some(crate::t2::ir::Range { lo: -10, hi: 10 }),
+                ..IRType::of(TypeBits::FIXNUM)
+            }));
+            guard.flags.guard = true;
+            guard.flags.effectful = true;
+            let (guard, _) = f.push_inst(entry, guard, &[]);
+            assert_eq!(f.block_mut(entry).insts.pop(), Some(guard));
+            f.block_mut(entry).insts.insert(0, guard);
+            let returns: Vec<_> = f.block_order().iter().copied().filter(|&block| {
+                f.terminator(block).is_some_and(|ret| f.inst(ret).opcode == Opcode::Return)
+            }).collect();
+            let (lo, hi) = if reverse { (0, 4) } else { (-1, 3) };
+            for block in returns { guard_return(&mut f, block, lo, hi); }
+            let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
+            let cases: Vec<_> = specialize(&f, 1, &single, &[call]).iter()
+                .map(|case| ((case.argument as i64) >> 3, (case.result as i64) >> 3)).collect();
+            assert_eq!(cases, if reverse { vec![(-1, 2), (-2, 4)] }
+                else { vec![(0, 1), (1, 3)] });
+        }
     }
 
     #[test]
