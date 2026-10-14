@@ -65,8 +65,11 @@ fn a_funcallable_instance_is_a_function_in_both_tiers() {
         command.args(["--no-init", "--eval", PROGRAM]);
         command.env("EGCL_FORCE_TIER", tier);
         if stress {
+            // Stress the class, closure, and dispatch operations below, not
+            // every allocation while bootstrapping the standard library.
             command
                 .env("EGCL_GC_STRESS", "1")
+                .env("EGCL_GC_STRESS_AFTER_INIT", "1")
                 .env("EGCL_GC_POISON", "1")
                 .env("EGCL_GC_VERIFY", "1");
         }
@@ -77,6 +80,13 @@ fn a_funcallable_instance_is_a_function_in_both_tiers() {
             "tier={tier} stress={stress}: {stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if stress {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("[gc-stress] EGCL_GC_STRESS_AFTER_INIT: stressing from allocation"),
+                "tier={tier}: GC stress did not arm"
+            );
+        }
         assert_eq!(
             stdout.lines().next().unwrap_or("").trim(),
             EXPECTED,
