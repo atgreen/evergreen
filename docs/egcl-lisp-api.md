@@ -1192,7 +1192,6 @@ The most user-relevant environment variables are:
 | `EGCL_WORKERS` | Default scheduler-group carrier count |
 | `EGCL_STACK_SIZE` | Per-fiber CL stack size |
 | `EGCL_MAX_FIBERS` | Fiber limit; legacy `EGCL_MAX_THREADS` is accepted |
-| `EGCL_TIME_SLICE_US` | Fiber cooperative-preemption interval |
 | `EGCL_PINNED_BLOCKING_ACTION` | `WARN`, `ERROR`, or `NIL`/`NATIVE` policy |
 | `EGCL_T0_T1_THRESHOLD` | T0 to T1 invocation threshold |
 | `EGCL_T1_T2_INVOKE_THRESHOLD` | T1 to T2 invocation threshold |

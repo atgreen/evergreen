@@ -41,6 +41,9 @@ pub(in crate::cli::bytecode) unsafe fn with_entry_roots<R>(request: *mut Ordinar
 #[cfg(test)]
 thread_local! {
     static ARITY_ROOTED_OBSERVER: Cell<Option<unsafe fn(*mut OrdinaryArityRequest)>> = const { Cell::new(None) };
+    pub(in crate::cli::bytecode) static RETURN_ROOTED_OBSERVER: Cell<Option<unsafe fn(*mut EgclVal)>> = const { Cell::new(None) };
+    // Model a notification arriving after the return poll, before native resume.
+    pub(in crate::cli::bytecode) static YIELD_AFTER_RETURN_TO_OWNER: Cell<usize> = const { Cell::new(0) };
 }
 #[cfg(test)]
 static COLD_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
@@ -77,7 +80,22 @@ unsafe fn refresh_control(control: *mut NativeRecursiveControl) {
     control.deadline_armed = u8::from(egcl_rt::sandbox_cpu_deadline_armed());
 }
 
-pub(in crate::cli::bytecode) fn finish(result: Result<EgclVal, EgclError>, out: *mut OrdinaryHelperOutcome) {
+/// Return to generated code with notifications serviced and result roots live.
+///
+/// The caller must retain its `root_publication::published` boundary.
+pub(in crate::cli::bytecode) unsafe fn finish(result: Result<EgclVal, EgclError>, out: *mut OrdinaryHelperOutcome) {
+    let result = result.and_then(|value| guard_c2i(|| {
+        egcl_rt::rooted!(value = value);
+        if !native_error_pending() && egcl_rt::thread::current_execution_poll_pending() {
+            #[cfg(test)]
+            if let Some(observe) = RETURN_ROOTED_OBSERVER.with(Cell::get) {
+                unsafe { observe(std::ptr::from_mut(&mut *value)); }
+            }
+            let mut poll = NativeOutcome { value: NIL, exit: NativeExit::Returned };
+            unsafe { poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll); }
+        }
+        Ok(*value)
+    }));
     let value = match result {
         Ok(value) => value,
         Err(error) => {

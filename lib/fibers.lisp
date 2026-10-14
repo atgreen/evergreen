@@ -10,13 +10,32 @@
           scheduler-group scheduler-group-p scheduler-group-carriers
           start-fibers submit-fiber finish-fibers run-fibers fiber-group-done-p
           fiber-error fiber-error-fiber fiber-error-cause
-          fiber-still-running print-fiber-backtrace))
+          fiber-still-running print-fiber-backtrace
+          cancel-fiber fiber-cancellation-requested-p check-fiber-cancellation
+          fiber-cancelled))
 
 (define-condition fiber-error (error)
   ((fiber :initarg :fiber :reader fiber-error-fiber)
    (cause :initarg :cause :reader fiber-error-cause)))
 
 (define-condition fiber-still-running (error) ())
+(define-condition fiber-cancelled (error) ())
+
+(defun cancel-fiber (fiber)
+  "Request cooperative cancellation without forcing termination."
+  (%check-fiber fiber)
+  (egcl::%native-fiber :cancel (fiber-id fiber)))
+
+(defun fiber-cancellation-requested-p (&optional (fiber (current-fiber)))
+  (if fiber
+      (progn (%check-fiber fiber)
+             (egcl::%native-fiber :cancellation-requested (fiber-id fiber)))
+      nil))
+
+(defun check-fiber-cancellation ()
+  (when (egcl::%native-fiber :cancellation-requested)
+    (error 'fiber-cancelled))
+  (values))
 
 (defstruct (fiber (:constructor %make-fiber))
   id name epoch group packet carrier
@@ -100,7 +119,9 @@
 (defun fiber-yield () (egcl::%native-fiber :yield))
 (defun fiber-sleep (seconds)
   (unless seconds (error 'type-error :datum seconds :expected-type '(real 0)))
-  (egcl::%native-fiber :sleep (%seconds seconds)))
+  (check-fiber-cancellation)
+  (egcl::%native-fiber :sleep (%seconds seconds))
+  (check-fiber-cancellation))
 
 (defvar *pinned-blocking-action* :warn)
 (defun fiber-pin (&optional (fiber (current-fiber)))
@@ -121,6 +142,7 @@
   (let ((deadline (and timeout (+ (get-internal-real-time)
                                  (* (%seconds timeout) internal-time-units-per-second)))))
     (loop
+      (check-fiber-cancellation)
       (when (funcall predicate) (return t))
       (let ((left (and deadline (/ (- deadline (get-internal-real-time))
                                   internal-time-units-per-second))))
@@ -146,7 +168,9 @@
   ;; Check before acquiring the join lock: another execution may already hold
   ;; that lock while waiting for this very fiber to finish.
   (when (eq fiber (current-fiber)) (error "A fiber cannot join itself"))
+  (check-fiber-cancellation)
   (let ((packet (%await fiber timeout)))
+    (check-fiber-cancellation)
     (cond ((null packet) (values nil nil))
           ((car packet) (values-list (cdr packet)))
           (t (error 'fiber-error :fiber fiber :cause (cdr packet))))))

@@ -820,6 +820,7 @@ thread_local! {
 /// handlers, so it must stay async-signal-safe: one lock-free atomic increment.
 pub fn mark_process_signal_activity() {
     PROCESS_SIGNAL_ACTIVITY.fetch_add(1, std::sync::atomic::Ordering::Release);
+    crate::execution_poll::request_all();
 }
 
 /// Process-lifetime address of the 64-bit atomic process-signal arrival epoch.

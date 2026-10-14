@@ -1359,6 +1359,9 @@ fn disasm_header(sym: u32, bf: &BytecodeFunction) -> String {
             let name = match ty {
                 DeclaredType::Any => return None,
                 DeclaredType::Fixnum => "FIXNUM",
+                DeclaredType::FixnumRange { lower, upper } => {
+                    return Some(format!("{parameter}: (INTEGER {lower} {upper})"));
+                }
                 DeclaredType::SingleFloat => "SINGLE-FLOAT",
             };
             Some(format!("{parameter}: {name}"))
@@ -8280,21 +8283,33 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
 }
 
 fn primitive_declared_type(type_form: EgclVal) -> Option<DeclaredType> {
-    if !type_form.is_symbol() {
+    if type_form.is_symbol() {
+        return match sym_bare_name_rc(type_form).as_ref() {
+            "FIXNUM" => Some(DeclaredType::Fixnum),
+            "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
+            _ => None,
+        };
+    }
+
+    let parts = list_to_vec(type_form);
+    let [head, lower, upper] = parts.as_slice() else {
+        return None;
+    };
+    if !head.is_symbol() || sym_bare_name_rc(*head).as_ref() != "INTEGER" {
         return None;
     }
-    match sym_bare_name_rc(type_form).as_ref() {
-        "FIXNUM" => Some(DeclaredType::Fixnum),
-        "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
-        _ => None,
+    if !lower.is_fixnum() || !upper.is_fixnum() {
+        return None;
     }
+    let (lower, upper) = (lower.as_fixnum(), upper.as_fixnum());
+    (lower <= upper).then_some(DeclaredType::FixnumRange { lower, upper })
 }
 
-/// Retain primitive parameter assertions from the declaration prefix of a
+/// Retain supported parameter assertions from the declaration prefix of a
 /// function body. Both `(type fixnum x)` and the standard shorthand
-/// `(fixnum x)` are accepted. Unknown declaration/type specifiers remain
-/// runtime no-ops for now and therefore contribute `Any`, never an unsound
-/// compiler assumption.
+/// `(fixnum x)` are accepted, alongside closed literal fixnum `INTEGER`
+/// ranges. Unknown declaration/type specifiers remain runtime no-ops for now
+/// and therefore contribute `Any`, never an unsound compiler assumption.
 /// Collect the bare names declared `(declare (special …))` in a body's leading
 /// declarations. The bytecode compiler does not yet bind/reference a
 /// non-earmuffed special variable dynamically — it would bind it lexically, so a
@@ -8996,7 +9011,9 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0200: callable-preserving source lowering. Version-1 units may have erased
 // LDB/BYTE, TYPEP, accessor, or memory-fence bindings. Their original callees
 // cannot be reconstructed, so a new major rejects them before installation.
-const BBU_BYTECODE_VERSION: u16 = 0x0200;
+// 0x0201: function metadata gains a tag-3 literal fixnum range, followed by
+// its two i64 endpoints. Older readers must reject the changed record layout.
+const BBU_BYTECODE_VERSION: u16 = 0x0201;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -10050,8 +10067,13 @@ fn serialize_bbu_function_metadata(functions: &[BbuFunction]) -> Vec<u8> {
                     DeclaredType::Any => 0,
                     DeclaredType::Fixnum => 1,
                     DeclaredType::SingleFloat => 2,
+                    DeclaredType::FixnumRange { .. } => 3,
                 },
             );
+            if let DeclaredType::FixnumRange { lower, upper } = declared_type {
+                put_i64(&mut out, lower);
+                put_i64(&mut out, upper);
+            }
         }
     }
     out
@@ -11588,6 +11610,14 @@ fn parse_bbu_function_metadata(
                 0 => DeclaredType::Any,
                 1 => DeclaredType::Fixnum,
                 2 => DeclaredType::SingleFloat,
+                3 => {
+                    let lower = cursor.i64()?;
+                    let upper = cursor.i64()?;
+                    if lower > upper {
+                        return Err(bbu_error("invalid declared fixnum range"));
+                    }
+                    DeclaredType::FixnumRange { lower, upper }
+                }
                 _ => return Err(bbu_error("invalid declared parameter type")),
             };
             params.push((name_ref, location, declared_type));
@@ -13347,6 +13377,14 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
 }
 
 fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclError> {
+    verified_operand_stack_depths(func).map(|_| ())
+}
+
+/// Exact reachable operand depths before each bytecode instruction. Unreachable
+/// instructions have no valid interpreter continuation and retain `None`.
+fn verified_operand_stack_depths(
+    func: &BytecodeFunction,
+) -> Result<Vec<Option<u32>>, EgclError> {
     let code = &func.code;
     let n = code.len();
     let fail = |pc: usize, msg: &str| -> EgclError {
@@ -13626,7 +13664,7 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclEr
             _ => unreachable!("instruction with a simple stack effect handled above"),
         }
     }
-    Ok(())
+    Ok(states.into_iter().map(|state| state.map(|(height, _)| height)).collect())
 }
 
 /// Verify, decode, and execute an authoritative portable BBU. No source reader
@@ -14630,17 +14668,23 @@ fn validate_declared_args(func: &BytecodeFunction, args: &[EgclVal]) -> Result<(
         let matches = match ty {
             DeclaredType::Any => true,
             DeclaredType::Fixnum => value.is_fixnum(),
+            DeclaredType::FixnumRange { lower, upper } => {
+                value.is_fixnum() && (lower..=upper).contains(&value.as_fixnum())
+            }
             DeclaredType::SingleFloat => value.is_single_float(),
         };
         if !matches {
             let expected = match ty {
                 DeclaredType::Any => unreachable!(),
-                DeclaredType::Fixnum => "FIXNUM",
-                DeclaredType::SingleFloat => "SINGLE-FLOAT",
+                DeclaredType::Fixnum => "FIXNUM".to_string(),
+                DeclaredType::FixnumRange { lower, upper } => {
+                    format!("(INTEGER {lower} {upper})")
+                }
+                DeclaredType::SingleFloat => "SINGLE-FLOAT".to_string(),
             };
             return Err(EgclError::TypeError {
                 datum: value,
-                expected: expected.to_string(),
+                expected,
             });
         }
     }
@@ -15066,11 +15110,9 @@ fn run_with_binding(
 }
 
 fn claim_process_signal_flags_for_current_execution() {
-    // Fast path: one relaxed load instead of six locked read-modify-writes.
-    // Draining the flags cost ~15% of every native call (bliss-htff) to answer
-    // a question that is "no" essentially always. SBCL and HotSpot both reduce
-    // this to a single instruction against a poll word; this is the
-    // process-global half of that.
+    // Explicit sandbox deadlines belong to the current execution's slow poll;
+    // their progress must not depend on unrelated process signal activity.
+    let _ = egcl_rt::poll_current_sandbox_cpu_deadline();
     if !egcl_rt::take_process_signal_activity() {
         return;
     }
@@ -15098,12 +15140,7 @@ fn claim_process_signal_flags_for_current_execution() {
     if egcl_rt::check_sigint() {
         post(egcl_rt::PendingSignal::Interrupt);
     }
-    let _ = egcl_rt::poll_current_sandbox_cpu_deadline();
-    // The deadline needs polling on every pass, but the gate above only lets us
-    // through when the summary is raised, so re-raise it while one is armed.
-    if egcl_rt::sandbox_cpu_deadline_armed() {
-        egcl_rt::mark_process_signal_activity();
-    }
+
 }
 
 fn pending_signal_error_for_current_execution() -> Option<EgclError> {
@@ -18303,7 +18340,8 @@ extern "C" fn c2i_deopt_t2_inline(
 /// header words per scope (function, bcp, locals, stack depth) then the
 /// slots. `outer` is the frame to write scope 0 into; `None` pushes a fresh
 /// frame for it too. `metadata` is the deopting code's; `None` takes the
-/// active code's. Pushed frames are popped again on any error.
+/// active code's. Pushed frames are popped again on any error; existing
+/// frame slots are not changed until the whole stream has been accepted.
 fn materialize_t2_deopt_scopes(
     n_scopes: u64,
     n_words: u64,
@@ -18315,6 +18353,20 @@ fn materialize_t2_deopt_scopes(
     if buf.is_null() || n_scopes == 0 {
         return Err("T2 deopt supplied an empty virtual-frame stream");
     }
+    let (Ok(scope_count), Ok(word_count)) = (
+        usize::try_from(n_scopes),
+        usize::try_from(n_words),
+    ) else {
+        return Err("T2 virtual-frame counts exceed addressable storage");
+    };
+    // Every scope needs four header words, even with no saved values. Bound
+    // counts before allocating and respect the raw-slice byte-length limit.
+    // The native caller must still prove the buffer's actual storage extent.
+    if scope_count > word_count / 4
+        || word_count > isize::MAX as usize / std::mem::size_of::<u64>()
+    {
+        return Err("invalid T2 virtual-frame stream counts");
+    }
 
     let metadata = metadata.or_else(|| ACTIVE_NATIVE_CODE.with(|slot| {
         // SAFETY: ActiveNativeCode retains a reference for the native call and
@@ -18325,32 +18377,102 @@ fn materialize_t2_deopt_scopes(
         return Err("T2 deopt has no active code metadata");
     };
 
-    let words = unsafe { std::slice::from_raw_parts(buf, n_words as usize) };
+    let words = unsafe { std::slice::from_raw_parts(buf, word_count) };
     let mut at = 0usize;
     let mut pushed = 0usize;
-    let mut scopes = Vec::with_capacity(n_scopes as usize);
+    let mut scopes = Vec::new();
+    let mut payloads = Vec::new();
+    scopes.try_reserve_exact(scope_count)
+        .map_err(|_| "cannot reserve T2 virtual-frame descriptors")?;
+    payloads.try_reserve_exact(scope_count)
+        .map_err(|_| "cannot reserve T2 virtual-frame payloads")?;
     let mut error: Option<&'static str> = None;
-    for scope_index in 0..n_scopes as usize {
+    for scope_index in 0..scope_count {
         if at + 4 > words.len() {
             error = Some("truncated T2 virtual-frame header");
             break;
         }
-        let function = words[at] as u32;
-        let bcp = words[at + 1] as u32;
-        let n_locals = words[at + 2] as usize;
-        let sp_top = words[at + 3] as usize;
-        at += 4;
-        let n_slots = n_locals.saturating_add(sp_top);
+        let (Ok(function), Ok(bcp)) = (
+            u32::try_from(words[at]),
+            u32::try_from(words[at + 1]),
+        ) else {
+            error = Some("invalid T2 virtual-frame identity or resume position");
+            break;
+        };
         let entry = metadata.deopt_bodies.get(&function).cloned();
         let Some(entry) = entry else {
             error = Some("T2 deopt function is absent from its compiled metadata");
             break;
         };
-        if at + n_slots > words.len() || n_slots > entry.num_slots() as usize {
+        let n_locals = words[at + 2];
+        let sp_top = words[at + 3];
+        if n_locals != u64::from(entry.n_locals)
+            || sp_top > u64::from(entry.max_stack)
+            || bcp as usize >= entry.code.len()
+            // Suspended callers have consumed arguments but not yet received
+            // the child's result. T0 Return must be able to push that value.
+            || (scope_index + 1 < scope_count && sp_top == u64::from(entry.max_stack))
+        {
+            error = Some("T2 virtual-frame header disagrees with its retained body");
+            break;
+        }
+        // Both counts now fit the retained body's u16 bounds.
+        let n_locals = n_locals as usize;
+        let sp_top = sp_top as usize;
+        let n_slots = n_locals + sp_top;
+        at += 4;
+        if n_slots > words.len() - at || n_slots > entry.num_slots() as usize {
             error = Some("invalid T2 virtual-frame slot count");
             break;
         }
+        let suspended = scope_index + 1 < scope_count;
+        let Ok(depths) = verified_operand_stack_depths(&entry) else {
+            error = Some("T2 deopt retained body has invalid stack discipline");
+            break;
+        };
+        // An innermost guard saves the complete pre-instruction stack. Each
+        // suspended caller resumes after its call, with just the child result
+        // still absent; Return will push it before the caller executes again.
+        let resume_depth = sp_top as u32 + u32::from(suspended);
+        if depths[bcp as usize] != Some(resume_depth) {
+            error = Some("T2 virtual-frame depth disagrees with its continuation");
+            break;
+        }
+        if suspended {
+            let Some(call_pc) = bcp.checked_sub(1) else {
+                error = Some("T2 suspended frame has no preceding instruction");
+                break;
+            };
+            let Some(Instr::CallNamed { sym, nargs }) = entry.code.get(call_pc as usize) else {
+                error = Some("T2 suspended frame does not resume after a named call");
+                break;
+            };
+            // A reachable successor can follow an unreachable call when a
+            // branch skips it. Require the call itself to be reachable with
+            // exactly the saved pending stack after consuming its arguments.
+            if depths[call_pc as usize]
+                .and_then(|depth| depth.checked_sub(u32::from(*nargs)))
+                != Some(sp_top as u32)
+            {
+                error = Some("T2 suspended call has no matching reachable stack state");
+                break;
+            }
+            // Compare serialized owners before the outer callable's name can
+            // replace its compilation owner below. The next scope validates
+            // the remainder of its header and resolves its retained body.
+            if words.get(at + n_slots).copied() != Some(u64::from(*sym)) {
+                error = Some("T2 suspended call target disagrees with its child");
+                break;
+            }
+        }
         let frame = if let (0, Some(outer)) = (scope_index, outer) {
+            // The saved payload may be smaller than the operand stack needed
+            // by subsequent T0 instructions. Frame::num_locals records the
+            // full allocated slot extent, including native spill/root homes.
+            if outer.is_null() || unsafe { (*outer).num_locals } < entry.num_slots() {
+                error = Some("T2 outer frame cannot hold its retained interpreter body");
+                break;
+            }
             outer
         } else {
             let Some(frame) = stack.push_frame(
@@ -18380,9 +18502,7 @@ fn materialize_t2_deopt_scopes(
                 );
             }
         }
-        for (slot, &bits) in words[at..at + n_slots].iter().enumerate() {
-            unsafe { slot_set(frame, slot as u16, EgclVal(bits)) };
-        }
+        payloads.push(&words[at..at + n_slots]);
         at += n_slots;
         // Metadata is keyed by the compilation owner; only the outermost
         // activation uses the calling closure's identity and captures.
@@ -18404,11 +18524,19 @@ fn materialize_t2_deopt_scopes(
             frame,
         });
     }
-    if error.is_some() || scopes.len() != n_scopes as usize || at != words.len() {
+    if error.is_some() || scopes.len() != scope_count || at != words.len() {
         for _ in 0..pushed {
             stack.pop_frame();
         }
         return Err(error.unwrap_or("truncated T2 virtual-frame stream"));
+    }
+    // Delay all writes, including to the reused outer frame, until malformed
+    // later scopes and stack exhaustion can no longer cause a partial restore.
+    // EgclStack frame allocation above does not collect or move the payload.
+    for (scope, payload) in scopes.iter().zip(payloads) {
+        for (slot, &bits) in payload.iter().enumerate() {
+            unsafe { slot_set(scope.frame, slot as u16, EgclVal(bits)) };
+        }
     }
     Ok((scopes, metadata))
 }

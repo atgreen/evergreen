@@ -33,15 +33,15 @@ fn at_self_cold() {
 
 fn before_self_call() {
     if DYNAMIC.with(Cell::get) { replace_and_collect(); }
-    let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
-    // The wrapper's refresh leaves this pending; the next self admission must
-    // publish its caller and take the cold poll, rather than the direct edge.
-    unsafe { &*execution }.request_yield();
+    // Arrive after the helper's return poll so the generated self edge
+    // must still publish its caller and take cold admission.
+    ordinary_t2::request_yield_after_return();
 }
 
 struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
+        native_transfer_entry::ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| target.set(0));
         ordinary_t2::RECURSIVE_LEAF_OBSERVER.with(|hook| hook.set(None));
         native_transfer_entry::ordinary_calls::SELF_COLD_OBSERVER.with(|hook| hook.set(None));
         MARKER.with(|slot| slot.set(std::ptr::null_mut()));

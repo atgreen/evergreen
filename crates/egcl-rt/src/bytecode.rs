@@ -241,6 +241,14 @@ pub enum DeclaredType {
     #[default]
     Any,
     Fixnum,
+    /// A closed, literal `INTEGER` interval whose endpoints are fixnums.
+    ///
+    /// This proves the tagged representation is a fixnum, while the shared
+    /// entry boundary retains the interval check.
+    FixnumRange {
+        lower: i64,
+        upper: i64,
+    },
     SingleFloat,
 }
 

@@ -179,6 +179,7 @@ fn post_requests(shared: Shared, count: usize) {
         let epoch = unsafe { &*egcl_rt::runtime::process_signal_activity_address() }
             .fetch_add(1, std::sync::atomic::Ordering::Release)
             .wrapping_add(1);
+        egcl_rt::execution_poll::request_all();
         // Hold the mutex over timestamp, real request and sequence publication:
         // the observer can never see a request with missing timing metadata.
         state.pending = Some(Pending {

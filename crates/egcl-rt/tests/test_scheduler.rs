@@ -14,9 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// Each of these creates carrier OS threads and drives fibers, and both the
 /// safepoint handshake and the thread registry are per PROCESS. Run
-/// concurrently they perturb each other: `time_slice_expiry_...` requests
-/// preemption process-wide, carriers from one test compete for CPU with
-/// another's, and `scheduler_group_exposes_real_native_carrier_threads`
+/// concurrently they perturb each other: carriers from one test compete for
+/// CPU with another's, and `scheduler_group_exposes_real_native_carrier_threads`
 /// observes `all_thread_ids()` including the other test's carriers. The
 /// observed failure was `yield_unmounts_and_later_resumes_after_the_call_site`
 /// asserting a yield ORDER of [1,2,3,4], which another test's carriers can
@@ -195,7 +194,7 @@ fn parked_fiber_unmounts_until_explicit_unpark() {
 }
 
 #[test]
-fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
+fn cpu_bound_fiber_is_not_time_sliced_at_safepoints() {
     serialize_scheduler!();
     PREEMPT_HOG_STARTED.store(0, Ordering::Release);
     PREEMPT_HOG_DONE.store(0, Ordering::Release);
@@ -215,10 +214,63 @@ fn time_slice_expiry_preempts_at_safepoints_on_one_carrier() {
     assert_eq!(group.finish().unwrap(), vec![T, T]);
     assert_eq!(
         PREEMPT_PEER_RAN_EARLY.load(Ordering::Acquire),
-        1,
-        "the peer fiber should run before the CPU-bound fiber completes"
+        0,
+        "a safepoint must not time-slice the CPU-bound fiber"
     );
 }
 
 #[path = "support/native_entry.rs"]
 mod native_entry;
+
+fn cancellation_sleeper() -> EgclVal {
+    egcl_rt::sync::fiber_sleep_cancellable(std::time::Duration::from_secs(60)).unwrap();
+    assert!(egcl_rt::thread::current_fiber_cancellation_requested());
+    T
+}
+
+#[test]
+fn cancellation_wakes_an_interruptible_sleep() {
+    serialize_scheduler!();
+    let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+    let fiber = make_fiber(native_entry::entry(cancellation_sleeper)).unwrap();
+    group.submit(fiber).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while fiber_state(fiber) != Some(FiberState::Blocked) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(fiber_state(fiber), Some(FiberState::Blocked));
+    egcl_rt::thread::request_fiber_cancellation(fiber).unwrap();
+    assert!(egcl_rt::thread::fiber_cancellation_requested(fiber).unwrap());
+    assert_eq!(group.finish().unwrap(), vec![T]);
+}
+
+#[test]
+fn cancellation_before_sleep_registration_is_not_lost() {
+    serialize_scheduler!();
+    let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+    let fiber = make_fiber(native_entry::entry(cancellation_sleeper)).unwrap();
+    egcl_rt::thread::request_fiber_cancellation(fiber).unwrap();
+    group.submit(fiber).unwrap();
+    assert_eq!(group.finish().unwrap(), vec![T]);
+}
+
+fn cancellation_parker() -> EgclVal {
+    park_current_fiber().unwrap();
+    assert!(egcl_rt::thread::current_fiber_cancellation_requested());
+    T
+}
+
+#[test]
+fn cancellation_wakes_explicit_park() {
+    serialize_scheduler!();
+    let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 1 }).unwrap();
+    let fiber = make_fiber(native_entry::entry(cancellation_parker)).unwrap();
+    group.submit(fiber).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while fiber_state(fiber) != Some(FiberState::Blocked) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(fiber_state(fiber), Some(FiberState::Blocked));
+    egcl_rt::thread::request_fiber_cancellation(fiber).unwrap();
+    assert_eq!(group.finish().unwrap(), vec![T]);
+}

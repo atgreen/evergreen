@@ -199,6 +199,8 @@ fn exercise(clear_between: bool) {
     .unwrap();
     let buffer = JitBuffer::new(&emitted.code).unwrap();
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 1;
     let active = AtomicBool::new(false);
     let mut control = Control {

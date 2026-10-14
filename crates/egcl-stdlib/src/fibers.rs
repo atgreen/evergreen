@@ -99,6 +99,9 @@ fn wait(fiber: FiberId, timeout: Option<Duration>) -> Result<bool, EgclError> {
     let _blocked = (mode == egcl_rt::sync::BlockingMode::Native)
         .then(|| unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() });
     loop {
+        if thread::current_fiber_cancellation_requested() {
+            return Ok(false);
+        }
         if done()? {
             return Ok(true);
         }
@@ -111,7 +114,7 @@ fn wait(fiber: FiberId, timeout: Option<Duration>) -> Result<bool, EgclError> {
         };
         match mode {
             egcl_rt::sync::BlockingMode::Native => std::thread::sleep(pause),
-            egcl_rt::sync::BlockingMode::Fiber => egcl_rt::sync::fiber_sleep(pause)?,
+            egcl_rt::sync::BlockingMode::Fiber => egcl_rt::sync::fiber_sleep_cancellable(pause)?,
         }
     }
 }
@@ -218,6 +221,22 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         } else {
             NIL
         }),
+        ("CANCEL", [number]) => {
+            thread::request_fiber_cancellation(FiberId(id(*number)?))?;
+            Ok(NIL)
+        }
+        ("CANCELLATION-REQUESTED", []) => Ok(if thread::current_fiber_cancellation_requested() {
+            T
+        } else {
+            NIL
+        }),
+        ("CANCELLATION-REQUESTED", [number]) => Ok(
+            if thread::fiber_cancellation_requested(FiberId(id(*number)?))? {
+                T
+            } else {
+                NIL
+            },
+        ),
         ("YIELD", []) => {
             thread::fiber_yield()?;
             Ok(NIL)
@@ -231,7 +250,7 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
                 let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
                 std::thread::sleep(duration);
             } else {
-                egcl_rt::sync::fiber_sleep(duration)?;
+                egcl_rt::sync::fiber_sleep_cancellable(duration)?;
             }
             Ok(NIL)
         }

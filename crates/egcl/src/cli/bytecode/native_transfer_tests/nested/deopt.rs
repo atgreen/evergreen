@@ -5,6 +5,314 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn deopt_scope_count_is_bounded_before_allocation() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: Vec::new() }),
+        deopt_bodies: Default::default(),
+    });
+    let words = [0u64; 4];
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut panicked = Vec::new();
+    for count in [0, 1, 2, u64::MAX] {
+        // The slice always names real storage. MAX overflows vector capacity
+        // before attempting an allocation in the old implementation; it does
+        // not require exhausting memory or constructing an invalid raw slice.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            materialize_t2_deopt_scopes(
+                count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+            )
+        }));
+        match result {
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("an owner absent from metadata must never be accepted"),
+            Err(_) => panicked.push(count),
+        }
+        assert_eq!(stack.fp(), before_fp);
+        assert_eq!(stack.sp(), before_sp);
+    }
+    assert!(panicked.is_empty(), "scope counts must reject without panicking: {panicked:?}");
+}
+
+#[test]
+fn deopt_outer_frame_has_room_for_the_resumed_body() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
+    let owner = egcl_rt::symbols::intern("DEOPT-OUTER-CAPACITY");
+    let body = Arc::new(
+        compile_function("DEOPT-OUTER-CAPACITY", *params, *forms, &env, false, false)
+            .expect("compile retained identity"),
+    );
+    assert_eq!(body.n_locals, 1);
+    assert_eq!(body.max_stack, 1);
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(owner, Arc::clone(&body))].into_iter().collect(),
+    });
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (capacity, accepted) in [(1, false), (2, true), (3, true)] {
+        let frame = stack.push_frame(
+            EgclVal::from_symbol_index(owner), std::ptr::null(), capacity, FLAG_CALL,
+        ).unwrap();
+        let original = EgclVal::from_fixnum(17);
+        unsafe { slot_set(frame, 0, original) };
+        let frame_sp = stack.sp();
+        // The saved local fits even in the undersized frame, so probing the
+        // old acceptance is safe. Never execute that frame: LoadLocal needs
+        // a second slot despite the empty saved operand stack.
+        let words = [u64::from(owner), 0, 1, 0, EgclVal::from_fixnum(23).0];
+        let result = materialize_t2_deopt_scopes(
+            1, words.len() as u64, words.as_ptr(), Some(frame), Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted { mismatches.push(capacity); }
+        if result.is_err() {
+            assert_eq!(unsafe { slot_get(frame, 0) }, original, "rejection preserves locals");
+        }
+        assert_eq!(stack.fp(), frame);
+        assert_eq!(stack.sp(), frame_sp);
+        stack.pop_frame();
+        assert_eq!(stack.fp(), before_fp);
+        assert_eq!(stack.sp(), before_sp);
+    }
+    assert!(mismatches.is_empty(), "incorrect outer-frame capacity acceptance: {mismatches:?}");
+}
+
+#[test]
+fn deopt_scope_chain_matches_call_continuations() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env("(defun deopt-chain-child (x) (+ x 1))", &mut env).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(child_forms = reader::read_from_string("((+ x 1))").unwrap().0);
+    let child_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-CHILD");
+    let child = Arc::new(
+        compile_function("DEOPT-CHAIN-CHILD", *params, *child_forms, &env, false, false)
+            .expect("compile retained child"),
+    );
+    let _child_root = egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+        bodies: vec![Arc::clone(&child)],
+    });
+    egcl_rt::rooted!(parent_forms = reader::read_from_string("((+ 3 (deopt-chain-child x)))").unwrap().0);
+    let parent_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-PARENT");
+    let parent = Arc::new(
+        compile_function("DEOPT-CHAIN-PARENT", *params, *parent_forms, &env, false, false)
+            .expect("compile retained parent"),
+    );
+    let call_pc = parent.code.iter().position(|op| {
+        matches!(op, Instr::CallNamed { sym, nargs: 1 } if *sym == child_symbol)
+    }).expect("parent must call the retained child") as u64;
+    assert_eq!(parent.n_locals, 1);
+    assert_eq!(child.n_locals, 1);
+    assert!(parent.max_stack >= 2);
+    let other_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-OTHER");
+    let skipped_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-SKIPPED-CALL");
+    let mut skipped = (*parent).clone();
+    skipped.constants = vec![EgclVal::from_fixnum(3), EgclVal::from_fixnum(18)];
+    skipped.code = vec![
+        Instr::Const(0),
+        Instr::Const(1),
+        Instr::Br(4),
+        Instr::CallNamed { sym: child_symbol, nargs: 1 },
+        Instr::CallNamed { sym: egcl_rt::symbols::intern("+"), nargs: 2 },
+        Instr::Return,
+    ];
+    skipped.max_stack = 2;
+    let skipped = Arc::new(skipped);
+    let depths = verified_operand_stack_depths(&skipped).expect("valid branch-over-call bytecode");
+    assert_eq!(depths[3], None, "the alleged suspended call is unreachable");
+    assert_eq!(depths[4], Some(2), "its successor is reachable by the branch");
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&parent), Arc::clone(&child), Arc::clone(&skipped)],
+        }),
+        deopt_bodies: [
+            (parent_symbol, Arc::clone(&parent)),
+            (child_symbol, Arc::clone(&child)),
+            (other_symbol, Arc::clone(&child)),
+            (skipped_symbol, skipped),
+        ].into_iter().collect(),
+    });
+    let scope = |owner: u32, bcp, values: &[EgclVal]| {
+        let mut words = vec![u64::from(owner), bcp, 1, values.len() as u64];
+        words.push(EgclVal::from_fixnum(17).0);
+        words.extend(values.iter().map(|value| value.0));
+        words
+    };
+    let three = EgclVal::from_fixnum(3);
+    let mut valid = scope(parent_symbol, call_pc + 1, &[three]);
+    valid.extend(scope(child_symbol, 0, &[]));
+    let mut trailing_word = valid.clone();
+    trailing_word.push(0);
+    let mut wrong_target = scope(parent_symbol, call_pc + 1, &[three]);
+    wrong_target.extend(scope(other_symbol, 0, &[]));
+    let mut wrong_parent_pc = scope(parent_symbol, 0, &[three]);
+    wrong_parent_pc.extend(scope(child_symbol, 0, &[]));
+    let mut wrong_parent_depth = scope(parent_symbol, call_pc + 1, &[]);
+    wrong_parent_depth.extend(scope(child_symbol, 0, &[]));
+    let mut wrong_child_depth = scope(parent_symbol, call_pc + 1, &[three]);
+    wrong_child_depth.extend(scope(child_symbol, 0, &[three]));
+    let mut unreachable_call = scope(skipped_symbol, 4, &[three]);
+    unreachable_call.extend(scope(child_symbol, 0, &[]));
+    let cases = [
+        ("valid retained chain", valid, 2, true),
+        ("valid post-call root", scope(parent_symbol, call_pc + 1, &[three, EgclVal::from_fixnum(18)]), 1, true),
+        ("wrong call target", wrong_target, 2, false),
+        ("parent not after call", wrong_parent_pc, 2, false),
+        ("wrong pending parent depth", wrong_parent_depth, 2, false),
+        ("wrong child guard depth", wrong_child_depth, 2, false),
+        ("wrong root guard depth", scope(child_symbol, 0, &[three]), 1, false),
+        ("unreachable suspended call", unreachable_call, 2, false),
+        ("trailing word after valid chain", trailing_word, 2, false),
+    ];
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (name, words, count, accepted) in cases {
+        let result = materialize_t2_deopt_scopes(
+            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted { mismatches.push(name); }
+        if let Ok((scopes, retained)) = result {
+            if accepted {
+                assert_eq!(
+                    resume_inlined_in_t0(scopes, retained, None, &mut env).unwrap(),
+                    EgclVal::from_fixnum(21),
+                    "{name}: resume exactly the pending computation",
+                );
+            } else {
+                // Malformed activations are never executed.
+                for _ in scopes { stack.pop_frame(); }
+            }
+        }
+        assert_eq!(stack.fp(), before_fp, "{name}: frame cleanup");
+        assert_eq!(stack.sp(), before_sp, "{name}: stack cleanup");
+    }
+    assert!(mismatches.is_empty(), "incorrect continuation acceptance: {mismatches:?}");
+}
+
+#[test]
+fn deopt_scope_headers_match_retained_bodies() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env("(defun deopt-header-target (x) x)", &mut env).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("((deopt-header-target x))").unwrap().0);
+    let symbol = egcl_rt::symbols::intern("DEOPT-HEADER-OWNER");
+    let body = Arc::new(
+        compile_function("DEOPT-HEADER-OWNER", *params, *forms, &env, false, false).unwrap(),
+    );
+    assert_eq!(body.n_locals, 1);
+    let after_call = body.code.iter().position(|op| matches!(op, Instr::CallNamed { .. }))
+        .expect("fixture must have a suspended call") as u64 + 1;
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+    });
+    let scope = |function, bcp, locals, depth| {
+        let mut words = vec![function, bcp, locals, depth];
+        words.resize(4 + (locals + depth) as usize, NIL.0);
+        words
+    };
+    let owner = u64::from(symbol);
+    let mut full_parent = scope(owner, after_call, 1, u64::from(body.max_stack));
+    full_parent.extend(scope(owner, 0, 1, 0));
+    let mut valid_parent = scope(owner, after_call, 1, 0);
+    valid_parent.extend(scope(owner, 0, 1, 0));
+    let cases = [
+        ("valid root", scope(owner, 0, 1, 0), 1, true),
+        ("header-shaped but mismatched callee", valid_parent, 2, false),
+        ("missing local", scope(owner, 0, 0, 0), 1, false),
+        ("extra local", scope(owner, 0, 2, 0), 1, false),
+        ("truncated function id", scope(owner + (1u64 << 32), 0, 1, 0), 1, false),
+        ("truncated resume position", scope(owner, 1u64 << 32, 1, 0), 1, false),
+        ("resume past body", scope(owner, body.code.len() as u64, 1, 0), 1, false),
+        ("excess operand depth", scope(owner, 0, 1, u64::from(body.max_stack) + 1), 1, false),
+        ("no room for child result", full_parent, 2, false),
+    ];
+    let stack = egcl_rt::current_stack();
+    let parent = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (name, words, count, accepted) in cases {
+        // Never resume malformed activations. All writes are into fresh frames
+        // allocated from the retained body, so this probes rejection safely.
+        let result = materialize_t2_deopt_scopes(
+            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted {
+            mismatches.push(name);
+        }
+        if let Ok((scopes, _)) = result {
+            for _ in scopes { stack.pop_frame(); }
+        }
+        assert_eq!(stack.fp(), parent, "{name}: frame rollback");
+        assert_eq!(stack.sp(), before_sp, "{name}: stack rollback");
+    }
+    assert!(mismatches.is_empty(), "incorrect frame-header acceptance: {mismatches:?}");
+}
+
+#[test]
+fn malformed_inner_deopt_scope_preserves_outer_frame() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(forms = reader::read_from_string("(x)").unwrap().0);
+    let symbol = egcl_rt::symbols::intern("DEOPT-VALIDATE-BEFORE-WRITE");
+    let body = Arc::new(
+        compile_function("DEOPT-VALIDATE-BEFORE-WRITE", *params, *forms, &env, false, false)
+            .unwrap(),
+    );
+    assert_eq!(body.n_locals, 1);
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&body)],
+        }),
+        deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+    });
+    let stack = egcl_rt::current_stack();
+    let parent = stack.fp();
+    let frame = stack
+        .push_frame(EgclVal::from_symbol_index(symbol), std::ptr::null(), body.num_slots(), FLAG_CALL)
+        .unwrap();
+    let original = EgclVal::from_fixnum(17);
+    unsafe { slot_set(frame, 0, original) };
+    // The second scope is structurally complete but has no retained body.
+    let absent = egcl_rt::symbols::intern("DEOPT-MISSING-INNER-BODY");
+    let words = [u64::from(symbol), 0, 1, 0, NIL.0, u64::from(absent), 0, 0, 0];
+    let result = materialize_t2_deopt_scopes(
+        2, words.len() as u64, words.as_ptr(), Some(frame), Some(metadata),
+    );
+    let after = unsafe { slot_get(frame, 0) };
+    let restored_fp = stack.fp();
+    stack.pop_frame();
+    assert!(result.is_err(), "an unknown retained body must be rejected");
+    assert_eq!(restored_fp, frame);
+    assert_eq!(stack.fp(), parent);
+    assert_eq!(after, original, "reject the whole stream before writing outer slots");
+}
+
+#[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_optimized_child_guard_returns_and_escapes_without_replay() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());

@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Accept global `INLINE` and `NOTINLINE` declarations for SETF function names
+  without confusing their policies with the corresponding getters, fixing
+  ASDF loading ([#326](https://github.com/atgreen/evergreen/pull/326)).
+
+- Forward immediately reloaded native frame slots from their just-stored
+  registers while retaining the memory stores needed for garbage collection
+  and recovery ([#326](https://github.com/atgreen/evergreen/pull/326), carried
+  forward from [#311](https://github.com/atgreen/evergreen/pull/311)).
+
+- Preserve bounded integer parameter ranges in T2, and retain declared argument
+  checks on direct recursive calls, including calls replaced by pure return
+  shortcuts. Use dominating numeric comparisons to prove recursive argument
+  bounds without redundant checks, and omit add/subtract overflow checks when
+  checked operand ranges prove the result fits a fixnum. Correct constant-left
+  subtraction when the result reuses the right operand's register. Retain global
+  `FTYPE` declaration metadata during compilation and source-free BFASL loading;
+  result-type enforcement and optimization from these declarations are not yet enabled
+  ([#326](https://github.com/atgreen/evergreen/pull/326)).
+
+- Replace repeated native runtime checks with an execution-local poll and remove
+  redundant ownership/depth checks from trusted ordinary self-calls. Reduce
+  measured warmed `fib(35)` time from 190.5 ms to 107 ms on the benchmark host
+  ([#312](https://github.com/atgreen/evergreen/pull/312)).
+
+- Schedule fibers cooperatively without automatic CPU time slices or per-fiber
+  CPU budgets. Add cooperative cancellation with explicit checkpoints and
+  interruptible public sleep, park, and join; retain opt-in sandbox CPU limits
+  ([#312](https://github.com/atgreen/evergreen/pull/312)).
+
 - Let eligible ordinary T2 functions return from bounded, noncollecting entry
   paths before constructing a native frame, including simple recursive base
   cases ([#310](https://github.com/atgreen/evergreen/pull/310)).

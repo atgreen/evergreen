@@ -201,6 +201,8 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
         revision_address: &revision as *const _ as u64, heat_slot: 0,
     };
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 3;
     let active = AtomicBool::new(false);
     let mut control = NativeRecursiveControl {
@@ -233,9 +235,8 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
         (3, vec![2, 0, 1, 2], false),
     ] {
         descriptor.arity = indices.len();
-        // A replacement frame is legal at the depth cap; capacity fallback
-        // still performs a real child call and therefore needs spare depth.
-        control.depth_limit = if tail { depth } else { depth + 1 };
+        // Ordinary tail handoffs and machine CALLs ignore legacy reentry depth.
+        control.depth_limit = depth;
         std::hint::black_box(&control);
         std::hint::black_box(&descriptor);
         let code = emit_framed_ordinary_tail_call(
@@ -281,7 +282,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
             }
             assert_eq!(observed[4], indices.len() as u64);
             assert_eq!(observed[5], NIL.0);
-            assert_eq!(observed[9], if tail { 3 } else { 4 });
+            assert_eq!(observed[9], 3, "machine CALLs do not consume Rust/native reentry depth");
             if tail {
                 assert_eq!(observed[6..9], [output[10], output[11], 0x5151]);
             } else {
@@ -335,7 +336,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
                     // covered by native_ordinary_mv_admission after a real producer.
                     1 => execution.request_yield(),
                     2 => revision.store(8, Relaxed),
-                    3 => bytes[0].store(1, Relaxed),
+                    3 => execution.request_poll(),
                     _ => unreachable!(),
                 }
                 std::hint::black_box(&control);
@@ -372,7 +373,8 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
                 control.stack_limit = 0;
                 assert_eq!(execution.take_yield_request(), guard == 1);
                 revision.store(7, Relaxed);
-                bytes[0].store(0, Relaxed);
+                // Model the cold runtime consuming its published request.
+                execution.begin_poll();
             }
         }
     }

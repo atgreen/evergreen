@@ -163,7 +163,7 @@ mod ordinary_primitives;
 pub use ordinary_primitives::{OrdinaryPrimitive, lower_ordinary_primitives};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{emit_framed_ordinary_call, emit_framed_ordinary_tail_call,
-    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, OrdinaryCallTarget, OrdinaryCallFlags,
+    emit_framed_ordinary_guarded_call, emit_framed_ordinary_two_calls, emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll, emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_function_with_self_call_facts, OrdinarySelfCallFacts, OrdinaryCallTarget, OrdinaryCallFlags,
     OrdinaryColdRequest, OrdinaryGuardOptions, OrdinaryGuardRequest};
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -585,6 +585,29 @@ fn mul_cannot_overflow(range: Option<crate::t2::ir::Range>, c: i64) -> bool {
     }
 }
 
+/// Prove the mathematical sum/difference fits before operating on tagged words.
+/// Use operand bounds, never the result's potentially clipped fixnum range.
+fn add_sub_cannot_overflow(
+    left: Option<crate::t2::ir::Range>,
+    right: Option<crate::t2::ir::Range>,
+    subtract: bool,
+) -> bool {
+    let (Some(left), Some(right)) = (left, right) else { return false };
+    for range in [left, right] {
+        if range.lo > range.hi || range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX {
+            return false;
+        }
+    }
+    let (lo, hi) = if subtract {
+        (i128::from(left.lo) - i128::from(right.hi),
+         i128::from(left.hi) - i128::from(right.lo))
+    } else {
+        (i128::from(left.lo) + i128::from(right.lo),
+         i128::from(left.hi) + i128::from(right.hi))
+    };
+    lo >= i128::from(FIXNUM_MIN) && hi <= i128::from(FIXNUM_MAX)
+}
+
 /// Get value `v` into a register: an already-assigned one, or a deferred fixnum
 /// constant materialised (tagged) into a fresh register on demand.
 fn framed_mat(
@@ -932,14 +955,25 @@ fn framed_stack_disp(slot: u32) -> i32 {
 fn load_home(a: &mut Asm, dst: u8, home: FramedHome, rsp_adjust: i32) {
     match home {
         FramedHome::Reg(src) => mov_rr(a, dst, src),
-        FramedHome::Stack(slot) => load_from_rsp(a, dst, framed_stack_disp(slot) + rsp_adjust),
+        FramedHome::Stack(slot) => {
+            let displacement = framed_stack_disp(slot) + rsp_adjust;
+            if let Some(source) = a.preceding_rsp_store(displacement) {
+                mov_rr(a, dst, source);
+            } else {
+                load_from_rsp(a, dst, displacement);
+            }
+        }
     }
 }
 
 fn store_home(a: &mut Asm, home: FramedHome, src: u8, rsp_adjust: i32) {
     match home {
         FramedHome::Reg(dst) => mov_rr(a, dst, src),
-        FramedHome::Stack(slot) => store_to_rsp(a, src, framed_stack_disp(slot) + rsp_adjust),
+        FramedHome::Stack(slot) => {
+            let displacement = framed_stack_disp(slot) + rsp_adjust;
+            store_to_rsp(a, src, displacement);
+            a.remember_rsp_store(displacement, src);
+        }
     }
 }
 
@@ -1087,6 +1121,18 @@ pub struct NativePollFastPath {
     pub instrument_skips: bool,
 }
 
+/// One acquire observation of the running execution's pending work. The slot
+/// lives longer than generated code and follows a fiber across carrier changes.
+/// Producers publish their payload before arming; only the published runtime
+/// poll clears the notification, before draining its authoritative sources.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_execution_poll_guard(a: &mut Asm, execution: u8, slow: egcl_rt::asm::Label) {
+    load_mem64_disp(a, SCRATCH, execution, egcl_rt::exec_context::offsets::POLL_SLOT as i32);
+    load_mem64_disp(a, RAX, SCRATCH, 0);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::Ne, slow);
+}
+
 /// Only reserved scratch registers are touched before the conditional edge;
 /// the caller has not spilled or published any roots yet. x86 loads provide the
 /// required Acquire/SeqCst load ordering for these runtime atomic cells.
@@ -1096,32 +1142,11 @@ fn emit_idle_poll_guard(a: &mut Asm, fast: NativePollFastPath, home: FramedHome,
 {
     use std::mem::offset_of;
     let slow = a.label();
-    for (address, byte) in [(fast.gc_requested, true), (fast.sigusr1_pending, true),
-        (fast.posted_signal, false), (fast.native_errors, false)] {
-        mov_imm64(a, SCRATCH, address as i64);
-        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
-        alu_r_imm(a, 7, RAX, 0);
-        a.jcc(Cc::Ne, slow);
-    }
     load_home(a, 7, home, 0);
     alu_r_imm(a, 7, 7, 0);
     a.jcc(Cc::E, slow);
-    mov_imm64(a, SCRATCH, fast.signal_epoch as i64);
-    load_mem64_disp(a, RAX, SCRATCH, 0);
-    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_signal_epoch) as u8);
-    a.jcc(Cc::Ne, slow);
     load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, execution) as i32);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
-    cmp_mem64_disp8(a, RAX, 7, offset_of!(NativePollControl, seen_carrier) as u8);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
-    mov_rr(a, SCRATCH, 7);
-    alu_r_imm(a, 0, SCRATCH, offset_of!(NativePollControl, deadline_armed) as i32);
-    movzx_mem8(a, RAX, SCRATCH);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
+    emit_execution_poll_guard(a, SCRATCH, slow);
     if fast.observe_forces_cold {
         let no_observer = a.label();
         load_mem64_disp(a, SCRATCH, 7, offset_of!(NativePollControl, test_observer) as i32);
@@ -1431,6 +1456,10 @@ fn emit_arith_inst(
         Opcode::FixnumAdd | Opcode::FixnumSub => {
             let is_add = data.opcode == Opcode::FixnumAdd;
             let (a0, b0) = (data.args[0], data.args[1]);
+            let range = |v| consts.get(&v)
+                .map(|&n| crate::t2::ir::Range { lo: n, hi: n })
+                .or(f.value(v).ty.range);
+            let needs_overflow_check = !add_sub_cannot_overflow(range(a0), range(b0), !is_add);
             // Fold a constant right operand (add/sub var, const), or a constant left
             // operand for the commutative add.
             let folded = if let Some(&c) = consts.get(&b0) {
@@ -1446,7 +1475,9 @@ fn emit_arith_inst(
                     guard(a, var, x);
                     mov_rr(a, dst, x);
                     alu_r_imm(a, if is_add { 0 } else { 5 }, dst, t32);
-                    a.jcc(Cc::O, deopt);
+                    if needs_overflow_check {
+                        a.jcc(Cc::O, deopt);
+                    }
                     return Ok(());
                 }
             }
@@ -1460,6 +1491,12 @@ fn emit_arith_inst(
                     // Addition is commutative, so accumulate the untouched LHS
                     // into the RHS/result register without a destructive move.
                     alu_rr(a, op, dst, x);
+                } else if x == SCRATCH {
+                    // A materialised constant LHS already occupies rdx. Consume
+                    // it before reusing the RHS/result register; MOV preserves
+                    // the subtraction's overflow flag for the guard below.
+                    alu_rr(a, op, SCRATCH, y);
+                    mov_rr(a, dst, SCRATCH);
                 } else {
                     // Subtraction is not commutative: preserve RHS in reserved
                     // rdx before overwriting the coalesced destination.
@@ -1471,7 +1508,9 @@ fn emit_arith_inst(
                 mov_rr(a, dst, x);
                 alu_rr(a, op, dst, y);
             }
-            a.jcc(Cc::O, deopt);
+            if needs_overflow_check {
+                a.jcc(Cc::O, deopt);
+            }
         }
         Opcode::FixnumNeg => {
             let a0 = data.args[0];
@@ -2143,33 +2182,11 @@ fn emit_native_recursive_call(
     // RDI/RAX/SCRATCH/R11 are not final value homes. The control pointer is raw,
     // execution-owned, and follows a fiber across carrier migration.
     load_home(a, 7, control_home, 0);
-    for (address, byte) in [(recursion.flags.gc_requested, true),
-        (recursion.flags.sigusr1_pending, true), (recursion.flags.posted_signal, false),
-        (recursion.flags.native_errors, false)] {
-        mov_imm64(a, SCRATCH, address as i64);
-        if byte { movzx_mem8(a, RAX, SCRATCH); } else { load_mem64_disp(a, RAX, SCRATCH, 0); }
-        alu_r_imm(a, 7, RAX, 0); // cmp rax,0
-        a.jcc(Cc::Ne, slow);
-    }
+    load_mem64_disp(a, SCRATCH, 7, 0); // execution
+    emit_execution_poll_guard(a, SCRATCH, slow);
     mov_imm64(a, SCRATCH, recursion.flags.generation as i64);
     load_mem64_disp(a, RAX, SCRATCH, 0);
     cmp_mem64_disp8(a, RAX, 7, 32);
-    a.jcc(Cc::Ne, slow);
-    mov_imm64(a, SCRATCH, recursion.flags.signal_epoch as i64);
-    load_mem64_disp(a, RAX, SCRATCH, 0);
-    cmp_mem64_disp8(a, RAX, 7, 48);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, SCRATCH, 7, 0); // execution
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::CARRIER_ID as i32);
-    cmp_mem64_disp8(a, RAX, 7, 40);
-    a.jcc(Cc::Ne, slow);
-    load_mem64_disp(a, RAX, SCRATCH, egcl_rt::exec_context::offsets::YIELD_REQUESTED as i32);
-    alu_r_imm(a, 7, RAX, 0);
-    a.jcc(Cc::Ne, slow);
-    mov_rr(a, SCRATCH, 7);
-    alu_r_imm(a, 0, SCRATCH, 64);
-    movzx_mem8(a, RAX, SCRATCH); // deadline_armed
-    alu_r_imm(a, 7, RAX, 0);
     a.jcc(Cc::Ne, slow);
     if recursion.flags.observe_forces_cold {
         let no_observer = a.label();
@@ -3059,9 +3076,9 @@ fn emit_cons_guard(
 
 /// A speculated fixnum operand proof reified as an SSA guard value
 /// (speculate.rs materialize_fixnum_operand_guards, egcl-x5y.25b): test the
-/// low three tag bits are zero, deopt otherwise, and pass the value through to
-/// its result register. Downstream typed ops skip their own operand re-check
-/// because the result's inferred type is FIXNUM.
+/// low three tag bits are zero and enforce any inclusive range, deopt otherwise,
+/// then pass the value through to its result register. The result's type facts
+/// must be true before downstream typed operations can rely on them.
 fn emit_fixnum_value_guard(
     a: &mut Asm,
     data: &crate::t2::ir::InstData,
@@ -3083,6 +3100,28 @@ fn emit_fixnum_value_guard(
         .get(&data.args[0])
         .ok_or(EmitError::UnsupportedOp(0xF2))?;
     guard_fixnum(a, xr, deopt);
+    if let AuxData::TypeTag(ty) = data.aux {
+        if let Some(range) = ty.range {
+            // Intersect with the tag's representable domain before shifting
+            // bounds. Tagged fixnums preserve signed integer ordering.
+            let lo = range.lo.max(FIXNUM_MIN);
+            let hi = range.hi.min(FIXNUM_MAX);
+            if lo > hi {
+                a.jmp(deopt);
+            } else {
+                if lo > FIXNUM_MIN {
+                    mov_imm64(a, SCRATCH, lo << 3);
+                    cmp_rr(a, xr, SCRATCH);
+                    a.jcc(Cc::L, deopt);
+                }
+                if hi < FIXNUM_MAX {
+                    mov_imm64(a, SCRATCH, hi << 3);
+                    cmp_rr(a, xr, SCRATCH);
+                    a.jcc(Cc::G, deopt);
+                }
+            }
+        }
+    }
     let dst = framed_alloc(reg, pool, data.results[0])?;
     mov_rr(a, dst, xr);
     Ok(())
@@ -4846,8 +4885,9 @@ fn emit_framed_inner(
     // Parameter declarations are checked by the shared bytecode/native entry
     // boundary before this code runs. Seed the emitter's proof sets from their
     // entry SSA types so typed operations do not emit a second, redundant tag
-    // guard. Declared functions do not expose the unchecked register-entry ABI
-    // below, keeping this assumption true for recursive compiled calls too.
+    // guard. Legacy unchecked register entries are disabled for declarations;
+    // ordinary direct self-calls prove or check the argument contract before
+    // entering this body (or using a pure return shortcut).
     let type_is = |value: Value, bits: TypeBits| {
         let actual = f.value(value).ty.bits;
         !actual.is_bottom() && actual.meet(bits) == actual
@@ -5456,8 +5496,12 @@ fn emit_framed_inner(
     let mut a = Asm::new();
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
-                                    // Variadic and activation-backed functions require the frame entry.
-    if native_frame_mode && has_declared_params { return Err(EmitError::UnsupportedOp(0xFA)); }
+    // The legacy native-frame ABI has no checked parameter ingress. Ordinary
+    // entries do: their root dispatcher validates declarations before jumping
+    // into generated code, and only source-proven self calls share that entry.
+    if native_frame_mode && has_declared_params && !ordinary_call_mode {
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     let has_reg_entry = !ordinary_call_mode && (native_frame_mode || (!has_declared_params
         && !f.is_variadic()
         && frame_base_home.is_none()
@@ -5705,6 +5749,12 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut ordinary_self_stack_fixups = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_self_prefix = ordinary.and_then(|options|
+        ordinary_prefix::select(f, options.arity, &single_returns));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_self_specializations = ordinary.zip(ordinary_call).map_or_else(Vec::new,
+        |(options, calls)| ordinary_prefix::specialize(f, options.arity, &single_returns, calls.self_calls));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
         let offset = a.here();
@@ -5948,8 +5998,11 @@ fn emit_framed_inner(
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
-                    ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
+                    ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
+                        outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
+                        self_prefix: ordinary_self_prefix.as_ref(),
+                        self_specializations: &ordinary_self_specializations,
                         mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
                         emit_epilogue: &emit_epilogue })?; }
@@ -8455,6 +8508,92 @@ mod tests {
         }
     }
 
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn fixnum_guard_enforces_inclusive_declared_ranges() {
+        use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+        use crate::t2::ir::{
+            AuxData, Function, IRType, InstData, InstFlags, Opcode, Range, TypeBits,
+            ValueRepresentation,
+        };
+        use egcl_rt::value::{EgclVal, NIL};
+        std::thread_local! {
+            static REJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn reject() { REJECTED.with(|seen| seen.set(true)); }
+        let mut missed = Vec::new();
+        for range in [
+            Range { lo: -3, hi: 5 },
+            Range { lo: 1 << 40, hi: (1 << 40) + 5 },
+            Range { lo: FIXNUM_MIN, hi: FIXNUM_MIN + 1 },
+            Range { lo: FIXNUM_MAX - 1, hi: FIXNUM_MAX },
+            Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX },
+            Range { lo: i64::MIN, hi: i64::MAX },
+            Range { lo: FIXNUM_MIN - 2, hi: FIXNUM_MIN - 1 },
+            Range { lo: FIXNUM_MAX + 1, hi: FIXNUM_MAX + 2 },
+            Range { lo: 5, hi: -3 },
+            Range { lo: 0, hi: 0 },
+        ] {
+            let mut f = Function::new("checked-inline-argument");
+            let entry = f.entry();
+            let input = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+            let state = f.frame_states.add(FrameState {
+                scopes: vec![FrameScope { function: 0, bcp: 7,
+                    locals: vec![ValueSource::Value { value: input, repr: ValueRepresentation::Tagged }],
+                    stack: vec![],
+                }],
+                remat: vec![],
+            });
+            let checked_type = IRType { bits: TypeBits::FIXNUM, range: Some(range), class_id: None };
+            // A dominating tag proof must not erase the narrower range guard.
+            let (_, tagged) = f.push_inst(entry, InstData {
+                opcode: Opcode::Guard, args: vec![input], results: vec![],
+                aux: AuxData::TypeTag(IRType::of(TypeBits::FIXNUM)),
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: Some(state), source_pos: 0,
+            }, &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)]);
+            let (_, checked) = f.push_inst(entry, InstData {
+                opcode: Opcode::Guard, args: vec![tagged[0]], results: vec![],
+                aux: AuxData::TypeTag(checked_type),
+                flags: InstFlags { guard: true, effectful: true, ..Default::default() },
+                targets: vec![], frame_state: Some(state), source_pos: 0,
+            }, &[(checked_type, ValueRepresentation::Tagged)]);
+            f.set_terminator(entry, InstData {
+                opcode: Opcode::Return, args: vec![checked[0]], results: vec![],
+                aux: AuxData::None, flags: InstFlags { terminator: true, ..Default::default() }, targets: vec![],
+                frame_state: None, source_pos: 0,
+            });
+            crate::t2::verify::verify(&f).expect("bounded guard IR");
+            crate::t2::pass::Pass::run(&mut crate::t2::opt_guard::GuardElim,
+                &mut f, &mut crate::t2::pass::Analyses::new());
+            crate::t2::verify::verify(&f).expect("optimized bounded guard IR");
+            let code = emit_framed(&f, reject as *const () as usize as u64,
+                0, 0, 0, 0, 0, 0, 0, None).expect("emit bounded guard");
+            let buffer = egcl_rt::jit::JitBuffer::new(&code.code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            let mut values = vec![EgclVal::from_fixnum(FIXNUM_MIN), EgclVal::from_fixnum(FIXNUM_MAX),
+                EgclVal::from_fixnum(0), NIL, EgclVal::from_single_float(1.0)];
+            for number in [Some(range.lo), Some(range.hi), range.lo.checked_sub(1), range.hi.checked_add(1)]
+                .into_iter().flatten()
+            {
+                if (FIXNUM_MIN..=FIXNUM_MAX).contains(&number) {
+                    values.push(EgclVal::from_fixnum(number));
+                }
+            }
+            for value in values {
+                REJECTED.with(|seen| seen.set(false));
+                let mut frame = [value.0, 0, 0];
+                let result = function(frame.as_mut_ptr());
+                let accepted = value.is_fixnum()
+                    && (range.lo..=range.hi).contains(&value.as_fixnum());
+                if REJECTED.with(|seen| seen.get()) == accepted { missed.push((range, value)); }
+                if accepted { assert_eq!(result, value.0, "guard preserves the argument"); }
+            }
+        }
+        assert!(missed.is_empty(), "incorrect bounded guard decisions: {missed:?}");
+    }
+
     /// The framed-emitter milestone: a T2-emitted `(* x 5)` runs via the
     /// interpreter frame ABI — a fixnum arg gives `x*5` (fast path, operand stack
     /// gone), a float arg trips the guard and calls the deopt routine.
@@ -8587,6 +8726,139 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn add_sub_range_code(
+        opcode: crate::t2::ir::Opcode,
+        left: Option<crate::t2::ir::Range>,
+        right: Result<i64, crate::t2::ir::Range>,
+        constant_on_left: bool,
+        deopt: Option<extern "C" fn()>,
+    ) -> Vec<u8> {
+        use crate::t2::ir::{IRType, TypeBits, ValueRepresentation};
+        let mut f = build_mul_ranged(right.unwrap_or(0), left);
+        let entry = f.entry();
+        let arithmetic = f.block(entry).insts[1];
+        f.inst_mut(arithmetic).opcode = opcode;
+        if let Err(range) = right {
+            let y = f.add_block_param(entry, IRType {
+                bits: TypeBits::FIXNUM, range: Some(range), class_id: None,
+            }, ValueRepresentation::Tagged);
+            f.inst_mut(arithmetic).args[1] = y;
+        }
+        if constant_on_left {
+            f.inst_mut(arithmetic).args.swap(0, 1);
+        }
+        emit_framed(&f, deopt.unwrap_or(mock_c2i_deopt) as *const () as usize as u64,
+            0, 0, 0, 0, 0, 0, 0, None).expect("emit ranged arithmetic").code
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn has_overflow_branch(code: &[u8]) -> bool {
+        iced_x86::Decoder::new(64, code, iced_x86::DecoderOptions::NONE)
+            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Jo)
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_elides_overflow_for_immediate_and_register_operands() {
+        use crate::t2::ir::{Opcode, Range};
+        use egcl_rt::value::EgclVal;
+        for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
+            for right in [Ok(2), Ok(-2), Err(Range { lo: -2, hi: 2 })] {
+                for constant_on_left in [false, true] {
+                    let code = add_sub_range_code(opcode, Some(Range { lo: -40, hi: 40 }),
+                        right, constant_on_left, None);
+                    assert!(!has_overflow_branch(&code),
+                        "bounded {opcode:?} {right:?}, swapped={constant_on_left}, cannot overflow");
+                    let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+                    let function: extern "C" fn(*mut u64) -> u64 =
+                        unsafe { std::mem::transmute(buffer.as_ptr()) };
+                    for x in [-40, 0, 40] {
+                        let y = right.unwrap_or(-2);
+                        let (a, b) = if constant_on_left { (y, x) } else { (x, y) };
+                        let expected = if opcode == Opcode::FixnumAdd { a + b } else { a - b };
+                        let mut frame = [EgclVal::from_fixnum(x).0, EgclVal::from_fixnum(y).0, 0, 0];
+                        assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected,
+                            "{opcode:?}, {right:?}, swapped={constant_on_left}, x={x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_accepts_exact_fixnum_endpoints() {
+        use crate::t2::ir::{Opcode, Range};
+        use egcl_rt::value::EgclVal;
+        for (opcode, range, constant) in [
+            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, 1),
+            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, 1),
+            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, -1),
+            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, -1),
+        ] {
+            let code = add_sub_range_code(opcode, Some(range), Ok(constant), false, None);
+            assert!(!has_overflow_branch(&code),
+                "inclusive fixnum endpoints are safe for {opcode:?}, {range:?}, {constant}");
+            let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            for x in [range.lo, range.hi] {
+                let expected = if opcode == Opcode::FixnumAdd { x + constant } else { x - constant };
+                let mut frame = [EgclVal::from_fixnum(x).0, 0, 0];
+                assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_keeps_overflow_for_unknown_or_excessive_ranges() {
+        use crate::t2::ir::{Opcode, Range};
+        for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
+            for range in [None, Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }),
+                Some(Range { lo: i64::MIN, hi: i64::MAX }),
+                Some(Range { lo: 40, hi: 0 })] {
+                let code = add_sub_range_code(opcode, range, Ok(1), false, None);
+                assert!(has_overflow_branch(&code),
+                    "no sound overflow proof for {opcode:?}, {range:?}");
+            }
+            for swapped in [false, true] {
+                for right in [Ok(1), Err(Range { lo: -1, hi: 1 })] {
+                    let code = add_sub_range_code(opcode,
+                        Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }), right, swapped, None);
+                    assert!(has_overflow_branch(&code),
+                        "overflow remains possible for {opcode:?}, {right:?}, swapped={swapped}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn constant_left_sub_preserves_scratch_lhs_when_result_reuses_rhs() {
+        use crate::t2::ir::Opcode;
+        use egcl_rt::value::EgclVal;
+        std::thread_local! {
+            static OVERFLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn overflow() {
+            OVERFLOWED.with(|seen| seen.set(true));
+        }
+        // No range proof: exercise the original overflow-checked register path.
+        let code = add_sub_range_code(Opcode::FixnumSub, None, Ok(2), true, Some(overflow));
+        assert!(has_overflow_branch(&code));
+        let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+        let function: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = [EgclVal::from_fixnum(-40).0, 0, 0];
+        assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), 42);
+        assert!(!OVERFLOWED.with(|seen| seen.get()));
+        frame[0] = EgclVal::from_fixnum(FIXNUM_MIN).0;
+        let _ = function(frame.as_mut_ptr());
+        assert!(OVERFLOWED.with(|seen| seen.get()), "MOV must preserve OF for deoptimization");
     }
 
     /// Range-proven-safe `* 5` strength-reduces to a single `lea` with no overflow
@@ -9430,3 +9702,31 @@ mod poll_map_tests {
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 #[path = "emit_raw_float_tests.rs"]
 mod raw_float_tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod adjacent_home_tests {
+    use super::*;
+    #[test]
+    fn immediately_reloaded_home_uses_stored_register() {
+        let mut a = Asm::new();
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let store_end = a.here();
+        load_home(&mut a, RAX, FramedHome::Stack(3), 0);
+        assert_eq!(a.here(), store_end, "same-register reload must disappear");
+        load_home(&mut a, 11, FramedHome::Stack(3), 0);
+        let code = a.finish().unwrap();
+        assert_eq!(&code[store_end..], &[0x49, 0x89, 0xc3]);
+    }
+    #[test]
+    fn home_reload_after_label_or_stack_change_stays_in_memory() {
+        let mut a = Asm::new();
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let end = a.here(); let label = a.label(); a.bind(label);
+        load_home(&mut a, RAX, FramedHome::Stack(3), 0);
+        assert!(a.here() > end);
+        store_home(&mut a, FramedHome::Stack(3), RAX, 0);
+        let end = a.here();
+        load_home(&mut a, RAX, FramedHome::Stack(3), 8);
+        assert!(a.here() > end);
+    }
+}

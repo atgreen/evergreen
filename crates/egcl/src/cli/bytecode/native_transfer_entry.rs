@@ -546,8 +546,25 @@ impl TransferCode {
         Some(self.code.as_ptr().wrapping_add(offset))
     }
 
+    /// Code bounds for an in-flight ordinary segment. Unlike a published
+    /// descriptor, this does not authorize arbitrary named callers to enter
+    /// the register ABI: it is used only to retain the already validated root
+    /// callable while its generated body is executing.
+    pub(super) fn ordinary_code_bounds(&self) -> Option<(usize, usize)> {
+        self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
+        Some((self.code.as_ptr() as usize, self.code_len))
+    }
+
     pub(super) fn ordinary_descriptor(&self, revision: u64) -> Option<egcl_rt::call_table::OrdinaryEntryDescriptor> {
         use egcl_rt::call_table::{OrdinaryEntryDescriptor, ORDINARY_X64_LISP_KIND, ORDINARY_X64_LISP_VERSION, ORDINARY_ENV_NONE};
+        // Root ingress validates declared parameters before entering generated
+        // code, and source-proven self calls preserve those established facts.
+        // A named ordinary caller has no per-parameter validator at its raw
+        // machine boundary yet, so do not publish this entry as a general
+        // descriptor. It will take the checked dispatcher instead.
+        if self.body.param_types.iter().any(|ty| !ty.is_any()) {
+            return None;
+        }
         let offset = self.ordinary_entry.filter(|offset| *offset < self.code_len)?;
         Some(OrdinaryEntryDescriptor {
             kind: ORDINARY_X64_LISP_KIND, version: ORDINARY_X64_LISP_VERSION, revision,
@@ -874,12 +891,19 @@ impl TransferCode {
                                         heat_slot: cell.ordinary_heat_address() as u64,
                                     revision_address: cell.revision_address() as u64 }))
                                 }).collect::<Option<Vec<_>>>()?;
-                            egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_calls(
+                            egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_call_facts(
                                 &ir, options, &targets, call_flags, cold.as_ptr() as u64,
                                 egcl_compiler::t2::emit::OrdinaryGuardOptions {
                                     veneer: guard.as_ref()?.as_ptr() as u64,
                                     multiple_values: c2i_t2_mv as *const () as u64,
-                                }, poll.as_ptr() as u64, &self_calls).inspect_err(|error| t2_log_write(format_args!(
+                                }, poll.as_ptr() as u64, &self_calls,
+                                egcl_compiler::t2::emit::OrdinarySelfCallFacts {
+                                    // Root run scopes a matching control; named
+                                    // ingress validates it. Runtime adapters
+                                    // re-enter run, and callbacks restore the
+                                    // enclosing control before native resume.
+                                    trusted_control: true,
+                                }).inspect_err(|error| t2_log_write(format_args!(
                                     "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
                                 ))).ok()
                         };
@@ -1217,8 +1241,14 @@ impl TransferCode {
         // moving GC may park and scan before generated code starts. Native
         // loop/back-edge polling remains a separate emitter gate.
         if osr_offset.is_none() {
+            egcl_rt::thread::begin_current_execution_poll();
             egcl_rt::safepoint::poll_safepoint();
-            if let Some(error) = pending_signal_error_for_current_execution() {
+            let signal_error = pending_signal_error_for_current_execution();
+            egcl_rt::thread::rearm_current_execution_poll();
+            if native_error_pending() {
+                egcl_rt::thread::request_current_execution_poll();
+            }
+            if let Some(error) = signal_error {
                 return Err(error);
             }
         }
@@ -1561,10 +1591,6 @@ pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
             .param_layout
             .iter()
             .all(|(_, location)| matches!(location, VarLoc::Slot(_)))
-        && body
-            .param_types
-            .iter()
-            .all(|ty| matches!(ty, DeclaredType::Any))
 }
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
@@ -1591,10 +1617,7 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
-    body.param_types
-        .iter()
-        .all(|ty| matches!(ty, DeclaredType::Any))
-        && body.param_layout.len() == usize::from(body.arity)
+    body.param_layout.len() == usize::from(body.arity)
         && body
             .param_layout
             .iter()
@@ -2686,11 +2709,7 @@ fn idle_t2_poll(request: *mut u8) -> bool {
     // These queries neither initialize a carrier nor consume a notification.
     // A concurrent request after an idle read remains pending at the next
     // unchanged poll site, just as when it races an ordinary poll's read.
-    !egcl_rt::safepoint::poll_work_pending()
-        && PENDING_NATIVE_ERRORS.load(AtomicOrdering::Relaxed) == 0
-        && !egcl_rt::runtime::process_signal_activity_pending()
-        && !egcl_rt::any_posted_pending_signal()
-        && !egcl_rt::sandbox_cpu_deadline_armed()
+    !egcl_rt::thread::current_execution_poll_pending()
 }
 
 #[cfg(test)]
@@ -2868,6 +2887,9 @@ pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     out: *mut egcl_rt::native_transfer::NativeOutcome,
 ) {
     use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
+    // Clear before inspecting authoritative sources. An arrival during this
+    // drain must remain armed; refreshing control snapshots must never clear it.
+    egcl_rt::thread::begin_current_execution_poll();
     egcl_rt::safepoint::poll_safepoint();
     if request as usize & 1 != 0
         && let Err(error) = guard_c2i(|| {
@@ -2885,6 +2907,10 @@ pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     } else {
         NativeExit::Returned
     };
+    egcl_rt::thread::rearm_current_execution_poll();
+    if native_error_pending() {
+        egcl_rt::thread::request_current_execution_poll();
+    }
     unsafe {
         out.write(NativeOutcome { value: NIL, exit });
     }

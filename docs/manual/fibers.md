@@ -82,6 +82,26 @@ its carrier. Sleep durations and timeouts are expressed in seconds. A yield is
 a scheduling opportunity, not a synchronization protocol. Shared state still
 requires a mutex, condition variable, or another explicit protocol.
 
+Fibers have no automatic CPU time slice or per-fiber CPU budget. A CPU-bound
+fiber keeps its carrier until it yields or blocks. Explicit sandbox limits
+(`--sandbox` with `EGCL_SANDBOX_CPU_MS`) remain separate and opt-in.
+
+```lisp
+(egcl-fiber:cancel-fiber fiber)
+(egcl-fiber:fiber-cancellation-requested-p &optional fiber) -> boolean
+(egcl-fiber:check-fiber-cancellation)
+```
+
+Cancellation records a sticky request. It does not forcibly terminate a fiber
+or change its return value. A computation can inspect the status and finish
+normally, or call `CHECK-FIBER-CANCELLATION`, which signals `FIBER-CANCELLED`.
+Normal Lisp handlers and `UNWIND-PROTECT` cleanup apply. `FIBER-SLEEP`,
+`FIBER-PARK` and `FIBER-JOIN` check cancellation at safe boundaries; sleeping
+fibers wake promptly. Requests made before a fiber starts are preserved.
+Mutex, condition and semaphore waits, pinned native blocking, foreign calls,
+and arbitrary I/O are not interrupted by this API. Their next explicit check
+observes the request after the operation returns.
+
 Subprocess pipe operations and process waits park unpinned fibers. Ordinary file
 and terminal I/O still use blocking OS calls and can occupy the carrier.
 Established TCP streams use the fiber-aware waits described under

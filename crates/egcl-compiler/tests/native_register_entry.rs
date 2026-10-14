@@ -450,6 +450,8 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
     assert!(caller.frame_entry.is_none(), "call-only artifact cannot advertise its UD2 entry");
     let buffer = JitBuffer::new(&caller.code).unwrap();
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 0;
     let mv_active = AtomicBool::new(false);
     let mut control = NativeRecursiveControl {
@@ -526,34 +528,45 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         assert!(values.gc_locations().count() >= 4);
     }
     let original = descriptor;
-    let control_address = &mut control as *mut _ as u64;
-    for case in 0..23 {
+    assert!(original.is_compatible(), "published baseline descriptor is valid");
+    // These are immutable descriptor invariants, enforced before publication,
+    // not repeated at each generated call. Check the same compatibility gate
+    // here; call_table's publication test also proves rejected replacements
+    // preserve the previous entry. Never inject malformed published metadata.
+    for case in [0, 1, 6, 7, 20, 21, 22] {
+        let mut invalid = original;
         match case {
-            0 => descriptor.kind ^= 1,
-            1 => descriptor.version += 1,
+            0 => invalid.kind ^= 1,
+            1 => invalid.version += 1,
+            6 => invalid.stack_required = 0,
+            7 => invalid.stack_required = usize::MAX,
+            20 => invalid.owner = 0,
+            21 => invalid.code_start = invalid.entry + 1,
+            22 => invalid.code_len = usize::MAX,
+            _ => unreachable!(),
+        }
+        assert!(!invalid.is_compatible(), "case {case}: reject before publication");
+    }
+    let control_address = &mut control as *mut _ as u64;
+    // Native emitters consume one local poll; producer-specific handshakes
+    // belong to runtime tests, not synthetic global cells in this fixture.
+    // This call site's incoming multiple-value state is proven empty. Dynamic
+    // MV rejection is exercised after a real producer in
+    // native_ordinary_mv_admission; forging mv_active here violates ingress.
+    for case in [2, 3, 4, 5, 8, 11, 12, 18, 19, 23] {
+        match case {
             2 => descriptor.arity = 3,
             3 => descriptor.environment = ORDINARY_ENV_CLOSURE,
             4 => revision.store(8, Relaxed),
             5 => slot.store(0, Relaxed),
-            6 => descriptor.stack_required = 0,
-            7 => descriptor.stack_required = usize::MAX,
             8 => control.stack_limit = u64::MAX,
-            9 => control.depth_limit = 0,
-            10 => mv_active.store(true, Relaxed),
-            11 => control.deadline_armed = 1,
+            11 => execution.request_poll(),
             12 => execution.set_carrier_id(3),
-            13 => words[2].store(1, Relaxed),
-            14 => bytes[0].store(1, Relaxed),
-            15 => bytes[1].store(1, Relaxed),
-            16 => words[0].store(1, Relaxed),
-            17 => words[1].store(1, Relaxed),
             18 => execution.request_yield(),
             19 => unsafe {
                 execution.swap_active_native_control(0);
             },
-            20 => descriptor.owner = 0,
-            21 => descriptor.code_start = descriptor.entry + 1,
-            22 => descriptor.code_len = usize::MAX,
+            23 => control.execution = std::ptr::null(),
             _ => unreachable!(),
         }
         // Generated code reads these records through the published raw addresses.
@@ -598,11 +611,13 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         revision.store(7, Relaxed);
         slot.store(&descriptor as *const _ as usize, Relaxed);
         control.stack_limit = 0;
+        control.execution = execution.as_ptr();
         control.depth_limit = 8;
         control.deadline_armed = 0;
         mv_active.store(false, Relaxed);
         execution.set_carrier_id(2);
         execution.take_yield_request();
+        execution.begin_poll();
         for flag in &bytes {
             flag.store(0, Relaxed);
         }
@@ -636,7 +651,8 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
     descriptor.stack_required = 8;
     std::hint::black_box(&descriptor);
     let tuple = run();
-    assert_eq!([tuple[0], tuple[1], tuple[8], tuple[9]], [1, 1, 3, 0x789]);
+    assert_eq!([tuple[0], tuple[1], tuple[8], tuple[9]], [0, 1, 3, 0x789],
+        "ordinary machine calls do not increment Rust/native reentry depth");
     assert_eq!(depth, 0);
     assert_eq!(
         ORDINARY_COLD_COUNT.load(Relaxed),
@@ -782,6 +798,8 @@ fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_t
     assert_eq!(maps.iter().count(), 4, "each call owns direct and cold return maps");
     let buffer = JitBuffer::new(&code.code).unwrap();
     let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 2);
+    // The runtime consumes the initially armed poll before entering native code.
+    execution.begin_poll();
     let mut depth = 0;
     let mut control = NativeRecursiveControl { execution: execution.as_ptr(), depth: &mut depth,
         reserved_counter: 0, mv_active: TWO_CALL_ACTIVE.as_ptr(), expected_generation: 0,

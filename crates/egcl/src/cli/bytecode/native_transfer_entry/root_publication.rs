@@ -368,7 +368,18 @@ unsafe fn publish_with<R>(
     );
     ACTIVE.with(|slot| slot.set(&mut boundary));
     let _linked = Linked(&mut boundary);
-    body()
+    let result = body();
+    #[cfg(test)]
+    ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| {
+        if target.get() == owner as usize {
+            target.set(0);
+            // This exact caller is about to resume. Nested root adapters that
+            // borrow its publication must not consume the one-shot injection.
+            let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+            unsafe { &*execution }.request_yield();
+        }
+    });
+    result
 }
 
 /// Publish the generated caller suspended beneath a permanent mapped-call

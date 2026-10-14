@@ -37,12 +37,8 @@
 //!    region) from their declared types.
 //! 2. Iterate up to `MAX_PASSES` times over reverse postorder; widening is
 //!    switched on after `WIDEN_AFTER` passes. Each pass:
-//!    1. Recompute the refinement tables against current facts.
-//!       `edge_refine[T]` holds facts true on entry to block `T` because the
-//!       only edge into `T` is a `Brif` on a fixnum comparison (`narrow_cmp`
-//!       derives bounds for both operands from the relation and the branch
-//!       taken; `!=` yields nothing). `check_refine[B]` holds the narrowings
-//!       of every `TypeCheck`/`Guard` with a `TypeTag` in block `B`.
+//!    1. Collect `check_refine[B]`, the narrowings of every
+//!       `TypeCheck`/`Guard` with a `TypeTag` in block `B`.
 //!    2. For each block: join its parameters over predecessor edge
 //!       arguments; build a local environment by walking the dominator chain
 //!       and meeting in every edge refinement on the chain (including the
@@ -51,6 +47,11 @@
 //!       each result into the global fact and inserting it into the local
 //!       environment. A `TypeCheck`/`Guard` met in program order narrows its
 //!       operand for the rest of the block.
+//!       After evaluating a block, derive its outgoing branch refinements
+//!       from the updated facts. `edge_refine[T]` holds bounds true on the
+//!       unique edge into `T` from a fixnum comparison (`!=` yields nothing).
+//!       Producing these before visiting successors avoids permanently joining
+//!       coarse results before the comparison's constant bounds are known.
 //!    3. Stop early when no fact changed.
 //! 3. Derive representations: a fact confined to fixnum, single-float or
 //!    double-float bits becomes the corresponding unboxed representation,
@@ -71,8 +72,8 @@
 //! region that block dominates, which is cheap to compute and exactly what a
 //! counted loop needs (`i < n` on the sole entry to the body proves
 //! `i ∈ [lo, n-1]`, letting the index's overflow guard be eliminated later).
-//! Edge refinements are only recorded when the target's sole predecessor is
-//! the branching block, which keeps them sound without edge splitting.
+//! Edge refinements are only recorded when the target has exactly one incoming
+//! edge from the branching block, not merely one distinct predecessor block.
 //! Results are a side table so the analysis is non-destructive and any
 //! consumer can rerun it on whatever IR it currently holds.
 //!
@@ -629,29 +630,6 @@ pub fn infer(f: &Function) -> InferenceResult {
         let mut check_refine: HashMap<usize, Vec<Refine>> = HashMap::new();
 
         for &b in &rpo {
-            // Branch-condition refinements.
-            if let Some(term) = f.terminator(b) {
-                let t = f.inst(term);
-                if t.opcode == Opcode::Brif && !t.args.is_empty() {
-                    let cond = t.args[0];
-                    if let ValueDef::Result { inst, .. } = f.value(cond).def {
-                        let cdef = f.inst(inst);
-                        if cdef.args.len() == 2 {
-                            let (ca, cb) = (cdef.args[0], cdef.args[1]);
-                            for (edge, taken) in [(0usize, true), (1usize, false)] {
-                                if let Some(call) = t.targets.get(edge) {
-                                    let tgt = call.block;
-                                    // Only sound if the edge is the sole way in.
-                                    if f.preds(tgt) == vec![b] {
-                                        let refs = narrow_cmp(cdef.opcode, ca, cb, taken, &g);
-                                        edge_refine.entry(tgt.index()).or_default().extend(refs);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             // TypeCheck / Guard narrowings within this block, for dominated blocks.
             for &inst in &f.block(b).insts {
                 let idef = f.inst(inst);
@@ -757,6 +735,36 @@ pub fn infer(f: &Function) -> InferenceResult {
                         let v = idef.args[0];
                         let cur = fact(v, &env, &g);
                         env.insert(v, ty_meet(cur, *tag));
+                    }
+                }
+            }
+            // Compute outgoing bounds only after this block's instructions:
+            // its comparison operands (including constants) now have facts.
+            // Global facts still accumulate monotonically, so a loop-carried
+            // bound that grows on a later pass weakens the inferred result.
+            if let Some(term) = f.terminator(b) {
+                let t = f.inst(term);
+                if t.opcode == Opcode::Brif && !t.args.is_empty() {
+                    let cond = t.args[0];
+                    if let ValueDef::Result { inst, .. } = f.value(cond).def {
+                        let cdef = f.inst(inst);
+                        if cdef.args.len() == 2 {
+                            let (ca, cb) = (cdef.args[0], cdef.args[1]);
+                            for (edge, taken) in [(0usize, true), (1usize, false)] {
+                                if let Some(call) = t.targets.get(edge) {
+                                    let tgt = call.block;
+                                    // preds() deduplicates blocks. Two branch
+                                    // outcomes entering the same block do not
+                                    // establish either outcome's constraint.
+                                    if f.preds(tgt) == vec![b]
+                                        && t.targets.iter().filter(|c| c.block == tgt).count() == 1
+                                    {
+                                        let refs = narrow_cmp(cdef.opcode, ca, cb, taken, &g);
+                                        edge_refine.entry(tgt.index()).or_default().extend(refs);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1088,6 +1096,227 @@ mod tests {
         // Without the dominated-path narrowing, `p` would be TOP and the add
         // could not be trusted; with it, x is a fixnum.
         assert_eq!(res.ty(x[0]).bits, TypeBits::FIXNUM);
+    }
+
+    #[test]
+    fn dominating_comparison_bounds_recursive_arguments() {
+        let mut f = Function::new("bounded-recursive-arguments");
+        let entry = f.entry();
+        let n = f.add_block_param(
+            entry,
+            IRType {
+                range: Some(Range { lo: 0, hi: 40 }),
+                ..fixnum()
+            },
+            ValueRepresentation::Tagged,
+        );
+        let leaf = f.make_block();
+        let recursive = f.make_block();
+        let two = const_fixnum(&mut f, entry, 2);
+        let (_, condition) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![n, two],
+                ..inst(Opcode::FixnumCmpLt)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                args: vec![condition[0]],
+                targets: vec![
+                    BlockCall {
+                        block: leaf,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: recursive,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let one_at_leaf = const_fixnum(&mut f, leaf, 1);
+        let (_, leaf_result) = f.push_inst(
+            leaf,
+            InstData {
+                args: vec![n, one_at_leaf],
+                ..inst(Opcode::FixnumSub)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(leaf, ret());
+        let one = const_fixnum(&mut f, recursive, 1);
+        let mut children = Vec::new();
+        for amount in [one, two] {
+            let (_, result) = f.push_inst(
+                recursive,
+                InstData {
+                    args: vec![n, amount],
+                    ..inst(Opcode::FixnumSub)
+                },
+                &[(fixnum(), ValueRepresentation::Tagged)],
+            );
+            children.push(result[0]);
+        }
+        f.set_terminator(recursive, ret());
+
+        let inferred = infer(&f);
+        assert_eq!(
+            inferred.range(n),
+            Some(Range { lo: 0, hi: 40 }),
+            "the branch must not narrow the entry parameter globally"
+        );
+        assert_eq!(inferred.range(children[0]), Some(Range { lo: 1, hi: 39 }));
+        assert_eq!(inferred.range(children[1]), Some(Range { lo: 0, hi: 38 }));
+        assert_eq!(
+            inferred.range(leaf_result[0]),
+            Some(Range { lo: -1, hi: 0 })
+        );
+    }
+
+    #[test]
+    fn comparison_with_shared_successor_does_not_refine_either_outcome() {
+        let mut f = Function::new("shared-comparison-successor");
+        let entry = f.entry();
+        let n = f.add_block_param(
+            entry,
+            IRType {
+                range: Some(Range { lo: 0, hi: 40 }),
+                ..fixnum()
+            },
+            ValueRepresentation::Tagged,
+        );
+        // Entry facts are known before the first inference pass. Neither
+        // branch outcome may constrain the block that both edges enter.
+        let bound = f.add_block_param(
+            entry,
+            IRType {
+                range: Some(Range { lo: 2, hi: 2 }),
+                ..fixnum()
+            },
+            ValueRepresentation::Tagged,
+        );
+        let successor = f.make_block();
+        let (_, condition) = f.push_inst(
+            entry,
+            InstData {
+                args: vec![n, bound],
+                ..inst(Opcode::FixnumCmpLt)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            entry,
+            InstData {
+                args: vec![condition[0]],
+                targets: vec![
+                    BlockCall {
+                        block: successor,
+                        args: vec![]
+                    };
+                    2
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let one = const_fixnum(&mut f, successor, 1);
+        let (_, result) = f.push_inst(
+            successor,
+            InstData {
+                args: vec![n, one],
+                ..inst(Opcode::FixnumAdd)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(successor, ret());
+        assert_eq!(infer(&f).range(result[0]), Some(Range { lo: 1, hi: 41 }));
+    }
+
+    #[test]
+    fn loop_carried_comparison_bound_weakens_later_refinements() {
+        let mut f = Function::new("changing-comparison-bound");
+        let entry = f.entry();
+        let n = f.add_block_param(
+            entry,
+            IRType {
+                range: Some(Range { lo: 0, hi: 40 }),
+                ..fixnum()
+            },
+            ValueRepresentation::Tagged,
+        );
+        let initial = const_fixnum(&mut f, entry, 40);
+        let one = const_fixnum(&mut f, entry, 1);
+        let header = f.make_block();
+        let bound = f.add_block_param(header, fixnum(), ValueRepresentation::Tagged);
+        let body = f.make_block();
+        let exit = f.make_block();
+        f.set_terminator(
+            entry,
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![initial],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        let (_, condition) = f.push_inst(
+            header,
+            InstData {
+                args: vec![n, bound],
+                ..inst(Opcode::FixnumCmpLt)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            header,
+            InstData {
+                args: vec![condition[0]],
+                targets: vec![
+                    BlockCall {
+                        block: exit,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: body,
+                        args: vec![],
+                    },
+                ],
+                ..inst(Opcode::Brif)
+            },
+        );
+        let (_, child) = f.push_inst(
+            body,
+            InstData {
+                args: vec![n, one],
+                ..inst(Opcode::FixnumSub)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        // This fact is not available on the first header visit. The backedge
+        // must weaken the earlier n >= 40 constraint on a subsequent pass.
+        let later = const_fixnum(&mut f, body, 2);
+        f.set_terminator(
+            body,
+            InstData {
+                targets: vec![BlockCall {
+                    block: header,
+                    args: vec![later],
+                }],
+                ..inst(Opcode::Jump)
+            },
+        );
+        f.set_terminator(exit, ret());
+        let inferred = infer(&f);
+        assert_eq!(inferred.range(bound), Some(Range { lo: 2, hi: 40 }));
+        assert_eq!(
+            inferred.range(child[0]),
+            Some(Range { lo: 1, hi: 39 }),
+            "must not retain only the first pass's n >= 40 constraint"
+        );
     }
 
     #[test]

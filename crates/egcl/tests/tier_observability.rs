@@ -12,8 +12,8 @@
 
 use std::process::{Command, Output};
 
-// Mapped Linux admission currently excludes captured/variadic and declared entries.
-// Fallback assertions preserve semantics; missing entry coverage is bliss-shih7.27.
+// Mapped Linux admission still excludes captured and variadic entries. Checked
+// primitive declarations have an ordinary native entry and validate at ingress.
 const MAPPED_LINUX: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
 const BIN: &str = env!("CARGO_BIN_EXE_egcl");
@@ -1473,29 +1473,24 @@ fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
         out.contains("checked parameter declarations: X: FIXNUM"),
         "{out}"
     );
-    if MAPPED_LINUX {
-        assert!(out.contains("; T0 —"), "{out}");
-        assert!(!out.contains("Mapped native transfer ABI"), "{out}");
-    } else {
-        assert!(out.contains("; T2 — profile-guided native"), "{out}");
-        assert!(
-            out.contains("checked parameter declarations: X: FIXNUM"),
-            "{out}"
-        );
-        assert!(
-            out.lines()
-                .any(|line| line.contains("imul ") && line.ends_with(",5")),
-            "expected direct declared fixnum multiply in allocated registers:\n{out}"
-        );
-        assert!(
-            !out.contains("test cl,7"),
-            "declaration proof should remove the operation guard:\n{out}"
-        );
-        assert!(
-            out.contains("jo near"),
-            "fixnum overflow must remain guarded:\n{out}"
-        );
-    }
+    assert!(out.contains("; T2 — profile-guided native"), "{out}");
+    assert!(
+        out.contains("checked parameter declarations: X: FIXNUM"),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line.contains("imul ") && line.ends_with(",5")),
+        "expected direct declared fixnum multiply in allocated registers:\n{out}"
+    );
+    assert!(
+        !out.contains("test cl,7"),
+        "declaration proof should remove the operation guard:\n{out}"
+    );
+    assert!(
+        out.contains("jo near"),
+        "fixnum overflow must remain guarded:\n{out}"
+    );
     assert!(
         out.lines().any(|line| line == "TYPE-ERROR"),
         "wrong declared argument must be caught as TYPE-ERROR:\n{out}"
@@ -1503,6 +1498,35 @@ fn declared_fixnum_parameter_removes_arithmetic_type_guard() {
     assert!(
         out.lines().any(|line| line == "5764607523034234875"),
         "overflow must deopt to exact bignum multiplication:\n{out}"
+    );
+}
+
+#[test]
+fn declared_bounded_integer_parameter_is_checked_and_proven_as_fixnum() {
+    let program = "\
+        (defun declared-bounded-mul5 (x) \
+          (declare (type (integer 0 40) x) (optimize (speed 3) (safety 1))) \
+          (* x 5)) \
+        (dotimes (k 60) (declared-bounded-mul5 9)) \
+        (format t \"~a~%\" (declared-bounded-mul5 9)) \
+        (disassemble (quote declared-bounded-mul5)) \
+        (dolist (bad '(-1 41 1.5)) \
+          (format t \"~a~%\" \
+            (handler-case \
+              (progn (declared-bounded-mul5 bad) (quote missed-type-error)) \
+              (type-error () (quote type-error)))))";
+
+    let (out, ok) = run(program, &[("EGCL_T2", "1")]);
+    assert!(ok, "declared bounded T2 function failed: {out}");
+    assert_eq!(out.lines().next().unwrap_or(""), "45");
+    assert!(
+        out.contains("checked parameter declarations: X:"),
+        "bounded declaration must reach the native entry: {out}"
+    );
+    assert_eq!(
+        out.lines().filter(|line| *line == "TYPE-ERROR").count(),
+        3,
+        "the lower bound, upper bound, and non-fixnum input must be rejected: {out}"
     );
 }
 
@@ -1523,14 +1547,7 @@ fn declared_parameter_validation_is_shared_by_t0_and_t1() {
 
     let (t1, t1_ok) = run(program, &[("EGCL_T1_THRESHOLD", "2")]);
     assert!(t1_ok, "T1 declaration validation failed: {t1}");
-    assert_eq!(
-        t1.lines().next().unwrap_or(""),
-        if MAPPED_LINUX {
-            "0 TYPE-ERROR"
-        } else {
-            "1 TYPE-ERROR"
-        }
-    );
+    assert_eq!(t1.lines().next().unwrap_or(""), "1 TYPE-ERROR");
 }
 
 /// The live T2 path uses regalloc2 rather than declining when more values are
@@ -1684,7 +1701,7 @@ fn declared_single_float_parameter_removes_arithmetic_type_guard() {
         "{out}"
     );
     if MAPPED_LINUX {
-        assert!(out.contains("; T0 —"), "{out}");
+        assert!(out.contains("; T1 — tagged baseline native"), "{out}");
         assert!(!out.contains("Mapped native transfer ABI"), "{out}");
     } else {
         assert!(

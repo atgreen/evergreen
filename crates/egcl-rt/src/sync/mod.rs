@@ -108,6 +108,17 @@ pub fn blocking_mode(operation: &str) -> Result<BlockingMode, EgclError> {
 /// pinned fiber under the configured fallback policy), this blocks the native
 /// thread in the ordinary way.
 pub fn fiber_sleep(duration: Duration) -> Result<(), EgclError> {
+    sleep_fiber(duration, false)
+}
+
+/// Sleep until the deadline or a cooperative cancellation request. The caller
+/// observes the sticky request after returning; this does not inject an error.
+/// Internal retry loops use `fiber_sleep` so cancellation cannot make them spin.
+pub fn fiber_sleep_cancellable(duration: Duration) -> Result<(), EgclError> {
+    sleep_fiber(duration, true)
+}
+
+fn sleep_fiber(duration: Duration, cancellable: bool) -> Result<(), EgclError> {
     if duration.is_zero() {
         if current_fiber().is_some() {
             return fiber_yield();
@@ -128,7 +139,11 @@ pub fn fiber_sleep(duration: Duration) -> Result<(), EgclError> {
                 crate::thread::cancel_prepared_current_fiber_park();
                 return Err(error);
             }
-            crate::thread::park_prepared_current_fiber()
+            if cancellable {
+                crate::thread::park_prepared_current_fiber_cancellable()
+            } else {
+                crate::thread::park_prepared_current_fiber()
+            }
         }
     }
 }
