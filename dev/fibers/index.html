@@ -2027,6 +2027,22 @@ and reported by <code>finish-fibers</code> after work drains. Hooks should retur
 its carrier. Sleep durations and timeouts are expressed in seconds. A yield is
 a scheduling opportunity, not a synchronization protocol. Shared state still
 requires a mutex, condition variable, or another explicit protocol.</p>
+<p>Fibers have no automatic CPU time slice or per-fiber CPU budget. A CPU-bound
+fiber keeps its carrier until it yields or blocks. Explicit sandbox limits
+(<code>--sandbox</code> with <code>EGCL_SANDBOX_CPU_MS</code>) remain separate and opt-in.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nv">egcl-fiber:cancel-fiber</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-cancellation-requested-p</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span><span class="w"> </span><span class="nv">-&gt;</span><span class="w"> </span><span class="kt">boolean</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="p">(</span><span class="nv">egcl-fiber:check-fiber-cancellation</span><span class="p">)</span>
+</code></pre></div>
+<p>Cancellation records a sticky request. It does not forcibly terminate a fiber
+or change its return value. A computation can inspect the status and finish
+normally, or call <code>CHECK-FIBER-CANCELLATION</code>, which signals <code>FIBER-CANCELLED</code>.
+Normal Lisp handlers and <code>UNWIND-PROTECT</code> cleanup apply. <code>FIBER-SLEEP</code>,
+<code>FIBER-PARK</code> and <code>FIBER-JOIN</code> check cancellation at safe boundaries; sleeping
+fibers wake promptly. Requests made before a fiber starts are preserved.
+Mutex, condition and semaphore waits, pinned native blocking, foreign calls,
+and arbitrary I/O are not interrupted by this API. Their next explicit check
+observes the request after the operation returns.</p>
 <p>Subprocess pipe operations and process waits park unpinned fibers. Ordinary file
 and terminal I/O still use blocking OS calls and can occupy the carrier.
 Established TCP streams use the fiber-aware waits described under
@@ -2059,11 +2075,11 @@ fiber does not interrupt an in-progress read. An explicit readiness wait release
 stream ownership and can be woken by close.</p>
 <h2 id="pinning">Lisp pinning<a class="headerlink" href="#pinning" title="Permanent link">&para;</a></h2>
 <p><strong>Functions, macro, and variable</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-pin</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-unpin</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-can-yield-p</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span><span class="w"> </span><span class="nv">-&gt;</span><span class="w"> </span><span class="kt">boolean</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">(</span><span class="nv">egcl-fiber:with-fiber-pinned</span><span class="w"> </span><span class="p">((</span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">))</span><span class="w"> </span><span class="nv">body*</span><span class="p">)</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="nv">egcl-fiber:*pinned-blocking-action*</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-pin</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-unpin</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="p">(</span><span class="nv">egcl-fiber:fiber-can-yield-p</span><span class="w"> </span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">)</span><span class="w"> </span><span class="nv">-&gt;</span><span class="w"> </span><span class="kt">boolean</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="p">(</span><span class="nv">egcl-fiber:with-fiber-pinned</span><span class="w"> </span><span class="p">((</span><span class="k">&amp;optional</span><span class="w"> </span><span class="nv">fiber</span><span class="p">))</span><span class="w"> </span><span class="nv">body*</span><span class="p">)</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="nv">egcl-fiber:*pinned-blocking-action*</span>
 </code></pre></div>
 <p>Pinning is a balanced counter that prevents carrier migration. The
 macro balances the counter across ordinary and nonlocal exits. Explicit yield
