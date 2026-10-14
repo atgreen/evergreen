@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.0.8 - 2026-10-14
+
 ### Native compilation and performance
 
 - Compile eligible recursive self-calls directly through the x86-64 Lisp ABI,
