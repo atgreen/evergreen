@@ -318,15 +318,15 @@
 ;;; bootstrap evaluator.
 ;;; ---------------------------------------------------------------------------
 
-;; DECLAIM records global declarations. Inline policy must take effect while
-;; compiling subsequent definitions as well as when loading or evaluating the
-;; form; ordinary PROCLAIM calls alone have no compile-time effect.
+;; DECLAIM records global declarations. Inline policy and function types take
+;; effect while compiling subsequent definitions as well as when loading or
+;; evaluating the form; ordinary PROCLAIM calls alone have no compile-time effect.
 (defmacro declaim (&rest specs)
   (let ((forms nil))
     (dolist (spec specs)
       (when (consp spec)
         (case (car spec)
-          ((inline notinline)
+          ((inline notinline ftype)
            (push (list 'eval-when '(:compile-toplevel :load-toplevel :execute)
                        (list 'proclaim (list 'quote spec)))
                  forms))
@@ -359,6 +359,20 @@
       ((inline notinline)
         (dolist (name (cdr decl-spec))
           (setf (get name 'egcl-internal::inline-policy) (car decl-spec))))
+      (ftype
+        ;; Retain the raw type, including VALUES cardinality syntax. This is
+        ;; declaration metadata, not yet a proof about a compiled call result.
+        ;; SETF functions and ordinary functions have distinct names even when
+        ;; their accessor symbol is the same; symbol properties retain package
+        ;; identity and are traced with the symbol.
+        (dolist (name (cddr decl-spec))
+          (cond
+            ((symbolp name)
+             (setf (get name 'egcl-internal::function-type) (cadr decl-spec)))
+            ((and (consp name) (eq (car name) 'setf)
+                  (consp (cdr name)) (symbolp (cadr name)) (null (cddr name)))
+             (setf (get (cadr name) 'egcl-internal::setf-function-type)
+                   (cadr decl-spec))))))
       (special (egcl-internal::%proclaim-special (cdr decl-spec)))
       (declaration (egcl-internal::%proclaim-declaration (cdr decl-spec)))
       (optimize (egcl-internal::%proclaim-optimize (cdr decl-spec)))))
