@@ -128,7 +128,10 @@ abstract-interpretation rules for stack maps, type slots, and unwind metadata;
 a loader MAY reject an older verifier version if the unit lacks metadata needed
 by the current runtime's GC or deoptimizer.
 
-The current bytecode version is **2.0** (`0x0200`). Version-1 writers could
+The current bytecode version is **2.2** (`0x0202`). Version 2.1 added bounded
+fixnum parameter metadata; version 2.2 adds `CHECK_RESULT` (`0x45`), described
+below. A unit claiming an earlier minor version cannot contain this opcode.
+Version-1 writers could
 replace calls to `LDB`, `BYTE`, `TYPEP`, class/structure readers, and literal
 memory fences with instructions that no longer identify the original callable.
 Those bodies cannot honor later replacement of that callable. All version-1
@@ -382,6 +385,19 @@ with the last argument nearest the top of stack.
 | `0x39` | `BACK_EDGE` | `pc loop_header` | `- -> -` | Count loop edge, poll safepoint, and trigger OSR if eligible. |
 | `0x3a` | `DEBUG_TRAP` | `u32 reason` | `- -> -` | Debugger/profiler trap; no semantic effect when disabled. |
 | `0x3b` | `UNREACHABLE` | none | `- -> signal` | Verified unreachable path; signals if executed. |
+
+Version 2.2 additionally defines:
+
+| Opcode | Mnemonic | Operands | Stack effect | Semantics |
+|--------|----------|----------|--------------|-----------|
+| `0x45` | `CHECK_RESULT` | `u8 kind`, optional `i64 lower`, `i64 upper` | `primary -> primary` | Check the primary without modifying the multiple-value tuple; signal a catchable type error on failure, including at safety 0. |
+
+`kind` is 0 for unrestricted, 1 for fixnum, 2 for single-float, or 3 for an
+inclusive fixnum range. Only kind 3 carries endpoints, stored little-endian;
+reversed endpoints and unknown kinds are rejected. A zero-value return has
+`NIL` as its primary for this check; a successful check does not change its
+zero-value cardinality. This instruction does not implement a `VALUES` type's
+cardinality or secondary-value constraints.
 
 The verifier computes stack height and stack-map liveness from opcode stack
 effects.  Every forward and backward branch target MUST point at an opcode

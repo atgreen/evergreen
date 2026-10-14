@@ -8284,18 +8284,24 @@ fn parse_macro_lambda_list(params_form: EgclVal) -> Option<(Vec<String>, u16, Op
 
 fn primitive_declared_type(type_form: EgclVal) -> Option<DeclaredType> {
     if type_form.is_symbol() {
-        return match sym_bare_name_rc(type_form).as_ref() {
-            "FIXNUM" => Some(DeclaredType::Fixnum),
-            "SINGLE-FLOAT" => Some(DeclaredType::SingleFloat),
-            _ => None,
-        };
+        // These registry keys identify the bootstrap's canonical CL symbols;
+        // a package-local DEFTYPE with the same printed name is not evidence
+        // that a value has the builtin representation.
+        let symbol = type_form.symbol_index();
+        if symbol == reader::find_symbol_index("FIXNUM") {
+            return Some(DeclaredType::Fixnum);
+        }
+        if symbol == reader::find_symbol_index("SINGLE-FLOAT") {
+            return Some(DeclaredType::SingleFloat);
+        }
+        return None;
     }
 
     let parts = list_to_vec(type_form);
     let [head, lower, upper] = parts.as_slice() else {
         return None;
     };
-    if !head.is_symbol() || sym_bare_name_rc(*head).as_ref() != "INTEGER" {
+    if !head.is_symbol() || head.symbol_index() != reader::find_symbol_index("INTEGER") {
         return None;
     }
     if !lower.is_fixnum() || !upper.is_fixnum() {
@@ -8303,6 +8309,82 @@ fn primitive_declared_type(type_form: EgclVal) -> Option<DeclaredType> {
     }
     let (lower, upper) = (lower.as_fixnum(), upper.as_fixnum());
     (lower <= upper).then_some(DeclaredType::FixnumRange { lower, upper })
+}
+
+/// Snapshot a supported primary-result contract into the selected definition.
+/// Unsupported result forms supply no optimizer fact. In particular, VALUES
+/// contracts need separate cardinality handling and are not flattened here.
+fn declared_primary_result(symbol: u32) -> Option<DeclaredType> {
+    let key = resolve_sym("EGCL-INTERNAL::FUNCTION-TYPE")?;
+    let mut plist = egcl_rt::symbols::symbol_plist(symbol)?;
+    while plist.is_cons() {
+        let (property, rest) = cp(plist);
+        if !rest.is_cons() {
+            return None;
+        }
+        let (value, tail) = cp(rest);
+        if property == key {
+            let parts = list_to_vec(value);
+            let [head, _, result] = parts.as_slice() else { return None };
+            if !head.is_symbol() || sym_bare_name_rc(*head).as_ref() != "FUNCTION" {
+                return None;
+            }
+            return primitive_declared_type(*result);
+        }
+        plist = tail;
+    }
+    None
+}
+
+/// Keep a canonical contract with the retained source, just as DEFUN retains
+/// lexical inline policy there. T explicitly snapshots the absence of a check.
+pub(super) fn capture_primary_result_body(symbol: u32, body: EgclVal) -> EgclVal {
+    egcl_rt::rooted!(body = body);
+    let ty = declared_primary_result(symbol).unwrap_or(DeclaredType::Any);
+    egcl_rt::rooted!(type_form = match ty {
+        DeclaredType::Any => T,
+        DeclaredType::Fixnum => resolve_sym("FIXNUM").expect("FIXNUM symbol"),
+        DeclaredType::SingleFloat => resolve_sym("SINGLE-FLOAT").expect("SINGLE-FLOAT symbol"),
+        DeclaredType::FixnumRange { lower, upper } => {
+            let integer = resolve_sym("INTEGER").expect("INTEGER symbol");
+            vec_to_list(&[integer, EgclVal::from_fixnum(lower), EgclVal::from_fixnum(upper)])
+        }
+    });
+    let marker = resolve_sym("EGCL-INTERNAL::CHECKED-PRIMARY-RESULT").expect("result marker");
+    egcl_rt::rooted!(specifier = vec_to_list(&[marker, *type_form]));
+    let declare = resolve_sym("DECLARE").expect("DECLARE symbol");
+    egcl_rt::rooted!(declaration = vec_to_list(&[declare, *specifier]));
+    // Keep a docstring ahead of the declaration prefix.
+    if body.is_cons() && cp(*body).0.is_string() && cp(*body).1.is_cons() {
+        egcl_rt::rooted!(doc = cp(*body).0);
+        egcl_rt::rooted!(tail = arena_cons(*declaration, cp(*body).1));
+        arena_cons(*doc, *tail)
+    } else {
+        arena_cons(*declaration, *body)
+    }
+}
+
+/// Read only the selected body's private declaration, never a replacement's
+/// public FTYPE property. This routine does not allocate Lisp objects.
+pub(super) fn retained_primary_result(body: EgclVal) -> Option<DeclaredType> {
+    let marker = reader::find_symbol_index("EGCL-INTERNAL::CHECKED-PRIMARY-RESULT")?;
+    let forms = list_to_vec(super::body_through_implicit_block(body));
+    for form in forms.into_iter().skip_while(|form| form.is_string()) {
+        if !form.is_cons() { break; }
+        let (head, tail) = cp(form);
+        if !head.is_symbol() || sym_bare_name_rc(head).as_ref() != "DECLARE" { break; }
+        for specifier in list_to_vec(tail) {
+            if !specifier.is_cons() { continue; }
+            let (kind, args) = cp(specifier);
+            if kind.symbol_index() != Some(marker)
+                || !args.is_cons()
+            { continue; }
+            let (ty, rest) = cp(args);
+            if !rest.is_nil() { continue; }
+            return if ty == T { Some(DeclaredType::Any) } else { primitive_declared_type(ty) };
+        }
+    }
+    None
 }
 
 /// Retain supported parameter assertions from the declaration prefix of a
@@ -8352,7 +8434,9 @@ fn body_declared_special(body: EgclVal) -> std::collections::HashSet<String> {
 
 fn declared_parameter_types(body: EgclVal, params: &[String]) -> Option<Vec<DeclaredType>> {
     let mut result = vec![DeclaredType::Any; params.len()];
-    let mut forms = list_to_vec(body).into_iter();
+    // DEFUN retains its declaration prefix inside the implicit BLOCK; local
+    // function and closure bodies already expose the same prefix directly.
+    let mut forms = list_to_vec(super::body_through_implicit_block(body)).into_iter();
     let mut next = forms.next();
     if next.is_some_and(EgclVal::is_string) {
         next = forms.next(); // optional function docstring precedes declarations
@@ -8412,6 +8496,24 @@ fn declared_parameter_types(body: EgclVal, params: &[String]) -> Option<Vec<Decl
         next = forms.next();
     }
     Some(result)
+}
+
+/// Keep interpreted and native-fallback fixed-arity ingress consistent with
+/// bytecode ingress. Unsupported declarations supply no representation facts.
+pub(super) fn validate_declared_lambda_args(
+    params: EgclVal,
+    body: EgclVal,
+    args: &[EgclVal],
+) -> Result<(), EgclError> {
+    let Some((names, _, _, false)) = parse_lambda_list(params) else {
+        return Ok(());
+    };
+    if let Some(types) = declared_parameter_types(body, &names) {
+        for (ty, value) in types.into_iter().zip(args.iter().copied()) {
+            validate_declared_value(ty, value)?;
+        }
+    }
+    Ok(())
 }
 
 /// Lower a fixed-arity function `(params . body)` to a [`BytecodeFunction`].
@@ -8723,6 +8825,13 @@ fn compile_function_forcing_boxed(
     if lowered.is_err() {
         return None;
     }
+    if !macro_lambda_list
+        && let Some(result_type) = retained_primary_result(*body)
+            .or_else(|| lo.self_symbol.and_then(declared_primary_result))
+        && !result_type.is_any()
+    {
+        lo.emit(Instr::CheckResult(result_type));
+    }
     lo.emit(Instr::Return);
 
     let mut function = BytecodeFunction {
@@ -9013,7 +9122,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // cannot be reconstructed, so a new major rejects them before installation.
 // 0x0201: function metadata gains a tag-3 literal fixnum range, followed by
 // its two i64 endpoints. Older readers must reject the changed record layout.
-const BBU_BYTECODE_VERSION: u16 = 0x0201;
+// 0x0202: primary-preserving primitive result assertions (opcode 0x45).
+const BBU_BYTECODE_VERSION: u16 = 0x0202;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -9509,6 +9619,8 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::MakeClosure { .. } => 7,
         Instr::AllocCons => 1,
         Instr::TypeP(_) => 3, // opcode byte + u16 type-class
+        Instr::CheckResult(DeclaredType::FixnumRange { .. }) => 18,
+        Instr::CheckResult(_) => 2,
         Instr::MemoryFence(_) => 2,
         Instr::Pop | Instr::Dup => 1,
         Instr::Br(_) | Instr::BrIfFalse(_) | Instr::BrIfTrue(_) => 5,
@@ -9675,6 +9787,19 @@ fn serialize_bbu_function(
             Instr::TypeP(class) => {
                 put_u8(&mut code, 0x42);
                 put_u16(&mut code, *class);
+            }
+            Instr::CheckResult(ty) => {
+                put_u8(&mut code, 0x45);
+                put_u8(&mut code, match ty {
+                    DeclaredType::Any => 0,
+                    DeclaredType::Fixnum => 1,
+                    DeclaredType::SingleFloat => 2,
+                    DeclaredType::FixnumRange { .. } => 3,
+                });
+                if let DeclaredType::FixnumRange { lower, upper } = ty {
+                    code.extend_from_slice(&lower.to_le_bytes());
+                    code.extend_from_slice(&upper.to_le_bytes());
+                }
             }
             Instr::MemoryFence(kind) => {
                 put_u8(&mut code, 0x44);
@@ -11918,6 +12043,7 @@ fn decode_bbu_function(
     encoded: &EncodedBbuFunction,
     constants: &[EgclVal],
     handler_case_table: &[Vec<(u32, u32, u32)>],
+    bytecode_version: u16,
 ) -> Result<BytecodeFunction, EgclError> {
     let mut cursor = BbuCursor::new(&encoded.code);
     let mut starts = Vec::new();
@@ -12062,6 +12188,20 @@ fn decode_bbu_function(
             0x27 => Instr::PopHandler,
             0x30 => Instr::AllocCons,
             0x42 => Instr::TypeP(cursor.u16()?),
+            0x45 if bytecode_version >= 0x0202 => Instr::CheckResult(match cursor.u8()? {
+                0 => DeclaredType::Any,
+                1 => DeclaredType::Fixnum,
+                2 => DeclaredType::SingleFloat,
+                3 => {
+                    let lower = cursor.i64()?;
+                    let upper = cursor.i64()?;
+                    if lower > upper {
+                        return Err(bbu_error("invalid result range"));
+                    }
+                    DeclaredType::FixnumRange { lower, upper }
+                }
+                _ => return Err(bbu_error("invalid result type")),
+            }),
             0x44 => Instr::MemoryFence(
                 MemoryFenceKind::from_u8(cursor.u8()?)
                     .ok_or_else(|| bbu_error("invalid memory-fence kind"))?,
@@ -13188,7 +13328,8 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
     // a full load of real ASDF/UIOP, adjacency found NO sites at all; threading
     // finds them.
     //
-    // Only `Br` and `PopHandler` may be threaded through. In particular NOT
+    // Branches, handler pops, and the function's terminal result check may be
+    // threaded through. In particular NOT
     // `ClearMv`: that truncates the call's result to one value, and a back-edge
     // skipping it would let the base case's `(values 1 2)` escape a
     // single-value context untruncated.
@@ -13204,6 +13345,11 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
                     pops += 1;
                     j += 1;
                 }
+                // Only the shared terminal contract is redundant for a
+                // source-proven call to this same retained body: the eventual
+                // base case still executes it before returning. Do not skip
+                // checks elsewhere or checks after arbitrary named calls.
+                Some(Instr::CheckResult(_)) if j + 2 == code.len() => j += 1,
                 // Exactly the prologue's blocks left open, and then the return.
                 Some(Instr::Return) => return pops == entry,
                 _ => return false,
@@ -13258,7 +13404,7 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
             Instr::StoreLocal(_) | Instr::Pop => (1, 0),
             Instr::ClearMv => (0, 0),
             Instr::Dup => (1, 2),
-            Instr::TypeP(_) => (1, 1),
+            Instr::TypeP(_) | Instr::CheckResult(_) => (1, 1),
             Instr::MemoryFence(_) => (0, 1),
             Instr::AllocCons => (2, 1),
             Instr::SetValues(nvals) => (*nvals as u32, 1),
@@ -13324,8 +13470,14 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
     for (i, instr) in code.iter().enumerate() {
         map[i] = new_code.len() as u32;
         if sites.contains(&i) {
-            // The last argument is on top, so the slots fill in reverse.
-            for slot in param_slots.iter().rev() {
+            // All arguments are evaluated before replacing any parameter.
+            // The backedge bypasses ingress, so check each new value before
+            // publishing it in a typed slot. The last argument is on top.
+            for (index, slot) in param_slots.iter().enumerate().rev() {
+                let ty = func.param_types.get(index).copied().unwrap_or(DeclaredType::Any);
+                if !ty.is_any() {
+                    new_code.push(Instr::CheckResult(ty));
+                }
                 new_code.push(Instr::StoreLocal(*slot));
             }
             new_code.push(Instr::Br(entry as u32));
@@ -13470,7 +13622,7 @@ fn verified_operand_stack_depths(
             | Instr::NamedTag { .. }
             | Instr::PopRestartCase => Some((0, 0)),
             Instr::ValuesToList => Some((1, 1)),
-            Instr::TypeP(_) => Some((1, 1)),
+            Instr::TypeP(_) | Instr::CheckResult(_) => Some((1, 1)),
             Instr::MemoryFence(_) => Some((0, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
@@ -14095,7 +14247,9 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     egcl_rt::rooted_ref!(_constants_root = &mut constants);
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
-        let mut function = decode_bbu_function(encoded, &constants, &handler_case_tables[index])?;
+        let mut function = decode_bbu_function(
+            encoded, &constants, &handler_case_tables[index], bytecode_version,
+        )?;
         function.restart_cases = restart_tables[index]
             .iter()
             .map(|table| {
@@ -14665,28 +14819,33 @@ const FLAG_CALL: u32 = 0b00;
 
 fn validate_declared_args(func: &BytecodeFunction, args: &[EgclVal]) -> Result<(), EgclError> {
     for (ty, value) in func.param_types.iter().copied().zip(args.iter().copied()) {
-        let matches = match ty {
-            DeclaredType::Any => true,
-            DeclaredType::Fixnum => value.is_fixnum(),
-            DeclaredType::FixnumRange { lower, upper } => {
-                value.is_fixnum() && (lower..=upper).contains(&value.as_fixnum())
-            }
-            DeclaredType::SingleFloat => value.is_single_float(),
-        };
-        if !matches {
-            let expected = match ty {
-                DeclaredType::Any => unreachable!(),
-                DeclaredType::Fixnum => "FIXNUM".to_string(),
-                DeclaredType::FixnumRange { lower, upper } => {
-                    format!("(INTEGER {lower} {upper})")
-                }
-                DeclaredType::SingleFloat => "SINGLE-FLOAT".to_string(),
-            };
-            return Err(EgclError::TypeError {
-                datum: value,
-                expected,
-            });
+        validate_declared_value(ty, value)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_declared_value(ty: DeclaredType, value: EgclVal) -> Result<(), EgclError> {
+    let matches = match ty {
+        DeclaredType::Any => true,
+        DeclaredType::Fixnum => value.is_fixnum(),
+        DeclaredType::FixnumRange { lower, upper } => {
+            value.is_fixnum() && (lower..=upper).contains(&value.as_fixnum())
         }
+        DeclaredType::SingleFloat => value.is_single_float(),
+    };
+    if !matches {
+        let expected = match ty {
+            DeclaredType::Any => unreachable!(),
+            DeclaredType::Fixnum => "FIXNUM".to_string(),
+            DeclaredType::FixnumRange { lower, upper } => {
+                format!("(INTEGER {lower} {upper})")
+            }
+            DeclaredType::SingleFloat => "SINGLE-FLOAT".to_string(),
+        };
+        return Err(EgclError::TypeError {
+            datum: value,
+            expected,
+        });
     }
     Ok(())
 }
@@ -15532,6 +15691,16 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 } else {
                     NIL
                 });
+            }
+            Instr::CheckResult(ty) => {
+                let value = acts[top_idx].pop_op();
+                // Keep the primary rooted in the activation while constructing
+                // a condition. A successful check leaves Env's MV state intact.
+                acts[top_idx].push_op(value);
+                if let Err(error) = validate_declared_value(ty, value) {
+                    let pending = error_to_pending(error, env);
+                    initiate_unwind(acts, stack, env, pending)?;
+                }
             }
             Instr::MemoryFence(kind) => {
                 env.clear_mv();
