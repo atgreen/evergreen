@@ -731,10 +731,21 @@ fn direct_recursive_fib_does_not_charge_global_invocation_heat() {
 #[test]
 fn direct_self_stack_admission_checks_exact_child_budget_and_balances_depth() {
     let f = fib();
-    // fib(2) has two leaf children. A denied admission returns the cold
-    // sentinel -1 for each child, while admitted children return 1 and 0.
-    for (below_bottom, expected) in [(1, 1_i64), (0, -2), (-1, -2)] {
-        execute_with_self_stack_bound(&f, 1, &[2 << 3, 0, 0, 0, 0, 0, 0],
+    // fib(6)'s first child fib(5) requires a frame; its grandchildren and the
+    // second child fib(4) are folded. Admit the first child for 5+3=8, or
+    // reject it with the cold sentinel for -1+3=2. fib(2) would not exercise
+    // stack admission at all: both calls are eliminated before this check.
+    for (below_bottom, expected) in [(1, 8_i64), (0, 2), (-1, 2)] {
+        execute_with_self_stack_bound(&f, 1, &[6 << 3, 0, 0, 0, 0, 0, 0],
             (expected << 3) as u64, 0, None, true, Some(below_bottom), 0);
+    }
+}
+
+#[test]
+fn eliminated_self_calls_do_not_require_child_stack_space() {
+    let f = fib();
+    for below_bottom in [1, 0, -1] {
+        execute_with_self_stack_bound(&f, 1, &[2 << 3, 0, 0, 0, 0, 0, 0],
+            1 << 3, 0, None, true, Some(below_bottom), 0);
     }
 }

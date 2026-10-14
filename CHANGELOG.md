@@ -4,7 +4,9 @@
 
 - Preserve bounded integer parameter ranges in T2, and retain declared argument
   checks on direct recursive calls, including calls replaced by pure return
-  shortcuts ([#326](https://github.com/atgreen/evergreen/pull/326)).
+  shortcuts. Use dominating numeric comparisons to prove recursive argument
+  bounds without redundant checks
+  ([#326](https://github.com/atgreen/evergreen/pull/326)).
 
 - Replace repeated native runtime checks with an execution-local poll and remove
   redundant ownership/depth checks from trusted ordinary self-calls. Reduce

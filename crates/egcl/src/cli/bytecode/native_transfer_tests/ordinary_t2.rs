@@ -305,6 +305,13 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
         .count();
     assert_eq!(base_case_tests, 3,
         "pure base case is checked at entry and inlined at both direct self-call sites");
+    assert!(!instructions.windows(2).any(|pair|
+        pair[0].mnemonic() == iced_x86::Mnemonic::Cmp
+            && pair[0].op0_register() == iced_x86::Register::RAX
+            && pair[0].op1_register() == iced_x86::Register::RDX
+            && matches!(pair[1].mnemonic(), iced_x86::Mnemonic::Jl | iced_x86::Mnemonic::Jg)),
+        "the dominating n >= 2 branch must prove both recursive argument intervals; \
+         do not emit redundant declared-bound checks before the direct calls");
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
