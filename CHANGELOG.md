@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Check supported primitive `FTYPE` primary-result declarations even at safety
+  zero, preserving multiple values and the executing definition's contract.
+  Retain checks in source-free BFASL files, and enforce declared argument types
+  on interpreted calls, mapped recursion, and optimized self-tail calls
+  ([#331](https://github.com/atgreen/evergreen/pull/331)). The matched typed
+  Fibonacci comparison measured a small slowdown from 30 ms to 31 ms median;
+  see the [checked-result report](tests/benchmarks/results/2026-10-14-fib-checked-results.md).
+
 ## 0.0.8 - 2026-10-14
 
 ### Native compilation and performance
