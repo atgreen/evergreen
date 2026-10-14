@@ -39,6 +39,8 @@ impl EgclSemaphore {
         self.count.load(Ordering::Acquire)
     }
 
+    // Keep the stable/MSRV atomic API; newer nightlies rename it to try_update.
+    #[allow(deprecated)]
     pub fn try_wait(&self, permits: i64) -> Result<bool, EgclError> {
         if permits <= 0 {
             return Err(EgclError::ProgramError(
@@ -115,6 +117,8 @@ impl EgclSemaphore {
         }
     }
 
+    // Keep the stable/MSRV atomic API; newer nightlies rename it to try_update.
+    #[allow(deprecated)]
     pub fn signal(&self, permits: i64) -> Result<(), EgclError> {
         let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
         if permits <= 0 {

@@ -15,6 +15,10 @@ struct State {
     high: usize,
     rounds: usize,
     intact: bool,
+    #[cfg(egcl_tsan)]
+    scheduler_tsan: usize,
+    #[cfg(egcl_tsan)]
+    fiber_tsan: usize,
 }
 
 thread_local! {
@@ -27,8 +31,14 @@ fn suspend(fiber: bool) {
     // stack accesses it while this one is suspended.
     unsafe {
         if fiber {
+            #[cfg(egcl_tsan)]
+            context::swap_tsan(&raw mut (*state).fiber, (*state).scheduler, (*state).scheduler_tsan);
+            #[cfg(not(egcl_tsan))]
             context::swap(&raw mut (*state).fiber, (*state).scheduler);
         } else {
+            #[cfg(egcl_tsan)]
+            context::swap_tsan(&raw mut (*state).scheduler, (*state).fiber, (*state).fiber_tsan);
+            #[cfg(not(egcl_tsan))]
             context::swap(&raw mut (*state).scheduler, (*state).fiber);
         }
     }
@@ -95,6 +105,10 @@ fn repeated_switches_preserve_both_stacks_and_live_values() {
         high: stack.as_ptr() as usize + stack.len(),
         rounds: 0,
         intact: false,
+        #[cfg(egcl_tsan)]
+        scheduler_tsan: unsafe { context::__tsan_get_current_fiber() as usize },
+        #[cfg(egcl_tsan)]
+        fiber_tsan: unsafe { context::__tsan_create_fiber(0) as usize },
     };
     assert!(!state.fiber.is_null());
     STATE.set(&raw mut state);
@@ -104,4 +118,6 @@ fn repeated_switches_preserve_both_stacks_and_live_values() {
         assert_eq!(state.rounds, round);
     }
     STATE.set(std::ptr::null_mut());
+    #[cfg(egcl_tsan)]
+    unsafe { context::__tsan_destroy_fiber(state.fiber_tsan as *mut _) };
 }

@@ -235,16 +235,30 @@ pub unsafe fn mmap(
     fd: i32,
     offset: i64,
 ) -> Result<*mut u8, i32> {
-    let r = syscall6(
-        nr::MMAP,
-        addr as usize,
-        len,
-        prot as usize,
-        flags as usize,
-        fd as isize as usize,
-        offset as usize,
-    );
-    check(r).map(|a| a as *mut u8)
+    // TSan must observe mapping lifetimes: a reused virtual address is not
+    // the same allocation, even when unrelated threads use it successively.
+    #[cfg(egcl_tsan)]
+    {
+        let mapped = libc::mmap(addr.cast(), len, prot, flags, fd, offset);
+        if mapped == libc::MAP_FAILED {
+            Err(*libc::__errno_location())
+        } else {
+            Ok(mapped.cast())
+        }
+    }
+    #[cfg(not(egcl_tsan))]
+    {
+        let r = syscall6(
+            nr::MMAP,
+            addr as usize,
+            len,
+            prot as usize,
+            flags as usize,
+            fd as isize as usize,
+            offset as usize,
+        );
+        check(r).map(|a| a as *mut u8)
+    }
 }
 
 /// `munmap(2)`.
@@ -254,6 +268,15 @@ pub unsafe fn mmap(
 /// `addr`/`len` must name a mapping previously returned by [`mmap`].
 #[inline]
 pub unsafe fn munmap(addr: *mut u8, len: usize) -> Result<(), i32> {
+    #[cfg(egcl_tsan)]
+    {
+        if libc::munmap(addr.cast(), len) == 0 {
+            Ok(())
+        } else {
+            Err(*libc::__errno_location())
+        }
+    }
+    #[cfg(not(egcl_tsan))]
     check(syscall2(nr::MUNMAP, addr as usize, len)).map(|_| ())
 }
 

@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(egcl_msan)");
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_SANITIZE");
+    if std::env::var("CARGO_CFG_SANITIZE")
+        .unwrap_or_default()
+        .split(',')
+        .any(|sanitizer| sanitizer == "memory")
+    {
+        println!("cargo:rustc-cfg=egcl_msan");
+    }
     let target = std::env::var("TARGET").unwrap_or_default();
     // One capability gate for the scheduler and its integration tests.
     println!("cargo:rustc-check-cfg=cfg(egcl_unix_fibers)");
@@ -11,6 +20,17 @@ fn main() {
         .unwrap_or_default()
         .split(',')
         .any(|family| family == "unix");
+    // Instrument the x86-64 Unix stack-switch backend used by sanitizer CI.
+    println!("cargo:rustc-check-cfg=cfg(egcl_tsan)");
+    if arch == "x86_64"
+        && unix
+        && std::env::var("CARGO_CFG_SANITIZE")
+            .unwrap_or_default()
+            .split(',')
+            .any(|sanitizer| sanitizer == "thread")
+    {
+        println!("cargo:rustc-cfg=egcl_tsan");
+    }
     let pointers_64 = std::env::var("CARGO_CFG_TARGET_POINTER_WIDTH").as_deref() == Ok("64");
     let unix_fibers = unix
         && pointers_64

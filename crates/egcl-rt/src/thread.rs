@@ -77,6 +77,8 @@ struct FiberExecutionContext {
     // suspends (crate::context::swap writes through this cell).
     context: Box<UnsafeCell<crate::context::Context>>,
     _native_stack: EgclStack,
+    #[cfg(egcl_tsan)]
+    tsan: usize,
 }
 
 #[cfg(egcl_unix_fibers)]
@@ -98,6 +100,8 @@ impl FiberExecutionContext {
         Ok(Self {
             context: Box::new(UnsafeCell::new(sp)),
             _native_stack: native_stack,
+            #[cfg(egcl_tsan)]
+            tsan: unsafe { crate::context::__tsan_create_fiber(0) as usize },
         })
     }
 
@@ -109,6 +113,12 @@ impl FiberExecutionContext {
 #[cfg(egcl_unix_fibers)]
 impl Drop for FiberExecutionContext {
     fn drop(&mut self) {
+        // The scheduler retains the Fiber while mounted, so this owned context
+        // is never current when its final owner is dropped (including unstarted fibers).
+        #[cfg(egcl_tsan)]
+        unsafe {
+            crate::context::__tsan_destroy_fiber(self.tsan as *mut _)
+        };
         let low = self._native_stack.base() as usize - crate::syscall::page_size();
         crate::runtime::unregister_sigsegv_stack_guard_range(low);
     }
@@ -1275,6 +1285,9 @@ pub struct Fiber {
     /// then be stale (reads the wrong/cleared carrier slot). See bliss-bca.5.
     #[cfg_attr(not(egcl_fibers), allow(dead_code))]
     scheduler_return: AtomicUsize,
+    // Borrowed carrier context, refreshed on every mount for migration.
+    #[cfg(egcl_tsan)]
+    scheduler_tsan: AtomicUsize,
     /// Carrier pool chosen by the first scheduler-group submission.  Wakeups
     /// from timers, synchronization primitives, and I/O always return to this
     /// pool; a fiber cannot migrate between scheduler groups.
@@ -1380,6 +1393,8 @@ impl Fiber {
         self.pin_count.fetch_add(1, Ordering::AcqRel);
     }
 
+    // Keep the stable/MSRV atomic API; newer nightlies rename it to try_update.
+    #[allow(deprecated)]
     pub fn unpin(&self) -> Result<(), EgclError> {
         self.pin_count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
@@ -2140,6 +2155,20 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
                     .scheduler_return
                     .store(&mut scheduler_context as *mut _ as usize, Ordering::Release);
                 let fiber_sp = *thread.execution_context.as_ptr();
+                #[cfg(egcl_tsan)]
+                {
+                    thread.scheduler_tsan.store(
+                        crate::context::__tsan_get_current_fiber() as usize,
+                        Ordering::Release,
+                    );
+                    crate::context::swap_tsan(
+                        &mut scheduler_context,
+                        fiber_sp,
+                        thread.execution_context.tsan,
+                    );
+                    thread.scheduler_tsan.store(0, Ordering::Release);
+                }
+                #[cfg(not(egcl_tsan))]
                 crate::context::swap(&mut scheduler_context, fiber_sp);
                 thread.scheduler_return.store(0, Ordering::Release);
             }
@@ -2250,6 +2279,15 @@ unsafe fn swap_fiber_to_scheduler(fiber: &Fiber) -> Result<(), EgclError> {
     }
     // Save the fiber's context into its cell and switch back to the carrier.
     // SAFETY: `scheduler` points at the carrier's live on-stack context.
+    #[cfg(egcl_tsan)]
+    unsafe {
+        crate::context::swap_tsan(
+            fiber.execution_context.as_ptr(),
+            *scheduler,
+            fiber.scheduler_tsan.load(Ordering::Acquire),
+        )
+    };
+    #[cfg(not(egcl_tsan))]
     unsafe { crate::context::swap(fiber.execution_context.as_ptr(), *scheduler) };
     Ok(())
 }
@@ -2700,6 +2738,8 @@ pub fn make_fiber_with_stack_size(entry: EgclVal, stack_size: usize) -> Result<F
         host_roots: crate::gc::FiberRoots::new(),
         native_faults: crate::runtime::FiberFaultState::default(),
         scheduler_return: AtomicUsize::new(0),
+        #[cfg(egcl_tsan)]
+        scheduler_tsan: AtomicUsize::new(0),
         scheduler_pool: OrderedMutex::new(
             LockLevel::ExecutionObject,
             fiber_object_order(id, 3),

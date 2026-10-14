@@ -8,19 +8,37 @@ use egcl_rt::FrameType;
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn init_heap() {
-    egcl_rt::init_heap(&egcl_rt::GcConfig {
-        heap_size: 4 * 1024 * 1024,
-        heap_max: 16 * 1024 * 1024,
-        nursery_size: 64 * 1024,
-        tlab_size: 4096,
-        region_size: 4096,
-        promotion_threshold: 3,
-        pause_target_ms: 10,
-        gc_workers: 1,
-        satb_buffer_size: 32,
-        old_occupancy_trigger: 0.9,
-    })
-    .unwrap();
+    // Runtime registries retain heap references across tests. Replacing the
+    // heap would unmap those objects without retiring their global roots.
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        egcl_rt::init_heap(&egcl_rt::GcConfig {
+            heap_size: 4 * 1024 * 1024,
+            heap_max: 16 * 1024 * 1024,
+            nursery_size: 64 * 1024,
+            tlab_size: 4096,
+            region_size: 4096,
+            promotion_threshold: 3,
+            pause_target_ms: 10,
+            gc_workers: 1,
+            satb_buffer_size: 32,
+            old_occupancy_trigger: 0.9,
+        })
+        .unwrap();
+    });
+}
+
+#[test]
+fn heap_fixture_preserves_symbols_between_test_setups() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
+    let symbol = egcl_rt::symbols::make_uninterned("DEBUG-STACK-FIXTURE");
+    init_heap();
+    egcl_rt::collect_t0_minor().unwrap();
+    assert_eq!(
+        egcl_rt::symbols::symbol_name(symbol.symbol_index().unwrap()).as_deref(),
+        Some("DEBUG-STACK-FIXTURE")
+    );
 }
 
 #[test]
@@ -105,6 +123,7 @@ fn snapshots_resolve_function_objects_and_survive_collection_and_stack_pop() {
 #[test]
 fn logical_frames_merge_with_runtime_frames_and_outlive_unwinding() {
     let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
     assert!(capture_current(100).is_empty());
     let stack = egcl_rt::thread::current_stack();
     let outer = CallFrame::enter("OUTER");
@@ -139,6 +158,7 @@ fn logical_frames_merge_with_runtime_frames_and_outlive_unwinding() {
 #[test]
 fn managed_argument_records_merge_without_duplicate_calls() {
     let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
     let outer = CallFrame::enter_with_args("TREE-OUTER", &[egcl_rt::EgclVal::from_fixnum(41)]);
     let stack = egcl_rt::thread::current_stack();
     stack.push_frame(NIL, std::ptr::null(), 0, 0).unwrap();
@@ -278,6 +298,7 @@ fn native_identity_belongs_to_installed_code_and_owned_snapshots() {
 #[test]
 fn control_records_do_not_consume_the_call_limit() {
     let _serial = TEST_LOCK.lock().unwrap();
+    init_heap();
     let stack = egcl_rt::thread::current_stack();
     stack.push_frame(NIL, std::ptr::null(), 0, 0).unwrap();
     stack
@@ -396,6 +417,7 @@ mod fibers {
     #[test]
     fn current_and_suspended_fibers_keep_their_own_frames_across_migration() {
         let _serial = TEST_LOCK.lock().unwrap();
+        init_heap();
         let caller = CallFrame::enter("NATIVE-CALLER");
         let group = SchedulerGroup::init(&SchedulerConfig { num_workers: 4 }).unwrap();
         let mut ids = Vec::new();
