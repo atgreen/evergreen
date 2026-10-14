@@ -200,13 +200,17 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
             && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
         .count();
     assert_eq!(direct_calls, 2, "both recursive edges must call generated code directly");
-    let base_case_tests = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
-        iced_x86::DecoderOptions::NONE).into_iter().filter(|instruction|
+    let instructions: Vec<_> = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
+        iced_x86::DecoderOptions::NONE).into_iter().collect();
+    let base_case_tests = instructions.windows(2).filter(|pair| {
+        let instruction = &pair[0];
         instruction.mnemonic() == iced_x86::Mnemonic::Cmp
             && instruction.op0_register() == iced_x86::Register::RDI
             && matches!(instruction.op1_kind(), iced_x86::OpKind::Immediate8to64
                 | iced_x86::OpKind::Immediate32to64)
-            && instruction.immediate(1) == 16)
+            && instruction.immediate(1) == 16
+            && pair[1].mnemonic() == iced_x86::Mnemonic::Jge
+        })
         .count();
     assert_eq!(base_case_tests, 3,
         "pure base case is checked at entry and inlined at both direct self-call sites");
@@ -259,7 +263,7 @@ fn ordinary_t2_inlined_prefix_preserves_poll_and_stack_admission() {
     assert_mapped_t2(&code);
     let _reset = Reset;
     SELF_COLD_OBSERVER.with(|hook| hook.set(Some(restore_limit)));
-    for (n, cold_expected) in [(1, false), (2, true)] {
+    for (n, cold_expected) in [(1, false), (2, false), (8, true)] {
         take_cold_calls_for_test();
         let result = native_transfer_entry::with_ordinary_entry_hook_for_test(deny_child, ||
             run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env)).unwrap();
@@ -268,12 +272,15 @@ fn ordinary_t2_inlined_prefix_preserves_poll_and_stack_admission() {
             "only a prefix miss requires child-stack admission");
     }
     SELF_COLD_OBSERVER.with(|hook| hook.set(None));
-    take_cold_calls_for_test();
-    let result = native_transfer_entry::with_ordinary_entry_hook_for_test(
-        egcl_rt::thread::request_current_execution_poll, ||
-        run_native(&code, symbol, &[EgclVal::from_fixnum(1)], &mut env)).unwrap();
-    assert_eq!(result, EgclVal::from_fixnum(1));
-    assert!(take_cold_calls_for_test() > 0, "a pending poll must precede even an inlined leaf");
+    for n in [1, 2] {
+        take_cold_calls_for_test();
+        let result = native_transfer_entry::with_ordinary_entry_hook_for_test(
+            egcl_rt::thread::request_current_execution_poll, ||
+            run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env)).unwrap();
+        assert_eq!(result, EgclVal::from_fixnum(n));
+        assert!(take_cold_calls_for_test() > 0,
+            "a pending poll precedes both the original leaf and recursive specialization");
+    }
 }
 
 #[test]

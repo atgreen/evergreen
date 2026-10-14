@@ -100,7 +100,7 @@ pub(super) struct OrdinaryCallEmission<'a> {
     tail: bool,
     pub(super) guard: Option<OrdinaryGuardOptions>,
     pub(super) poll_veneer: Option<u64>,
-    self_calls: &'a [Inst],
+    pub(super) self_calls: &'a [Inst],
     direct_self: bool,
     self_facts: OrdinarySelfCallFacts,
 }
@@ -533,6 +533,7 @@ pub(super) struct OrdinaryCallFrame<'a> {
     pub mv_known_empty: bool,
     pub self_entry: egcl_rt::asm::Label,
     pub self_prefix: Option<&'a ordinary_prefix::Prefix>,
+    pub self_specializations: &'a [ordinary_prefix::Specialization],
     pub self_stack_fixups: &'a mut Vec<usize>,
     pub emit_epilogue: &'a dyn Fn(&mut Asm),
 }
@@ -570,6 +571,7 @@ impl OrdinaryCallEmission<'_> {
             mv_known_empty,
             self_entry,
             self_prefix,
+            self_specializations,
             self_stack_fixups,
             emit_epilogue,
         } = frame;
@@ -614,6 +616,7 @@ impl OrdinaryCallEmission<'_> {
                     load_home(a, reg, FramedHome::Stack(base + index as u32), 0);
                 }
                 ordinary_prefix::emit_selected(a, prefix, Some(done));
+                ordinary_prefix::emit_specializations(a, self_specializations, done);
                 // Failed prefix tests leave argument registers live, so restore
                 // the control pointer used by normal child-stack admission.
                 load_home(a, 7, control_home, 0);
