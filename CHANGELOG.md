@@ -5,9 +5,11 @@
 - Preserve bounded integer parameter ranges in T2, and retain declared argument
   checks on direct recursive calls, including calls replaced by pure return
   shortcuts. Use dominating numeric comparisons to prove recursive argument
-  bounds without redundant checks. Retain global `FTYPE` declaration metadata
-  during compilation and source-free BFASL loading; result-type enforcement and
-  optimization from these declarations are not yet enabled
+  bounds without redundant checks, and omit add/subtract overflow checks when
+  checked operand ranges prove the result fits a fixnum. Correct constant-left
+  subtraction when the result reuses the right operand's register. Retain global
+  `FTYPE` declaration metadata during compilation and source-free BFASL loading;
+  result-type enforcement and optimization from these declarations are not yet enabled
   ([#326](https://github.com/atgreen/evergreen/pull/326)).
 
 - Replace repeated native runtime checks with an execution-local poll and remove

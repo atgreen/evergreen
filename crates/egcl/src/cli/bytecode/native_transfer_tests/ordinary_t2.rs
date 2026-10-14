@@ -312,6 +312,10 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
             && matches!(pair[1].mnemonic(), iced_x86::Mnemonic::Jl | iced_x86::Mnemonic::Jg)),
         "the dominating n >= 2 branch must prove both recursive argument intervals; \
          do not emit redundant declared-bound checks before the direct calls");
+    assert_eq!(instructions.iter().filter(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Jo).count(), 1,
+        "checked n in [0,40] proves both subtractions safe; the sum of \
+         recursive results still requires its overflow check");
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),

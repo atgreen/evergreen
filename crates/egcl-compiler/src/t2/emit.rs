@@ -585,6 +585,29 @@ fn mul_cannot_overflow(range: Option<crate::t2::ir::Range>, c: i64) -> bool {
     }
 }
 
+/// Prove the mathematical sum/difference fits before operating on tagged words.
+/// Use operand bounds, never the result's potentially clipped fixnum range.
+fn add_sub_cannot_overflow(
+    left: Option<crate::t2::ir::Range>,
+    right: Option<crate::t2::ir::Range>,
+    subtract: bool,
+) -> bool {
+    let (Some(left), Some(right)) = (left, right) else { return false };
+    for range in [left, right] {
+        if range.lo > range.hi || range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX {
+            return false;
+        }
+    }
+    let (lo, hi) = if subtract {
+        (i128::from(left.lo) - i128::from(right.hi),
+         i128::from(left.hi) - i128::from(right.lo))
+    } else {
+        (i128::from(left.lo) + i128::from(right.lo),
+         i128::from(left.hi) + i128::from(right.hi))
+    };
+    lo >= i128::from(FIXNUM_MIN) && hi <= i128::from(FIXNUM_MAX)
+}
+
 /// Get value `v` into a register: an already-assigned one, or a deferred fixnum
 /// constant materialised (tagged) into a fresh register on demand.
 fn framed_mat(
@@ -1422,6 +1445,10 @@ fn emit_arith_inst(
         Opcode::FixnumAdd | Opcode::FixnumSub => {
             let is_add = data.opcode == Opcode::FixnumAdd;
             let (a0, b0) = (data.args[0], data.args[1]);
+            let range = |v| consts.get(&v)
+                .map(|&n| crate::t2::ir::Range { lo: n, hi: n })
+                .or(f.value(v).ty.range);
+            let needs_overflow_check = !add_sub_cannot_overflow(range(a0), range(b0), !is_add);
             // Fold a constant right operand (add/sub var, const), or a constant left
             // operand for the commutative add.
             let folded = if let Some(&c) = consts.get(&b0) {
@@ -1437,7 +1464,9 @@ fn emit_arith_inst(
                     guard(a, var, x);
                     mov_rr(a, dst, x);
                     alu_r_imm(a, if is_add { 0 } else { 5 }, dst, t32);
-                    a.jcc(Cc::O, deopt);
+                    if needs_overflow_check {
+                        a.jcc(Cc::O, deopt);
+                    }
                     return Ok(());
                 }
             }
@@ -1451,6 +1480,12 @@ fn emit_arith_inst(
                     // Addition is commutative, so accumulate the untouched LHS
                     // into the RHS/result register without a destructive move.
                     alu_rr(a, op, dst, x);
+                } else if x == SCRATCH {
+                    // A materialised constant LHS already occupies rdx. Consume
+                    // it before reusing the RHS/result register; MOV preserves
+                    // the subtraction's overflow flag for the guard below.
+                    alu_rr(a, op, SCRATCH, y);
+                    mov_rr(a, dst, SCRATCH);
                 } else {
                     // Subtraction is not commutative: preserve RHS in reserved
                     // rdx before overwriting the coalesced destination.
@@ -1462,7 +1497,9 @@ fn emit_arith_inst(
                 mov_rr(a, dst, x);
                 alu_rr(a, op, dst, y);
             }
-            a.jcc(Cc::O, deopt);
+            if needs_overflow_check {
+                a.jcc(Cc::O, deopt);
+            }
         }
         Opcode::FixnumNeg => {
             let a0 = data.args[0];
@@ -8570,6 +8607,139 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", unix))]
     fn contains(hay: &[u8], needle: &[u8]) -> bool {
         hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn add_sub_range_code(
+        opcode: crate::t2::ir::Opcode,
+        left: Option<crate::t2::ir::Range>,
+        right: Result<i64, crate::t2::ir::Range>,
+        constant_on_left: bool,
+        deopt: Option<extern "C" fn()>,
+    ) -> Vec<u8> {
+        use crate::t2::ir::{IRType, TypeBits, ValueRepresentation};
+        let mut f = build_mul_ranged(right.unwrap_or(0), left);
+        let entry = f.entry();
+        let arithmetic = f.block(entry).insts[1];
+        f.inst_mut(arithmetic).opcode = opcode;
+        if let Err(range) = right {
+            let y = f.add_block_param(entry, IRType {
+                bits: TypeBits::FIXNUM, range: Some(range), class_id: None,
+            }, ValueRepresentation::Tagged);
+            f.inst_mut(arithmetic).args[1] = y;
+        }
+        if constant_on_left {
+            f.inst_mut(arithmetic).args.swap(0, 1);
+        }
+        emit_framed(&f, deopt.unwrap_or(mock_c2i_deopt) as *const () as usize as u64,
+            0, 0, 0, 0, 0, 0, 0, None).expect("emit ranged arithmetic").code
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    fn has_overflow_branch(code: &[u8]) -> bool {
+        iced_x86::Decoder::new(64, code, iced_x86::DecoderOptions::NONE)
+            .into_iter().any(|instruction| instruction.mnemonic() == iced_x86::Mnemonic::Jo)
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_elides_overflow_for_immediate_and_register_operands() {
+        use crate::t2::ir::{Opcode, Range};
+        use egcl_rt::value::EgclVal;
+        for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
+            for right in [Ok(2), Ok(-2), Err(Range { lo: -2, hi: 2 })] {
+                for constant_on_left in [false, true] {
+                    let code = add_sub_range_code(opcode, Some(Range { lo: -40, hi: 40 }),
+                        right, constant_on_left, None);
+                    assert!(!has_overflow_branch(&code),
+                        "bounded {opcode:?} {right:?}, swapped={constant_on_left}, cannot overflow");
+                    let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+                    let function: extern "C" fn(*mut u64) -> u64 =
+                        unsafe { std::mem::transmute(buffer.as_ptr()) };
+                    for x in [-40, 0, 40] {
+                        let y = right.unwrap_or(-2);
+                        let (a, b) = if constant_on_left { (y, x) } else { (x, y) };
+                        let expected = if opcode == Opcode::FixnumAdd { a + b } else { a - b };
+                        let mut frame = [EgclVal::from_fixnum(x).0, EgclVal::from_fixnum(y).0, 0, 0];
+                        assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected,
+                            "{opcode:?}, {right:?}, swapped={constant_on_left}, x={x}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_accepts_exact_fixnum_endpoints() {
+        use crate::t2::ir::{Opcode, Range};
+        use egcl_rt::value::EgclVal;
+        for (opcode, range, constant) in [
+            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, 1),
+            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, 1),
+            (Opcode::FixnumAdd, Range { lo: FIXNUM_MIN + 1, hi: FIXNUM_MAX }, -1),
+            (Opcode::FixnumSub, Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX - 1 }, -1),
+        ] {
+            let code = add_sub_range_code(opcode, Some(range), Ok(constant), false, None);
+            assert!(!has_overflow_branch(&code),
+                "inclusive fixnum endpoints are safe for {opcode:?}, {range:?}, {constant}");
+            let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+            let function: extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(buffer.as_ptr()) };
+            for x in [range.lo, range.hi] {
+                let expected = if opcode == Opcode::FixnumAdd { x + constant } else { x - constant };
+                let mut frame = [EgclVal::from_fixnum(x).0, 0, 0];
+                assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), expected);
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn range_safe_add_sub_keeps_overflow_for_unknown_or_excessive_ranges() {
+        use crate::t2::ir::{Opcode, Range};
+        for opcode in [Opcode::FixnumAdd, Opcode::FixnumSub] {
+            for range in [None, Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }),
+                Some(Range { lo: i64::MIN, hi: i64::MAX }),
+                Some(Range { lo: 40, hi: 0 })] {
+                let code = add_sub_range_code(opcode, range, Ok(1), false, None);
+                assert!(has_overflow_branch(&code),
+                    "no sound overflow proof for {opcode:?}, {range:?}");
+            }
+            for swapped in [false, true] {
+                for right in [Ok(1), Err(Range { lo: -1, hi: 1 })] {
+                    let code = add_sub_range_code(opcode,
+                        Some(Range { lo: FIXNUM_MIN, hi: FIXNUM_MAX }), right, swapped, None);
+                    assert!(has_overflow_branch(&code),
+                        "overflow remains possible for {opcode:?}, {right:?}, swapped={swapped}");
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", unix))]
+    #[test]
+    fn constant_left_sub_preserves_scratch_lhs_when_result_reuses_rhs() {
+        use crate::t2::ir::Opcode;
+        use egcl_rt::value::EgclVal;
+        std::thread_local! {
+            static OVERFLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        extern "C" fn overflow() {
+            OVERFLOWED.with(|seen| seen.set(true));
+        }
+        // No range proof: exercise the original overflow-checked register path.
+        let code = add_sub_range_code(Opcode::FixnumSub, None, Ok(2), true, Some(overflow));
+        assert!(has_overflow_branch(&code));
+        let buffer = egcl_rt::jit::JitBuffer::new(&code).unwrap();
+        let function: extern "C" fn(*mut u64) -> u64 =
+            unsafe { std::mem::transmute(buffer.as_ptr()) };
+        let mut frame = [EgclVal::from_fixnum(-40).0, 0, 0];
+        assert_eq!(EgclVal(function(frame.as_mut_ptr())).as_fixnum(), 42);
+        assert!(!OVERFLOWED.with(|seen| seen.get()));
+        frame[0] = EgclVal::from_fixnum(FIXNUM_MIN).0;
+        let _ = function(frame.as_mut_ptr());
+        assert!(OVERFLOWED.with(|seen| seen.get()), "MOV must preserve OF for deoptimization");
     }
 
     /// Range-proven-safe `* 5` strength-reduces to a single `lea` with no overflow
