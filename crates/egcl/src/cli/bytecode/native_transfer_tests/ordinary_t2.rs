@@ -200,6 +200,16 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
             && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
         .count();
     assert_eq!(direct_calls, 2, "both recursive edges must call generated code directly");
+    let base_case_tests = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
+        iced_x86::DecoderOptions::NONE).into_iter().filter(|instruction|
+        instruction.mnemonic() == iced_x86::Mnemonic::Cmp
+            && instruction.op0_register() == iced_x86::Register::RDI
+            && matches!(instruction.op1_kind(), iced_x86::OpKind::Immediate8to64
+                | iced_x86::OpKind::Immediate32to64)
+            && instruction.immediate(1) == 16)
+        .count();
+    assert_eq!(base_case_tests, 3,
+        "pure base case is checked at entry and inlined at both direct self-call sites");
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
@@ -210,6 +220,81 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
     assert!(matches!(run_native(&code, symbol, &bad_args, &mut env),
         Err(EgclError::TypeError { .. })),
         "the public Fibonacci entry must retain its checked parameter contract");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_inlined_prefix_preserves_poll_and_stack_admission() {
+    use native_transfer_entry::ordinary_calls::{SELF_COLD_OBSERVER, take_cold_calls_for_test};
+    use egcl_compiler::t2::emit::NativeRecursiveControl;
+    thread_local! {
+        static SAVED_LIMIT: Cell<u64> = const { Cell::new(0) };
+    }
+    fn control() -> *mut NativeRecursiveControl {
+        let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+        let control = unsafe { &*execution }.active_native_control();
+        assert_ne!(control, 0);
+        control as *mut NativeRecursiveControl
+    }
+    fn deny_child() {
+        let control = control();
+        SAVED_LIMIT.with(|saved| saved.set(unsafe { (*control).stack_limit }));
+        unsafe { (*control).stack_limit = u64::MAX; }
+    }
+    fn restore_limit() {
+        let control = control();
+        unsafe { (*control).stack_limit = SAVED_LIMIT.with(Cell::get); }
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { SELF_COLD_OBSERVER.with(|hook| hook.set(None)); }
+    }
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-PREFIX-ADMISSION";
+    let form = "(if (< n 1) n (+ (ordinary-prefix-admission (- n 1)) 1))";
+    crate::cli::read_eval_all_env(&format!("(defun {name} (n) {form})"), &mut env).unwrap();
+    let (symbol, code) = install(name, "(n)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    let _reset = Reset;
+    SELF_COLD_OBSERVER.with(|hook| hook.set(Some(restore_limit)));
+    for (n, cold_expected) in [(1, false), (2, true)] {
+        take_cold_calls_for_test();
+        let result = native_transfer_entry::with_ordinary_entry_hook_for_test(deny_child, ||
+            run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env)).unwrap();
+        assert_eq!(result, EgclVal::from_fixnum(n));
+        assert_eq!(take_cold_calls_for_test() > 0, cold_expected,
+            "only a prefix miss requires child-stack admission");
+    }
+    SELF_COLD_OBSERVER.with(|hook| hook.set(None));
+    take_cold_calls_for_test();
+    let result = native_transfer_entry::with_ordinary_entry_hook_for_test(
+        egcl_rt::thread::request_current_execution_poll, ||
+        run_native(&code, symbol, &[EgclVal::from_fixnum(1)], &mut env)).unwrap();
+    assert_eq!(result, EgclVal::from_fixnum(1));
+    assert!(take_cold_calls_for_test() > 0, "a pending poll must precede even an inlined leaf");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_inlined_prefix_preserves_permuted_arguments_and_live_values() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-PREFIX-PERMUTATION";
+    let form = "(if (< n 1) a (+ (ordinary-prefix-permutation (- n 1) b a) a))";
+    crate::cli::read_eval_all_env(&format!("(defun {name} (n a b) {form})"), &mut env).unwrap();
+    let (symbol, code) = install(name, "(n a b)", &format!("({form})"), &mut env);
+    assert_mapped_t2(&code);
+    for (n, expected) in [(0, 10), (1, 30), (2, 40), (3, 60)] {
+        let args = [n, 10, 20].map(EgclVal::from_fixnum);
+        assert_eq!(run_native(&code, symbol, &args, &mut env).unwrap(),
+            EgclVal::from_fixnum(expected));
+    }
+    assert!(run_native(&code, symbol, &[NIL, EgclVal::from_fixnum(10),
+        EgclVal::from_fixnum(20)], &mut env).is_err(),
+        "a failed fixnum prefix guard retains the original error path");
 }
 
 #[test]

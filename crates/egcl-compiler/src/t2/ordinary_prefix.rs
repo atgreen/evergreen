@@ -27,7 +27,7 @@ enum Check {
     Fixnum(Atom),
     Less(Atom, Atom, bool),
 }
-struct Prefix {
+pub(super) struct Prefix {
     checks: Vec<Check>,
     result: Atom,
 }
@@ -201,7 +201,7 @@ fn walk(
     None
 }
 
-fn select(f: &Function, arity: usize, single: &HashSet<Inst>) -> Option<Prefix> {
+pub(super) fn select(f: &Function, arity: usize, single: &HashSet<Inst>) -> Option<Prefix> {
     if arity > 3
         || f.is_variadic()
         || !f.osr_entries.is_empty()
@@ -242,6 +242,12 @@ pub(super) fn emit(a: &mut Asm, f: &Function, arity: usize, single: &HashSet<Ins
     let Some(prefix) = select(f, arity, single) else {
         return;
     };
+    emit_selected(a, &prefix, None);
+}
+
+/// A call-site prefix joins its caller's result continuation without creating
+/// or retiring a frame. The caller has already checked poll and MV state.
+pub(super) fn emit_selected(a: &mut Asm, prefix: &Prefix, continuation: Option<egcl_rt::asm::Label>) {
     // A statically impossible guard must not produce an unconditional return.
     if prefix
         .checks
@@ -252,7 +258,7 @@ pub(super) fn emit(a: &mut Asm, f: &Function, arity: usize, single: &HashSet<Ins
     }
     let framed = a.label();
     let mut guarded = HashSet::new();
-    for check in prefix.checks {
+    for check in prefix.checks.iter().cloned() {
         match check {
             Check::Fixnum(Atom::Argument(register)) => {
                 if guarded.insert(register) {
@@ -281,7 +287,12 @@ pub(super) fn emit(a: &mut Asm, f: &Function, arity: usize, single: &HashSet<Ins
         }
     }
     load(a, RAX, prefix.result);
-    crate::t2::native_return::emit_single_return(a);
+    if let Some(continuation) = continuation {
+        a.push(0xf8); // clc: exactly one value, matching the ordinary return ABI
+        a.jmp(continuation);
+    } else {
+        crate::t2::native_return::emit_single_return(a);
+    }
     a.bind(framed);
 }
 

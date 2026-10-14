@@ -532,6 +532,7 @@ pub(super) struct OrdinaryCallFrame<'a> {
     /// Unknown tuples still require the runtime admission check.
     pub mv_known_empty: bool,
     pub self_entry: egcl_rt::asm::Label,
+    pub self_prefix: Option<&'a ordinary_prefix::Prefix>,
     pub self_stack_fixups: &'a mut Vec<usize>,
     pub emit_epilogue: &'a dyn Fn(&mut Asm),
 }
@@ -568,6 +569,7 @@ impl OrdinaryCallEmission<'_> {
             control_home,
             mv_known_empty,
             self_entry,
+            self_prefix,
             self_stack_fixups,
             emit_epilogue,
         } = frame;
@@ -602,6 +604,21 @@ impl OrdinaryCallEmission<'_> {
         }
         // Ordinary machine frames are bounded by their exact stack budget.
         // The legacy depth counter bounds Rust/native reentry only.
+
+        if self.direct_self && !self.tail {
+            if let Some(prefix) = self_prefix {
+                // All sources were snapshotted before any ABI register changes.
+                // The pure prefix cannot collect or deopt. On success there is
+                // no child frame to admit; pending polls already went cold above.
+                for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
+                    load_home(a, reg, FramedHome::Stack(base + index as u32), 0);
+                }
+                ordinary_prefix::emit_selected(a, prefix, Some(done));
+                // Failed prefix tests leave argument registers live, so restore
+                // the control pointer used by normal child-stack admission.
+                load_home(a, 7, control_home, 0);
+            }
+        }
 
         if self.direct_self {
             // Patched from the final published bound, including guard/cold

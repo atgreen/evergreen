@@ -5678,6 +5678,9 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let mut ordinary_self_stack_fixups = Vec::new();
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_self_prefix = ordinary.and_then(|options|
+        ordinary_prefix::select(f, options.arity, &single_returns));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
         let offset = a.here();
@@ -5923,6 +5926,7 @@ fn emit_framed_inner(
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
                     ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
+                        self_prefix: ordinary_self_prefix.as_ref(),
                         mv_known_empty: single_returns.contains(&inst),
                         self_stack_fixups: &mut ordinary_self_stack_fixups,
                         emit_epilogue: &emit_epilogue })?; }
