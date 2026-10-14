@@ -230,6 +230,7 @@ pub struct Asm {
     /// Bound offset of each label, or `None` while still forward-referenced.
     labels: Vec<Option<usize>>,
     fixups: Vec<Fixup>,
+    preceding_rsp_store: Option<(usize, i32, u8)>,
 }
 
 impl Default for Asm {
@@ -244,7 +245,26 @@ impl Asm {
             code: Vec::new(),
             labels: Vec::new(),
             fixups: Vec::new(),
+            preceding_rsp_store: None,
         }
+    }
+
+    /// Record the complete preceding RSP-relative word store.
+    /// The emitter must call this only after storing an unchanged source register.
+    /// Any intervening instruction bytes, bound label or patch invalidate reuse;
+    /// this never removes the authoritative memory store.
+    pub fn remember_rsp_store(&mut self, displacement: i32, source: u8) {
+        self.preceding_rsp_store = Some((self.here(), displacement, source));
+    }
+
+    /// Source register for an immediately preceding matching store.
+    /// Match the effective displacement, including any temporary stack adjustment.
+    /// A same-register elided reload can preserve this knowledge without emitting
+    /// bytes, since it changes neither the register nor the stack.
+    pub fn preceding_rsp_store(&self, displacement: i32) -> Option<u8> {
+        self.preceding_rsp_store.and_then(|(end, stored, source)| {
+            (end == self.here() && stored == displacement).then_some(source)
+        })
     }
 
     /// Current end of the buffer — the offset the next emitted byte will take.
@@ -286,6 +306,7 @@ impl Asm {
     /// `rel32` control flow between instructions.
     #[inline]
     pub fn patch_u8(&mut self, at: usize, b: u8) {
+        self.preceding_rsp_store = None;
         self.code[at] = b;
     }
 
@@ -318,6 +339,7 @@ impl Asm {
     /// bug and panics rather than silently resolving to the wrong site.
     pub fn bind(&mut self, l: Label) {
         debug_assert!(self.labels[l.0].is_none(), "label {l:?} bound twice");
+        self.preceding_rsp_store = None;
         self.labels[l.0] = Some(self.code.len());
     }
 
@@ -653,5 +675,50 @@ mod tests {
         wide.extend_from_slice(&vec![0u8; span]);
         wide.bind(far);
         assert!(wide.finish().is_some());
+    }
+}
+
+#[cfg(test)]
+mod adjacent_store_tests {
+    use super::*;
+    fn stored() -> Asm {
+        let mut a = Asm::new();
+        a.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x18]);
+        a.remember_rsp_store(24, 0);
+        a
+    }
+    #[test]
+    fn only_exact_adjacent_address_retains_source() {
+        let a = stored();
+        assert_eq!(a.preceding_rsp_store(24), Some(0));
+        assert_eq!(a.preceding_rsp_store(16), None);
+        assert_eq!(a.preceding_rsp_store(32), None);
+    }
+    #[test]
+    fn zero_byte_label_binding_breaks_adjacency() {
+        let mut a = stored();
+        let label = a.label();
+        assert_eq!(a.preceding_rsp_store(24), Some(0));
+        a.bind(label);
+        assert_eq!(a.preceding_rsp_store(24), None);
+    }
+    #[test]
+    fn bytes_calls_and_patches_invalidate_store_knowledge() {
+        let mut a = stored(); a.push(0x90);
+        assert_eq!(a.preceding_rsp_store(24), None);
+        let mut a = stored(); a.extend_from_slice(&[0x48, 0x31, 0xc0]);
+        assert_eq!(a.preceding_rsp_store(24), None);
+        let mut a = stored(); let l = a.label(); a.call(l);
+        assert_eq!(a.preceding_rsp_store(24), None);
+        let mut a = stored(); a.patch_u8(0, 0x49);
+        assert_eq!(a.preceding_rsp_store(24), None);
+    }
+    #[test]
+    fn newer_store_replaces_prior_store() {
+        let mut a = stored();
+        a.extend_from_slice(&[0x4c, 0x89, 0x5c, 0x24, 0x20]);
+        a.remember_rsp_store(32, 11);
+        assert_eq!(a.preceding_rsp_store(24), None);
+        assert_eq!(a.preceding_rsp_store(32), Some(11));
     }
 }

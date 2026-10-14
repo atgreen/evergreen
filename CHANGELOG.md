@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Forward immediately reloaded native frame slots from their just-stored
+  registers while retaining the memory stores needed for garbage collection
+  and recovery ([#326](https://github.com/atgreen/evergreen/pull/326), carried
+  forward from [#311](https://github.com/atgreen/evergreen/pull/311)).
+
 - Preserve bounded integer parameter ranges in T2, and retain declared argument
   checks on direct recursive calls, including calls replaced by pure return
   shortcuts. Use dominating numeric comparisons to prove recursive argument

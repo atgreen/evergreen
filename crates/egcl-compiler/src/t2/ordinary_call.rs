@@ -637,12 +637,12 @@ impl OrdinaryCallEmission<'_> {
                         if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi {
                             return Err(EmitError::UnsupportedOp(0xFA));
                         }
-                        if !actual_range.is_some_and(|got| got.lo >= range.lo) {
+                        if actual_range.is_none_or(|got| got.lo < range.lo) {
                             mov_imm64(a, SCRATCH, range.lo << 3);
                             cmp_rr(a, RAX, SCRATCH);
                             a.jcc(Cc::L, cold);
                         }
-                        if !actual_range.is_some_and(|got| got.hi <= range.hi) {
+                        if actual_range.is_none_or(|got| got.hi > range.hi) {
                             mov_imm64(a, SCRATCH, range.hi << 3);
                             cmp_rr(a, RAX, SCRATCH);
                             a.jcc(Cc::G, cold);

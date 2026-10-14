@@ -229,8 +229,8 @@ fn native_v2_apply_releases_arguments_before_parent_continues() {
     )
     .unwrap();
     install_t2("APPLY-ZERO", "()", "(42)", &env);
-    // Declared parameter representations are not admitted by the mapped ABI
-    // yet. Keep this type-error case in T0 while APPLY-ZERO exercises mapped T2.
+    // Checked declared parameters now admit ordinary native entry. The invalid
+    // APPLY argument below must still fail and release its argument storage.
     let typed_symbol = egcl_rt::symbols::intern("APPLY-FIXNUM");
     egcl_rt::rooted!(typed_params = reader::read_from_string("(x)").unwrap().0);
     egcl_rt::rooted!(
@@ -258,7 +258,7 @@ fn native_v2_apply_releases_arguments_before_parent_continues() {
             t1_threshold(),
             &typed_body
         )
-        .is_none()
+        .is_some()
     );
     egcl_rt::rooted!(
         zero = egcl_rt::symbols::symbol_function(egcl_rt::symbols::intern("APPLY-ZERO")).unwrap()
