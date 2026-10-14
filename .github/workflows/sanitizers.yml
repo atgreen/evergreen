@@ -53,6 +53,8 @@ jobs:
     name: ${{ matrix.san }}sanitizer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: install nightly with rust-src (build-std needs the source)
         run: |
           rustup toolchain install nightly --component rust-src --profile minimal
@@ -75,10 +77,10 @@ jobs:
           # untouched, and it is the one that finds use-after-free and
           # out-of-bounds in the unsafe code this job exists for.
           ASAN_OPTIONS: detect_leaks=0
-        # TWO tests are excluded BY NAME, with a reason, rather than silenced in
-        # the source -- the gc.yml convention. Both pass without a sanitizer and
-        # produce NO sanitizer report under one; they fail because of what ASan
-        # cannot follow, not because of what the code does:
+          SANITIZER: ${{ matrix.san }}
+        # Retain the existing panic-boundary exclusion. The direct stack-switch
+        # exclusion is ASan-only: TSan now tracks owned fiber contexts and MSan
+        # tracks initialized FFI input and generated callback argument slots.
         #
         #   repeated_switches_preserve_both_stacks_and_live_values  (fiber_context)
         #     fails `assertion failed: state.intact`. Fiber switching swaps
@@ -90,24 +92,22 @@ jobs:
         #   callback_panic_payload_destructors_cannot_unwind_into_c
         #     same family: a panic deliberately stopped at the C boundary.
         #
-        # Measured over the whole crate with ASan: 87 binaries, 805 passed,
-        # these 2 failed, and ZERO AddressSanitizer reports -- no UB found.
-        #
-        # ONLY THE ADDRESS LEG IS VERIFIED. thread and memory were not run
-        # locally (each needs its own build-std of std). TSan over a lock-free
-        # GC and MSan without every C dependency instrumented may well need
-        # their own exclusions or may not be viable at all; treat their first
-        # red run as information, not as a regression.
+        # The TSan-only race-control test requires an atomic child to pass and
+        # an intentionally racy child to fail with a named TSan race report.
+        # This checks that fiber handoff annotations do not mask concurrent races.
         # --no-fail-fast for the reason documented in ci.yml: cargo test stops
         # at the first failing test BINARY, which in a UB gate means the first
         # sanitizer report hides every later one. A sanitizer run is worth
         # having only if it reports everything it found.
         run: |
+          skips=(--skip callback_panic_payload_destructors_cannot_unwind_into_c)
+          if [[ "$SANITIZER" == address ]]; then
+            skips+=(--skip repeated_switches_preserve_both_stacks_and_live_values)
+          fi
           cargo +nightly test -Z build-std \
             --target x86_64-unknown-linux-gnu \
             -p egcl-rt --no-fail-fast -- \
-            --skip repeated_switches_preserve_both_stacks_and_live_values \
-            --skip callback_panic_payload_destructors_cannot_unwind_into_c
+            "${skips[@]}"
 
 # THERE IS NO MIRI JOB, deliberately — measured, bliss-0g677.
 #
@@ -137,6 +137,5 @@ jobs:
 # To bring Miri back, the prerequisite is on egcl-rt, not here: put the
 # raw-syscall path behind a cfg so a Miri build goes through libc instead of
 # `asm!`. Then -p egcl-compiler becomes genuinely interpretable and the job is
-# worth its runtime. Until then the sanitizer matrix above is the real UB gate,
-# and it passes: ASan over egcl-rt is 140 tests, 0 failures, 0 sanitizer
-# reports.
+# worth its runtime. Until then the sanitizer matrix above checks the runtime;
+# its current results are recorded by each workflow run.

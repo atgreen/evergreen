@@ -976,9 +976,34 @@ mod native_stack_limit_tests {
                 let local = 0u64;
                 let probe = &local as *const _ as u64;
                 let limit = super::current_native_stack_limit();
+                let mut attributes = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_getattr_np(libc::pthread_self(), attributes.as_mut_ptr())
+                    },
+                    0
+                );
+                let mut attributes = unsafe { attributes.assume_init() };
+                let mut base = std::ptr::null_mut();
+                let mut actual_size = 0;
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_attr_getstack(&attributes, &mut base, &mut actual_size)
+                    },
+                    0
+                );
+                assert_eq!(unsafe { libc::pthread_attr_destroy(&mut attributes) }, 0);
                 assert!(limit < probe, "fresh worker must have native call headroom");
-                assert!(probe - limit < size as u64,
-                    "limit must belong to this worker, not the main stack");
+                // pthreads may reuse a larger cached reservation than requested.
+                // Validate ownership and headroom against the actual allocation.
+                let low = base as usize;
+                let high = low.checked_add(actual_size).unwrap();
+                assert!((low..high).contains(&(probe as usize)));
+                assert_eq!(
+                    limit,
+                    low.saturating_add(128 * 1024).min(high) as u64,
+                    "limit must belong to this worker's actual reservation"
+                );
                 assert_eq!(limit, super::current_native_stack_limit(), "cached bounds are stable");
             }).unwrap()
         }).collect();

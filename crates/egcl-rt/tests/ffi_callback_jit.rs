@@ -127,6 +127,45 @@ fn integer(bits: u8, signed: bool) -> AlienType {
     AlienType::Int { bits, signed }
 }
 
+#[cfg(egcl_msan)]
+#[test]
+fn callback_shadow_repair_does_not_initialize_context_or_pointees() {
+    unsafe extern "C" {
+        fn __msan_poison(address: *const u8, size: usize);
+        fn __msan_unpoison(address: *const u8, size: usize);
+        fn __msan_test_shadow(address: *const u8, size: usize) -> isize;
+    }
+    unsafe extern "C" fn inspect(context: *mut (), arguments: *const u64) -> u64 {
+        let slots_clean = unsafe { __msan_test_shadow(arguments.cast(), 8) == -1 };
+        let context_poisoned = unsafe { __msan_test_shadow(context.cast(), 8) == 0 };
+        if !slots_clean {
+            return 0;
+        }
+        let pointee = unsafe { *arguments } as *const u8;
+        let pointee_poisoned = unsafe { __msan_test_shadow(pointee, 8) == 0 };
+        u64::from(slots_clean && context_poisoned && pointee_poisoned)
+    }
+    let mut context = 42u64;
+    let mut pointee = 99u64;
+    let adapter = CallbackAdapter::new(
+        &integer(64, false),
+        &[AlienType::Pointer(Box::new(AlienType::Void))],
+        (&mut context as *mut u64).cast(),
+        inspect,
+    )
+    .unwrap();
+    let call: unsafe extern "C" fn(*mut u64) -> u64 =
+        unsafe { std::mem::transmute(adapter.as_fn_ptr()) };
+    unsafe {
+        __msan_poison((&context as *const u64).cast(), 8);
+        __msan_poison((&pointee as *const u64).cast(), 8);
+        let result = call(&mut pointee);
+        __msan_unpoison((&context as *const u64).cast(), 8);
+        __msan_unpoison((&pointee as *const u64).cast(), 8);
+        assert_eq!(result, 1);
+    }
+}
+
 fn symbol(name: &str) -> *const () {
     #[cfg(unix)]
     use std::process::Command;

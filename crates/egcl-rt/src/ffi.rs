@@ -11,6 +11,9 @@ use crate::value::EgclVal;
 
 pub mod memory;
 
+#[cfg(all(egcl_tsan, not(feature = "c-ffi")))]
+mod tsan_mmap;
+
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
 mod abi;
 #[cfg(all(target_arch = "x86_64", any(unix, windows)))]
@@ -847,10 +850,24 @@ mod elf_backend {
     /// symbols against the host and running its constructors.
     pub fn load_foreign_library(name: &str) -> Result<*mut (), EgclError> {
         let host = SyntheticModule::new("__egcl_host", host_symbols());
+        // elf_loader's raw pread bypasses MSan's initialized-byte tracking.
+        // Instrumented reads and checked copies preserve shadow state without
+        // declaring unread bytes initialized. Keep ordinary file-backed loading.
+        #[cfg(egcl_msan)]
+        let input = elf_loader::input::ElfBinary::owned(
+            name,
+            std::fs::read(name)
+                .map_err(|e| EgclError::FfiError(format!("cannot read '{name}': {e}")))?,
+        );
+        #[cfg(not(egcl_msan))]
+        let input = name;
+        let loader = Loader::new();
+        #[cfg(egcl_tsan)]
+        let loader = loader.with_mmap(super::tsan_mmap::TSanMmap);
         let lib = Relocator::new()
             .run(
-                Loader::new()
-                    .load_dylib(name)
+                loader
+                    .load_dylib(input)
                     .map_err(|e| EgclError::FfiError(format!("cannot load '{name}': {e}")))?,
             )
             .scope([host])

@@ -16,6 +16,12 @@ use crate::{EgclError, jit::JitBuffer};
 /// declared argument. It returns raw result bits and MUST NOT unwind into C.
 pub type Dispatcher = unsafe extern "C" fn(*mut (), *const u64) -> u64;
 
+#[cfg(egcl_msan)]
+unsafe extern "C" {
+    fn __msan_unpoison(address: *const u8, size: usize);
+    fn __msan_unpoison_param(count: usize);
+}
+
 /// Owns one distinct W^X C-entry mapping. Foreign users must retire the entry
 /// before dropping this owner; GC never controls this native lifetime.
 pub struct CallbackAdapter {
@@ -82,6 +88,25 @@ impl CallbackAdapter {
             }
             code.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp+disp32],rax
             code.extend_from_slice(&((shadow_bytes + index * 8) as u32).to_le_bytes());
+        }
+        #[cfg(egcl_msan)]
+        {
+            // Generated stores do not update MSan shadow. Every captured slot
+            // above is fully written and width-normalized. Mark only those
+            // slots, never padding, context storage, or pointer referents.
+            // Capture all incoming registers first: these helper calls may
+            // clobber them. Reload dispatcher arguments after both helpers.
+            code.extend_from_slice(&[0x48, 0x89, 0xe7]); // mov rdi,rsp
+            code.extend_from_slice(&[0x48, 0xbe]); // movabs rsi,slot_bytes
+            code.extend_from_slice(&((arguments.len() * 8) as u64).to_le_bytes());
+            code.extend_from_slice(&[0x48, 0xb8]);
+            code.extend_from_slice(&(__msan_unpoison as *const () as u64).to_le_bytes());
+            code.extend_from_slice(&[0xff, 0xd0]);
+            // The next instrumented call receives two initialized pointers.
+            code.extend_from_slice(&[0xbf, 2, 0, 0, 0]); // mov edi,2
+            code.extend_from_slice(&[0x48, 0xb8]);
+            code.extend_from_slice(&(__msan_unpoison_param as *const () as u64).to_le_bytes());
+            code.extend_from_slice(&[0xff, 0xd0]);
         }
         // The dispatcher uses the platform C ABI too.
         code.extend_from_slice(&[0x48, if cfg!(windows) { 0xb9 } else { 0xbf }]);

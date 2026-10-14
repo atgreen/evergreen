@@ -87,3 +87,22 @@ fn loads_a_library_and_calls_a_function() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn rejects_empty_and_truncated_library_input() {
+    let dir = std::env::temp_dir().join(format!("egcl-ffi-invalid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, contents) in [
+        ("empty.so", &[][..]),
+        ("truncated.so", &b"\x7fELF\x02\x01\x01\x00"[..]),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        assert!(
+            egcl_rt::ffi::load_foreign_library(path.to_str().unwrap()).is_err(),
+            "{name} must be rejected without reading uninitialized header bytes"
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::remove_dir(dir).unwrap();
+}

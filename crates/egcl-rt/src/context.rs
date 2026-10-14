@@ -26,6 +26,41 @@ pub type Context = *mut u8;
 /// An empty/placeholder context (filled in by the first [`swap`] out of it).
 pub const NULL: Context = core::ptr::null_mut();
 
+#[cfg(egcl_tsan)]
+unsafe extern "C" {
+    pub fn __tsan_get_current_fiber() -> *mut core::ffi::c_void;
+    pub fn __tsan_create_fiber(flags: u32) -> *mut core::ffi::c_void;
+    pub fn __tsan_destroy_fiber(fiber: *mut core::ffi::c_void);
+    fn __tsan_switch_to_fiber(fiber: *mut core::ffi::c_void, flags: u32);
+}
+
+/// Switch logical sanitizer context immediately before the physical stack.
+///
+/// # Safety
+/// The requirements of `swap` apply. `destination` must be the live TSan
+/// context owning `to`, exclusively resumed by this caller.
+#[cfg(egcl_tsan)]
+#[unsafe(naked)]
+pub unsafe extern "C" fn swap_tsan(from: *mut Context, to: Context, destination: usize) {
+    core::arch::naked_asm!(
+        "push rdi",
+        "push rsi",
+        "sub rsp, 8",
+        "mov rdi, rdx",
+        // A carrier and its mounted fiber execute sequentially and share
+        // carrier TLS. Model that handoff, not independent concurrent threads.
+        "xor esi, esi",
+        "call {switch}",
+        "add rsp, 8",
+        "pop rsi",
+        "pop rdi",
+        // No instrumented Rust call/return may occur between these switches.
+        "jmp {physical}",
+        switch = sym __tsan_switch_to_fiber,
+        physical = sym context_swap,
+    );
+}
+
 #[cfg(all(egcl_unix_fibers, target_arch = "aarch64"))]
 #[path = "context/aarch64.rs"]
 mod backend;
