@@ -408,7 +408,12 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
             flags.signal_epoch].contains(&0)
         || crate::t2::verify::verify(f).is_err()
         || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
-        || f.frame_states.iter().any(|(_, state)| state.scopes.len() != 1)
+        || f.frame_states.iter().any(|(_, state)| {
+            // Retained self expansion shares one body's scope-free recovery
+            // protocol. Cross-function logical frames need separate admission.
+            state.scopes.first().is_none_or(|outer|
+                state.scopes.iter().any(|scope| scope.function != outer.function))
+        })
     { return Err(bad()); }
     let single = crate::t2::opt_clear_mv::single_value_state(f, true);
     let mut returns = Vec::new();

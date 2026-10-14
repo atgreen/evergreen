@@ -120,7 +120,7 @@ thread_local! {
     static RESUME_COLLECTIONS: Cell<u32> = const { Cell::new(0) };
 }
 
-fn collect_during_foreign_guard_resume() {
+fn collect_during_foreign_guard_resume(_scopes: u64) {
     RESUME_COLLECTIONS.with(|count| count.set(count.get() + 1));
     HeapCollector::new().minor_gc().unwrap();
 }

@@ -104,19 +104,38 @@ fn note_segment_deopt(code: &TransferCode) {
     }
 }
 
-/// Rebuild one retained activation's local handler order without creating new
-/// registrations. Catch tags remain rooted in Env throughout this handoff.
+/// Move the outer retained activation's local handler order without creating
+/// registrations. Scope-free inlined self frames rebuild their own local blocks
+/// during interpreter resumption; only the outer frame owns the native ledger.
 unsafe fn take_guard_resume_state(
     context: *mut CaptureContext,
     code: &TransferCode,
     scopes: &[InlinedResumeScope],
     env: &Env,
 ) -> Result<OuterResumeState, EgclError> {
-    let [scope] = scopes else {
+    let Some(scope) = scopes.first() else {
         return Err(invalid_capture());
     };
     if !Arc::ptr_eq(&scope.body, &code.body) {
         return Err(invalid_capture());
+    }
+    if scopes.len() > 1 {
+        if code.ordinary_entry.is_none() || code.body.has_env
+            || !code.body.params_form.is_nil() || !scope_free_native_body(&code.body, false)
+        {
+            return Err(invalid_capture());
+        }
+        for scope in scopes {
+            if !Arc::ptr_eq(&scope.body, &code.body) {
+                return Err(invalid_capture());
+            }
+            let active = code.control_scopes.before(scope.bcp).ok_or_else(invalid_capture)?;
+            if active.iter().any(|scope| scope.ownership != Ownership::Local
+                || !matches!(scope.kind, ScopeKind::Block { register: false, .. }))
+            {
+                return Err(invalid_capture());
+            }
+        }
     }
     // Prepared transfers cannot be replaced by lexical state. Running
     // cleanup continuations are validated below and moved with their payloads.
@@ -281,9 +300,9 @@ unsafe fn take_guard_resume_state(
     Ok(state)
 }
 
-/// Mapped guards materialize exactly one retained frame. Validate its complete
-/// stream before changing native metadata or any activation slot; unlike the
-/// general inline materializer, this path never needs to grow EgclStack.
+/// Validate the complete stream before changing native metadata or activation
+/// slots. Ordinary guards may reconstruct retained self frames; legacy mapped
+/// guards still own exactly one logical frame.
 unsafe fn validate_guard_stream(
     request: &TransferDeoptRequest,
     code: &TransferCode,
@@ -299,17 +318,25 @@ unsafe fn validate_guard_stream_slots(
     slots: u16,
     metadata: &T2InstalledMetadata,
 ) -> Result<u32, EgclError> {
-    if request.n_scopes != 1 || request.words.is_null() || request.n_words < 4
-        || request.n_words > 4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack)
+    let max_words = request.n_scopes.checked_mul(
+        4 + u64::from(code.body.n_locals) + u64::from(code.body.max_stack),
+    ).ok_or_else(invalid_capture)?;
+    let word_count = usize::try_from(request.n_words).map_err(|_| invalid_capture())?;
+    if request.n_scopes == 0 || (code.ordinary_entry.is_none() && request.n_scopes != 1)
+        || request.words.is_null() || request.n_words < 4
+        || request.n_scopes > request.n_words / 4 || request.n_words > max_words
+        || word_count > isize::MAX as usize / std::mem::size_of::<u64>()
     {
         return Err(invalid_capture());
     }
-    let words = unsafe { std::slice::from_raw_parts(request.words, request.n_words as usize) };
+    // Ordinary ingress additionally bounds this entire buffer within the
+    // published native temporary extent before adapting the request.
+    let words = unsafe { std::slice::from_raw_parts(request.words, word_count) };
     validate_guard_scope_chain(words, request.n_scopes, code, slots, metadata)
 }
 
 /// Validate retained logical self frames without changing slots or native state.
-/// The production wrapper still admits one frame until nested resumption is wired.
+/// Only ordinary scope-free self expansion may own more than one logical frame.
 fn validate_guard_scope_chain(
     words: &[u64],
     count: u64,
@@ -413,6 +440,165 @@ fn deopt_payload_ranges(words: &[u64], n_scopes: u64) -> Result<Vec<std::ops::Ra
 #[cfg(test)]
 mod retained_guard_chain_tests {
     use super::*;
+    use egcl_rt::Collector;
+
+    thread_local! {
+        static OBSERVED_SCOPES: Cell<u64> = const { Cell::new(0) };
+        static COLLECT_AT_NESTED_GUARD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn ordinary_nested_self_guard_resumes_three_real_scopes() {
+        use egcl_compiler::t2::{build, inlining::InlineOptions, speculate, verify};
+        use egcl_compiler::t2::ir::{AuxData, Opcode};
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        crate::cli::read_eval_all_env(
+            "(defun ordinary-nested-self (n x) (declare (type fixnum n))
+               (if (< n 1) (progn (+ (car x) 1) (+ (car x) 1))
+                   (+ 1 (ordinary-nested-self (- n 1) x))))", &mut env,
+        ).unwrap();
+        egcl_rt::rooted!(params = reader::read_from_string("(n x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(
+            "((declare (type fixnum n))
+              (if (< n 1) (progn (+ (car x) 1) (+ (car x) 1))
+                  (+ 1 (ordinary-nested-self (- n 1) x))))").unwrap().0);
+        let symbol = egcl_rt::symbols::intern("ORDINARY-NESTED-SELF");
+        let body = Arc::new(compile_function("ORDINARY-NESTED-SELF", *params, *forms,
+            &env, false, false).unwrap());
+        assert_eq!(body.self_call_sites.len(), 1);
+        registry_put(symbol, Arc::clone(&body));
+        let input = egcl_rt::CrossThreadRoot::new(snapshot_t2_input(symbol, 0).unwrap());
+        let call_cells = input.with_gc_stable_mutator(|input| input.call_cells.clone());
+        let mut options = InlineOptions::default().with_root_symbol(symbol)
+            .with_body(symbol, Arc::clone(&body));
+        options.config.self_inline_depth = 2;
+        options.config.small_threshold = 100;
+        let mut ordinary = build::build_from_bytecode_with_inline_options(&body, options).unwrap();
+        speculate::speculate(&mut ordinary, &|_| Some(speculate::SpecType::Fixnum));
+        verify::verify(&ordinary).unwrap();
+        assert!(ordinary.frame_states.iter().any(|(_, state)| state.scopes.len() == 3),
+            "fixture must actually expand two recursive levels");
+        assert!(ordinary.block_order().iter().flat_map(|&block| &ordinary.block(block).insts)
+            .any(|&inst| ordinary.inst(inst).opcode == Opcode::Call
+                && matches!(ordinary.inst(inst).aux, AuxData::CallTarget(target) if target == symbol)),
+            "bounded expansion must retain a recursive leaf");
+        assert_ordinary_scope_shape_rejections(&ordinary, &call_cells);
+        let mut baseline = build::build_for_transfer_optimization(&body, symbol).unwrap();
+        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).unwrap();
+        build::legalize_transfer_calls(&mut baseline, &scopes).unwrap();
+        let metadata = Arc::new(T2InstalledMetadata {
+            speculations: Vec::new(),
+            _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
+            deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+        });
+        let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
+            retain_native_body(&body), &baseline, Some(&ordinary), Some(metadata),
+            &call_cells, false, CompilationTier::T2).expect("emit retained self expansion");
+        code.set_installed_symbol(symbol);
+        assert!(code.ordinary_entry.is_some(), "nested guard fixture must use the ordinary ABI");
+        assert!(code.has_deopt);
+        assert_guard_request_bound_rejections(&mut code);
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        let environment_depths = (env.handlers.len(), env.restarts.len(), env.catch_stack.len());
+        egcl_rt::rooted!(callable = egcl_rt::symbols::symbol_function(symbol).unwrap());
+        // A direct float parameter would fail an entry preguard before reaching
+        // the nested branch. Its first addition fails a guard; the second must
+        // reload X from a relocated logical local after recovery.
+        for mode in ["normal", "gc", "error", "redefined"] {
+            if mode == "redefined" {
+                crate::cli::read_eval_all_env(
+                    "(defun ordinary-nested-self (n x) (declare (ignore n x)) 100)", &mut env,
+                ).unwrap();
+            }
+            egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
+            egcl_rt::rooted!(argument = crate::cli::arena_cons(
+                if mode == "error" { NIL } else { EgclVal::from_single_float(2.5) }, NIL));
+            let original = argument.to_raw();
+            OBSERVED_SCOPES.with(|seen| seen.set(0));
+            COLLECT_AT_NESTED_GUARD.with(|collect| collect.set(mode == "gc"));
+            egcl_rt::rooted!(result = with_ordinary_guard_resume_observer_for_test(
+                |scopes| {
+                    assert_eq!(scopes, 3);
+                    OBSERVED_SCOPES.with(|seen| {
+                        assert_eq!(seen.replace(scopes), 0, "only one native guard may resume this call");
+                    });
+                    if COLLECT_AT_NESTED_GUARD.with(Cell::get) {
+                        egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
+                    }
+                },
+                || code.run_callable(*callable, &[EgclVal::from_fixnum(2), *argument], &mut env),
+            ));
+            assert_eq!(OBSERVED_SCOPES.with(Cell::get), 3, "observe actual native guard request");
+            if mode == "error" {
+                assert!(matches!(&*result, Err(EgclError::Signalled(details))
+                    if condition_matches_handler(&env, details.condition, "TYPE-ERROR")), "{:?}", &*result);
+            } else {
+                assert_eq!(*result.as_ref().unwrap(), EgclVal::from_single_float(5.5), "{mode}");
+            }
+            if mode == "gc" {
+                assert_ne!(argument.to_raw(), original, "guard collection must really relocate X");
+            }
+            assert_eq!((stack.fp(), stack.sp()), before, "{mode}");
+            assert_eq!((env.handlers.len(), env.restarts.len(), env.catch_stack.len()), environment_depths);
+        }
+    }
+
+    fn assert_guard_request_bound_rejections(code: &mut TransferCode) {
+        let words = [0u64; 8];
+        for (n_scopes, n_words) in [(0, 4), (u64::MAX, 8), (1, u64::MAX), (3, 8)] {
+            let request = TransferDeoptRequest { n_scopes, n_words, words: words.as_ptr(),
+                activation: std::ptr::null_mut() };
+            assert!(unsafe { validate_guard_stream_slots(&request, code, code.body.num_slots(),
+                code.deopt_metadata.as_ref().unwrap()) }.is_err(),
+                "invalid bounds must reject before reading beyond the buffer");
+        }
+        let entry = code.ordinary_entry.take();
+        let request = TransferDeoptRequest { n_scopes: 2, n_words: 8, words: words.as_ptr(),
+            activation: std::ptr::null_mut() };
+        let rejected = unsafe { validate_guard_stream_slots(&request, code, code.body.num_slots(),
+            code.deopt_metadata.as_ref().unwrap()) }.is_err();
+        code.ordinary_entry = entry;
+        assert!(rejected, "legacy mapped recovery remains single-scope");
+    }
+
+    fn assert_ordinary_scope_shape_rejections(
+        ordinary: &egcl_compiler::t2::ir::Function,
+        cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
+    ) {
+        use egcl_compiler::t2::{emit, ir::{AuxData, Opcode}};
+        let mut ordinary = ordinary.clone();
+        let mut cells = cells.to_vec();
+        ordinary_primitives::lower(&mut ordinary, &mut cells).unwrap();
+        egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut ordinary, true);
+        let targets: Vec<_> = ordinary.block_order().iter()
+            .flat_map(|&block| ordinary.block(block).insts.iter().copied())
+            .filter(|&inst| ordinary.inst(inst).opcode == Opcode::Call)
+            .map(|inst| {
+                let AuxData::CallTarget(symbol) = ordinary.inst(inst).aux else { panic!("named call") };
+                (inst, emit::OrdinaryCallTarget { symbol, descriptor_slot: 1, heat_slot: 1, revision_address: 1 })
+            }).collect();
+        // These nonzero addresses are emitted only, never executed.
+        let emit = |function: &egcl_compiler::t2::ir::Function| {
+            emit::emit_framed_ordinary_function_with_poll(function,
+                emit::OrdinaryLispEntryOptions { arity: 2, arity_error_veneer: 1 }, &targets,
+                emit::OrdinaryCallFlags { gc_requested: 1, sigusr1_pending: 1, posted_signal: 1,
+                    native_errors: 1, signal_epoch: 1 }, 1,
+                emit::OrdinaryGuardOptions { veneer: 1, multiple_values: 1 }, 1)
+        };
+        assert!(emit(&ordinary).is_ok(), "valid same-function chain control");
+        let nested = ordinary.frame_states.iter().find(|(_, state)| state.scopes.len() == 3).unwrap().0;
+        for mixed in [false, true] {
+            let mut invalid = ordinary.clone();
+            let scopes = &mut invalid.frame_states.get_mut(nested).scopes;
+            if mixed { scopes[1].function = scopes[0].function.wrapping_add(1); }
+            else { scopes.clear(); }
+            assert!(emit(&invalid).is_err(), "empty or cross-function chains must not emit");
+        }
+    }
 
     fn fixture(env: &mut Env) -> (u32, Rc<NativeCode>) {
         crate::cli::read_eval_all_env(
@@ -497,9 +683,87 @@ mod retained_guard_chain_tests {
             assert_eq!((stack.fp(), stack.sp()), before, "validation must not materialize frames");
             assert_eq!(result.unwrap_or_else(|error| panic!(
                 "valid {count}-frame retained self chain rejected: {error:?}")), parent_pc);
-            assert!(validate_native(&words, count as u64, code).is_err(),
-                "production must keep nested recovery gated until resumption is supported");
+            assert_eq!(validate_native(&words, count as u64, code).unwrap(), parent_pc,
+                "ordinary recovery accepts the same validated retained self chain");
         }
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn retained_self_guard_chain_resumes_with_outer_state() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        for mode in ["normal", "error", "redefined"] {
+            exercise_retained_chain_handoff(mode);
+        }
+    }
+
+    fn exercise_retained_chain_handoff(mode: &str) {
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let (symbol, owner) = fixture(&mut env);
+        let code = mapped(&owner);
+        let body = &code.body;
+        let depths = verified_operand_stack_depths(body).unwrap();
+        let call_pc = body.self_call_sites[0];
+        let pending = depths[call_pc as usize].unwrap() - u32::from(body.arity);
+        let parent = frame_words(symbol, body, call_pc + 1, pending);
+        let mut words = parent.repeat(2);
+        let child_header = words.len();
+        words.extend(frame_words(symbol, body, 0, 0));
+        let VarLoc::Slot(argument_slot) = body.param_layout[0].1 else {
+            panic!("scope-free fixture parameter must occupy a frame slot");
+        };
+        let child_arg = child_header + 4 + usize::from(argument_slot);
+        if mode == "error" { words[child_arg] = NIL.to_raw(); }
+        if mode == "redefined" {
+            words[child_arg] = EgclVal::from_fixnum(0).to_raw();
+            crate::cli::read_eval_all_env(
+                "(defun retained-guard-chain (n) (declare (ignore n)) 100)", &mut env,
+            ).unwrap();
+        }
+        assert!(validate(&words, 3, code).is_ok());
+        let mut activation = ActivationState::prepare(code, &mut env).unwrap();
+        egcl_rt::rooted_ref!(_activation = &mut activation);
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        let environment_depths = (env.handlers.len(), env.restarts.len(), env.catch_stack.len());
+        let _retire = RetireNativeDeoptFrame { fp: before.0, sp: before.1 };
+        let frame = stack.push_frame(EgclVal::from_symbol_index(symbol),
+            std::ptr::null(), body.num_slots(), FLAG_CALL).unwrap();
+        let mut context = activation.context(code, frame,
+            std::ptr::null_mut(), std::ptr::null_mut());
+        let (mut scopes, metadata) = materialize_t2_deopt_scopes(
+            3, words.len() as u64, words.as_ptr(), Some(frame),
+            code.deopt_metadata.clone(),
+        ).expect("materialize validated retained self frames");
+        let inner_pc = scopes[1].bcp;
+        scopes[1].bcp = u32::MAX;
+        assert!(unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }.is_err());
+        assert!(unsafe { (*context.guard_resume).is_some() },
+            "invalid inner PC must not consume the outer reservation");
+        scopes[1].bcp = inner_pc;
+        scopes[1].body = Arc::new(body.as_ref().clone());
+        assert!(unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }.is_err());
+        assert!(unsafe { (*context.guard_resume).is_some() },
+            "equal but nonidentical retained body must not consume the reservation");
+        scopes[1].body = Arc::clone(body);
+        let state = unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }
+            .expect("transfer outer state without rejecting retained inner frames");
+        assert!(unsafe { (*context.guard_resume).is_none() },
+            "outer reservation transfers exactly once");
+        assert!(unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }.is_err(),
+            "a second handoff must not duplicate outer state");
+        egcl_rt::rooted!(result = resume_inlined_in_t0_with_state(scopes, metadata, None,
+            Some(state), &mut env));
+        if mode == "error" {
+            assert!(matches!(&*result, Err(EgclError::Signalled(details))
+                if condition_matches_handler(&env, details.condition, "TYPE-ERROR")), "{:?}", &*result);
+        } else {
+            assert_eq!(*result.as_ref().unwrap(), EgclVal::from_fixnum(if mode == "redefined" { 2 } else { 3 }));
+        }
+        assert_eq!((stack.fp(), stack.sp()), before,
+            "resumption must retire all materialized frames");
+        assert_eq!((env.handlers.len(), env.restarts.len(), env.catch_stack.len()), environment_depths);
     }
 
     #[test]
@@ -997,15 +1261,15 @@ unsafe fn resume_native_child_guard(
 /// Complete one guarded ordinary activation while its native callers remain
 /// published. The wrapper owns the ordinary tuple/error landing protocol.
 #[cfg(test)]
-type OrdinaryGuardObserver = Cell<Option<fn()>>;
+type OrdinaryGuardObserver = Cell<Option<fn(u64)>>;
 
 #[cfg(test)]
 static ORDINARY_GUARD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<OrdinaryGuardObserver> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 #[cfg(test)]
-pub(in crate::cli::bytecode) fn with_ordinary_guard_resume_observer_for_test<R>(observe: fn(), body: impl FnOnce() -> R) -> R {
-    struct Restore(Option<fn()>);
+pub(in crate::cli::bytecode) fn with_ordinary_guard_resume_observer_for_test<R>(observe: fn(u64), body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<fn(u64)>);
     impl Drop for Restore {
         fn drop(&mut self) { ORDINARY_GUARD_OBSERVER.with(|slot| slot.set(self.0)); }
     }
@@ -1099,7 +1363,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         adapted.activation = unsafe { frame.add(1).cast() };
         let mut out = NativeOutcome { value: NIL, exit: NativeExit::Returned };
         #[cfg(test)]
-        if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(); }
+        if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(request.n_scopes); }
         unsafe { resume_guard_with_arguments((&adapted as *const TransferDeoptRequest).cast_mut().cast(),
             &mut out, Some(original_arguments.take())); }
         return Ok(out.value); // the ordinary wrapper consumes any stashed error
@@ -1108,7 +1372,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     let retained = boundary.directory.callable_for_pc(boundary.cursor.pc).ok_or_else(invalid_capture)?;
     retained.with_gc_stable_mutator(|value| *callable = *value);
     #[cfg(test)]
-    if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(); }
+    if let Some(observe) = ORDINARY_GUARD_OBSERVER.with(Cell::get) { observe(request.n_scopes); }
     unsafe { resume_native_child_guard(code, &adapted, metadata, *callable, original_arguments.take(), bcp) }
 }
 
