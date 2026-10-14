@@ -327,19 +327,119 @@ unsafe fn validate_guard_stream_slots(
 /// place until the resumed interpreter owns its values. Header words are raw.
 struct NativeDeoptRoots {
     payload: *mut EgclVal,
-    payload_len: usize,
+    payload_ranges: Vec<std::ops::Range<usize>>,
     arguments: *mut EgclVal,
     argument_count: usize,
 }
 
 impl egcl_rt::gc::TraceHostRoots for NativeDeoptRoots {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
-        for index in 0..self.payload_len {
-            visit(unsafe { self.payload.add(index) });
+        for range in &self.payload_ranges {
+            for index in range.clone() {
+                visit(unsafe { self.payload.add(index) });
+            }
         }
         for index in 0..self.argument_count {
             visit(unsafe { self.arguments.add(index) });
         }
+    }
+}
+
+/// Structural validation only: callers must separately validate retained bodies,
+/// bytecode PCs, slot capacities and representations before scanning these roots.
+fn deopt_payload_ranges(words: &[u64], n_scopes: u64) -> Result<Vec<std::ops::Range<usize>>, EgclError> {
+    let count = usize::try_from(n_scopes).map_err(|_| invalid_capture())?;
+    if count == 0 || count > words.len() / 4 { return Err(invalid_capture()); }
+    let mut ranges = Vec::new();
+    ranges.try_reserve(count).map_err(|_| EgclError::Oom)?;
+    let mut offset = 0usize;
+    for _ in 0..count {
+        let start = offset.checked_add(4).ok_or_else(invalid_capture)?;
+        let header = words.get(offset..start).ok_or_else(invalid_capture)?;
+        let locals = usize::try_from(header[2]).map_err(|_| invalid_capture())?;
+        let stack = usize::try_from(header[3]).map_err(|_| invalid_capture())?;
+        let end = start.checked_add(locals).and_then(|end| end.checked_add(stack))
+            .filter(|&end| end <= words.len()).ok_or_else(invalid_capture)?;
+        ranges.push(start..end);
+        offset = end;
+    }
+    if offset != words.len() { return Err(invalid_capture()); }
+    Ok(ranges)
+}
+
+#[cfg(test)]
+mod payload_root_tests {
+    use super::*;
+    use egcl_rt::gc::TraceHostRoots;
+
+    #[test]
+    fn nested_guard_roots_exclude_every_virtual_frame_header() {
+        let mut words = [11, 3, 1, 1, 80, 88, 11, 5, 1, 0, 96];
+        let base = words.as_mut_ptr().cast::<EgclVal>();
+        let mut roots = NativeDeoptRoots {
+            payload: base,
+            payload_ranges: deopt_payload_ranges(&words, 2).unwrap(),
+            arguments: std::ptr::null_mut(),
+            argument_count: 0,
+        };
+        let mut visited = Vec::new();
+        roots.trace_host_roots(&mut |slot| {
+            visited.push(unsafe { slot.offset_from(base) });
+            unsafe { *slot = EgclVal::from_fixnum(99); }
+        });
+        assert_eq!(visited, vec![4, 5, 10], "only locals and operand-stack slots are roots");
+        assert_eq!(&words[..4], &[11, 3, 1, 1]);
+        assert_eq!(&words[6..10], &[11, 5, 1, 0]);
+    }
+
+    #[test]
+    fn guard_payload_ranges_require_exact_bounded_streams() {
+        assert_eq!(deopt_payload_ranges(&[11, 3, 0, 0], 1).unwrap(), vec![4..4]);
+        assert_eq!(deopt_payload_ranges(&[11, 3, 1, 1, 80, 88], 1).unwrap(), vec![4..6]);
+        assert_eq!(deopt_payload_ranges(&[11, 3, 0, 0, 11, 4, 0, 1, 80], 2).unwrap(),
+            vec![4..4, 8..9]);
+        for (words, count) in [
+            (vec![], 0), (vec![11, 3, 0, 0], 0),
+            (vec![11, 3, 0], 1), (vec![11, 3, 1, 0], 1),
+            (vec![11, 3, 0, 0, 80], 1), (vec![11, 3, 0, 0], 2),
+            (vec![11, 3, 0, 0, 11, 4, 0], 2),
+            (vec![11, 3, 0, 0, 11, 4, 1, 0], 2),
+            (vec![11, 3, u64::MAX, 1], 1),
+            (vec![11, 3, 0, u64::MAX], 1),
+            (vec![11, 3, 0, 0], u64::MAX),
+        ] {
+            assert!(deopt_payload_ranges(&words, count).is_err(), "{words:?}, scopes={count}");
+        }
+    }
+
+    #[test]
+    fn nested_guard_payload_and_argument_roots_follow_moving_gc() {
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (mut words, mut arguments) = {
+            egcl_rt::rooted!(first = crate::cli::arena_cons(EgclVal::from_fixnum(41), NIL));
+            egcl_rt::rooted!(second = crate::cli::arena_cons(EgclVal::from_fixnum(42), NIL));
+            egcl_rt::rooted!(argument = crate::cli::arena_cons(EgclVal::from_fixnum(43), NIL));
+            ([11, 3, 1, 0, first.to_raw(), 11, 5, 0, 1, second.to_raw()], [*argument])
+        };
+        // No Lisp allocation occurs between dropping construction roots and
+        // registering the native stream/argument descriptor below.
+        let before = [words[4], words[9], arguments[0].to_raw()];
+        let mut roots = NativeDeoptRoots {
+            payload: words.as_mut_ptr().cast(),
+            payload_ranges: deopt_payload_ranges(&words, 2).unwrap(),
+            arguments: arguments.as_mut_ptr(),
+            argument_count: arguments.len(),
+        };
+        egcl_rt::rooted_ref!(_roots = &mut roots);
+        egcl_rt::gc::full_gc().unwrap();
+        for (index, (value, expected)) in [(EgclVal(words[4]), 41),
+            (EgclVal(words[9]), 42), (arguments[0], 43)].into_iter().enumerate()
+        {
+            assert_ne!(value.to_raw(), before[index], "prove relocation for root {index}");
+            assert_eq!(crate::cli::cp(value).0, EgclVal::from_fixnum(expected));
+        }
+        assert_eq!(&words[..4], &[11, 3, 1, 0]);
+        assert_eq!(&words[5..9], &[11, 5, 0, 1]);
     }
 }
 
@@ -534,10 +634,10 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
             return Err(invalid_capture());
         }
         let mut roots = NativeDeoptRoots {
-            payload: unsafe { request.words.add(4).cast_mut().cast() },
+            payload: request.words.cast_mut().cast(),
             // The reboxer roots tagged words while this owner roots arguments.
             // Do not scan raw F64 words with the completed-payload descriptor.
-            payload_len: 0,
+            payload_ranges: Vec::new(),
             arguments: arguments_address as *mut EgclVal,
             argument_count: count,
         };
@@ -551,7 +651,8 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
                 egcl_rt::gc::alloc_double_float,
             )
         }.map_err(|_| invalid_capture())?;
-        roots.payload_len = words_len - 4;
+        roots.payload_ranges = deopt_payload_ranges(
+            unsafe { std::slice::from_raw_parts(request.words, words_len) }, request.n_scopes)?;
         // Preserve the existing all-or-unavailable debugger policy for mutated
         // parameter bindings; immutable native copies are still rooted above.
         let recipe = native_debug::arguments(&code.body, false);
@@ -778,8 +879,10 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     let mut adapted = TransferDeoptRequest { n_scopes: request.n_scopes, n_words: request.n_words,
         words: request.words, activation: std::ptr::null_mut() };
     let bcp = unsafe { validate_guard_stream_slots(&adapted, code, code.body.num_slots(), &metadata) }?;
-    let mut roots = NativeDeoptRoots { payload: unsafe { request.words.add(4).cast_mut().cast() },
-        payload_len: request.n_words as usize - 4, arguments, argument_count: count };
+    let mut roots = NativeDeoptRoots { payload: request.words.cast_mut().cast(),
+        payload_ranges: deopt_payload_ranges(unsafe {
+            std::slice::from_raw_parts(request.words, request.n_words as usize)
+        }, request.n_scopes)?, arguments, argument_count: count };
     egcl_rt::rooted_ref!(_roots = &mut roots);
     egcl_rt::rooted!(original_arguments = Some(unsafe { std::slice::from_raw_parts(arguments, count) }.to_vec()));
     let segment = boundary.segment;
@@ -909,8 +1012,10 @@ unsafe fn resume_guard_with_arguments(
                 )
             }.map_err(|_| invalid_capture())?;
             Some(NativeDeoptRoots {
-                payload: unsafe { request.words.add(4).cast_mut().cast() },
-                payload_len,
+                payload: request.words.cast_mut().cast(),
+                payload_ranges: deopt_payload_ranges(unsafe {
+                    std::slice::from_raw_parts(request.words, request.n_words as usize)
+                }, request.n_scopes)?,
                 arguments: std::ptr::null_mut(),
                 argument_count: 0,
             })
