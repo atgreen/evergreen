@@ -3,7 +3,7 @@
 
 //! Bounded ordinary calls with explicit continuation and final-result policies.
 use super::*;
-use crate::t2::ir::{AuxData, Inst, InstData, Opcode, Value, ValueRepresentation};
+use crate::t2::ir::{AuxData, Inst, InstData, Opcode, TypeBits, Value, ValueRepresentation};
 use egcl_rt::call_table::{
     OrdinaryCallHeat, ORDINARY_ENV_NONE, OrdinaryEntryDescriptor,
 };
@@ -526,6 +526,8 @@ fn compare_zero_memory(a: &mut Asm, base: u8, displacement: u8, byte: bool) {
 
 /// The frame storage and its matching callee-save retirement sequence.
 pub(super) struct OrdinaryCallFrame<'a> {
+    pub function: &'a Function,
+    pub inference: &'a crate::t2::infer::InferenceResult,
     pub outgoing: NativeValueArea,
     pub control_home: FramedHome,
     /// Must-state at this call, after actual return normalization and resets.
@@ -566,6 +568,8 @@ impl OrdinaryCallEmission<'_> {
         frame: OrdinaryCallFrame<'_>,
     ) -> Result<Vec<CallReturn>, EmitError> {
         let OrdinaryCallFrame {
+            function,
+            inference,
             outgoing,
             control_home,
             mv_known_empty,
@@ -606,6 +610,51 @@ impl OrdinaryCallEmission<'_> {
         }
         // Ordinary machine frames are bounded by their exact stack budget.
         // The legacy depth counter bounds Rust/native reentry only.
+
+        if self.direct_self {
+            // Source identity does not prove the next argument contract. Check
+            // it before even a pure return shortcut: those shortcuts also
+            // bypass the shared checked entry. A miss dispatches the retained
+            // definition through that entry, preserving its TYPE-ERROR.
+            let parameters = &function.block(function.entry()).params;
+            if parameters.len() != data.args.len() {
+                return Err(EmitError::UnsupportedOp(0xFA));
+            }
+            for (index, (&parameter, &argument)) in parameters.iter().zip(&data.args).enumerate() {
+                if !function.is_entry_param_checked(parameter) { continue; }
+                let expected = function.value(parameter).ty;
+                let actual = inference.ty(argument);
+                let tag_proven = !actual.bits.is_bottom() && expected.bits.contains(actual.bits);
+                let actual_range = if tag_proven { actual.range } else { None };
+                let range_proven = expected.range.is_none_or(|range| actual_range.is_some_and(
+                    |got| got.lo >= range.lo && got.hi <= range.hi));
+                if tag_proven && range_proven { continue; }
+                load_home(a, RAX, FramedHome::Stack(base + index as u32), 0);
+                if expected.bits == TypeBits::FIXNUM {
+                    if !tag_proven { guard_fixnum(a, RAX, cold); }
+                    if let Some(range) = expected.range {
+                        // Declared fixnum intervals must fit the tagged word.
+                        if range.lo < FIXNUM_MIN || range.hi > FIXNUM_MAX || range.lo > range.hi {
+                            return Err(EmitError::UnsupportedOp(0xFA));
+                        }
+                        if !actual_range.is_some_and(|got| got.lo >= range.lo) {
+                            mov_imm64(a, SCRATCH, range.lo << 3);
+                            cmp_rr(a, RAX, SCRATCH);
+                            a.jcc(Cc::L, cold);
+                        }
+                        if !actual_range.is_some_and(|got| got.hi <= range.hi) {
+                            mov_imm64(a, SCRATCH, range.hi << 3);
+                            cmp_rr(a, RAX, SCRATCH);
+                            a.jcc(Cc::G, cold);
+                        }
+                    }
+                } else if expected.bits == TypeBits::SINGLE_FLOAT && expected.range.is_none() {
+                    guard_single_float(a, RAX, cold);
+                } else {
+                    return Err(EmitError::UnsupportedOp(0xFA));
+                }
+            }
+        }
 
         if self.direct_self && !self.tail {
             if let Some(prefix) = self_prefix {

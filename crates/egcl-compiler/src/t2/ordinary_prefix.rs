@@ -314,7 +314,26 @@ fn evaluate_pure(
     saw_call: &mut bool,
 ) -> Option<u64> {
     let entry = f.entry();
-    let mut values = HashMap::from([(f.block(entry).params[0], argument)]);
+    let parameter = *f.block(entry).params.first()?;
+    if f.is_entry_param_checked(parameter) {
+        // Every interpreted recursive invocation bypasses the runtime entry,
+        // just like the emitted shortcut. A valid outer argument cannot make
+        // an invalid deeper call pure: preserve the original declaration error.
+        let declared = f.value(parameter).ty;
+        if declared.class_id.is_some() { return None; }
+        if declared.bits == TypeBits::FIXNUM {
+            if argument & 7 != 0 { return None; }
+            let value = (argument as i64) >> 3;
+            if declared.range.is_some_and(|range| value < range.lo || value > range.hi) {
+                return None;
+            }
+        } else if declared.bits == TypeBits::SINGLE_FLOAT && declared.range.is_none() {
+            if argument & 7 != 4 { return None; }
+        } else {
+            return None;
+        }
+    }
+    let mut values = HashMap::from([(parameter, argument)]);
     let mut block = entry;
     'blocks: loop {
         for &inst in &f.block(block).insts {
@@ -560,6 +579,34 @@ mod tests {
             assert_eq!(evaluate_pure(&f, (input as u64) << 3, &[], 3, &mut 512, &mut false), None);
             assert_eq!(evaluate_pure(&f, egcl_rt::value::NIL.0, &[], 3, &mut 512, &mut false), None);
         }
+    }
+
+    #[test]
+    fn partial_evaluation_preserves_recursive_entry_contracts() {
+        use crate::t2::ir::Range;
+        let (mut f, call) = counter(false);
+        let parameter = f.block(f.entry()).params[0];
+        f.mark_entry_param_checked(parameter);
+        f.refine_type(parameter, IRType {
+            range: Some(Range { lo: 0, hi: 0 }),
+            ..IRType::of(TypeBits::FIXNUM)
+        });
+        // The outer argument is valid; its nested call with -1 is not.
+        assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), None);
+        let single = crate::t2::opt_clear_mv::single_value_state(&f, true);
+        assert!(specialize(&f, 1, &single, &[call]).is_empty());
+        f.refine_type(parameter, IRType {
+            range: Some(Range { lo: -1, hi: 2 }),
+            ..IRType::of(TypeBits::FIXNUM)
+        });
+        assert_eq!(evaluate_pure(&f, 0, &[call], 3, &mut 512, &mut false), Some(8));
+        assert!(!specialize(&f, 1, &single, &[call]).is_empty());
+        let mut identity = identity();
+        let parameter = identity.block(identity.entry()).params[0];
+        identity.mark_entry_param_checked(parameter);
+        identity.refine_type(parameter, IRType::of(TypeBits::FIXNUM));
+        assert_eq!(evaluate_pure(&identity, egcl_rt::value::NIL.0,
+            &[], 3, &mut 512, &mut false), None);
     }
 
     #[test]

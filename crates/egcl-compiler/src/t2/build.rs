@@ -1441,7 +1441,10 @@ impl<'a> Builder<'a> {
             let ty = match declared {
                 DeclaredType::Any => IRType::TOP,
                 DeclaredType::Fixnum => IRType::of(TypeBits::FIXNUM),
-                DeclaredType::FixnumRange { .. } => IRType::of(TypeBits::FIXNUM),
+                DeclaredType::FixnumRange { lower, upper } => IRType {
+                    range: Some(crate::t2::ir::Range { lo: lower, hi: upper }),
+                    ..IRType::of(TypeBits::FIXNUM)
+                },
                 DeclaredType::SingleFloat => IRType::of(TypeBits::SINGLE_FLOAT),
             };
             let p = self
@@ -3134,6 +3137,21 @@ mod tests {
         let parameter = f.block(f.entry()).params[0];
         assert_eq!(f.value(parameter).ty, IRType::of(TypeBits::FIXNUM));
         assert!(f.is_entry_param_checked(parameter));
+    }
+
+    #[test]
+    fn declared_parameter_range_seeds_entry_ssa() {
+        use crate::t2::ir::Range;
+        let mut typed = bf("bounded", vec![Instr::LoadLocal(0), Instr::Return],
+            vec![], 1, 1, 1);
+        typed.param_types = vec![DeclaredType::FixnumRange { lower: 0, upper: 40 }];
+        let f = build_from_bytecode(&typed).expect("build bounded function");
+        let parameter = f.block(f.entry()).params[0];
+        assert_eq!(f.value(parameter).ty.bits, TypeBits::FIXNUM);
+        assert_eq!(f.value(parameter).ty.range, Some(Range { lo: 0, hi: 40 }));
+        assert!(f.is_entry_param_checked(parameter));
+        assert_eq!(crate::t2::infer::infer(&f).range(parameter),
+            Some(Range { lo: 0, hi: 40 }));
     }
 
     #[test]

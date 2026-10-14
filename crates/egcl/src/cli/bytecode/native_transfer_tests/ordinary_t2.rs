@@ -161,6 +161,97 @@ fn ordinary_t2_admits_checked_fixnum_self_recursion() {
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_self_calls_preserve_checked_parameter_contracts() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    for (name, declaration, form, input) in [
+        ("ORDINARY-T2-SELF-RANGE-LOW", "(integer 2 40)",
+         "(if (< n 2) n (+ (ordinary-t2-self-range-low 1) 0))", 2),
+        ("ORDINARY-T2-SELF-RANGE-HIGH", "(integer 0 40)",
+         "(if (< n 3) (+ (ordinary-t2-self-range-high 41) 0) n)", 2),
+        ("ORDINARY-T2-SELF-BAD-TAG", "fixnum",
+         "(if n (+ (ordinary-t2-self-bad-tag nil) 0) 7)", 2),
+        ("ORDINARY-T2-SELF-NESTED-RANGE", "(integer 0 1)",
+         "(if (< n 0) n (+ (ordinary-t2-self-nested-range (- n 1)) 2))", 1),
+    ] {
+        crate::cli::read_eval_all_env(
+            &format!("(defun {name} (n) (declare (type {declaration} n)) {form})"),
+            &mut env,
+        ).unwrap();
+        let (symbol, code) = install(name, "(n)",
+            &format!("((declare (type {declaration} n)) {form})"), &mut env);
+        assert_mapped_t2(&code);
+        assert_proven_self_call(&code, symbol);
+        let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+        assert!(mapped.ordinary_entry.is_some(), "exercise ordinary self admission");
+        let result = run_native(&code, symbol, &[EgclVal::from_fixnum(input)], &mut env);
+        assert!(matches!(&result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })),
+            "{name}: recursive ingress must check declarations, including before a pure shortcut: {result:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_self_calls_check_dynamic_range_endpoints() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let name = "ORDINARY-T2-SELF-DYNAMIC-RANGE";
+    let forms = "((declare (type (integer 2 40) n))
+        (if again (+ (ordinary-t2-self-dynamic-range next next nil) 0) n))";
+    crate::cli::read_eval_all_env(
+        "(defun ordinary-t2-self-dynamic-range (n next again)
+           (declare (type (integer 2 40) n))
+           (if again (+ (ordinary-t2-self-dynamic-range next next nil) 0) n))",
+        &mut env,
+    ).unwrap();
+    let (symbol, code) = install(name, "(n next again)", forms, &mut env);
+    assert_mapped_t2(&code);
+    assert_proven_self_call(&code, symbol);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some());
+    for next in [2, 40] {
+        native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+        let value = EgclVal::from_fixnum(next);
+        assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(2), value, T], &mut env)
+            .unwrap(), value);
+        assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
+            "inclusive endpoint {next} must pass generated checks without an adapter");
+    }
+    for value in [EgclVal::from_fixnum(1), EgclVal::from_fixnum(41), NIL] {
+        let result = run_native(&code, symbol, &[EgclVal::from_fixnum(2), value, T], &mut env);
+        assert!(matches!(&result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })),
+            "dynamic recursive argument {value:?} must satisfy both tag and interval: {result:?}");
+    }
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn ordinary_t2_self_calls_check_single_float_tags() {
+    let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    crate::cli::read_eval_all_env(
+        "(defun ordinary-t2-self-float-tag (n again)
+           (declare (type single-float n))
+           (if again (progn (ordinary-t2-self-float-tag 1 nil) n) n))",
+        &mut env,
+    ).unwrap();
+    let (symbol, code) = install("ORDINARY-T2-SELF-FLOAT-TAG", "(n again)",
+        "((declare (type single-float n))
+          (if again (progn (ordinary-t2-self-float-tag 1 nil) n) n))", &mut env);
+    assert_mapped_t2(&code);
+    assert_proven_self_call(&code, symbol);
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
+    assert!(mapped.ordinary_entry.is_some());
+    let result = run_native(&code, symbol, &[EgclVal::from_single_float(1.25), T], &mut env);
+    assert!(matches!(&result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })),
+        "wrong float tag: {result:?}");
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
     let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);

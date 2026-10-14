@@ -4815,8 +4815,9 @@ fn emit_framed_inner(
     // Parameter declarations are checked by the shared bytecode/native entry
     // boundary before this code runs. Seed the emitter's proof sets from their
     // entry SSA types so typed operations do not emit a second, redundant tag
-    // guard. Declared functions do not expose the unchecked register-entry ABI
-    // below, keeping this assumption true for recursive compiled calls too.
+    // guard. Legacy unchecked register entries are disabled for declarations;
+    // ordinary direct self-calls prove or check the argument contract before
+    // entering this body (or using a pure return shortcut).
     let type_is = |value: Value, bits: TypeBits| {
         let actual = f.value(value).ty.bits;
         !actual.is_bottom() && actual.meet(bits) == actual
@@ -5927,7 +5928,8 @@ fn emit_framed_inner(
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 { inst_calls = ordinary_call.unwrap().for_inst(inst).emit(&mut a, &d, &homes, &const_tagged,
-                    ordinary_call::OrdinaryCallFrame { outgoing: outgoing_area,
+                    ordinary_call::OrdinaryCallFrame { function: f, inference: &inference,
+                        outgoing: outgoing_area,
                         control_home: native_control_home.unwrap(), self_entry: ordinary_self_entry,
                         self_prefix: ordinary_self_prefix.as_ref(),
                         self_specializations: &ordinary_self_specializations,

@@ -50,9 +50,10 @@ EGCL source (unchanged by the optimization):
   (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 ```
 
-The FTYPE declaration above is currently ignored by EGCL; it is not evidence
-of result-type propagation. Checked parameter metadata is retained, but the
-full parameter interval is not yet propagated as a T2 range fact.
+At the measured runtime revision, EGCL ignores the FTYPE declaration above;
+it is not evidence of result-type propagation. Checked parameter metadata is
+retained, but that revision does not propagate the full interval as a T2 range
+fact. Later compiler changes require their own performance measurements.
 
 SBCL source, compiled to a FASL before the timed process loads it:
 

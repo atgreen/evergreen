@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve bounded integer parameter ranges in T2, and retain declared argument
+  checks on direct recursive calls, including calls replaced by pure return
+  shortcuts ([#326](https://github.com/atgreen/evergreen/pull/326)).
+
 - Replace repeated native runtime checks with an execution-local poll and remove
   redundant ownership/depth checks from trusted ordinary self-calls. Reduce
   measured warmed `fib(35)` time from 190.5 ms to 107 ms on the benchmark host
