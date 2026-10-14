@@ -5,6 +5,119 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn deopt_scope_chain_matches_call_continuations() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env("(defun deopt-chain-child (x) (+ x 1))", &mut env).unwrap();
+    egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+    egcl_rt::rooted!(child_forms = reader::read_from_string("((+ x 1))").unwrap().0);
+    let child_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-CHILD");
+    let child = Arc::new(
+        compile_function("DEOPT-CHAIN-CHILD", *params, *child_forms, &env, false, false)
+            .expect("compile retained child"),
+    );
+    let _child_root = egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+        bodies: vec![Arc::clone(&child)],
+    });
+    egcl_rt::rooted!(parent_forms = reader::read_from_string("((+ 3 (deopt-chain-child x)))").unwrap().0);
+    let parent_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-PARENT");
+    let parent = Arc::new(
+        compile_function("DEOPT-CHAIN-PARENT", *params, *parent_forms, &env, false, false)
+            .expect("compile retained parent"),
+    );
+    let call_pc = parent.code.iter().position(|op| {
+        matches!(op, Instr::CallNamed { sym, nargs: 1 } if *sym == child_symbol)
+    }).expect("parent must call the retained child") as u64;
+    assert_eq!(parent.n_locals, 1);
+    assert_eq!(child.n_locals, 1);
+    assert!(parent.max_stack >= 2);
+    let other_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-OTHER");
+    let skipped_symbol = egcl_rt::symbols::intern("DEOPT-CHAIN-SKIPPED-CALL");
+    let mut skipped = (*parent).clone();
+    skipped.constants = vec![EgclVal::from_fixnum(3), EgclVal::from_fixnum(18)];
+    skipped.code = vec![
+        Instr::Const(0),
+        Instr::Const(1),
+        Instr::Br(4),
+        Instr::CallNamed { sym: child_symbol, nargs: 1 },
+        Instr::CallNamed { sym: egcl_rt::symbols::intern("+"), nargs: 2 },
+        Instr::Return,
+    ];
+    skipped.max_stack = 2;
+    let skipped = Arc::new(skipped);
+    let depths = verified_operand_stack_depths(&skipped).expect("valid branch-over-call bytecode");
+    assert_eq!(depths[3], None, "the alleged suspended call is unreachable");
+    assert_eq!(depths[4], Some(2), "its successor is reachable by the branch");
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies {
+            bodies: vec![Arc::clone(&parent), Arc::clone(&child), Arc::clone(&skipped)],
+        }),
+        deopt_bodies: [
+            (parent_symbol, Arc::clone(&parent)),
+            (child_symbol, Arc::clone(&child)),
+            (other_symbol, Arc::clone(&child)),
+            (skipped_symbol, skipped),
+        ].into_iter().collect(),
+    });
+    let scope = |owner: u32, bcp, values: &[EgclVal]| {
+        let mut words = vec![u64::from(owner), bcp, 1, values.len() as u64];
+        words.push(EgclVal::from_fixnum(17).0);
+        words.extend(values.iter().map(|value| value.0));
+        words
+    };
+    let three = EgclVal::from_fixnum(3);
+    let mut valid = scope(parent_symbol, call_pc + 1, &[three]);
+    valid.extend(scope(child_symbol, 0, &[]));
+    let mut wrong_target = scope(parent_symbol, call_pc + 1, &[three]);
+    wrong_target.extend(scope(other_symbol, 0, &[]));
+    let mut wrong_parent_pc = scope(parent_symbol, 0, &[three]);
+    wrong_parent_pc.extend(scope(child_symbol, 0, &[]));
+    let mut wrong_parent_depth = scope(parent_symbol, call_pc + 1, &[]);
+    wrong_parent_depth.extend(scope(child_symbol, 0, &[]));
+    let mut wrong_child_depth = scope(parent_symbol, call_pc + 1, &[three]);
+    wrong_child_depth.extend(scope(child_symbol, 0, &[three]));
+    let mut unreachable_call = scope(skipped_symbol, 4, &[three]);
+    unreachable_call.extend(scope(child_symbol, 0, &[]));
+    let cases = [
+        ("valid retained chain", valid, 2, true),
+        ("valid post-call root", scope(parent_symbol, call_pc + 1, &[three, EgclVal::from_fixnum(18)]), 1, true),
+        ("wrong call target", wrong_target, 2, false),
+        ("parent not after call", wrong_parent_pc, 2, false),
+        ("wrong pending parent depth", wrong_parent_depth, 2, false),
+        ("wrong child guard depth", wrong_child_depth, 2, false),
+        ("wrong root guard depth", scope(child_symbol, 0, &[three]), 1, false),
+        ("unreachable suspended call", unreachable_call, 2, false),
+    ];
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut mismatches = Vec::new();
+    for (name, words, count, accepted) in cases {
+        let result = materialize_t2_deopt_scopes(
+            count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+        );
+        if result.is_ok() != accepted { mismatches.push(name); }
+        if let Ok((scopes, retained)) = result {
+            if accepted {
+                assert_eq!(
+                    resume_inlined_in_t0(scopes, retained, None, &mut env).unwrap(),
+                    EgclVal::from_fixnum(21),
+                    "{name}: resume exactly the pending computation",
+                );
+            } else {
+                // Malformed activations are never executed.
+                for _ in scopes { stack.pop_frame(); }
+            }
+        }
+        assert_eq!(stack.fp(), before_fp, "{name}: frame cleanup");
+        assert_eq!(stack.sp(), before_sp, "{name}: stack cleanup");
+    }
+    assert!(mismatches.is_empty(), "incorrect continuation acceptance: {mismatches:?}");
+}
+
+#[test]
 fn deopt_scope_headers_match_retained_bodies() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
@@ -38,7 +151,7 @@ fn deopt_scope_headers_match_retained_bodies() {
     valid_parent.extend(scope(owner, 0, 1, 0));
     let cases = [
         ("valid root", scope(owner, 0, 1, 0), 1, true),
-        ("valid suspended parent", valid_parent, 2, true),
+        ("header-shaped but mismatched callee", valid_parent, 2, false),
         ("missing local", scope(owner, 0, 0, 0), 1, false),
         ("extra local", scope(owner, 0, 2, 0), 1, false),
         ("truncated function id", scope(owner + (1u64 << 32), 0, 1, 0), 1, false),

@@ -13377,6 +13377,14 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
 }
 
 fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclError> {
+    verified_operand_stack_depths(func).map(|_| ())
+}
+
+/// Exact reachable operand depths before each bytecode instruction. Unreachable
+/// instructions have no valid interpreter continuation and retain `None`.
+fn verified_operand_stack_depths(
+    func: &BytecodeFunction,
+) -> Result<Vec<Option<u32>>, EgclError> {
     let code = &func.code;
     let n = code.len();
     let fail = |pc: usize, msg: &str| -> EgclError {
@@ -13656,7 +13664,7 @@ fn verify_operand_stack_discipline(func: &BytecodeFunction) -> Result<(), EgclEr
             _ => unreachable!("instruction with a simple stack effect handled above"),
         }
     }
-    Ok(())
+    Ok(states.into_iter().map(|state| state.map(|(height, _)| height)).collect())
 }
 
 /// Verify, decode, and execute an authoritative portable BBU. No source reader
@@ -18398,6 +18406,46 @@ fn materialize_t2_deopt_scopes(
         if n_slots > words.len() - at || n_slots > entry.num_slots() as usize {
             error = Some("invalid T2 virtual-frame slot count");
             break;
+        }
+        let suspended = scope_index + 1 < n_scopes as usize;
+        let Ok(depths) = verified_operand_stack_depths(&entry) else {
+            error = Some("T2 deopt retained body has invalid stack discipline");
+            break;
+        };
+        // An innermost guard saves the complete pre-instruction stack. Each
+        // suspended caller resumes after its call, with just the child result
+        // still absent; Return will push it before the caller executes again.
+        let resume_depth = sp_top as u32 + u32::from(suspended);
+        if depths[bcp as usize] != Some(resume_depth) {
+            error = Some("T2 virtual-frame depth disagrees with its continuation");
+            break;
+        }
+        if suspended {
+            let Some(call_pc) = bcp.checked_sub(1) else {
+                error = Some("T2 suspended frame has no preceding instruction");
+                break;
+            };
+            let Some(Instr::CallNamed { sym, nargs }) = entry.code.get(call_pc as usize) else {
+                error = Some("T2 suspended frame does not resume after a named call");
+                break;
+            };
+            // A reachable successor can follow an unreachable call when a
+            // branch skips it. Require the call itself to be reachable with
+            // exactly the saved pending stack after consuming its arguments.
+            if depths[call_pc as usize]
+                .and_then(|depth| depth.checked_sub(u32::from(*nargs)))
+                != Some(sp_top as u32)
+            {
+                error = Some("T2 suspended call has no matching reachable stack state");
+                break;
+            }
+            // Compare serialized owners before the outer callable's name can
+            // replace its compilation owner below. The next scope validates
+            // the remainder of its header and resolves its retained body.
+            if words.get(at + n_slots).copied() != Some(u64::from(*sym)) {
+                error = Some("T2 suspended call target disagrees with its child");
+                break;
+            }
         }
         let frame = if let (0, Some(outer)) = (scope_index, outer) {
             outer
