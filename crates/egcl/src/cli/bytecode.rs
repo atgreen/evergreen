@@ -18353,6 +18353,20 @@ fn materialize_t2_deopt_scopes(
     if buf.is_null() || n_scopes == 0 {
         return Err("T2 deopt supplied an empty virtual-frame stream");
     }
+    let (Ok(scope_count), Ok(word_count)) = (
+        usize::try_from(n_scopes),
+        usize::try_from(n_words),
+    ) else {
+        return Err("T2 virtual-frame counts exceed addressable storage");
+    };
+    // Every scope needs four header words, even with no saved values. Bound
+    // counts before allocating and respect the raw-slice byte-length limit.
+    // The native caller must still prove the buffer's actual storage extent.
+    if scope_count > word_count / 4
+        || word_count > isize::MAX as usize / std::mem::size_of::<u64>()
+    {
+        return Err("invalid T2 virtual-frame stream counts");
+    }
 
     let metadata = metadata.or_else(|| ACTIVE_NATIVE_CODE.with(|slot| {
         // SAFETY: ActiveNativeCode retains a reference for the native call and
@@ -18363,13 +18377,17 @@ fn materialize_t2_deopt_scopes(
         return Err("T2 deopt has no active code metadata");
     };
 
-    let words = unsafe { std::slice::from_raw_parts(buf, n_words as usize) };
+    let words = unsafe { std::slice::from_raw_parts(buf, word_count) };
     let mut at = 0usize;
     let mut pushed = 0usize;
-    let mut scopes = Vec::with_capacity(n_scopes as usize);
-    let mut payloads = Vec::with_capacity(n_scopes as usize);
+    let mut scopes = Vec::new();
+    let mut payloads = Vec::new();
+    scopes.try_reserve_exact(scope_count)
+        .map_err(|_| "cannot reserve T2 virtual-frame descriptors")?;
+    payloads.try_reserve_exact(scope_count)
+        .map_err(|_| "cannot reserve T2 virtual-frame payloads")?;
     let mut error: Option<&'static str> = None;
-    for scope_index in 0..n_scopes as usize {
+    for scope_index in 0..scope_count {
         if at + 4 > words.len() {
             error = Some("truncated T2 virtual-frame header");
             break;
@@ -18393,7 +18411,7 @@ fn materialize_t2_deopt_scopes(
             || bcp as usize >= entry.code.len()
             // Suspended callers have consumed arguments but not yet received
             // the child's result. T0 Return must be able to push that value.
-            || (scope_index + 1 < n_scopes as usize && sp_top == u64::from(entry.max_stack))
+            || (scope_index + 1 < scope_count && sp_top == u64::from(entry.max_stack))
         {
             error = Some("T2 virtual-frame header disagrees with its retained body");
             break;
@@ -18407,7 +18425,7 @@ fn materialize_t2_deopt_scopes(
             error = Some("invalid T2 virtual-frame slot count");
             break;
         }
-        let suspended = scope_index + 1 < n_scopes as usize;
+        let suspended = scope_index + 1 < scope_count;
         let Ok(depths) = verified_operand_stack_depths(&entry) else {
             error = Some("T2 deopt retained body has invalid stack discipline");
             break;
@@ -18506,7 +18524,7 @@ fn materialize_t2_deopt_scopes(
             frame,
         });
     }
-    if error.is_some() || scopes.len() != n_scopes as usize || at != words.len() {
+    if error.is_some() || scopes.len() != scope_count || at != words.len() {
         for _ in 0..pushed {
             stack.pop_frame();
         }

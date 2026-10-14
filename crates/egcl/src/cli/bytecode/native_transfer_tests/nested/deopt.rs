@@ -5,6 +5,39 @@ use super::*;
 use crate::cli::{arena_cons, format_val, heap_test_lock, read_eval_all_env};
 
 #[test]
+fn deopt_scope_count_is_bounded_before_allocation() {
+    let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let metadata = Arc::new(T2InstalledMetadata {
+        speculations: Vec::new(),
+        _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: Vec::new() }),
+        deopt_bodies: Default::default(),
+    });
+    let words = [0u64; 4];
+    let stack = egcl_rt::current_stack();
+    let before_fp = stack.fp();
+    let before_sp = stack.sp();
+    let mut panicked = Vec::new();
+    for count in [0, 1, 2, u64::MAX] {
+        // The slice always names real storage. MAX overflows vector capacity
+        // before attempting an allocation in the old implementation; it does
+        // not require exhausting memory or constructing an invalid raw slice.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            materialize_t2_deopt_scopes(
+                count, words.len() as u64, words.as_ptr(), None, Some(Arc::clone(&metadata)),
+            )
+        }));
+        match result {
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("an owner absent from metadata must never be accepted"),
+            Err(_) => panicked.push(count),
+        }
+        assert_eq!(stack.fp(), before_fp);
+        assert_eq!(stack.sp(), before_sp);
+    }
+    assert!(panicked.is_empty(), "scope counts must reject without panicking: {panicked:?}");
+}
+
+#[test]
 fn deopt_outer_frame_has_room_for_the_resumed_body() {
     let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
