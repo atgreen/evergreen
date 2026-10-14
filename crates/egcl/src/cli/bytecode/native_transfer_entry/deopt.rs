@@ -104,6 +104,31 @@ fn note_segment_deopt(code: &TransferCode) {
     }
 }
 
+/// Preserve the executing definition in materialized native self frames. The
+/// native stream validator has already proved every suspended self-call link;
+/// the general cross-function materializer intentionally only records symbols.
+unsafe fn retain_self_scope_callables(
+    code: &TransferCode,
+    scopes: &[InlinedResumeScope],
+) -> Result<(), EgclError> {
+    if scopes.len() <= 1 { return Ok(()); }
+    if code.ordinary_entry.is_none()
+        || scopes.iter().any(|scope| !Arc::ptr_eq(&scope.body, &code.body) || scope.frame.is_null())
+    {
+        return Err(invalid_capture());
+    }
+    let callable = unsafe { (*scopes[0].frame).function };
+    if !egcl_rt::function::is_interpreted_function(callable) {
+        return Err(invalid_capture());
+    }
+    // All checks precede writes. No safepoint separates the read from these
+    // stores into scanned frame headers; never resolve the mutable public name.
+    for scope in &scopes[1..] {
+        unsafe { (*scope.frame).function = callable; }
+    }
+    Ok(())
+}
+
 /// Move the outer retained activation's local handler order without creating
 /// registrations. Scope-free inlined self frames rebuild their own local blocks
 /// during interpreter resumption; only the outer frame owns the native ledger.
@@ -444,6 +469,7 @@ mod retained_guard_chain_tests {
 
     thread_local! {
         static OBSERVED_SCOPES: Cell<u64> = const { Cell::new(0) };
+        static OBSERVED_GUARDS: Cell<u64> = const { Cell::new(0) };
         static COLLECT_AT_NESTED_GUARD: Cell<bool> = const { Cell::new(false) };
     }
 
@@ -485,6 +511,7 @@ mod retained_guard_chain_tests {
             .any(|&inst| ordinary.inst(inst).opcode == Opcode::Call
                 && matches!(ordinary.inst(inst).aux, AuxData::CallTarget(target) if target == symbol)),
             "bounded expansion must retain a recursive leaf");
+        assert_retained_leaf_identity(&ordinary, &body, symbol);
         assert_ordinary_scope_shape_rejections(&ordinary, &call_cells);
         let mut baseline = build::build_for_transfer_optimization(&body, symbol).unwrap();
         let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).unwrap();
@@ -508,7 +535,8 @@ mod retained_guard_chain_tests {
         // A direct float parameter would fail an entry preguard before reaching
         // the nested branch. Its first addition fails a guard; the second must
         // reload X from a relocated logical local after recovery.
-        for mode in ["normal", "gc", "error", "redefined"] {
+        for (mode, n) in [("normal", 2), ("gc", 2), ("error", 2),
+            ("deep", 5), ("redefined", 5)] {
             if mode == "redefined" {
                 crate::cli::read_eval_all_env(
                     "(defun ordinary-nested-self (n x) (declare (ignore n x)) 100)", &mut env,
@@ -519,31 +547,190 @@ mod retained_guard_chain_tests {
                 if mode == "error" { NIL } else { EgclVal::from_single_float(2.5) }, NIL));
             let original = argument.to_raw();
             OBSERVED_SCOPES.with(|seen| seen.set(0));
+            OBSERVED_GUARDS.with(|seen| seen.set(0));
             COLLECT_AT_NESTED_GUARD.with(|collect| collect.set(mode == "gc"));
             egcl_rt::rooted!(result = with_ordinary_guard_resume_observer_for_test(
                 |scopes| {
                     assert_eq!(scopes, 3);
-                    OBSERVED_SCOPES.with(|seen| {
-                        assert_eq!(seen.replace(scopes), 0, "only one native guard may resume this call");
-                    });
+                    OBSERVED_SCOPES.with(|seen| seen.set(scopes));
+                    OBSERVED_GUARDS.with(|seen| seen.set(seen.get() + 1));
                     if COLLECT_AT_NESTED_GUARD.with(Cell::get) {
                         egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
                     }
                 },
-                || code.run_callable(*callable, &[EgclVal::from_fixnum(2), *argument], &mut env),
+                || code.run_callable(*callable, &[EgclVal::from_fixnum(n), *argument], &mut env),
             ));
             assert_eq!(OBSERVED_SCOPES.with(Cell::get), 3, "observe actual native guard request");
+            assert_eq!(OBSERVED_GUARDS.with(Cell::get), if n == 2 { 1 } else { 2 },
+                "the deep child and its native parent's result guard each resume once: {mode}");
             if mode == "error" {
                 assert!(matches!(&*result, Err(EgclError::Signalled(details))
                     if condition_matches_handler(&env, details.condition, "TYPE-ERROR")), "{:?}", &*result);
             } else {
-                assert_eq!(*result.as_ref().unwrap(), EgclVal::from_single_float(5.5), "{mode}");
+                assert_eq!(*result.as_ref().unwrap(), EgclVal::from_single_float(n as f32 + 3.5), "{mode}");
             }
             if mode == "gc" {
                 assert_ne!(argument.to_raw(), original, "guard collection must really relocate X");
             }
             assert_eq!((stack.fp(), stack.sp()), before, "{mode}");
             assert_eq!((env.handlers.len(), env.restarts.len(), env.catch_stack.len()), environment_depths);
+        }
+        exercise_retained_cold_leaf(&code, *callable, &mut env);
+    }
+
+    fn exercise_retained_cold_leaf(code: &TransferCode, callable: EgclVal, env: &mut Env) {
+        use egcl_compiler::t2::emit::NativeRecursiveControl;
+        use super::super::ordinary_calls::SELF_COLD_OBSERVER;
+        thread_local! {
+            static SAVED_LIMIT: Cell<u64> = const { Cell::new(0) };
+            static COLD_OBSERVED: Cell<u64> = const { Cell::new(0) };
+        }
+        fn control() -> *mut NativeRecursiveControl {
+            let execution = egcl_rt::thread::current_execution_context_for_native().unwrap();
+            let control = unsafe { &*execution }.active_native_control();
+            assert_ne!(control, 0);
+            control as *mut NativeRecursiveControl
+        }
+        fn deny_child() {
+            let control = control();
+            SAVED_LIMIT.with(|saved| saved.set(unsafe { (*control).stack_limit }));
+            unsafe { (*control).stack_limit = u64::MAX; }
+        }
+        fn collect_in_cold_call() {
+            unsafe { (*control()).stack_limit = SAVED_LIMIT.with(Cell::get); }
+            COLD_OBSERVED.with(|seen| seen.set(seen.get() + 1));
+            egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
+        }
+        struct RestoreObserver(Option<fn()>);
+        impl Drop for RestoreObserver {
+            fn drop(&mut self) { SELF_COLD_OBSERVER.with(|hook| hook.set(self.0)); }
+        }
+        egcl_rt::rooted!(callable = callable);
+        let _restore = RestoreObserver(SELF_COLD_OBSERVER.with(|hook|
+            hook.replace(Some(collect_in_cold_call))));
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        let environment_depths = (env.handlers.len(), env.restarts.len(), env.catch_stack.len());
+        // The public name already returns 100. Both cases must dispatch the
+        // retained definition with the leaf's n=2, not the root's n=5.
+        for error in [false, true] {
+            egcl_rt::gc::HeapCollector::new().minor_gc().unwrap();
+            egcl_rt::rooted!(argument = crate::cli::arena_cons(
+                if error { NIL } else { EgclVal::from_single_float(2.5) }, NIL));
+            let original = argument.to_raw();
+            COLD_OBSERVED.with(|seen| seen.set(0));
+            egcl_rt::rooted!(result = with_ordinary_entry_hook_for_test(deny_child, ||
+                code.run_callable(*callable, &[EgclVal::from_fixnum(5), *argument], env)));
+            assert_eq!(COLD_OBSERVED.with(Cell::get), 1, "force exactly one retained cold leaf");
+            assert_ne!(argument.to_raw(), original, "cold collection must relocate the argument");
+            if error {
+                assert!(matches!(&*result, Err(EgclError::Signalled(details))
+                    if condition_matches_handler(env, details.condition, "TYPE-ERROR")), "{:?}", &*result);
+            } else {
+                assert_eq!(*result.as_ref().unwrap(), EgclVal::from_single_float(8.5));
+            }
+            assert_eq!((stack.fp(), stack.sp()), before);
+            assert_eq!((env.handlers.len(), env.restarts.len(), env.catch_stack.len()), environment_depths);
+        }
+    }
+
+    fn assert_retained_leaf_identity(
+        ir: &egcl_compiler::t2::ir::Function, body: &BytecodeFunction, symbol: u32,
+    ) {
+        use egcl_compiler::t2::ir::{AuxData, Opcode};
+        let leaves: Vec<_> = ir.block_order().iter()
+            .flat_map(|&block| ir.block(block).insts.iter().copied())
+            .filter(|&inst| ir.inst(inst).opcode == Opcode::Call
+                && matches!(ir.inst(inst).aux, AuxData::CallTarget(target) if target == symbol))
+            .collect();
+        assert!(!leaves.is_empty());
+        assert_eq!(ordinary_t2::proven_self_calls(ir, body, symbol), leaves,
+            "residual calls inside retained self frames must keep direct self identity");
+        let mut unproven = body.clone();
+        unproven.self_call_sites.clear();
+        assert!(ordinary_t2::proven_self_calls(ir, &unproven, symbol).is_empty(),
+            "matching names alone do not prove retained identity");
+        for fault in ["mixed", "parent", "leaf", "empty", "locals", "stack", "arity"] {
+            let mut invalid = ir.clone();
+            for &leaf in &leaves {
+                let state = invalid.inst(leaf).frame_state.unwrap();
+                if fault == "arity" { invalid.inst_mut(leaf).args.pop(); }
+                let scopes = &mut invalid.frame_states.get_mut(state).scopes;
+                assert_eq!(scopes.len(), 3);
+                match fault {
+                    "mixed" => scopes[1].function = symbol.wrapping_add(1),
+                    "parent" => scopes[0].bcp = 0,
+                    "leaf" => scopes.last_mut().unwrap().bcp = u32::MAX,
+                    "empty" => scopes.clear(),
+                    "locals" => scopes[1].locals.clear(),
+                    "stack" => scopes[0].stack.clear(),
+                    _ => {},
+                }
+            }
+            assert!(ordinary_t2::proven_self_calls(&invalid, body, symbol).is_empty(), "{fault}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn nested_argument_guard_keeps_retained_contract_after_redefinition() {
+        use egcl_compiler::t2::{build, inlining::InlineOptions, speculate};
+        let _lock = crate::cli::heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let name = "RETAINED-NESTED-CONTRACT";
+        let forms = "((declare (type (integer 1 10) n))
+            (if (< n 1) 0 (+ 1 (retained-nested-contract (- n 1)))))";
+        crate::cli::read_eval_all_env(
+            "(defun retained-nested-contract (n) (declare (type (integer 1 10) n))
+                (if (< n 1) 0 (+ 1 (retained-nested-contract (- n 1)))))", &mut env,
+        ).unwrap();
+        egcl_rt::rooted!(params = reader::read_from_string("(n)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
+        let symbol = egcl_rt::symbols::intern(name);
+        let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+        registry_put(symbol, Arc::clone(&body));
+        egcl_rt::rooted!(callable = egcl_rt::symbols::symbol_function(symbol).unwrap());
+        let input = egcl_rt::CrossThreadRoot::new(snapshot_t2_input(symbol, 0).unwrap());
+        let cells = input.with_gc_stable_mutator(|input| input.call_cells.clone());
+        let mut options = InlineOptions::default().with_root_symbol(symbol)
+            .with_body(symbol, Arc::clone(&body));
+        options.config.self_inline_depth = 2;
+        options.config.small_threshold = 100;
+        let mut ordinary = build::build_from_bytecode_with_inline_options(&body, options).unwrap();
+        speculate::speculate(&mut ordinary, &|_| Some(speculate::SpecType::Fixnum));
+        let mut baseline = build::build_for_transfer_optimization(&body, symbol).unwrap();
+        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).unwrap();
+        build::legalize_transfer_calls(&mut baseline, &scopes).unwrap();
+        let metadata = Arc::new(T2InstalledMetadata {
+            speculations: Vec::new(),
+            _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
+            deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
+        });
+        let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
+            retain_native_body(&body), &baseline, Some(&ordinary), Some(metadata),
+            &cells, false, CompilationTier::T2).unwrap();
+        code.set_installed_symbol(symbol);
+        assert!(code.ordinary_entry.is_some());
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp(), stack.sp());
+        for (redefined, n) in [(false, 2), (true, 2), (true, 5)] {
+            if redefined {
+                crate::cli::read_eval_all_env(
+                    "(defun retained-nested-contract (n) (declare (ignore n)) 100)", &mut env,
+                ).unwrap();
+            }
+            OBSERVED_SCOPES.with(|seen| seen.set(0));
+            egcl_rt::rooted!(result = with_ordinary_guard_resume_observer_for_test(
+                |scopes| { OBSERVED_SCOPES.with(|seen| seen.set(scopes)); },
+                || code.run_callable(*callable, &[EgclVal::from_fixnum(n)], &mut env),
+            ));
+            assert_eq!(OBSERVED_SCOPES.with(Cell::get), 2,
+                "the second erased call must fail its argument contract inside an inlined frame");
+            assert!(matches!(&*result, Err(EgclError::Signalled(details))
+                if condition_matches_handler(&env, details.condition, "TYPE-ERROR")),
+                "retained argument zero must fail, redefined={redefined}, n={n}: {:?}", &*result);
+            assert_eq!((stack.fp(), stack.sp()), before);
         }
     }
 
@@ -701,6 +888,7 @@ mod retained_guard_chain_tests {
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let (symbol, owner) = fixture(&mut env);
+        egcl_rt::rooted!(callable = egcl_rt::symbols::symbol_function(symbol).unwrap());
         let code = mapped(&owner);
         let body = &code.body;
         let depths = verified_operand_stack_depths(body).unwrap();
@@ -736,6 +924,10 @@ mod retained_guard_chain_tests {
             3, words.len() as u64, words.as_ptr(), Some(frame),
             code.deopt_metadata.clone(),
         ).expect("materialize validated retained self frames");
+        assert!(unsafe { retain_self_scope_callables(code, &scopes) }.is_err(),
+            "a public symbol cannot supply retained callable identity");
+        assert!(scopes.iter().all(|scope| unsafe { (*scope.frame).function.is_symbol() }));
+        unsafe { (*frame).function = *callable; }
         let inner_pc = scopes[1].bcp;
         scopes[1].bcp = u32::MAX;
         assert!(unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }.is_err());
@@ -743,10 +935,15 @@ mod retained_guard_chain_tests {
             "invalid inner PC must not consume the outer reservation");
         scopes[1].bcp = inner_pc;
         scopes[1].body = Arc::new(body.as_ref().clone());
+        assert!(unsafe { retain_self_scope_callables(code, &scopes) }.is_err());
+        assert!(scopes[1..].iter().all(|scope| unsafe { (*scope.frame).function.is_symbol() }),
+            "invalid identity proof must not change inner frame headers");
         assert!(unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }.is_err());
         assert!(unsafe { (*context.guard_resume).is_some() },
             "equal but nonidentical retained body must not consume the reservation");
         scopes[1].body = Arc::clone(body);
+        unsafe { retain_self_scope_callables(code, &scopes) }.unwrap();
+        assert!(scopes.iter().all(|scope| unsafe { (*scope.frame).function == *callable }));
         let state = unsafe { take_guard_resume_state(&mut context, code, &scopes, &env) }
             .expect("transfer outer state without rejecting retained inner frames");
         assert!(unsafe { (*context.guard_resume).is_none() },
@@ -1246,6 +1443,7 @@ unsafe fn resume_native_child_guard(
         Some(metadata),
     )
     .map_err(|message| EgclError::Internal(message.into()))?;
+    unsafe { retain_self_scope_callables(code, &scopes)?; }
     note_segment_deopt(code);
     if let Some(arguments) = arguments.as_ref() {
         state
@@ -1516,6 +1714,7 @@ unsafe fn resume_guard_with_arguments(
             Some(metadata),
         )
         .map_err(|message| EgclError::Internal(message.into()))?;
+        unsafe { retain_self_scope_callables(code, &scopes)?; }
         note_segment_deopt(code);
         // Every stream word is now in scanned slots. There is no mutable
         // CaptureContext reference or RefCell borrow across resumed Lisp.

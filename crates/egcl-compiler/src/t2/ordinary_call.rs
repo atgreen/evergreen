@@ -466,7 +466,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
         let data = f.inst(*inst);
         data.args.len() == entry.arity && data.frame_state.is_some_and(|state| {
             let scopes = &f.frame_states.get(state).scopes;
-            scopes.len() == 1 && scopes[0].function == target.symbol
+            !scopes.is_empty() && scopes.iter().all(|scope| scope.function == target.symbol)
         })
     })) { return Err(bad()); }
 

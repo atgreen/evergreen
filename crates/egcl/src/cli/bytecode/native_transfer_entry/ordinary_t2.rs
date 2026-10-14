@@ -152,10 +152,17 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
     Some(native)
 }
 
-/// Only source-proven root-frame calls can bind to this retained definition.
-/// Inlined frames and generated primitive calls never acquire that identity.
+/// Only source-proven calls in this retained body's logical frame chain can
+/// bind directly. Each suspended parent must itself be a proven self expansion;
+/// matching names in arbitrary inlined frames do not establish identity.
 pub(super) fn proven_self_calls(ir: &Function, body: &BytecodeFunction, symbol: u32) -> Vec<egcl_compiler::t2::ir::Inst> {
     use egcl_compiler::t2::ir::{AuxData, Opcode};
+    let Ok(depths) = verified_operand_stack_depths(body) else { return Vec::new() };
+    let proven_site = |pc: u32| {
+        body.self_call_sites.binary_search(&pc).is_ok()
+            && matches!(body.code.get(pc as usize), Some(Instr::CallNamed { sym, nargs })
+                if *sym == symbol && *nargs == body.arity)
+    };
     ir.block_order().iter().flat_map(|&block| ir.block(block).insts.iter().copied())
         .filter(|&inst| {
             let data = ir.inst(inst);
@@ -164,7 +171,21 @@ pub(super) fn proven_self_calls(ir: &Function, body: &BytecodeFunction, symbol: 
             }
             let Some(state) = data.frame_state else { return false };
             let scopes = &ir.frame_states.get(state).scopes;
-            scopes.len() == 1 && scopes[0].function == symbol
-                && body.self_call_sites.binary_search(&scopes[0].bcp).is_ok()
+            !scopes.is_empty() && data.args.len() == usize::from(body.arity)
+                && scopes.iter().enumerate().all(|(index, scope)| {
+                    let suspended = index + 1 < scopes.len();
+                    if scope.function != symbol || scope.locals.len() != usize::from(body.n_locals)
+                        || depths.get(scope.bcp as usize).copied().flatten()
+                            != Some(scope.stack.len() as u32 + u32::from(suspended))
+                    { return false; }
+                    if suspended {
+                        scope.bcp.checked_sub(1).is_some_and(|pc| proven_site(pc)
+                            && depths.get(pc as usize).copied().flatten()
+                                .and_then(|depth| depth.checked_sub(u32::from(body.arity)))
+                                == Some(scope.stack.len() as u32))
+                    } else {
+                        proven_site(scope.bcp)
+                    }
+                })
         }).collect()
 }
