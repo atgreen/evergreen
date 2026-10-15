@@ -131,6 +131,18 @@ The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
   ([#333](https://github.com/atgreen/evergreen/pull/333),
   [#334](https://github.com/atgreen/evergreen/pull/334)).
 
+### Known limitations
+
+- `--shake` retains every candidate function instead of pruning the
+  unreachable ones, so a shaken executable is correct but no smaller than the
+  image it came from. The conformance work in this release took the saved image
+  from 3 source closures to 30, and the reader entry points quoted inside them
+  reach the analyzer's "can invoke arbitrary code" rule, which then keeps
+  everything. The shaker is being conservative rather than wrong -- nothing is
+  removed that a program needs -- and `dynamic = preserve` behaves as before.
+  Tracked in `bliss-mihqk`; the six `shake_cli` pruning tests are marked
+  `#[ignore]` against it.
+
 ## 0.0.8 - 2026-10-14
 
 ### Native compilation and performance
