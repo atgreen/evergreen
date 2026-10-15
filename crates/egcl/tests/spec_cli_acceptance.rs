@@ -1512,8 +1512,11 @@ fn stage_four_cli_supports_call_next_method_eql_specializers_and_short_form_comb
                ;; list combination collects from both (most-specific first). Same
                ;; parameter specializers would be one method — the second replaces
                ;; the first per CLHS 7.6.2 (bliss-day).
-               (defmethod collect ((x integer)) 'a)
-               (defmethod collect ((x t)) 'b)
+               ;; A short-form combination accepts only its own qualifier or
+               ;; :around (CLHS 7.6.6.4), so these must be qualified `list`.
+               ;; Unqualified, both egcl and SBCL signal at call time.
+               (defmethod collect list ((x integer)) 'a)
+               (defmethod collect list ((x t)) 'b)
                (defgeneric sum-values (x) (:method-combination +))
                (defmethod sum-values + ((x integer)) 1)
                (defmethod sum-values + ((x t)) 2)

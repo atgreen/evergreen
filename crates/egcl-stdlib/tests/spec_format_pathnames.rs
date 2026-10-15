@@ -29,6 +29,13 @@ fn pseudo_string(s: &str) -> EgclVal {
     val
 }
 
+/// Decode a Lisp string's contents.  Two string objects with equal contents are
+/// distinct heap objects, so `assert_eq!` on the `EgclVal`s compares pointers
+/// and fails even when the text matches; compare the decoded text instead.
+fn lisp_text(val: EgclVal) -> String {
+    unsafe { egcl_rt::object::read_simple_string(val.as_ptr()) }
+}
+
 fn keyword(name: &str) -> EgclVal {
     let mut h: u64 = 0x517cc1b727220a95;
     for b in name.bytes() {
@@ -192,8 +199,12 @@ fn format_reports_errors_for_bad_directives_and_argument_types() {
         format(NIL, "~{~A", &[list(&[EgclVal::from_fixnum(1)])]).expect_err("unmatched");
     assert!(matches!(unmatched, EgclError::Internal(_)));
 
-    let wrong_type = format(NIL, "~D", &[T]).expect_err("wrong type");
-    assert!(matches!(wrong_type, EgclError::TypeError { .. }));
+    // CLHS 22.3.2.2: if the argument to ~D is not an integer it is printed in
+    // ~A format and decimal base -- it is NOT an error.  This asserted a
+    // TYPE-ERROR, which is what egcl did before the FORMAT directives were
+    // brought in line with the standard; (format nil "~D" t) is "T" in SBCL.
+    let printed = format(NIL, "~D", &[T]).expect("~D prints a non-numeric argument");
+    assert_eq!(lisp_text(printed), "T");
 }
 
 #[test]
@@ -343,16 +354,24 @@ fn logical_pathname_translations_are_setfable_and_translate_matching_sources() {
         target_root.display()
     ));
     set_logical_pathname_translations(host, translations).expect("set translations");
+    // Compare the stored text, not object identity: the accessor hands back a
+    // string built from the stored translations rather than the very object
+    // that was set.
     assert_eq!(
-        logical_pathname_translations(host).expect("get translations"),
-        translations
+        lisp_text(logical_pathname_translations(host).expect("get translations")),
+        lisp_text(translations)
     );
 
     let (logical, _) =
         parse_namestring(pseudo_string("SYS:SRC;PKG.LISP"), None, None).expect("logical parse");
     let translated = translate_logical_pathname(logical).expect("logical translation");
-    assert_eq!(pathname_name(translated), pseudo_string("PKG"));
-    assert_eq!(pathname_type(translated), pseudo_string("LISP"));
+    // Translating a logical pathname to a physical one on a Unix host maps the
+    // components into the host's customary case, which is lowercase (CLHS
+    // 19.3.1.1.7).  SBCL answers "pkg"/"lisp" for this translation too.  The
+    // uppercase expectation here was masked by the identity comparison above,
+    // which could never match whatever the case.
+    assert_eq!(lisp_text(pathname_name(translated)), "pkg");
+    assert_eq!(lisp_text(pathname_type(translated)), "lisp");
     assert!(pathname_directory(translated) != NIL);
 }
 

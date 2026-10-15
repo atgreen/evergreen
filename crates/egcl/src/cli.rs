@@ -41550,8 +41550,18 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // bare `t` to the process stdout and cannot see the dynamic binding
     // (bliss-oht4). NIL (return a string) and explicit stream/string destinations
     // pass through unchanged; the resolved stream is handled like any stream dest.
+    //
+    // Look *STANDARD-OUTPUT* up directly rather than through
+    // resolve_output_stream: that helper implements the STREAM DESIGNATOR rule
+    // of CLHS 21.1, where a bare `t` designates *TERMINAL-IO*, which is right
+    // for (write-string "x" t) but wrong here.  FORMAT's `t` is a destination,
+    // not a stream designator, and CLHS FORMAT says "if destination is t, the
+    // output is sent to *standard-output*".  Going through the designator
+    // helper sent (let ((*standard-output* cap)) (format t ...)) -- and so
+    // (with-output-to-string (*standard-output*) (format t ...)) -- to the
+    // terminal while the capture stream stayed empty.
     if *dest == T {
-        *dest = resolve_output_stream(T, env);
+        *dest = env.lookup_var("*STANDARD-OUTPUT*").unwrap_or(NIL);
     }
     let (ff, fa) = cp(*r);
     egcl_rt::rooted!(fa = fa);

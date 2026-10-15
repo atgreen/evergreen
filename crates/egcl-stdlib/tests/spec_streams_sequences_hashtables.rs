@@ -22,7 +22,8 @@ use egcl_stdlib::hashtable::{
 use egcl_stdlib::pathnames::register_string;
 use egcl_stdlib::sequences;
 use egcl_stdlib::streams::{
-    ExternalFormat, IF_EXISTS_SUPERSEDE_VAL, StreamDirection, close, file_length_fn, file_position,
+    ExternalFormat, IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_SUPERSEDE_VAL, StreamDirection,
+    close, file_length_fn, file_position,
     get_output_stream_string, make_broadcast_stream, make_concatenated_stream, make_echo_stream,
     make_lisp_string, make_lisp_string_fresh, make_string_input_stream, make_string_output_stream,
     make_synonym_stream, make_two_way_stream, open, open_stream_p, set_file_position,
@@ -234,7 +235,8 @@ fn file_streams_expose_position_length_and_external_format() {
         StreamDirection::Output,
         NIL,
         IF_EXISTS_SUPERSEDE_VAL,
-        T,
+        // :if-does-not-exist :create (T is not an accepted value).
+        IF_DOES_NOT_EXIST_CREATE_VAL,
         ExternalFormat::Utf8,
     )
     .unwrap();

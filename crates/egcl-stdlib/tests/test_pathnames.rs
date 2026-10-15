@@ -771,7 +771,13 @@ fn open_with_nonexistent_directory_errors() {
         streams::StreamDirection::Output,
         NIL, // default element-type
         NIL, // if-exists
-        NIL, // if-does-not-exist
+        // :if-does-not-exist :create, the CL default for :direction :output.
+        // Passing NIL here means the CL ":if-does-not-exist nil" policy, whose
+        // defined answer is to RETURN NIL rather than signal -- so the open
+        // succeeded-with-NIL and no FileError was ever possible.  With :create
+        // the missing parent directory makes the create itself fail, which is
+        // the error this test is about.
+        streams::IF_DOES_NOT_EXIST_CREATE_VAL,
         streams::ExternalFormat::Utf8,
     );
     assert!(

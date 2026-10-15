@@ -395,6 +395,19 @@ fn compute_effective_method_non_standard_variants() {
     assert_eq!(standard.2, vec![primary_1, primary_2]);
     assert_eq!(standard.3, vec![after]);
 
+    // A short-form combination accepts exactly its own qualifier, which its
+    // primary methods carry, and :around (CLHS 7.6.6.4).
+    // MethodQualifier::Combination records "carries the combination's name";
+    // MethodQualifier::Primary means UNQUALIFIED and is not acceptable.  This
+    // loop used to pass the Primary-qualified methods plus an :after method and
+    // expect both to be tolerated -- SBCL signals for the equivalent program
+    // ("requires all methods have either the single qualifier APPEND or the
+    // single qualifier :AROUND"), and so does egcl.
+    let combined_1 = fx(320);
+    let combined_2 = fx(321);
+    set_method_specializers(combined_1, vec![], MethodQualifier::Combination);
+    set_method_specializers(combined_2, vec![], MethodQualifier::Combination);
+
     for combo in [
         MethodCombinationType::Plus,
         MethodCombinationType::And,
@@ -406,11 +419,18 @@ fn compute_effective_method_non_standard_variants() {
         MethodCombinationType::Max,
         MethodCombinationType::Progn,
     ] {
-        let key =
-            compute_effective_method(gf, combo, &[around, primary_1, primary_2, after]).unwrap();
+        let key = compute_effective_method(gf, combo, &[around, combined_1, combined_2]).unwrap();
         let (kind, methods) = get_short_form_method(key).unwrap();
         assert_eq!(kind, combo);
-        assert_eq!(methods, vec![primary_1, primary_2]);
+        assert_eq!(methods, vec![combined_1, combined_2]);
+
+        // An unqualified or :after method is an error, not something to drop.
+        for bad in [primary_1, after] {
+            assert!(
+                compute_effective_method(gf, combo, &[around, combined_1, bad]).is_err(),
+                "{combo:?} must reject a method qualifier it does not accept"
+            );
+        }
     }
 }
 
@@ -449,9 +469,15 @@ fn multi_argument_dispatch_uses_later_specializer_positions() {
 
     let first_instance = make_instance(first, &[]).unwrap();
     let second_instance = make_instance(second_specific, &[]).unwrap();
-    let fixnum_class = class_of(fx(0));
-    let standard_object_class = class_direct_superclasses(fixnum_class)[0];
-    let t_class = class_direct_superclasses(standard_object_class)[0];
+    // Ask for T's class by name.  This used to walk two levels of
+    // CLASS-DIRECT-SUPERCLASSES up from FIXNUM's class and call the result T,
+    // which only held while the built-in classes were a shallow chain: with
+    // the CLHS precedence order in place FIXNUM's ancestry runs through the
+    // numeric tower, so the walk landed on an intermediate class and every
+    // method specialized on it became inapplicable -- COMPUTE-APPLICABLE-
+    // METHODS then correctly answered the empty list and the test read it as a
+    // dispatch failure.
+    let t_class = find_class(T).expect("T names a class after bootstrap");
 
     let gf = make_generic_function(sym(803), NIL).unwrap();
     let generic_second = fx(804);
@@ -581,3 +607,4 @@ fn metaobject_handles_are_off_the_fixnum_tag() {
     assert!(gf.is_meta_handle());
     assert_ne!(gf, EgclVal::from_fixnum(gf.as_meta_handle_id()));
 }
+
