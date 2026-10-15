@@ -4798,6 +4798,60 @@ fn eval_when_execute_mode_on_eval_and_source() {
     }
 }
 
+/// CLHS 2.4.8: GET-DISPATCH-MACRO-CHARACTER reports a function for each
+/// standard # sub-character, and that function behaves as the standard reader
+/// does when called: #+ and #- skip the next object under *READ-SUPPRESS* and
+/// return no values, so a reader that wraps the standard syntax -- zacl
+/// rewrites Allegro's (version>= ...) features and hands the rest to the
+/// standard #+ function -- still reads a list with a skipped element. It used
+/// to answer NIL for every sub-character but #\, and the wrapper died calling
+/// NIL.
+#[test]
+fn get_dispatch_macro_character_reports_callable_standard_functions() {
+    let program = r#"
+      (let* ((plus (get-dispatch-macro-character #\# #\+))
+             (paren (get-dispatch-macro-character #\# #\())
+             (bar (get-dispatch-macro-character #\# #\|))
+             (skipped (with-input-from-string (s "(or) skipped kept")
+                        (multiple-value-list (funcall plus s #\+ nil))))
+             (kept (with-input-from-string (s "(and) kept")
+                     (multiple-value-list (funcall plus s #\+ nil))))
+             (vec (with-input-from-string (s "1 2 3)")
+                    (multiple-value-list (funcall paren s #\( nil))))
+             (comment (with-input-from-string (s " text |# 7")
+                        (multiple-value-list (funcall bar s #\| nil)))))
+        (defun wrapped-sharp-plus (stream character arg)
+          (declare (ignore arg))
+          (let* ((original (get-dispatch-macro-character #\# character (copy-readtable nil)))
+                 (expression (read stream))
+                 (combined (make-concatenated-stream
+                            (make-string-input-stream (prin1-to-string expression))
+                            (make-string-input-stream " ")
+                            stream)))
+            (funcall original combined character nil)))
+        (let ((*readtable* (copy-readtable nil)))
+          (set-dispatch-macro-character #\# #\+ 'wrapped-sharp-plus)
+          (set-dispatch-macro-character #\# #\- 'wrapped-sharp-plus)
+          (princ (list (functionp plus) skipped kept vec comment
+                       (read-from-string "(a #+(or) b #-(or) c #+(and) d)")))))
+    "#;
+    let out = egcl_bin()
+        .args(["--eval", program])
+        .output()
+        .expect("run egcl with the dispatch reader functions");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(T NIL (KEPT) (#(1 2 3)) NIL (A C D))"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// FBOUNDP and FMAKUNBOUND consulted only NAME-keyed tables, and an uninterned
 /// symbol is not in the name registry. A function installed with
 /// `(setf (symbol-function (gensym)) …)` was therefore CALLABLE but reported
