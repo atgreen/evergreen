@@ -2646,6 +2646,14 @@ struct MethodDef {
     /// be bound with the same binder as functions (handles &optional/&rest/&key).
     lambda_list: EgclVal,
     qualifier: egcl_stdlib::MethodQualifier,
+    /// For a `Combination` qualifier, WHICH short-form combination it named.
+    /// `MethodQualifier::Combination` does not record that, and the name used to
+    /// be recovered by looking the owning generic up at query time -- so a
+    /// method REMOVED from its generic reported `(STANDARD)` instead of its own
+    /// `(+)` (bliss-0tz2h). The method now carries it. `None` for any other
+    /// qualifier, and for a method restored from an image written before this
+    /// field existed, where the generic lookup remains the fallback.
+    combination: Option<egcl_stdlib::MethodCombinationType>,
     body: EgclVal,
 }
 
@@ -3412,7 +3420,7 @@ fn host_serialize_registries() -> Vec<u8> {
                                     d.method_id.to_raw(),
                                     d.lambda_list.to_raw(),
                                     d.body.to_raw(),
-                                    qualifier_to_u8(d.qualifier),
+                                    qualifier_to_u8(d.qualifier, d.combination),
                                     frame_id_of(d.captured_frame.as_ref()),
                                     d.specializers
                                         .iter()
@@ -3726,20 +3734,37 @@ fn u8_to_combination(b: u8) -> egcl_stdlib::MethodCombinationType {
     }
 }
 
-fn qualifier_to_u8(q: egcl_stdlib::MethodQualifier) -> u8 {
+/// The image's qualifier byte. 0-5 are the plain qualifiers, and a
+/// `Combination` qualifier that knows WHICH combination it named is written as
+/// `COMBINATION_QUALIFIER_BASE + <combination byte>` so a saved method keeps
+/// its own qualifiers across a dump and restore. A bare 4 is still accepted on
+/// read: that is what images written before this encoding contain, and those
+/// methods fall back to their generic's combination (bliss-0tz2h).
+const COMBINATION_QUALIFIER_BASE: u8 = 16;
+
+fn qualifier_to_u8(
+    q: egcl_stdlib::MethodQualifier,
+    combination: Option<egcl_stdlib::MethodCombinationType>,
+) -> u8 {
     use egcl_stdlib::MethodQualifier as Q;
     match q {
         Q::Primary => 0,
         Q::Before => 1,
         Q::After => 2,
         Q::Around => 3,
-        Q::Combination => 4,
+        Q::Combination => match combination {
+            Some(c) => COMBINATION_QUALIFIER_BASE + combination_to_u8(c),
+            None => 4,
+        },
         Q::Other => 5,
     }
 }
 
 fn u8_to_qualifier(b: u8) -> egcl_stdlib::MethodQualifier {
     use egcl_stdlib::MethodQualifier as Q;
+    if b >= COMBINATION_QUALIFIER_BASE {
+        return Q::Combination;
+    }
     match b {
         1 => Q::Before,
         2 => Q::After,
@@ -3748,6 +3773,13 @@ fn u8_to_qualifier(b: u8) -> egcl_stdlib::MethodQualifier {
         5 => Q::Other,
         _ => Q::Primary,
     }
+}
+
+/// The combination a qualifier byte names, or `None` when the byte does not
+/// carry one (every qualifier but `Combination`, and the legacy bare 4).
+fn u8_to_method_combination(b: u8) -> Option<egcl_stdlib::MethodCombinationType> {
+    (b >= COMBINATION_QUALIFIER_BASE)
+        .then(|| u8_to_combination(b - COMBINATION_QUALIFIER_BASE))
 }
 
 /// Restore hook: parse the section, remap each saved pointer through the heap's
@@ -4319,6 +4351,7 @@ fn drain_pending_host_generics(env: &Env) {
             .into_iter()
             .map(|(mid, ll, body, qual, frame_id, specs)| MethodDef {
                 method_id: EgclVal::from_raw(mid),
+                combination: u8_to_method_combination(qual),
                 // Resolved against the CLSR frame table restored above. u32::MAX
                 // means the method captured nothing (bliss-mxjr).
                 captured_frame: if frame_id == u32::MAX {
@@ -11906,7 +11939,12 @@ fn dispatch_print_object(val: EgclVal, escape: bool) -> Option<String> {
         invoke_generic_function("PRINT-OBJECT", &[*val, *stream], env)
     };
     PRINTING_OBJECT.with(|c| c.set(false));
-    result.ok()?;
+    if let Err(e) = result {
+        // As for the pprint hook: a user PRINT-OBJECT method that signals or
+        // throws must not be read as "no method applied" (bliss-gppm7).
+        park_print_error(e);
+        return None;
+    }
     let s = egcl_stdlib::get_output_stream_string(*stream).ok()?;
     Some(val_as_str(s))
 }
@@ -11935,6 +11973,46 @@ fn stdlib_format_apply_hook(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, 
     apply_function(*func, &args, env)
 }
 
+thread_local! {
+    /// An error, or a non-local transfer, raised by Lisp that the PRINTER called
+    /// back into: a user `PRINT-OBJECT` method or a `*PRINT-PPRINT-DISPATCH*`
+    /// entry. Both hooks return `Option<String>` and the rendering chain behind
+    /// them returns a plain `String`, so there is nowhere to hand a `Result`
+    /// back; discarding the error instead made a signalling pprint entry read as
+    /// "no applicable entry, print normally", so `(format nil "~S" 1)` answered
+    /// "1" where SBCL signals, and a THROW out of an entry was swallowed
+    /// outright (bliss-gppm7). The error is parked here and re-signalled at the
+    /// boundary of the printing operation itself.
+    static PENDING_PRINT_ERROR: std::cell::RefCell<Option<EgclError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Park an error raised by Lisp called from the printer. The FIRST one wins:
+/// rendering continues after a declined hook and may call back again, and the
+/// original cause is the one worth reporting.
+fn park_print_error(e: EgclError) {
+    PENDING_PRINT_ERROR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(e);
+        }
+    });
+}
+
+/// Re-signal whatever a printer callback parked, at the end of a printing
+/// operation. `Err` from the operation itself wins, so that path only clears
+/// the slot: a stale parked error must never leak into the next operation.
+fn resignal_print_error(result: Result<EgclVal, EgclError>) -> Result<EgclVal, EgclError> {
+    let parked = PENDING_PRINT_ERROR.with(|cell| cell.borrow_mut().take());
+    match result {
+        Ok(v) => match parked {
+            Some(e) => Err(e),
+            None => Ok(v),
+        },
+        Err(e) => Err(e),
+    }
+}
+
 fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
     let table = egcl_rt::symbols::find_index("*PRINT-PPRINT-DISPATCH*")
         .and_then(egcl_rt::symbols::symbol_value)?;
@@ -11951,7 +12029,15 @@ fn stdlib_pprint_dispatch_hook(val: EgclVal, _escape: bool) -> Option<String> {
     // Safety: the parked pointer is the live print-entry &mut Env (as in
     // stdlib_print_object_hook); printing is single-threaded.
     let env = unsafe { &mut *ptr };
-    let result = apply_function(dispatch, &[*table, *val], env).ok()?;
+    let result = match apply_function(dispatch, &[*table, *val], env) {
+        Ok(v) => v,
+        Err(e) => {
+            // A pprint entry that signals or throws is NOT "no applicable
+            // entry": park the error so the printing operation re-signals it.
+            park_print_error(e);
+            return None;
+        }
+    };
     if is_string_value(result) {
         Some(val_as_str(result))
     } else {
@@ -14815,7 +14901,8 @@ fn is_builtin_disjoint_type(name: &str) -> bool {
 // hi2)` iff head is a subtype head of head2 AND the interval is contained.
 //
 // GC-safety: this whole path is allocation-free — bounds are extracted to `f64`
-// only via `num_bound_f64` (which never allocates), so no minor GC can fire and
+// only via `num_bound_exact` (which never allocates on the Lisp heap), so no
+// minor GC can fire and
 // no `EgclVal` needs rooting across it.
 
 /// A numeric head that admits interval bounds.
@@ -14862,12 +14949,23 @@ fn num_head_from_name(name: &str) -> Option<NumHead> {
     })
 }
 
-/// One end of a numeric interval.
-#[derive(Clone, Copy)]
+/// One end of a numeric interval, held EXACTLY.
+///
+/// These bounds used to be `f64`, which cannot tell adjacent integers apart
+/// above 2^53: `(integer 2^64 2^64)` and `(integer 2^64+1 2^64+1)` converted to
+/// the same double, so the range algebra below saw two singleton types as
+/// mutually containing and SUBTYPEP answered `T, T` where it must answer
+/// `NIL, T` (bliss-lek50). A finite float IS a rational, so every bound this
+/// code accepts -- integer, ratio, single or double float -- is a `BigRat` with
+/// no loss, and `bigrat_cmp` then decides every comparison exactly.
+///
+/// `BigRat` allocates on the RUST heap, never the Lisp heap, so this path still
+/// cannot fire a minor GC -- the property the callers depend on.
+#[derive(Clone)]
 enum Bnd {
     Star,
-    Incl(f64),
-    Excl(f64),
+    Incl(egcl_rt::bignum::BigRat),
+    Excl(egcl_rt::bignum::BigRat),
 }
 
 struct NumType {
@@ -14876,38 +14974,24 @@ struct NumType {
     hi: Bnd,
 }
 
-/// Extract a numeric bound value as `f64` WITHOUT allocating (so this path can
-/// never trigger a GC). Handles fixnums, single/double floats, and ratios whose
-/// numerator and denominator are fixnums — which covers every bound the ansi
-/// numeric-subtypep tests use. Bignums / big ratios return `None`, causing the
-/// caller to fall back to "unknown" rather than risk a moving-GC bug or an
-/// inexact answer.
-fn num_bound_f64(v: EgclVal) -> Option<f64> {
-    if v.is_fixnum() {
-        return Some(v.as_fixnum() as f64);
-    }
-    if v.is_heap_object() {
-        // A bignum bound ((unsigned-byte 64) and wider): the f64 approximation
-        // decides the containment the same way adjacent widths need.
-        if let Some(b) = egcl_rt::bignum::bigint_from_val(v) {
-            return Some(b.to_f64());
-        }
+/// A numeric bound as an exact rational. Integers (fixnum or bignum) and ratios
+/// convert directly; a finite float is converted to the rational it actually
+/// denotes, not to an approximation. A non-number, or a non-finite float, gives
+/// `None` so the whole relation stays "unknown".
+///
+/// Nothing here allocates on the Lisp heap, so no minor GC can fire while a
+/// caller holds unrooted values.
+fn num_bound_exact(v: EgclVal) -> Option<egcl_rt::bignum::BigRat> {
+    if let Some(r) = egcl_rt::bignum::as_bigrat(v) {
+        return Some(r);
     }
     if v.is_single_float() {
-        return Some(v.as_single_float() as f64);
+        let f = v.as_single_float();
+        return f.is_finite().then(|| f32_to_bigrat(f));
     }
     if v.is_double_float() {
-        return Some(v.as_double_float());
-    }
-    if let Some((n, d)) = ratio_parts_val(v) {
-        if n.is_fixnum() && d.is_fixnum() {
-            let df = d.as_fixnum() as f64;
-            if df == 0.0 {
-                return None;
-            }
-            return Some(n.as_fixnum() as f64 / df);
-        }
-        return None;
+        let f = v.as_double_float();
+        return f.is_finite().then(|| f64_to_bigrat(f));
     }
     None
 }
@@ -14924,9 +15008,9 @@ fn parse_num_bound(arg: Option<EgclVal>) -> Option<Bnd> {
             }
             if a.is_cons() {
                 let (inner, _) = cp(a);
-                return Some(Bnd::Excl(num_bound_f64(inner)?));
+                return Some(Bnd::Excl(num_bound_exact(inner)?));
             }
-            Some(Bnd::Incl(num_bound_f64(a)?))
+            Some(Bnd::Incl(num_bound_exact(a)?))
         }
     }
 }
@@ -14945,11 +15029,18 @@ fn parse_num_type(t: EgclVal) -> Option<NumType> {
         // For integers an exclusive bound names the adjacent integer, so
         // (INTEGER (9)) is (INTEGER 10) (ansi subtypep.integer.23/24).
         if head == NumHead::Integer {
-            if let Bnd::Excl(x) = lo {
-                lo = Bnd::Incl(x.floor() + 1.0);
+            // A legal INTEGER bound is an integer, so stepping by one is exact.
+            // Anything else is left exclusive rather than guessed at.
+            let one = egcl_rt::bignum::BigRat::from_i64(1);
+            if let Bnd::Excl(x) = &lo {
+                if x.is_integer() {
+                    lo = Bnd::Incl(egcl_rt::bignum::bigrat_add(x, &one));
+                }
             }
-            if let Bnd::Excl(x) = hi {
-                hi = Bnd::Incl(x.ceil() - 1.0);
+            if let Bnd::Excl(x) = &hi {
+                if x.is_integer() {
+                    hi = Bnd::Incl(egcl_rt::bignum::bigrat_sub(x, &one));
+                }
             }
         }
         Some(NumType { head, lo, hi })
@@ -14959,8 +15050,8 @@ fn parse_num_type(t: EgclVal) -> Option<NumType> {
         if name.as_ref() == "BIT" {
             return Some(NumType {
                 head: NumHead::Integer,
-                lo: Bnd::Incl(0.0),
-                hi: Bnd::Incl(1.0),
+                lo: Bnd::Incl(egcl_rt::bignum::BigRat::from_i64(0)),
+                hi: Bnd::Incl(egcl_rt::bignum::BigRat::from_i64(1)),
             });
         }
         let head = num_head_from_name(&name)?;
@@ -14993,59 +15084,60 @@ fn type_spec_invalid_for_typep(spec: EgclVal) -> bool {
 /// Is the numeric type provably empty (no numbers)? A range with lo > hi, or an
 /// exclusive endpoint that collapses the interval, is the empty type.
 fn num_type_empty(t: &NumType) -> bool {
-    let (lv, l_excl) = match t.lo {
+    let (lv, l_excl) = match &t.lo {
         Bnd::Star => return false,
         Bnd::Incl(v) => (v, false),
         Bnd::Excl(v) => (v, true),
     };
-    let (hv, h_excl) = match t.hi {
+    let (hv, h_excl) = match &t.hi {
         Bnd::Star => return false,
         Bnd::Incl(v) => (v, false),
         Bnd::Excl(v) => (v, true),
     };
-    if lv > hv {
-        return true;
+    match egcl_rt::bignum::bigrat_cmp(lv, hv) {
+        std::cmp::Ordering::Greater => true,
+        // Equal endpoints: empty unless both inclusive (a single point). For
+        // INTEGER an open endpoint at equal values is likewise empty.
+        std::cmp::Ordering::Equal => l_excl || h_excl,
+        std::cmp::Ordering::Less => false,
     }
-    // Equal endpoints: empty unless both inclusive (a single point). For INTEGER
-    // an open endpoint at equal values is likewise empty.
-    if lv == hv && (l_excl || h_excl) {
-        return true;
-    }
-    false
 }
 
 fn num_single_point(t: &NumType) -> bool {
-    matches!((t.lo, t.hi), (Bnd::Incl(a), Bnd::Incl(b)) if a == b)
+    matches!((&t.lo, &t.hi), (Bnd::Incl(a), Bnd::Incl(b))
+        if egcl_rt::bignum::bigrat_cmp(a, b) == std::cmp::Ordering::Equal)
 }
 
 /// Lower-bound coverage: does `sup_lo` admit every x that `sub_lo` admits?
-fn num_lower_ok(sup_lo: Bnd, sub_lo: Bnd) -> bool {
+fn num_lower_ok(sup_lo: &Bnd, sub_lo: &Bnd) -> bool {
+    use std::cmp::Ordering::{Equal, Less};
     match sup_lo {
         Bnd::Star => true,
         Bnd::Incl(a) => match sub_lo {
             Bnd::Star => false,
-            Bnd::Incl(b) | Bnd::Excl(b) => a <= b,
+            Bnd::Incl(b) | Bnd::Excl(b) => matches!(egcl_rt::bignum::bigrat_cmp(a, b), Less | Equal),
         },
         Bnd::Excl(a) => match sub_lo {
             Bnd::Star => false,
-            Bnd::Incl(b) => a < b,
-            Bnd::Excl(b) => a <= b,
+            Bnd::Incl(b) => egcl_rt::bignum::bigrat_cmp(a, b) == Less,
+            Bnd::Excl(b) => matches!(egcl_rt::bignum::bigrat_cmp(a, b), Less | Equal),
         },
     }
 }
 
 /// Upper-bound coverage: does `sup_hi` admit every x that `sub_hi` admits?
-fn num_upper_ok(sup_hi: Bnd, sub_hi: Bnd) -> bool {
+fn num_upper_ok(sup_hi: &Bnd, sub_hi: &Bnd) -> bool {
+    use std::cmp::Ordering::{Equal, Greater};
     match sup_hi {
         Bnd::Star => true,
         Bnd::Incl(a) => match sub_hi {
             Bnd::Star => false,
-            Bnd::Incl(b) | Bnd::Excl(b) => a >= b,
+            Bnd::Incl(b) | Bnd::Excl(b) => matches!(egcl_rt::bignum::bigrat_cmp(a, b), Greater | Equal),
         },
         Bnd::Excl(a) => match sub_hi {
             Bnd::Star => false,
-            Bnd::Incl(b) => a > b,
-            Bnd::Excl(b) => a >= b,
+            Bnd::Incl(b) => egcl_rt::bignum::bigrat_cmp(a, b) == Greater,
+            Bnd::Excl(b) => matches!(egcl_rt::bignum::bigrat_cmp(a, b), Greater | Equal),
         },
     }
 }
@@ -15071,8 +15163,8 @@ fn numeric_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
         }
         return Some((false, true));
     }
-    let lo_ok = num_lower_ok(p2.lo, p1.lo);
-    let hi_ok = num_upper_ok(p2.hi, p1.hi);
+    let lo_ok = num_lower_ok(&p2.lo, &p1.lo);
+    let hi_ok = num_upper_ok(&p2.hi, &p1.hi);
     Some((lo_ok && hi_ok, true))
 }
 
@@ -15153,8 +15245,12 @@ fn upgrade_elt(spec: EgclVal) -> EltU {
         // compound element types upgrade to T under egcl's policy.
         if let Some(nt) = parse_num_type(spec) {
             if matches!(nt.head, NumHead::Integer) {
-                if let (Bnd::Incl(lo), Bnd::Incl(hi)) = (nt.lo, nt.hi) {
-                    if lo == 0.0 && hi == 1.0 {
+                if let (Bnd::Incl(lo), Bnd::Incl(hi)) = (&nt.lo, &nt.hi) {
+                    let zero = egcl_rt::bignum::BigRat::from_i64(0);
+                    let one = egcl_rt::bignum::BigRat::from_i64(1);
+                    if egcl_rt::bignum::bigrat_cmp(lo, &zero) == std::cmp::Ordering::Equal
+                        && egcl_rt::bignum::bigrat_cmp(hi, &one) == std::cmp::Ordering::Equal
+                    {
                         return EltU::Bit;
                     }
                 }
@@ -18450,7 +18546,12 @@ fn eval_builtin_arguments(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let args = eval_args(forms, env)?;
-    evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler")
+    let result =
+        evaluated_builtins::call(name, &args, env).expect("source builtin has an evaluated handler");
+    // WRITE, PRIN1, PRINC, PRINT and friends render through the printer, which
+    // cannot return a Result from its callbacks into Lisp; re-signal anything a
+    // callback parked, and clear it either way so it cannot leak (bliss-gppm7).
+    resignal_print_error(result)
 }
 
 fn eval_atomic_update_form(
@@ -30269,7 +30370,8 @@ fn is_ansi_standard_macro(bare: &str) -> bool {
 /// `vec_to_list` / `eval_form` (moving GC).
 fn synthesize_macro_expander(env: &mut Env, name: EgclVal) -> Result<EgclVal, EgclError> {
     let lam = resolve_sym("LAMBDA").unwrap_or(NIL);
-    let mexp = resolve_sym("MACROEXPAND-1").unwrap_or(NIL);
+    let list_op = resolve_sym("LIST").unwrap_or(NIL);
+    let progn = resolve_sym("PROGN").unwrap_or(NIL);
     let decl = resolve_sym("DECLARE").unwrap_or(NIL);
     let ignore = resolve_sym("IGNORE").unwrap_or(NIL);
     let quote = resolve_sym("QUOTE").unwrap_or(NIL);
@@ -30291,7 +30393,21 @@ fn synthesize_macro_expander(env: &mut Env, name: EgclVal) -> Result<EgclVal, Eg
     egcl_rt::rooted!(quoted_name = vec_to_list(&[quote, *name]));
     egcl_rt::rooted!(cdr_form = vec_to_list(&[cdr_op, *form_p]));
     egcl_rt::rooted!(rebuilt = vec_to_list(&[cons_op, *quoted_name, *cdr_form]));
-    egcl_rt::rooted!(body = vec_to_list(&[mexp, *rebuilt]));
+    // Expand to `(PROGN <the call, rebuilt as NAME>)`.
+    //
+    // This is reached only for a standard macro the evaluator implements as a
+    // special-form arm, with no Lisp-level expansion to hand back (a real macro
+    // definition is returned before we get here). The body used to be
+    // `(macroexpand-1 <rebuilt>)`, which for such a name returns the form
+    // UNCHANGED -- so `(funcall (macro-function 'defclass) form nil)` answered
+    // `form` itself, where every other implementation answers an expansion
+    // (bliss-i07x5). Wrapping in PROGN is a valid expansion: it evaluates
+    // identically, it re-enters the native arm, and PROGN's subforms keep
+    // top-level status (CLHS 3.2.3.1) so a top-level DEFCLASS stays top level.
+    // MACROEXPAND terminates on it, because PROGN is a special operator and not
+    // itself a macro.
+    egcl_rt::rooted!(quoted_progn = vec_to_list(&[quote, progn]));
+    egcl_rt::rooted!(body = vec_to_list(&[list_op, *quoted_progn, *rebuilt]));
     egcl_rt::rooted!(lambda_form = vec_to_list(&[lam, *params, *decl_form, *body]));
     eval_form(*lambda_form, env)
 }
@@ -36734,10 +36850,24 @@ fn applicable_method_defs(env: &mut Env, gf_name: &str, args: &[EgclVal]) -> Vec
         .collect()
 }
 
+/// The short-form method combination the named generic function uses, if it is
+/// registered. Used when defining a method so the method records its own
+/// combination rather than looking it up later (bliss-0tz2h).
+fn methods_map_combination(
+    env: &Env,
+    generic_name: &str,
+) -> Option<egcl_stdlib::MethodCombinationType> {
+    env.generics
+        .borrow()
+        .get(generic_name)
+        .map(|generic| generic.combination)
+}
+
 fn method_qualifier_list(
     env: &Env,
     generic_name: &str,
     qualifier: egcl_stdlib::MethodQualifier,
+    combination: Option<egcl_stdlib::MethodCombinationType>,
 ) -> EgclVal {
     use egcl_stdlib::MethodQualifier as Q;
     let name = match qualifier {
@@ -36746,12 +36876,17 @@ fn method_qualifier_list(
         Q::After => ":AFTER",
         Q::Around => ":AROUND",
         Q::Combination => {
-            let combination = env
-                .generics
-                .borrow()
-                .get(generic_name)
-                .map(|generic| generic.combination)
-                .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
+            // The method's OWN combination when it has one. Falling back to the
+            // owning generic is only for methods restored from an image written
+            // before the field existed -- and is exactly what reported
+            // (STANDARD) for a detached method, which belongs to no generic.
+            let combination = combination.unwrap_or_else(|| {
+                env.generics
+                    .borrow()
+                    .get(generic_name)
+                    .map(|generic| generic.combination)
+                    .unwrap_or(egcl_stdlib::MethodCombinationType::Standard)
+            });
             method_combination_name(combination)
         }
     };
@@ -37399,6 +37534,19 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             .last()
             .is_some_and(|&base| base != frame_addr(&env.frame))
     });
+    // Capture WHICH short-form combination a `Combination` qualifier named, so
+    // the method can report its own qualifiers once detached. Read BEFORE the
+    // methods borrow below: the lock order is 'evaluator generics' (22) before
+    // 'evaluator methods' (23), and taking them the other way round trips the
+    // runtime's lock-order guard.
+    let combination = if qualifier == egcl_stdlib::MethodQualifier::Combination {
+        Some(
+            methods_map_combination(env, &name)
+                .unwrap_or(egcl_stdlib::MethodCombinationType::Standard),
+        )
+    } else {
+        None
+    };
     {
         let mut methods_map = env.methods.borrow_mut();
         let list = methods_map.entry(name.clone()).or_default();
@@ -37418,6 +37566,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             specializers,
             lambda_list: *lambda_list,
             qualifier,
+            combination,
             body,
         });
     }
@@ -41403,6 +41552,9 @@ fn eval_format(args: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let gray = is_gray_stream(*dest);
     let result = egcl_stdlib::format(if gray { NIL } else { *dest }, &fs, &av);
     PRINT_ENV.with(|c| c.set(prev_env));
+    // A ~A/~S that called a user PRINT-OBJECT method or pprint entry which
+    // signalled parked the error; this is that operation's boundary.
+    let result = resignal_print_error(result);
     if gray {
         egcl_rt::rooted!(rendered = result?);
         invoke_generic_function(
@@ -43229,6 +43381,7 @@ mod env_gc_root_tests {
             specializers: vec![MethodSpecializer::Eql(marker(offset + 1))],
             lambda_list: marker(offset + 2),
             qualifier: egcl_stdlib::MethodQualifier::Primary,
+            combination: None,
             body: marker(offset + 3),
         }
     }

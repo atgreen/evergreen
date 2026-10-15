@@ -3435,7 +3435,9 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             egcl_rt::rooted!(def = def);
             match operator {
-                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(env, &owner, def.qualifier)),
+                "METHOD-QUALIFIERS" => {
+                    Ok(method_qualifier_list(env, &owner, def.qualifier, def.combination))
+                }
                 "METHOD-SPECIALIZERS" => Ok(method_specializer_list(&def.specializers)),
                 "METHOD-LAMBDA-LIST" => Ok(def.lambda_list),
                 _ => {
@@ -3556,13 +3558,30 @@ fn resolve(name: &str) -> Option<Handler> {
                 if let Some(detached) = map.get_mut(DETACHED_METHODS_KEY) {
                     detached.retain(|m| m.method_id != args[1]);
                 }
-                let list = map.entry(gf_name.clone()).or_default();
-                // A method with the same qualifiers and specializers is replaced.
-                list.retain(|m| {
-                    !(m.qualifier == def.qualifier
-                        && specializers_equal(&m.specializers, &def.specializers))
-                });
-                list.push((*def).clone());
+                // A method with the same qualifiers and specializers is
+                // replaced (CLHS ADD-METHOD). The displaced one is still a live
+                // method object the program may hold and re-add, so move it to
+                // the detached pool: dropping it made (add-method gf displaced)
+                // a TYPE-ERROR, because the object no longer resolved to any
+                // method at all (bliss-0tz2h).
+                let mut displaced: Vec<MethodDef> = Vec::new();
+                {
+                    let list = map.entry(gf_name.clone()).or_default();
+                    list.retain(|m| {
+                        let same = m.qualifier == def.qualifier
+                            && specializers_equal(&m.specializers, &def.specializers);
+                        if same {
+                            displaced.push(m.clone());
+                        }
+                        !same
+                    });
+                    list.push((*def).clone());
+                }
+                if !displaced.is_empty() {
+                    map.entry(DETACHED_METHODS_KEY.to_string())
+                        .or_default()
+                        .extend(displaced);
+                }
             }
             egcl_stdlib::clos::add_method(generic_function, args[1])?;
             invalidate_gf_dispatch_cache();
