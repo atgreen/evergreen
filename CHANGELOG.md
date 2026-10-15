@@ -8,6 +8,35 @@ The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
 `misc` (740) chapters pass completely, as do `cons`, `data-and-control-flow`,
 `hash-tables`, `characters` and `strings`.
 
+- `SUBTYPEP` compares numeric bounds exactly. Bounds were held as `f64`, which
+  cannot tell adjacent integers apart above 2^53, so
+  `(subtypep '(integer 2^64 2^64) '(integer 2^64+1 2^64+1))` answered `T, T` --
+  a definite and wrong answer -- where it must answer `NIL, T`. Every bound the
+  range algebra accepts (integer, ratio, single or double float) is a rational,
+  so bounds are now exact rationals and every comparison is exact
+  ([#337](https://github.com/atgreen/evergreen/pull/337)).
+- An error or non-local exit from a user print function propagates. A
+  `*PRINT-PPRINT-DISPATCH*` entry or a `PRINT-OBJECT` method that signalled was
+  read as "no applicable entry", so the object printed normally and the error
+  vanished: `(format nil "~S" 1)` answered `"1"` instead of signalling, and a
+  `THROW` out of an entry was swallowed. The error is now re-signalled at the
+  boundary of the printing operation
+  ([#337](https://github.com/atgreen/evergreen/pull/337)).
+- A method object reports its own qualifiers once detached from its generic
+  function. `METHOD-QUALIFIERS` recovered the name of a short-form combination
+  by looking up the owning generic, so a method removed with `REMOVE-METHOD`
+  reported `(STANDARD)` rather than its own `(+)`. Methods now carry their
+  combination, including across `SAVE-LISP-AND-DIE` and image restore
+  ([#337](https://github.com/atgreen/evergreen/pull/337)).
+- `ADD-METHOD` keeps a method it displaces. Replacing a method with the same
+  qualifiers and specializers dropped the old one, so a program still holding
+  it got a `TYPE-ERROR` from `(add-method gf displaced)` and the wrong method
+  answered the call. The displaced method is now detached and can be re-added
+  ([#337](https://github.com/atgreen/evergreen/pull/337)).
+- `MACRO-FUNCTION` of a standard macro the evaluator implements natively returns
+  an expander that actually expands. It previously handed back the form
+  unchanged, so the returned function satisfied the type but did nothing
+  ([#337](https://github.com/atgreen/evergreen/pull/337)).
 - Run on kernels built without user shadow-stack support. On such a kernel
   (WSL2's, and many cloud VM kernels) `arch_prctl(ARCH_SHSTK_STATUS)` fails with
   `EINVAL`, which was read as "hardening state unknown" and refused, so every
