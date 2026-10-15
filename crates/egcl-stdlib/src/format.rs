@@ -1267,7 +1267,16 @@ fn real_format_value(val: EgclVal) -> Result<f64, EgclError> {
     }
 }
 
-fn egclval_to_print_inner(v: EgclVal, escapep: bool) -> String {
+fn egclval_to_print_inner(mut v: EgclVal, escapep: bool) -> String {
+    // Root V for the rest of the function. dispatch_pprint below calls a Lisp
+    // pprint function through the dispatch hook: that allocates (the applicable
+    // entry search, a string stream, the call itself) and so can fire a
+    // relocating minor GC. The hook roots its OWN copy, which keeps the object
+    // alive but leaves this one stale, and every test after the call -- is_nil,
+    // is_instance, the heap-object header reads -- would then read a moved
+    // object. Same shape as the condition that printed as #<HEAP-OBJECT> in
+    // stdlib_print_object_hook (bliss-phgt).
+    egcl_rt::rooted_ref!(_v_root = &mut v);
     // A *PRINT-PPRINT-DISPATCH* entry applying to V prints it instead
     // (only when *PRINT-PRETTY* is true and a table with entries is bound).
     if let Some(s) = dispatch_pprint(v, escapep) {
