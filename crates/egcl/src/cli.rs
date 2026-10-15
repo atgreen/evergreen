@@ -18936,10 +18936,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
             "EVAL-WHEN" => {
                 let (situations, body) = cp(cdr);
-                return if eval_when_should_run(situations, env)? {
-                    eval_progn(body, env)
+                if !eval_when_should_run(situations, env)? {
+                    return Ok(NIL);
+                }
+                // CLHS 3.2.3.1: once COMPILE-FILE evaluates a top-level
+                // EVAL-WHEN's body (compile-time-too mode), a nested EVAL-WHEN
+                // runs whenever :EXECUTE is present, and whatever the body calls
+                // -- EVAL included -- is ordinary evaluation.  Keeping the
+                // CompileFile rule for the body made every
+                // (eval-when (:load-toplevel :execute) ...) reached from
+                // compile-time code evaluate to NIL without running, which is
+                // what DEFREADTABLE expands to, so a readtable defined for use
+                // in the same file never existed at compile time.
+                return if matches!(env.eval_context, EvalContext::CompileFile) {
+                    with_eval_context(env, EvalContext::Eval, |env| eval_progn(body, env))
                 } else {
-                    Ok(NIL)
+                    eval_progn(body, env)
                 };
             }
             "BLOCK" => {
