@@ -2138,9 +2138,17 @@ fn to_roman(n: i64, old: bool) -> String {
 /// character itself when it has no name.  The implementation-defined names
 /// match SBCL for compatibility with libraries such as cl-str (bliss-rr9q).
 pub fn character_name(c: char) -> String {
-    // CLHS 22.1.3.2: a graphic character other than Space prints as itself;
-    // Space and the non-graphic characters print by name.
-    if c != ' ' && graphic_char_p(c) {
+    // CLHS 22.1.3.2: a graphic character prints as itself; a non-graphic one
+    // prints by name.
+    //
+    // Every WHITESPACE character prints by name, not just Space. A literal
+    // NO-BREAK SPACE (U+00A0) or IDEOGRAPHIC SPACE (U+3000) in the output is
+    // indistinguishable from a plain space, so PRIN1 would not read back to the
+    // same character -- and `graphic_char_p` accepts both, being true for
+    // everything from U+00A0 up. SBCL prints #\NO-BREAK_SPACE and
+    // #\IDEOGRAPHIC_SPACE for them (bliss-nbsp-name). A whitespace character
+    // with no name in the table still falls through and prints as itself.
+    if !c.is_whitespace() && graphic_char_p(c) {
         return c.to_string();
     }
     egcl_compiler::reader::char_name(c).unwrap_or_else(|| c.to_string())

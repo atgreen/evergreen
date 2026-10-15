@@ -5173,6 +5173,21 @@ a hook error aborts startup.")
         do (if (consp list) (setq list (cdr list)) (return-from egcl::%typed-struct-list-name-p nil)))
   (and (consp list) (eq (car list) name)))
 
+(defun egcl::%typed-struct-check-form (value-form slot-type)
+  "VALUE-FORM wrapped so a value outside SLOT-TYPE signals a TYPE-ERROR whose
+datum is the value and whose expected type is the declared one. A :TYPE slot
+option is enforced for a typed structure exactly as for a standard one (CLHS
+3.4.6): SBCL signals for (make-list-point :x :bad) with an INTEGER slot, and
+this used to store :BAD silently because the typed path -- which boot.lisp owns
+entirely, eval_defstruct delegating to %DEFTYPEDSTRUCT -- never checked. T
+declares no constraint, so it is returned unwrapped and costs nothing."
+  (if (eq slot-type t)
+      value-form
+      (let ((value (gensym "TYPED-SLOT")))
+        `(let ((,value ,value-form))
+           (check-type ,value ,slot-type)
+           ,value))))
+
 (defun egcl::%typed-struct-build-form (rep element-type total names slots values)
   "A form building the sequence: NAMES mark the :NAMED positions, VALUES is an
 alist from slot name to the form supplying it."
@@ -5180,7 +5195,11 @@ alist from slot name to the form supplying it."
     (dolist (entry names)
       (setf (nth (cdr entry) elements) `',(car entry)))
     (dolist (slot slots)
-      (setf (nth (second slot) elements) (cdr (assoc (first slot) values))))
+      ;; Enforce the slot's :TYPE here, where both the keyword constructor and
+      ;; every BOA constructor pass through.
+      (setf (nth (second slot) elements)
+            (egcl::%typed-struct-check-form (cdr (assoc (first slot) values))
+                                            (fourth slot))))
     (if (eq rep 'list)
         `(list ,@elements)
         `(make-array ,total :element-type ',element-type
@@ -5312,7 +5331,9 @@ no parameter names take their defaults."
             (index (second slot)))
         (push `(defun ,accessor (object) (elt object ,index)) forms)
         (unless (fifth slot)
-          (push `(defun (setf ,accessor) (value object) (setf (elt object ,index) value))
+          (push `(defun (setf ,accessor) (value object)
+                   (setf (elt object ,index)
+                         ,(egcl::%typed-struct-check-form 'value (fourth slot))))
                 forms))))
     ;; The predicate exists only for a :NAMED structure.
     (let ((predicate (cond ((not named) nil)
