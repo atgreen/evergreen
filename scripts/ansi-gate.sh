@@ -45,7 +45,10 @@ set -u
 # objects 811/52, arrays 1243/113, printer 2288/158, system-construction 39/38.
 # files added 2026-10-15: ok (87/87) once RENAME-FILE accepted a file stream as
 # its filespec (rename-file.4) and the gate cleared sandbox/scratch for it.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files)
+# environment added 2026-10-15: ok (210/210) once FUNCTION-KEYWORDS,
+# INITIALIZE-INSTANCE, NO-APPLICABLE-METHOD and NO-NEXT-METHOD had function
+# objects (documentation.function.t.12 walks every standard generic function).
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"

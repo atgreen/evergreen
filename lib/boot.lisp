@@ -582,6 +582,22 @@
   (declare (ignore environment))
   (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
 
+;; CLHS FUNCTION-KEYWORDS: the keyword parameter names a method's lambda list
+;; declares, as keywords, and whether it has &ALLOW-OTHER-KEYS.
+(defgeneric function-keywords (method))
+(defmethod function-keywords ((method standard-method))
+  (let ((keys '()) (allow-other-keys nil) (in-keys nil))
+    (dolist (item (method-lambda-list method))
+      (cond ((eq item '&key) (setq in-keys t))
+            ((eq item '&allow-other-keys) (setq allow-other-keys t))
+            ((member item lambda-list-keywords) (setq in-keys nil))
+            (in-keys
+             (push (cond ((symbolp item) (intern (symbol-name item) :keyword))
+                         ((consp (car item)) (caar item))
+                         (t (intern (symbol-name (car item)) :keyword)))
+                   keys))))
+    (values (nreverse keys) allow-other-keys)))
+
 ;; CHANGE-CLASS is a generic function so :before/:after/:around methods take
 ;; part; the standard method is the built-in class change.
 (defmethod change-class ((instance standard-object) new-class &rest initargs)
@@ -608,6 +624,25 @@
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
   (egcl-internal::%check-initargs instance initargs)
   (apply #'shared-initialize instance nil initargs))
+
+;; CLHS INITIALIZE-INSTANCE: the default method calls SHARED-INITIALIZE with
+;; slot-names T.  MAKE-INSTANCE's built-in slot initialization stands in for it
+;; and runs the user's :after methods itself, so this method is reached by a
+;; direct call and by a user :around method's CALL-NEXT-METHOD.
+(defmethod initialize-instance ((instance standard-object) &rest initargs)
+  (apply #'shared-initialize instance t initargs))
+
+;; CLHS NO-APPLICABLE-METHOD and NO-NEXT-METHOD: the default methods signal an
+;; error.  The dispatcher signals its own conditions in those situations; these
+;; definitions make the two standard generic functions reachable as function
+;; objects (ansi documentation.function.t.12) and callable by user code.
+(defmethod no-applicable-method ((generic-function t) &rest function-arguments)
+  (error "no applicable method for generic function ~S with arguments ~S"
+         generic-function function-arguments))
+
+(defmethod no-next-method ((generic-function t) (method t) &rest args)
+  (declare (ignore args))
+  (error "no next method for ~S in generic function ~S" method generic-function))
 
 (defmethod update-instance-for-different-class
     ((previous standard-object) (current standard-object) &rest initargs)
