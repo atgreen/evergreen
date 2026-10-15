@@ -225,7 +225,7 @@ static ANY_NONUPCASE_CASE: std::sync::atomic::AtomicBool =
 /// 0 = `:upcase` (default), 1 = `:downcase`, 2 = `:preserve`, 3 = `:invert`.
 /// Reads the `case_mode` byte from the live readtable object; a non-readtable
 /// value (e.g. the `:standard-readtable` placeholder) reads as `:upcase`.
-fn current_readtable_case_mode() -> u8 {
+pub fn current_readtable_case_mode() -> u8 {
     if !ANY_NONUPCASE_CASE.load(std::sync::atomic::Ordering::Relaxed) {
         return 0;
     }
@@ -2149,36 +2149,42 @@ fn collect_token(
     }
     if case_mode == 3 {
         // `:invert` — if every unescaped letter is the same case, invert it;
-        // a mixed-case token is left unchanged (CLHS 23.1.2).
-        let mut saw_upper = false;
-        let mut saw_lower = false;
-        for (ch, eligible) in name.chars().zip(invert_eligible.iter()) {
-            if *eligible {
-                if ch.is_ascii_uppercase() {
-                    saw_upper = true;
-                } else if ch.is_ascii_lowercase() {
-                    saw_lower = true;
+        // a mixed-case token is left unchanged (CLHS 23.1.2).  The package
+        // prefix and the symbol name are inverted independently, so
+        // `print-symbol-test-package::A` (what the printer writes for |a|)
+        // reads back as that symbol (ansi print.symbol.random.*).
+        let chars: Vec<char> = name.chars().collect();
+        let split = first_unescaped_colon
+            .map(|byte| name[..byte].chars().count())
+            .unwrap_or(chars.len());
+        let mut inverted = String::with_capacity(name.len());
+        for (lo, hi) in [(0, split), (split, chars.len())] {
+            let mut saw_upper = false;
+            let mut saw_lower = false;
+            for k in lo..hi {
+                if invert_eligible[k] {
+                    if chars[k].is_ascii_uppercase() {
+                        saw_upper = true;
+                    } else if chars[k].is_ascii_lowercase() {
+                        saw_lower = true;
+                    }
                 }
             }
-        }
-        if saw_upper ^ saw_lower {
-            let inverted: String = name
-                .chars()
-                .zip(invert_eligible.iter())
-                .map(|(ch, eligible)| {
-                    if *eligible {
-                        if ch.is_ascii_uppercase() {
-                            ch.to_ascii_lowercase()
-                        } else {
-                            ch.to_ascii_uppercase()
-                        }
+            let flip = saw_upper ^ saw_lower;
+            for k in lo..hi {
+                let ch = chars[k];
+                inverted.push(if flip && invert_eligible[k] {
+                    if ch.is_ascii_uppercase() {
+                        ch.to_ascii_lowercase()
                     } else {
-                        ch
+                        ch.to_ascii_uppercase()
                     }
-                })
-                .collect();
-            name = inverted;
+                } else {
+                    ch
+                });
+            }
         }
+        name = inverted;
     }
     Ok((name, pos, had_escape, first_unescaped_colon))
 }
@@ -2344,6 +2350,66 @@ pub fn read_symbol_token(name: &str) -> Result<Option<EgclVal>, EgclError> {
     }
     let idx = resolve_symbol_via_hook(None, &upper).unwrap_or_else(|| intern_symbol(&upper));
     Ok(Some(EgclVal::from_symbol_index(idx)))
+}
+
+/// The names of the 32 ASCII control characters (codes 0-31), in code order:
+/// the standard semi-standard names (Backspace, Tab, Newline, Page, Return)
+/// and the ASCII mnemonics for the rest, matching SBCL.  Code 0 and code 7
+/// print as "Null" and "Bell"; "Nul" and "Bel" read back too.
+pub const CONTROL_CHAR_NAMES: [&str; 32] = [
+    "Null", "Soh", "Stx", "Etx", "Eot", "Enq", "Ack", "Bell", "Backspace", "Tab", "Newline",
+    "Vt", "Page", "Return", "So", "Si", "Dle", "Dc1", "Dc2", "Dc3", "Dc4", "Nak", "Syn",
+    "Etb", "Can", "Em", "Sub", "Escape", "Fs", "Gs", "Rs", "Us",
+];
+
+/// CHAR-NAME: the name of `c`, when it has one.  Every non-graphic character
+/// is named so that `#\` output always reads back: the control table above,
+/// Rubout, Next-Line, and `U+XXXX` for the remaining C1 controls; the two
+/// named Unicode spaces keep their names.  Other graphic characters have none.
+pub fn char_name(c: char) -> Option<String> {
+    let code = c as u32;
+    Some(match code {
+        0..=31 => CONTROL_CHAR_NAMES[code as usize].to_string(),
+        32 => "Space".to_string(),
+        127 => "Rubout".to_string(),
+        0x85 => "Next-Line".to_string(),
+        0x80..=0x9f => format!("U+{:04X}", code),
+        0xa0 => "NO-BREAK_SPACE".to_string(),
+        0x3000 => "IDEOGRAPHIC_SPACE".to_string(),
+        _ => return None,
+    })
+}
+
+/// NAME-CHAR: the character `name` designates, ignoring case: anything
+/// `char_name` produces, the aliases Nul/Bel/Esc/Linefeed/Delete, and the
+/// `U+XXXX` / `UXXXX` hexadecimal spellings.
+pub fn char_from_name(name: &str) -> Option<char> {
+    let lower = name.to_ascii_lowercase();
+    if let Some(pos) = CONTROL_CHAR_NAMES
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name))
+    {
+        return char::from_u32(pos as u32);
+    }
+    let direct = match lower.as_str() {
+        "nul" => '\0',
+        "bel" => '\u{7}',
+        "esc" => '\u{1b}',
+        "space" => ' ',
+        "linefeed" => '\n',
+        "rubout" | "delete" => '\u{7f}',
+        "next-line" => '\u{85}',
+        "no-break_space" => '\u{a0}',
+        "ideographic_space" => '\u{3000}',
+        _ => {
+            let hex = lower
+                .strip_prefix("u+")
+                .or_else(|| lower.strip_prefix('u'))
+                .filter(|h| h.len() >= 2 && h.chars().all(|d| d.is_ascii_hexdigit()))?;
+            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+        }
+    };
+    Some(direct)
 }
 
 /// `colon_pos` is the byte offset of the token's package marker — the first
@@ -2533,7 +2599,30 @@ fn try_parse_number_with_base(s: &str, read_base: u32) -> Result<Option<EgclVal>
     // `1.5d0` (double-float syntax) and `1d0` must read as a float, not a
     // symbol. parse_decimal_float validates the grammar so hex-like symbols
     // (e.g. `FACE` in a base-16 context) are not misread as floats.
-    if read_base == 10 {
+    // `123.` with a trailing decimal point is a DECIMAL integer whatever the
+    // read base (CLHS 2.3.2.1.1; ansi print.complex.random with *print-radix*).
+    if let Some(body) = s.strip_suffix('.') {
+        let digits = body.trim_start_matches(['+', '-']);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            if let Ok(n) = body.trim_start_matches('+').parse::<i64>() {
+                if fits_fixnum(n) {
+                    return Ok(Some(EgclVal::from_fixnum(n)));
+                }
+                return Ok(Some(alloc_bignum_from_i64(n)));
+            }
+            if let Some(big) = parse_bignum(body, 10) {
+                return Ok(Some(big));
+            }
+        }
+    }
+    // Float syntax is always decimal (CLHS 2.3.1.1); a token that is a valid
+    // integer in the current base reads as that integer first, so `1E5` stays
+    // an integer in base 16 (ansi print.double-float.random under *print-base*).
+    let integer_in_base = {
+        let digits = s.trim_start_matches(['+', '-']);
+        !digits.is_empty() && digits.chars().all(|c| c.is_digit(read_base))
+    };
+    if !integer_in_base {
         if let Some((f, is_double)) = parse_decimal_float(s) {
             // CLHS 2.3.2.2: a literal outside the target format's range must
             // signal an error, not read as infinity (bliss-37sr; SBCL signals
@@ -3184,35 +3273,16 @@ fn read_char_literal_input(
     }
     if end - start > 1 {
         let name: String = chars.data()[start..end].iter().collect();
-        match name.to_lowercase().as_str() {
-            "sub" => return Ok((EgclVal::from_char('\u{1a}'), end)),
-            "esc" | "escape" => return Ok((EgclVal::from_char('\u{1b}'), end)),
-            "space" => return Ok((EgclVal::from_char(' '), end)),
-            "newline" => return Ok((EgclVal::from_char('\n'), end)),
-            "tab" => return Ok((EgclVal::from_char('\t'), end)),
-            "return" => return Ok((EgclVal::from_char('\r'), end)),
-            "backspace" => return Ok((EgclVal::from_char('\u{08}'), end)),
-            // CHAR-NAME of code 7 is "Bell", so #\Bell must read back
-            // (syntax.sharp-backslash.6).
-            "bell" => return Ok((EgclVal::from_char('\u{07}'), end)),
-            "rubout" | "delete" => return Ok((EgclVal::from_char('\u{7F}'), end)),
-            "page" => return Ok((EgclVal::from_char('\u{0C}'), end)),
-            "linefeed" => return Ok((EgclVal::from_char('\n'), end)),
-            "vt" => return Ok((EgclVal::from_char('\u{0B}'), end)),
-            "next-line" => return Ok((EgclVal::from_char('\u{85}'), end)),
-            "no-break_space" => return Ok((EgclVal::from_char('\u{A0}'), end)),
-            "ideographic_space" => return Ok((EgclVal::from_char('\u{3000}'), end)),
-            "nul" | "null" => return Ok((EgclVal::from_char('\0'), end)),
-            _ => {
-                if name.len() == 1 {
-                    return Ok((EgclVal::from_char(name.chars().next().unwrap()), end));
-                }
-                return Err(EgclError::StreamError(format!(
-                    "unknown character name: {}",
-                    name
-                )));
-            }
+        if let Some(c) = char_from_name(&name) {
+            return Ok((EgclVal::from_char(c), end));
         }
+        if name.len() == 1 {
+            return Ok((EgclVal::from_char(name.chars().next().unwrap()), end));
+        }
+        return Err(EgclError::StreamError(format!(
+            "unknown character name: {}",
+            name
+        )));
     }
     Ok((EgclVal::from_char(chars.at(pos)?), end))
 }
