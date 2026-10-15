@@ -267,6 +267,33 @@ fn any_custom_macros() -> bool {
 /// (just past the sub-char). Returns None when no handler applies; otherwise
 /// the handler's contribution: its single value, or — for a zero-value
 /// handler — the NEXT token read from where the handler stopped.
+/// Continue after a Lisp reader-macro function contributed no value: like
+/// a comment, it yields no object, so the next object is read -- unless the
+/// macro was the last thing before a list close `)` or the end of input,
+/// where there is no next object. Return MISSING then, so the enclosing
+/// list reader closes the list (or the top-level loop sees nothing read)
+/// instead of reading `)` as a token. The built-in `#|` arm has done this
+/// since babel's `(#x110000 #| yay |#)`; a user `#+` wrapper skipping the
+/// last element of a list -- zacl's Allegro feature rewriter on
+/// AllegroServe's `(defvar *socket-stream-type* #+... :hiper #-... :stream)`
+/// -- hit the same "unexpected ')'" through the three Lisp-handler paths.
+#[allow(clippy::too_many_arguments)]
+fn continue_after_silent_macro(
+    chars: &mut ReaderInput<'_>,
+    pos: usize,
+    labels: &mut CircularLabels,
+    read_base: u32,
+    read_eval: bool,
+    read_circular: bool,
+    depth: usize,
+) -> Result<(EgclVal, usize), EgclError> {
+    let p = skip_whitespace_and_comments(chars, pos)?;
+    if !chars.has(p)? || chars.at(p)? == ')' {
+        return Ok((MISSING, p));
+    }
+    read_token_with_base(chars, p, labels, read_base, read_eval, read_circular, depth)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn try_custom_sharp_dispatch(
     chars: &mut ReaderInput<'_>,
@@ -298,7 +325,7 @@ fn try_custom_sharp_dispatch(
                 let newpos = pos_after_sub + consumed;
                 match vals.into_iter().next() {
                     Some(v) => Ok((v, newpos)),
-                    None => read_token_with_base(
+                    None => continue_after_silent_macro(
                         chars,
                         newpos,
                         labels,
@@ -1485,7 +1512,7 @@ fn read_custom_dispatch_char(
                         let newpos = p + consumed;
                         match vals.into_iter().next() {
                             Some(v) => Ok((v, newpos)),
-                            None => read_token_with_base(
+                            None => continue_after_silent_macro(
                                 chars,
                                 newpos,
                                 labels,
@@ -1571,7 +1598,7 @@ fn read_token_with_base(
                                     let newpos = pos + 1 + consumed;
                                     match vals.into_iter().next() {
                                         Some(v) => Ok((v, newpos)),
-                                        None => read_token_with_base(
+                                        None => continue_after_silent_macro(
                                             chars,
                                             newpos,
                                             labels,

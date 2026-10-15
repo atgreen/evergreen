@@ -4632,6 +4632,44 @@ fn find_symbol_is_case_sensitive() {
     );
 }
 
+/// A Lisp reader-macro function that returns no values -- a `#+` wrapper
+/// skipping an element, a comment-like `#z`, a plain macro character -- yields
+/// no object, and when it is the last thing before `)` the list closes there,
+/// as it does for the built-in `#|...|#`. The reader used to read the next
+/// token unconditionally and hit `)` ("unexpected ')'"), which stopped
+/// AllegroServe's `(defvar *socket-stream-type* #+(...) :hiper #-(...) :stream)`
+/// under zacl's feature rewriter.
+#[test]
+fn silent_reader_macro_before_a_list_close_closes_the_list() {
+    let program = r##"
+      (defun silent (stream &rest args) (declare (ignore stream args)) (values))
+      (let ((*readtable* (copy-readtable nil)))
+        (set-dispatch-macro-character #\# #\z 'silent)
+        (set-macro-character #\! 'silent)
+        (make-dispatch-macro-character #\$)
+        (set-dispatch-macro-character #\$ #\z 'silent)
+        (princ (list (read-from-string "(a #z)") (read-from-string "(a #z
+          )")
+                     (read-from-string "(#z)") (read-from-string "(a !)") (read-from-string "(a $z)")
+                     (read-from-string "(a #z b)") (multiple-value-list (read-from-string "#z" nil :eof)))))
+    "##;
+    let out = egcl_bin()
+        .args(["--eval", program])
+        .output()
+        .expect("run egcl with silent reader macros");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("((A) (A) NIL (A) (A) (A B) (EOF 2))"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-rsur: CHAR-NAME/NAME-CHAR must round-trip. Char 65533 (U+FFFD) was
 /// wrongly named "Rubout" (which is char 127), so (name-char (char-name #\U+FFFD))
 /// gave 127, not 65533. U+FFFD has no CL standard name -> char-name returns nil.
