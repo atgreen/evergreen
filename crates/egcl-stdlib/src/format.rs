@@ -1105,14 +1105,30 @@ fn format_e_fixed(f: f64, d: usize, e: Option<usize>, k: i64, exp_char: char) ->
 }
 
 /// Walk a cons-cell linked list and collect all car values into a Vec.
+/// The elements of a list. A cdr-circular list stops once the cycle is
+/// detected, so a `~:<...~:>` or `~{...~}` over `#1=(0 . #1#)` cannot grow a
+/// vector without bound (the printer chapter once died allocating 8 GB here).
 fn cons_list_to_vec(v: EgclVal) -> Vec<EgclVal> {
     let mut result = Vec::new();
     let mut current = v;
+    // Floyd's tortoise: advances one cons for every two the cursor takes.
+    let mut tortoise = v;
+    let mut step = false;
     while current.is_cons() {
         unsafe {
             let ptr = current.as_ptr() as *const egcl_rt::object::ConsCell;
             result.push((*ptr).car);
             current = (*ptr).cdr;
+        }
+        if step {
+            unsafe {
+                let ptr = tortoise.as_ptr() as *const egcl_rt::object::ConsCell;
+                tortoise = (*ptr).cdr;
+            }
+        }
+        step = !step;
+        if current.is_cons() && current == tortoise {
+            break;
         }
     }
     result

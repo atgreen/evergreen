@@ -3401,11 +3401,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let instance = args.first().copied().unwrap_or(NIL);
             let slot = args.get(1).copied().unwrap_or(NIL);
-            Ok(if slot_is_bound(instance, slot, env)? {
-                T
-            } else {
-                NIL
-            })
+            slot_boundp_protocol(instance, slot, env)
         }),
 
         "ALLOCATE-INSTANCE" => Some(|_operator, args, env| {
@@ -3421,6 +3417,151 @@ fn resolve(name: &str) -> Option<Handler> {
             // real class metaobjects rather than here.
             let class = resolve_class_metaobject(env, class_input)?;
             egcl_stdlib::clos::allocate_instance(class)
+        }),
+
+        "METHOD-QUALIFIERS" | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST"
+        | "METHOD-GENERIC-FUNCTION" => Some(|operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some((owner, def)) = method_def_by_id(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "METHOD".into(),
+                });
+            };
+            egcl_rt::rooted!(def = def);
+            match operator {
+                "METHOD-QUALIFIERS" => Ok(method_qualifier_list(env, &owner, def.qualifier)),
+                "METHOD-SPECIALIZERS" => Ok(method_specializer_list(&def.specializers)),
+                "METHOD-LAMBDA-LIST" => Ok(def.lambda_list),
+                _ => {
+                    // The generic function as `#'name` reifies it, so it is EQ
+                    // to what the program holds (ansi method-generic-function.*).
+                    if owner == DETACHED_METHODS_KEY {
+                        return Ok(NIL);
+                    }
+                    let Some(name_sym) = resolve_sym(&owner) else {
+                        return Ok(NIL);
+                    };
+                    egcl_rt::rooted!(function_form =
+                        vec_to_list(&[resolve_sym("FUNCTION").unwrap_or(NIL), name_sym]));
+                    eval_form(*function_form, env)
+                }
+            }
+        }),
+
+        "COMPUTE-APPLICABLE-METHODS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            egcl_rt::rooted!(call_args = list_to_vec(args[1]));
+            let mut ordered = applicable_method_defs(env, &gf_name, &call_args);
+            egcl_rt::rooted_ref!(_ordered_root = &mut ordered);
+            let ids: Vec<EgclVal> = ordered.iter().map(|method| method.method_id).collect();
+            Ok(vec_to_list(&ids))
+        }),
+
+        "REMOVE-METHOD" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            // CLHS REMOVE-METHOD: a method the generic function does not have
+            // leaves it unchanged; the generic function is returned.
+            let removed = {
+                let mut map = env.methods.borrow_mut();
+                let Some(list) = map.get_mut(&gf_name) else {
+                    return Ok(args[0]);
+                };
+                list.iter()
+                    .position(|m| m.method_id == args[1])
+                    .map(|position| list.remove(position))
+            };
+            if let Some(def) = removed {
+                let generic_function = env
+                    .generics
+                    .borrow()
+                    .get(&gf_name)
+                    .map(|generic| generic.generic_function);
+                if let Some(generic_function) = generic_function {
+                    egcl_stdlib::clos::remove_method(generic_function, args[1])?;
+                }
+                env.methods
+                    .borrow_mut()
+                    .entry(DETACHED_METHODS_KEY.to_string())
+                    .or_default()
+                    .push(def);
+                invalidate_gf_dispatch_cache();
+            }
+            Ok(args[0])
+        }),
+
+        "ADD-METHOD" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            let Some(gf_name) = generic_function_name_of(env, args[0]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            let Some((owner, def)) = method_def_by_id(env, args[1]) else {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "METHOD".into(),
+                });
+            };
+            egcl_rt::rooted!(def = def);
+            if owner == gf_name {
+                return Ok(args[0]);
+            }
+            // CLHS ADD-METHOD: a method already belonging to another generic
+            // function, or with an incongruent lambda list, is an error.
+            if owner != DETACHED_METHODS_KEY {
+                return Err(EgclError::ProgramError(format!(
+                    "ADD-METHOD: the method already belongs to {owner}"
+                )));
+            }
+            let name_sym = resolve_sym(&gf_name).unwrap_or(NIL);
+            if let Some(generic_lambda_list) = stored_generic_lambda_list(name_sym) {
+                if !method_lambda_list_congruent(generic_lambda_list, def.lambda_list) {
+                    return Err(EgclError::ProgramError(format!(
+                        "ADD-METHOD: the method's lambda list is not congruent with {gf_name}"
+                    )));
+                }
+            }
+            let generic_function = env
+                .generics
+                .borrow()
+                .get(&gf_name)
+                .map(|generic| generic.generic_function);
+            let Some(generic_function) = generic_function else {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "GENERIC-FUNCTION".into(),
+                });
+            };
+            {
+                let mut map = env.methods.borrow_mut();
+                if let Some(detached) = map.get_mut(DETACHED_METHODS_KEY) {
+                    detached.retain(|m| m.method_id != args[1]);
+                }
+                let list = map.entry(gf_name.clone()).or_default();
+                // A method with the same qualifiers and specializers is replaced.
+                list.retain(|m| {
+                    !(m.qualifier == def.qualifier
+                        && specializers_equal(&m.specializers, &def.specializers))
+                });
+                list.push((*def).clone());
+            }
+            egcl_stdlib::clos::add_method(generic_function, args[1])?;
+            invalidate_gf_dispatch_cache();
+            Ok(args[0])
         }),
 
         "FIND-METHOD" => Some(|_operator, args, env| {
@@ -3456,6 +3597,22 @@ fn resolve(name: &str) -> Option<Handler> {
                     .find(|(_, d)| d.generic_function == gf)
                     .map(|(n, _)| n.clone())
             };
+            // CLHS FIND-METHOD: the specializer list must be as long as the
+            // generic function's required parameter list (ansi find-method.error.9/10).
+            if let Some(generic_lambda_list) = gf_name
+                .as_deref()
+                .and_then(egcl_rt::symbols::find_index)
+                .map(EgclVal::from_symbol_index)
+                .and_then(stored_generic_lambda_list)
+            {
+                let (required, ..) = lambda_list_shape(generic_lambda_list);
+                if spec_args.len() != required {
+                    return Err(EgclError::ProgramError(format!(
+                        "FIND-METHOD: {} specializers given for a generic function with {required} required parameters",
+                        spec_args.len()
+                    )));
+                }
+            }
             let not_found = |env: &mut Env, msg: String| -> Result<EgclVal, EgclError> {
                 if errorp {
                     let condition = make_simple_error_condition(arena_str(&msg), env)?;
@@ -3469,6 +3626,38 @@ fn resolve(name: &str) -> Option<Handler> {
                     format!("FIND-METHOD: {} is not a generic function", format_val(gf)),
                 );
             };
+            // A qualifier that names a short-form combination names ONE
+            // combination, but MethodQualifier has a single `Combination`
+            // variant that does not record which. Comparing on the variant
+            // alone made (find-method gf '(max) …) match a method qualified
+            // (+), handing back a method SBCL does not find at all. The
+            // generic function knows its own combination, so require the name
+            // to be that one (bliss-0tz2h).
+            {
+                let requested = list_to_vec(args[1]);
+                if let [q] = requested.as_slice() {
+                    if q.is_symbol() {
+                        let qname = sym_bare_name_rc(*q);
+                        if qname.as_ref() != "STANDARD"
+                            && method_combination_from_name(qname.as_ref()).is_some()
+                        {
+                            let actual = env
+                                .generics
+                                .borrow()
+                                .get(&gf_name)
+                                .map(|generic| method_combination_name(generic.combination));
+                            if actual != Some(qname.as_ref()) {
+                                return not_found(
+                                    env,
+                                    format!(
+                                        "FIND-METHOD: {gf_name} does not use the {qname} method combination"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // `want_qual == None` means a qualifier list egcl's standard
             // combination never produces — no method can match.
             if let Some(want_qual) = want_qual {
@@ -3498,7 +3687,9 @@ fn resolve(name: &str) -> Option<Handler> {
             )
         }),
 
-        "CHANGE-CLASS" => Some(|_operator, args, env| {
+        "CHANGE-CLASS"
+        | "EGCL-INTERNAL::%STANDARD-CHANGE-CLASS"
+        | "EGCL-INTERNAL:%STANDARD-CHANGE-CLASS" => Some(|_operator, args, env| {
             egcl_rt::rooted!(args = args.to_vec());
             if args.len() < 2 || (args.len() - 2) % 2 != 0 {
                 return Err(EgclError::ProgramError(
@@ -3506,6 +3697,26 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             egcl_rt::rooted!(class = resolve_class_metaobject(env, args[1])?);
+            // Only a standard instance changes class, and only to a standard
+            // class (ansi change-class.error.5/6).
+            if !egcl_stdlib::is_instance(args[0]) {
+                return Err(EgclError::TypeError {
+                    datum: args[0],
+                    expected: "STANDARD-OBJECT".into(),
+                });
+            }
+            if !is_standard_class_metaobject(*class) {
+                return Err(EgclError::TypeError {
+                    datum: args[1],
+                    expected: "STANDARD-CLASS".into(),
+                });
+            }
+            check_initargs_valid(
+                env,
+                &class_name_for_instance_class(*class),
+                &args[2..],
+                &["UPDATE-INSTANCE-FOR-DIFFERENT-CLASS", "SHARED-INITIALIZE"],
+            )?;
             egcl_rt::rooted!(previous =
                 egcl_stdlib::clos::copy_instance_for_class_change(args[0])?);
             let old_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
@@ -3592,6 +3803,10 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
             egcl_rt::rooted!(raw_initargs = list_to_vec(args[2]));
+            // SHARED-INITIALIZE itself checks only the list's shape; initarg
+            // validity belongs to its callers (CLHS 7.1.2; ansi
+            // shared-initialize.6.8 passes :foo through).
+            check_initarg_pairs(&raw_initargs)?;
             egcl_rt::rooted!(initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?);
             // Explicit initargs apply regardless of SLOT-NAMES. That argument
             // only selects unbound slots whose initforms may run afterwards.
@@ -3601,6 +3816,71 @@ fn resolve(name: &str) -> Option<Handler> {
                 .collect::<Vec<_>>();
             apply_class_initforms(
                 args[0], &class_name, env, eligible.as_deref(), &explicit_slots,
+            )?;
+            Ok(args[0])
+        }),
+
+        // (name lambda-list lambda-list-p precedence-order precedence-p): the
+        // ENSURE-GENERIC-FUNCTION options for an existing generic function. A
+        // new lambda list must be congruent with every existing method; a new
+        // :argument-precedence-order re-sorts dispatch (ansi
+        // ensure-generic-function.6/8).
+        "EGCL-INTERNAL::%ENSURE-GENERIC-OPTIONS"
+        | "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 5 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%ENSURE-GENERIC-OPTIONS requires 5 arguments".into(),
+                ));
+            }
+            let name_form = args[0];
+            let name = function_name_key(name_form);
+            if !args[2].is_nil() {
+                let lambda_list = args[1];
+                let existing: Vec<EgclVal> = env
+                    .methods
+                    .borrow()
+                    .get(&name)
+                    .map(|list| list.iter().map(|method| method.lambda_list).collect())
+                    .unwrap_or_default();
+                for method_lambda_list in existing {
+                    if !method_lambda_list_congruent(lambda_list, method_lambda_list) {
+                        return Err(EgclError::ProgramError(format!(
+                            "ENSURE-GENERIC-FUNCTION {name}: an existing method's lambda list is not congruent with {}",
+                            format_val(lambda_list)
+                        )));
+                    }
+                }
+                if name_form.is_symbol() {
+                    store_generic_lambda_list(name_form, lambda_list);
+                }
+            }
+            if !args[4].is_nil() && name_form.is_symbol() {
+                let lambda_list = stored_generic_lambda_list(name_form).unwrap_or(args[1]);
+                let precedence = parse_argument_precedence_order(name_form, lambda_list, args[3])?;
+                store_argument_precedence_order(name_form, &precedence);
+                invalidate_gf_dispatch_cache();
+            }
+            Ok(name_form)
+        }),
+
+        // (instance initargs): the CLHS 7.1.2 validity check REINITIALIZE-INSTANCE
+        // performs before SHARED-INITIALIZE runs (ansi reinitialize-instance.error.1).
+        "EGCL-INTERNAL::%CHECK-INITARGS"
+        | "EGCL-INTERNAL:%CHECK-INITARGS" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(
+                    "EGCL-INTERNAL:%CHECK-INITARGS requires an instance and an initarg list".into(),
+                ));
+            }
+            let class_name = class_name_for_instance_class(egcl_stdlib::class_of(args[0]));
+            let initargs = list_to_vec(args[1]);
+            check_initargs_valid(
+                env,
+                &class_name,
+                &initargs,
+                &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
             )?;
             Ok(args[0])
         }),
@@ -3618,6 +3898,12 @@ fn resolve(name: &str) -> Option<Handler> {
             let instance = args[0];
             let raw_initargs = list_to_vec(args[1]);
             let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
+            check_initargs_valid(
+                env,
+                &class_name,
+                &raw_initargs,
+                &["REINITIALIZE-INSTANCE", "SHARED-INITIALIZE"],
+            )?;
             let initargs = resolved_initarg_values(&class_name, &raw_initargs, env)?;
             reinitialize_instance_values(instance, &initargs, env)
         }),

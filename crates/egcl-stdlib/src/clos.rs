@@ -64,6 +64,9 @@ struct ClassMeta {
     direct_subs: Vec<EgclVal>,
     /// Direct :instance-allocated slot names (as passed to `define_class`).
     slots: Vec<EgclVal>,
+    /// Direct :class-allocated slot names: an inherited instance slot of the
+    /// same name is not part of this class's instance layout (CLHS 7.5.3).
+    shared_slots: Vec<EgclVal>,
     /// Frozen, process-lifetime descriptor shared with instances. Built-in
     /// (never-instantiated) classes have no wrapper.
     wrapper: Option<&'static ClassWrapper>,
@@ -296,10 +299,17 @@ fn bare_symbol_name(sym: EgclVal) -> Option<String> {
 /// Qualifier for a method (for method combination).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MethodQualifier {
+    /// An unqualified method.
     Primary,
     Before,
     After,
     Around,
+    /// The qualifier that names a short-form method combination (`+`, `AND`,
+    /// `PROGN`, ...): the "primary" methods of such a generic function.
+    Combination,
+    /// A qualifier the generic function's method combination does not know;
+    /// calling the generic function with the method applicable is an error.
+    Other,
 }
 
 /// Metadata for a method: specializers and qualifier.
@@ -711,6 +721,8 @@ fn qualifier_to_u8(q: MethodQualifier) -> u8 {
         MethodQualifier::Before => 1,
         MethodQualifier::After => 2,
         MethodQualifier::Around => 3,
+        MethodQualifier::Combination => 4,
+        MethodQualifier::Other => 5,
     }
 }
 
@@ -719,6 +731,8 @@ fn u8_to_qualifier(b: u8) -> MethodQualifier {
         1 => MethodQualifier::Before,
         2 => MethodQualifier::After,
         3 => MethodQualifier::Around,
+        4 => MethodQualifier::Combination,
+        5 => MethodQualifier::Other,
         _ => MethodQualifier::Primary,
     }
 }
@@ -927,6 +941,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         st.class_meta.insert(
             class,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name,
                 direct_supers,
                 direct_subs,
@@ -1326,6 +1341,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             t_cls,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name: t_nm,
                 direct_supers: vec![],
                 direct_subs: vec![],
@@ -1339,6 +1355,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.class_meta.insert(
             std_obj,
             ClassMeta {
+                shared_slots: Vec::new(),
                 name: std_nm,
                 direct_supers: vec![t_cls],
                 direct_subs: vec![],
@@ -1359,12 +1376,28 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             (hpo_nm, hpo_cls),
         ];
         for (nm, cls) in &builtins {
+            // CLHS 4.3.7 / Figure 4-8: the built-in classes are not subclasses
+            // of STANDARD-OBJECT; each sits under its own type (FIXNUM under
+            // INTEGER, NULL under SYMBOL and LIST, CONS under LIST, FLOAT under
+            // REAL) and the rest directly under T (ansi *-cpl, types.6).
+            let supers = if *cls == fix_cls {
+                vec![int_cls]
+            } else if *cls == nul_cls {
+                vec![sym_cls, list_cls]
+            } else if *cls == con_cls {
+                vec![list_cls]
+            } else if *cls == flt_cls {
+                vec![real_cls]
+            } else {
+                vec![t_cls]
+            };
             st.class_registry.insert(*nm, *cls);
             st.class_meta.insert(
                 *cls,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name: *nm,
-                    direct_supers: vec![std_obj],
+                    direct_supers: supers,
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: None,
@@ -1422,6 +1455,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             st.class_meta.insert(
                 cls,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name: nm,
                     direct_supers: supers,
                     direct_subs: vec![],
@@ -1559,6 +1593,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
             st.class_meta.insert(
                 class,
                 ClassMeta {
+                    shared_slots: Vec::new(),
                     name,
                     direct_supers: default_supers,
                     direct_subs: vec![],
@@ -1615,6 +1650,20 @@ pub fn define_class(
     direct_supers: &[EgclVal],
     slots: &[EgclVal],
 ) -> Result<(), EgclError> {
+    define_class_with_shared_slots(name, class, direct_supers, slots, &[])
+}
+
+/// [`define_class`] for a class that also declares `shared_slots` with
+/// `:allocation :class`: those names are left out of the instance layout even
+/// when a superclass has an instance slot of the same name (CLHS 7.5.3; ansi
+/// class-0211, class-0215, slot-value.2).
+pub fn define_class_with_shared_slots(
+    name: EgclVal,
+    class: EgclVal,
+    direct_supers: &[EgclVal],
+    slots: &[EgclVal],
+    shared_slots: &[EgclVal],
+) -> Result<(), EgclError> {
     let key = class_name_key(name);
     with_state_mut(|st| {
         // Track handle-id registration order (for diamond-hierarchy inference)
@@ -1658,6 +1707,7 @@ pub fn define_class(
         st.class_meta.insert(
             class,
             ClassMeta {
+                shared_slots: shared_slots.to_vec(),
                 name,
                 direct_supers: supers,
                 direct_subs: vec![],
@@ -1694,14 +1744,21 @@ fn finalize_class_layout(st: &mut ClosState, class: EgclVal) {
     let cpl = c3_linearize(st, class).unwrap_or_else(|_| vec![class]);
     let mut order: Vec<EgclVal> = Vec::new();
     let mut index: HashMap<EgclVal, usize> = HashMap::new();
+    // A slot a more specific class declares :allocation :class shadows the
+    // instance slot of the same name in a less specific class (CLHS 7.5.3).
+    let mut shadowed: HashSet<EgclVal> = HashSet::new();
     for c in &cpl {
         if let Some(meta) = st.class_meta.get(c) {
             for &slot_name in &meta.slots {
+                if shadowed.contains(&slot_name) {
+                    continue;
+                }
                 if let std::collections::hash_map::Entry::Vacant(e) = index.entry(slot_name) {
                     e.insert(order.len());
                     order.push(slot_name);
                 }
             }
+            shadowed.extend(meta.shared_slots.iter().copied());
         }
     }
     let slot_count = order.len() as u32;
@@ -2286,6 +2343,9 @@ pub fn shared_initialize_with_list(
     if !is_instance(instance) {
         return Err(EgclError::Internal("not an instance".into()));
     }
+    // CLHS 7.1.4: when several initargs name the same slot, the leftmost wins
+    // (ansi reinitialize-instance.5/10, shared-initialize.1.3).
+    let mut filled: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + 1 < initargs.len() {
         let slot_name = initargs[i];
@@ -2301,7 +2361,10 @@ pub fn shared_initialize_with_list(
         if is_eligible {
             unsafe {
                 if let Some(idx) = instance_slot_index(instance, slot_name) {
-                    *slot_cell(instance, idx) = value;
+                    if !filled.contains(&idx) {
+                        filled.push(idx);
+                        *slot_cell(instance, idx) = value;
+                    }
                 }
             }
         }
@@ -2535,6 +2598,16 @@ pub fn generic_function_name(gf: EgclVal) -> Option<EgclVal> {
 /// its own method table (cli.rs env.methods), so this map only tracks methods,
 /// and a generic function reaching add-method without a prior make_generic_function
 /// entry (e.g. one restored from an image) must not be an error (bliss-lb6).
+/// True for a method handle registered through `set_method_specializers`.
+pub fn is_method_object(value: EgclVal) -> bool {
+    value.is_meta_handle() && with_state(|st| st.method_meta.contains_key(&value))
+}
+
+/// True for a generic function object made by `make_generic_function`.
+pub fn is_generic_function_object(value: EgclVal) -> bool {
+    value.is_meta_handle() && with_state(|st| st.generic_functions.contains_key(&value))
+}
+
 pub fn add_method(generic_function: EgclVal, method: EgclVal) -> Result<(), EgclError> {
     with_state_mut(|st| {
         st.generic_functions
@@ -2813,6 +2886,7 @@ pub fn compute_effective_method(
             // returned directly. When there are auxiliary methods, we build
             // an EffectiveMethod descriptor.
 
+            let mut invalid_qualifier = false;
             let (around, before, primary, after) = with_state(|st| {
                 let mut around = Vec::new();
                 let mut before = Vec::new();
@@ -2826,6 +2900,11 @@ pub fn compute_effective_method(
                             MethodQualifier::Before => before.push(m),
                             MethodQualifier::Primary => primary.push(m),
                             MethodQualifier::After => after.push(m),
+                            // CLHS 7.6.6.2: the standard method combination
+                            // signals an error for any other qualifier.
+                            MethodQualifier::Combination | MethodQualifier::Other => {
+                                invalid_qualifier = true
+                            }
                         },
                         None => primary.push(m), // no metadata = primary
                     }
@@ -2836,6 +2915,11 @@ pub fn compute_effective_method(
 
                 (around, before, primary, after)
             });
+            if invalid_qualifier {
+                return Err(EgclError::ProgramError(
+                    "an applicable method has a qualifier the standard method combination does not accept".into(),
+                ));
+            }
 
             if primary.is_empty() {
                 return Err(EgclError::Internal(
@@ -2865,22 +2949,37 @@ pub fn compute_effective_method(
             // These apply an operator to the results of all primary methods.
             // We store the method list and combination type for later invocation.
 
+            // CLHS 7.6.6.4: a short-form combination's primary methods carry the
+            // combination's name as their one qualifier; :AROUND methods are run
+            // by the caller around the combined result; an unqualified method or
+            // any other qualifier is an error when such a method is applicable.
+            let mut invalid_qualifier = false;
             let primary_methods: Vec<EgclVal> = with_state(|st| {
                 methods
                     .iter()
                     .copied()
-                    .filter(|m| {
-                        match st.method_meta.get(m) {
-                            Some(meta) => meta.qualifier == MethodQualifier::Primary,
-                            None => true, // no metadata = primary
-                        }
+                    .filter(|m| match st.method_meta.get(m) {
+                        Some(meta) => match meta.qualifier {
+                            MethodQualifier::Combination => true,
+                            MethodQualifier::Around => false,
+                            _ => {
+                                invalid_qualifier = true;
+                                false
+                            }
+                        },
+                        None => true, // no metadata = primary
                     })
                     .collect()
             });
+            if invalid_qualifier {
+                return Err(EgclError::ProgramError(
+                    "an applicable method has a qualifier its method combination does not accept".into(),
+                ));
+            }
 
             if primary_methods.is_empty() {
-                return Err(EgclError::Internal(
-                    "no primary methods for short-form combination".into(),
+                return Err(EgclError::ProgramError(
+                    "no applicable primary method for the method combination".into(),
                 ));
             }
 

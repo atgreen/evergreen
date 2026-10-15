@@ -11159,7 +11159,11 @@ pub fn build_image_from_runtime(env: &Env) -> Result<Vec<u8>, EgclError> {
                     egcl_stdlib::MethodQualifier::Before => resolve_sym(":BEFORE"),
                     egcl_stdlib::MethodQualifier::After => resolve_sym(":AFTER"),
                     egcl_stdlib::MethodQualifier::Around => resolve_sym(":AROUND"),
-                    egcl_stdlib::MethodQualifier::Primary => None,
+                    // A short-form combination's qualifier is its generic's
+                    // combination name, not known here; re-emitted unqualified.
+                    egcl_stdlib::MethodQualifier::Primary
+                    | egcl_stdlib::MethodQualifier::Combination
+                    | egcl_stdlib::MethodQualifier::Other => None,
                 };
                 let plain = list_to_vec(m.lambda_list);
                 let mut spec_params: Vec<EgclVal> = Vec::new();

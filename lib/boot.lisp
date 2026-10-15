@@ -34,10 +34,15 @@
 (setq egcl-internal::*documentation* (make-hash-table :test 'equal))
 
 (defun documentation (object &optional doc-type)
-  ;; GETHASH returns two values; DOCUMENTATION returns one.
+  ;; A function object documented under T is documented as a FUNCTION
+  ;; (ansi defgeneric.2). GETHASH returns two values; DOCUMENTATION returns one.
+  (when (and (eq doc-type t) (functionp object))
+    (setq doc-type 'function))
   (values (gethash (cons object doc-type) egcl-internal::*documentation*)))
 
 (defun (setf documentation) (new object &optional doc-type)
+  (when (and (eq doc-type t) (functionp object))
+    (setq doc-type 'function))
   (setf (gethash (cons object doc-type) egcl-internal::*documentation*) new)
   new)
 
@@ -556,7 +561,52 @@
   (declare (ignore class))
   (error 'unbound-slot :name slot-name :instance instance))
 
+;; CLHS SLOT-MISSING: the default method signals an error; SLOT-VALUE, (SETF
+;; SLOT-VALUE), SLOT-BOUNDP and SLOT-MAKUNBOUND call it for a slot the class
+;; does not have.
+(defmethod slot-missing (class instance slot-name operation &optional new-value)
+  (declare (ignore class new-value))
+  (error "~S: the slot ~S is missing from ~S" operation slot-name instance))
+
+;; CLHS MAKE-LOAD-FORM: the default methods for standard objects, structures
+;; and conditions signal an error; a program defines its own methods, usually
+;; through MAKE-LOAD-FORM-SAVING-SLOTS.
+(defgeneric make-load-form (object &optional environment))
+(defmethod make-load-form ((object standard-object) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+(defmethod make-load-form ((object structure-object) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+(defmethod make-load-form ((object condition) &optional environment)
+  (declare (ignore environment))
+  (error "MAKE-LOAD-FORM: no method has been defined for ~S" object))
+
+;; CHANGE-CLASS is a generic function so :before/:after/:around methods take
+;; part; the standard method is the built-in class change.
+(defmethod change-class ((instance standard-object) new-class &rest initargs)
+  (apply #'egcl-internal::%standard-change-class instance new-class initargs))
+
+;; MAKE-INSTANCES-OBSOLETE returns the class; instances keep their slots and
+;; are brought up to date lazily by a class redefinition.
+(defgeneric make-instances-obsolete (class))
+(defmethod make-instances-obsolete ((class t))
+  (if (symbolp class) (find-class class) class))
+
+(defgeneric update-instance-for-redefined-class
+    (instance added-slots discarded-slots property-list &rest initargs))
+(defmethod update-instance-for-redefined-class
+    ((instance standard-object) added-slots discarded-slots property-list &rest initargs)
+  (declare (ignore discarded-slots property-list))
+  (apply #'shared-initialize instance added-slots initargs))
+
+;; ED has no editor to invoke; it accepts its argument and does nothing.
+(defun ed (&optional x)
+  (declare (ignore x))
+  nil)
+
 (defmethod reinitialize-instance ((instance standard-object) &rest initargs)
+  (egcl-internal::%check-initargs instance initargs)
   (apply #'shared-initialize instance nil initargs))
 
 (defmethod update-instance-for-different-class
@@ -796,9 +846,18 @@
 ;; keeps its float type and everything else upgrades to RATIONAL (CL default).
 (defun upgraded-complex-part-type (type &optional environment)
   (declare (ignore environment))
-  (if (member type '(single-float double-float short-float long-float float))
-      type
-      'rational))
+  ;; A class metaobject stands for its name. Rationals share one part type,
+  ;; each float format is its own, FLOAT and REAL stay as they are
+  ;; (ansi numbers upgraded-complex-part-type.*).
+  (let ((type (if (typep type 'class) (class-name type) type)))
+    (cond ((member type '(single-float short-float)) 'single-float)
+          ((member type '(double-float long-float)) 'double-float)
+          ((member type '(float real)) type)
+          ((subtypep type 'rational) 'rational)
+          ((subtypep type 'single-float) 'single-float)
+          ((subtypep type 'double-float) 'double-float)
+          ((subtypep type 'float) 'float)
+          (t 'real))))
 
 ;; Early bootstrap REMOVE-DUPLICATES: EQL only, keeps first occurrence. Used by
 ;; the package machinery loaded before the full definition (further below, after
@@ -4993,15 +5052,24 @@ a hook error aborts startup.")
 (defun print-not-readable-object (condition)
   (slot-value condition 'object))
 
-(defun ensure-generic-function (name &rest options &key lambda-list &allow-other-keys)
+(defun ensure-generic-function (name &rest options
+                                &key (lambda-list nil lambda-list-p)
+                                     (argument-precedence-order nil precedence-p)
+                                &allow-other-keys)
   (declare (ignore options))
   (cond ((and (fboundp name) (typep (fdefinition name) 'generic-function))
+         ;; The existing generic function keeps its methods; a new lambda list
+         ;; must be congruent with them, a new precedence order re-sorts dispatch.
+         (egcl-internal::%ensure-generic-options
+          name lambda-list lambda-list-p argument-precedence-order precedence-p)
          (fdefinition name))
         ((fboundp name)
          (error 'program-error
                 :format-control "~S already names an ordinary function, macro or special operator."
                 :format-arguments (list name)))
-        (t (eval `(defgeneric ,name ,lambda-list)))))
+        (t (eval `(defgeneric ,name ,lambda-list
+                    ,@(when precedence-p
+                        `((:argument-precedence-order ,@argument-precedence-order))))))))
 
 (defun invalid-method-error (method format-control &rest format-arguments)
   (error "Invalid method ~S:~%~?" method format-control format-arguments))
