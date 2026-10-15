@@ -9138,6 +9138,41 @@ fn gray_input_stream_routes_read_functions_through_generics() {
     );
 }
 
+#[test]
+fn gray_stream_instances_are_streams_for_method_dispatch() {
+    // FUNDAMENTAL-STREAM sits under STREAM, as on every host with Gray streams:
+    // a method specialized on STREAM applies to a Gray instance (AllegroServe's
+    // compatibility layer reads its socket streams through one), is less
+    // specific than a method on the Gray class itself, and STREAM is in the
+    // instance's class precedence list. User code still cannot name STREAM as
+    // a direct superclass.
+    let prog = r#"(progn
+       (defclass two-chars (fundamental-character-input-stream)
+         ((chars :initform (list #\a #\b) :accessor tc-chars)))
+       (defmethod stream-read-char ((s two-chars)) (or (pop (tc-chars s)) :eof))
+       (defgeneric grab (stream)
+         (:method ((stream stream)) (list :stream (read-char stream nil :eof))))
+       (defmethod grab ((stream two-chars)) (cons :gray (call-next-method)))
+       (let ((g (make-instance 'two-chars)))
+         (format t "~s ~s ~s ~s"
+                 (grab g)
+                 (grab (make-string-input-stream "z"))
+                 (not (null (member (find-class 'stream)
+                                    (class-precedence-list (class-of g)))))
+                 (handler-case (progn (eval '(defclass under-stream (stream) ())) :defined)
+                   (error () :refused)))))"#;
+    let output = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("(:GRAY :STREAM #\\a) (:STREAM #\\z) T :REFUSED"),
+        "expected the STREAM method to apply to the Gray instance, got stdout: '{stdout}', stderr: '{err}'"
+    );
+}
+
 // ══════════════════════════════════════════════════════════════════
 // ASDF long-tail fixes (bliss-lb6.7): -if sequence bounds, LOOP `by`,
 // catchable unknown-keyword errors.

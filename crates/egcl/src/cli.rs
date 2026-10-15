@@ -35597,6 +35597,13 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         if matches!(bare.as_ref(), "STANDARD-OBJECT" | "T" | "FUNCALLABLE-STANDARD-OBJECT") {
             continue;
         }
+        // The prelude alone may put a class under STREAM: lib/boot.lisp defines
+        // FUNDAMENTAL-STREAM that way so a method specialized on STREAM applies
+        // to Gray stream instances and their precedence lists name STREAM, as
+        // on SBCL, CCL and ECL. User code is still refused (defclass.error.23).
+        if bare.as_ref() == "STREAM" && !BOOT_COMPLETE.with(|c| c.get()) {
+            continue;
+        }
         // The standard classes whose metaclass is STANDARD-CLASS (such as
         // STANDARD-GENERIC-FUNCTION) may be subclassed; built-in and
         // structure classes may not.
