@@ -3626,6 +3626,38 @@ fn resolve(name: &str) -> Option<Handler> {
                     format!("FIND-METHOD: {} is not a generic function", format_val(gf)),
                 );
             };
+            // A qualifier that names a short-form combination names ONE
+            // combination, but MethodQualifier has a single `Combination`
+            // variant that does not record which. Comparing on the variant
+            // alone made (find-method gf '(max) …) match a method qualified
+            // (+), handing back a method SBCL does not find at all. The
+            // generic function knows its own combination, so require the name
+            // to be that one (bliss-0tz2h).
+            {
+                let requested = list_to_vec(args[1]);
+                if let [q] = requested.as_slice() {
+                    if q.is_symbol() {
+                        let qname = sym_bare_name_rc(*q);
+                        if qname.as_ref() != "STANDARD"
+                            && method_combination_from_name(qname.as_ref()).is_some()
+                        {
+                            let actual = env
+                                .generics
+                                .borrow()
+                                .get(&gf_name)
+                                .map(|generic| method_combination_name(generic.combination));
+                            if actual != Some(qname.as_ref()) {
+                                return not_found(
+                                    env,
+                                    format!(
+                                        "FIND-METHOD: {gf_name} does not use the {qname} method combination"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             // `want_qual == None` means a qualifier list egcl's standard
             // combination never produces — no method can match.
             if let Some(want_qual) = want_qual {
