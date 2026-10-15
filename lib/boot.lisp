@@ -1071,8 +1071,11 @@
   (declare (ignore stream char))
   (error "The standard reader macro cannot be invoked directly."))
 (defun readtable-case (readtable)
+  ;; A non-readtable argument is a TYPE-ERROR (ansi readtable-case.error.3).
+  (check-type readtable readtable)
   (egcl::%readtable-case readtable))
 (defun (setf readtable-case) (mode readtable)
+  (check-type readtable readtable)
   (unless (member mode '(:upcase :downcase :preserve :invert))
     (error 'type-error :datum mode
                        :expected-type '(member :upcase :downcase :preserve :invert)))
@@ -1124,6 +1127,18 @@
        (write-char #\> ,out)
        nil)))
 
+;;; READ-DELIMITED-LIST: read objects from STREAM up to the terminating CHAR,
+;;; which is consumed, and return them as a list (CLHS 23.2).
+(defun read-delimited-list (char &optional (stream *standard-input*) recursive-p)
+  (declare (ignore recursive-p))
+  (let ((stream (cond ((eq stream t) *terminal-io*)
+                      ((null stream) *standard-input*)
+                      (t stream)))
+        (result '()))
+    (do ((c (peek-char t stream t nil t) (peek-char t stream t nil t)))
+        ((char= c char) (read-char stream t nil t) (nreverse result))
+      (push (read stream t nil t) result))))
+
 ;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
 (defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
   (declare (ignore index))
@@ -1138,7 +1153,9 @@
 
 (defmacro with-standard-io-syntax (&rest body)
   `(let ((*readtable* :standard-readtable)
-         (*package* "COMMON-LISP-USER")
+         ;; The package object itself, not its name: the binding must be EQ
+         ;; to (find-package "CL-USER") (ansi with-standard-io-syntax.1).
+         (*package* (find-package "COMMON-LISP-USER"))
          (*print-array* t)
          (*print-base* 10)
          (*print-case* :upcase)
@@ -3526,11 +3543,14 @@
       (let ((outvars (mapcar (lambda (s) (declare (ignore s)) (gensym))
                              (car stores)))
             (sources (append (cdr getters) (list newval))))
+        ;; SHIFTF yields exactly one value, the primary old value of the first
+        ;; place (CLHS 5.1.2.3; ansi shiftf.7), even for a VALUES place whose
+        ;; reading produced several.
         `(let* ,binds
            (multiple-value-bind ,outvars ,(car getters)
              ,(%bind-setf-stores stores sources
                                  (append setters
-                                         (list (cons 'values outvars))))))))))
+                                         (list (car outvars))))))))))
 
 ;;; PROG / PROG*: LET (or LET*) plus an implicit BLOCK NIL and TAGBODY.
 ;;; A leading (declare ...) belongs to the LET, not to the TAGBODY: CLHS 6.1.1.4

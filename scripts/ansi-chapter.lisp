@@ -28,6 +28,13 @@
 
 (format t "~%=== ANSI chapter ~a (egcl gate) ===~%" *ansi-chapter*)
 
+;; Every <chapter>/load.lsp starts with
+;; (compile-and-load "ANSI-TESTS:AUX;<chapter>-aux.lsp"), so the ANSI-TESTS
+;; logical host has to exist before any chapter loads.  Same translation as
+;; gclload1.lsp, pointed at the checkout's auxiliary/ directory.
+(setf (logical-pathname-translations "ANSI-TESTS")
+      (list (list "AUX;*.*.*" *aux-dir*)))
+
 (load (merge-pathnames "compile-and-load.lsp" *ansi-test-dir*))
 (load (merge-pathnames "rt-package.lsp" *ansi-test-dir*))
 (compile-and-load (merge-pathnames "rt.lsp" *ansi-test-dir*))

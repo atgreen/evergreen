@@ -5384,6 +5384,15 @@ fn funcallable_instance_function(v: EgclVal) -> Option<EgclVal> {
     egcl_stdlib::slot_value(v, slot).ok()
 }
 
+/// A retained generic-function value: the cached `(EGCL::CLOSURE . id)` wrapper
+/// `#'gf` / SYMBOL-FUNCTION hand out for a DEFGENERIC name. ANSI makes every
+/// such object a GENERIC-FUNCTION (and a STANDARD-GENERIC-FUNCTION), a subtype
+/// of FUNCTION; ansi-test's universe.lsp asserts exactly that before any
+/// chapter can load.
+fn is_generic_function_value(v: EgclVal) -> bool {
+    generic_wrapper_name(v).is_some()
+}
+
 fn is_function_value(v: EgclVal) -> bool {
     if v.is_function() {
         return true;
@@ -6420,6 +6429,9 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
         // `(create-scanner (scanner function))` method was skipped and a scanner
         // closure fell through to the `(parse-tree t)` method (bliss-5ir).
         "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(arg).then_some(1),
+        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+            is_generic_function_value(arg).then_some(1)
+        }
         "CONS" => (arg.is_cons() && !is_function_value(arg)).then_some(1),
         "LIST" => (arg.is_list() && !is_function_value(arg)).then_some(2),
         // PATHNAME is a distinct built-in type (not a CLOS instance); ASDF's
@@ -7037,6 +7049,31 @@ fn combine_short_form_results(
     }
 }
 
+/// The standard behaviour of a built-in generic function when no user method
+/// applies. A DEFMETHOD on MAKE-INSTANCE for one class turns the name into a
+/// user generic, and without this every other class lost its construction:
+/// rt's own COPY-ENTRY copier calls MAKE-INSTANCE, so loading the ansi objects
+/// chapter died at its first DEFTEST. The built-in path takes forms, so the
+/// evaluated arguments are passed quoted.
+fn builtin_generic_fallback(
+    name: &str,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    if symbol_bare_name(name) != "MAKE-INSTANCE" {
+        return None;
+    }
+    egcl_rt::rooted!(args = args.to_vec());
+    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len()));
+    let quote = quote_sym();
+    for i in 0..args.len() {
+        let quoted = vec_to_list(&[quote, args[i]]);
+        items.push(quoted);
+    }
+    let form_cdr = vec_to_list(&items);
+    Some(eval_make_instance(form_cdr, env))
+}
+
 /// Build and signal a catchable error condition for a failed generic-function
 /// dispatch (`no-applicable-method`, R5.??). Returns the terminal error when no
 /// handler transfers control.
@@ -7495,6 +7532,9 @@ fn invoke_generic_function_inner(
 
     let mut methods = env.methods.borrow().get(name).cloned().unwrap_or_default();
     if methods.is_empty() {
+        if let Some(result) = builtin_generic_fallback(name, args, env) {
+            return result;
+        }
         return Err(no_applicable_method_error(env, name));
     }
     egcl_rt::rooted_ref!(_methods_root = &mut methods);
@@ -7519,6 +7559,9 @@ fn invoke_generic_function_inner(
             && generic_is_slot_reader(env, name)
         {
             return Ok(NIL);
+        }
+        if let Some(result) = builtin_generic_fallback(name, args, env) {
+            return result;
         }
         return Err(no_applicable_method_error(env, name));
     }
@@ -11395,6 +11438,29 @@ fn reader_struct_constructor(name: EgclVal, slots: &[EgclVal]) -> Option<EgclVal
     if !egcl_stdlib::is_structure_class(class) {
         return None;
     }
+    // #S calls the structure's constructor (CLHS 2.4.8.13), so slots the
+    // literal leaves out take their initforms. Go through the full
+    // MAKE-INSTANCE protocol when a load environment is available (the same
+    // channel #. and custom reader macros use); the raw slot fill below leaves
+    // omitted slots unbound (ansi syntax.sharp-s.1).
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if !ptr.is_null() {
+        // Safety: as for read_time_eval — the pointer refers to the load loop's
+        // live `&mut Env` for exactly the span of the enclosing read.
+        let env = unsafe { &mut *ptr };
+        let quote = quote_sym();
+        egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(slots.len() + 1));
+        let quoted_name = vec_to_list(&[quote, name]);
+        items.push(quoted_name);
+        for slot in slots.iter() {
+            let quoted = vec_to_list(&[quote, *slot]);
+            items.push(quoted);
+        }
+        let form_cdr = vec_to_list(&items);
+        if let Ok(instance) = eval_make_instance(form_cdr, env) {
+            return Some(instance);
+        }
+    }
     egcl_stdlib::make_instance(class, slots).ok()
 }
 
@@ -13579,7 +13645,8 @@ fn builtin_condition_supertypes(name: &str) -> Option<Vec<String>> {
 
 fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
     let chain: &'static [&'static str] = match name {
-        "COMPILED-FUNCTION" => &["FUNCTION", "ATOM", "T"],
+        "COMPILED-FUNCTION" | "GENERIC-FUNCTION" => &["FUNCTION", "ATOM", "T"],
+        "STANDARD-GENERIC-FUNCTION" => &["GENERIC-FUNCTION", "FUNCTION", "ATOM", "T"],
         "FIXNUM" | "BIGNUM" => &["INTEGER", "RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "INTEGER" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
         "RATIO" => &["RATIONAL", "REAL", "NUMBER", "ATOM", "T"],
@@ -14850,6 +14917,9 @@ fn typep_matches(
     if type_spec.is_symbol() && is_function_value(object) {
         match sym_bare_name_rc(type_spec).as_ref() {
             "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => return Ok(true),
+            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+                return Ok(is_generic_function_value(object))
+            }
             "CONS" | "LIST" => return Ok(false),
             _ => {}
         }
@@ -14890,10 +14960,13 @@ fn typep_matches(
         // LIST.  Handle them before the generic CLOS/class-of route, which can
         // otherwise observe their representation and report the cons classes.
         if is_function_value(object) {
-            return Ok(matches!(
-                type_name.as_ref(),
-                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION"
-            ));
+            return Ok(match type_name.as_ref() {
+                "T" | "ATOM" | "FUNCTION" | "COMPILED-FUNCTION" => true,
+                "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => {
+                    is_generic_function_value(object)
+                }
+                _ => false,
+            });
         }
         // A class metaobject tested against a metaclass type. egcl represents a
         // user/struct class as its name symbol, so `(find-class 'foo)` is that
@@ -15045,6 +15118,7 @@ fn typep_matches(
             "EXTENDED-CHAR" => false,
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
+            "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(object),
             "PACKAGE" => is_package_value(env, object),
             "HASH-TABLE" => egcl_stdlib::hash_table_count(object).is_ok(),
             "PATHNAME" => egcl_stdlib::is_pathname(object),
@@ -16358,6 +16432,7 @@ fn value_satisfies_declared_type(type_form: EgclVal, value: EgclVal) -> Result<b
         // `(the function (encoder mapping))`, where the encoder is exactly such
         // a closure.
         "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(value),
+        "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(value),
         "CONS" => value.is_cons() && !is_function_value(value),
         "ATOM" => !value.is_cons() || is_function_value(value),
         other => {
@@ -18127,10 +18202,16 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         j += 2;
                     }
                 }
+                // The leftmost occurrence of a keyword wins (CLHS 3.4.1.4;
+                // read-from-string.11/.12), so each key is taken once.
+                let (mut seen_start, mut seen_end, mut seen_preserve) = (false, false, false);
+                let mut preserve_whitespace = false;
                 let mut j = 0;
                 while j + 1 < key_tail.len() {
                     match sym_bare_name_rc(key_tail[j]).as_ref() {
+                        "START" if seen_start => {}
                         "START" => {
+                            seen_start = true;
                             start = val_as_str(key_tail[j + 1])
                                 .parse()
                                 .ok()
@@ -18141,12 +18222,19 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                 })
                                 .unwrap_or(0)
                         }
-                        "END" if !key_tail[j + 1].is_nil() => {
+                        "END" if seen_end => {}
+                        "END" => {
+                            seen_end = true;
                             if key_tail[j + 1].is_fixnum() {
                                 end = key_tail[j + 1].as_fixnum() as usize;
                             }
                         }
-                        "END" | "PRESERVE-WHITESPACE" | "ALLOW-OTHER-KEYS" => {}
+                        "PRESERVE-WHITESPACE" if seen_preserve => {}
+                        "PRESERVE-WHITESPACE" => {
+                            seen_preserve = true;
+                            preserve_whitespace = !key_tail[j + 1].is_nil();
+                        }
+                        "ALLOW-OTHER-KEYS" => {}
                         _ if allow_other => {}
                         other => {
                             return Err(EgclError::ProgramError(format!(
@@ -18171,7 +18259,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                             "end of file on READ-FROM-STRING".into(),
                         ));
                     }
-                    Ok((form, consumed)) => {
+                    Ok((form, mut consumed)) => {
+                        // READ (unlike READ-PRESERVING-WHITESPACE) also consumes
+                        // the single whitespace character that terminated a token
+                        // (CLHS 2.2, 23.1.3; read-from-string.2, syntax.sharp-plus.2).
+                        // A form closed by its own delimiter (`)`, `"`) ends the
+                        // read where that delimiter does.
+                        if !preserve_whitespace
+                            && consumed > 0
+                            && start + consumed < end
+                            && chars[start + consumed].is_whitespace()
+                            && !matches!(chars[start + consumed - 1], ')' | '"')
+                        {
+                            consumed += 1;
+                        }
                         env.set_mv(vec![form, EgclVal::from_fixnum((start + consumed) as i64)]);
                         return Ok(form);
                     }
@@ -21674,15 +21775,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "PROBE-FILE" => {
                 // (probe-file pathspec) — truename if the file exists, else NIL.
                 let (pathname_form, _) = cp(cdr);
-                let pathname = eval_form(pathname_form, env)?;
-                return Ok(egcl_stdlib::probe_file(pathname)?.unwrap_or(NIL));
+                egcl_rt::rooted!(pathname = eval_form(pathname_form, env)?);
+                // Relative to *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), as OPEN.
+                if pathname.is_string() || egcl_stdlib::is_pathname(*pathname) {
+                    *pathname = resolve_against_dpd(*pathname, env)?;
+                }
+                return Ok(egcl_stdlib::probe_file(*pathname)?.unwrap_or(NIL));
             }
             "OPEN" => return eval_builtin_arguments(&name, cdr, env),
             "DELETE-FILE" => {
                 // (delete-file pathspec) — delete the file, returning T.
                 let (path_form, _) = cp(cdr);
-                let pathspec = eval_form(path_form, env)?;
-                egcl_stdlib::delete_file(pathspec)?;
+                egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
+                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                    *pathspec = resolve_against_dpd(*pathspec, env)?;
+                }
+                egcl_stdlib::delete_file(*pathspec)?;
                 return Ok(T);
             }
             "RENAME-FILE" => {
@@ -21703,8 +21811,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 // CL universal time (seconds since 1900-01-01). ASDF uses it for
                 // staleness checks (bliss-lb6.14).
                 let (path_form, _) = cp(cdr);
-                let pathspec = eval_form(path_form, env)?;
-                let path = path_designator_to_string(pathspec)?;
+                egcl_rt::rooted!(pathspec = eval_form(path_form, env)?);
+                if pathspec.is_string() || egcl_stdlib::is_pathname(*pathspec) {
+                    *pathspec = resolve_against_dpd(*pathspec, env)?;
+                }
+                let path = path_designator_to_string(*pathspec)?;
                 if let Some(date) = egcl_stdlib::embedded_files::write_date(&path) {
                     return Ok(EgclVal::from_fixnum(date));
                 }
@@ -21904,6 +22015,26 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 });
             }
             "TRANSLATE-LOGICAL-PATHNAME" => return eval_builtin_arguments(&name, cdr, env),
+            "LOGICAL-PATHNAME-TRANSLATIONS" => {
+                // (logical-pathname-translations host) → the host's list of
+                // (from-wildcard to-wildcard) pairs as stored by SETF (R5.189);
+                // an undefined host is a TYPE-ERROR per ANSI 19.3.1.
+                let n = form_arg_count(cdr);
+                if n != 1 {
+                    return Err(EgclError::ProgramError(format!(
+                        "LOGICAL-PATHNAME-TRANSLATIONS requires exactly 1 argument, got {n}"
+                    )));
+                }
+                let (host_form, _) = cp(cdr);
+                let host = eval_form(host_form, env)?;
+                let host_str = val_as_str(host);
+                return egcl_stdlib::logical_pathname_translations(&host_str).map_err(|_| {
+                    EgclError::TypeError {
+                        datum: host,
+                        expected: "defined logical host".to_string(),
+                    }
+                });
+            }
             "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" => {
                 // (load-logical-pathname-translations host) → NIL when the host's
                 // translations are already defined (nothing to load); an ERROR
@@ -36176,7 +36307,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "PROBE-FILE" | "TRUENAME" | "DIRECTORY" | "WILD-PATHNAME-P"
             | "PATHNAME-MATCH-P" | "TRANSLATE-PATHNAME" | "ENSURE-DIRECTORIES-EXIST"
             | "LOGICAL-PATHNAME" | "TRANSLATE-LOGICAL-PATHNAME"
-            | "LOAD-LOGICAL-PATHNAME-TRANSLATIONS"
+            | "LOAD-LOGICAL-PATHNAME-TRANSLATIONS" | "LOGICAL-PATHNAME-TRANSLATIONS"
             | "FILE-NAMESTRING" | "DIRECTORY-NAMESTRING" | "ENOUGH-NAMESTRING"
             | "COMPILE-FILE" | "COMPILE-FILE-PATHNAME" | "FILE-WRITE-DATE"
             // Time
@@ -38556,6 +38687,11 @@ fn val_as_str(val: EgclVal) -> String {
 /// rather than the namestring, so callers that take file paths (LOAD, etc.) must
 /// resolve pathnames through `namestring` first. bliss-lb6.
 fn path_designator_to_string(v: EgclVal) -> Result<String, EgclError> {
+    // A logical pathname (or logical namestring) reaches the filesystem only
+    // through its host's translations (ANSI 19.3.1).
+    if let Some(physical) = egcl_stdlib::translated_physical(v)? {
+        return path_designator_to_string(physical);
+    }
     if egcl_stdlib::is_pathname(v) {
         return Ok(val_as_str(egcl_stdlib::namestring(v)?));
     }

@@ -119,6 +119,7 @@ pub use packages::{
     present_symbols, rename_package, seed_ansi_symbols, shadow, shadowing_import, unexport,
     unintern, unuse_package, use_package, use_package_by_name,
 };
+pub use pathnames::translated_physical;
 pub use pathnames::{
     PathDirComp, delete_file, directory, ensure_directories_exist, is_logical_pathname,
     is_pathname, logical_pathname_from_string, logical_pathname_translations, make_pathname,

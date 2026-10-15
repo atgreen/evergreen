@@ -2561,7 +2561,18 @@ fn resolve(name: &str) -> Option<Handler> {
                     val_as_str(path_val)
                 )));
             }
-            egcl_rt::rooted!(path_val = path_val);
+            // A relative filespec names a file relative to
+            // *DEFAULT-PATHNAME-DEFAULTS*, not the process directory (CLHS
+            // 19.2.3); without the merge a file written as "foo.txt" and then
+            // probed through the merged pathname were two different files
+            // (ansi pathnames enough-namestring.4, file-namestring.3, ...).
+            egcl_rt::rooted!(
+                path_val = if path_val.is_string() || egcl_stdlib::is_pathname(path_val) {
+                    resolve_against_dpd(path_val, env)?
+                } else {
+                    path_val
+                }
+            );
             let options = decode_open_options(opts, env)?;
             egcl_stdlib::open(
                 *path_val,

@@ -3074,9 +3074,12 @@ fn unknown_bare_name_is_homed_in_the_current_package_without_leaking_into_cl() {
 
 #[test]
 fn feature_conditionals_match_package_qualified_feature_symbols() {
-    // Feature names are compared by SYMBOL-NAME, independent of the package in
-    // which the feature expression was read. A package with an empty use-list
-    // therefore still recognizes the runtime's :EGCL feature.
+    // A feature expression is read with *PACKAGE* bound to KEYWORD (CLHS
+    // 2.4.8.17), so the symbol it names does not depend on the package the
+    // expression appeared in: a package with an empty use-list still
+    // recognizes the runtime's :EGCL feature. Membership is then decided the
+    // way (member feature *features*) would decide it, so a non-keyword symbol
+    // in *FEATURES* is NOT matched by a bare feature name -- as in SBCL.
     let output = egcl()
         .args([
             "--no-init",
@@ -3102,6 +3105,48 @@ fn feature_conditionals_match_package_qualified_feature_symbols() {
             .any(|line| line.trim() == "(:YES)"),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn feature_conditionals_read_t_and_nil_as_keywords() {
+    // A feature expression is read with *PACKAGE* bound to KEYWORD (CLHS
+    // 2.4.8.17), so `t` and `nil` there name the keywords :T and :NIL like any
+    // other feature name. Reading them as the constants T and NIL instead made
+    // a pushed :T invisible to #+t, because membership compares the registry
+    // name KEYWORD:T against T. #+nil must still skip its datum while :NIL is
+    // absent from *FEATURES*, which is what the idiom relies on.
+    let output = egcl()
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:push :t cl:*features*)",
+            "--eval",
+            "(cl:list #+t :yes #-t :no)",
+            "--eval",
+            "(cl:list #+nil :skipped :kept)",
+        ])
+        .output()
+        .expect("run T/NIL feature-expression probe");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line.trim() == "(:YES)"),
+        "#+t did not match a pushed :T; stdout: {} stderr: {}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "(:KEPT)"),
+        "#+nil did not skip its datum; stdout: {} stderr: {}",
+        stdout,
         String::from_utf8_lossy(&output.stderr)
     );
 }
