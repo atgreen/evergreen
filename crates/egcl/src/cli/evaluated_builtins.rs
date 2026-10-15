@@ -2732,9 +2732,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             let universal = num_val(args[0])? as i64;
-            let time_zone = match args.get(1) {
-                Some(v) if !v.is_nil() => Some(num_val(*v)? as i64),
-                _ => None,
+            // The zone is a rational number of hours (ansi decode-universal-time.4
+            // uses -70571/3600); convert it exactly to seconds.
+            let zone_arg = args.get(1).copied().filter(|v| !v.is_nil());
+            let time_zone = match zone_arg {
+                Some(v) => Some(egcl_stdlib::time::zone_seconds(v)?),
+                None => None,
             };
             let (sec, min, hour, date, month, year, dow, dst, zone) =
                 egcl_stdlib::time::decode_universal_time(universal, time_zone);
@@ -2747,7 +2750,8 @@ fn resolve(name: &str) -> Option<Handler> {
                 EgclVal::from_fixnum(year),
                 EgclVal::from_fixnum(dow),
                 if dst { T } else { NIL },
-                EgclVal::from_fixnum(zone),
+                // The zone used, as given (a rational stays a rational).
+                zone_arg.unwrap_or(EgclVal::from_fixnum(zone)),
             ];
             let first = values[0];
             env.set_mv(values);
@@ -3298,7 +3302,16 @@ fn resolve(name: &str) -> Option<Handler> {
             // (WARN.14).
             let warning_sym = resolve_sym("WARNING").unwrap_or(NIL);
             let is_warning = typep_matches(env, *cond, warning_sym)?;
-            if !is_warning || (datum_is_instance && !rest_args.is_empty()) {
+            if datum_is_instance && !rest_args.is_empty() {
+                // The offending value is the argument list, which must be
+                // empty for a condition datum (WARN.14).
+                egcl_rt::rooted!(extra = vec_to_list(rest_args));
+                return Err(EgclError::TypeError {
+                    datum: *extra,
+                    expected: "NULL".into(),
+                });
+            }
+            if !is_warning {
                 return Err(EgclError::TypeError {
                     datum: *datum,
                     expected: "WARNING".into(),
@@ -4311,7 +4324,9 @@ fn resolve(name: &str) -> Option<Handler> {
 
             // (apropos-list string &optional package) → matching symbols.
 
-            let needle = val_as_str(args.first().copied().unwrap_or(NIL));
+            // The search string is a string designator: a symbol searches by
+            // its name, a character by itself (ansi apropos-list.1/.2).
+            let needle = string_designator_name(args.first().copied().unwrap_or(NIL));
             let package = args.get(1).copied().unwrap_or(NIL);
             let matches = apropos_symbols(env, &needle, package);
             Ok(vec_to_list(&matches))
@@ -4328,7 +4343,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // (apropos string &optional package) — print each match to
             // *standard-output*; CLHS specifies no values are returned.
 
-            let needle = val_as_str(args.first().copied().unwrap_or(NIL));
+            let needle = string_designator_name(args.first().copied().unwrap_or(NIL));
             let package = args.get(1).copied().unwrap_or(NIL);
             let matches = apropos_symbols(env, &needle, package);
             // Render everything BEFORE writing: `symbol_function`/variable

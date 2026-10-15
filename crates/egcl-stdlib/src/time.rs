@@ -74,6 +74,28 @@ pub fn encode_universal_time(
     local + time_zone.unwrap_or(0) * 3600
 }
 
+/// A time zone argument (a rational number of hours in -24..24, west of GMT)
+/// as a whole number of seconds; TYPE-ERROR otherwise. Shared by
+/// ENCODE-UNIVERSAL-TIME and DECODE-UNIVERSAL-TIME.
+pub fn zone_seconds(value: EgclVal) -> Result<i64, EgclError> {
+    let zone = as_bigrat(value)
+        .filter(|zone| {
+            bigrat_cmp(zone, &BigRat::from_i64(-24)) != Ordering::Less
+                && bigrat_cmp(zone, &BigRat::from_i64(24)) != Ordering::Greater
+        })
+        .ok_or_else(|| EgclError::TypeError {
+            datum: value,
+            expected: "(or null (rational -24 24))".into(),
+        })?;
+    let (seconds, remainder) = big_divmod(&big_mul(&zone.num, &BigInt::from_i64(3600)), &zone.den);
+    if !remainder.is_zero() {
+        return Err(EgclError::ProgramError(
+            "time zone must represent a whole number of seconds".into(),
+        ));
+    }
+    Ok(i64::from(seconds.sign) * seconds.mag.first().copied().unwrap_or(0) as i64)
+}
+
 /// Validate Lisp decoded-time arguments and encode without floating-point
 /// coercion or host-integer overflow. Omitted/NIL zones retain the GMT default.
 pub fn encode_universal_time_checked(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
@@ -111,25 +133,7 @@ pub fn encode_universal_time_checked(args: &[EgclVal]) -> Result<EgclVal, EgclEr
     }
     let zone_seconds = match args.get(6).copied().filter(|zone| !zone.is_nil()) {
         None => 0,
-        Some(value) => {
-            let zone = as_bigrat(value)
-                .filter(|zone| {
-                    bigrat_cmp(zone, &BigRat::from_i64(-24)) != Ordering::Less
-                        && bigrat_cmp(zone, &BigRat::from_i64(24)) != Ordering::Greater
-                })
-                .ok_or_else(|| EgclError::TypeError {
-                    datum: value,
-                    expected: "(or null (rational -24 24))".into(),
-                })?;
-            let (seconds, remainder) =
-                big_divmod(&big_mul(&zone.num, &BigInt::from_i64(3600)), &zone.den);
-            if !remainder.is_zero() {
-                return Err(EgclError::ProgramError(
-                    "time zone must represent a whole number of seconds".into(),
-                ));
-            }
-            i64::from(seconds.sign) * seconds.mag.first().copied().unwrap_or(0) as i64
-        }
+        Some(value) => zone_seconds(value)?,
     };
     // Split off complete Gregorian cycles so even bignum years use the same
     // bounded civil-date arithmetic as ordinary years.
@@ -161,10 +165,13 @@ pub fn encode_universal_time_checked(args: &[EgclVal]) -> Result<EgclVal, EgclEr
 /// false (no DST modelling), and `zone` is the zone actually used.
 pub fn decode_universal_time(
     universal_time: i64,
-    time_zone: Option<i64>,
+    time_zone_seconds: Option<i64>,
 ) -> (i64, i64, i64, i64, i64, i64, i64, bool, i64) {
-    let zone = time_zone.unwrap_or(0);
-    let local = universal_time - zone * 3600;
+    // The zone arrives in SECONDS west of GMT (a rational number of hours is
+    // exact that way); the returned zone is whole hours.
+    let zone_seconds = time_zone_seconds.unwrap_or(0);
+    let zone = zone_seconds.div_euclid(3600);
+    let local = universal_time - zone_seconds;
     // Floor-divide so a time before the epoch still lands on the right day.
     let days = local.div_euclid(SECS_PER_DAY);
     let rem = local.rem_euclid(SECS_PER_DAY);

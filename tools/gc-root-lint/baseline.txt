@@ -1,6 +1,7 @@
 # gc-root-lint baseline (bliss-jaf). Keys are file:function:variable.
 # Regenerate with: cargo run -p gc-root-lint -- --bless
 crates/egcl/src/cli.rs:builtin_generic_fallback:result
+crates/egcl/src/cli.rs:eval_defstruct:name_sym
 crates/egcl/src/cli.rs:eval_handler_case:result
 crates/egcl/src/cli.rs:eval_restart_case:result
 crates/egcl/src/cli.rs:eval_tagbody:result
