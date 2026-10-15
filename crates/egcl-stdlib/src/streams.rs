@@ -3852,6 +3852,33 @@ pub fn socket_set_read_timeout(
         .map_err(|e| EgclError::StreamError(format!("socket read timeout: {e}")))
 }
 
+/// The local and peer names of an established socket stream, as the
+/// addresses the OS reports. For the address queries of socket libraries
+/// (usocket's `get-local-name`, `get-peer-address` and the rest), which had
+/// nothing to build on: only a listener's port was answered.
+pub fn socket_stream_names(
+    stream: EgclVal,
+) -> Result<(std::net::SocketAddr, std::net::SocketAddr), EgclError> {
+    let socket = socket_option_handle(stream)?;
+    let local = socket
+        .local_addr()
+        .map_err(|e| EgclError::StreamError(format!("socket local name: {e}")))?;
+    let peer = socket
+        .peer_addr()
+        .map_err(|e| EgclError::StreamError(format!("socket peer name: {e}")))?;
+    Ok((local, peer))
+}
+
+/// The address a listener is bound to.
+pub fn socket_listener_local_name(id: u64) -> Result<std::net::SocketAddr, EgclError> {
+    let listener = socket_listener(id)?;
+    listener.check_open()?;
+    listener
+        .socket
+        .local_addr()
+        .map_err(|e| EgclError::FileError(format!("socket listener local name: {e}")))
+}
+
 /// The raw file descriptor backing a file/socket IO stream, or None.
 #[cfg(unix)]
 pub fn stream_raw_fd(stream: EgclVal) -> Option<i32> {

@@ -595,7 +595,15 @@ The native server primitives used by library adapters are:
 (egcl::%socket-listener-ready-p listener timeout-ms) -> boolean
 (egcl::%socket-accept listener) -> bidirectional-octet-stream
 (egcl::%socket-close listener)
+(egcl::%socket-listener-local-name listener) -> (address-string port)
+(egcl::%socket-local-name stream) -> (address-string port)
+(egcl::%socket-peer-name stream) -> (address-string port)
 ```
+
+The three name functions answer the bound or connected address of a listener
+or an established stream as the text of the IP address and the port number,
+for the address queries of socket libraries (usocket's `get-local-name`,
+`get-peer-address` and the rest).
 
 Listener IDs are process-wide: another native thread or fiber can query, accept,
 or close a listener. Port zero selects an available local port. Ports must be in

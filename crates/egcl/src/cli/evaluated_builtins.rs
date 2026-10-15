@@ -6,6 +6,14 @@
 //! implementations without retaining the tree-walking operator dispatcher.
 use super::*;
 
+/// `(address-string port)` for a socket name, the shape the three
+/// %SOCKET-...-NAME builtins answer. The string is rooted across the list's
+/// allocation.
+fn socket_name_list(name: &std::net::SocketAddr) -> EgclVal {
+    egcl_rt::rooted!(address = arena_str(&name.ip().to_string()));
+    vec_to_list(&[*address, EgclVal::from_fixnum(name.port() as i64)])
+}
+
 type Handler = fn(&str, &[EgclVal], &mut Env) -> Result<EgclVal, EgclError>;
 
 pub(super) fn call(
@@ -1151,6 +1159,40 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(egcl_stdlib::stream_raw_fd(s)
                 .map(|fd| EgclVal::from_fixnum(fd as i64))
                 .unwrap_or(NIL))
+        }),
+
+        "EGCL::%SOCKET-LOCAL-NAME" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%socket-local-name stream) → (address-string port)
+
+            let s = args.first().copied().unwrap_or(NIL);
+            let (local, _) = egcl_stdlib::socket_stream_names(s)?;
+            Ok(socket_name_list(&local))
+        }),
+
+        "EGCL::%SOCKET-PEER-NAME" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%socket-peer-name stream) → (address-string port)
+
+            let s = args.first().copied().unwrap_or(NIL);
+            let (_, peer) = egcl_stdlib::socket_stream_names(s)?;
+            Ok(socket_name_list(&peer))
+        }),
+
+        "EGCL::%SOCKET-LISTENER-LOCAL-NAME" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%socket-listener-local-name listener-id) → (address-string port)
+
+            if args.is_empty() || !args[0].is_fixnum() {
+                return Err(EgclError::ProgramError(
+                    "%socket-listener-local-name: a listener id is required".into(),
+                ));
+            }
+            let name = egcl_stdlib::socket_listener_local_name(args[0].as_fixnum() as u64)?;
+            Ok(socket_name_list(&name))
         }),
 
         "EGCL::%SOCKET-WAIT-FOR-INPUT" => Some(|_operator, args, _env| {
