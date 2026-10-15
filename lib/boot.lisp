@@ -1912,7 +1912,19 @@
       ((null tail) (values nil nil nil))
     (when (member (car tail) indicator-list :test (function eq))
       (return (values (car tail) (cadr tail) tail)))))
-(defun nreverse (seq) (reverse seq))
+;; A vector is reversed in place and returned as itself, so its element type,
+;; fill pointer and adjustability survive (ansi nreverse-vector.5/6 compare
+;; TYPE-OF of the argument and the result); a list goes through REVERSE.
+(defun nreverse (seq)
+  (if (listp seq)
+      (reverse seq)
+      (let ((i 0) (j (1- (length seq))))
+        (do () ((>= i j) seq)
+          (let ((tmp (aref seq i)))
+            (setf (aref seq i) (aref seq j))
+            (setf (aref seq j) tmp))
+          (setq i (1+ i))
+          (setq j (1- j))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; GCD / LCM and the STRING-TRIM family.

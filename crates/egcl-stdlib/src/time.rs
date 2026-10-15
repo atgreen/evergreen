@@ -385,7 +385,10 @@ mod tests {
         // Noon in zone 5 (EST) is 17:00 GMT.
         let ut = encode_universal_time(0, 0, 12, 1, 1, 2020, Some(5));
         assert_eq!(decode_universal_time(ut, Some(0)).2, 17);
-        // And decoding back in zone 5 recovers noon.
-        assert_eq!(decode_universal_time(ut, Some(5)).2, 12);
+        // And decoding back in zone 5 recovers noon; DECODE takes the zone
+        // in seconds west of GMT and reports it back in hours.
+        let decoded = decode_universal_time(ut, Some(5 * 3600));
+        assert_eq!(decoded.2, 12);
+        assert_eq!(decoded.8, 5);
     }
 }

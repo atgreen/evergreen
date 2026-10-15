@@ -35,7 +35,15 @@ set -u
 # Remaining survey from that day, for whoever enables the next one:
 # symbols 1135/10 (one is bliss-0dtf, the ratio-literal reader bug),
 # iteration 794/49, types-and-classes 565/58.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings)
+# conditions and misc added 2026-10-13: ok (673/673 and 740/740) at the end
+# of the ANSI conformance series (HANDLER-CASE special variables, the
+# standard functions CL-FUNCTION-SYMBOLS.1 found missing, arity checks).
+# Survey of the same day, every chapter: symbols 1144/1, environment 209/1,
+# files 86/1, numbers 1441/3, pathnames 212/3, sequences 3285/2,
+# eval-and-compile 313/5, iteration 835/8, streams 795/8, packages 491/9,
+# types-and-classes 613/10, structures 1380/14, reader 658/15,
+# objects 811/52, arrays 1243/113, printer 2288/158, system-construction 39/38.
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"
