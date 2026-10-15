@@ -3858,14 +3858,21 @@
       (let ((outvars (mapcar (lambda (s) (declare (ignore s)) (gensym))
                              (car stores)))
             (sources (append (cdr getters) (list newval))))
-        ;; SHIFTF yields exactly one value, the primary old value of the first
-        ;; place (CLHS 5.1.2.3; ansi shiftf.7), even for a VALUES place whose
-        ;; reading produced several.
+        ;; SHIFTF returns every old value of the first place, so a place whose
+        ;; reading produces several -- a VALUES place, or an expander with more
+        ;; than one store variable -- shifts them all out and can feed another
+        ;; SHIFTF.  This used to return only the primary value, citing ansi
+        ;; shiftf.7; that test is inside a #||...||# block in the suite,
+        ;; disabled by its own authors, whose note reads "several lisps return
+        ;; '(a b) and when viewed as a shift register it makes sense to have
+        ;; all the values from first place to be returned".  SBCL returns
+        ;; (A B) for (shiftf (values x y) (floor 10 3)); so do we.  A
+        ;; single-store place still yields exactly one value.
         `(let* ,binds
            (multiple-value-bind ,outvars ,(car getters)
              ,(%bind-setf-stores stores sources
                                  (append setters
-                                         (list (car outvars))))))))))
+                                         (list `(values ,@outvars))))))))))
 
 ;;; PROG / PROG*: LET (or LET*) plus an implicit BLOCK NIL and TAGBODY.
 ;;; A leading (declare ...) belongs to the LET, not to the TAGBODY: CLHS 6.1.1.4

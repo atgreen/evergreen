@@ -9659,7 +9659,13 @@ fn generic_accepts_union_of_method_keywords() {
     // bliss-lb6.14: a keyword accepted by ANY applicable method is valid for the
     // generic call, even if the method that runs doesn't list it (CLHS 7.6.5) —
     // ASDF's OPERATE :around declares :verbose, the primary method doesn't.
-    let prog = "(defgeneric gk (x)) \
+    // The generic function must itself mention &key: CLHS 7.6.4 congruence
+    // forbids a method lambda list from adding &key when the generic's does
+    // not have it, and both egcl and SBCL signal a PROGRAM-ERROR for
+    // (defgeneric gk (x)) with these two methods.  ASDF's OPERATE, the shape
+    // this test is modelled on, declares &key on the generic.  The keyword
+    // union across applicable methods is what is under test here.
+    let prog = "(defgeneric gk (x &key)) \
                 (defmethod gk :around (x &key verbose) (declare (ignore verbose)) (call-next-method)) \
                 (defmethod gk (x &key mode) (declare (ignore mode)) :ran) \
                 (format t \"~a\" (gk 1 :verbose t :mode :fast))";
@@ -13481,7 +13487,11 @@ fn make_array_builds_a_plain_simple_vector() {
             "(NIL NIL)",
         ),
         (
-            "(eq (type-of (make-array 4)) (type-of (vector nil nil nil nil)))",
+            // Same type as `(vector ...)`.  TYPE-OF returns the compound
+            // specifier (SIMPLE-VECTOR 4) for both, and two freshly consed
+            // specifiers are never EQ -- SBCL answers NIL to the EQ form too.
+            // EQUAL compares the specifiers, which is what "same type" means.
+            "(equal (type-of (make-array 4)) (type-of (vector nil nil nil nil)))",
             "T",
         ),
         // Writable, and every cell holds the SAME initial element (CLHS).
@@ -17890,7 +17900,13 @@ fn abs_preserves_exact_type_on_both_dispatch_paths() {
         ("(abs -1/2)", "1/2"),
         ("(abs 1/2)", "1/2"),
         ("(abs -100000000000000000000)", "100000000000000000000"),
-        ("(type-of (abs -5))", "FIXNUM"),
+        // TYPE-OF may return any recognizable subtype, and for a non-negative
+        // fixnum both egcl and SBCL return a compound (INTEGER 0 <limit>)
+        // rather than FIXNUM -- the limit is the implementation's fixnum
+        // range, so pinning the spelling pins an implementation detail.  What
+        // this test is about is that ABS of a fixnum stays a fixnum instead of
+        // promoting, so assert that directly.
+        ("(typep (abs -5) 'fixnum)", "T"),
         ("(type-of (abs -5.5d0))", "DOUBLE-FLOAT"),
         // ABS of a complex is its magnitude (bliss-dhrx), and the magnitude
         // takes the PARTS' float format -- this boxed as a single-float
@@ -19430,4 +19446,34 @@ fn open_expands_byte_element_type_aliases() {
         (&with_open, "((UNSIGNED-BYTE 8) 0 129 255 :EOF)"),
     ]);
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn format_to_t_follows_a_rebound_standard_output() {
+    // CLHS FORMAT: "if destination is t, the output is sent to
+    // *standard-output*".  That is NOT the stream-designator rule of CLHS
+    // 21.1, where a bare `t` designates *TERMINAL-IO* -- so FORMAT must not
+    // go through the designator resolver.  It did, and because *TERMINAL-IO*
+    // and *STANDARD-OUTPUT* both point at the terminal in a default REPL the
+    // bug stayed invisible until something rebound *STANDARD-OUTPUT*: the
+    // output went to the terminal and the capture stream stayed empty.
+    //
+    // WITH-OUTPUT-TO-STRING over *STANDARD-OUTPUT* plus `format t` is the
+    // common capture idiom, so cover it directly as well as the explicit LET.
+    let wots = "(with-output-to-string (*standard-output*) (format t \"inner\"))";
+    let rebound = "(let ((c (make-string-output-stream)))
+                     (let ((*standard-output* c)) (format t \"captured\"))
+                     (get-output-stream-string c))";
+    // An explicit stream destination still wins over the dynamic binding.
+    let explicit = "(let ((c (make-string-output-stream)))
+                      (let ((*standard-output* (make-string-output-stream)))
+                        (format c \"explicit\"))
+                      (get-output-stream-string c))";
+    run_expression_cases(&[
+        (wots, "\"inner\""),
+        (rebound, "\"captured\""),
+        // A NIL destination still returns the formatted string.
+        ("(format nil \"~a\" :s)", "\"S\""),
+        (explicit, "\"explicit\""),
+    ]);
 }

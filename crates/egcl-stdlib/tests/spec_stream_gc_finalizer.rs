@@ -11,8 +11,10 @@
 //! serialized on a file-local lock like the other GC tests in the tree.
 
 use std::sync::{Mutex, OnceLock};
-use egcl_rt::value::{NIL, T, EgclVal};
-use egcl_stdlib::streams::{IF_EXISTS_SUPERSEDE_VAL, install_gc_hooks, set_symbol_stream};
+use egcl_rt::value::{NIL, EgclVal};
+use egcl_stdlib::streams::{
+    IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_SUPERSEDE_VAL, install_gc_hooks, set_symbol_stream,
+};
 use egcl_stdlib::{
     ExternalFormat, StreamDirection, make_broadcast_stream, make_lisp_string,
     make_string_input_stream, make_string_output_stream, make_synonym_stream, open,
@@ -53,7 +55,10 @@ fn file_stream_fd_released_by_gc_finalizer() {
             StreamDirection::Output,
             NIL,
             IF_EXISTS_SUPERSEDE_VAL,
-            T,
+            // :if-does-not-exist :create -- T is not one of the values
+            // missing_file_policy accepts, so passing it made every open fail
+            // with "file not found" before the file could be created.
+            IF_DOES_NOT_EXIST_CREATE_VAL,
             ExternalFormat::Utf8,
         )
         .expect("open output file stream");

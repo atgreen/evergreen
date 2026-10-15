@@ -258,15 +258,43 @@ fn clos_effective_method_surfaces_standard_and_short_form_combinations() {
     assert_eq!(standard.2, vec![primary_a, primary_b]);
     assert_eq!(standard.3, vec![after]);
 
+    // A short-form combination accepts exactly two qualifiers (CLHS 7.6.6.4):
+    // the combination's own name, which its primary methods carry, and
+    // :around.  MethodQualifier::Combination is how a method records "carries
+    // the combination's name"; MethodQualifier::Primary means UNQUALIFIED,
+    // which is not acceptable here.  This test used to pass the Primary-
+    // qualified methods plus an :after method and expect the :after to be
+    // silently dropped -- it now builds properly qualified methods instead.
+    let combined_a = fx(3606);
+    let combined_b = fx(3607);
+    set_method_specializers(combined_a, vec![], MethodQualifier::Combination);
+    set_method_specializers(combined_b, vec![], MethodQualifier::Combination);
+
     let short_key = compute_effective_method(
         gf,
         MethodCombinationType::Append,
-        &[around, primary_a, primary_b, after],
+        &[around, combined_a, combined_b],
     )
     .unwrap();
     let short = get_short_form_method(short_key).unwrap();
     assert_eq!(short.0, MethodCombinationType::Append);
-    assert_eq!(short.1, vec![primary_a, primary_b]);
+    assert_eq!(short.1, vec![combined_a, combined_b]);
+
+    // An unqualified or :after method is an error when applicable to a
+    // short-form combination.  SBCL signals for the equivalent program --
+    // "requires all methods have either the single qualifier APPEND or the
+    // single qualifier :AROUND" -- and so does egcl.
+    for bad in [primary_a, after] {
+        assert!(
+            compute_effective_method(
+                gf,
+                MethodCombinationType::Append,
+                &[around, combined_a, bad],
+            )
+            .is_err(),
+            "a short-form combination must reject a method it does not accept"
+        );
+    }
 }
 
 #[test]

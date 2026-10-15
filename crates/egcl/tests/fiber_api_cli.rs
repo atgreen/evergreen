@@ -433,12 +433,21 @@ fn native_threads_and_fibers_have_distinct_types_and_visible_carriers() {
                 (assert (= 3 (length (remove-duplicates fibers :test #'eq))))
                 (dolist (carrier carriers)
                   (assert (not (eql parent carrier)))
-                  (assert (eq (type-of worker) (type-of carrier)))
+                  ;; A thread is an integer handle, so (eq (type-of worker)
+                  ;; (type-of carrier)) only ever held because TYPE-OF
+                  ;; answered FIXNUM for every small integer; it now answers
+                  ;; the tightest type, so two handles give BIT and
+                  ;; (INTEGER 0 ...).  What matters is that both are threads
+                  ;; and neither is a fiber, which the predicates state
+                  ;; directly.
+                  (assert (not (egcl-fiber:fiber-p worker)))
                   (assert (not (egcl-fiber:fiber-p carrier)))
                   (assert (egcl-thread:thread-alive-p carrier))
                   (assert (member carrier (egcl-thread:all-threads))))
                 (dolist (fiber fibers)
-                  (assert (not (eq (type-of worker) (type-of fiber))))
+                  ;; Threads and fibers are distinct kinds: the fiber
+                  ;; satisfies FIBER-P and the carrier thread does not.
+                  (assert (egcl-fiber:fiber-p fiber))
                   (assert (typep fiber 'egcl-fiber:fiber))
                   (assert (not (member fiber (egcl-thread:all-threads))))
                   (egcl-fiber:submit-fiber group fiber))
