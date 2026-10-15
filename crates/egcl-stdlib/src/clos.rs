@@ -1229,7 +1229,9 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     // must know (ansi symbols cl-types-that-are-classes.*; the objects chapter
     // names STANDARD-GENERIC-FUNCTION while loading). Handles continue the
     // negative range; nothing dispatches on them beyond FIND-CLASS,
-    // CLASS-NAME, CLASS-PRECEDENCE-LIST and TYPEP of the metaobject.
+    // CLASS-NAME, CLASS-PRECEDENCE-LIST and TYPEP of the metaobject. RESTART is
+    // deliberately absent: the runtime defines it as a standard class whose
+    // instances are the first-class restart objects (ensure_restart_class).
     let stream_cls = EgclVal::from_fixnum(-24);
     let bstream_cls = EgclVal::from_fixnum(-25);
     let cstream_cls = EgclVal::from_fixnum(-26);
@@ -1243,7 +1245,6 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let pkg_cls = EgclVal::from_fixnum(-34);
     let rstate_cls = EgclVal::from_fixnum(-35);
     let rtable_cls = EgclVal::from_fixnum(-36);
-    let restart_cls = EgclVal::from_fixnum(-37);
     let sobj_cls = EgclVal::from_fixnum(-38);
     let class_cls = EgclVal::from_fixnum(-39);
     let sclass_cls = EgclVal::from_fixnum(-40);
@@ -1301,7 +1302,6 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let pkg_nm = nm("PACKAGE");
     let rstate_nm = nm("RANDOM-STATE");
     let rtable_nm = nm("READTABLE");
-    let restart_nm = nm("RESTART");
     let sobj_nm = nm("STRUCTURE-OBJECT");
     let class_nm = nm("CLASS");
     let sclass_nm = nm("STANDARD-CLASS");
@@ -1404,7 +1404,6 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             (pkg_nm, pkg_cls, vec![t_cls]),
             (rstate_nm, rstate_cls, vec![t_cls]),
             (rtable_nm, rtable_cls, vec![t_cls]),
-            (restart_nm, restart_cls, vec![t_cls]),
             (sobj_nm, sobj_cls, vec![t_cls]),
             // Metaobject classes (AMOP): CLASS, METHOD and METHOD-COMBINATION
             // are standard objects; a generic function is also a FUNCTION.

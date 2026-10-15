@@ -170,6 +170,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 .lookup_var("*PRINT-ESCAPE*")
                 .map(|value| !value.is_nil())
                 .unwrap_or(true);
+            // Every other printer-control keyword binds its *PRINT-...* variable
+            // for the duration of the call (CLHS WRITE), so :circle t prints
+            // shared structure with #n= labels instead of looping on a circular
+            // list, and :pretty/:length/:level/... reach the printer
+            // (ansi printer print.cons.5-7).
+            let mut bindings: Vec<DynBind> = Vec::new();
             let mut i = 1;
             while i + 1 < args.len() {
                 let key = sym_bare_name_rc(args[i]);
@@ -177,6 +183,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 match key.as_ref() {
                     "STREAM" => stream_idx = Some(i + 1),
                     "ESCAPE" => escape = !val.is_nil(),
+                    "ARRAY" | "BASE" | "CASE" | "CIRCLE" | "GENSYM" | "LENGTH" | "LEVEL"
+                    | "LINES" | "MISER-WIDTH" | "PPRINT-DISPATCH" | "PRETTY" | "RADIX"
+                    | "READABLY" | "RIGHT-MARGIN" => {
+                        if let Some(var) = resolve_sym(&format!("*PRINT-{key}*")) {
+                            bindings.push(DynBind::establish(var, val));
+                        }
+                    }
                     _ => {}
                 }
                 i += 2;
@@ -195,6 +208,7 @@ fn resolve(name: &str) -> Option<Handler> {
             let stream = stream_idx.map(|k| args[k]).unwrap_or(NIL);
             let out = resolve_output_stream(stream, env);
             write_str_to(out, &rendered, env)?;
+            drop(bindings);
             Ok(args[0])
         }),
 

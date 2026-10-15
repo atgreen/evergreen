@@ -628,19 +628,11 @@
 (defun princ-to-string (x) (format nil "~a" x))
 (defun prin1-to-string (x) (format nil "~s" x))
 (defun write-to-string (x &rest keys)
-  ;; Honour the print-control keywords that affect integer/general output:
-  ;; :base rebinds *print-base* (the printer reads it), and :escape selects
-  ;; ~S (readable, default) vs ~A. Other keys are accepted and ignored for now
-  ;; (bliss-82lz). *print-base*/*print-escape* are defvar'd later in this file;
-  ;; the body runs post-boot, so they are bound and special by call time.
-  (let* ((base-tail (member :base keys))
-         (radix-tail (member :radix keys))
-         (escape-tail (member :escape keys))
-         (*print-base* (if base-tail (cadr base-tail) *print-base*))
-         (*print-radix* (if radix-tail (cadr radix-tail) *print-radix*)))
-    (if (and escape-tail (null (cadr escape-tail)))
-        (format nil "~a" x)
-        (format nil "~s" x))))
+  ;; WRITE to a string stream: WRITE binds every printer-control keyword
+  ;; (:base :circle :escape :pretty :length ...) around the printing, so this
+  ;; honours them all (CLHS 22.4; ansi printer print.cons.5-7).
+  (with-output-to-string (s)
+    (apply #'write x :stream s keys)))
 
 ;; Minimal PPRINT: a fresh newline, then the escaped printed representation of
 ;; OBJECT, with no trailing space, returning no values (CLHS). Full XP pretty-
@@ -1037,18 +1029,24 @@
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
 ;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
 ;; copies around a computation.
-(defvar *random-state* (list :random-state))
+;; A random state is (:RANDOM-STATE . seed); RANDOM advances the seed in place
+;; and seeds a NIL one from OS entropy on first use. Copying the cons copies
+;; the sequence, which is what MAKE-RANDOM-STATE promises (CLHS 12.2).
+(defvar *random-state* (cons :random-state nil))
 (defun make-random-state (&optional state)
-  ;; CLHS: STATE is a RANDOM-STATE, T, or NIL. The argument was simply IGNORED,
-  ;; so (make-random-state 0) handed back a fresh state instead of signalling
-  ;; (ansi MAKE-RANDOM-STATE.ERROR.4). The placeholder RESULT is unchanged --
-  ;; egcl has one global PRNG, which is a separate question (MAKE-RANDOM-STATE.1
-  ;; wants a real independent copy and still fails).
+  ;; CLHS: STATE is a RANDOM-STATE, T (a fresh, randomly seeded state), or
+  ;; NIL (a copy of the current state).
   (unless (or (null state) (eq state t) (random-state-p state))
     (error 'type-error
            :datum state
            :expected-type '(or (member nil t) random-state)))
-  (list :random-state))
+  (if (eq state t)
+      (cons :random-state nil)
+      (let ((source (or state *random-state*)))
+        ;; A state never drawn from has no seed yet; one draw fixes it so the
+        ;; copy and the original continue identically.
+        (unless (cdr source) (random 2 source))
+        (cons :random-state (cdr source)))))
 (defun random-state-p (object)
   (and (consp object) (eq (car object) :random-state)))
 (defun copy-readtable (&optional from-readtable to-readtable)
