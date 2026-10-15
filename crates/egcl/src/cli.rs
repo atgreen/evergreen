@@ -32107,8 +32107,13 @@ fn eval_defmacro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // CLHS DEFMACRO: the body is enclosed in an implicit BLOCK named after the
     // macro, so RETURN-FROM that name exits the expander (ansi defmacro.2).
     // The same wrap DEFUN and DEFINE-SETF-EXPANDER perform at definition time.
-    // A leading docstring and declarations stay outside the block: the
-    // special-declaration scan looks through the implicit block, as for DEFUN.
+    // The special-declaration scan looks through the implicit block, as for DEFUN.
+    //
+    // Keep the UNWRAPPED body for the documentation scan below: wrapping puts
+    // the leading docstring inside the BLOCK, so it is no longer the body's
+    // first form and the scan found the (BLOCK …) form instead -- DOCUMENTATION
+    // of a documented macro answered NIL (bliss-uevqu).
+    egcl_rt::rooted!(doc_body = body);
     if name_form.is_symbol() {
         egcl_rt::rooted!(block_body = arena_cons(name_form, body));
         egcl_rt::rooted!(block_form = arena_cons(resolve_sym("BLOCK").unwrap_or(NIL), *block_body));
@@ -32133,7 +32138,8 @@ fn eval_defmacro(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         },
     );
     // CFFI's DEFCFUN defines a variadic binding as a macro, docstring and all.
-    record_function_documentation(name_form, body, env)?;
+    // Scan the pre-wrap body: see the note at the implicit BLOCK above.
+    record_function_documentation(name_form, *doc_body, env)?;
     Ok(name_form)
 }
 
