@@ -43,7 +43,9 @@ set -u
 # eval-and-compile 313/5, iteration 835/8, streams 795/8, packages 491/9,
 # types-and-classes 613/10, structures 1380/14, reader 658/15,
 # objects 811/52, arrays 1243/113, printer 2288/158, system-construction 39/38.
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc)
+# files added 2026-10-15: ok (87/87) once RENAME-FILE accepted a file stream as
+# its filespec (rename-file.4) and the gate cleared sandbox/scratch for it.
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"
@@ -131,6 +133,13 @@ for chapter in "${chapters[@]}"; do
     fi
     # Stale-fasl hazard (bliss-89lj): always compile fresh.
     find "$ANSI_TEST_DIR" -name '*.fasl' -delete
+    # ensure-directories-exist.8 (files) creates sandbox/scratch itself and
+    # expects it absent, while every other chapter's run leaves it behind
+    # (scripts/ansi-chapter.lisp provisions it for them), so a second run on
+    # the same checkout failed that one test. Clear it before the chapter.
+    if [ "$chapter" = files ]; then
+        rm -rf "$ANSI_TEST_DIR/sandbox/scratch"
+    fi
 
     log="$(mktemp "${TMPDIR:-/tmp}/ansi-gate-$chapter.XXXXXX.log")"
     # egcl rejects mixing --eval with --load, so parameterize via a tiny

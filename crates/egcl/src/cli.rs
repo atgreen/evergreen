@@ -23342,8 +23342,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(from = eval_form(from_form, env)?);
                 egcl_rt::rooted!(to = eval_form(*to_form, env)?);
                 // Both names are relative to *DEFAULT-PATHNAME-DEFAULTS*
-                // (ansi files rename-file.*).
-                if is_path_designator(*from) {
+                // (ansi files rename-file.*).  A file stream, open or closed,
+                // designates the pathname it was opened with (CLHS 20.1;
+                // ansi rename-file.4), which is already absolute.
+                if egcl_rt::types::streamp(*from) {
+                    *from = egcl_stdlib::parse_namestring(*from, None, None)?.0;
+                } else if is_path_designator(*from) {
                     *from = resolve_against_dpd(*from, env)?;
                 }
                 // NEW-NAME is merged with FILESPEC (CLHS RENAME-FILE), so a bare
