@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+### ANSI conformance
+
+The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
+`misc` (740) chapters pass completely, as do `cons`, `data-and-control-flow`,
+`hash-tables`, `characters` and `strings`.
+
+- Run on kernels built without user shadow-stack support. On such a kernel
+  (WSL2's, and many cloud VM kernels) `arch_prctl(ARCH_SHSTK_STATUS)` fails with
+  `EINVAL`, which was read as "hardening state unknown" and refused, so every
+  program aborted with `ordinary callable boundary is unavailable`
+  ([#314](https://github.com/atgreen/evergreen/pull/314)).
+- Reader: honor single escapes inside `|...|`, resolve escaped `\T` and `|NIL|`
+  to the constants, read `t` and `nil` in a `#+`/`#-` feature expression as the
+  keywords `:T` and `:NIL`, honor the length argument of `#n*` and `#n(`, give
+  `#S` slots their initforms, and read `#nA` sequences.
+  `WITH-STANDARD-IO-SYNTAX` binds `*PACKAGE*` to the package rather than its
+  name ([#315](https://github.com/atgreen/evergreen/pull/315)).
+- Printer and `FORMAT`: `WRITE` binds every printer-control keyword;
+  `*PRINT-READABLY*` overrides `*PRINT-LENGTH*`, `*PRINT-LEVEL*` and
+  `*PRINT-GENSYM*`; printing circular structure without `*PRINT-CIRCLE*` stops
+  at the stack budget instead of faulting. The `~^`, `~{`, `~/name/`, `~<`,
+  `~F`, `~C`, `~D` and `~R` directives follow their parameters, `FORMATTER`
+  functions return the arguments they did not consume, and pprint-dispatch
+  tables work ([#317](https://github.com/atgreen/evergreen/pull/317),
+  [#320](https://github.com/atgreen/evergreen/pull/320),
+  [#324](https://github.com/atgreen/evergreen/pull/324)).
+- Streams, files and pathnames: `READ-CHAR-NO-HANG` and `LISTEN` no longer
+  block on a pipe, socket or terminal with nothing buffered, and both honor a
+  character pushed back with `UNREAD-CHAR`. `*TERMINAL-IO*` is bidirectional.
+  Binary streams support wide `(unsigned-byte N)` element types; a broadcast
+  stream reports its last component's `FILE-POSITION` and `FILE-LENGTH` and
+  passes on values its components accept; and a too-large or negative
+  `FILE-POSITION` signals a `TYPE-ERROR` instead of crashing the process.
+  Logical pathname translations accept the ANSI list of wildcard pairs,
+  `DIRECTORY` merges against the default directory, and `READ-SEQUENCE` fills a
+  list ([#316](https://github.com/atgreen/evergreen/pull/316),
+  [#318](https://github.com/atgreen/evergreen/pull/318),
+  [#321](https://github.com/atgreen/evergreen/pull/321)).
+- Symbols, macros and structures: every standard macro and function the
+  evaluator implements natively reports as `FBOUNDP`, the REPL history
+  variables and `*BREAK-ON-SIGNALS*` are bound, `DEFMACRO` keeps its
+  documentation string, `SYMBOL-MACROLET` shadows a global symbol macro,
+  `TRACE` and `UNTRACE` work, and `:TYPE`d structures are supported
+  ([#319](https://github.com/atgreen/evergreen/pull/319),
+  [#322](https://github.com/atgreen/evergreen/pull/322),
+  [#325](https://github.com/atgreen/evergreen/pull/325)).
+- CLOS: method objects are first class, with `REMOVE-METHOD`, `ADD-METHOD`,
+  `COMPUTE-APPLICABLE-METHODS`, and a `FIND-METHOD` that distinguishes one
+  method combination from another. `DEFCLASS` and `DEFGENERIC` syntax and
+  initarg validity are checked, `SLOT-MISSING` is called, class slots shadow
+  inherited instance slots, effective slots and the built-in classes follow the
+  CLHS precedence order, short-form method combinations run with `:around`
+  methods, and `CHANGE-CLASS` is generic
+  ([#316](https://github.com/atgreen/evergreen/pull/316),
+  [#323](https://github.com/atgreen/evergreen/pull/323)).
+- Sequences and types: `NREVERSE` reverses a vector in place, `MAPCAR` blames
+  the dotted tail in its `TYPE-ERROR`, `TYPEP` knows `GENERIC-FUNCTION` and
+  `STANDARD-GENERIC-FUNCTION`, bit operations accept any bit array,
+  `ADJUST-ARRAY` copies, `RATIONALIZE` round-trips through the float it came
+  from, and a copied `RANDOM-STATE` replays its sequence
+  ([#315](https://github.com/atgreen/evergreen/pull/315),
+  [#316](https://github.com/atgreen/evergreen/pull/316),
+  [#317](https://github.com/atgreen/evergreen/pull/317),
+  [#325](https://github.com/atgreen/evergreen/pull/325)).
+
+### Performance
+
+- Memoize tree-walking macro expansions, so an interpreted loop body expands
+  its macros once instead of once per iteration. `ASSERT` expands a `LOOP`,
+  which made interpreted test loops far slower than necessary; a
+  2000-iteration `ASSERT` loop now runs in 14 ms. Memoized expansions are
+  dropped at each `EVAL` boundary, so a form mutated between two evaluations is
+  expanded again rather than reusing the first expansion
+  ([#321](https://github.com/atgreen/evergreen/pull/321),
+  [#322](https://github.com/atgreen/evergreen/pull/322)).
+
+### Correctness
+
+- Root printed and formatted values across calls back into Lisp — the
+  pretty-printer dispatch hook and the `~{` iteration body function — so a
+  relocating garbage collection during a user print function or `FORMATTER`
+  cannot leave the caller holding a stale object
+  ([#320](https://github.com/atgreen/evergreen/pull/320),
+  [#324](https://github.com/atgreen/evergreen/pull/324)).
 - Check supported primitive `FTYPE` primary-result declarations even at safety
   zero, preserving multiple values and the executing definition's contract.
   Retain checks in source-free BFASL files, and enforce declared argument types
