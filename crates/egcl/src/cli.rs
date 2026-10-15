@@ -6176,18 +6176,26 @@ fn check_initargs_valid(
                 bare == "T" || bare == "STANDARD-OBJECT" || precedence.contains(&bare)
             }
         };
-        let methods = env.methods.borrow();
-        for generic_name in generic_names {
-            for def in methods.get(*generic_name).into_iter().flatten() {
-                if !applies(def) {
-                    continue;
-                }
-                let info = lambda_list_key_info(def.lambda_list);
-                if info.allow_other_keys {
-                    return Ok(());
-                }
-                valid.extend(info.keys);
+        // Copy the applicable methods' lambda lists out from under the
+        // methods borrow before reading them: naming their symbols can take
+        // the symbol registry (lock order 3), which the lock-order guard
+        // refuses while 'evaluator methods' (23) is held.  A restored image's
+        // cold symbol-name cache tripped it on its first MAKE-INSTANCE.
+        let lambda_lists: Vec<EgclVal> = {
+            let methods = env.methods.borrow();
+            generic_names
+                .iter()
+                .flat_map(|generic_name| methods.get(*generic_name).into_iter().flatten())
+                .filter(|def| applies(def))
+                .map(|def| def.lambda_list)
+                .collect()
+        };
+        for lambda_list in lambda_lists {
+            let info = lambda_list_key_info(lambda_list);
+            if info.allow_other_keys {
+                return Ok(());
             }
+            valid.extend(info.keys);
         }
     }
     for pair in initargs.chunks_exact(2) {
@@ -37139,20 +37147,27 @@ fn check_generic_call_arguments(
         }
     }
     let mut valid = generic.keys;
-    {
+    // Copy the applicable methods' lambda lists out from under the methods
+    // borrow before reading them: naming their symbols takes the symbol
+    // registry (lock order 3), which the runtime's lock-order guard refuses
+    // while 'evaluator methods' (23) is held.  ASDF's LOAD-SYSTEM :VERBOSE
+    // NIL tripped it on every debug build.
+    let method_lambda_lists: Vec<EgclVal> = {
         let methods = env.methods.borrow();
         let defs = methods.get(name);
-        for id in method_ids {
-            let Some(def) = defs.and_then(|defs| defs.iter().find(|def| def.method_id == id))
-            else {
-                continue;
-            };
-            let info = lambda_list_key_info(def.lambda_list);
-            if info.allow_other_keys || (info.has_rest && !info.has_key) {
-                return Ok(());
-            }
-            valid.extend(info.keys);
+        method_ids
+            .filter_map(|id| {
+                defs.and_then(|defs| defs.iter().find(|def| def.method_id == id))
+                    .map(|def| def.lambda_list)
+            })
+            .collect()
+    };
+    for lambda_list in method_lambda_lists {
+        let info = lambda_list_key_info(lambda_list);
+        if info.allow_other_keys || (info.has_rest && !info.has_key) {
+            return Ok(());
         }
+        valid.extend(info.keys);
     }
     for pair in tail.chunks(2) {
         let key = pair[0];
