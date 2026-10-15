@@ -1141,6 +1141,43 @@
 ;;; knows how to poll a pipe or socket without blocking; it cannot be written
 ;;; here in terms of READ-CHAR, which blocks.
 
+;;; INTERACTIVE-STREAM-P: true for a stream connected to the terminal (CLHS
+;;; 21.2): *TERMINAL-IO* itself, a synonym stream resolving to an interactive
+;;; stream, or a two-way/echo stream whose input side is interactive.
+(defun interactive-stream-p (stream)
+  (unless (streamp stream)
+    (error 'type-error :datum stream :expected-type 'stream))
+  (cond ((eq stream *terminal-io*) t)
+        ((typep stream 'synonym-stream)
+         (let ((target (symbol-value (synonym-stream-symbol stream))))
+           (and (streamp target) (not (eq target stream))
+                (interactive-stream-p target))))
+        ((typep stream 'two-way-stream)
+         (interactive-stream-p (two-way-stream-input-stream stream)))
+        ((typep stream 'echo-stream)
+         (interactive-stream-p (echo-stream-input-stream stream)))
+        (t nil)))
+
+;;; LISTEN: true when a character is immediately available on STREAM, and false
+;;; both when none is available yet and at end of file (CLHS 21.2).
+;;;
+;;; READ-CHAR-NO-HANG draws exactly that distinction -- it answers NIL for
+;;; either case and a character only when one is really there -- so ask it and
+;;; push the character back. PEEK-CHAR cannot serve here: on a pipe, socket or
+;;; terminal with nothing buffered it blocks, which is the one thing LISTEN must
+;;; never do. Nor can an interactive stream simply answer NIL: that reports no
+;;; input while a key is waiting.
+(defun listen (&optional (stream *standard-input*))
+  (let ((stream (cond ((eq stream t) *terminal-io*)
+                      ((null stream) *standard-input*)
+                      (t stream))))
+    (unless (streamp stream)
+      (error 'type-error :datum stream :expected-type 'stream))
+    (let ((c (read-char-no-hang stream nil nil)))
+      (when c
+        (unread-char c stream)
+        t))))
+
 ;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
 ;;; the stream itself holds, so this only checks the designator and returns NIL.
 (defun clear-input (&optional (stream *standard-input*))

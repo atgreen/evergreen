@@ -1447,10 +1447,19 @@ impl GrayStream for StreamMutableState {
                 );
             }
         }
-        // For string streams, if exhausted return NIL.
-        // For file streams, reads never block on regular files, so just call stream_read_char.
-        if let StreamInner::StringInput { position, end, .. } = &self.inner {
-            if *position >= *end {
+        // For string streams, if exhausted return NIL -- but a character pushed
+        // back with UNREAD-CHAR is available even at the end of the string, so
+        // it must be consulted first. Ignoring it made NO-HANG (and so LISTEN)
+        // answer "nothing available" for a character the caller had just
+        // unread, which is ansi streams listen.6.
+        if let StreamInner::StringInput {
+            position,
+            end,
+            unread,
+            ..
+        } = &self.inner
+        {
+            if unread.is_none() && *position >= *end {
                 return Ok(NIL);
             }
         }
