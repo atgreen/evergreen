@@ -611,10 +611,23 @@ fn format_directive_tilde_at_brace_iteration_remaining() {
 
 #[test]
 fn format_directive_tilde_colon_at_brace_iteration_remaining_sublists() {
-    // ~:@{body~} — remaining args are sublists (R5.160)
-    let result = format_nil("~:@{~A~}", &[NIL, NIL]);
-    // ~:@{...~} with NIL args (empty sublists) should succeed
-    assert!(result.is_ok(), "~:@{{~A~}} with NIL args should succeed");
+    // ~:@{body~} — each remaining argument is a sublist supplying the body's
+    // arguments (R5.160). A NIL sublist supplies none, so the body's ~A has
+    // nothing to consume and that is a FORMAT-ERROR, not a success: SBCL
+    // signals SB-FORMAT:FORMAT-ERROR for (format nil "~:@{~A~}" nil nil) and
+    // egcl signals SIMPLE-CONTROL-ERROR. This test previously asserted the
+    // lenient behaviour egcl had before the directive was made conformant.
+    assert!(
+        format_nil("~:@{~A~}", &[NIL, NIL]).is_err(),
+        "an empty sublist supplies no argument for the body's ~~A"
+    );
+    // With no arguments at all there are no sublists to iterate, which is not
+    // an error -- SBCL and egcl both produce "".
+    assert_eq!(
+        format_nil_string("~:@{~A~}", &[]),
+        "",
+        "no sublists means no iterations"
+    );
 }
 
 // ~[ ~] — conditional (R5.161)
@@ -1264,24 +1277,29 @@ fn format_error_too_few_arguments_for_directive() {
 }
 
 #[test]
-fn format_error_tilde_d_with_non_numeric() {
-    // ~D expects a numeric argument; passing a character should error
-    let result = format_nil("~D", &[EgclVal::from_char('a')]);
-    assert!(
-        result.is_err(),
-        "format ~D with non-numeric argument should return error"
+fn format_tilde_d_prints_a_non_numeric_as_by_tilde_a() {
+    // CLHS 22.3.2.2: if the argument to ~D is not an integer it is printed in
+    // ~A format and decimal base -- it is NOT an error. This test used to
+    // assert an error, which is what egcl did before the FORMAT directives were
+    // brought in line with the standard; SBCL agrees with the behaviour below
+    // ((format nil "~D" #\a) => "a").
+    assert_eq!(
+        format_nil_string("~D", &[EgclVal::from_char('a')]),
+        "a",
+        "~~D with a non-numeric argument prints, it does not error"
     );
 }
 
 #[test]
-fn format_error_radix_directives_with_non_numeric() {
-    // ~B, ~O, ~X all require numeric arguments
+fn format_radix_directives_print_a_non_numeric_as_by_tilde_a() {
+    // CLHS 22.3.2.2 again: ~B, ~O and ~X print a non-integer argument in ~A
+    // format rather than signalling. Verified against SBCL, which prints "x"
+    // for all three.
     for directive in ["~B", "~O", "~X"] {
-        let result = format_nil(directive, &[EgclVal::from_char('x')]);
-        assert!(
-            result.is_err(),
-            "format {} with non-numeric should error",
-            directive
+        assert_eq!(
+            format_nil_string(directive, &[EgclVal::from_char('x')]),
+            "x",
+            "{directive} with a non-numeric argument prints it as by ~~A"
         );
     }
 }
