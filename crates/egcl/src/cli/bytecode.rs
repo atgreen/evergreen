@@ -23110,6 +23110,18 @@ fn compile_t2_artifact(_input: &T2CompileInput) -> Option<T2Artifact> {
 }
 
 #[cfg(not(egcl_no_t2))]
+fn optimize_t2_ir(function: &mut egcl_compiler::t2::ir::Function) {
+    use egcl_compiler::t2::pass::PassManager;
+    let mut pm = PassManager::new();
+    pm.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
+    pm.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
+    pm.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
+    pm.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
+    pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
+    pm.run(function);
+}
+
+#[cfg(not(egcl_no_t2))]
 fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Only targets with an optimizing native emitter may publish T2 code. This is
     // a safety property, not an optimisation: without it the pipeline runs to
@@ -23272,14 +23284,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // Each pass preserves well-formedness (spec §4.10 R4.60); re-verify before
     // emitting, and decline T2 (fall back to T1) if anything went wrong.
     for function in std::iter::once(&mut f).chain(packed.iter_mut()) {
-        use egcl_compiler::t2::pass::PassManager;
-        let mut pm = PassManager::new();
-        pm.add(Box::new(egcl_compiler::t2::opt_fold::ConstFold));
-        pm.add(Box::new(egcl_compiler::t2::opt_gvn::Gvn));
-        pm.add(Box::new(egcl_compiler::t2::opt_guard::GuardElim));
-        pm.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
-        pm.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
-        pm.run(function);
+        optimize_t2_ir(function);
     }
     if let Err(e) = egcl_compiler::t2::verify::verify(&f) {
         t2_log!("{name}: post-mid-end verify failed: {e:?} => stay T1");
@@ -23287,13 +23292,24 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let (mapped, speculations) = match packed.as_ref().and_then(|candidate| {
+    let (mut mapped, mut speculations) = match packed.as_ref().and_then(|candidate| {
         native_transfer_entry::prepare_ordinary_t2(input, candidate)
             .map(|prepared| (prepared, t2_numeric_speculations(candidate, sym)))
     }) {
         Some((prepared, speculations)) => (Some(prepared), speculations),
         None => (native_transfer_entry::prepare_ordinary_t2(input, &f), speculations),
     };
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(prepared) = &mut mapped {
+        prepared.expand_self_calls(input, &profile);
+        for site in t2_numeric_speculations(prepared.ordinary_ir(), sym) {
+            if !speculations.contains(&site) { speculations.push(site); }
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_candidate = mapped.as_ref().map(|prepared| prepared.ordinary_ir());
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_candidate: Option<&egcl_compiler::t2::ir::Function> = None;
 
     // Linux publishes only mapped code. Do not make a usable mapped worker
     // artifact depend on an emitter for a calling convention we cannot install.
@@ -23327,7 +23343,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // from its optimized IR, independently of checked emission. Include the
     // checked emitter's reported slots as well when it is the selected ABI.
     if has_mapped {
-        for function in std::iter::once(&f).chain(packed.iter()) {
+        for function in std::iter::once(&f).chain(packed.iter()).chain(ordinary_candidate) {
             for &block in function.block_order() {
                 for &instruction in &function.block(block).insts {
                     if let egcl_compiler::t2::ir::AuxData::HeapLiteral { slot } =
@@ -23356,7 +23372,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     }
     let mut deopt_bodies = HashMap::new();
     if has_mapped || checked.as_ref().is_some_and(|code| code.has_deopt) {
-        for (_, state) in f.frame_states.iter() {
+        for (_, state) in std::iter::once(&f).chain(ordinary_candidate)
+            .flat_map(|function| function.frame_states.iter()) {
             for scope in &state.scopes {
                 if deopt_bodies.contains_key(&scope.function) {
                     continue;
@@ -23527,8 +23544,9 @@ fn t2_numeric_speculations(
                 continue;
             };
             let scopes = &f.frame_states.get(state).scopes;
-            if let [scope] = scopes.as_slice() {
-                if scope.function == symbol && !sites.contains(&(scope.bcp, kind)) {
+            if let Some(scope) = scopes.last() {
+                if scopes.iter().all(|scope| scope.function == symbol)
+                    && !sites.contains(&(scope.bcp, kind)) {
                     sites.push((scope.bcp, kind));
                 }
             }

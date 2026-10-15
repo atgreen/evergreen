@@ -523,7 +523,7 @@ mod retained_guard_chain_tests {
         });
         let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
             retain_native_body(&body), &baseline, Some(&ordinary), Some(metadata),
-            &call_cells, false, CompilationTier::T2).expect("emit retained self expansion");
+            &call_cells, false, CompilationTier::T2, None).expect("emit retained self expansion");
         code.set_installed_symbol(symbol);
         assert!(code.ordinary_entry.is_some(), "nested guard fixture must use the ordinary ABI");
         assert!(code.has_deopt);
@@ -709,7 +709,7 @@ mod retained_guard_chain_tests {
         });
         let mut code = TransferCode::emit_prepared_with_ordinary(Arc::clone(&body),
             retain_native_body(&body), &baseline, Some(&ordinary), Some(metadata),
-            &cells, false, CompilationTier::T2).unwrap();
+            &cells, false, CompilationTier::T2, None).unwrap();
         code.set_installed_symbol(symbol);
         assert!(code.ordinary_entry.is_some());
         let stack = egcl_rt::current_stack();

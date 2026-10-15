@@ -42,7 +42,7 @@ fn ordinary_labels_self_cold_retains_real_local_callable() {
     egcl_rt::rooted_ref!(_env = &mut env);
     let forms = "((labels ((walk (n marker)
         (if (= n 0) (car marker)
-            (progn (local-self-observer) (+ (walk 0 marker) 0)))))
+            (progn (local-self-observer) (+ (walk (- n 1) marker) 0)))))
         (walk n marker)))";
     super::super::super::read_eval_all_env(&format!(
         "(defun local-self-observer () (%ordinary-t2-entry-for-test))
@@ -71,7 +71,9 @@ fn ordinary_labels_self_cold_retains_real_local_callable() {
     assert!(local_code.is_t2);
     ordinary_t2::expect_entry(&local_code);
     egcl_rt::rooted!(marker = super::super::super::arena_cons(EgclVal::from_fixnum(71), NIL));
-    egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(1), *marker]);
+    // Two worker inline levels must leave a real residual self call. A
+    // single jump to zero would only test the now-call-free expanded path.
+    egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(3), *marker]);
     MARKER.with(|slot| slot.set(&mut *marker));
     COLD.with(|count| count.set(0));
     let _reset = Reset;

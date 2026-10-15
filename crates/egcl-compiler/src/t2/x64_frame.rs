@@ -21,7 +21,7 @@
 //! materialises (tagged constants it folds into immediates, and comparison
 //! results fused into a branch). It returns [`FrameHomes`]:
 //!
-//! * `values` — a home for every non-excluded SSA value. A GPR value whose
+//! * `values` — a home for every required, non-excluded SSA value. A GPR value whose
 //!   every reported range agrees on one register keeps that register, mapped
 //!   through `GPR_X86` to its hardware encoding. A value whose ranges agree
 //!   on one stack slot keeps its alias relationship with that slot. Anything
@@ -365,6 +365,34 @@ pub fn select_frame_homes(
     machine: &MachFunc,
     mut excluded: impl FnMut(Value) -> bool,
 ) -> Result<FrameHomes, FrameHomeError> {
+    // Optimizations detach instructions without compacting the SSA arena.
+    // Retain layout and all recovery/OSR uses, not merely allocator ranges:
+    // unreported values can still need a stable metadata home. Deliberately
+    // retain even unattached frame states rather than infer metadata reachability.
+    let mut required = HashSet::new();
+    for &block in f.block_order() {
+        required.extend(f.block(block).params.iter().copied());
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            required.extend(data.args.iter().chain(&data.results).copied());
+            for target in &data.targets {
+                required.extend(target.args.iter().copied());
+            }
+        }
+    }
+    for (_, state) in f.frame_states.iter() {
+        for source in state.scopes.iter().flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            .chain(state.remat.iter().flat_map(|recipe| recipe.inputs.iter()))
+        {
+            if let crate::t2::frame_state::ValueSource::Value { value, .. } = source {
+                required.insert(*value);
+            }
+        }
+    }
+    for entry in &f.osr_entries {
+        required.extend(entry.checks.iter().map(|&(value, _)| value));
+    }
+    required.extend(machine.value_locations.iter().map(|range| Value(range.vreg.num)));
     let mut ranges: HashMap<Value, Vec<Location>> = HashMap::new();
     for range in &machine.value_locations {
         if range.vreg.class == RegClass::Gpr {
@@ -378,7 +406,7 @@ pub fn select_frame_homes(
     let mut stack_slots = machine.num_spill_slots;
     for value_num in 0..f.num_values() as u32 {
         let value = Value(value_num);
-        if excluded(value) {
+        if !required.contains(&value) || excluded(value) {
             continue;
         }
         let locs = ranges.get(&value).map(Vec::as_slice).unwrap_or_default();
@@ -426,4 +454,70 @@ pub fn select_frame_homes(
         values,
         stack_slots,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::t2::frame_state::{FrameScope, FrameState, ValueSource};
+    use crate::t2::ir::{IRType, InstData, InstFlags, TypeBits};
+
+    #[test]
+    fn detached_unused_values_do_not_reserve_homes_but_recovery_values_do() {
+        let mut f = Function::new("dead-frame-home");
+        let entry = f.entry();
+        let ty = IRType::of(TypeBits::FIXNUM);
+        let repr = ValueRepresentation::Tagged;
+        let argument = f.add_block_param(entry, ty, repr);
+        let constant = |value| InstData {
+            opcode: Opcode::ConstFixnum, args: vec![], results: vec![],
+            aux: AuxData::FixnumImm(value), flags: InstFlags::default(),
+            targets: vec![], frame_state: None, source_pos: 0,
+        };
+        let (_, recovery) = f.push_inst(entry, constant(7), &[(ty, repr)]);
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope { function: 17, bcp: 0,
+                locals: vec![ValueSource::Value { value: recovery[0], repr }], stack: vec![] }],
+            remat: vec![],
+        });
+        f.set_terminator(entry, InstData {
+            opcode: Opcode::Return, args: vec![argument], results: vec![],
+            aux: AuxData::None, flags: InstFlags::default(), targets: vec![],
+            frame_state: Some(state), source_pos: 0,
+        });
+        let machine = MachFunc::default();
+        let before = select_frame_homes(&f, &machine, |_| false).unwrap();
+        assert!(before.values.contains_key(&recovery[0]),
+            "missing allocator ranges must not discard recovery-only homes");
+        let ret = f.block_mut(entry).insts.pop().unwrap();
+        let (detached, dead) = f.push_inst(entry, constant(99), &[(ty, repr)]);
+        assert_eq!(f.block_mut(entry).insts.pop(), Some(detached));
+        f.block_mut(entry).insts.push(ret);
+        let after = select_frame_homes(&f, &machine, |_| false).unwrap();
+        assert_eq!(after.stack_slots, before.stack_slots,
+            "detached arena results must not enlarge the emitted frame");
+        assert!(!after.values.contains_key(&dead[0]));
+        assert!(after.values.contains_key(&argument));
+        assert!(after.values.contains_key(&recovery[0]));
+        // Home selection conservatively retains any metadata reference, even
+        // without a corresponding allocator range or a laid-out definition.
+        for kind in 0..3 {
+            let mut metadata = f.clone();
+            let source = ValueSource::Value { value: dead[0], repr };
+            match kind {
+                0 => metadata.frame_states.get_mut(state).scopes[0].stack.push(source),
+                1 => metadata.frame_states.get_mut(state).remat.push(
+                    crate::t2::frame_state::RematRecipe {
+                        op: crate::t2::frame_state::RematOp::BoxFixnum,
+                        inputs: vec![source], result_repr: repr,
+                    }),
+                _ => metadata.osr_entries.push(crate::t2::ir::OsrEntry {
+                    control_scopes: vec![], bcp: 0, block: entry,
+                    frame_state: state, checks: vec![(dead[0], ty)],
+                }),
+            }
+            let homes = select_frame_homes(&metadata, &machine, |_| false).unwrap();
+            assert!(homes.values.contains_key(&dead[0]), "retain metadata kind {kind}");
+        }
+    }
 }

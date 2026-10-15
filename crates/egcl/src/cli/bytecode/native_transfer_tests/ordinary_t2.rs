@@ -185,9 +185,11 @@ fn ordinary_t2_self_calls_preserve_checked_parameter_contracts() {
         assert_proven_self_call(&code, symbol);
         let NativeCodeStorage::Mapped(mapped) = &code._storage else { unreachable!() };
         assert!(mapped.ordinary_entry.is_some(), "exercise ordinary self admission");
-        let result = run_native(&code, symbol, &[EgclVal::from_fixnum(input)], &mut env);
-        assert!(matches!(&result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })),
-            "{name}: recursive ingress must check declarations, including before a pure shortcut: {result:?}");
+        egcl_rt::rooted!(result = run_native(&code, symbol, &[EgclVal::from_fixnum(input)], &mut env));
+        assert!(matches!(&*result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })
+            || matches!(error.without_backtrace(), EgclError::Signalled(details)
+                if condition_matches_handler(&env, details.condition, "TYPE-ERROR"))),
+            "{name}: recursive ingress must check declarations, including before a pure shortcut: {:?}", &*result);
     }
 }
 
@@ -220,9 +222,11 @@ fn ordinary_t2_self_calls_check_dynamic_range_endpoints() {
             "inclusive endpoint {next} must pass generated checks without an adapter");
     }
     for value in [EgclVal::from_fixnum(1), EgclVal::from_fixnum(41), NIL] {
-        let result = run_native(&code, symbol, &[EgclVal::from_fixnum(2), value, T], &mut env);
-        assert!(matches!(&result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })),
-            "dynamic recursive argument {value:?} must satisfy both tag and interval: {result:?}");
+        egcl_rt::rooted!(result = run_native(&code, symbol, &[EgclVal::from_fixnum(2), value, T], &mut env));
+        assert!(matches!(&*result, Err(error) if matches!(error.without_backtrace(), EgclError::TypeError { .. })
+            || matches!(error.without_backtrace(), EgclError::Signalled(details)
+                if condition_matches_handler(&env, details.condition, "TYPE-ERROR"))),
+            "dynamic recursive argument {value:?} must satisfy both tag and interval: {:?}", &*result);
     }
 }
 
@@ -290,7 +294,7 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
             && instruction.near_branch_target() >= code.entry as u64
             && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
         .count();
-    assert_eq!(direct_calls, 2, "both recursive edges must call generated code directly");
+    assert_eq!(direct_calls, 8, "two expansion levels retain eight direct recursive edges");
     let instructions: Vec<_> = iced_x86::Decoder::with_ip(64, bytes, code.entry as u64,
         iced_x86::DecoderOptions::NONE).into_iter().collect();
     let base_case_tests = instructions.windows(2).filter(|pair| {
@@ -303,8 +307,21 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
             && pair[1].mnemonic() == iced_x86::Mnemonic::Jge
         })
         .count();
-    assert_eq!(base_case_tests, 3,
-        "pure base case is checked at entry and inlined at both direct self-call sites");
+    assert_eq!(base_case_tests, 9,
+        "pure base case is checked at entry and at all eight residual self-call sites");
+    for argument in [2_u64, 3, 4] {
+        let shortcuts = instructions.windows(2).filter(|pair| {
+            pair[0].mnemonic() == iced_x86::Mnemonic::Cmp
+                && pair[0].op0_register() == iced_x86::Register::RDI
+                && matches!(pair[0].op1_kind(), iced_x86::OpKind::Immediate8to64
+                    | iced_x86::OpKind::Immediate32to64)
+                && pair[0].immediate(1) == argument << 3
+                && pair[1].mnemonic() == iced_x86::Mnemonic::Jne
+        }).count();
+        assert_eq!(shortcuts, direct_calls,
+            "expansion must preserve the proven small-input shortcut for {argument} \
+             at every residual self-call, without changing its logical work budget");
+    }
     assert!(!instructions.windows(2).any(|pair|
         pair[0].mnemonic() == iced_x86::Mnemonic::Cmp
             && pair[0].op0_register() == iced_x86::Register::RAX
@@ -313,9 +330,9 @@ fn ordinary_t2_uses_native_recursion_for_bounded_fibonacci() {
         "the dominating n >= 2 branch must prove both recursive argument intervals; \
          do not emit redundant declared-bound checks before the direct calls");
     assert_eq!(instructions.iter().filter(|instruction|
-        instruction.mnemonic() == iced_x86::Mnemonic::Jo).count(), 1,
+        instruction.mnemonic() == iced_x86::Mnemonic::Jo).count(), 7,
         "checked n in [0,40] proves both subtractions safe; the sum of \
-         recursive results still requires its overflow check");
+         recursive results still requires an overflow check at each of seven expanded sums");
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
     assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(12)], &mut env).unwrap(),
@@ -374,14 +391,25 @@ fn ordinary_t2_inlined_prefix_preserves_poll_and_stack_admission() {
             "only a prefix miss requires child-stack admission");
     }
     SELF_COLD_OBSERVER.with(|hook| hook.set(None));
-    for n in [1, 2] {
+    for n in [1, 2, 8] {
         take_cold_calls_for_test();
         let result = native_transfer_entry::with_ordinary_entry_hook_for_test(
             egcl_rt::thread::request_current_execution_poll, ||
             run_native(&code, symbol, &[EgclVal::from_fixnum(n)], &mut env)).unwrap();
         assert_eq!(result, EgclVal::from_fixnum(n));
-        assert!(take_cold_calls_for_test() > 0,
-            "a pending poll precedes both the original leaf and recursive specialization");
+        if n <= 2 {
+            assert_eq!(take_cold_calls_for_test(), 0,
+                "bounded inlined returns have no residual call admission");
+            assert!(egcl_rt::thread::current_execution_poll_pending(),
+                "a call-free return must not lose the pending notification");
+            // Drain at a real published entry, never clear the notification
+            // directly without servicing its authoritative sources.
+            assert_eq!(run_native(&code, symbol, &[EgclVal::from_fixnum(0)], &mut env).unwrap(),
+                EgclVal::from_fixnum(0));
+        } else {
+            assert!(take_cold_calls_for_test() > 0,
+                "a pending poll precedes residual self-call admission");
+        }
     }
 }
 
@@ -1487,7 +1515,7 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
             && instruction.near_branch_target() >= code.entry as u64
             && instruction.near_branch_target() < code.entry as u64 + code.code_len as u64)
         .collect();
-    assert_eq!(self_calls.len(), 2, "installed Fibonacci must contain both direct self calls");
+    assert_eq!(self_calls.len(), 8, "two expansion levels retain eight direct self calls");
     assert!(!instructions.iter().any(|instruction|
         instruction.mnemonic() == iced_x86::Mnemonic::Cmp
             && instruction.op0_register() == iced_x86::Register::R13
@@ -1500,7 +1528,8 @@ fn ordinary_t2_recursive_fib_has_no_per_call_frame_helpers() {
                 | iced_x86::OpKind::Immediate32to64)
             && instruction.immediate(1) == 0),
         "self calls rely on nonnull control established at native entry");
-    assert_eq!(self_calls[0].near_branch_target(), self_calls[1].near_branch_target());
+    assert!(self_calls.iter().all(|call|
+        call.near_branch_target() == self_calls[0].near_branch_target()));
     let start = instructions.iter().position(|instruction|
         instruction.ip() == self_calls[0].near_branch_target()).unwrap();
     let frame = instructions[start..].iter().position(|instruction|
@@ -1796,6 +1825,9 @@ fn ordinary_t2_recursive_frames_do_not_grow_the_managed_stack() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
+    thread_local! {
+        static RECOVERED_LOGICAL_FRAMES: Cell<u64> = const { Cell::new(0) };
+    }
     use native_transfer_entry::{take_recursive_entries, take_recursive_helper_calls};
     assert!(egcl_rt::native_transfer::is_supported());
     let _lock = super::super::super::heap_test_lock()
@@ -1855,13 +1887,16 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         take_recursive_helper_calls();
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
         native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+        RECOVERED_LOGICAL_FRAMES.with(|count| count.set(0));
         egcl_rt::rooted!(
-            result = run_native(
+            result = native_transfer_entry::with_ordinary_guard_resume_observer_for_test(
+                |scopes| RECOVERED_LOGICAL_FRAMES.with(|count| count.set(count.get() + scopes)),
+                || run_native(
                 &code,
                 symbol,
                 &[EgclVal::from_fixnum(8), EgclVal::from_fixnum(x)],
                 &mut env,
-            )
+            ))
             .unwrap()
         );
         assert_eq!(
@@ -1880,9 +1915,11 @@ fn ordinary_t2_native_recursive_overflow_resumes_every_frame_without_replay() {
         );
         assert_eq!(
             mapped.deopt_count() - deopts,
-            if overflow { 9 } else { 0 },
-            "each overflowing activation must resume its own continuation"
+            if overflow { 3 } else { 0 },
+            "each physical activation recovers its three logical frames"
         );
+        assert_eq!(RECOVERED_LOGICAL_FRAMES.with(Cell::get), if overflow { 9 } else { 0 },
+            "all nine logical continuations must still recover exactly once");
         assert_eq!(
             (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get)),
             before
