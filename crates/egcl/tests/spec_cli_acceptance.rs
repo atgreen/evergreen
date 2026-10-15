@@ -167,6 +167,48 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
 }
 
 #[test]
+fn read_char_no_hang_sees_a_character_pushed_back_at_end_of_string() {
+    // UNREAD-CHAR makes a character available again even once the string is
+    // exhausted, so READ-CHAR-NO-HANG must consult the pushback slot before
+    // reporting "nothing available yet" -- and LISTEN, which is built on it,
+    // must then answer true. Returning NIL here is ansi streams listen.6, and
+    // it was reachable from Lisp only once READ-CHAR-NO-HANG stopped being an
+    // alias for READ-CHAR.
+    let output = egcl()
+        .args([
+            "--no-init",
+            "--eval",
+            "(cl:progn \
+               (cl:format t \"NOHANG ~s~%\" \
+                 (cl:with-input-from-string (s \"x\") \
+                   (cl:read-char s) (cl:unread-char #\\x s) \
+                   (cl:read-char-no-hang s cl:nil :none))) \
+               (cl:format t \"LISTEN ~s~%\" \
+                 (cl:with-input-from-string (s \"x\") \
+                   (cl:read-char s) (cl:unread-char #\\x s) \
+                   (cl:and (cl:listen s) t))))",
+        ])
+        .output()
+        .expect("run pushback no-hang probe");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.lines().any(|line| line.trim() == "NOHANG #\\x"),
+        "READ-CHAR-NO-HANG ignored a pushed-back character; stdout: {stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.trim() == "LISTEN T"),
+        "LISTEN ignored a pushed-back character; stdout: {stdout}"
+    );
+}
+
+#[test]
 fn read_char_no_hang_answers_nil_on_an_open_empty_stdin() {
     // CLHS 21.2: READ-CHAR-NO-HANG answers NIL when no character is available
     // YET, which is only distinguishable from end of file while the descriptor
