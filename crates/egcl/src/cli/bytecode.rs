@@ -13166,7 +13166,17 @@ fn execute_bbu_ensure_package(
             .unwrap_or(egcl_stdlib::intern(export_name, package)?.0);
         egcl_rt::rooted_ref!(_symbol_root = &mut symbol);
         egcl_stdlib::add_symbol(package, export_name, symbol, true)?;
-        egcl_rt::symbols::set_symbol_package(symbol.as_symbol_index(), package);
+        // EXPORT does not change a symbol's home package: a symbol the package
+        // re-exports from one it uses (CL:CAR) stays CL's, and NIL and T are
+        // immediates with no registry index at all -- `as_symbol_index`
+        // panicked here when a package exported them (Parenscript exports #:t
+        // and #:nil).  Only a symbol with no home yet is homed here, as IMPORT
+        // of an uninterned symbol does.
+        if let Some(index) = symbol.symbol_index() {
+            if egcl_rt::symbols::symbol_package(index).is_none_or(|p| p.is_nil()) {
+                egcl_rt::symbols::set_symbol_package(index, package);
+            }
+        }
     }
 
     // Any remaining qualified symbols referenced by functions/thunks are
@@ -13192,7 +13202,9 @@ fn execute_bbu_ensure_package(
             let mut symbol = values[index];
             egcl_rt::rooted_ref!(_symbol_root = &mut symbol);
             egcl_stdlib::add_symbol(package, bare_name, symbol, *kind == 3)?;
-            egcl_rt::symbols::set_symbol_package(symbol.as_symbol_index(), package);
+            if let Some(index) = symbol.symbol_index() {
+                egcl_rt::symbols::set_symbol_package(index, package);
+            }
         }
     }
     Ok(package)
