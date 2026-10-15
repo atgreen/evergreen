@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.9 - 2026-10-15
 
 ### ANSI conformance
 
@@ -122,6 +122,14 @@ The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
   ([#331](https://github.com/atgreen/evergreen/pull/331)). The matched typed
   Fibonacci comparison measured a small slowdown from 30 ms to 31 ms median;
   see the [checked-result report](tests/benchmarks/results/2026-10-14-fib-checked-results.md).
+- Raise the declared `TYPE-ERROR` when a nested recursive argument contract
+  fails, instead of returning a value through a replacement definition
+  ([#334](https://github.com/atgreen/evergreen/pull/334)).
+- Resume a validated chain of self-inlined native frames through ordinary guard
+  recovery, transferring the outer activation state exactly once and preserving
+  the executing definition across redefinition and garbage collection
+  ([#333](https://github.com/atgreen/evergreen/pull/333),
+  [#334](https://github.com/atgreen/evergreen/pull/334)).
 
 ## 0.0.8 - 2026-10-14
 
