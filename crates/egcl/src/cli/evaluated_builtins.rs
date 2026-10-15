@@ -1219,6 +1219,25 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%STREAM-LISTEN" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%stream-listen stream) → T | NIL
+            //
+            // The stream's own LISTEN: buffered or unread input, else a
+            // non-consuming readiness probe of the OS handle (a peek on a
+            // socket, a zero-timeout poll on a pipe), false at end of file.
+            // boot.lisp's LISTEN uses it for streams whose element type is
+            // not CHARACTER: its character path (READ-CHAR-NO-HANG and
+            // UNREAD-CHAR) would pull a pending byte of an octet socket into
+            // the character unread slot, where READ-BYTE never looks, so
+            // LISTEN answered T and the READ-BYTE after it hung.
+
+            let s = args.first().copied().unwrap_or(NIL);
+            require_stream(s)?;
+            Ok(if egcl_stdlib::stream_listen(s)? { T } else { NIL })
+        }),
+
         "WRITE-BYTE" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 
