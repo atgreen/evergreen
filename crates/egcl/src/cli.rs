@@ -2932,6 +2932,22 @@ fn macro_expansion_cacheable(lexical: bool, mdef: &MacroDef) -> bool {
     !lexical && !params_form_uses_environment(mdef.params_form)
 }
 
+/// Drop memoized expansions at an evaluation boundary (bliss-hdbe6).
+///
+/// The memo is keyed EQ on the call form, so it cannot see the form's CONTENTS
+/// change. A program may legally build a form, EVAL it, mutate it and EVAL it
+/// again, and must get the new expansion; keyed on identity alone the stale one
+/// came back instead. Clearing here keeps memoization for the whole of a single
+/// evaluation -- which is what stops an interpreted loop body from re-expanding
+/// once per iteration -- while making each EVAL re-expand what it is handed.
+///
+/// Storing the sentinel reuses the existing generation check in
+/// `macro_expansion_cache_table` rather than adding a second invalidation path:
+/// the next call sees a mismatch and empties the table.
+fn invalidate_macro_expansion_cache() {
+    MACRO_EXPANSION_CACHE_GENERATION.store(u64::MAX, AtomicOrdering::Release);
+}
+
 fn cached_macro_expansion(form: EgclVal) -> Option<EgclVal> {
     egcl_rt::rooted!(form = form);
     let table = macro_expansion_cache_table()?;
@@ -21149,6 +21165,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let mut native_probe = bytecode::NativeEvalProbe::enter();
                 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
                 egcl_rt::rooted_ref!(_native_probe_root = &mut native_probe);
+                // This is an evaluation boundary: the form handed to EVAL may
+                // have been mutated since it was last evaluated, and the
+                // expansion memo is keyed EQ on the form, so it would hand back
+                // the expansion of the OLD contents (bliss-hdbe6).
+                invalidate_macro_expansion_cache();
                 let result = eval_form(form, &mut child)?;
                 // The inner form's OWN values are EVAL's values, so republish the
                 // child's multiple-value state on the caller.

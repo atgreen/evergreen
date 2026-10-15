@@ -1164,7 +1164,13 @@ impl GrayStream for StreamMutableState {
             // make-two-way-stream.12/.13, make-concatenated-stream.22).
             StreamInner::TwoWay => crate::streams::stream_read_byte(comps[0]),
             StreamInner::Echo => {
-                let byte = crate::streams::stream_read_byte(comps[0])?;
+                let mut byte = crate::streams::stream_read_byte(comps[0])?;
+                // Root BYTE across the echo write. On a wide element type the
+                // value is a heap bignum, and the write allocates (buffering,
+                // and the component's own element encoding), so a relocating GC
+                // would leave this copy stale -- and it is the value returned to
+                // the caller. stream_write_byte roots its OWN copy, not this one.
+                egcl_rt::rooted_ref!(_byte_root = &mut byte);
                 if byte != EOF {
                     crate::streams::stream_write_byte(comps[1], byte)?;
                 }
@@ -1296,6 +1302,35 @@ impl GrayStream for StreamMutableState {
         if let StreamElementType::Integer { bits, signed } = self.element_type {
             return self.write_integer_element(byte, bits, signed);
         }
+        // A composite stream has no element type of its own, so it must hand the
+        // value to its components and let each validate against ITS element
+        // type. Checking for an octet here first rejected
+        // (write-byte 256 (make-broadcast-stream s)) even when S was an
+        // (unsigned-byte 16) stream that accepts 256 -- SBCL writes it.
+        {
+            let mut comps = self.components().to_vec();
+            egcl_rt::rooted_ref!(_components_root = &mut comps);
+            match &self.inner {
+                StreamInner::Broadcast => {
+                    // GC can update the rooted vector during a child call, so do
+                    // not hold an iterator borrow across one.
+                    #[allow(clippy::needless_range_loop)]
+                    for index in 0..comps.len() {
+                        let s = comps[index];
+                        crate::streams::stream_write_byte(s, byte)?;
+                    }
+                    return Ok(());
+                }
+                StreamInner::TwoWay | StreamInner::Echo => {
+                    return crate::streams::stream_write_byte(comps[1], byte);
+                }
+                StreamInner::Synonym => {
+                    let target = resolve_synonym(comps[0])?;
+                    return crate::streams::stream_write_byte(target, byte);
+                }
+                _ => {}
+            }
+        }
         // CLHS WRITE-BYTE: a non-integer (or one outside the element type) is a
         // TYPE-ERROR the program can handle — never a host panic.
         if !byte.is_fixnum() {
@@ -1363,23 +1398,8 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::Broadcast => {
-                // GC can update the rooted vector during a child call; do not
-                // retain an iterator borrow across that call.
-                #[allow(clippy::needless_range_loop)]
-                for index in 0..comps.len() {
-                    let s = comps[index];
-                    crate::streams::stream_write_byte(s, byte)?;
-                }
-                Ok(())
-            }
-            StreamInner::TwoWay | StreamInner::Echo => {
-                crate::streams::stream_write_byte(comps[1], byte)
-            }
-            StreamInner::Synonym => {
-                let target = resolve_synonym(comps[0])?;
-                crate::streams::stream_write_byte(target, byte)
-            }
+            // Broadcast / TwoWay / Echo / Synonym are handled above, before the
+            // octet check, so that each component validates for itself.
             StreamInner::Stdout { line, col } => {
                 write_to_std(false, &[b])?;
                 track_col(b as char, line, col);
@@ -3107,10 +3127,37 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 let target = resolve_synonym(comps[0])?;
                 file_position(target)
             }
-            StreamInner::Broadcast => Ok(EgclVal::from_fixnum(0)),
+            // A broadcast stream reports its LAST component's position, and 0
+            // only when it has none (CLHS BROADCAST-STREAM). Answering 0
+            // unconditionally made (file-position (make-broadcast-stream out))
+            // disagree with (file-position out) after a write.
+            StreamInner::Broadcast => match comps.last() {
+                Some(last) => file_position(*last),
+                None => Ok(EgclVal::from_fixnum(0)),
+            },
             _ => Ok(NIL), // non-positionable
         }
     })
+}
+
+/// Octet offset of element index `position` in a stream whose elements occupy
+/// `per_element` octets.
+///
+/// FILE-POSITION addresses ELEMENTS, not octets, so on a wide element type a
+/// large index can exceed any file offset: index 2^59 on an
+/// `(unsigned-byte 256)` stream asks for 2^64 octets. Multiplying unchecked
+/// panicked outright in a debug build ("attempt to multiply with overflow")
+/// and left the stream's state poisoned, and a negative index wrapped to a
+/// huge offset instead of being rejected. SBCL signals a TYPE-ERROR for both,
+/// so this does too.
+fn element_octet_offset(position: EgclVal, per_element: u64) -> Result<u64, EgclError> {
+    u64::try_from(position.as_fixnum())
+        .ok()
+        .and_then(|index| index.checked_mul(per_element))
+        .ok_or_else(|| EgclError::TypeError {
+            datum: position,
+            expected: "file position reachable with this stream's element type".to_string(),
+        })
 }
 
 /// Set the file position. Returns T on success, NIL if not positionable. R5.124.
@@ -3146,7 +3193,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 *buf_pos = 0;
                 *buf_fill = 0;
                 *unread = None;
-                let pos = position.as_fixnum() as u64 * per_element;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -3156,7 +3203,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 file, write_buf, ..
             } => {
                 file_flush_write_buf(file, write_buf)?;
-                let pos = position.as_fixnum() as u64 * per_element;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -3175,7 +3222,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 *buf_pos = 0;
                 *buf_fill = 0;
                 *unread = None;
-                let pos = position.as_fixnum() as u64 * per_element;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -3326,10 +3373,13 @@ pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 let target = resolve_synonym(comps[0])?;
                 file_length_fn(target)
             }
-            // A broadcast stream with no components reports 0 (CLHS
-            // BROADCAST-STREAM); any other non-file stream is a TYPE-ERROR
-            // (ansi file-length.error.*).
-            StreamInner::Broadcast => Ok(EgclVal::from_fixnum(0)),
+            // A broadcast stream reports its LAST component's length, and 0
+            // only when it has no components (CLHS BROADCAST-STREAM); any
+            // other non-file stream is a TYPE-ERROR (ansi file-length.error.*).
+            StreamInner::Broadcast => match comps.last() {
+                Some(last) => file_length_fn(*last),
+                None => Ok(EgclVal::from_fixnum(0)),
+            },
             _ => Err(EgclError::TypeError {
                 datum: stream,
                 expected: "FILE-STREAM".into(),
