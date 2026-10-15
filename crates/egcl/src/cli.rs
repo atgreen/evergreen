@@ -12708,8 +12708,17 @@ fn read_forms_for_compile(
             // alexandria, cl-ppcre, babel and iterate swallow ZERO compile-time
             // errors between them, so nothing relied on the tolerance.
             if let Err(e) = process_compile_toplevel_form(val, env) {
-                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
                 *compile_time_failure = Some(());
+                // A control transfer (a HANDLER-CASE clause, an invoked restart,
+                // a RETURN-FROM) established around COMPILE-FILE travels as an
+                // Internal error carrying a `__NAME__:id` token; it must reach
+                // its frame unchanged.  Wrapping it reported the token itself as
+                // the failure -- "internal error: __HANDLER_CASE__:36229" -- and
+                // hid the condition the clause was handling.
+                if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) {
+                    return Err(e);
+                }
+                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
                 return Err(EgclError::FileError(format!(
                     "{src_path}: compile-time evaluation failed near line {line}: {e}"
                 )));
