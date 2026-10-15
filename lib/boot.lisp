@@ -4343,7 +4343,13 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
             (if d
                 (progn (setf value (+ (* value radix) d)) (setf any t) (incf i))
                 (return-from digits)))))
-      (loop while (and (< i end) (ws-p (char string i))) do (incf i))
+      ;; Trailing whitespace is part of what the strict parse accepts (CLHS:
+      ;; "possibly surrounded on either side by whitespace"); with JUNK-ALLOWED
+      ;; the second value is the index of the delimiter that ended the parse,
+      ;; and a space after the digits is that delimiter (cl-pdf reads
+      ;; "FontBBox -113 -250 ..." by the index it hands back).
+      (unless junk-allowed
+        (loop while (and (< i end) (ws-p (char string i))) do (incf i)))
       (cond
         (junk-allowed (values (if any (* sign value) nil) i))
         ((and any (>= i end)) (values (* sign value) i))
