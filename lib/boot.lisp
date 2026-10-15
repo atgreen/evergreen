@@ -3961,7 +3961,9 @@
 (defgeneric stream-write-char (stream character))
 (defgeneric stream-line-column (stream))
 (defgeneric stream-start-line-p (stream))
-(defgeneric stream-write-string (stream string start end))
+;; Gray's proposal (and SBCL's SB-GRAY) make START and END optional here, and
+;; the portable Gray stream libraries define their methods that way.
+(defgeneric stream-write-string (stream string &optional start end))
 (defgeneric stream-terpri (stream))
 (defgeneric stream-fresh-line (stream))
 (defgeneric stream-finish-output (stream))
@@ -4062,7 +4064,8 @@
 (defmethod stream-start-line-p ((stream fundamental-character-output-stream))
   (eql (stream-line-column stream) 0))
 
-(defmethod stream-write-string ((stream fundamental-character-output-stream) string start end)
+(defmethod stream-write-string ((stream fundamental-character-output-stream) string
+                                &optional (start 0) end)
   (let ((end (or end (length string))))
     (do ((i start (1+ i)))
         ((>= i end) string)
