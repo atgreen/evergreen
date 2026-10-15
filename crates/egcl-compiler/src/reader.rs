@@ -2269,6 +2269,17 @@ fn parse_token_with_base(
         }
     }
 
+    // Inside a #+/#- feature expression a bare symbol is read in KEYWORD
+    // (CLHS 2.4.8.17), so #+X names :X, not <current-package>::X. This precedes
+    // the NIL/T cases below, because in a feature expression `t` and `nil` name
+    // the keywords :T and :NIL like any other feature name -- reading them as
+    // the constants T and NIL made (push :t *features*) then #+t take the false
+    // branch, since membership compares KEYWORD:T against T. #+nil still skips
+    // its datum: :NIL is no more present in *FEATURES* than NIL was.
+    if FEATURE_EXPRESSION.with(|f| f.get()) {
+        let full = format!("KEYWORD:{}", name);
+        return Ok(EgclVal::from_symbol_index(intern_symbol(&full)));
+    }
     // It's a symbol. An escape only suppresses case folding and number
     // interpretation (CLHS 2.3.1.1), so \T, |T| and T are the same symbol T;
     // the exact-case comparison already keeps |t| a different symbol.
@@ -2277,12 +2288,6 @@ fn parse_token_with_base(
     }
     if name == "T" {
         return Ok(T);
-    }
-    // Inside a #+/#- feature expression a bare symbol is read in KEYWORD
-    // (CLHS 2.4.8.17), so #+X names :X, not <current-package>::X.
-    if FEATURE_EXPRESSION.with(|f| f.get()) {
-        let full = format!("KEYWORD:{}", name);
-        return Ok(EgclVal::from_symbol_index(intern_symbol(&full)));
     }
     // Route a bare symbol through the interpreter's current *PACKAGE* so that a
     // symbol read bare inside package P shares identity (and its value cell) with
