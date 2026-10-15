@@ -68,6 +68,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 )),
             }
         }),
+        "EGCL::%FORMAT-CONSUMED" => Some(|_operator, args, _env| {
+            if !args.is_empty() {
+                return Err(EgclError::ProgramError(
+                    "%FORMAT-CONSUMED takes no arguments".into(),
+                ));
+            }
+            Ok(EgclVal::from_fixnum(
+                egcl_stdlib::format::last_consumed_arg_count() as i64,
+            ))
+        }),
         "EGCL::%PPRINT-NATIVE-COLUMN" => Some(|_operator, args, _env| {
             if args.len() != 1 {
                 return Err(EgclError::ProgramError(

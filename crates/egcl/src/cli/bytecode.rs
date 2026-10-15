@@ -5715,12 +5715,39 @@ impl<'e> Lowerer<'e> {
             let (bind_list, body) = cp(clause_rest);
             let saved_next_local = self.next_local;
             self.enter_scope();
+            // The clause body as lowered: rewritten below when the clause
+            // variable is special.
+            egcl_rt::rooted!(clause_body = body);
             let var_slot = if bind_list.is_cons() {
                 let (var, _) = cp(bind_list);
                 if !var.is_symbol() {
                     return Err(Bail);
                 }
-                Some(self.alloc_slot(&sym_name(var)))
+                let var_name = sym_name(var);
+                let decl_special = body_declared_special(body);
+                if is_special_name(&var_name) || decl_special.contains(&var_name) {
+                    // A special clause variable binds DYNAMICALLY, like the same
+                    // variable in a LET (CLHS 3.3.4; ansi HANDLER-CASE.11). The
+                    // driver stores the condition in a hidden lexical slot and
+                    // the body runs inside `(let ((VAR hidden)) (declare (special
+                    // VAR)) ...)`, whose lowering establishes the dynamic binding.
+                    egcl_rt::rooted!(hidden = super::gensym_symbol("HANDLER-CASE-CONDITION"));
+                    let slot = self.alloc_slot(&sym_name(*hidden));
+                    let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
+                    let declare_sym = super::resolve_sym("DECLARE").ok_or(Bail)?;
+                    let special_sym = super::resolve_sym("SPECIAL").ok_or(Bail)?;
+                    egcl_rt::rooted!(binding = vec_to_list(&[var, *hidden]));
+                    egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+                    egcl_rt::rooted!(special_decl = vec_to_list(&[special_sym, var]));
+                    egcl_rt::rooted!(declare_form = vec_to_list(&[declare_sym, *special_decl]));
+                    egcl_rt::rooted!(let_tail = arena_cons(*declare_form, body));
+                    egcl_rt::rooted!(let_body = arena_cons(*bindings, *let_tail));
+                    egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
+                    *clause_body = arena_cons(*let_form, NIL);
+                    Some(slot)
+                } else {
+                    Some(self.alloc_slot(&var_name))
+                }
             } else {
                 None
             };
@@ -5729,7 +5756,7 @@ impl<'e> Lowerer<'e> {
             // The driver lands here with the operand stack at `sp_restore` and
             // the condition already stored in `var_slot`.
             self.cur_stack = sp_restore;
-            self.lower_progn(body)?; // clause value (+1)
+            self.lower_progn(*clause_body)?; // clause value (+1)
             // A handler clause returns the values of its last form, exactly like
             // a PROGN — e.g. IGNORE-ERRORS' `(values nil c)` must keep the
             // condition secondary value (bliss-xy7t). `lower_progn` already leaves

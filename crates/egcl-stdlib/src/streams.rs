@@ -3610,6 +3610,37 @@ pub fn two_way_stream_output_stream(stream: EgclVal) -> Option<EgclVal> {
     .flatten()
 }
 
+/// The component streams of a BROADCAST stream (CLHS BROADCAST-STREAM-STREAMS),
+/// or None when `stream` is not one.
+pub fn broadcast_stream_streams(stream: EgclVal) -> Option<Vec<EgclVal>> {
+    with_stream(stream, |guard| {
+        Ok(if matches!(guard.inner, StreamInner::Broadcast) {
+            Some(guard.components().to_vec())
+        } else {
+            None
+        })
+    })
+    .ok()
+    .flatten()
+}
+
+/// The streams a CONCATENATED stream still has to read from, starting with the
+/// current one (CLHS CONCATENATED-STREAM-STREAMS), or None when `stream` is not
+/// one.
+pub fn concatenated_stream_streams(stream: EgclVal) -> Option<Vec<EgclVal>> {
+    with_stream(stream, |guard| {
+        Ok(match &guard.inner {
+            StreamInner::Concatenated { cursor } => {
+                let comps = guard.components();
+                Some(comps[(*cursor).min(comps.len())..].to_vec())
+            }
+            _ => None,
+        })
+    })
+    .ok()
+    .flatten()
+}
+
 // A Windows SOCKET cannot be represented as a Unix file descriptor.
 #[cfg(windows)]
 pub fn stream_raw_fd(_stream: EgclVal) -> Option<i32> {
