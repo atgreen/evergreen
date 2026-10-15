@@ -417,6 +417,35 @@ impl StreamMutableState {
 
 // ── File I/O helpers ──────────────────────────────────────────────
 
+/// Whether a read of the process standard input would return without waiting.
+///
+/// `StreamInner::Stdin` holds no `StreamHandle`, so it cannot use
+/// `socket_has_input`; it asks descriptor 0 directly. `POLLHUP`/`POLLERR` count
+/// as "would not block" because a read then returns end of file immediately,
+/// and end of file is reported through the EOF conventions rather than as
+/// "nothing available yet". So this answers false only while the descriptor is
+/// genuinely open with no data, which is when READ-CHAR-NO-HANG must give NIL.
+#[cfg(unix)]
+fn stdin_read_would_not_block() -> Result<bool, EgclError> {
+    use egcl_rt::syscall::{POLLERR, POLLHUP, POLLIN, PollFd};
+    let mut descriptor = PollFd {
+        fd: 0,
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one descriptor, owned by the process for the duration of the call.
+    unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, 0) }
+        .map_err(|errno| EgclError::StreamError(format!("read-char-no-hang: errno {}", errno.abs())))?;
+    Ok(descriptor.revents & (POLLIN | POLLHUP | POLLERR) != 0)
+}
+
+/// Off Unix the descriptor cannot be polled portably yet, so keep the previous
+/// behaviour (attempt the read) rather than reporting a character absent.
+#[cfg(not(unix))]
+fn stdin_read_would_not_block() -> Result<bool, EgclError> {
+    Ok(true)
+}
+
 const FILE_BUF_SIZE: usize = 8192;
 
 /// Read a single UTF-8 char from a buffered file input, refilling buffer as needed.
@@ -1422,6 +1451,15 @@ impl GrayStream for StreamMutableState {
         // For file streams, reads never block on regular files, so just call stream_read_char.
         if let StreamInner::StringInput { position, end, .. } = &self.inner {
             if *position >= *end {
+                return Ok(NIL);
+            }
+        }
+        // The process standard input carries no handle of its own, so ask the
+        // descriptor whether a read would block. When stdin is a pipe, socket or
+        // terminal with nothing buffered yet, NO-HANG must answer NIL instead of
+        // waiting for a character that may never come.
+        if let StreamInner::Stdin { unread, .. } = &self.inner {
+            if unread.is_none() && !stdin_read_would_not_block()? {
                 return Ok(NIL);
             }
         }

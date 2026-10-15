@@ -1364,6 +1364,43 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(result)
         }),
 
+        "READ-CHAR-NO-HANG" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (read-char-no-hang &optional stream eof-error-p eof-value
+            //  recursive-p): a character if one is available, NIL if none is
+            //  available YET, and the end-of-file conventions only at actual
+            //  end of file (CLHS 21.2). The distinction is the whole point of
+            //  the function, so it delegates to the stdlib stream protocol,
+            //  which polls a pipe or socket without blocking -- READ-CHAR
+            //  blocks and cannot implement this.
+            let stream = if !args.is_empty() { args[0] } else { NIL };
+            let eof_error_p = if args.len() > 1 { args[1] } else { T };
+            let in_stream = resolve_input_stream(stream, env);
+            let (result, at_eof) = if is_gray_stream(in_stream) {
+                let r = invoke_generic_function("STREAM-READ-CHAR-NO-HANG", &[in_stream], env)?;
+                // A Gray stream answers NIL for "nothing available yet"; only a
+                // non-character, non-NIL value means end of file.
+                let eof = !r.is_character() && !r.is_nil();
+                (r, eof)
+            } else {
+                let r = egcl_stdlib::stream_read_char_no_hang(in_stream)?;
+                let eof = r == EOF;
+                (r, eof)
+            };
+            if at_eof {
+                if eof_error_p.is_nil() {
+                    // Re-read eof-value from the rooted args after the
+                    // (allocating) read (bliss-6b2 #2).
+                    return Ok(if args.len() > 2 { args[2] } else { NIL });
+                }
+                return Err(EgclError::StreamError(
+                    "end of file on READ-CHAR-NO-HANG".into(),
+                ));
+            }
+            Ok(result)
+        }),
+
         "PEEK-CHAR" => Some(|_operator, args, env| {
             let args = RootedVals::new(args.to_vec());
 

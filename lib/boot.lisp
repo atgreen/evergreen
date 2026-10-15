@@ -1139,12 +1139,9 @@
         ((char= c char) (read-char stream t nil t) (nreverse result))
       (push (read stream t nil t) result))))
 
-;;; READ-CHAR-NO-HANG: like READ-CHAR, but NIL when no character is available
-;;; yet (CLHS 21.2). Every stream here has its input available or is at end,
-;;; so this is READ-CHAR with the EOF conventions passed through.
-(defun read-char-no-hang (&optional (stream *standard-input*) (eof-error-p t)
-                                    eof-value recursive-p)
-  (read-char stream eof-error-p eof-value recursive-p))
+;;; READ-CHAR-NO-HANG is a builtin wired to the stdlib stream protocol, which
+;;; knows how to poll a pipe or socket without blocking; it cannot be written
+;;; here in terms of READ-CHAR, which blocks.
 
 ;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
 ;;; the stream itself holds, so this only checks the designator and returns NIL.

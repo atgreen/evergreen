@@ -167,6 +167,62 @@ fn repl_acceptance_drives_the_real_binary_through_read_eval_print_and_exit() {
 }
 
 #[test]
+fn read_char_no_hang_answers_nil_on_an_open_empty_stdin() {
+    // CLHS 21.2: READ-CHAR-NO-HANG answers NIL when no character is available
+    // YET, which is only distinguishable from end of file while the descriptor
+    // is still open. Writing it as READ-CHAR blocks here until the peer sends
+    // something or hangs up; SBCL answers NIL immediately, as does this.
+    //
+    // The child's stdin must stay OPEN and EMPTY for the whole run, so this
+    // keeps the pipe handle alive and must not use wait_with_output, which
+    // closes stdin and would turn the probe into an end-of-file test. The wait
+    // is bounded so a regression fails the test instead of hanging the suite.
+    let mut child = egcl()
+        .args([
+            "--no-init",
+            "--eval",
+            "(progn (format t \"RESULT ~S~%\" \
+             (read-char-no-hang *standard-input* nil :eof)) (finish-output))",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn egcl read-char-no-hang probe");
+    let _stdin_stays_open = child.stdin.take().expect("child stdin");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let exit = loop {
+        match child.try_wait().expect("poll read-char-no-hang probe") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let Some(status) = exit else {
+        panic!(
+            "READ-CHAR-NO-HANG blocked on an open, empty stdin instead of \
+             answering NIL; stdout so far: {stdout}"
+        );
+    };
+    assert_eq!(status.code(), Some(0), "stdout: {stdout}");
+    assert!(
+        stdout.lines().any(|line| line.trim() == "RESULT NIL"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
 fn no_image_eval_mode_supports_bootstrap_without_a_saved_image() {
     // Per R7.21 and R7.22, --no-image is an explicit startup profile and MUST still permit bootstrapping work.
     let output = egcl()

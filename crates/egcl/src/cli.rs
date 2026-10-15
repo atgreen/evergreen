@@ -18198,7 +18198,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "GET" => return eval_builtin_arguments(&name, cdr, env),
             "REMPROP" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING-INPUT-STREAM" => return eval_builtin_arguments(&name, cdr, env),
-            "READ-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            "READ-CHAR" | "READ-CHAR-NO-HANG" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "PEEK-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             #[cfg(not(egcl_no_dynamic_code))]
             "READ" | "READ-PRESERVING-WHITESPACE" => {
@@ -36383,7 +36385,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "OPEN"
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
-            | "PEEK-CHAR" | "UNREAD-CHAR"
+            | "PEEK-CHAR" | "UNREAD-CHAR" | "READ-CHAR-NO-HANG"
             | "FLOAT-RADIX" | "FLOAT-DIGITS" | "FLOAT-PRECISION" | "FLOAT-SIGN"
             | "SCALE-FLOAT" | "DECODE-FLOAT" | "INTEGER-DECODE-FLOAT"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
