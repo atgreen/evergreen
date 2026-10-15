@@ -1029,6 +1029,21 @@
 ;; lightweight placeholders — enough for portable code (e.g. bordeaux-threads'
 ;; +STANDARD-IO-BINDINGS+) that rebinds *RANDOM-STATE* / *READTABLE* to fresh
 ;; copies around a computation.
+;; The REPL history variables and *BREAK-ON-SIGNALS* are standard variables
+;; (CLHS 25.1.1, 9.2) and must be bound even when no REPL maintains them
+;; (ansi symbols cl-variable-symbols.1).
+(defvar * nil)
+(defvar ** nil)
+(defvar *** nil)
+(defvar + nil)
+(defvar ++ nil)
+(defvar +++ nil)
+(defvar / nil)
+(defvar // nil)
+(defvar /// nil)
+(defvar - nil)
+(defvar *break-on-signals* nil)
+
 ;; A random state is (:RANDOM-STATE . seed); RANDOM advances the seed in place
 ;; and seeds a NIL one from OS entropy on first use. Copying the cons copies
 ;; the sequence, which is what MAKE-RANDOM-STATE promises (CLHS 12.2).
