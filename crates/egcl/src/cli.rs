@@ -7060,18 +7060,37 @@ fn builtin_generic_fallback(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
-    if symbol_bare_name(name) != "MAKE-INSTANCE" {
+    if !is_builtin_function(&symbol_bare_name(name)) || builtin_fallback_active(name) {
         return None;
     }
+    egcl_rt::rooted!(op = resolve_sym(name)?);
     egcl_rt::rooted!(args = args.to_vec());
-    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len()));
+    egcl_rt::rooted!(items = Vec::<EgclVal>::with_capacity(args.len() + 1));
+    items.push(*op);
     let quote = quote_sym();
     for i in 0..args.len() {
         let quoted = vec_to_list(&[quote, args[i]]);
         items.push(quoted);
     }
-    let form_cdr = vec_to_list(&items);
-    Some(eval_make_instance(form_cdr, env))
+    let form = vec_to_list(&items);
+    // While the synthesized call evaluates, operator-position dispatch must
+    // take the built-in path for this name rather than the user methods that
+    // just failed to apply.
+    let previous = BUILTIN_FALLBACK_NAME.with(|cell| cell.replace(Some(name.to_string())));
+    let result = eval_form(form, env);
+    BUILTIN_FALLBACK_NAME.with(|cell| *cell.borrow_mut() = previous);
+    Some(result)
+}
+
+thread_local! {
+    /// The generic-function name whose built-in behaviour is currently being
+    /// applied by [`builtin_generic_fallback`].
+    static BUILTIN_FALLBACK_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn builtin_fallback_active(name: &str) -> bool {
+    BUILTIN_FALLBACK_NAME.with(|cell| cell.borrow().as_deref() == Some(name))
 }
 
 /// Build and signal a catchable error condition for a failed generic-function
@@ -13690,6 +13709,9 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "ARRAY" => &["ATOM", "T"],
         "SEQUENCE" => &["T"],
         "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" => &["ATOM", "T"],
+        "LOGICAL-PATHNAME" => &["PATHNAME", "ATOM", "T"],
+        "FILE-STREAM" | "STRING-STREAM" | "BROADCAST-STREAM" | "CONCATENATED-STREAM"
+        | "TWO-WAY-STREAM" | "ECHO-STREAM" | "SYNONYM-STREAM" => &["STREAM", "ATOM", "T"],
         "STANDARD-OBJECT" => &["T"],
         "ATOM" => &["T"],
         "T" => &[],
@@ -14681,6 +14703,16 @@ fn complex_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 }
 
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
+    // egcl has no extended characters, so BASE-CHAR and CHARACTER are the same
+    // type in both directions (TYPEP already says so; ansi arrays
+    // upgraded-array-element-type.2 checks the two SUBTYPEP answers agree).
+    if t1.is_symbol()
+        && t2.is_symbol()
+        && matches!(sym_bare_name_rc(t1).as_ref(), "CHARACTER" | "BASE-CHAR")
+        && matches!(sym_bare_name_rc(t2).as_ref(), "CHARACTER" | "BASE-CHAR")
+    {
+        return (true, true);
+    }
     if t1.is_cons() && t2.is_cons() {
         let (head1, args1) = cp(t1);
         let (head2, args2) = cp(t2);
@@ -14933,7 +14965,12 @@ fn typep_matches(
     // `(typep thread-instance 'thread)` wrongly NIL (bliss-66ny). The STANDARD-
     // OBJECT / STRUCTURE-OBJECT / CONDITION distinctions are left to the general
     // instance handling below.
-    if type_spec.is_symbol() && egcl_stdlib::is_instance(object) {
+    if type_spec.is_symbol()
+        && egcl_stdlib::is_instance(object)
+        // A Gray stream is an instance whose stream-ness the stream-type check
+        // below decides, not the STREAM class registered for FIND-CLASS.
+        && !is_stream_type_specifier(type_spec)
+    {
         let orig = sym_bare_name_rc(type_spec);
         if orig.as_ref() != "T"
             && orig.as_ref() != "STANDARD-OBJECT"
@@ -15133,10 +15170,12 @@ fn typep_matches(
                     || (object.is_symbol()
                         && sym_bare_name_rc(object).as_ref() == "STANDARD-READTABLE")
             }
-            "STREAM" | "FILE-STREAM" => is_stream(object),
-            "SYNONYM-STREAM" => egcl_stdlib::synonym_stream_symbol(object).is_some(),
-            "TWO-WAY-STREAM" | "ECHO-STREAM" => {
-                egcl_stdlib::two_way_stream_input_stream(object).is_some()
+            "STREAM" => is_stream(object),
+            // Each native stream kind is exactly one of the standard stream
+            // classes (CLHS 21.2; ansi streams make-broadcast-stream.1, ...).
+            "FILE-STREAM" | "STRING-STREAM" | "BROADCAST-STREAM" | "CONCATENATED-STREAM"
+            | "TWO-WAY-STREAM" | "ECHO-STREAM" | "SYNONYM-STREAM" => {
+                egcl_stdlib::stream_class_name(object) == Some(type_name.as_ref())
             }
             "SIMPLE-VECTOR" => is_simple_vector_value(object),
             // A string is a (vector character); an ARRAY includes general
@@ -16833,6 +16872,19 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         "HASH-TABLE-WEAKNESS" => Some((1, 1)),
+        // Array functions (ansi arrays *.error.*: a wrong argument count is a
+        // PROGRAM-ERROR, not a TYPE-ERROR about a missing argument).
+        "ARRAY-RANK" | "ARRAY-DIMENSIONS" | "ARRAY-TOTAL-SIZE" | "ARRAY-ELEMENT-TYPE"
+        | "ARRAY-HAS-FILL-POINTER-P" | "ARRAY-DISPLACEMENT" | "ADJUSTABLE-ARRAY-P"
+        | "FILL-POINTER" | "VECTOR-POP" | "ARRAYP" | "VECTORP" | "SIMPLE-VECTOR-P"
+        | "BIT-VECTOR-P" | "SIMPLE-BIT-VECTOR-P" | "STRINGP" | "SIMPLE-STRING-P" => Some((1, 1)),
+        "ARRAY-DIMENSION" | "VECTOR-PUSH" => Some((2, 2)),
+        "VECTOR-PUSH-EXTEND" => Some((2, 3)),
+        "UPGRADED-ARRAY-ELEMENT-TYPE" => Some((1, 2)),
+        "ARRAY-IN-BOUNDS-P" | "ARRAY-ROW-MAJOR-INDEX" => Some((1, usize::MAX)),
+        "GET-INTERNAL-REAL-TIME" | "GET-INTERNAL-RUN-TIME" | "GET-UNIVERSAL-TIME" => {
+            Some((0, 0))
+        }
         // Sequence functions with a fixed shape. Calling a standard function
         // with the wrong number of arguments is a PROGRAM-ERROR (CLHS); these
         // were reaching their bodies and answering a TYPE-ERROR about NIL, or
@@ -17440,6 +17492,15 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (val_form, _) = cp(r);
                 let value = eval_form(val_form, env)?;
                 let type_form = *type_form;
+                // (THE (VALUES ...) form) declares the shape of the multiple
+                // values, which a single-value check cannot judge; the primary
+                // value passes through unchecked (CLHS THE; ansi the.1-17).
+                if type_form.is_cons()
+                    && cp(type_form).0.is_symbol()
+                    && sym_bare_name_rc(cp(type_form).0).as_ref() == "VALUES"
+                {
+                    return Ok(value);
+                }
                 // The quick primitive check handles the common declared types;
                 // fall back to full TYPEP so user DEFTYPEs (e.g. babel's
                 // `(the array-index ...)` → alexandria's ARRAY-INDEX) and
@@ -18137,7 +18198,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "GET" => return eval_builtin_arguments(&name, cdr, env),
             "REMPROP" => return eval_builtin_arguments(&name, cdr, env),
             "MAKE-STRING-INPUT-STREAM" => return eval_builtin_arguments(&name, cdr, env),
-            "READ-CHAR" => return eval_builtin_arguments(&name, cdr, env),
+            "READ-CHAR" | "READ-CHAR-NO-HANG" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "PEEK-CHAR" => return eval_builtin_arguments(&name, cdr, env),
             #[cfg(not(egcl_no_dynamic_code))]
             "READ" | "READ-PRESERVING-WHITESPACE" => {
@@ -24975,7 +25038,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // Installed reader methods participate in ordinary generic dispatch,
         // including around methods and later method redefinitions. A slot-name
         // mapping alone cannot justify bypassing the applicable methods.
-        if env.generics.contains_key(&name) || env.methods.contains_key(&name) {
+        if (env.generics.contains_key(&name) || env.methods.contains_key(&name))
+            && !builtin_fallback_active(&name)
+        {
             let args = eval_args(cdr, env)?;
             return invoke_generic_function(&name, &args, env);
         }
@@ -36320,7 +36385,7 @@ fn is_builtin_function(name: &str) -> bool {
             | "OPEN"
             | "PRINT" | "PRIN1" | "PRINC" | "WRITE" | "WRITE-STRING" | "WRITE-LINE"
             | "WRITE-CHAR" | "TERPRI" | "FRESH-LINE" | "READ" | "READ-LINE" | "READ-CHAR"
-            | "PEEK-CHAR" | "UNREAD-CHAR"
+            | "PEEK-CHAR" | "UNREAD-CHAR" | "READ-CHAR-NO-HANG"
             | "FLOAT-RADIX" | "FLOAT-DIGITS" | "FLOAT-PRECISION" | "FLOAT-SIGN"
             | "SCALE-FLOAT" | "DECODE-FLOAT" | "INTEGER-DECODE-FLOAT"
             | "READ-FROM-STRING" | "FORMAT" | "PRIN1-TO-STRING" | "PRINC-TO-STRING"
@@ -38224,8 +38289,26 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
     };
 
     // Input defaults to an error on a missing file; probe defaults to NIL.
-    if !if_dne_supplied && matches!(direction, egcl_stdlib::StreamDirection::Input) {
-        if_does_not_exist = T;
+    // CLHS OPEN: :IF-DOES-NOT-EXIST defaults to :ERROR for :INPUT, or when
+    // :IF-EXISTS is :OVERWRITE or :APPEND; to :CREATE for :OUTPUT and :IO
+    // otherwise; and to NIL for :PROBE (ansi streams open.io.*, open.output.*).
+    if !if_dne_supplied {
+        let exists_keeps = matches!(
+            sym_bare_name_rc(if_exists).as_ref(),
+            "APPEND" | "OVERWRITE"
+        ) || if_exists == egcl_stdlib::streams::IF_EXISTS_APPEND_VAL
+            || if_exists == egcl_stdlib::streams::IF_EXISTS_OVERWRITE_VAL;
+        if_does_not_exist = match direction {
+            egcl_stdlib::StreamDirection::Input => T,
+            egcl_stdlib::StreamDirection::Output | egcl_stdlib::StreamDirection::Io => {
+                if exists_keeps {
+                    T
+                } else {
+                    egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL
+                }
+            }
+            _ => NIL,
+        };
     }
     if_does_not_exist = match sym_bare_name_rc(if_does_not_exist).as_ref() {
         "CREATE" => egcl_stdlib::streams::IF_DOES_NOT_EXIST_CREATE_VAL,

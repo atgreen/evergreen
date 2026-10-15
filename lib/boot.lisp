@@ -1139,6 +1139,29 @@
         ((char= c char) (read-char stream t nil t) (nreverse result))
       (push (read stream t nil t) result))))
 
+;;; READ-CHAR-NO-HANG is a builtin wired to the stdlib stream protocol, which
+;;; knows how to poll a pipe or socket without blocking; it cannot be written
+;;; here in terms of READ-CHAR, which blocks.
+
+;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
+;;; the stream itself holds, so this only checks the designator and returns NIL.
+(defun clear-input (&optional (stream *standard-input*))
+  (let ((stream (cond ((eq stream t) *terminal-io*)
+                      ((null stream) *standard-input*)
+                      (t stream))))
+    (unless (streamp stream)
+      (error 'type-error :datum stream :expected-type 'stream))
+    nil))
+
+;;; FILE-AUTHOR: the file's author is not recorded in a portable way; NIL is
+;;; the permitted answer when it cannot be determined (CLHS 20.2). The file
+;;; must exist, else a FILE-ERROR.
+(defun file-author (pathspec)
+  (let ((truename (probe-file pathspec)))
+    (unless truename
+      (error 'file-error :pathname (pathname pathspec)))
+    nil))
+
 ;;; WITH-INPUT-FROM-STRING: bind VAR to a string-input-stream over STRING.
 (defmacro with-input-from-string ((var string &key (start 0) end index) &rest body)
   (declare (ignore index))
@@ -1985,7 +2008,47 @@
 ;; adjustable char collectors this way (bliss-omw). Only the fill-pointer/
 ;; adjustable rank-1 case is supported (delegated to %adjust-array); other cases
 ;; are uncommon in the libraries we load.
+;; A fresh array of NEW-DIMENSIONS holding ARRAY's elements at the subscripts
+;; both arrays share, the rest INITIAL-ELEMENT (or INITIAL-CONTENTS when given):
+;; ADJUST-ARRAY's result for an array that is not actually adjustable, which
+;; ANSI permits to be a new array (CLHS ADJUST-ARRAY; ansi adjust-array.*).
+(defun %adjust-array-copy (array dims keys)
+  (let* ((dims (if (listp dims) dims (list dims)))
+         (iel-cell (member :initial-element keys))
+         (ic-cell (member :initial-contents keys))
+         (et-cell (member :element-type keys))
+         (fp-cell (member :fill-pointer keys))
+         (element-type (if et-cell (cadr et-cell) (array-element-type array)))
+         (new (if ic-cell
+                  (make-array dims :element-type element-type
+                                   :initial-contents (cadr ic-cell))
+                  (if iel-cell
+                      (make-array dims :element-type element-type
+                                       :initial-element (cadr iel-cell))
+                      (make-array dims :element-type element-type))))
+         (old-dims (array-dimensions array)))
+    (unless (or ic-cell (/= (length dims) (length old-dims)))
+      (dotimes (i (array-total-size new))
+        ;; Decompose the row-major index into subscripts, innermost last.
+        (let ((subs nil) (rest i) (inside t))
+          (dolist (d (reverse dims))
+            (push (mod rest d) subs)
+            (setq rest (floor rest d)))
+          (do ((ss subs (cdr ss)) (od old-dims (cdr od)))
+              ((or (null ss) (not inside)))
+            (when (>= (car ss) (car od)) (setq inside nil)))
+          (when inside
+            (setf (row-major-aref new i) (apply #'aref array subs))))))
+    (when (and fp-cell (cadr fp-cell) (= (length dims) 1))
+      (let ((fp (cadr fp-cell)))
+        (setq new (make-array dims :element-type element-type
+                                   :fill-pointer (if (eq fp t) (car dims) fp)
+                                   :initial-contents (coerce new 'list)))))
+    new))
+
 (defun adjust-array (array new-dimensions &rest keys)
+  (unless (and (adjustable-array-p array) (= (array-rank array) 1))
+    (return-from adjust-array (%adjust-array-copy array new-dimensions keys)))
   (let* ((size (if (consp new-dimensions) (car new-dimensions) new-dimensions))
          (fp-cell (member :fill-pointer keys))
          (iel-cell (member :initial-element keys))
@@ -2011,34 +2074,45 @@
 ;; for the ubiquitous 2-arg use; a caller relying on in-place identity is not
 ;; served until bit-vectors become mutable. Each op is a bit of a boolean of two
 ;; single-bit inputs, so plain LOGAND/LOGIOR/LOGXOR and (- 1 bit) compute them.
-(defun %bit-op-2 (fn bv1 bv2)
-  (let ((n (length bv1)) (bits nil))
-    (dotimes (i n) (push (funcall fn (bit bv1 i) (bit bv2 i)) bits))
-    (%bit-vector-from-bits (nreverse bits))))
-(defun bit-and (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logand a b)) bv1 bv2))
-(defun bit-ior (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logior a b)) bv1 bv2))
-(defun bit-xor (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logxor a b)) bv1 bv2))
-(defun bit-eqv (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (- 1 (logxor a b))) bv1 bv2))
-(defun bit-nand (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (- 1 (logand a b))) bv1 bv2))
-(defun bit-nor (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (- 1 (logior a b))) bv1 bv2))
-(defun bit-andc1 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logand (- 1 a) b)) bv1 bv2))
-(defun bit-andc2 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logand a (- 1 b))) bv1 bv2))
-(defun bit-orc1 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logior (- 1 a) b)) bv1 bv2))
-(defun bit-orc2 (bv1 bv2 &optional opt-result) (declare (ignore opt-result))
-  (%bit-op-2 (lambda (a b) (logior a (- 1 b))) bv1 bv2))
-(defun bit-not (bv &optional opt-result) (declare (ignore opt-result))
-  (let ((n (length bv)) (bits nil))
-    (dotimes (i n) (push (- 1 (bit bv i)) bits))
-    (%bit-vector-from-bits (nreverse bits))))
+;; The two operands may be bit arrays of any rank with the same dimensions
+;; (CLHS 15.2: bit-and etc. take bit-arrays); the result goes into OPT-RESULT
+;; when that is a bit array, into the first operand for T, else into a fresh
+;; array of the same dimensions (ansi arrays bit-and.* on rank 0 and rank 2).
+(defun %bit-op-2 (fn bv1 bv2 &optional opt-result)
+  (let ((result (cond ((eq opt-result t) bv1)
+                      ((arrayp opt-result) opt-result)
+                      (t (make-array (array-dimensions bv1) :element-type 'bit)))))
+    (dotimes (i (array-total-size bv1))
+      (setf (row-major-aref result i)
+            (funcall fn (row-major-aref bv1 i) (row-major-aref bv2 i))))
+    result))
+(defun bit-and (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logand a b)) bv1 bv2 opt-result))
+(defun bit-ior (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logior a b)) bv1 bv2 opt-result))
+(defun bit-xor (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logxor a b)) bv1 bv2 opt-result))
+(defun bit-eqv (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (- 1 (logxor a b))) bv1 bv2 opt-result))
+(defun bit-nand (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (- 1 (logand a b))) bv1 bv2 opt-result))
+(defun bit-nor (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (- 1 (logior a b))) bv1 bv2 opt-result))
+(defun bit-andc1 (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logand (- 1 a) b)) bv1 bv2 opt-result))
+(defun bit-andc2 (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logand a (- 1 b))) bv1 bv2 opt-result))
+(defun bit-orc1 (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logior (- 1 a) b)) bv1 bv2 opt-result))
+(defun bit-orc2 (bv1 bv2 &optional opt-result)
+  (%bit-op-2 (lambda (a b) (logior a (- 1 b))) bv1 bv2 opt-result))
+(defun bit-not (bv &optional opt-result)
+  (let ((result (cond ((eq opt-result t) bv)
+                      ((arrayp opt-result) opt-result)
+                      (t (make-array (array-dimensions bv) :element-type 'bit)))))
+    (dotimes (i (array-total-size bv))
+      (setf (row-major-aref result i) (- 1 (row-major-aref bv i))))
+    result))
 
 ;; MAKE-SEQUENCE result-type size &key initial-element — a fresh sequence of the
 ;; given type. Dispatches on the type's head: list types build a list, string

@@ -1225,6 +1225,35 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let str_cls = EgclVal::from_fixnum(-21);
     let bitv_cls = EgclVal::from_fixnum(-22);
     let htbl_cls = EgclVal::from_fixnum(-23);
+    // The remaining standard classes of CLHS 4.3.7 / figure 4-8 that FIND-CLASS
+    // must know (ansi symbols cl-types-that-are-classes.*; the objects chapter
+    // names STANDARD-GENERIC-FUNCTION while loading). Handles continue the
+    // negative range; nothing dispatches on them beyond FIND-CLASS,
+    // CLASS-NAME, CLASS-PRECEDENCE-LIST and TYPEP of the metaobject.
+    let stream_cls = EgclVal::from_fixnum(-24);
+    let bstream_cls = EgclVal::from_fixnum(-25);
+    let cstream_cls = EgclVal::from_fixnum(-26);
+    let estream_cls = EgclVal::from_fixnum(-27);
+    let fstream_cls = EgclVal::from_fixnum(-28);
+    let sstream_cls = EgclVal::from_fixnum(-29);
+    let ystream_cls = EgclVal::from_fixnum(-30);
+    let tstream_cls = EgclVal::from_fixnum(-31);
+    let path_cls = EgclVal::from_fixnum(-32);
+    let lpath_cls = EgclVal::from_fixnum(-33);
+    let pkg_cls = EgclVal::from_fixnum(-34);
+    let rstate_cls = EgclVal::from_fixnum(-35);
+    let rtable_cls = EgclVal::from_fixnum(-36);
+    let restart_cls = EgclVal::from_fixnum(-37);
+    let sobj_cls = EgclVal::from_fixnum(-38);
+    let class_cls = EgclVal::from_fixnum(-39);
+    let sclass_cls = EgclVal::from_fixnum(-40);
+    let bclass_cls = EgclVal::from_fixnum(-41);
+    let stclass_cls = EgclVal::from_fixnum(-42);
+    let gf_cls = EgclVal::from_fixnum(-43);
+    let sgf_cls = EgclVal::from_fixnum(-44);
+    let method_cls = EgclVal::from_fixnum(-45);
+    let smethod_cls = EgclVal::from_fixnum(-46);
+    let mcomb_cls = EgclVal::from_fixnum(-47);
 
     // Names: interned into the shared registry by their real CL names
     // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
@@ -1259,6 +1288,30 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let str_nm = nm("STRING");
     let bitv_nm = nm("BIT-VECTOR");
     let htbl_nm = nm("HASH-TABLE");
+    let stream_nm = nm("STREAM");
+    let bstream_nm = nm("BROADCAST-STREAM");
+    let cstream_nm = nm("CONCATENATED-STREAM");
+    let estream_nm = nm("ECHO-STREAM");
+    let fstream_nm = nm("FILE-STREAM");
+    let sstream_nm = nm("STRING-STREAM");
+    let ystream_nm = nm("SYNONYM-STREAM");
+    let tstream_nm = nm("TWO-WAY-STREAM");
+    let path_nm = nm("PATHNAME");
+    let lpath_nm = nm("LOGICAL-PATHNAME");
+    let pkg_nm = nm("PACKAGE");
+    let rstate_nm = nm("RANDOM-STATE");
+    let rtable_nm = nm("READTABLE");
+    let restart_nm = nm("RESTART");
+    let sobj_nm = nm("STRUCTURE-OBJECT");
+    let class_nm = nm("CLASS");
+    let sclass_nm = nm("STANDARD-CLASS");
+    let bclass_nm = nm("BUILT-IN-CLASS");
+    let stclass_nm = nm("STRUCTURE-CLASS");
+    let gf_nm = nm("GENERIC-FUNCTION");
+    let sgf_nm = nm("STANDARD-GENERIC-FUNCTION");
+    let method_nm = nm("METHOD");
+    let smethod_nm = nm("STANDARD-METHOD");
+    let mcomb_nm = nm("METHOD-COMBINATION");
 
     with_state_mut(|st| {
         // Another thread may have initialized CLOS while we interned names.
@@ -1338,6 +1391,32 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             (str_nm, str_cls, vec![vec_cls]),
             (bitv_nm, bitv_cls, vec![vec_cls]),
             (htbl_nm, htbl_cls, vec![t_cls]),
+            (stream_nm, stream_cls, vec![t_cls]),
+            (bstream_nm, bstream_cls, vec![stream_cls]),
+            (cstream_nm, cstream_cls, vec![stream_cls]),
+            (estream_nm, estream_cls, vec![stream_cls]),
+            (fstream_nm, fstream_cls, vec![stream_cls]),
+            (sstream_nm, sstream_cls, vec![stream_cls]),
+            (ystream_nm, ystream_cls, vec![stream_cls]),
+            (tstream_nm, tstream_cls, vec![stream_cls]),
+            (path_nm, path_cls, vec![t_cls]),
+            (lpath_nm, lpath_cls, vec![path_cls]),
+            (pkg_nm, pkg_cls, vec![t_cls]),
+            (rstate_nm, rstate_cls, vec![t_cls]),
+            (rtable_nm, rtable_cls, vec![t_cls]),
+            (restart_nm, restart_cls, vec![t_cls]),
+            (sobj_nm, sobj_cls, vec![t_cls]),
+            // Metaobject classes (AMOP): CLASS, METHOD and METHOD-COMBINATION
+            // are standard objects; a generic function is also a FUNCTION.
+            (class_nm, class_cls, vec![std_obj]),
+            (sclass_nm, sclass_cls, vec![class_cls]),
+            (bclass_nm, bclass_cls, vec![class_cls]),
+            (stclass_nm, stclass_cls, vec![class_cls]),
+            (gf_nm, gf_cls, vec![fun_cls, std_obj]),
+            (sgf_nm, sgf_cls, vec![gf_cls]),
+            (method_nm, method_cls, vec![std_obj]),
+            (smethod_nm, smethod_cls, vec![method_cls]),
+            (mcomb_nm, mcomb_cls, vec![std_obj]),
         ];
         for (nm, cls, supers) in hierarchy {
             st.class_registry.insert(nm, cls);
@@ -1662,6 +1741,34 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     if crate::hash_table_p(object) {
         return EgclVal::from_fixnum(-23);
     }
+    // Arrays, streams, packages and pathnames belong to their standard
+    // classes (CLHS 4.3.7), so (typep "abc" (find-class 'string)) and
+    // (class-of (make-array 3)) answer as ANSI requires (ansi arrays
+    // make-array.*, types-and-classes). The classes are registered under their
+    // name symbols by the bootstrap hierarchy. Decide the name here: the stream
+    // state lock sits below the CLOS definitions lock, and interning (a lookup
+    // for these bootstrap names) must not happen under with_state either.
+    let standard_name = if egcl_rt::types::stringp(object) {
+        Some("STRING")
+    } else if egcl_rt::types::bit_vector_p(object) {
+        Some("BIT-VECTOR")
+    } else if egcl_rt::types::vectorp(object) {
+        Some("VECTOR")
+    } else if egcl_rt::types::arrayp(object) || egcl_rt::types::md_array_p(object) {
+        Some("ARRAY")
+    } else if egcl_rt::types::streamp(object) {
+        Some(crate::streams::stream_class_name(object).unwrap_or("STREAM"))
+    } else if egcl_rt::types::packagep(object) {
+        Some("PACKAGE")
+    } else if crate::is_logical_pathname(object) {
+        Some("LOGICAL-PATHNAME")
+    } else if crate::is_pathname(object) {
+        Some("PATHNAME")
+    } else {
+        None
+    };
+    let standard_sym =
+        standard_name.map(|name| EgclVal::from_symbol_index(egcl_rt::symbols::intern(name)));
     with_state(|st| {
         if object == NIL {
             return st.null_class;
@@ -1686,6 +1793,9 @@ pub fn class_of(object: EgclVal) -> EgclVal {
         }
         if object.is_function() {
             return st.function_class;
+        }
+        if let Some(class) = standard_sym.and_then(|sym| st.class_registry.get(&sym).copied()) {
+            return class;
         }
         if object.is_heap_object() {
             return st.heap_object_class;
@@ -1899,7 +2009,13 @@ fn c3_linearize_inner(
             .map(|l| l[0])
             .find(|&h| !lists.iter().any(|l| l[1..].contains(&h)))
             .ok_or_else(|| {
-                EgclError::Internal("C3 linearization failed: inconsistent hierarchy".into())
+                // A Lisp-level error, so a DEFCLASS whose superclasses cannot be
+                // ordered is caught by HANDLER-CASE like any other definition
+                // error (ansi objects defclass.forward-ref.4) rather than
+                // aborting the image.
+                EgclError::ProgramError(
+                    "C3 linearization failed: inconsistent class hierarchy".into(),
+                )
             })?;
 
         result.push(head);

@@ -140,6 +140,7 @@ pub use sequences::{
     string_set_char, subseq, substitute, vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
+pub use streams::stream_class_name;
 pub use streams::{
     ExternalFormat, StreamDirection, StreamElementType, close, file_length_fn, file_position,
     get_output_stream_string, input_stream_p, interactive_stream_p, is_byte_stream,
