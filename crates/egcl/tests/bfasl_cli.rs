@@ -2874,6 +2874,52 @@ fn circular_literals_round_trip_without_source() {
     fs::remove_dir_all(dir).unwrap();
 }
 
+/// A condition a reader macro signals during COMPILE-FILE's pre-read reaches a
+/// HANDLER-CASE established around COMPILE-FILE, like any other condition
+/// signalled inside it. The transfer to the clause travels through the Rust
+/// reader as an Internal error carrying a `__HANDLER_CASE__:id` token; the
+/// pre-read used to wrap that token as a read failure and then downgrade the
+/// file to a source-only artifact, so the clause never ran, COMPILE-FILE
+/// "succeeded", and the artifact re-read the same text at load time. zacl's
+/// delegating #+ reader hit this on every AllegroServe file.
+#[test]
+fn compile_file_pre_read_passes_control_transfers_to_the_callers_handler() {
+    let dir = workdir("pre-read-control-transfer");
+    let src = dir.join("signals.lisp");
+    let out = dir.join("signals.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (eval-when (:compile-toplevel :load-toplevel :execute)
+        (defun signalling-reader (stream sub-char arg)
+          (declare (ignore stream sub-char arg))
+          (error "reader macro signalled"))
+        (set-dispatch-macro-character #\# #\q 'signalling-reader))
+      (defparameter *after-the-signal* #q)
+    "#,
+    )
+    .unwrap();
+    let result = run(&format!(
+        r#"(handler-case (progn (compile-file {src:?} {out:?}) (princ "NO-TRANSFER"))
+             (error (e) (princ (list "HANDLED" (search "reader macro signalled" (princ-to-string e))))))"#
+    ));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("(HANDLED 0)"),
+        "the caller's HANDLER-CASE clause must take the reader macro's condition: {stdout}"
+    );
+    assert!(
+        !out.exists(),
+        "no artifact may be written for a compilation the caller's clause abandoned"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn read_time_multidimensional_array_is_portable_without_compile_time_helper() {
     let dir = workdir("read-time-md-array");

@@ -12678,10 +12678,26 @@ fn read_forms_for_compile(
             if pos >= chars.len() {
                 break;
             }
-            let (val, next_pos) = read_next_form_at(&chars, pos, env).map_err(|e| {
-                let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
-                EgclError::FileError(format!("compile-file read failed near line {line}: {e}"))
-            })?;
+            let (val, next_pos) = match read_next_form_at(&chars, pos, env) {
+                Ok(read) => read,
+                // A control transfer established around COMPILE-FILE -- a
+                // HANDLER-CASE clause taking a condition a reader macro
+                // signalled, an invoked restart -- travels as an Internal
+                // error carrying a `__NAME__:id` token and must reach its
+                // frame unchanged, as it already does for the compile-time
+                // evaluation below. Wrapping it reported the token itself as
+                // a read failure and, worse, downgraded the file to a
+                // source-only artifact that the caller's clause never saw.
+                Err(e) if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    let line = chars[..pos].iter().filter(|&&ch| ch == '\n').count() + 1;
+                    return Err(EgclError::FileError(format!(
+                        "compile-file read failed near line {line}: {e}"
+                    )));
+                }
+            };
             if val == EOF {
                 break;
             }
@@ -17197,6 +17213,12 @@ fn build_bfasl_from_source(
             // propagate it, as SBCL does, rather than writing an artifact that
             // pretends the file compiled (bliss-wk2q).
             Err(e) if compile_time_failure.is_some() => return Err(e),
+            // A control-transfer token (see read_forms_for_compile) is not a
+            // file that cannot be pre-read: the transfer is in progress and
+            // writing a source-only artifact would swallow it.
+            Err(e) if matches!(&e, EgclError::Internal(message) if message.starts_with("__")) => {
+                return Err(e);
+            }
             Err(e) => {
                 // This downgrade IS load-bearing — iterate installs its `#L` reader
                 // macro from a mid-file eval-when the upfront pass cannot honour — but
