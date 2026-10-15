@@ -1186,13 +1186,26 @@
 ;; (CLHS 23.1.2 default). Portable code (e.g. chunga) reads READTABLE-CASE to
 ;; decide how to case-fold tokens; supporting the reader — and a SETF that
 ;; accepts the one mode we implement — is enough to load such systems.
-;; Placeholder reader-macro function reported by GET-MACRO-CHARACTER for a
-;; standard macro character (egcl's built-in char readers are in Rust, so there
-;; is no real Lisp function to hand back; this fbound stub satisfies portable
-;; code that only checks FUNCTIONP / FBOUNDP of the result).
+;; The reader-macro function GET-MACRO-CHARACTER reports for a standard macro
+;; character.  EGCL's built-in character readers are in Rust, so this stands in
+;; for them: it reads the object the character introduces by pushing the
+;; character back in front of the stream and reading with the standard
+;; readtable.  That makes the function callable, as CLHS 2.1.4.4 allows
+;; ((funcall (get-macro-character #\() stream #\() reads a list), and lets a
+;; library that copies syntax between readtables with GET-MACRO-CHARACTER and
+;; SET-MACRO-CHARACTER -- named-readtables' (:merge :standard) -- produce a
+;; readtable that still reads.  A semicolon consumes the comment and returns no
+;; values; a close paren is the reader error it always is.
+(defvar egcl::*standard-readtable-for-macro-functions* nil)
 (defun egcl::%standard-reader-macro (stream char)
-  (declare (ignore stream char))
-  (error "The standard reader macro cannot be invoked directly."))
+  (cond ((char= char #\;) (read-line stream nil nil) (values))
+        ((char= char #\)) (error 'reader-error :stream stream))
+        (t (let ((*readtable* (or egcl::*standard-readtable-for-macro-functions*
+                                  (setq egcl::*standard-readtable-for-macro-functions*
+                                        (copy-readtable nil))))
+                 (in (make-concatenated-stream (make-string-input-stream (string char))
+                                               stream)))
+             (read in t nil t)))))
 (defun readtable-case (readtable)
   ;; A non-readtable argument is a TYPE-ERROR (ansi readtable-case.error.3).
   (check-type readtable readtable)
