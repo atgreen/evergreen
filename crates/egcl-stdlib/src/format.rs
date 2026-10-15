@@ -64,6 +64,12 @@ fn apply_format_function(func: EgclVal, args: &[EgclVal]) -> Result<EgclVal, Egc
     call_format_dispatch(func, args)
 }
 
+/// The body FORMATTER function as `run_iteration_body` takes it: NIL, the
+/// sentinel for "the directive has a literal body", becomes None.
+fn body_function_arg(v: EgclVal) -> Option<EgclVal> {
+    (!v.is_nil()).then_some(v)
+}
+
 /// One pass over a `~{` body. An empty body takes its control from the first
 /// argument (CLHS 22.3.7.4): a string is formatted in place; a function (a
 /// FORMATTER) is called with a string stream and the remaining arguments and
@@ -3474,7 +3480,15 @@ fn format_impl(
                 };
                 // An empty body takes the control -- a string or a FORMATTER
                 // function -- from the next argument (CLHS 22.3.7.4).
-                let mut body_function: Option<EgclVal> = None;
+                // Root the body FORMATTER function across the iteration calls
+                // below. Each run_iteration_body invokes Lisp and allocates (the
+                // nested format, its argument lists, the output string), so a
+                // relocating GC would leave an unrooted copy stale for the NEXT
+                // pass -- and the directive may iterate many times. Held as a
+                // EgclVal with NIL for "no function" because the root macros
+                // take a EgclVal, not an Option (bliss-gppm7).
+                let mut body_function: EgclVal = NIL;
+                egcl_rt::rooted_ref!(_body_function_root = &mut body_function);
                 if body.is_empty() {
                     if *arg_idx >= args.len() {
                         return Err(EgclError::ControlError("too few args for ~{~}".into()));
@@ -3483,7 +3497,7 @@ fn format_impl(
                     *arg_idx += 1;
                     match extract_egcl_string(control) {
                         Some(text) => body = text,
-                        None => body_function = Some(control),
+                        None => body_function = control,
                     }
                 }
                 let reached = |n: i64| max_iter.is_some_and(|m| n >= m);
@@ -3494,7 +3508,7 @@ fn format_impl(
                     if at_least_once && *arg_idx >= args.len() && !reached(0) {
                         let mut sub_idx = 0;
                         OUTER_REMAINING.with(|c| c.set(Some(0)));
-                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
                         take_escape();
                     }
                     while *arg_idx < args.len() && !reached(iters) {
@@ -3510,7 +3524,7 @@ fn format_impl(
                         let sub_args = proper_list_elements(sub)?;
                         let mut sub_idx = 0;
                         OUTER_REMAINING.with(|c| c.set(Some(args.len() - *arg_idx)));
-                        run_iteration_body(&body, body_function, &sub_args, &mut sub_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), &sub_args, &mut sub_idx, output)?;
                         // `~^` ends this sublist's pass; `~:^` the iteration.
                         if take_escape() == 2 {
                             break;
@@ -3521,12 +3535,12 @@ fn format_impl(
                     // ~@{ : iterate over the remaining arguments themselves.
                     let mut iters = 0i64;
                     if at_least_once && *arg_idx >= args.len() && !reached(0) {
-                        run_iteration_body(&body, body_function, args, arg_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), args, arg_idx, output)?;
                         take_escape();
                     }
                     while *arg_idx < args.len() && !reached(iters) {
                         let before = *arg_idx;
-                        run_iteration_body(&body, body_function, args, arg_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), args, arg_idx, output)?;
                         if take_escape() != 0 {
                             break;
                         }
@@ -3553,7 +3567,7 @@ fn format_impl(
                         let saved_outer = OUTER_REMAINING.with(|c| c.get());
                         OUTER_REMAINING.with(|c| c.set(Some(0)));
                         let mut sub_idx = 0;
-                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
                         take_escape();
                         OUTER_REMAINING.with(|c| c.set(saved_outer));
                     }
@@ -3574,7 +3588,7 @@ fn format_impl(
                             let sub_args = proper_list_elements(*sublist)?;
                             let mut sub_idx = 0;
                             OUTER_REMAINING.with(|c| c.set(Some(sublists.len() - iters - 1)));
-                            run_iteration_body(&body, body_function, &sub_args, &mut sub_idx, output)?;
+                            run_iteration_body(&body, body_function_arg(body_function), &sub_args, &mut sub_idx, output)?;
                             if take_escape() == 2 {
                                 break;
                             }
@@ -3596,7 +3610,7 @@ fn format_impl(
                     }
                     if list_val.is_nil() && at_least_once && !reached(0) {
                         let mut sub_idx = 0;
-                        run_iteration_body(&body, body_function, &[], &mut sub_idx, output)?;
+                        run_iteration_body(&body, body_function_arg(body_function), &[], &mut sub_idx, output)?;
                         take_escape();
                     }
                     if !list_val.is_nil() {
@@ -3606,7 +3620,7 @@ fn format_impl(
                         let mut iters = 0i64;
                         while sub_idx < list_elements.len() && !reached(iters) {
                             let before = sub_idx;
-                            run_iteration_body(&body, body_function, &list_elements, &mut sub_idx, output)?;
+                            run_iteration_body(&body, body_function_arg(body_function), &list_elements, &mut sub_idx, output)?;
                             if take_escape() != 0 {
                                 break;
                             }
