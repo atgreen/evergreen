@@ -4670,6 +4670,33 @@ fn char_name_round_trips() {
     );
 }
 
+/// NAME-CHAR accepts the character names SBCL and Clozure CL both read beyond
+/// the standard ones: Ff and Formfeed for Page (AllegroServe's parse.cl writes
+/// `#\ff`), Lf, Cr, Bs, Ht, Sp, Del and Altmode. They are aliases only:
+/// CHAR-NAME keeps answering the standard name, so round trips are unchanged.
+#[test]
+fn name_char_reads_the_shared_implementation_aliases() {
+    let prog = "(prin1 (list (char-code #\\ff) (char-code #\\Formfeed) (char-code #\\lf) (char-code #\\cr)
+                      (char-code #\\bs) (char-code #\\ht) (char-code #\\sp) (char-code #\\del)
+                      (char-code #\\altmode) (char-name #\\ff) (char-name #\\del)))";
+    let out = egcl_bin()
+        .args(["--eval", prog])
+        .output()
+        .expect("run egcl");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("(12 12 10 13 8 9 32 127 27 \"Page\" \"Rubout\")"),
+        "got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// bliss-gxe9: `(macro-function 'NAME)` must return an expander that expands as
 /// NAME regardless of the operator of the form it is applied to, so it can be
 /// installed elsewhere via (setf (macro-function OTHER) …) (CLHS 3.1.2.1.2.2;

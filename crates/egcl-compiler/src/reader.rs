@@ -2381,7 +2381,9 @@ pub fn char_name(c: char) -> Option<String> {
 }
 
 /// NAME-CHAR: the character `name` designates, ignoring case: anything
-/// `char_name` produces, the aliases Nul/Bel/Esc/Linefeed/Delete, and the
+/// `char_name` produces, the aliases SBCL and Clozure CL both read
+/// (Nul/Bel/Esc/Altmode, Linefeed/Lf, Cr, Bs, Ht, Sp, Del/Delete,
+/// Ff/Formfeed for Page -- AllegroServe writes `#\ff`), and the
 /// `U+XXXX` / `UXXXX` hexadecimal spellings.
 pub fn char_from_name(name: &str) -> Option<char> {
     let lower = name.to_ascii_lowercase();
@@ -2394,10 +2396,14 @@ pub fn char_from_name(name: &str) -> Option<char> {
     let direct = match lower.as_str() {
         "nul" => '\0',
         "bel" => '\u{7}',
-        "esc" => '\u{1b}',
-        "space" => ' ',
-        "linefeed" => '\n',
-        "rubout" | "delete" => '\u{7f}',
+        "bs" => '\u{8}',
+        "ht" => '\t',
+        "ff" | "formfeed" => '\u{c}',
+        "cr" => '\r',
+        "esc" | "altmode" => '\u{1b}',
+        "space" | "sp" => ' ',
+        "linefeed" | "lf" => '\n',
+        "rubout" | "delete" | "del" => '\u{7f}',
         "next-line" => '\u{85}',
         "no-break_space" => '\u{a0}',
         "ideographic_space" => '\u{3000}',
