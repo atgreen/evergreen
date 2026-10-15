@@ -309,6 +309,13 @@ fn is_wild(val: EgclVal) -> bool {
     is_keyword(val, "WILD")
 }
 
+/// True for the stdlib's internal `:WILD` sentinel (the value a wild component
+/// parsed from a namestring carries), which the interpreter's accessors turn
+/// into the real keyword before handing it to Lisp.
+pub fn is_wild_sentinel(val: EgclVal) -> bool {
+    val.0 == keyword_hash("WILD")
+}
+
 fn alloc_pathname(rec: PathnameRecord) -> EgclVal {
     install_pathname_global_root_scanner();
     // A pathname is a REAL heap object carrying the PATHNAME type_id in its
@@ -1086,7 +1093,17 @@ pub fn merge_pathnames(
                 (None, None) => true,
                 _ => false,
             });
-    let default_dir = if same_volume {
+    // A logical pathname takes its directory from the defaults only when they
+    // name the same logical host: a physical default directory has no meaning
+    // under a logical host's translations, and the ansi-test suite relies on
+    // (probe-file "CLTEST:probe-file.txt") translating the bare name against
+    // the host while *DEFAULT-PATHNAME-DEFAULTS* is physical.
+    let logical_cross_host = primary.parsed.is_logical
+        && !matches!(
+            (&primary.parsed.host_name, &def.parsed.host_name),
+            (Some(a), Some(b)) if def.parsed.is_logical && a.eq_ignore_ascii_case(b)
+        );
+    let default_dir = if same_volume && !logical_cross_host {
         def.parsed.directory.as_ref()
     } else {
         None
@@ -1501,7 +1518,13 @@ fn pathname_match_with_captures(
                 return None;
             }
         }
-        (None, Some(pattern)) if pattern.parts.is_empty() => {}
+        // A pattern of only `**;` (wild-inferiors) matches a pathname with no
+        // directory at all: zero levels (ansi files probe-file.4, truename.5).
+        (None, Some(pattern))
+            if pattern
+                .parts
+                .iter()
+                .all(|part| matches!(part, DirPart::WildInferiors)) => {}
         _ => return None,
     }
 

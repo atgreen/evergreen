@@ -112,6 +112,121 @@ pub enum ExternalFormat {
 pub enum StreamElementType {
     Character,
     UnsignedByte8,
+    /// `(unsigned-byte BITS)` / `(signed-byte BITS)` for any other width.
+    /// Each element occupies `BITS.div_ceil(8)` octets, little-endian, two's
+    /// complement when signed (ansi streams open.*, file-length.*).
+    Integer { bits: u16, signed: bool },
+}
+
+impl StreamElementType {
+    /// Octets one element occupies in a file.
+    pub fn octets_per_element(self) -> usize {
+        match self {
+            StreamElementType::Integer { bits, .. } => usize::from(bits).div_ceil(8),
+            _ => 1,
+        }
+    }
+
+    /// A binary (integer-element) stream, of any width.
+    pub fn is_binary(self) -> bool {
+        !matches!(self, StreamElementType::Character)
+    }
+
+    /// The code `open()` and `stream_element_type()` exchange with the
+    /// interpreter: the bit width, negated for a signed type; 8 is the
+    /// `(unsigned-byte 8)` fast path.
+    pub fn from_code(code: EgclVal) -> StreamElementType {
+        if !code.is_fixnum() {
+            return StreamElementType::Character;
+        }
+        match code.as_fixnum() {
+            8 => StreamElementType::UnsignedByte8,
+            n if (1..=i64::from(u16::MAX)).contains(&n) => StreamElementType::Integer {
+                bits: n as u16,
+                signed: false,
+            },
+            n if (-i64::from(u16::MAX)..=-1).contains(&n) => StreamElementType::Integer {
+                bits: (-n) as u16,
+                signed: true,
+            },
+            _ => StreamElementType::Character,
+        }
+    }
+
+    pub fn to_code(self) -> EgclVal {
+        match self {
+            StreamElementType::Character => T,
+            StreamElementType::UnsignedByte8 => EgclVal::from_fixnum(8),
+            StreamElementType::Integer { bits, signed } => {
+                let bits = i64::from(bits);
+                EgclVal::from_fixnum(if signed { -bits } else { bits })
+            }
+        }
+    }
+
+    fn type_name(self) -> String {
+        match self {
+            StreamElementType::Character => "CHARACTER".into(),
+            StreamElementType::UnsignedByte8 => "(UNSIGNED-BYTE 8)".into(),
+            StreamElementType::Integer { bits, signed } => {
+                format!("({} {})", if signed { "SIGNED-BYTE" } else { "UNSIGNED-BYTE" }, bits)
+            }
+        }
+    }
+}
+
+/// Assemble a little-endian element of `bits` bits from its octets.
+fn integer_from_octets(octets: &[u8], bits: u16, signed: bool) -> EgclVal {
+    use egcl_rt::bignum::{BigInt, mag_bit, mag_set_bit, mag_sub, mag_trim};
+    let bits = usize::from(bits);
+    let mut limbs = vec![0u64; octets.len().div_ceil(8).max(1)];
+    for (i, b) in octets.iter().enumerate() {
+        limbs[i / 8] |= u64::from(*b) << (8 * (i % 8));
+    }
+    // Drop any bits above the element width.
+    let (full, rem) = (bits / 64, bits % 64);
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        if i > full || (i == full && rem == 0) {
+            *limb = 0;
+        } else if i == full {
+            *limb &= (1u64 << rem) - 1;
+        }
+    }
+    let mag = mag_trim(limbs);
+    if signed && bits > 0 && (bits - 1) / 64 < mag.len() && mag_bit(&mag, bits - 1) == 1 {
+        // Sign bit set: the value is RAW - 2^BITS.
+        let mut pow = Vec::new();
+        mag_set_bit(&mut pow, bits);
+        return BigInt::from_mag(-1, mag_sub(&pow, &mag)).to_val();
+    }
+    BigInt::from_mag(1, mag).to_val()
+}
+
+/// The little-endian octets of `value` as an element of `bits` bits, or None
+/// when it does not fit the element type.
+fn integer_to_octets(value: &egcl_rt::bignum::BigInt, bits: u16, signed: bool) -> Option<Vec<u8>> {
+    use egcl_rt::bignum::{mag_bitlen, twos_limbs};
+    let bits = usize::from(bits);
+    let n_octets = bits.div_ceil(8);
+    let n_limbs = n_octets.div_ceil(8).max(1);
+    let magnitude_bits = mag_bitlen(&value.mag);
+    let in_range = if signed {
+        if value.sign >= 0 {
+            magnitude_bits < bits
+        } else {
+            // -2^(BITS-1) is representable: a magnitude of exactly one bit at BITS-1.
+            magnitude_bits < bits
+                || (magnitude_bits == bits
+                    && value.mag.iter().map(|l| l.count_ones()).sum::<u32>() == 1)
+        }
+    } else {
+        value.sign >= 0 && magnitude_bits <= bits
+    };
+    if !in_range {
+        return None;
+    }
+    let limbs = twos_limbs(value, n_limbs.max(value.mag.len()));
+    Some((0..n_octets).map(|i| (limbs[i / 8] >> (8 * (i % 8))) as u8).collect())
 }
 
 // ── if_exists keyword constants ───────────────────────────────────
@@ -164,6 +279,87 @@ struct StreamMutableState {
 }
 
 impl StreamMutableState {
+    /// One octet of a binary file stream, or EOF.
+    fn read_raw_octet(&mut self) -> Result<EgclVal, EgclError> {
+        match &mut self.inner {
+            StreamInner::FileInput {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            }
+            | StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } => file_read_byte_raw(file, read_buf, buf_pos, buf_fill),
+            _ => Err(EgclError::StreamError(
+                "binary element type on a non-file stream".into(),
+            )),
+        }
+    }
+
+    fn write_raw_octet(&mut self, b: u8) -> Result<(), EgclError> {
+        match &mut self.inner {
+            StreamInner::FileOutput {
+                file, write_buf, ..
+            }
+            | StreamInner::FileIo {
+                file, write_buf, ..
+            } => {
+                write_buf.push(b);
+                if write_buf.len() >= FILE_BUF_SIZE {
+                    file_flush_write_buf(file, write_buf)?;
+                }
+                Ok(())
+            }
+            _ => Err(EgclError::StreamError(
+                "binary element type on a non-file stream".into(),
+            )),
+        }
+    }
+
+    /// READ-BYTE on an `Integer` element type: the element's octets, assembled.
+    fn read_integer_element(&mut self, bits: u16, signed: bool) -> Result<EgclVal, EgclError> {
+        let n = usize::from(bits).div_ceil(8);
+        let mut octets = Vec::with_capacity(n);
+        for i in 0..n {
+            let b = self.read_raw_octet()?;
+            if b == EOF {
+                if i == 0 {
+                    return Ok(EOF);
+                }
+                return Err(EgclError::StreamError(
+                    "end of file inside a binary element".into(),
+                ));
+            }
+            octets.push(b.as_fixnum() as u8);
+        }
+        Ok(integer_from_octets(&octets, bits, signed))
+    }
+
+    /// WRITE-BYTE on an `Integer` element type.
+    fn write_integer_element(
+        &mut self,
+        byte: EgclVal,
+        bits: u16,
+        signed: bool,
+    ) -> Result<(), EgclError> {
+        let type_error = || EgclError::TypeError {
+            datum: byte,
+            expected: StreamElementType::Integer { bits, signed }.type_name(),
+        };
+        let value = egcl_rt::bignum::bigint_from_val(byte).ok_or_else(type_error)?;
+        let octets = integer_to_octets(&value, bits, signed).ok_or_else(type_error)?;
+        for b in octets {
+            self.write_raw_octet(b)?;
+        }
+        Ok(())
+    }
+
     /// The stream's immutable component references (see `StreamAlloc::components`).
     /// Read the raw back-pointer without borrowing `self`, so callers may hold
     /// this alongside a `&mut self.inner` match.
@@ -370,7 +566,20 @@ impl StreamMutableState {
             StreamInner::Concatenated { .. } => StreamDirection::Input,
             StreamInner::TwoWay => StreamDirection::Io,
             StreamInner::Echo => StreamDirection::Io,
-            StreamInner::Synonym => StreamDirection::Io,
+            // A synonym stream has the direction of the stream its symbol
+            // currently names (ansi make-synonym-stream.1/.3).
+            StreamInner::Synonym => match resolve_synonym(self.components()[0]) {
+                Ok(target) => {
+                    let input = crate::streams::input_stream_p(target);
+                    let output = crate::streams::output_stream_p(target);
+                    match (input, output) {
+                        (true, false) => StreamDirection::Input,
+                        (false, true) => StreamDirection::Output,
+                        _ => StreamDirection::Io,
+                    }
+                }
+                Err(_) => StreamDirection::Io,
+            },
             StreamInner::Stdin { .. } => StreamDirection::Input,
             StreamInner::Stdout { .. } => StreamDirection::Output,
             StreamInner::Stderr { .. } => StreamDirection::Output,
@@ -925,7 +1134,12 @@ impl GrayStream for StreamMutableState {
     // For character-based streams, read a character and return its codepoint.
     fn stream_read_byte(&mut self) -> Result<EgclVal, EgclError> {
         self.check_input()?;
+        if let StreamElementType::Integer { bits, signed } = self.element_type {
+            return self.read_integer_element(bits, signed);
+        }
         let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
+        let mut comps = self.components().to_vec();
+        egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut self.inner {
             StreamInner::FileInput {
                 element_type,
@@ -946,6 +1160,36 @@ impl GrayStream for StreamMutableState {
                 buf_fill,
                 ..
             } if byte_stream => file_read_byte_raw(file, read_buf, buf_pos, buf_fill),
+            // Composite streams read bytes from their binary components (ansi
+            // make-two-way-stream.12/.13, make-concatenated-stream.22).
+            StreamInner::TwoWay => crate::streams::stream_read_byte(comps[0]),
+            StreamInner::Echo => {
+                let mut byte = crate::streams::stream_read_byte(comps[0])?;
+                // Root BYTE across the echo write. On a wide element type the
+                // value is a heap bignum, and the write allocates (buffering,
+                // and the component's own element encoding), so a relocating GC
+                // would leave this copy stale -- and it is the value returned to
+                // the caller. stream_write_byte roots its OWN copy, not this one.
+                egcl_rt::rooted_ref!(_byte_root = &mut byte);
+                if byte != EOF {
+                    crate::streams::stream_write_byte(comps[1], byte)?;
+                }
+                Ok(byte)
+            }
+            StreamInner::Concatenated { cursor } => {
+                while *cursor < comps.len() {
+                    let result = crate::streams::stream_read_byte(comps[*cursor])?;
+                    if result != EOF {
+                        return Ok(result);
+                    }
+                    *cursor += 1;
+                }
+                Ok(EOF)
+            }
+            StreamInner::Synonym => {
+                let target = resolve_synonym(comps[0])?;
+                crate::streams::stream_read_byte(target)
+            }
             _ => {
                 // Character stream fallback: read char, return codepoint.
                 let ch = self.stream_read_char()?;
@@ -1055,6 +1299,38 @@ impl GrayStream for StreamMutableState {
 
     fn stream_write_byte(&mut self, byte: EgclVal) -> Result<(), EgclError> {
         self.check_output()?;
+        if let StreamElementType::Integer { bits, signed } = self.element_type {
+            return self.write_integer_element(byte, bits, signed);
+        }
+        // A composite stream has no element type of its own, so it must hand the
+        // value to its components and let each validate against ITS element
+        // type. Checking for an octet here first rejected
+        // (write-byte 256 (make-broadcast-stream s)) even when S was an
+        // (unsigned-byte 16) stream that accepts 256 -- SBCL writes it.
+        {
+            let mut comps = self.components().to_vec();
+            egcl_rt::rooted_ref!(_components_root = &mut comps);
+            match &self.inner {
+                StreamInner::Broadcast => {
+                    // GC can update the rooted vector during a child call, so do
+                    // not hold an iterator borrow across one.
+                    #[allow(clippy::needless_range_loop)]
+                    for index in 0..comps.len() {
+                        let s = comps[index];
+                        crate::streams::stream_write_byte(s, byte)?;
+                    }
+                    return Ok(());
+                }
+                StreamInner::TwoWay | StreamInner::Echo => {
+                    return crate::streams::stream_write_byte(comps[1], byte);
+                }
+                StreamInner::Synonym => {
+                    let target = resolve_synonym(comps[0])?;
+                    return crate::streams::stream_write_byte(target, byte);
+                }
+                _ => {}
+            }
+        }
         // CLHS WRITE-BYTE: a non-integer (or one outside the element type) is a
         // TYPE-ERROR the program can handle — never a host panic.
         if !byte.is_fixnum() {
@@ -1122,23 +1398,8 @@ impl GrayStream for StreamMutableState {
                 }
                 Ok(())
             }
-            StreamInner::Broadcast => {
-                // GC can update the rooted vector during a child call; do not
-                // retain an iterator borrow across that call.
-                #[allow(clippy::needless_range_loop)]
-                for index in 0..comps.len() {
-                    let s = comps[index];
-                    crate::streams::stream_write_byte(s, byte)?;
-                }
-                Ok(())
-            }
-            StreamInner::TwoWay | StreamInner::Echo => {
-                crate::streams::stream_write_byte(comps[1], byte)
-            }
-            StreamInner::Synonym => {
-                let target = resolve_synonym(comps[0])?;
-                crate::streams::stream_write_byte(target, byte)
-            }
+            // Broadcast / TwoWay / Echo / Synonym are handled above, before the
+            // octet check, so that each component validates for itself.
             StreamInner::Stdout { line, col } => {
                 write_to_std(false, &[b])?;
                 track_col(b as char, line, col);
@@ -1540,6 +1801,11 @@ impl GrayStream for StreamMutableState {
 
     fn stream_fresh_line(&mut self) -> Result<bool, EgclError> {
         self.check_output()?;
+        // Nothing has been written to a broadcast stream with no components,
+        // so FRESH-LINE has nothing to do (ansi make-broadcast-stream.4).
+        if matches!(self.inner, StreamInner::Broadcast) && self.components().is_empty() {
+            return Ok(false);
+        }
         if !self.stream_start_line_p() {
             self.stream_terpri()?;
             Ok(true)
@@ -1605,7 +1871,7 @@ impl GrayStream for StreamMutableState {
         for &elem in elements {
             if elem.is_character() {
                 self.stream_write_char(elem)?;
-            } else if elem.is_fixnum() {
+            } else if elem.is_fixnum() || egcl_rt::bignum::bigint_from_val(elem).is_some() {
                 self.stream_write_byte(elem)?;
             } else {
                 return Err(EgclError::StreamError(
@@ -2084,6 +2350,16 @@ fn with_stream<T: egcl_rt::gc::TraceHostRoots>(
 
 // ── Stream constructors ────────────────────────────────────────────
 
+/// Apply OPEN's :IF-DOES-NOT-EXIST policy to a missing file about to be created
+/// for :OUTPUT or :IO: NIL returns NIL from OPEN, T (:ERROR) signals FILE-ERROR,
+/// and :CREATE falls through (ansi streams open.error.9-14).
+fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(), EgclError> {
+    if if_does_not_exist == IF_DOES_NOT_EXIST_CREATE_VAL {
+        return Ok(());
+    }
+    Err(EgclError::FileError(format!("file not found: {}", path_str)))
+}
+
 pub fn open(
     pathname: EgclVal,
     direction: StreamDirection,
@@ -2098,11 +2374,7 @@ pub fn open(
 
     // Issue #5: Determine element type from the element_type parameter.
     // NIL or T defaults to Character. Fixnum 8 signals (unsigned-byte 8).
-    let elt = if element_type_val == EgclVal::from_fixnum(8) {
-        StreamElementType::UnsignedByte8
-    } else {
-        StreamElementType::Character
-    };
+    let elt = StreamElementType::from_code(element_type_val);
 
     // `OPEN` accepts pathname designators, including registry-backed pathname
     // sentinels and registered string sentinels used by the bootstrap tests.
@@ -2232,6 +2504,10 @@ pub fn open(
                         .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
                 }
             } else {
+                if if_does_not_exist == NIL {
+                    return Ok(NIL);
+                }
+                missing_file_policy(if_does_not_exist, &path_str)?;
                 std::fs::File::create(path)
                     .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
             };
@@ -2283,6 +2559,10 @@ pub fn open(
                         .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
                 }
             } else {
+                if if_does_not_exist == NIL {
+                    return Ok(NIL);
+                }
+                missing_file_policy(if_does_not_exist, &path_str)?;
                 std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -2552,10 +2832,7 @@ pub fn output_stream_p(stream: EgclVal) -> bool {
 pub fn stream_element_type(stream: EgclVal) -> EgclVal {
     egcl_rt::rooted!(stream = stream);
     match lock_stream(*stream) {
-        Ok(guard) => match guard.element_type {
-            StreamElementType::Character => T,
-            StreamElementType::UnsignedByte8 => EgclVal::from_fixnum(8),
-        },
+        Ok(guard) => guard.element_type.to_code(),
         Err(_) => NIL,
     }
 }
@@ -2584,6 +2861,30 @@ pub fn is_byte_stream(stream: EgclVal) -> bool {
         Ok(guard.element_type == StreamElementType::UnsignedByte8)
     })
     .unwrap_or(false)
+}
+
+/// True if STREAM has an integer element type of any width, so sequence I/O
+/// over it transfers elements with READ-BYTE / WRITE-BYTE rather than
+/// characters.
+pub fn is_binary_stream(stream: EgclVal) -> bool {
+    // A composite stream is binary when the component it reads from or writes
+    // to is (ansi make-two-way-stream.12, make-concatenated-stream.22).
+    let (binary, delegate) = with_stream(stream, |guard| {
+        let comps = guard.components();
+        Ok((
+            guard.element_type.is_binary(),
+            match &guard.inner {
+                StreamInner::TwoWay | StreamInner::Echo => comps.first().copied(),
+                StreamInner::Concatenated { cursor } => {
+                    comps.get(*cursor).copied().or_else(|| comps.first().copied())
+                }
+                StreamInner::Synonym => resolve_synonym(comps[0]).ok(),
+                _ => None,
+            },
+        ))
+    })
+    .unwrap_or((false, None));
+    binary || delegate.is_some_and(is_binary_stream)
 }
 
 pub fn stream_write_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {
@@ -2752,6 +3053,7 @@ pub fn stream_external_format(stream: EgclVal) -> ExternalFormat {
 pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| {
         guard.check_open()?;
+        let per_element = guard.element_type.octets_per_element() as u64;
         let mut comps = guard.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
@@ -2778,7 +3080,7 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                     .stream_position()
                     .map_err(|e| EgclError::StreamError(format!("file-position error: {}", e)))?;
                 let buffered_unread = (*buf_fill - *buf_pos) as u64;
-                Ok(EgclVal::from_fixnum((os_pos - buffered_unread) as i64))
+                Ok(EgclVal::from_fixnum(((os_pos - buffered_unread) / per_element) as i64))
             }
             StreamInner::FileOutput {
                 file, write_buf, ..
@@ -2787,7 +3089,7 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                     .stream_position()
                     .map_err(|e| EgclError::StreamError(format!("file-position error: {}", e)))?;
                 let pending = write_buf.len() as u64;
-                Ok(EgclVal::from_fixnum((os_pos + pending) as i64))
+                Ok(EgclVal::from_fixnum(((os_pos + pending) / per_element) as i64))
             }
             StreamInner::FileIo {
                 file,
@@ -2802,7 +3104,7 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 let buffered_unread = (*buf_fill - *buf_pos) as u64;
                 let pending_write = write_buf.len() as u64;
                 Ok(EgclVal::from_fixnum(
-                    (os_pos - buffered_unread + pending_write) as i64,
+                    ((os_pos - buffered_unread + pending_write) / per_element) as i64,
                 ))
             }
             StreamInner::StringInput {
@@ -2825,9 +3127,37 @@ pub fn file_position(stream: EgclVal) -> Result<EgclVal, EgclError> {
                 let target = resolve_synonym(comps[0])?;
                 file_position(target)
             }
+            // A broadcast stream reports its LAST component's position, and 0
+            // only when it has none (CLHS BROADCAST-STREAM). Answering 0
+            // unconditionally made (file-position (make-broadcast-stream out))
+            // disagree with (file-position out) after a write.
+            StreamInner::Broadcast => match comps.last() {
+                Some(last) => file_position(*last),
+                None => Ok(EgclVal::from_fixnum(0)),
+            },
             _ => Ok(NIL), // non-positionable
         }
     })
+}
+
+/// Octet offset of element index `position` in a stream whose elements occupy
+/// `per_element` octets.
+///
+/// FILE-POSITION addresses ELEMENTS, not octets, so on a wide element type a
+/// large index can exceed any file offset: index 2^59 on an
+/// `(unsigned-byte 256)` stream asks for 2^64 octets. Multiplying unchecked
+/// panicked outright in a debug build ("attempt to multiply with overflow")
+/// and left the stream's state poisoned, and a negative index wrapped to a
+/// huge offset instead of being rejected. SBCL signals a TYPE-ERROR for both,
+/// so this does too.
+fn element_octet_offset(position: EgclVal, per_element: u64) -> Result<u64, EgclError> {
+    u64::try_from(position.as_fixnum())
+        .ok()
+        .and_then(|index| index.checked_mul(per_element))
+        .ok_or_else(|| EgclError::TypeError {
+            datum: position,
+            expected: "file position reachable with this stream's element type".to_string(),
+        })
 }
 
 /// Set the file position. Returns T on success, NIL if not positionable. R5.124.
@@ -2836,6 +3166,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
     egcl_rt::rooted_ref!(_position_root = &mut position);
     with_stream(stream, |guard| {
         guard.check_open()?;
+        let per_element = guard.element_type.octets_per_element() as u64;
         let mut comps = guard.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
@@ -2862,7 +3193,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 *buf_pos = 0;
                 *buf_fill = 0;
                 *unread = None;
-                let pos = position.as_fixnum() as u64;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -2872,7 +3203,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 file, write_buf, ..
             } => {
                 file_flush_write_buf(file, write_buf)?;
-                let pos = position.as_fixnum() as u64;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -2891,7 +3222,7 @@ pub fn set_file_position(stream: EgclVal, position: EgclVal) -> Result<EgclVal, 
                 *buf_pos = 0;
                 *buf_fill = 0;
                 *unread = None;
-                let pos = position.as_fixnum() as u64;
+                let pos = element_octet_offset(position, per_element)?;
                 file.seek(std::io::SeekFrom::Start(pos)).map_err(|e| {
                     EgclError::StreamError(format!("set-file-position error: {}", e))
                 })?;
@@ -3010,6 +3341,7 @@ pub fn set_file_position_to_end(stream: EgclVal) -> Result<EgclVal, EgclError> {
 pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
     with_stream(stream, |guard| {
         guard.check_open()?;
+        let per_element = guard.element_type.octets_per_element();
         let mut comps = guard.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
         match &mut guard.inner {
@@ -3028,19 +3360,30 @@ pub fn file_length_fn(stream: EgclVal) -> Result<EgclVal, EgclError> {
             StreamInner::FileInput { file, .. }
             | StreamInner::FileOutput { file, .. }
             | StreamInner::FileIo { file, .. } => {
+                // In elements, not octets, for wide binary element types.
                 if let Some(len) = file.memory_len() {
-                    return Ok(EgclVal::from_fixnum(len as i64));
+                    return Ok(EgclVal::from_fixnum((len / per_element as u64) as i64));
                 }
                 let metadata = file
                     .metadata()
                     .map_err(|e| EgclError::StreamError(format!("file-length error: {}", e)))?;
-                Ok(EgclVal::from_fixnum(metadata.len() as i64))
+                Ok(EgclVal::from_fixnum((metadata.len() / per_element as u64) as i64))
             }
             StreamInner::Synonym => {
                 let target = resolve_synonym(comps[0])?;
                 file_length_fn(target)
             }
-            _ => Ok(NIL),
+            // A broadcast stream reports its LAST component's length, and 0
+            // only when it has no components (CLHS BROADCAST-STREAM); any
+            // other non-file stream is a TYPE-ERROR (ansi file-length.error.*).
+            StreamInner::Broadcast => match comps.last() {
+                Some(last) => file_length_fn(*last),
+                None => Ok(EgclVal::from_fixnum(0)),
+            },
+            _ => Err(EgclError::TypeError {
+                datum: stream,
+                expected: "FILE-STREAM".into(),
+            }),
         }
     })
 }

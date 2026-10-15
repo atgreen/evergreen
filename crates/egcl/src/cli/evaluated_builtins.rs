@@ -185,6 +185,15 @@ fn resolve(name: &str) -> Option<Handler> {
             // shared structure with #n= labels instead of looping on a circular
             // list, and :pretty/:length/:level/... reach the printer
             // (ansi printer print.cons.5-7).
+            check_keyword_args(
+                "WRITE",
+                &args[1..],
+                &[
+                    "STREAM", "ESCAPE", "ARRAY", "BASE", "CASE", "CIRCLE", "GENSYM", "LENGTH",
+                    "LEVEL", "LINES", "MISER-WIDTH", "PPRINT-DISPATCH", "PRETTY", "RADIX",
+                    "READABLY", "RIGHT-MARGIN",
+                ],
+            )?;
             let mut bindings: Vec<DynBind> = Vec::new();
             let mut i = 1;
             while i + 1 < args.len() {
@@ -333,6 +342,14 @@ fn resolve(name: &str) -> Option<Handler> {
             // each write out to all component streams. eval_args keeps the
             // component streams rooted across the allocating constructor.
 
+            for &component in args.iter() {
+                if !egcl_stdlib::output_stream_p(component) {
+                    return Err(EgclError::TypeError {
+                        datum: component,
+                        expected: "(AND STREAM (SATISFIES OUTPUT-STREAM-P))".into(),
+                    });
+                }
+            }
             egcl_stdlib::make_broadcast_stream(&args)
         }),
 
@@ -342,6 +359,14 @@ fn resolve(name: &str) -> Option<Handler> {
             // (make-concatenated-stream &rest streams) → input stream that
             // reads successively from each component.
 
+            for &component in args.iter() {
+                if !egcl_stdlib::input_stream_p(component) {
+                    return Err(EgclError::TypeError {
+                        datum: component,
+                        expected: "(AND STREAM (SATISFIES INPUT-STREAM-P))".into(),
+                    });
+                }
+            }
             egcl_stdlib::make_concatenated_stream(&args)
         }),
 
@@ -352,6 +377,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let input = args.first().copied().unwrap_or(NIL);
             let output = args.get(1).copied().unwrap_or(NIL);
+            check_two_way_components(input, output)?;
             egcl_stdlib::make_two_way_stream(input, output)
         }),
 
@@ -362,6 +388,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let input = args.first().copied().unwrap_or(NIL);
             let output = args.get(1).copied().unwrap_or(NIL);
+            check_two_way_components(input, output)?;
             egcl_stdlib::make_echo_stream(input, output)
         }),
 
@@ -372,6 +399,12 @@ fn resolve(name: &str) -> Option<Handler> {
             // that is the current value of SYMBOL.
 
             let symbol = args.first().copied().unwrap_or(NIL);
+            if !symbol.is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: symbol,
+                    expected: "SYMBOL".into(),
+                });
+            }
             egcl_stdlib::make_synonym_stream(symbol)
         }),
 
@@ -401,6 +434,14 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%NATIVE-INTERACTIVE-STREAM-P" => Some(|_operator, args, _env| {
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(
+                    "%NATIVE-INTERACTIVE-STREAM-P requires one stream".into(),
+                ));
+            }
+            Ok(if egcl_stdlib::interactive_stream_p(args[0]) { T } else { NIL })
+        }),
         "EGCL::%NATIVE-STREAM-ELEMENT-TYPE" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
@@ -1136,7 +1177,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 ));
             }
             let byte = args[0];
-            let out = resolve_output_stream(args[1], env);
+            // A binary output STREAM, not a designator (ansi write-byte.error.4).
+            require_stream(args[1])?;
+            let out = args[1];
             check_pending_sigpipe_for_output()?;
             if is_gray_stream(out) {
                 invoke_generic_function("STREAM-WRITE-BYTE", &[out, byte], env)?;
@@ -1154,7 +1197,10 @@ fn resolve(name: &str) -> Option<Handler> {
             if args.is_empty() {
                 return Err(EgclError::Internal("READ-BYTE requires a stream".into()));
             }
-            let inp = resolve_input_stream(args[0], env);
+            // READ-BYTE takes a binary input STREAM, not a designator: NIL and
+            // T are TYPE-ERRORs (ansi read-byte.error.5).
+            require_stream(args[0])?;
+            let inp = args[0];
             let eof_error = args.get(1).map(|v| *v != NIL).unwrap_or(true);
             let gray = is_gray_stream(inp);
             let b = if gray {
@@ -1346,7 +1392,15 @@ fn resolve(name: &str) -> Option<Handler> {
                     "MAKE-STRING-INPUT-STREAM requires a string".into(),
                 ));
             }
-            let string = args[0];
+            // A fill-pointer or displaced string is read through its elements
+            // into a simple copy (ansi make-string-input-stream.7-9).
+            egcl_rt::rooted!(string = if is_string_value(args[0])
+                && egcl_stdlib::is_complex_vector(args[0])
+            {
+                arena_str(&val_as_str(args[0]))
+            } else {
+                args[0]
+            });
             let start = if args.len() > 1 && args[1].is_fixnum() {
                 args[1].as_fixnum() as usize
             } else {
@@ -1357,7 +1411,7 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 None
             };
-            egcl_stdlib::make_string_input_stream(string, start, end)
+            egcl_stdlib::make_string_input_stream(*string, start, end)
         }),
 
         "READ-CHAR" => Some(|_operator, args, env| {
@@ -2628,7 +2682,7 @@ fn resolve(name: &str) -> Option<Handler> {
             // probed through the merged pathname were two different files
             // (ansi pathnames enough-namestring.4, file-namestring.3, ...).
             egcl_rt::rooted!(
-                path_val = if path_val.is_string() || egcl_stdlib::is_pathname(path_val) {
+                path_val = if is_path_designator(path_val) {
                     resolve_against_dpd(path_val, env)?
                 } else {
                     path_val
@@ -2773,7 +2827,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-NAME", &args)?)?;
-            Ok(egcl_stdlib::pathname_name(pathname))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_name(pathname)))
         }),
 
         "PATHNAME-TYPE" => Some(|_operator, args, _env| {
@@ -2781,7 +2835,7 @@ fn resolve(name: &str) -> Option<Handler> {
 
             let pathname =
                 coerce_pathname_designator(pathname_accessor_arg("PATHNAME-TYPE", &args)?)?;
-            Ok(egcl_stdlib::pathname_type(pathname))
+            Ok(lisp_pathname_component(egcl_stdlib::pathname_type(pathname)))
         }),
 
         "PATHNAME-DIRECTORY" => Some(|_operator, args, _env| {
@@ -4115,7 +4169,8 @@ fn resolve(name: &str) -> Option<Handler> {
             // regex-replace stitches output with `(write-string s :start :end)`
             // and produced garbage when these were ignored).
             let chars: Vec<char> = full.chars().collect();
-            let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+            let (kstart, kend) =
+                read_start_end_keys_checked("WRITE-STRING", &args[kv_from..], chars.len())?;
             let s: String = chars[kstart..kend].iter().collect();
             let mut out = resolve_output_stream(stream, env);
             egcl_rt::rooted_ref!(_output_root = &mut out);
@@ -4153,7 +4208,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 (NIL, 1)
             };
             let chars: Vec<char> = full.chars().collect();
-            let (kstart, kend) = read_start_end_keys(&args[kv_from..], chars.len());
+            let (kstart, kend) = read_start_end_keys_checked("WRITE-LINE", &args[kv_from..], chars.len())?;
             let s: String = chars[kstart..kend].iter().collect();
             let mut out = resolve_output_stream(stream, env);
             egcl_rt::rooted_ref!(_output_root = &mut out);
@@ -4619,4 +4674,22 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
         _ => None,
     }
+}
+
+/// MAKE-TWO-WAY-STREAM / MAKE-ECHO-STREAM take an input stream and an output
+/// stream; anything else is a TYPE-ERROR (ansi make-two-way-stream.error.5-7).
+fn check_two_way_components(input: EgclVal, output: EgclVal) -> Result<(), EgclError> {
+    if !egcl_stdlib::input_stream_p(input) {
+        return Err(EgclError::TypeError {
+            datum: input,
+            expected: "(AND STREAM (SATISFIES INPUT-STREAM-P))".into(),
+        });
+    }
+    if !egcl_stdlib::output_stream_p(output) {
+        return Err(EgclError::TypeError {
+            datum: output,
+            expected: "(AND STREAM (SATISFIES OUTPUT-STREAM-P))".into(),
+        });
+    }
+    Ok(())
 }
