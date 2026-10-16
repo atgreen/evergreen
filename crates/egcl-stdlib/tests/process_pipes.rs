@@ -509,3 +509,94 @@ fn close_reports_broken_pipe_and_abort_releases_it() {
     assert!(!open_stream_p(*output));
     close(*output, false).unwrap();
 }
+
+/// A parked character read on a process pipe must not lock other threads out
+/// of the stream.
+///
+/// `stream_read_char` on a pipe used to wait with the stream's state mutex
+/// held, so for as long as the child withheld its output every other thread
+/// touching that stream blocked. `stream_element_type` answers from stored
+/// state and performs no I/O whatsoever, so it must never wait on a peer.
+///
+/// A pipe is the only way to reach this path from a test: a FIFO opened with
+/// `OPEN` is a `StreamHandle::File`, not a `StreamHandle::Pipe`, and regular
+/// files are deliberately excluded because a readiness poll always reports a
+/// regular descriptor ready. Lisp cannot reach it at all -- uiop's
+/// `run-program` slurps `:output :stream` into a string on EGCL -- so the test
+/// lives here rather than beside the socket cases.
+///
+/// Failure is visible two ways: the watchdog exits 124 if the probe blocks for
+/// the whole withholding window, and the elapsed assertion catches a shorter
+/// stall in-process.
+#[test]
+fn a_parked_pipe_read_does_not_lock_other_threads_out_of_the_stream() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    use egcl_rt::EgclVal;
+
+    const CHILD: &str = "EGCL_PARKED_PIPE_LOCK_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_parked_pipe_read_does_not_lock_other_threads_out_of_the_stream",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    static INPUT: AtomicU64 = AtomicU64::new(0);
+
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(30));
+        eprintln!("a parked pipe read locked the stream");
+        std::process::exit(124);
+    });
+    egcl_rt::thread::current_thread_id();
+    egcl_rt::gc::ensure_heap_initialized();
+
+    // READY first, so the read below is the one that parks; then the child
+    // withholds its payload long enough for the probe to be unambiguous.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf 'READY\\n'; sleep 3; printf 'X'"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    egcl_rt::rooted!(
+        input = process_stdout_stream(child.stdout.take().unwrap(), StreamElementType::Character)
+    );
+    let (line, _) = stream_read_line(*input).unwrap();
+    assert_eq!(string_text(line), "READY");
+
+    INPUT.store(input.to_raw(), Ordering::Release);
+    let reader = std::thread::spawn(|| {
+        egcl_rt::thread::current_thread_id();
+        egcl_rt::rooted!(stream = EgclVal::from_raw(INPUT.load(Ordering::Acquire)));
+        stream_read_char(*stream).unwrap()
+    });
+
+    // Let the reader reach its wait before probing.
+    std::thread::sleep(Duration::from_millis(400));
+    let start = Instant::now();
+    let element_type = stream_element_type(*input);
+    let waited = start.elapsed();
+    assert_ne!(element_type, NIL, "the stream must still answer its type");
+    assert!(
+        waited < Duration::from_millis(1500),
+        "STREAM-ELEMENT-TYPE waited {waited:?} behind a parked pipe reader"
+    );
+
+    assert_eq!(reader.join().unwrap(), EgclVal::from_char('X'));
+    assert!(child.wait().unwrap().success());
+    close(*input, false).unwrap();
+}
