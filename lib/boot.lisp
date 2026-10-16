@@ -5198,10 +5198,11 @@ sorted by nickname."
             ((string-equal answer "no") (return nil))
             (t (format *query-io* "~&Please answer yes or no.~%"))))))
 
-;; Streams carry a single external format in this image.
+;; A file stream's external format is the one it was opened with (UTF-8,
+;; LATIN-1 or ASCII); every other stream answers :UTF-8, the image's own.
 (defun stream-external-format (stream)
   (check-type stream stream)
-  :default)
+  (egcl::%stream-external-format stream))
 
 ;; FILE-STRING-LENGTH (CLHS 21.2): the octets OBJECT occupies on STREAM, whose
 ;; external format is UTF-8; 1 for a broadcast stream (CLHS BROADCAST-STREAM).

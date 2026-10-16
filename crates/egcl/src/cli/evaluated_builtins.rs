@@ -1232,6 +1232,24 @@ fn resolve(name: &str) -> Option<Handler> {
             })
         }),
 
+        "EGCL::%STREAM-EXTERNAL-FORMAT" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%stream-external-format stream) → :UTF-8 | :LATIN-1 | :ASCII ...
+            // The keyword a file stream was opened with; the stream layer
+            // answers UTF-8 for every stream that carries none.
+            let s = args.first().copied().unwrap_or(NIL);
+            require_stream(s)?;
+            let name = match egcl_stdlib::stream_external_format(s) {
+                egcl_stdlib::ExternalFormat::Utf8 => ":UTF-8",
+                egcl_stdlib::ExternalFormat::Latin1 => ":LATIN-1",
+                egcl_stdlib::ExternalFormat::Ascii => ":ASCII",
+                egcl_stdlib::ExternalFormat::Utf16 => ":UTF-16",
+                egcl_stdlib::ExternalFormat::Utf32 => ":UTF-32",
+            };
+            Ok(resolve_sym(name).unwrap_or(NIL))
+        }),
+
         "EGCL::%STREAM-LISTEN" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
@@ -2780,7 +2798,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 options.element_type,
                 options.if_exists,
                 options.if_does_not_exist,
-                egcl_stdlib::ExternalFormat::Utf8,
+                options.external_format,
             )
         }),
 
