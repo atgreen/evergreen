@@ -2658,6 +2658,16 @@ fn with_stream_input<T: egcl_rt::gc::TraceHostRoots>(
         let timeout_ms = remaining.map(|t| t.as_millis().min(i32::MAX as u128) as i32);
         let ready = remaining != Some(std::time::Duration::ZERO)
             && handle.wait_readable(timeout_ms).unwrap_or(true);
+        // `unwrap_or(true)` deliberately treats a failed wait as ready and lets
+        // the read below report the real error. An interrupt is the exception:
+        // the wait ended because this execution was interrupted, so retrying
+        // re-parks and the readiness error is swallowed again -- a spin, not a
+        // read error. Unwind instead, leaving the interrupt pending so the next
+        // safepoint signals the posted condition rather than this placeholder
+        // (bliss-5uklt).
+        if egcl_rt::thread::current_execution_has_interrupt() {
+            return Err(EgclError::Interrupt);
+        }
         if !ready {
             // Produce the timeout through the same mapper the in-mutex path
             // used, so the condition stays EGCL-EXT:IO-TIMEOUT rather than a

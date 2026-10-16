@@ -600,3 +600,63 @@ fn a_parked_pipe_read_does_not_lock_other_threads_out_of_the_stream() {
     assert!(child.wait().unwrap().success());
     close(*input, false).unwrap();
 }
+
+/// An interrupt must unwind a reader parked in the STREAM layer, not spin it.
+///
+/// `with_stream_input` parks on readiness with `wait_readable(..).unwrap_or(true)`,
+/// which deliberately treats a failed wait as ready so the read below reports the
+/// real error. An interrupt is the exception: the wait ended *because* this
+/// execution was interrupted, so treating it as ready re-parks and swallows the
+/// same error again -- a busy spin rather than an unwind.
+///
+/// This goes through `stream_read_byte` on a socket, the path a Lisp program
+/// actually takes. `test_socket_readiness::a_directed_interrupt_ends_a_wait_
+/// parked_in_the_kernel` calls `wait_socket` directly and so passes straight
+/// through this hole; it took a test at this layer to see it.
+#[test]
+fn an_interrupt_unwinds_a_reader_parked_in_the_stream_layer() {
+    use egcl_rt::thread::{current_thread_id, interrupt_thread};
+    use egcl_rt::value::T;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    egcl_rt::thread::current_thread_id();
+    egcl_rt::gc::ensure_heap_initialized();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        egcl_rt::gc::ensure_heap_initialized();
+        tx.send(current_thread_id()).unwrap();
+        egcl_rt::rooted!(stream = socket_connect("127.0.0.1", port, None).unwrap());
+        let started = Instant::now();
+        let result = stream_read_byte(*stream);
+        let _ = done.send((result.is_err(), started.elapsed()));
+    });
+
+    // Accepted and then held silent: only the interrupt can release the reader.
+    let _peer = listener.accept().unwrap();
+
+    let target = rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    interrupt_thread(target, T).expect("interrupt must be accepted");
+
+    // Bounded rather than `join`: the regression this guards against is a SPIN,
+    // and joining a spinning thread hangs the whole suite instead of reporting
+    // which test broke. Measured: with the guard reverted this test ran past a
+    // 300s cap; with the bound it fails in 10s and names the cause.
+    let (errored, elapsed) = finished
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the interrupt did not unwind the parked read -- it is spinning");
+    assert!(
+        errored,
+        "a parked READ-BYTE must unwind when interrupted, not return a value"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the interrupt did not unwind the parked read: {elapsed:?}"
+    );
+}

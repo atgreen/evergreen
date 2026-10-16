@@ -860,6 +860,14 @@ impl NativeThread {
     fn post_interrupt(&self, condition: EgclVal) {
         *self.interrupt_value.lock().unwrap() = condition;
         self.interrupt_pending.store(true, Ordering::Release);
+        // Also raise it on the channel the execution path actually consumes.
+        // `interrupt_pending` alone is only read after the entry returns, so on
+        // its own a posted interrupt could not reach running Lisp at all
+        // (bliss-5uklt). `PendingSignal::Interrupt` is taken at a safepoint in
+        // every tier -- the tree-walker's backward GO, the bytecode run_loop,
+        // and the native back-edge poll -- which is how SIGINT already reaches
+        // a hot loop.
+        self.post_pending_signal(PendingSignal::Interrupt);
         self.execution.request_poll();
         crate::execution_poll::request_carrier(self.id.0);
     }
@@ -868,6 +876,10 @@ impl NativeThread {
         self.interrupt_pending
             .swap(false, Ordering::AcqRel)
             .then(|| *self.interrupt_value.lock().unwrap())
+    }
+
+    fn has_interrupt(&self) -> bool {
+        self.interrupt_pending.load(Ordering::Acquire)
     }
 
     fn post_pending_signal(&self, signal: PendingSignal) {
@@ -1579,6 +1591,10 @@ impl Fiber {
     fn post_interrupt(&self, condition: EgclVal) {
         *self.interrupt_value.lock().unwrap() = condition;
         self.interrupt_pending.store(true, Ordering::Release);
+        // See `NativeThread::post_interrupt`: this is the channel the execution
+        // path consumes, and without it the interrupt waits for the entry to
+        // return on its own (bliss-5uklt).
+        self.post_pending_signal(PendingSignal::Interrupt);
         self.execution.request_poll();
     }
 
@@ -2301,7 +2317,13 @@ fn run_fiber_entry(thread: &Fiber) -> Result<EgclVal, EgclError> {
     let entry = thread.entry();
     let mut result = run_entry(entry);
 
-    if thread.has_interrupt() {
+    // An interrupt that was never delivered -- posted after the entry had
+    // finished, or to an entry that reached no safepoint -- still becomes the
+    // thread's result (R9.04/R13.18). But it must not overwrite an ERROR:
+    // once delivery at a safepoint can unwind the entry, overriding here would
+    // report the very interrupt we just delivered as a normal return
+    // (bliss-5uklt).
+    if result.is_ok() && thread.has_interrupt() {
         result = Ok(thread.take_interrupt().unwrap_or(NIL));
     }
 
@@ -2406,8 +2428,12 @@ where
         let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _host_state = setup();
             let mut value = run_entry(running.entry());
-            if let Some(interrupt) = running.take_interrupt() {
-                value = Ok(interrupt);
+            // Only an UNDELIVERED interrupt becomes the result; see
+            // `run_fiber_entry` for why an error must survive this.
+            if value.is_ok() {
+                if let Some(interrupt) = running.take_interrupt() {
+                    value = Ok(interrupt);
+                }
             }
             value
         }))
@@ -2418,6 +2444,13 @@ where
             )))
         });
         running.stack.publish_top();
+        // A finished thread reaches no further safepoint, so a signal still
+        // posted to it can never be delivered. Drain it: each posted signal
+        // holds a reservation in the process-wide count, and a leaked one keeps
+        // that count nonzero, pushing every other thread onto the slow signal
+        // path for the rest of the run. Before interrupts were posted on this
+        // channel nothing could leak here (bliss-5uklt).
+        while running.take_pending_signal().is_some() {}
         result.complete(value);
         crate::safepoint::retire_native_thread(&running);
     }) {
@@ -2589,9 +2622,44 @@ pub fn interrupt_thread(id: NativeThreadId, condition: EgclVal) -> Result<(), Eg
         .ok_or_else(|| EgclError::Internal(format!("no native thread with id {}", id.0)))?;
     if thread.state() != NativeThreadState::Dead {
         thread.post_interrupt(condition);
+        // Posting reaches a thread that is RUNNING Lisp, because it polls. A
+        // thread parked in a blocking syscall touches no polling page, so rouse
+        // it the way R13.14 prescribes and the collector already does for
+        // safepoints: directed, flag-only SIGUSR1, which makes the syscall
+        // return EINTR. `native_poll` then sees the pending interrupt and stops
+        // waiting rather than re-polling (bliss-5uklt).
+        signal_thread_to_leave_a_syscall(thread);
     }
     Ok(())
 }
+
+/// Directed SIGUSR1 by kernel TID -- the no-libc equivalent of
+/// `pthread_kill(pthread_t, SIGUSR1)`, as `signal_safepoint_participants` does.
+/// The handler only sets a flag; it never suspends the target (R13.14).
+#[cfg(unix)]
+fn signal_thread_to_leave_a_syscall(thread: &NativeThread) {
+    let tid = thread.os_thread_id.load(Ordering::Acquire);
+    if tid == 0 {
+        return;
+    }
+    // INSTALL FIRST. SIGUSR1's default disposition TERMINATES the process, so
+    // signalling before the handler exists does not interrupt the thread -- it
+    // kills the program. Measured: native_worker_panic_completes_join_and_
+    // releases_registry_entry died with 'signal: 10 (SIGUSR1)' when this call
+    // was missing. The safepoint path installs for the same reason before
+    // calling signal_safepoint_participants.
+    if crate::runtime::install_signal_handlers().is_err() {
+        return;
+    }
+    let _ = crate::syscall::tgkill(
+        crate::syscall::getpid(),
+        tid as i32,
+        crate::syscall::SIGUSR1,
+    );
+}
+
+#[cfg(not(unix))]
+fn signal_thread_to_leave_a_syscall(_thread: &NativeThread) {}
 
 pub fn post_current_pending_signal(signal: PendingSignal) {
     if let Some(fiber) = current_fiber() {
@@ -2645,6 +2713,28 @@ pub fn take_current_pending_signal() -> Option<PendingSignal> {
     current_fiber()
         .and_then(Fiber::take_pending_signal)
         .or_else(|| current_thread().take_pending_signal())
+}
+
+/// Whether an interrupt has been posted to the current execution and not yet
+/// consumed.
+///
+/// Read-only on purpose: a blocking wait uses this to decide to stop waiting,
+/// and the interrupt must stay pending so the next safepoint still delivers it
+/// (bliss-5uklt).
+pub fn current_execution_has_interrupt() -> bool {
+    // Both are consulted, as `take_current_pending_signal` consults both: an
+    // interrupt may have been posted to the fiber or to the carrier thread.
+    //
+    // Deliberately does NOT use `current_thread()`, which REGISTERS the calling
+    // thread when it has no entry yet. This is called from a poll retry loop,
+    // which has no business creating registry entries; and an unregistered
+    // thread cannot have a posted interrupt, because nothing could address it.
+    let thread_interrupted = CURRENT_NATIVE_THREAD.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|current| current.thread.has_interrupt())
+    });
+    current_fiber().is_some_and(Fiber::has_interrupt) || thread_interrupted
 }
 
 pub fn with_current_condition_state_mut<T>(f: impl FnOnce(&mut ThreadConditionState) -> T) -> T {

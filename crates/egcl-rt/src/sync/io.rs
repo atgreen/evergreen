@@ -53,6 +53,18 @@ fn native_poll(
                 if timeout.is_some_and(|t| started.elapsed() >= t) {
                     return Ok(false);
                 }
+                // A signal that is not for us -- the collector rousting a
+                // mutator out of a syscall, a profiler tick -- must not shorten
+                // the caller's deadline, which is what
+                // `native_timeout_keeps_its_deadline_when_signals_interrupt_poll`
+                // pins. An interrupt posted to THIS execution is different: the
+                // whole point of its directed SIGUSR1 is to end this wait, and
+                // retrying would re-enter poll with no timeout and wait forever
+                // (bliss-5uklt). Leave it pending so the next safepoint
+                // delivers it as a condition; this only stops the waiting.
+                if crate::thread::current_execution_has_interrupt() {
+                    return Err(EgclError::Interrupt);
+                }
             }
             Err(e) => {
                 return Err(EgclError::StreamError(format!(
