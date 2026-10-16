@@ -13,8 +13,6 @@
   or print a socket
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
 
-## Unreleased
-
 ### Fixed
 
 - A thread waiting for input on a stream no longer locks every other thread out
@@ -31,6 +29,52 @@
   its own lock, so a read parked on the component locked every other thread out
   of the composite -- and `*TERMINAL-IO*` is bidirectional
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
+
+- `COMPILE-FILE` now gives the body of a load-time-only top-level `EVAL-WHEN`
+  the top-level processing CLHS 3.2.3.1 requires. Without `:COMPILE-TOPLEVEL`
+  but with `:LOAD-TOPLEVEL`, the body forms are still top-level forms, so a
+  nested `(eval-when (:compile-toplevel) ...)`, a `DEFMACRO` or a `DEFPACKAGE`
+  among them keeps its compile-time effect. The whole form was evaluated
+  instead, which answered NIL for the outer form and never reached the inner
+  one: cl-store's `DEFBACKEND` expands to exactly that nest, so every later use
+  in the file compiled as a function call and the fasl died loading with
+  "STREAM is unbound"
+  ([#355](https://github.com/atgreen/evergreen/pull/355)).
+- `GET-DISPATCH-MACRO-CHARACTER` now reports a callable function for each
+  standard `#` sub-character (CLHS 2.4.8) rather than NIL for all but `#\`. A
+  reader that wraps the standard syntax -- zacl rewrites Allegro's
+  `(version>= ...)` features and hands the rest back to the standard `#+`
+  reader -- died calling NIL
+  ([#356](https://github.com/atgreen/evergreen/pull/356)).
+- A control transfer out of a reader macro now passes through `COMPILE-FILE`'s
+  pre-read. A `HANDLER-CASE` clause around `COMPILE-FILE` taking a condition a
+  reader macro signalled, or an invoked restart, was reported as a read failure
+  and silently downgraded the output to a source-only artifact, so the clause
+  never ran
+  ([#357](https://github.com/atgreen/evergreen/pull/357)).
+- The reader now accepts the character names SBCL and Clozure CL share:
+  `Ff`, `Formfeed`, `Lf`, `Cr`, `Bs`, `Ht`, `Sp`, `Del` and `Altmode`.
+  `CHAR-NAME` still answers the standard names, so printing round-trips are
+  unchanged ([#358](https://github.com/atgreen/evergreen/pull/358)).
+- The reader now closes the list when a Lisp reader-macro function returns no
+  values immediately before the closing parenthesis, as it already did for
+  `#|...|#`. The list previously lost its terminator
+  ([#359](https://github.com/atgreen/evergreen/pull/359)).
+- `LISTEN` no longer consumes the pending byte of an octet stream. It was
+  `READ-CHAR-NO-HANG` followed by `UNREAD-CHAR` for every stream, which on an
+  octet socket parked the byte in the character unread slot where `READ-BYTE`
+  never looks: `LISTEN` answered T and the `READ-BYTE` after it hung or lost an
+  octet outright. usocket's `WAIT-FOR-INPUT` calls `LISTEN` on every stream
+  socket before its backend runs, so AllegroServe hung on its first read after
+  every wait ([#360](https://github.com/atgreen/evergreen/pull/360)).
+- `FUNDAMENTAL-STREAM` now sits under `STREAM`, so a method on `STREAM` applies
+  to a Gray stream and `(typep gray-stream 'stream)` is true
+  ([#362](https://github.com/atgreen/evergreen/pull/362)).
+- `DEFINE-SYMBOL-MACRO` definitions now live in one process-wide table, so a
+  symbol macro defined on one thread is visible on every other. Each thread
+  previously kept its own, and a definition made before a thread started was
+  invisible inside it
+  ([#363](https://github.com/atgreen/evergreen/pull/363)).
 
 ## 0.0.9 - 2026-10-15
 
