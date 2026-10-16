@@ -3837,6 +3837,63 @@ fn socket_option_handle(stream: EgclVal) -> Result<TcpStream, EgclError> {
         .map_err(|e| EgclError::StreamError(format!("socket option: {e}")))
 }
 
+/// A socket address as `(octet-vector port)`.
+///
+/// SBCL's `sb-bsd-sockets:socket-name` returns "the address (as vector of
+/// bytes) and port" as multiple values; a builtin here yields one value, so the
+/// pair comes back as a two-element list and the caller spreads it (the same
+/// shape `%PRUNE-CLOSURES` uses).  The vector has 4 elements for IPv4 and 16
+/// for IPv6 -- do not assume the former, which is what SBCL's "depending on the
+/// address family" caveat covers.
+fn socket_address_pair(addr: std::net::SocketAddr) -> EgclVal {
+    let octets: Vec<EgclVal> = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4
+            .octets()
+            .iter()
+            .map(|b| EgclVal::from_fixnum(*b as i64))
+            .collect(),
+        std::net::IpAddr::V6(v6) => v6
+            .octets()
+            .iter()
+            .map(|b| EgclVal::from_fixnum(*b as i64))
+            .collect(),
+    };
+    // Root the vector across the list allocation: build_list allocates conses,
+    // and a minor collection there would relocate an unrooted vector.
+    egcl_rt::rooted!(vector = crate::sequences::build_simple_vector(&octets));
+    let port = EgclVal::from_fixnum(addr.port() as i64);
+    crate::sequences::build_list(&[*vector, port])
+}
+
+/// The address and port a LISTENER is bound to, as `(octet-vector port)`.
+///
+/// `socket_local_port` answers only the port and discards the address, which
+/// leaves usocket's `get-local-address` and `get-local-name` with nothing to
+/// call (bliss-by1gf).
+pub fn socket_listener_local_name(id: u64) -> Option<EgclVal> {
+    let addr = socket_listener(id).ok()?.socket.local_addr().ok()?;
+    Some(socket_address_pair(addr))
+}
+
+/// The address and port a connected STREAM is bound to locally.
+pub fn socket_stream_local_name(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let addr = socket_option_handle(stream)?
+        .local_addr()
+        .map_err(|e| EgclError::StreamError(format!("socket local name: {e}")))?;
+    Ok(socket_address_pair(addr))
+}
+
+/// The address and port of a connected STREAM's peer.
+///
+/// `socket_accept` discards the peer address `accept` reports, so this asks the
+/// socket rather than remembering it.
+pub fn socket_stream_peer_name(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    let addr = socket_option_handle(stream)?
+        .peer_addr()
+        .map_err(|e| EgclError::StreamError(format!("socket peer name: {e}")))?;
+    Ok(socket_address_pair(addr))
+}
+
 pub fn socket_read_timeout(stream: EgclVal) -> Result<Option<std::time::Duration>, EgclError> {
     socket_option_handle(stream)?
         .read_timeout()

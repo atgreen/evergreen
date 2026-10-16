@@ -310,7 +310,7 @@ pub fn append(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
 }
 
 /// Build a proper list from a slice of EgclVals.
-fn build_list(vals: &[EgclVal]) -> EgclVal {
+pub fn build_list(vals: &[EgclVal]) -> EgclVal {
     egcl_rt::rooted!(vals = vals.to_vec());
     egcl_rt::rooted!(list = NIL);
     for &v in vals.iter().rev() {
