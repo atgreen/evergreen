@@ -4058,8 +4058,12 @@
 ;;; start/end/eof arguments before dispatching.
 ;;; ---------------------------------------------------------------------------
 
-;;; 5.5.2.1  Base classes.
-(defclass fundamental-stream (standard-object)
+;;; 5.5.2.1  Base classes. FUNDAMENTAL-STREAM is a STREAM, as it is in every
+;;; host that offers Gray streams: a method specialized on STREAM applies to a
+;;; Gray stream instance, and STREAM is in its class precedence list. Only the
+;;; prelude may name STREAM as a direct superclass (DEFCLASS refuses it for
+;;; user code, as CLHS requires of a built-in class).
+(defclass fundamental-stream (standard-object stream)
   ((egcl::%gray-open-p :initform t)))
 (defclass fundamental-input-stream (fundamental-stream) ())
 (defclass fundamental-output-stream (fundamental-stream) ())
