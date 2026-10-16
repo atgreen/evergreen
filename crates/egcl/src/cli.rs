@@ -19468,6 +19468,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%SOCKET-FD" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-LISTENER-READY-P" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%STREAM-LISTEN" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
             "GETF" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),

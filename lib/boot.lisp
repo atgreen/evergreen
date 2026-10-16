@@ -1441,10 +1441,17 @@
                       (t stream))))
     (unless (streamp stream)
       (error 'type-error :datum stream :expected-type 'stream))
-    (let ((c (read-char-no-hang stream nil nil)))
-      (when c
-        (unread-char c stream)
-        t))))
+    ;; An octet stream (a binary file, a socket) has no characters to push
+    ;; back: READ-CHAR-NO-HANG would take the pending byte as a character
+    ;; and UNREAD-CHAR would park it where READ-BYTE never looks, so LISTEN
+    ;; answered T and the READ-BYTE after it hung.  Ask the stream itself,
+    ;; which probes the handle without consuming anything.
+    (if (subtypep (stream-element-type stream) 'character)
+        (let ((c (read-char-no-hang stream nil nil)))
+          (when c
+            (unread-char c stream)
+            t))
+        (egcl::%stream-listen stream))))
 
 ;;; CLEAR-INPUT: discard unread buffered input; nothing is buffered beyond what
 ;;; the stream itself holds, so this only checks the designator and returns NIL.
