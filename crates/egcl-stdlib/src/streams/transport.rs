@@ -216,6 +216,49 @@ impl Read for StreamHandle {
     }
 }
 
+impl StreamHandle {
+    /// Read without waiting, reporting `WouldBlock` rather than parking.
+    ///
+    /// `Read::read` below parks inside `socket_io` until the socket is ready.
+    /// That is correct in isolation but its caller holds the stream's state
+    /// mutex for the whole wait, which locks every other thread out of the
+    /// stream -- CLOSE, a write on the other half, even INPUT-STREAM-P
+    /// (bliss-vupo0). This lets the caller attempt the read under the mutex,
+    /// release it on `WouldBlock`, and park outside via `wait_readable`.
+    ///
+    /// Only sockets can report `WouldBlock`: they are the handles
+    /// `StreamHandle::socket` puts in non-blocking mode. Files and embedded
+    /// memory complete without parking, and a pipe's own helper thread already
+    /// keeps its wait off this mutex.
+    pub(super) fn read_without_waiting(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Socket(socket) => {
+                let mut socket = &*socket;
+                loop {
+                    match socket.read(buffer) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        result => return result,
+                    }
+                }
+            }
+            _ => self.read(buffer),
+        }
+    }
+
+    /// Whether this handle can report `WouldBlock` from `read_without_waiting`.
+    pub(super) fn parks_outside_mutex(&self) -> bool {
+        matches!(self, Self::Socket(_))
+    }
+
+    /// The read timeout budget a socket handle carries, if any.
+    pub(super) fn read_timeout_budget(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Socket(socket) => socket.read_timeout().ok().flatten(),
+            _ => None,
+        }
+    }
+}
+
 /// Retry non-blocking I/O against one timeout budget. Readiness is only a hint;
 /// a competing reader or a spurious notification may require another wait.
 fn socket_io<T>(
