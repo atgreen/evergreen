@@ -251,17 +251,22 @@ yet callable through the bootstrap evaluator.
 
 ### Package-local nicknames
 
-These CDR-10-style functions are exported from `EGCL-EXT`:
+`DEFPACKAGE` takes `(:local-nicknames (nickname package)...)` as on SBCL,
+CCL, ECL, ABCL, Clasp and LispWorks, `:package-local-nicknames` is on
+`*features*`, and these CDR-10-style functions are exported from `EGCL-EXT`:
 
 | Function | Contract |
 | --- | --- |
-| `(add-package-local-nickname local-name actual-package &optional (package *package*))` | Add a nickname visible only while resolving names from `package`; signal `PACKAGE-ERROR` for a conflicting global name belonging to another package |
-| `(remove-package-local-nickname local-name &optional (package *package*))` | Remove and return the previously associated package, or `NIL` |
-| `(package-local-nicknames &optional (package *package*))` | Return an alist of `(nickname . package)` |
-| `(package-locally-nicknamed-by-list package)` | Return packages that locally nickname `package` |
+| `(add-package-local-nickname local-name actual-package &optional (package *package*))` | Make `local-name` designate `actual-package` from inside `package` only; return `package`. `PACKAGE-ERROR` when `local-name` already designates another package there, when `actual-package` names no package, or when `local-name` is `CL`, `COMMON-LISP` or `KEYWORD` |
+| `(remove-package-local-nickname local-name &optional (package *package*))` | Remove the nickname; `T` if it was one, else `NIL` |
+| `(package-local-nicknames &optional (package *package*))` | An alist of `("NICKNAME" . package)`, sorted by nickname |
+| `(package-locally-nicknamed-by-list package)` | The packages that locally nickname `package` |
 
-Local nicknames shadow global package names and nicknames during
-`FIND-PACKAGE` lookup from the owning package.
+A local nickname of the current package shadows every global package name
+and nickname: the reader, `FIND-PACKAGE`, `INTERN` and `FIND-SYMBOL` all
+resolve a designator through `*package*`'s local nicknames first. The
+nickname is not a global one: `PACKAGE-NICKNAMES` does not list it, and no
+other package sees it.
 
 ### Conduit packages
 

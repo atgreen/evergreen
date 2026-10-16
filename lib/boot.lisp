@@ -4985,6 +4985,40 @@ a hook error aborts startup.")
   (egcl::%text-codec :decode (subseq vector start end) external-format nil))
 (export '(egcl-ext::string-to-octets egcl-ext::octets-to-string) :egcl-ext)
 
+;;; Package-local nicknames (CDR 10): the EGCL-EXT functions
+;;; docs/egcl-lisp-api.md lists, over the registry primitives.  Real
+;;; functions rather than name-dispatched builtins, so that a package may
+;;; import them -- UIOP's UIOP/PACKAGE-LOCAL-NICKNAMES does, and a
+;;; name-dispatched builtin imported that way is forked into an undefined
+;;; symbol.  DEFPACKAGE's :LOCAL-NICKNAMES option, and the reader's and
+;;; FIND-PACKAGE's use of the nicknames, live in the runtime.
+(defun egcl-ext::add-package-local-nickname (local-nickname actual-package
+                                             &optional (package *package*))
+  "Make LOCAL-NICKNAME designate ACTUAL-PACKAGE from inside PACKAGE only.
+Returns PACKAGE.  A PACKAGE-ERROR when LOCAL-NICKNAME already designates
+another package there, when ACTUAL-PACKAGE names no package, or when
+LOCAL-NICKNAME is CL, COMMON-LISP or KEYWORD."
+  (egcl::%add-package-local-nickname local-nickname actual-package package))
+
+(defun egcl-ext::remove-package-local-nickname (local-nickname
+                                                &optional (package *package*))
+  "Remove LOCAL-NICKNAME from PACKAGE: T if it was a local nickname there,
+else NIL."
+  (egcl::%remove-package-local-nickname local-nickname package))
+
+(defun egcl-ext::package-local-nicknames (&optional (package *package*))
+  "The package-local nicknames of PACKAGE, an alist of (\"NICKNAME\" . package)
+sorted by nickname."
+  (egcl::%package-local-nicknames package))
+
+(defun egcl-ext::package-locally-nicknamed-by-list (package)
+  "The packages that have a package-local nickname for PACKAGE."
+  (egcl::%package-locally-nicknamed-by-list package))
+
+(export '(egcl-ext::add-package-local-nickname egcl-ext::remove-package-local-nickname
+          egcl-ext::package-local-nicknames egcl-ext::package-locally-nicknamed-by-list)
+        :egcl-ext)
+
 ;;; Native ordering fences, distinct from a thread rendezvous barrier.
 (defun egcl-ext::memory-barrier (&optional (kind :full))
   (egcl::%memory-fence kind))

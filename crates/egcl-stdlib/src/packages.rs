@@ -1230,6 +1230,136 @@ pub fn package_use_list(package: EgclVal) -> Vec<EgclVal> {
     .unwrap_or_default()
 }
 
+/// Resolve `name` as code in `package` sees it: a package-local nickname of
+/// `package` first, then the global name or nickname. A local nickname
+/// shadows a global one (CDR 10), which is why the local table is consulted
+/// before `lookup_named_package`.
+pub fn find_package_from(package: EgclVal, name: &str) -> Option<EgclVal> {
+    let store = current_store().ok()?;
+    let g = store.state.read().ok()?;
+    if let Some(pkg) = g.packages.get(&pkg_id(package))
+        && let Some(&actual) = pkg.read().ok()?.local_nicknames.get(name)
+    {
+        return Some(actual);
+    }
+    lookup_named_package(&g, name)
+}
+
+/// The package that `name` is a package-local nickname for inside `package`,
+/// and nothing else: no global lookup, so a caller that has its own can keep
+/// it.
+pub fn local_nickname_target(package: EgclVal, name: &str) -> Option<EgclVal> {
+    let store = current_store().ok()?;
+    let g = store.state.read().ok()?;
+    let pkg = g.packages.get(&pkg_id(package))?;
+    let actual = *pkg.read().ok()?.local_nicknames.get(name)?;
+    Some(actual)
+}
+
+/// True if any package in the active registry has a package-local nickname.
+/// The reader asks this once per qualified token before looking a prefix up
+/// relative to the current package, so a program that defines none pays
+/// nothing more than this read.
+pub fn any_package_local_nicknames() -> bool {
+    LOCAL_NICKNAMES_DEFINED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LOCAL_NICKNAMES_DEFINED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Make `local_nickname` designate `actual_package` from inside `package` only.
+/// Adding the same mapping again is a no-op; a different one under the same
+/// nickname is a PACKAGE-ERROR.
+pub fn add_package_local_nickname(
+    package: EgclVal,
+    local_nickname: &str,
+    actual_package: EgclVal,
+) -> Result<(), EgclError> {
+    let store = current_store()?;
+    let g = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("local nickname add"))?;
+    let owner = lookup_package_arc(&g, package)?;
+    lookup_package_arc(&g, actual_package)?;
+    drop(g);
+    let mut owner = owner
+        .write()
+        .map_err(|_| lock_poisoned_error("local nickname add"))?;
+    match owner.local_nicknames.get(local_nickname).copied() {
+        Some(existing) if existing != actual_package => Err(EgclError::PackageError(format!(
+            "Local nickname {local_nickname:?} already designates another package in {}",
+            owner.name
+        ))),
+        _ => {
+            owner
+                .local_nicknames
+                .insert(local_nickname.to_string(), actual_package);
+            LOCAL_NICKNAMES_DEFINED.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+/// Remove `local_nickname` from `package`; the package it designated, or
+/// `None` when it was not a local nickname there.
+pub fn remove_package_local_nickname(
+    package: EgclVal,
+    local_nickname: &str,
+) -> Result<Option<EgclVal>, EgclError> {
+    let store = current_store()?;
+    let g = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("local nickname removal"))?;
+    let owner = lookup_package_arc(&g, package)?;
+    drop(g);
+    let mut owner = owner
+        .write()
+        .map_err(|_| lock_poisoned_error("local nickname removal"))?;
+    Ok(owner.local_nicknames.remove(local_nickname))
+}
+
+/// The package-local nicknames of `package`, as (nickname, package) pairs
+/// sorted by nickname so the answer is stable.
+pub fn package_local_nicknames(package: EgclVal) -> Result<Vec<(String, EgclVal)>, EgclError> {
+    let store = current_store()?;
+    let g = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("local nickname read"))?;
+    let pkg = lookup_package_arc(&g, package)?;
+    let pkg = pkg
+        .read()
+        .map_err(|_| lock_poisoned_error("local nickname read"))?;
+    let mut pairs: Vec<(String, EgclVal)> = pkg
+        .local_nicknames
+        .iter()
+        .map(|(name, &package)| (name.clone(), package))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(pairs)
+}
+
+/// Every package that has a package-local nickname for `package`.
+pub fn package_locally_nicknamed_by_list(package: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
+    let store = current_store()?;
+    let g = store
+        .state
+        .read()
+        .map_err(|_| lock_poisoned_error("local nickname reverse lookup"))?;
+    let mut out = Vec::new();
+    for pkg in g.packages.values() {
+        let pkg = pkg
+            .read()
+            .map_err(|_| lock_poisoned_error("local nickname reverse lookup"))?;
+        if pkg.local_nicknames.values().any(|&other| other == package) {
+            out.push(pkg.object);
+        }
+    }
+    Ok(out)
+}
+
 /// List all packages in the active registry.
 pub fn list_all_packages() -> Vec<EgclVal> {
     current_store()

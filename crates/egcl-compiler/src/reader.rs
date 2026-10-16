@@ -381,6 +381,27 @@ fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
     hook.and_then(|h| h(pkg, name))
 }
 
+// ── Package-local nicknames ───────────────────────────────────────
+//
+// The prefix of a qualified token may be a package-local nickname (CDR 10)
+// of the current package -- `a:` for ALEXANDRIA inside one library only --
+// and only the interpreter's package registry knows those tables. It
+// installs a resolver that answers the canonical name of the package the
+// prefix designates from *PACKAGE* when a local nickname claims it, or None,
+// in which case the prefix is looked up globally as before.
+type PackageResolver = fn(&str) -> Option<String>;
+static PACKAGE_RESOLVER: OrderedMutex<Option<PackageResolver>> =
+    OrderedMutex::new(LockLevel::CodeCache, 3, "reader package resolver", None);
+
+pub fn set_package_resolver(hook: Option<PackageResolver>) {
+    *PACKAGE_RESOLVER.lock().unwrap() = hook;
+}
+
+fn resolve_package_via_hook(prefix: &str) -> Option<String> {
+    let hook = *PACKAGE_RESOLVER.lock().unwrap();
+    hook.and_then(|h| h(prefix))
+}
+
 // ── Pathname construction ─────────────────────────────────────────
 //
 // `#P"…"` must produce the SAME pathname representation the rest of the system
@@ -2461,6 +2482,11 @@ fn try_package_qualified(name: &str, colon_pos: usize) -> Result<Option<EgclVal>
         } else {
             (rest, false)
         };
+        // A package-local nickname of the current package shadows every
+        // global name (CDR 10), and only the interpreter knows the table:
+        // ask it for the canonical name first, then match as before.
+        let local = resolve_package_via_hook(pkg);
+        let pkg = local.as_deref().unwrap_or(pkg);
         // Known packages: CL, KEYWORD, EGCL, COMMON-LISP
         match pkg {
             "CL" | "COMMON-LISP" => {

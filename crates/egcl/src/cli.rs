@@ -9328,6 +9328,10 @@ impl Env {
             resolve_sym(":EGCL").unwrap_or(NIL),
             resolve_sym(":COMMON-LISP").unwrap_or(NIL),
             resolve_sym(":ANSI-CL").unwrap_or(NIL),
+            // DEFPACKAGE's :LOCAL-NICKNAMES and the EGCL-EXT nickname
+            // functions: what UIOP's DEFINE-PACKAGE and every library that
+            // writes (:local-nicknames (:a :alexandria)) test for.
+            resolve_sym(":PACKAGE-LOCAL-NICKNAMES").unwrap_or(NIL),
         ];
         #[cfg(unix)]
         features.push(resolve_sym(":UNIX").unwrap_or(NIL));
@@ -12195,6 +12199,62 @@ fn homeless_identity_is_shareable(env: &Env, pkg_name: &str, name: &str, idx: u3
         || env.macros.borrow().contains_key(name)
 }
 
+/// The package `*PACKAGE*` designates right now, as a registry handle: the
+/// value cell first (a LET of *PACKAGE* binds only that), then a lexical
+/// binding, else the Env's current package. Over `&Env`, so the per-token
+/// package lookups can ask it.
+fn current_package_object(env: &Env) -> Option<EgclVal> {
+    let value = reader::find_symbol_index("*PACKAGE*")
+        .and_then(global_value_cell)
+        .or_else(|| env.lookup_var("*PACKAGE*"));
+    match value {
+        Some(v) if egcl_stdlib::is_package(v) => Some(v),
+        Some(v) if is_package_designator(v) => {
+            egcl_stdlib::find_package(&normalize_package_name(&string_designator_name(v)))
+        }
+        _ => egcl_stdlib::find_package(&env.current_package),
+    }
+}
+
+/// The package a designator names, for the package-local nickname functions:
+/// a package object as itself, a string, symbol or character through the
+/// current package's local nicknames and then the global names, and a
+/// PACKAGE-ERROR when nothing of that name exists.
+fn designated_package(env: &Env, v: EgclVal, what: &str) -> Result<EgclVal, EgclError> {
+    if egcl_stdlib::is_package(v) {
+        return Ok(v);
+    }
+    if !is_package_designator(v) {
+        return Err(package_designator_type_error(v));
+    }
+    let name = resolve_package_name(env, &string_designator_name(v));
+    egcl_stdlib::find_package(&name).ok_or_else(|| {
+        EgclError::PackageError(format!("{what}: there is no package named {name}"))
+    })
+}
+
+/// The reader's package-prefix hook: the canonical name of the package a
+/// qualified token's prefix designates from the current package when one of
+/// that package's local nicknames claims it, else None and the reader looks
+/// the prefix up globally as before. Parks on the same Env as
+/// reader_symbol_resolver.
+fn reader_package_resolver(prefix: &str) -> Option<String> {
+    if !egcl_stdlib::any_package_local_nicknames() {
+        return None;
+    }
+    let ptr = READ_EVAL_ENV.with(|c| c.get());
+    if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
+        return None;
+    }
+    // Safety: as in reader_symbol_resolver -- the load loop parks its live
+    // `&mut Env` here for the span of one top-level read, and reads never
+    // run concurrently.
+    let env = unsafe { &*ptr };
+    let current = current_package_object(env)?;
+    let actual = egcl_stdlib::local_nickname_target(current, &normalize_package_name(prefix))?;
+    egcl_stdlib::package_name(actual)
+}
+
 fn reader_symbol_resolver(pkg: Option<&str>, name: &str) -> Option<u32> {
     let ptr = READ_EVAL_ENV.with(|c| c.get());
     if ptr.is_null() || RESOLVING_SYMBOL.with(|c| c.get()) {
@@ -12557,6 +12617,7 @@ fn read_eval_all_env(source: &str, env: &mut Env) -> Result<EgclVal, EgclError> 
     reader::set_plain_macro_invoker(Some(reader_plain_macro_invoker));
     reader::set_readtable_getter(Some(cli_current_readtable));
     reader::set_symbol_resolver(Some(reader_symbol_resolver));
+    reader::set_package_resolver(Some(reader_package_resolver));
     reader::set_pathname_constructor(Some(reader_pathname_constructor));
     reader::set_struct_constructor(Some(reader_struct_constructor));
     egcl_stdlib::format::set_print_object_hook(Some(stdlib_print_object_hook));
@@ -13527,6 +13588,19 @@ fn resolve_package_name_cow<'a>(_env: &Env, raw: &'a str) -> std::borrow::Cow<'a
         "CL" => return std::borrow::Cow::Borrowed("COMMON-LISP"),
         "CL-USER" => return std::borrow::Cow::Borrowed("COMMON-LISP-USER"),
         _ => {}
+    }
+    // A package-local nickname of the CURRENT package shadows every global
+    // name (CDR 10, as SBCL): a library's (:local-nicknames (:a :alexandria))
+    // makes `a` designate ALEXANDRIA inside that library alone, for
+    // FIND-PACKAGE, INTERN, FIND-SYMBOL and the reader alike. Consulted only
+    // once some package has defined one, so a program without any pays
+    // nothing here.
+    if egcl_stdlib::any_package_local_nicknames()
+        && let Some(current) = current_package_object(_env)
+        && let Some(actual) = egcl_stdlib::local_nickname_target(current, &normalized)
+        && let Some(canonical) = egcl_stdlib::package_name(actual)
+    {
+        return std::borrow::Cow::Owned(canonical);
     }
     // The registry resolves a name OR nickname to the package; take its canonical
     // name. If unknown, return the normalized designator unchanged so it can name
@@ -24905,6 +24979,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:DECLARATION-SPECIFIERS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:PROCLAIMED-DECLARATIONS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:HASH-TABLE-WEAKNESS" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%ADD-PACKAGE-LOCAL-NICKNAME"
+            | "EGCL::%REMOVE-PACKAGE-LOCAL-NICKNAME"
+            | "EGCL::%PACKAGE-LOCAL-NICKNAMES"
+            | "EGCL::%PACKAGE-LOCALLY-NICKNAMED-BY-LIST" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "EGCL-EXT:PROCLAIMED-OPTIMIZE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:FINALIZE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:CANCEL-FINALIZATION" => return eval_builtin_arguments(&name, cdr, env),
@@ -41399,6 +41479,8 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     let mut shadows: Vec<String> = Vec::new();
     // (from-package, symbol-name, shadowing) imports retain their category.
     let mut import_from: Vec<(String, String, bool)> = Vec::new();
+    // (local-nickname, package designator) pairs from :LOCAL-NICKNAMES.
+    let mut local_nicknames: Vec<(String, String)> = Vec::new();
     // :size / :documentation may each appear at most once (CLHS); a repeat is a
     // PROGRAM-ERROR (ansi-test DEFPACKAGE.13/.14).
     let mut size_count = 0usize;
@@ -41469,7 +41551,26 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 "DOCUMENTATION" => doc_count += 1,
                 "SIZE" => size_count += 1,
-                "RECYCLE" | "UNINTERN" | "LOCAL-NICKNAMES" => {}
+                "LOCAL-NICKNAMES" => {
+                    // (:local-nicknames (nick package)...) -- CDR 10, as SBCL,
+                    // CCL, ECL, ABCL, Clasp and LispWorks read it. Each pair
+                    // makes NICK designate PACKAGE from inside this package
+                    // only; applied once the package exists, below.
+                    for pair in list_to_vec(val_list) {
+                        let parts = list_to_vec(pair);
+                        if parts.len() != 2 {
+                            return Err(EgclError::ProgramError(
+                                "DEFPACKAGE: each :LOCAL-NICKNAMES entry is a (nickname package) pair"
+                                    .into(),
+                            ));
+                        }
+                        local_nicknames.push((
+                            normalize_package_name(&string_designator_name(parts[0])),
+                            string_designator_name(parts[1]),
+                        ));
+                    }
+                }
+                "RECYCLE" | "UNINTERN" => {}
                 _ => {}
             }
         }
@@ -41557,6 +41658,25 @@ fn eval_defpackage(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     if let Some(pkg) = egcl_stdlib::find_package(&pkg_name) {
         for nick in &nicknames {
             let _ = egcl_stdlib::add_nickname(pkg, nick);
+        }
+        // :LOCAL-NICKNAMES. The named package must already exist, as on
+        // SBCL, and CL, COMMON-LISP and KEYWORD may not be renamed locally:
+        // a PACKAGE-ERROR either way. Re-evaluating the same DEFPACKAGE is
+        // a no-op; a nickname moved to another package is a PACKAGE-ERROR
+        // from the registry.
+        for (nick, actual) in &local_nicknames {
+            if matches!(nick.as_str(), "CL" | "COMMON-LISP" | "KEYWORD") {
+                return Err(EgclError::PackageError(format!(
+                    "DEFPACKAGE: {nick} may not be a package-local nickname"
+                )));
+            }
+            let actual_name = resolve_package_name(env, actual);
+            let Some(actual_pkg) = egcl_stdlib::find_package(&actual_name) else {
+                return Err(EgclError::PackageError(format!(
+                    "DEFPACKAGE: local nickname {nick} names no package {actual_name}"
+                )));
+            };
+            egcl_stdlib::add_package_local_nickname(pkg, nick, actual_pkg)?;
         }
     }
 
