@@ -53,6 +53,28 @@ fn global_macro_is_visible_to_worker_expansion() {
 }
 
 #[test]
+fn global_symbol_macro_is_visible_on_a_native_worker() {
+    // A DEFINE-SYMBOL-MACRO definition is a global definition like a DEFMACRO:
+    // a worker's fresh environment must expand it, in evaluated code and in a
+    // loaded function that references it (zacl spells SYS:*CURRENT-PROCESS*
+    // this way, and every AllegroServe worker died reading it as a variable).
+    check(
+        r#"
+        (defvar *shared-cell* :from-cell)
+        (defun shared-cell () *shared-cell*)
+        (define-symbol-macro *shared-sym* (shared-cell))
+        (defun shared-sym-ref () (list :ref *shared-sym*))
+        (assert (equal '(:from-cell (:ref :from-cell) (shared-cell))
+          (egcl-thread:join-thread
+            (egcl-thread:make-thread
+              (lambda () (list (eval '*shared-sym*) (shared-sym-ref) (macroexpand-1 '*shared-sym*)))))))
+        (assert (equal '(:ref :from-cell) (shared-sym-ref)))
+        (format t "SHARED-MACROS-OK~%")
+        "#,
+    );
+}
+
+#[test]
 fn worker_macro_retains_captured_values_after_worker_exit() {
     check(
         r#"
