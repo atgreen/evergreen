@@ -4,9 +4,10 @@
 
 ### ANSI conformance
 
-The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
-`misc` (740) chapters pass completely, as do `cons`, `data-and-control-flow`,
-`hash-tables`, `characters` and `strings`.
+The Dietz ansi-test suite now runs end to end. Nine chapters pass completely:
+`cons` (1882 tests), `data-and-control-flow` (1428), `misc` (740),
+`conditions` (673), `strings` (509), `characters` (259), `environment` (210),
+`hash-tables` (158) and `files` (87).
 
 - `SUBTYPEP` compares numeric bounds exactly. Bounds were held as `f64`, which
   cannot tell adjacent integers apart above 2^53, so
@@ -95,6 +96,52 @@ The Dietz ansi-test suite now runs end to end. Its `conditions` (673 tests) and
   [#316](https://github.com/atgreen/evergreen/pull/316),
   [#317](https://github.com/atgreen/evergreen/pull/317),
   [#325](https://github.com/atgreen/evergreen/pull/325)).
+- Character names round-trip for the whitespace characters. `PRIN1` printed
+  `#\No-break_space` and `#\Ideographic_space` as a literal invisible space,
+  so the output could not be read back and was indistinguishable from
+  `#\Space`. A character with a name now prints by name whenever it is not
+  simple graphic, matching SBCL
+  ([#348](https://github.com/atgreen/evergreen/pull/348)).
+- A `:TYPE`d structure enforces its declared slot types. The constructor and
+  the setf writers generated for a `(:type list)` or `(:type vector)` structure
+  accepted any value, so a slot declared `INTEGER` silently held a keyword.
+  Both now signal a `TYPE-ERROR`, including when the structure is loaded from a
+  compiled file with no source present
+  ([#348](https://github.com/atgreen/evergreen/pull/348)).
+- A generic call and `MAKE-INSTANCE` no longer abort the process while
+  validating keyword arguments. Both read their methods' lambda lists while
+  holding the evaluator's method table, and naming a symbol takes the symbol
+  registry, which the runtime's lock-order guard refuses in that order. A
+  restored image has a cold symbol-name cache, so its first `MAKE-INSTANCE`
+  tripped it; `ASDF:LOAD-SYSTEM` tripped the generic-call site on every debug
+  build ([#341](https://github.com/atgreen/evergreen/pull/341)).
+- `FUNCTION-KEYWORDS`, `INITIALIZE-INSTANCE`, `NO-APPLICABLE-METHOD` and
+  `NO-NEXT-METHOD` are generic functions with function objects, so code that
+  walks the standard generic functions -- or adds a method to one -- works
+  ([#340](https://github.com/atgreen/evergreen/pull/340)).
+- `RENAME-FILE` accepts an open file stream as its filespec, not only a
+  pathname or namestring
+  ([#339](https://github.com/atgreen/evergreen/pull/339)).
+- `PARSE-INTEGER` with `:JUNK-ALLOWED` returns the index of the delimiter that
+  stopped it, rather than an index past the whitespace following it
+  ([#343](https://github.com/atgreen/evergreen/pull/343)).
+- The Gray stream generic function `STREAM-WRITE-STRING` takes `START` and
+  `END` as optional arguments, so a two-argument call from portable code finds
+  an applicable method
+  ([#342](https://github.com/atgreen/evergreen/pull/342)).
+- The standard reader macros `GET-MACRO-CHARACTER` reports are callable
+  functions. It returned a value that satisfied the type but could not be
+  funcalled, so a readtable built by copying the standard one broke
+  ([#346](https://github.com/atgreen/evergreen/pull/346)).
+- A nested `EVAL-WHEN` inside a compile-time body is evaluated under the
+  execute rule, as CLHS 3.2.3.1 requires
+  ([#344](https://github.com/atgreen/evergreen/pull/344)).
+- A `THROW`, `GO` or `RETURN-FROM` out of a form `COMPILE-FILE` evaluates at
+  compile time passes through unchanged instead of being captured as a value
+  ([#345](https://github.com/atgreen/evergreen/pull/345)).
+- Loading a fasl whose package exports `T` or `NIL` no longer panics. The
+  loader looked up a symbol index for the two constants, which have none
+  ([#347](https://github.com/atgreen/evergreen/pull/347)).
 
 ### Performance
 
