@@ -2155,14 +2155,9 @@ struct Env {
     /// visible globally, matching how DEFUN installs into the symbol cell.
     setf_expanders: Rc<RefCell<HashMap<String, SetfExpander>>>,
     /// SYMBOL-MACROLET bindings: genuinely lexical, so a null lexical
-    /// environment (EVAL, CLHS 3.1.2.1) does not see them.
+    /// environment (EVAL, CLHS 3.1.2.1) does not see them. DEFINE-SYMBOL-MACRO
+    /// definitions live in the process-wide `GLOBAL_SYMBOL_MACROS` instead.
     symbol_macros: Rc<RefCell<HashMap<u32, EgclVal>>>,
-    /// DEFINE-SYMBOL-MACRO definitions: global, so they survive into a null
-    /// lexical environment exactly as a DEFUN or DEFPARAMETER does. Keeping
-    /// them in the lexical map meant EVAL dropped them, and a definition made
-    /// through EVAL was written into a table that was then discarded
-    /// (bliss-cb3c7).
-    global_symbol_macros: Rc<RefCell<HashMap<u32, EgclVal>>>,
     // These are GLOBAL definitions (classes, generic functions, methods):
     // shared and mutated in place so a definition made inside a child
     // Env (a FLET/MACROLET body, as when ASDF loads a system's files) is visible
@@ -2827,6 +2822,22 @@ static MACRO_FN_CACHE: LazyLock<OrderedMutex<HashMap<String, MacroFnCacheEntry>>
         )
     });
 static MACRO_ENV_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// DEFINE-SYMBOL-MACRO definitions, keyed by symbol index. Global, so they
+/// survive into a null lexical environment exactly as a DEFUN or DEFPARAMETER
+/// does (keeping them in the lexical map meant EVAL dropped them, bliss-cb3c7),
+/// and process-wide, so a thread's fresh environment sees them like any other
+/// global definition: held per root `Env`, every DEFINE-SYMBOL-MACRO read in a
+/// worker thread was an unbound variable (zacl's SYS:*CURRENT-PROCESS*, which
+/// killed every AllegroServe worker on its first request). Traced by the global
+/// root scanner; never evaluate or allocate while holding it.
+static GLOBAL_SYMBOL_MACROS: LazyLock<OrderedMutex<HashMap<u32, EgclVal>>> = LazyLock::new(|| {
+    OrderedMutex::new(
+        LockLevel::GcWorld,
+        27,
+        "global symbol macros",
+        HashMap::new(),
+    )
+});
 
 static CONTROL_VALUES: egcl_rt::execution_local::ExecutionLocal<
     RefCell<HashMap<String, EgclVal>>,
@@ -8797,6 +8808,15 @@ fn scan_evaluator_global_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     scan_evaluator_roots(visit, true);
 }
 
+/// The DEFINE-SYMBOL-MACRO table is process-wide (one for every thread), so its
+/// keys and expansions are visited here, once per collection, not per Env.
+fn visit_global_symbol_macro_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    for (&index, expansion) in GLOBAL_SYMBOL_MACROS.lock().unwrap().iter_mut() {
+        egcl_rt::symbols::trace_symbol_index(index, visit);
+        visit(expansion);
+    }
+}
+
 // Shaking follows closure and generic ownership from reachable handles. Ordinary
 // GC must continue scanning every registry entry until shake removes it.
 fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool) {
@@ -8829,6 +8849,7 @@ fn scan_evaluator_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: b
             }
         });
     }
+    visit_global_symbol_macro_roots(visit);
     // Shared per-pass visit state (bliss-s56e).
     with_env_visit_state(|state| {
         // Definitions outlive every Env, including the execution that created
@@ -9104,10 +9125,6 @@ impl Env {
             egcl_rt::symbols::trace_symbol_index(index, visit);
             visit(expansion);
         }
-        for (&index, expansion) in self.global_symbol_macros.borrow_mut().iter_mut() {
-            egcl_rt::symbols::trace_symbol_index(index, visit);
-            visit(expansion);
-        }
         for restart in &mut self.restarts {
             visit_restart_function_roots(&mut restart.function, state, visit);
             if let Some(function) = &mut restart.interactive_function {
@@ -9238,7 +9255,6 @@ impl Env {
             macros: Rc::new(RefCell::new(HashMap::new())),
             setf_expanders: Rc::new(RefCell::new(HashMap::new())),
             symbol_macros: Rc::new(RefCell::new(HashMap::new())),
-            global_symbol_macros: Rc::new(RefCell::new(HashMap::new())),
             classes: &CLASS_DEFINITIONS,
             generics: &GENERIC_DEFINITIONS,
             methods: &METHOD_DEFINITIONS,
@@ -9276,9 +9292,6 @@ impl Env {
                     if let Some(t) = regs.symbol_macros.upgrade() {
                         env.symbol_macros = t;
                     }
-                    if let Some(t) = regs.global_symbol_macros.upgrade() {
-                        env.global_symbol_macros = t;
-                    }
                 }
             });
         } else {
@@ -9287,7 +9300,6 @@ impl Env {
                     funs: Arc::downgrade(&env.funs),
                     setf_expanders: Rc::downgrade(&env.setf_expanders),
                     symbol_macros: Rc::downgrade(&env.symbol_macros),
-                    global_symbol_macros: Rc::downgrade(&env.global_symbol_macros),
                 });
             });
         }
@@ -9552,7 +9564,6 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
-            global_symbol_macros: Rc::clone(&self.global_symbol_macros),
             classes: self.classes,
             generics: self.generics,
             methods: self.methods,
@@ -9586,7 +9597,6 @@ impl Env {
             macros: Rc::clone(&self.macros),
             setf_expanders: Rc::clone(&self.setf_expanders),
             symbol_macros: Rc::clone(&self.symbol_macros),
-            global_symbol_macros: Rc::clone(&self.global_symbol_macros),
             classes: self.classes,
             generics: self.generics,
             methods: self.methods,
@@ -9733,7 +9743,7 @@ impl Env {
             .borrow()
             .get(&idx)
             .copied()
-            .or_else(|| self.global_symbol_macros.borrow().get(&idx).copied())
+            .or_else(|| GLOBAL_SYMBOL_MACROS.lock().unwrap().get(&idx).copied())
     }
 
     /// Is this symbol index bound as a symbol macro, lexically or globally?
@@ -9741,7 +9751,7 @@ impl Env {
     /// tree-walker, which expands it.
     pub(crate) fn has_symbol_macro(&self, idx: u32) -> bool {
         self.symbol_macros.borrow().contains_key(&idx)
-            || self.global_symbol_macros.borrow().contains_key(&idx)
+            || GLOBAL_SYMBOL_MACROS.lock().unwrap().contains_key(&idx)
     }
 
     /// Bind a symbol macro lexically (SYMBOL-MACROLET).
@@ -9750,11 +9760,12 @@ impl Env {
             .insert(symbol.as_symbol_index(), expansion);
     }
 
-    /// Define a symbol macro globally (DEFINE-SYMBOL-MACRO). The table is shared
-    /// by every env descended from the root, including a null lexical one.
+    /// Define a symbol macro globally (DEFINE-SYMBOL-MACRO): one process-wide
+    /// table, seen by every environment on every thread.
     fn define_global_symbol_macro(&mut self, symbol: EgclVal, expansion: EgclVal) {
-        self.global_symbol_macros
-            .borrow_mut()
+        GLOBAL_SYMBOL_MACROS
+            .lock()
+            .unwrap()
             .insert(symbol.as_symbol_index(), expansion);
     }
 
@@ -11146,7 +11157,6 @@ struct DefinitionalRegistries {
     funs: std::sync::Weak<SharedCell<HashMap<String, FunDef>>>,
     setf_expanders: std::rc::Weak<RefCell<HashMap<String, SetfExpander>>>,
     symbol_macros: std::rc::Weak<RefCell<HashMap<u32, EgclVal>>>,
-    global_symbol_macros: std::rc::Weak<RefCell<HashMap<u32, EgclVal>>>,
 }
 
 static LIVE_DEFINITIONAL_REGISTRIES: egcl_rt::execution_local::ExecutionLocal<
@@ -34820,13 +34830,17 @@ fn macroexpand_environment_from_cli(env: &Env) -> MacroexpandEnv {
     // bindings this env carries. A lexical binding shadows a global definition
     // of the same name, so it is pushed last.
     let mut symbol_macros = Vec::new();
-    for table in [&env.global_symbol_macros, &env.symbol_macros] {
-        for (&symbol_index, &expansion) in table.borrow().iter() {
-            symbol_macros.push((
-                EgclVal::from_symbol_index(symbol_index),
-                VariableInfo::SymbolMacro(expansion),
-            ));
-        }
+    for (&symbol_index, &expansion) in GLOBAL_SYMBOL_MACROS.lock().unwrap().iter() {
+        symbol_macros.push((
+            EgclVal::from_symbol_index(symbol_index),
+            VariableInfo::SymbolMacro(expansion),
+        ));
+    }
+    for (&symbol_index, &expansion) in env.symbol_macros.borrow().iter() {
+        symbol_macros.push((
+            EgclVal::from_symbol_index(symbol_index),
+            VariableInfo::SymbolMacro(expansion),
+        ));
     }
     if !symbol_macros.is_empty() {
         augment(&mut macro_env, symbol_macros);
@@ -43452,14 +43466,29 @@ mod env_gc_root_tests {
     }
 
     #[test]
+    fn global_symbol_macro_table_is_traced_by_the_global_root_scanner() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        GLOBAL_SYMBOL_MACROS.lock().unwrap().insert(0x8000_0105, NIL);
+        egcl_rt::gc::advance_root_scan_pass();
+        let mut seen = HashSet::new();
+        visit_global_symbol_macro_roots(&mut |slot| {
+            if let Some(index) = unsafe { *slot }.symbol_index() {
+                seen.insert(index);
+            }
+        });
+        GLOBAL_SYMBOL_MACROS.lock().unwrap().remove(&0x8000_0105);
+        assert!(
+            seen.contains(&0x8000_0105),
+            "global symbol macro key was not traced"
+        );
+    }
+
+    #[test]
     fn env_root_visitor_keeps_symbol_map_keys_alive() {
         let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let mut env = Env::new(false);
         env.frame.borrow_mut().symbol_vars.insert(0x8000_0101, NIL);
         env.symbol_macros.borrow_mut().insert(0x8000_0102, NIL);
-        env.global_symbol_macros
-            .borrow_mut()
-            .insert(0x8000_0103, NIL);
         env.locally_specials.push(0x8000_0104);
         egcl_rt::gc::advance_root_scan_pass();
         let mut seen = HashSet::new();
@@ -43468,7 +43497,7 @@ mod env_gc_root_tests {
                 seen.insert(index);
             }
         });
-        for index in [0x8000_0101, 0x8000_0102, 0x8000_0103, 0x8000_0104] {
+        for index in [0x8000_0101, 0x8000_0102, 0x8000_0104] {
             assert!(
                 seen.contains(&index),
                 "symbol map key {index:#x} was not traced"
