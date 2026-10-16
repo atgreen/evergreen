@@ -13,6 +13,20 @@
   or print a socket
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
 
+## Unreleased
+
+### Fixed
+
+- A thread waiting for input on a stream no longer locks every other thread out
+  of it. Input parked while holding the stream's state mutex, so for as long as
+  one thread waited for a peer, any other operation on that stream blocked --
+  `CLOSE`, a write on the other half of a socket, even `INPUT-STREAM-P`, which
+  performs no I/O. A server could not close a worker's idle keep-alive
+  connection, and on a bidirectional socket it could not write a reply while
+  another thread read. Readers are now serialized on a separate lock and wait
+  with the state mutex released
+  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+
 ## 0.0.9 - 2026-10-15
 
 ### ANSI conformance

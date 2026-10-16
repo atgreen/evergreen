@@ -264,6 +264,22 @@ struct StreamAlloc {
     /// Per-stream mutex — every operation spanning multiple elements is atomic
     /// under this lock (R5.120).
     state: OrderedExecutionMutex<StreamMutableState>,
+    /// Serializes INPUT operations so a reader can park for data with `state`
+    /// RELEASED (bliss-vupo0).
+    ///
+    /// Reads used to park inside `state`, which locked every other thread out
+    /// of the stream for the duration -- CLOSE, a write on the other half of a
+    /// socket, even INPUT-STREAM-P. The park cannot simply move outside
+    /// `state`, because a read consumes bytes and two readers would interleave;
+    /// the serialization has to live somewhere, so it lives here. Readers hold
+    /// `input` across the whole operation and take `state` only for work that
+    /// does not park. Everything else takes `state` alone and no longer waits
+    /// behind a parked reader.
+    ///
+    /// Lock order is `input` then `state`, enforced by giving `input` the lower
+    /// order of the pair (locks within a level must be acquired in increasing
+    /// order).
+    input: OrderedExecutionMutex<()>,
 }
 
 /// Mutable portion of stream state, protected by the per-stream mutex.
@@ -806,6 +822,94 @@ fn attach_timeout_stream(error: &mut EgclError, stream: EgclVal) {
 }
 
 /// Read a single raw byte from a buffered file input (for binary streams). Issue #10.
+impl StreamMutableState {
+    /// A duplicate of the descriptor an input park would wait on, with the read
+    /// timeout budget to wait against.
+    ///
+    /// Duplicated so a concurrent CLOSE cannot recycle the descriptor while the
+    /// park is running (`stream_wait_for_input` duplicates it for the same
+    /// reason). `None` when this stream cannot park outside the mutex, in which
+    /// case the caller must not retry.
+    fn parking_handle(&self) -> Option<(StreamHandle, Option<std::time::Duration>)> {
+        let file = match &self.inner {
+            StreamInner::FileIo { file, .. } | StreamInner::FileInput { file, .. } => file,
+            _ => return None,
+        };
+        if !file.parks_outside_mutex() {
+            return None;
+        }
+        let budget = file.read_timeout_budget();
+        file.try_clone().ok().map(|handle| (handle, budget))
+    }
+
+    /// `stream_read_byte` as one non-parking attempt.
+    ///
+    /// The direct descriptor arms use the refill that reports `WouldBlock`, so
+    /// the caller can park with the state mutex released. Every other arm --
+    /// composites, string streams, Gray streams, wide element types -- keeps
+    /// its existing behaviour and answers `Done`, so this is a no-op for them.
+    fn stream_read_byte_step(&mut self) -> Result<InputStep<EgclVal>, EgclError> {
+        self.check_input()?;
+        if let StreamElementType::Integer { bits, signed } = self.element_type {
+            return self.read_integer_element(bits, signed).map(InputStep::Done);
+        }
+        let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
+        match &mut self.inner {
+            StreamInner::FileInput {
+                element_type,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if *element_type == StreamElementType::UnsignedByte8 => {
+                file_read_byte_without_parking(file, read_buf, buf_pos, buf_fill)
+            }
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if byte_stream => {
+                file_read_byte_without_parking(file, read_buf, buf_pos, buf_fill)
+            }
+            _ => self.stream_read_byte().map(InputStep::Done),
+        }
+    }
+}
+
+/// Refill a byte buffer without parking, reporting `WouldBlock` to the caller.
+///
+/// The waiting twin of `file_read_byte_raw`: identical bookkeeping, but it asks
+/// the transport for a read that will not park, so `with_stream_input` can drop
+/// the stream's state mutex and park outside it (bliss-vupo0).
+fn file_read_byte_without_parking(
+    file: &mut StreamHandle,
+    read_buf: &mut Vec<u8>,
+    buf_pos: &mut usize,
+    buf_fill: &mut usize,
+) -> Result<InputStep<EgclVal>, EgclError> {
+    if *buf_pos >= *buf_fill {
+        read_buf.resize(FILE_BUF_SIZE, 0);
+        let n = match file.read_without_waiting(&mut read_buf[..]) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(InputStep::WouldBlock);
+            }
+            Err(e) => return Err(stream_io_error("file read error", e)),
+        };
+        if n == 0 {
+            return Ok(InputStep::Done(EOF));
+        }
+        *buf_pos = 0;
+        *buf_fill = n;
+    }
+    let byte = read_buf[*buf_pos];
+    *buf_pos += 1;
+    Ok(InputStep::Done(EgclVal::from_fixnum(byte as i64)))
+}
+
 fn file_read_byte_raw(
     file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
@@ -2145,6 +2249,10 @@ fn alloc_stream(
     let mut boxed = Box::new(StreamAlloc {
         file_namestring,
         components: components.into_boxed_slice(),
+        // Two orders per stream, state first so it takes the LARGER value and
+        // `input` the smaller: the pair must be acquirable as input -> state,
+        // and a composite still precedes all of its older components because
+        // both of its orders come from later (smaller) draws than theirs.
         state: OrderedExecutionMutex::new(
             LockLevel::Stream,
             NEXT_STREAM_ORDER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
@@ -2155,6 +2263,12 @@ fn alloc_stream(
                 inner,
                 components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<EgclVal>(), 0),
             },
+        ),
+        input: OrderedExecutionMutex::new(
+            LockLevel::Stream,
+            NEXT_STREAM_ORDER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed),
+            "stream input",
+            (),
         ),
     });
     let cptr: *const [EgclVal] = &*boxed.components;
@@ -2320,6 +2434,110 @@ pub(crate) fn file_namestring(stream: EgclVal) -> Result<String, EgclError> {
             datum: stream,
             expected: "stream associated with a file".into(),
         })
+}
+
+/// One attempt at an input operation: either it produced a value, or it would
+/// have had to park on the descriptor.
+enum InputStep<T> {
+    Done(T),
+    WouldBlock,
+}
+
+// Rooting follows the payload: a WouldBlock carries nothing the collector
+// needs to see.
+impl<T: egcl_rt::gc::TraceHostRoots> egcl_rt::gc::TraceHostRoots for InputStep<T> {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        if let Self::Done(value) = self {
+            value.trace_host_roots(visit);
+        }
+    }
+}
+
+/// Run an INPUT operation, parking for data with the state mutex RELEASED.
+///
+/// Holds the stream's `input` mutex for the whole operation, so readers stay
+/// serialized and cannot interleave their consumption of the underlying
+/// octets. Inside that, `operation` runs under `state` and may answer
+/// `WouldBlock`; when it does, `state` is dropped, the park happens on a
+/// duplicate of the handle, and the operation is retried.
+///
+/// Before this, a read parked inside `state` and locked every other thread out
+/// of the stream for the duration -- CLOSE, a write on the other half of a
+/// socket, even INPUT-STREAM-P (bliss-vupo0). The park could not simply move
+/// outside `state`, because a read consumes bytes and two readers would
+/// interleave; `input` is where that serialization went.
+///
+/// The retry loop owns the timeout budget, as `socket_io` does inside the
+/// transport, so a socket read timeout still reports the same `TimedOut` and
+/// still signals EGCL-EXT:IO-TIMEOUT.
+///
+/// The handle is duplicated under `state` so a concurrent CLOSE cannot recycle
+/// the descriptor during the park, the same reason `stream_wait_for_input`
+/// duplicates it.
+///
+/// Releasing `state` between attempts admits a moving collection (see
+/// `with_stream`), so no Lisp value is held across the gap -- only the rooted
+/// STREAM -- and buffer state is re-read from the guard on every attempt
+/// rather than cached across one.
+fn with_stream_input<T: egcl_rt::gc::TraceHostRoots>(
+    stream: EgclVal,
+    mut operation: impl FnMut(&mut StreamMutableState) -> Result<InputStep<T>, EgclError>,
+) -> Result<T, EgclError> {
+    egcl_rt::rooted!(stream = stream);
+    let alloc = get_stream_alloc(*stream)?;
+    let _input = alloc.input.lock()?;
+    let started = std::time::Instant::now();
+    loop {
+        let parking = {
+            let mut guard = alloc.state.lock()?;
+            let mut step = operation(&mut guard);
+            if let Err(error) = &mut step {
+                attach_timeout_stream(error, *stream);
+            }
+            egcl_rt::rooted_ref!(_step_root = &mut step);
+            let outcome = match step {
+                Ok(InputStep::Done(value)) => {
+                    let mut value = Ok(value);
+                    egcl_rt::rooted_ref!(_value_root = &mut value);
+                    drop(guard);
+                    drop(_value_root);
+                    return value;
+                }
+                Ok(InputStep::WouldBlock) => guard.parking_handle(),
+                Err(error) => {
+                    drop(guard);
+                    return Err(error);
+                }
+            };
+            drop(_step_root);
+            outcome
+        };
+        // `state` is released here; the park below cannot block another thread.
+        let Some((handle, budget)) = parking else {
+            // Nothing to park on, and the operation declined to produce a
+            // value: report it rather than spinning.
+            return Err(EgclError::StreamError(
+                "stream reported no input and no descriptor to wait on".into(),
+            ));
+        };
+        let remaining = budget.map(|t| t.saturating_sub(started.elapsed()));
+        let timeout_ms = remaining.map(|t| t.as_millis().min(i32::MAX as u128) as i32);
+        let ready = remaining != Some(std::time::Duration::ZERO)
+            && handle.wait_readable(timeout_ms).unwrap_or(true);
+        if !ready {
+            // Produce the timeout through the same mapper the in-mutex path
+            // used, so the condition stays EGCL-EXT:IO-TIMEOUT rather than a
+            // bare STREAM-ERROR. socket_io reported ErrorKind::TimedOut with
+            // this message and stream_io_error turned it into IoTimeout; keep
+            // both so callers and tests see no change.
+            let mut error = stream_io_error(
+                "file read error",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "socket I/O timed out"),
+            );
+            attach_timeout_stream(&mut error, *stream);
+            return Err(error);
+        }
+    }
 }
 
 /// Lock the per-stream mutex and return a guard. R5.120.
@@ -2851,7 +3069,12 @@ pub fn stream_unread_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError>
 }
 
 pub fn stream_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
-    with_stream(stream, |guard| guard.stream_read_byte())
+    // Byte reads are the paths that can park on a socket -- socket streams are
+    // (UNSIGNED-BYTE 8) -- so they go through the wrapper that parks with the
+    // state mutex released (bliss-vupo0). A stream that cannot park outside the
+    // mutex falls back to the in-mutex path, which is where character streams
+    // and files still are.
+    with_stream_input(stream, |guard| guard.stream_read_byte_step())
 }
 
 /// True if STREAM has element-type (unsigned-byte 8), so sequence I/O over it
