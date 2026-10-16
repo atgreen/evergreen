@@ -11,7 +11,9 @@
   listener's port but never any address, so usocket's `get-local-address`,
   `get-peer-address`, `get-peer-port` and `get-local-name` had no primitive
   behind them and AllegroServe could not log or print a socket
-  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+  ([#352](https://github.com/atgreen/evergreen/pull/352),
+  [#366](https://github.com/atgreen/evergreen/pull/366);
+  issue [#350](https://github.com/atgreen/evergreen/issues/350)).
 
 ### Fixed
 
@@ -23,18 +25,21 @@
   connection, and on a bidirectional socket it could not write a reply while
   another thread read. Readers are now serialized on a separate lock and wait
   with the state mutex released
-  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+  ([#353](https://github.com/atgreen/evergreen/pull/353);
+  issue [#350](https://github.com/atgreen/evergreen/issues/350)).
 - The same fix now covers composite streams. A `TWO-WAY`, `ECHO`,
   `CONCATENATED` or `SYNONYM` stream reached its component while still holding
   its own lock, so a read parked on the component locked every other thread out
   of the composite -- and `*TERMINAL-IO*` is bidirectional
-  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+  ([#354](https://github.com/atgreen/evergreen/pull/354);
+  issue [#350](https://github.com/atgreen/evergreen/issues/350)).
 - Character reads and process-pipe reads use the same non-parking path as byte
   reads, so a read that waits for input holds no stream mutex. Regular file I/O
   is deliberately excluded: a readiness poll always reports a regular
   descriptor ready, so polling cannot make a disk read cooperative, which is
   also where the JVM leaves file I/O for its virtual threads
-  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+  ([#365](https://github.com/atgreen/evergreen/pull/365);
+  issue [#350](https://github.com/atgreen/evergreen/issues/350)).
 - `READ-SEQUENCE` on a socket no longer deadlocks other threads using that
   stream. It was the last read that still waited while holding the stream's
   state mutex, and the reachable one: socket streams are `(unsigned-byte 8)`,
@@ -45,7 +50,8 @@
   rather than merely stalling. `READ-SEQUENCE` now waits with the mutex
   released and resumes where it left off, so a request split across several
   arrivals still fills completely and a short count still means end of file
-  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+  ([#367](https://github.com/atgreen/evergreen/pull/367);
+  issue [#350](https://github.com/atgreen/evergreen/issues/350)).
 - `COMPILE-FILE` now gives the body of a load-time-only top-level `EVAL-WHEN`
   the top-level processing CLHS 3.2.3.1 requires. Without `:COMPILE-TOPLEVEL`
   but with `:LOAD-TOPLEVEL`, the body forms are still top-level forms, so a
