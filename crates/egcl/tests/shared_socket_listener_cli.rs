@@ -126,3 +126,69 @@ fn a_parked_reader_does_not_lock_other_threads_out_of_the_stream() {
         "{stdout}"
     );
 }
+
+/// A composite must not hold its own guard across a component's park.
+///
+/// #353 moved direct reads off the state mutex, but the composite arms reached
+/// their component through the OUTER guard, so a TWO-WAY / ECHO /
+/// CONCATENATED stream reproduced the same bug one level up: a parked read on
+/// the inner socket locked every other thread out of the composite
+/// (bliss-ifed5). Reachable from Lisp through MAKE-TWO-WAY-STREAM and friends,
+/// and *TERMINAL-IO* is bidirectional.
+///
+/// Same discriminator as the direct case: INPUT-STREAM-P performs no I/O, the
+/// control assertion is on a different stream, and the reader is checked to be
+/// still parked so the test cannot pass by the park becoming a spin.
+#[test]
+fn a_parked_component_read_does_not_lock_the_composite() {
+    let output = Command::new("timeout")
+        .args([
+            "--kill-after=5",
+            "60",
+            env!("CARGO_BIN_EXE_egcl"),
+            "--no-init",
+            "--eval",
+            r#"
+            (let* ((listener (egcl::%socket-listen "127.0.0.1" 0 5))
+                   (port (egcl::%socket-local-port listener))
+                   (server nil)
+                   (reader-state :not-started))
+              (let ((acceptor (egcl-thread:make-thread
+                               (lambda () (setq server (egcl::%socket-accept listener)) :ok)))
+                    (client (egcl::%socket-connect "127.0.0.1" port)))
+                (egcl-thread:join-thread acceptor)
+                ;; Input half is the idle socket, so the read parks inside the
+                ;; component while the composite is what other threads touch.
+                (let ((two-way (make-two-way-stream server client)))
+                  (egcl-thread:make-thread
+                   (lambda ()
+                     (setq reader-state :parked)
+                     (handler-case (read-byte two-way) (error () :errored))
+                     (setq reader-state :returned)))
+                  (sleep 1)
+                  (assert (eq :parked reader-state))
+                  ;; Control: a different stream answers.
+                  (assert (input-stream-p client))
+                  ;; The point: the COMPOSITE answers while its component is parked.
+                  (assert (input-stream-p two-way))
+                  (assert (output-stream-p two-way))
+                  (assert (eq :parked reader-state)))
+                (close client))
+              (egcl::%socket-close listener)
+              (format t "PARKED-COMPONENT-DOES-NOT-LOCK-COMPOSITE~%"))
+            "#,
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}\n{:?}",
+        String::from_utf8_lossy(&output.stderr),
+        output.status
+    );
+    assert!(
+        stdout.contains("PARKED-COMPONENT-DOES-NOT-LOCK-COMPOSITE"),
+        "{stdout}"
+    );
+}

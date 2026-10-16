@@ -26,6 +26,11 @@
   another thread read. Readers are now serialized on a separate lock and wait
   with the state mutex released
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
+- The same fix now covers composite streams. A `TWO-WAY`, `ECHO`,
+  `CONCATENATED` or `SYNONYM` stream reached its component while still holding
+  its own lock, so a read parked on the component locked every other thread out
+  of the composite -- and `*TERMINAL-IO*` is bidirectional
+  ([#350](https://github.com/atgreen/evergreen/issues/350)).
 
 ## 0.0.9 - 2026-10-15
 

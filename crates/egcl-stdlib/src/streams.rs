@@ -3069,12 +3069,116 @@ pub fn stream_unread_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError>
 }
 
 pub fn stream_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    // A composite delegates to a component, and that inner read can park. Do
+    // it with the OUTER stream's state mutex released, or a TWO-WAY / ECHO /
+    // CONCATENATED stream reproduces bliss-vupo0 one level up (bliss-ifed5).
+    //
+    // `components` is immutable and lives outside the mutex -- and is empty for
+    // every non-composite stream -- so this costs no lock on the common path.
+    if !get_stream_alloc(stream)?.components.is_empty() {
+        return composite_read_byte(stream);
+    }
     // Byte reads are the paths that can park on a socket -- socket streams are
     // (UNSIGNED-BYTE 8) -- so they go through the wrapper that parks with the
     // state mutex released (bliss-vupo0). A stream that cannot park outside the
     // mutex falls back to the in-mutex path, which is where character streams
     // and files still are.
     with_stream_input(stream, |guard| guard.stream_read_byte_step())
+}
+
+/// What a composite byte read delegates to, decided under a brief hold of the
+/// outer `state` and then performed with it released.
+enum CompositeByteRead {
+    /// Read from this component and return what it gives.
+    Delegate(EgclVal),
+    /// Read from the first component, echo to the second.
+    Echo(EgclVal, EgclVal),
+    /// Read from the component at this cursor index; on EOF advance and retry.
+    Concatenated(EgclVal, usize),
+    /// The component list is exhausted.
+    Eof,
+    /// Not a delegating read after all (a wide element type, or a composite
+    /// arm that touches only its own state): run the original in-mutex path so
+    /// behaviour and error ordering are unchanged.
+    InMutex,
+}
+
+/// Read a byte from a composite stream without holding its state mutex across
+/// the component's read.
+///
+/// The outer `input` mutex is held throughout, which is what orders concurrent
+/// readers of this composite -- in particular it keeps two readers from
+/// advancing a CONCATENATED cursor at once, now that the inner read no longer
+/// happens under `state`.
+///
+/// Lock order still holds: a composite is constructed after its components and
+/// draws smaller order numbers, so outer-input -> outer-state and
+/// outer-state -> inner-input are both increasing.
+fn composite_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(stream = stream);
+    let alloc = get_stream_alloc(*stream)?;
+    let _input = alloc.input.lock()?;
+    loop {
+        let step = {
+            let guard = alloc.state.lock()?;
+            guard.check_input()?;
+            let comps = guard.components();
+            match (&guard.inner, guard.element_type) {
+                // A wide element type decodes several octets per element; leave
+                // it on the original path.
+                (_, StreamElementType::Integer { .. }) => CompositeByteRead::InMutex,
+                (StreamInner::TwoWay, _) => CompositeByteRead::Delegate(comps[0]),
+                (StreamInner::Echo, _) => CompositeByteRead::Echo(comps[0], comps[1]),
+                (StreamInner::Synonym, _) => {
+                    CompositeByteRead::Delegate(resolve_synonym(comps[0])?)
+                }
+                (StreamInner::Concatenated { cursor }, _) => {
+                    if *cursor < comps.len() {
+                        CompositeByteRead::Concatenated(comps[*cursor], *cursor)
+                    } else {
+                        CompositeByteRead::Eof
+                    }
+                }
+                _ => CompositeByteRead::InMutex,
+            }
+        };
+        // `state` is released here; the component read below cannot block
+        // another thread from touching this composite.
+        match step {
+            CompositeByteRead::Delegate(inner) => return crate::streams::stream_read_byte(inner),
+            CompositeByteRead::Echo(source, sink) => {
+                let mut byte = crate::streams::stream_read_byte(source)?;
+                // Root BYTE across the echo write, for the reason the in-mutex
+                // arm gives: on a wide element type it is a heap bignum, the
+                // write allocates, and this copy is what the caller receives.
+                egcl_rt::rooted_ref!(_byte_root = &mut byte);
+                if byte != EOF {
+                    crate::streams::stream_write_byte(sink, byte)?;
+                }
+                return Ok(byte);
+            }
+            CompositeByteRead::Concatenated(inner, index) => {
+                let value = crate::streams::stream_read_byte(inner)?;
+                if value != EOF {
+                    return Ok(value);
+                }
+                // Advance past the exhausted component, unless another reader
+                // already did while `state` was released.
+                let mut guard = alloc.state.lock()?;
+                if let StreamInner::Concatenated { cursor } = &mut guard.inner {
+                    if *cursor == index {
+                        *cursor += 1;
+                    }
+                } else {
+                    return Ok(EOF);
+                }
+            }
+            CompositeByteRead::Eof => return Ok(EOF),
+            CompositeByteRead::InMutex => {
+                return with_stream(*stream, |guard| guard.stream_read_byte());
+            }
+        }
+    }
 }
 
 /// True if STREAM has element-type (unsigned-byte 8), so sequence I/O over it
