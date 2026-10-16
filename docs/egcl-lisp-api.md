@@ -595,7 +595,18 @@ The native server primitives used by library adapters are:
 (egcl::%socket-listener-ready-p listener timeout-ms) -> boolean
 (egcl::%socket-accept listener) -> bidirectional-octet-stream
 (egcl::%socket-close listener)
+(egcl::%socket-local-name listener-or-stream) -> (octets port) | nil
+(egcl::%socket-peer-name stream) -> (octets port)
 ```
+
+`%SOCKET-LOCAL-NAME` and `%SOCKET-PEER-NAME` report an endpoint as a two-element
+list of an octet vector and a port, so one call answers both -- the shape SBCL's
+`sb-bsd-sockets:socket-name` returns as multiple values, and what usocket's
+`get-local-name` needs. The vector has four elements for IPv4 and sixteen for
+IPv6; do not assume the former. `%SOCKET-LOCAL-NAME` accepts either a listener
+ID or a connected stream and answers `NIL` for a closed listener, matching
+`%SOCKET-LOCAL-PORT`. A listener has no peer, so `%SOCKET-PEER-NAME` takes a
+connected stream only and signals otherwise.
 
 Listener IDs are process-wide: another native thread or fiber can query, accept,
 or close a listener. Port zero selects an available local port. Ports must be in

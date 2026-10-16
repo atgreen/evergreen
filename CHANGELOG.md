@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Socket endpoint queries: `(egcl::%socket-local-name listener-or-stream)` and
+  `(egcl::%socket-peer-name stream)` report an endpoint as an octet vector and
+  a port together, four elements for IPv4 and sixteen for IPv6. A library
+  adapter could previously learn a listener's port but never any address, so
+  usocket's `get-local-address`, `get-peer-address`, `get-peer-port` and
+  `get-local-name` had no primitive behind them and AllegroServe could not log
+  or print a socket
+  ([#350](https://github.com/atgreen/evergreen/issues/350)).
+
 ## 0.0.9 - 2026-10-15
 
 ### ANSI conformance

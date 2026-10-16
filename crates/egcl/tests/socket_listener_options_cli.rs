@@ -100,3 +100,57 @@ fn zero_backlog_limits_the_pending_connection_queue() {
     "#,
     );
 }
+
+#[test]
+fn socket_names_report_both_ends_of_a_connection() {
+    // usocket's GET-LOCAL-ADDRESS / GET-PEER-ADDRESS / GET-PEER-PORT /
+    // GET-LOCAL-NAME had no primitive behind them, so AllegroServe could not
+    // log or print a socket (bliss-by1gf, GitHub #350).  Address and port come
+    // back together as (octets port), the way SBCL's SOCKET-NAME returns them
+    // as multiple values.
+    //
+    // The cross-checks are the point: the client's PEER port must equal the
+    // listener's port, and the server's PEER port must equal the client's LOCAL
+    // port.  An implementation that answered local_addr() for both ends would
+    // satisfy neither.
+    check(
+        r#"
+      (let* ((l (egcl::%socket-listen "127.0.0.1" 0 5))
+             (port (egcl::%socket-local-port l))
+             (srv nil))
+        ;; A listener reports the address it is bound to, agreeing with
+        ;; %SOCKET-LOCAL-PORT on the port.  EQUALP, not EQUAL: EQUAL does not
+        ;; descend into vectors (CLHS 5.3.3), so it is false for two distinct
+        ;; #(127 0 0 1) objects however equal their contents.
+        (assert (equalp (egcl::%socket-local-name l) (list #(127 0 0 1) port)))
+        (let ((acc (egcl-thread:make-thread
+                    (lambda () (setq srv (egcl::%socket-accept l)) :ok)))
+              (cli (egcl::%socket-connect "127.0.0.1" port nil)))
+          (egcl-thread:join-thread acc)
+          (let ((srv-local (egcl::%socket-local-name srv))
+                (srv-peer  (egcl::%socket-peer-name srv))
+                (cli-local (egcl::%socket-local-name cli))
+                (cli-peer  (egcl::%socket-peer-name cli)))
+            ;; Shape: a 4-element octet vector for IPv4, plus a port.
+            (dolist (n (list srv-local srv-peer cli-local cli-peer))
+              (assert (vectorp (first n)))
+              (assert (= 4 (length (first n))))
+              (assert (equalp #(127 0 0 1) (first n)))
+              (assert (integerp (second n)))
+              (assert (plusp (second n))))
+            ;; The accepted socket is bound to the listener's port.
+            (assert (= port (second srv-local)))
+            ;; Cross-checks: the two primitives report opposite ends.
+            (assert (= port (second cli-peer)))
+            (assert (= (second cli-local) (second srv-peer)))
+            ;; A listener has no peer.
+            (assert (handler-case (progn (egcl::%socket-peer-name l) nil)
+                      (error () t))))
+          (close cli))
+        ;; A closed listener answers NIL, as %SOCKET-LOCAL-PORT does.
+        (egcl::%socket-close l)
+        (assert (null (egcl::%socket-local-name l)))
+        (format t "SOCKET-NAMES-OK~%"))
+    "#,
+    );
+}
