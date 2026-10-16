@@ -457,62 +457,6 @@ enum StreamInner {
 }
 
 impl StreamMutableState {
-    /// Read up to `count` octets, in bulk where the stream is a buffered byte
-    /// stream and one at a time otherwise.
-    ///
-    /// Callers that want octets rather than elements should use this: it takes
-    /// the stream lock once and avoids materializing one `EgclVal` per byte.
-    fn read_octets(&mut self, count: usize) -> Result<Vec<u8>, EgclError> {
-        self.check_input()?;
-        let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
-        match &mut self.inner {
-            StreamInner::FileInput {
-                element_type,
-                file,
-                read_buf,
-                buf_pos,
-                buf_fill,
-                ..
-            } if *element_type == StreamElementType::UnsignedByte8 => {
-                bulk_read_octets(file, read_buf, buf_pos, buf_fill, count)
-            }
-            StreamInner::FileIo {
-                file,
-                read_buf,
-                buf_pos,
-                buf_fill,
-                ..
-            } if byte_stream => bulk_read_octets(file, read_buf, buf_pos, buf_fill, count),
-            // Anything else (string streams, concatenated, character streams
-            // read as codepoints) keeps the per-element semantics of
-            // `stream_read_byte`, including its EOF and decoding behaviour.
-            _ => {
-                let mut out = Vec::with_capacity(count.min(1 << 22));
-                for _ in 0..count {
-                    let byte = self.stream_read_byte()?;
-                    if byte == EOF {
-                        break;
-                    }
-                    if !byte.is_fixnum() {
-                        return Err(EgclError::TypeError {
-                            datum: byte,
-                            expected: "an octet from a byte stream".into(),
-                        });
-                    }
-                    let value = byte.as_fixnum();
-                    if !(0..=255).contains(&value) {
-                        return Err(EgclError::TypeError {
-                            datum: byte,
-                            expected: "an (unsigned-byte 8) element".into(),
-                        });
-                    }
-                    out.push(value as u8);
-                }
-                Ok(out)
-            }
-        }
-    }
-
     /// Write OCTETS, in bulk where the stream is a buffered byte stream and one
     /// at a time otherwise.
     ///
@@ -991,6 +935,69 @@ impl StreamMutableState {
             _ => self.stream_read_byte().map(InputStep::Done),
         }
     }
+
+    /// `read_octets` as one non-parking attempt, appending into `out`.
+    ///
+    /// Mirrors `read_octets`: the direct-descriptor byte arms go through the
+    /// bulk helper that reports `WouldBlock`, everything else keeps the
+    /// per-element semantics of `stream_read_byte` -- via its `_step` twin, so
+    /// a composite or string stream behind this path parks outside the mutex
+    /// too.
+    fn read_octets_step(
+        &mut self,
+        out: &mut Vec<u8>,
+        count: usize,
+    ) -> Result<InputStep<()>, EgclError> {
+        self.check_input()?;
+        let byte_stream = self.element_type == StreamElementType::UnsignedByte8;
+        match &mut self.inner {
+            StreamInner::FileInput {
+                element_type,
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if *element_type == StreamElementType::UnsignedByte8 => {
+                bulk_read_octets_without_parking(file, read_buf, buf_pos, buf_fill, out, count)
+            }
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                ..
+            } if byte_stream => {
+                bulk_read_octets_without_parking(file, read_buf, buf_pos, buf_fill, out, count)
+            }
+            _ => {
+                while out.len() < count {
+                    let byte = match self.stream_read_byte_step()? {
+                        InputStep::Done(byte) => byte,
+                        InputStep::WouldBlock => return Ok(InputStep::WouldBlock),
+                    };
+                    if byte == EOF {
+                        break;
+                    }
+                    if !byte.is_fixnum() {
+                        return Err(EgclError::TypeError {
+                            datum: byte,
+                            expected: "an octet from a byte stream".into(),
+                        });
+                    }
+                    let value = byte.as_fixnum();
+                    if !(0..=255).contains(&value) {
+                        return Err(EgclError::TypeError {
+                            datum: byte,
+                            expected: "an (unsigned-byte 8) element".into(),
+                        });
+                    }
+                    out.push(value as u8);
+                }
+                Ok(InputStep::Done(()))
+            }
+        }
+    }
 }
 
 /// Refill a byte buffer without parking, reporting `WouldBlock` to the caller.
@@ -1046,7 +1053,8 @@ fn file_read_byte_raw(
     Ok(EgclVal::from_fixnum(byte as i64))
 }
 
-/// Read up to `count` octets from a buffered byte stream in one go.
+/// Read up to `count` octets from a buffered byte stream in one go, without
+/// parking: `WouldBlock` is reported to the caller instead.
 ///
 /// `file_read_byte_raw` above is the right shape for READ-BYTE and the wrong
 /// shape for READ-SEQUENCE: per octet it costs a buffer-bookkeeping branch, and
@@ -1054,37 +1062,49 @@ fn file_read_byte_raw(
 /// syscalls. This drains whatever the per-byte path left buffered and then reads
 /// straight into the destination in 64 KiB chunks, which is what makes a bulk
 /// transfer run at memory speed rather than per-element speed.
-fn bulk_read_octets(
+///
+/// It appends into `out` rather than returning a fresh Vec so the caller can own
+/// the accumulator across a park: a partially filled READ-SEQUENCE must not lose
+/// what it already transferred, and must not re-read it either.
+///
+/// `Done` means the request is finished -- `out.len() == count`, or the stream
+/// reached end of file and READ-SEQUENCE reports the short count. CLHS requires
+/// READ-SEQUENCE to keep going until one of those holds, so a transport with no
+/// data yet is `WouldBlock` (park and resume), never a short return.
+fn bulk_read_octets_without_parking(
     file: &mut StreamHandle,
     read_buf: &mut [u8],
     buf_pos: &mut usize,
     buf_fill: &mut usize,
+    out: &mut Vec<u8>,
     count: usize,
-) -> Result<Vec<u8>, EgclError> {
-    // `count` comes from a sequence's length, but cap the eager allocation
-    // anyway: a bogus one must not be a request to reserve that much memory.
-    let mut out: Vec<u8> = Vec::with_capacity(count.min(1 << 22));
-    let buffered = (*buf_fill - *buf_pos).min(count);
+) -> Result<InputStep<()>, EgclError> {
+    let buffered = (*buf_fill - *buf_pos).min(count - out.len());
     out.extend_from_slice(&read_buf[*buf_pos..*buf_pos + buffered]);
     *buf_pos += buffered;
     while out.len() < count {
         let base = out.len();
         let chunk = (count - base).min(1 << 16);
         out.resize(base + chunk, 0);
-        match file.read(&mut out[base..]) {
-            // Short of `count` is not an error: READ-SEQUENCE reports how much
-            // it transferred, and the caller compares against what it wanted.
+        match file.read_without_waiting(&mut out[base..]) {
+            // End of file: READ-SEQUENCE reports how much it transferred and
+            // the caller compares that against what it asked for.
             Ok(0) => {
                 out.truncate(base);
-                break;
+                return Ok(InputStep::Done(()));
             }
             Ok(n) => out.truncate(base + n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                out.truncate(base);
+                return Ok(InputStep::WouldBlock);
+            }
             Err(e) => {
+                out.truncate(base);
                 return Err(stream_io_error("file read error", e));
             }
         }
     }
-    Ok(out)
+    Ok(InputStep::Done(()))
 }
 
 /// Write a whole slice to a file, retrying short writes and EINTR.
@@ -3487,8 +3507,32 @@ pub fn stream_start_line_p(stream: EgclVal) -> bool {
     with_stream(stream, |guard| Ok(guard.stream_start_line_p())).unwrap_or(false)
 }
 
+/// READ-SEQUENCE over a character stream, waiting with the state mutex released.
+///
+/// The accumulator lives here rather than inside the step so partial progress
+/// survives a park: `with_stream_input` re-runs the operation after waiting, and
+/// a sequence read must neither lose nor re-read what it already transferred.
+/// It is rooted in place because the elements are Lisp values and a collection
+/// can relocate them while this thread waits (bliss-mclc6).
 pub fn stream_read_sequence(stream: EgclVal, count: usize) -> Result<Vec<EgclVal>, EgclError> {
-    with_stream(stream, |guard| guard.stream_read_sequence(count))
+    let mut out: Vec<EgclVal> = Vec::with_capacity(count.min(1 << 22));
+    egcl_rt::rooted_ref!(_out_root = &mut out);
+    let filled = with_stream_input(stream, |guard| {
+        while out.len() < count {
+            let element = match guard.stream_read_char_step()? {
+                InputStep::Done(element) => element,
+                InputStep::WouldBlock => return Ok(InputStep::WouldBlock),
+            };
+            if element == EOF {
+                break;
+            }
+            out.push(element);
+        }
+        Ok(InputStep::Done(()))
+    });
+    drop(_out_root);
+    filled?;
+    Ok(out)
 }
 
 /// Read up to COUNT octets, locking the stream once rather than once per byte.
@@ -3502,17 +3546,24 @@ pub fn stream_read_byte_sequence(
     stream: EgclVal,
     count: usize,
 ) -> Result<Vec<EgclVal>, EgclError> {
-    with_stream(stream, |guard| {
-        let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            let byte = guard.stream_read_byte()?;
+    let mut out: Vec<EgclVal> = Vec::with_capacity(count.min(1 << 22));
+    egcl_rt::rooted_ref!(_out_root = &mut out);
+    let filled = with_stream_input(stream, |guard| {
+        while out.len() < count {
+            let byte = match guard.stream_read_byte_step()? {
+                InputStep::Done(byte) => byte,
+                InputStep::WouldBlock => return Ok(InputStep::WouldBlock),
+            };
             if byte == crate::streams::EOF {
                 break;
             }
             out.push(byte);
         }
-        Ok(out)
-    })
+        Ok(InputStep::Done(()))
+    });
+    drop(_out_root);
+    filled?;
+    Ok(out)
 }
 
 /// Read up to `count` octets from STREAM as bytes.
@@ -3521,20 +3572,12 @@ pub fn stream_read_byte_sequence(
 /// a `Vec<EgclVal>`, which for a 6.76 MB file is a 54 MB intermediate on top of
 /// a dispatch per byte.
 pub fn stream_read_octets(stream: EgclVal, count: usize) -> Result<Vec<u8>, EgclError> {
-    // Not `with_stream`: that roots the result, and plain octets hold no Lisp
-    // value for the collector to trace or relocate. Root only the stream, which
-    // is what an allocation during the read could move.
-    egcl_rt::rooted!(stream = stream);
-    let mut guard = lock_stream(*stream)?;
-    let mut result = guard.read_octets(count);
-    if let Err(error) = &mut result {
-        attach_timeout_stream(error, *stream);
-        egcl_rt::rooted_ref!(_error_root = error);
-        drop(guard);
-    } else {
-        drop(guard);
-    }
-    result
+    // The accumulator needs no rooting: plain octets hold no Lisp value for the
+    // collector to trace or relocate. It still lives outside the step so the
+    // bytes already transferred survive a park, as the sequence forms above do.
+    let mut out: Vec<u8> = Vec::with_capacity(count.min(1 << 22));
+    with_stream_input(stream, |guard| guard.read_octets_step(&mut out, count))?;
+    Ok(out)
 }
 
 /// Write OCTETS to STREAM as bytes, taking the stream lock once.
