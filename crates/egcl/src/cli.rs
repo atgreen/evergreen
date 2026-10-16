@@ -13322,6 +13322,34 @@ fn process_compile_toplevel_form_at(
                     }
                     return Ok(());
                 }
+                // A top-level EVAL-WHEN (CLHS 3.2.3.1): with :COMPILE-TOPLEVEL
+                // its body is evaluated now (compile-time-too mode, the EVAL-WHEN
+                // arm of eval_form). WITHOUT it but with :LOAD-TOPLEVEL, the body
+                // forms are still top-level forms, processed in not-compile-time
+                // mode -- so a nested (:compile-toplevel ...) EVAL-WHEN, a
+                // DEFMACRO or a DEFPACKAGE among them keeps its compile-time
+                // effect. Evaluating the whole form instead asked
+                // eval_when_should_run, which answers NIL for the outer form and
+                // never reaches the inner one: cl-store's DEFBACKEND expands to
+                // exactly that nest around its DEFSTORE-/DEFRESTORE- macros, so
+                // every later use in the file compiled as a function call and
+                // the fasl died loading with "STREAM is unbound". An
+                // :EXECUTE-only top-level EVAL-WHEN has no compile-time effect.
+                "EVAL-WHEN" => {
+                    let (situations, body) = cp(cdr);
+                    if eval_when_has_situation(situations, EvalWhenSituation::CompileToplevel)? {
+                        eval_form(form, env)?;
+                    } else if eval_when_has_situation(situations, EvalWhenSituation::LoadToplevel)? {
+                        let mut rest = body;
+                        egcl_rt::rooted_ref!(_rest_root = &mut rest);
+                        while rest.is_cons() {
+                            let sub = cp(rest).0;
+                            process_compile_toplevel_form_at(sub, env, depth + 1)?;
+                            rest = cp(rest).1;
+                        }
+                    }
+                    return Ok(());
+                }
                 _ => {}
             }
             // A macro call is expanded, then its expansion processed.

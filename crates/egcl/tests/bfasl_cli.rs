@@ -2980,6 +2980,59 @@ fn compiled_in_package_affects_load_time_exports_and_restores_caller() {
     assert!(String::from_utf8_lossy(&loaded.stdout).contains("LOAD-PACKAGE-EFFECTS-OK"));
 }
 
+/// CLHS 3.2.3.1: a top-level EVAL-WHEN without :COMPILE-TOPLEVEL but with
+/// :LOAD-TOPLEVEL is processed in not-compile-time mode, and its body forms
+/// are STILL top-level forms -- so a nested (:compile-toplevel ...) EVAL-WHEN
+/// inside it is evaluated at compile time. cl-store's DEFBACKEND expands to
+/// exactly that nest around the DEFSTORE-/DEFRESTORE- macros it defines;
+/// COMPILE-FILE used to evaluate the outer form as a whole, which the
+/// CompileFile rule answered with NIL, so the macros were unknown to the rest
+/// of the file and every use compiled as a function call (the fasl died
+/// loading with "STREAM is unbound"). The argument below would signal if it
+/// were evaluated as a call, which is what makes the test bite.
+#[test]
+fn compile_file_processes_not_compile_time_eval_when_body_as_toplevel_forms() {
+    let dir = workdir("nct-eval-when");
+    let src = dir.join("nct.lisp");
+    let out = dir.join("nct.bfasl");
+    fs::write(
+        &src,
+        r#"
+      (eval-when (:compile-toplevel :load-toplevel :execute)
+        (defmacro nct-define-things (name)
+          `(eval-when (:load-toplevel :execute)
+             (eval-when (:compile-toplevel :load-toplevel :execute)
+               (defmacro ,name (x) `(list :expanded ',x))))))
+      (nct-define-things nct-mac)
+      (eval-when (:load-toplevel :execute)
+        (eval-when (:compile-toplevel :load-toplevel :execute)
+          (defmacro nct-literal-mac (x) `(list :literal ',x))))
+      (defun nct-user () (list (nct-mac (no-such-function 1)) (nct-literal-mac (no-such-function 2))))
+    "#,
+    )
+    .unwrap();
+    let compiled = run(&format!("(compile-file {:?} {:?})", src, out));
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    fs::remove_file(&src).unwrap();
+    let loaded = run(&format!("(progn (load {out:?}) (princ (nct-user)))"));
+    assert!(
+        loaded.status.success(),
+        "fresh-process load failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&loaded.stdout),
+        String::from_utf8_lossy(&loaded.stderr)
+    );
+    // The first stdout line is PRINC's; the harness echoes the --eval value after it.
+    assert_eq!(
+        String::from_utf8_lossy(&loaded.stdout).lines().next().unwrap_or("").trim(),
+        "((EXPANDED (NO-SUCH-FUNCTION 1)) (LITERAL (NO-SUCH-FUNCTION 2)))"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn compile_file_preserves_shadowed_symbol_identity() {
     let dir = workdir("package-shadow");
