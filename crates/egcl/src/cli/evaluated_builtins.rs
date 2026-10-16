@@ -568,6 +568,17 @@ fn resolve(name: &str) -> Option<Handler> {
                 let name = resolve_sym("EGCL::%STANDARD-CHARACTER-READER").unwrap();
                 return Ok(symbol_function_object(env, name).unwrap_or(NIL));
             }
+            // The other standard # sub-characters (CLHS 2.4.8) are read in
+            // Rust; report the boot.lisp function that stands in for them, so
+            // a reader that wraps the standard syntax (zacl hands a rewritten
+            // feature expression back to the standard #+ reader) gets a
+            // callable function rather than NIL.
+            if args[0].as_char() == '#'
+                && "'(*:.BOXRCASP=#+-|".contains(args[1].as_char().to_ascii_uppercase())
+            {
+                let name = resolve_sym("EGCL::%STANDARD-DISPATCH-READER-MACRO").unwrap();
+                return Ok(symbol_function_object(env, name).unwrap_or(NIL));
+            }
             Ok(NIL)
         }),
 

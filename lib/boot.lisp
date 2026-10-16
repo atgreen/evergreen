@@ -1235,12 +1235,77 @@
 (defun egcl::%standard-reader-macro (stream char)
   (cond ((char= char #\;) (read-line stream nil nil) (values))
         ((char= char #\)) (error 'reader-error :stream stream))
+        ((char= char #\#)
+         ;; The dispatching character: an optional decimal argument, the
+         ;; sub-character, then that sub-character's standard reader below.
+         (let ((arg nil) (sub nil))
+           (loop (let ((c (read-char stream t nil t)))
+                   (if (digit-char-p c)
+                       (setq arg (+ (* 10 (or arg 0)) (digit-char-p c)))
+                       (progn (setq sub c) (return)))))
+           (egcl::%standard-dispatch-reader-macro stream sub arg)))
         (t (let ((*readtable* (or egcl::*standard-readtable-for-macro-functions*
                                   (setq egcl::*standard-readtable-for-macro-functions*
                                         (copy-readtable nil))))
                  (in (make-concatenated-stream (make-string-input-stream (string char))
                                                stream)))
              (read in t nil t)))))
+
+;; The reader-macro function GET-DISPATCH-MACRO-CHARACTER reports for a
+;; standard # sub-character (CLHS 2.4.8), so that a library which copies or
+;; wraps the standard syntax -- zacl's reader hands a rewritten feature
+;; expression back to the standard #+ function, named-readtables merges
+;; dispatch tables -- gets a callable function rather than NIL.  #+ and #-
+;; read the feature expression in the KEYWORD package and skip the next
+;; object under *READ-SUPPRESS* when it is not wanted, returning no values
+;; as the standard reader does, so they work inside a list; #| skips the
+;; balanced comment and returns no values; every other sub-character is
+;; read by pushing the dispatch sequence back in front of the stream and
+;; reading with the standard readtable.  #\ keeps its own reader.
+(defun egcl::%featurep (expression)
+  (cond ((consp expression)
+         (case (car expression)
+           ((:and and) (every #'egcl::%featurep (cdr expression)))
+           ((:or or) (some #'egcl::%featurep (cdr expression)))
+           ((:not not) (not (egcl::%featurep (cadr expression))))
+           (t (error "Unknown feature expression operator ~S" (car expression)))))
+        ((symbolp expression)
+         (member expression *features* :test #'string=))
+        (t (error "~S is not a feature expression" expression))))
+(defun egcl::%standard-dispatch-reader-macro (stream sub-char arg)
+  (case sub-char
+    ((#\+ #\-)
+     (let* ((feature (let ((*package* (find-package :keyword))
+                           (*read-suppress* nil))
+                       (read stream t nil t)))
+            (wanted (if (egcl::%featurep feature)
+                        (char= sub-char #\+)
+                        (char= sub-char #\-))))
+       (if wanted
+           (values (read stream t nil t))
+           (let ((*read-suppress* t))
+             (read stream t nil t)
+             (values)))))
+    (#\|
+     (let ((depth 1))
+       (loop
+         (let ((c (read-char stream t nil t)))
+           (cond ((and (char= c #\|) (char= (peek-char nil stream t nil t) #\#))
+                  (read-char stream t nil t)
+                  (when (zerop (decf depth)) (return)))
+                 ((and (char= c #\#) (char= (peek-char nil stream t nil t) #\|))
+                  (read-char stream t nil t)
+                  (incf depth))))))
+     (values))
+    (t
+     (let ((*readtable* (or egcl::*standard-readtable-for-macro-functions*
+                            (setq egcl::*standard-readtable-for-macro-functions*
+                                  (copy-readtable nil))))
+           (in (make-concatenated-stream
+                (make-string-input-stream
+                 (if arg (format nil "#~d~c" arg sub-char) (format nil "#~c" sub-char)))
+                stream)))
+       (read in t nil t)))))
 (defun readtable-case (readtable)
   ;; A non-readtable argument is a TYPE-ERROR (ansi readtable-case.error.3).
   (check-type readtable readtable)
