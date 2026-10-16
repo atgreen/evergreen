@@ -119,10 +119,11 @@ fn socket_names_report_both_ends_of_a_connection() {
              (port (egcl::%socket-local-port l))
              (srv nil))
         ;; A listener reports the address it is bound to, agreeing with
-        ;; %SOCKET-LOCAL-PORT on the port.  EQUALP, not EQUAL: EQUAL does not
+        ;; %SOCKET-LOCAL-PORT on the port.  A listener id is not a stream, so
+        ;; it has its own primitive.  EQUALP, not EQUAL: EQUAL does not
         ;; descend into vectors (CLHS 5.3.3), so it is false for two distinct
         ;; #(127 0 0 1) objects however equal their contents.
-        (assert (equalp (egcl::%socket-local-name l) (list #(127 0 0 1) port)))
+        (assert (equalp (egcl::%socket-listener-local-name l) (list #(127 0 0 1) port)))
         (let ((acc (egcl-thread:make-thread
                     (lambda () (setq srv (egcl::%socket-accept l)) :ok)))
               (cli (egcl::%socket-connect "127.0.0.1" port nil)))
@@ -143,13 +144,16 @@ fn socket_names_report_both_ends_of_a_connection() {
             ;; Cross-checks: the two primitives report opposite ends.
             (assert (= port (second cli-peer)))
             (assert (= (second cli-local) (second srv-peer)))
-            ;; A listener has no peer.
+            ;; A listener has no peer, and is not a stream: neither the peer
+            ;; primitive nor the stream-only local one accepts its id.
             (assert (handler-case (progn (egcl::%socket-peer-name l) nil)
+                      (error () t)))
+            (assert (handler-case (progn (egcl::%socket-local-name l) nil)
                       (error () t))))
           (close cli))
         ;; A closed listener answers NIL, as %SOCKET-LOCAL-PORT does.
         (egcl::%socket-close l)
-        (assert (null (egcl::%socket-local-name l)))
+        (assert (null (egcl::%socket-listener-local-name l)))
         (format t "SOCKET-NAMES-OK~%"))
     "#,
     );

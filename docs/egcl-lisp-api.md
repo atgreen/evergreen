@@ -595,18 +595,23 @@ The native server primitives used by library adapters are:
 (egcl::%socket-listener-ready-p listener timeout-ms) -> boolean
 (egcl::%socket-accept listener) -> bidirectional-octet-stream
 (egcl::%socket-close listener)
-(egcl::%socket-local-name listener-or-stream) -> (octets port) | nil
+(egcl::%socket-listener-local-name listener) -> (octets port) | nil
+(egcl::%socket-local-name stream) -> (octets port)
 (egcl::%socket-peer-name stream) -> (octets port)
 ```
 
-`%SOCKET-LOCAL-NAME` and `%SOCKET-PEER-NAME` report an endpoint as a two-element
-list of an octet vector and a port, so one call answers both -- the shape SBCL's
+These three report an endpoint as a two-element list of an octet vector and a
+port, so one call answers both -- the shape SBCL's
 `sb-bsd-sockets:socket-name` returns as multiple values, and what usocket's
 `get-local-name` needs. The vector has four elements for IPv4 and sixteen for
-IPv6; do not assume the former. `%SOCKET-LOCAL-NAME` accepts either a listener
-ID or a connected stream and answers `NIL` for a closed listener, matching
-`%SOCKET-LOCAL-PORT`. A listener has no peer, so `%SOCKET-PEER-NAME` takes a
-connected stream only and signals otherwise.
+IPv6; do not assume the former.
+
+A listener is an integer ID and a connection is a stream, so each has its own
+primitive rather than one that switches on the argument's type.
+`%SOCKET-LISTENER-LOCAL-NAME` takes a listener ID and answers `NIL` for a closed
+listener, matching `%SOCKET-LOCAL-PORT`. `%SOCKET-LOCAL-NAME` and
+`%SOCKET-PEER-NAME` take a connected stream and signal otherwise; a listener has
+no peer in any case.
 
 Listener IDs are process-wide: another native thread or fiber can query, accept,
 or close a listener. Port zero selects an available local port. Ports must be in
