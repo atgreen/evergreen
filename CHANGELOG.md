@@ -17,6 +17,12 @@
 
 ### Fixed
 
+- `LISTEN` on a freshly opened octet file stream answers T while bytes remain
+  and NIL at the end of the file. With nothing buffered yet it asked the
+  handle as if it were a socket, and a regular file always answered NIL, so a
+  `(unsigned-byte 8)` file stream had to be read once before `LISTEN` saw
+  it. The file-stream case joins the socket test of
+  [#360](https://github.com/atgreen/evergreen/pull/360).
 - A thread waiting for input on a stream no longer locks every other thread out
   of it. Input parked while holding the stream's state mutex, so for as long as
   one thread waited for a peer, any other operation on that stream blocked --
