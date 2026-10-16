@@ -35,6 +35,17 @@
   descriptor ready, so polling cannot make a disk read cooperative, which is
   also where the JVM leaves file I/O for its virtual threads
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
+- `READ-SEQUENCE` on a socket no longer deadlocks other threads using that
+  stream. It was the last read that still waited while holding the stream's
+  state mutex, and the reachable one: socket streams are `(unsigned-byte 8)`,
+  so `READ-SEQUENCE` is how a library reads a socket. Any other thread touching
+  the stream blocked -- `CLOSE`, a write on the other half, even
+  `STREAM-ELEMENT-TYPE`, which performs no I/O -- and because the thread that
+  would supply the bytes was usually the blocked one, the program deadlocked
+  rather than merely stalling. `READ-SEQUENCE` now waits with the mutex
+  released and resumes where it left off, so a request split across several
+  arrivals still fills completely and a short count still means end of file
+  ([#350](https://github.com/atgreen/evergreen/issues/350)).
 - `COMPILE-FILE` now gives the body of a load-time-only top-level `EVAL-WHEN`
   the top-level processing CLHS 3.2.3.1 requires. Without `:COMPILE-TOPLEVEL`
   but with `:LOAD-TOPLEVEL`, the body forms are still top-level forms, so a
