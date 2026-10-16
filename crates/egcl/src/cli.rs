@@ -19473,6 +19473,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%SOCKET-LOCAL-PORT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-LOCAL-NAME" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-PEER-NAME" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%SOCKET-LISTENER-LOCAL-NAME" => {
+                return eval_builtin_arguments(&name, cdr, env)
+            }
             "EGCL::%SOCKET-ACCEPT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-CLOSE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-FD" => return eval_builtin_arguments(&name, cdr, env),

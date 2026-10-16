@@ -1130,25 +1130,38 @@ fn resolve(name: &str) -> Option<Handler> {
         "EGCL::%SOCKET-LOCAL-NAME" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (%socket-local-name listener-id-or-stream) → (octets port) | NIL.
-            // A listener is an integer id into the listener map; a connected
-            // socket is a stream object, so this accepts either -- the same
-            // split %SOCKET-LOCAL-PORT (id) and %SOCKET-READ-TIMEOUT (stream)
-            // already have.  SBCL's socket-name returns the address and port
-            // together, which is what usocket's GET-LOCAL-NAME wants, so they
-            // come back as one list rather than from two primitives.
+            // (%socket-local-name stream) → (octets port).  SBCL's socket-name
+            // returns the address and port together, which is what usocket's
+            // GET-LOCAL-NAME wants, so they come back as one list rather than
+            // from two primitives.  A listener has its own primitive rather
+            // than overloading this one: see %SOCKET-LISTENER-LOCAL-NAME.
             if args.len() != 1 {
                 return Err(EgclError::ProgramError(
-                    "%socket-local-name requires a listener id or socket stream".into(),
+                    "%socket-local-name requires a socket stream".into(),
                 ));
             }
-            if args[0].is_fixnum() {
-                return Ok(
-                    egcl_stdlib::streams::socket_listener_local_name(args[0].as_fixnum() as u64)
-                        .unwrap_or(NIL),
-                );
-            }
             egcl_stdlib::streams::socket_stream_local_name(args[0])
+        }),
+
+        "EGCL::%SOCKET-LISTENER-LOCAL-NAME" => Some(|_operator, args, _env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%socket-listener-local-name listener-id) → (octets port) | NIL.
+            // A listener is an integer id into the listener map, not a stream,
+            // so it gets its own name: one primitive that switched on the
+            // argument's type read as though a listener and a connection were
+            // interchangeable, and a caller passing the wrong one got a
+            // confusing failure rather than an arity-checked error.  NIL for a
+            // closed listener, matching %SOCKET-LOCAL-PORT.
+            if args.len() != 1 || !args[0].is_fixnum() {
+                return Err(EgclError::ProgramError(
+                    "%socket-listener-local-name requires a listener id".into(),
+                ));
+            }
+            Ok(
+                egcl_stdlib::streams::socket_listener_local_name(args[0].as_fixnum() as u64)
+                    .unwrap_or(NIL),
+            )
         }),
 
         "EGCL::%SOCKET-PEER-NAME" => Some(|_operator, args, _env| {
