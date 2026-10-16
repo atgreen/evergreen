@@ -226,10 +226,19 @@ impl StreamHandle {
     /// (bliss-vupo0). This lets the caller attempt the read under the mutex,
     /// release it on `WouldBlock`, and park outside via `wait_readable`.
     ///
-    /// Only sockets can report `WouldBlock`: they are the handles
-    /// `StreamHandle::socket` puts in non-blocking mode. Files and embedded
-    /// memory complete without parking, and a pipe's own helper thread already
-    /// keeps its wait off this mutex.
+    /// Sockets report it directly: `StreamHandle::socket` puts them in
+    /// non-blocking mode. A PIPE -- a child's stdout or stderr, the only thing
+    /// that builds `StreamHandle::Pipe` -- is asked for readiness first and
+    /// reports `WouldBlock` when it has none, so a pipe whose peer is slow
+    /// parks outside the mutex just as a socket does. Measured both ways in
+    /// `process_pipes::a_parked_pipe_read_does_not_lock_other_threads_out_of_the_stream`:
+    /// without this arm, `stream_element_type` on another thread waited 2.6s
+    /// behind a reader parked on a child that withheld its output, and it
+    /// returns at once with it.
+    ///
+    /// Files and embedded memory complete without parking, and a readiness
+    /// poll on a regular file is always ready, so there is nothing to hand
+    /// back -- note a FIFO opened with `OPEN` is a `File` here, not a `Pipe`.
     pub(super) fn read_without_waiting(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Socket(socket) => {
@@ -241,13 +250,22 @@ impl StreamHandle {
                     }
                 }
             }
+            Self::Pipe(_) => {
+                // Zero timeout: a readiness question, not a wait. Readers are
+                // serialized by the stream's `input` mutex, so nothing can
+                // consume the data between this answer and the read below.
+                if !self.wait_readable(Some(0))? {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                self.read(buffer)
+            }
             _ => self.read(buffer),
         }
     }
 
     /// Whether this handle can report `WouldBlock` from `read_without_waiting`.
     pub(super) fn parks_outside_mutex(&self) -> bool {
-        matches!(self, Self::Socket(_))
+        matches!(self, Self::Socket(_) | Self::Pipe(_))
     }
 
     /// The read timeout budget a socket handle carries, if any.

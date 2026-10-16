@@ -29,7 +29,12 @@
   its own lock, so a read parked on the component locked every other thread out
   of the composite -- and `*TERMINAL-IO*` is bidirectional
   ([#350](https://github.com/atgreen/evergreen/issues/350)).
-
+- Character reads and process-pipe reads use the same non-parking path as byte
+  reads, so a read that waits for input holds no stream mutex. Regular file I/O
+  is deliberately excluded: a readiness poll always reports a regular
+  descriptor ready, so polling cannot make a disk read cooperative, which is
+  also where the JVM leaves file I/O for its virtual threads
+  ([#350](https://github.com/atgreen/evergreen/issues/350)).
 - `COMPILE-FILE` now gives the body of a load-time-only top-level `EVAL-WHEN`
   the top-level processing CLHS 3.2.3.1 requires. Without `:COMPILE-TOPLEVEL`
   but with `:LOAD-TOPLEVEL`, the body forms are still top-level forms, so a

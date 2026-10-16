@@ -673,6 +673,78 @@ fn stdin_read_would_not_block() -> Result<bool, EgclError> {
 
 const FILE_BUF_SIZE: usize = 8192;
 
+/// Decode one character without parking, reporting `WouldBlock` to the caller.
+///
+/// The non-parking twin of `file_read_char_buffered`, so a character read can
+/// park with the stream's state mutex released (bliss-o61rm, the character half
+/// of bliss-vupo0).
+///
+/// Returning mid-character is safe because no partial state is local: the
+/// decoder consumes nothing until it has a whole character ("decode without
+/// consuming an incomplete prefix" below), and the refill compacts the partial
+/// prefix to the front of `read_buf` before reading. buf_pos/buf_fill therefore
+/// describe a valid, resumable position at every point a `WouldBlock` can be
+/// returned, including after compaction, and the retry re-attempts the decode
+/// from there.
+#[allow(clippy::too_many_arguments)]
+fn file_read_char_without_parking(
+    file: &mut StreamHandle,
+    read_buf: &mut Vec<u8>,
+    buf_pos: &mut usize,
+    buf_fill: &mut usize,
+    line: &mut u64,
+    col: &mut u64,
+    unread: &mut Option<char>,
+) -> Result<InputStep<EgclVal>, EgclError> {
+    if let Some(c) = unread.take() {
+        return Ok(InputStep::Done(EgclVal::from_char(c)));
+    }
+    loop {
+        for length in 1..=(*buf_fill - *buf_pos).min(4) {
+            match std::str::from_utf8(&read_buf[*buf_pos..*buf_pos + length]) {
+                Ok(text) => {
+                    let ch = text.chars().next().unwrap();
+                    *buf_pos += length;
+                    track_col(ch, line, col);
+                    return Ok(InputStep::Done(EgclVal::from_char(ch)));
+                }
+                Err(error) if error.error_len().is_some() || length == 4 => {
+                    *buf_pos += length;
+                    return Err(EgclError::StreamError(
+                        "invalid UTF-8 in file stream".into(),
+                    ));
+                }
+                Err(_) => {}
+            }
+        }
+        // Compact the incomplete prefix to the front, exactly as the parking
+        // version does, so the retry resumes from a valid position.
+        let remaining = *buf_fill - *buf_pos;
+        read_buf.copy_within(*buf_pos..*buf_fill, 0);
+        read_buf.resize(FILE_BUF_SIZE, 0);
+        *buf_pos = 0;
+        *buf_fill = remaining;
+        let count = match file.read_without_waiting(&mut read_buf[remaining..]) {
+            Ok(count) => count,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(InputStep::WouldBlock);
+            }
+            Err(e) => {
+                return Err(EgclError::StreamError(format!("file read error: {e}")));
+            }
+        };
+        if count == 0 {
+            if remaining != 0 {
+                return Err(EgclError::StreamError(
+                    "incomplete UTF-8 sequence at EOF".into(),
+                ));
+            }
+            return Ok(InputStep::Done(EOF));
+        }
+        *buf_fill += count;
+    }
+}
+
 /// Read a single UTF-8 char from a buffered file input, refilling buffer as needed.
 // These are the disjoint mutable fields of a file stream plus its wait policy;
 // borrowing the whole stream here would conflict with the caller's field borrows.
@@ -840,6 +912,48 @@ impl StreamMutableState {
         }
         let budget = file.read_timeout_budget();
         file.try_clone().ok().map(|handle| (handle, budget))
+    }
+
+    /// `stream_read_char` as one non-parking attempt.
+    ///
+    /// Mirrors `stream_read_byte_step`: the direct descriptor arms use the
+    /// decoder that reports `WouldBlock`, every other arm keeps its existing
+    /// behaviour and answers `Done`. The FileIo arm flushes pending output
+    /// first, as the parking version does, so an interactive stream still sees
+    /// its prompt before the read waits.
+    fn stream_read_char_step(&mut self) -> Result<InputStep<EgclVal>, EgclError> {
+        self.check_input()?;
+        match &mut self.inner {
+            StreamInner::FileInput {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                line,
+                col,
+                unread,
+                ..
+            } => file_read_char_without_parking(
+                file, read_buf, buf_pos, buf_fill, line, col, unread,
+            ),
+            StreamInner::FileIo {
+                file,
+                read_buf,
+                buf_pos,
+                buf_fill,
+                write_buf,
+                line,
+                col,
+                unread,
+                ..
+            } => {
+                file_flush_write_buf(file, write_buf)?;
+                file_read_char_without_parking(
+                    file, read_buf, buf_pos, buf_fill, line, col, unread,
+                )
+            }
+            _ => self.stream_read_char().map(InputStep::Done),
+        }
     }
 
     /// `stream_read_byte` as one non-parking attempt.
@@ -3059,7 +3173,17 @@ pub fn stream_element_type(stream: EgclVal) -> EgclVal {
 // Each wrapper acquires the per-stream mutex (R5.120).
 
 pub fn stream_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
-    with_stream(stream, |guard| guard.stream_read_char())
+    // Composites delegate to a component, whose read can park; do that with
+    // the outer guard released (bliss-ifed5 for bytes, same shape here).
+    // `components` is outside the mutex and empty for non-composites, so this
+    // costs no lock on the common path.
+    if !get_stream_alloc(stream)?.components.is_empty() {
+        return composite_read_char(stream);
+    }
+    // Character reads can park on a slow device just as byte reads park on a
+    // peer, so they go through the wrapper that parks with the state mutex
+    // released (bliss-o61rm).
+    with_stream_input(stream, |guard| guard.stream_read_char_step())
 }
 
 pub fn stream_unread_char(stream: EgclVal, ch: EgclVal) -> Result<(), EgclError> {
@@ -3084,6 +3208,72 @@ pub fn stream_read_byte(stream: EgclVal) -> Result<EgclVal, EgclError> {
     // mutex falls back to the in-mutex path, which is where character streams
     // and files still are.
     with_stream_input(stream, |guard| guard.stream_read_byte_step())
+}
+
+/// Read a character from a composite stream without holding its state mutex
+/// across the component's read.
+///
+/// The character twin of `composite_read_byte`; see that function for why the
+/// outer `input` mutex is held throughout and how the CONCATENATED cursor is
+/// advanced safely.
+fn composite_read_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted!(stream = stream);
+    let alloc = get_stream_alloc(*stream)?;
+    let _input = alloc.input.lock()?;
+    loop {
+        let step = {
+            let guard = alloc.state.lock()?;
+            guard.check_input()?;
+            let comps = guard.components();
+            match &guard.inner {
+                StreamInner::TwoWay => CompositeByteRead::Delegate(comps[0]),
+                StreamInner::Echo => CompositeByteRead::Echo(comps[0], comps[1]),
+                StreamInner::Synonym => {
+                    CompositeByteRead::Delegate(resolve_synonym(comps[0])?)
+                }
+                StreamInner::Concatenated { cursor } => {
+                    if *cursor < comps.len() {
+                        CompositeByteRead::Concatenated(comps[*cursor], *cursor)
+                    } else {
+                        CompositeByteRead::Eof
+                    }
+                }
+                _ => CompositeByteRead::InMutex,
+            }
+        };
+        // `state` is released here.
+        match step {
+            CompositeByteRead::Delegate(inner) => return crate::streams::stream_read_char(inner),
+            CompositeByteRead::Echo(source, sink) => {
+                let mut ch = crate::streams::stream_read_char(source)?;
+                // Root CH across the echo write for the reason the byte path
+                // documents: the write allocates and this copy is returned.
+                egcl_rt::rooted_ref!(_ch_root = &mut ch);
+                if ch != EOF {
+                    crate::streams::stream_write_char(sink, ch)?;
+                }
+                return Ok(ch);
+            }
+            CompositeByteRead::Concatenated(inner, index) => {
+                let value = crate::streams::stream_read_char(inner)?;
+                if value != EOF {
+                    return Ok(value);
+                }
+                let mut guard = alloc.state.lock()?;
+                if let StreamInner::Concatenated { cursor } = &mut guard.inner {
+                    if *cursor == index {
+                        *cursor += 1;
+                    }
+                } else {
+                    return Ok(EOF);
+                }
+            }
+            CompositeByteRead::Eof => return Ok(EOF),
+            CompositeByteRead::InMutex => {
+                return with_stream(*stream, |guard| guard.stream_read_char());
+            }
+        }
+    }
 }
 
 /// What a composite byte read delegates to, decided under a brief hold of the
