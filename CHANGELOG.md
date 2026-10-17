@@ -44,6 +44,14 @@
 
 ### Fixed
 
+- Hash tables find every key their test calls equal. An `EQUALP` table missed
+  `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
+  for a simple one, a string for a vector of its characters, and equal
+  structures and hash tables; `EQUAL` tables missed fill-pointer strings and lost
+  an adjustable-vector key once an element changed. `EQL` (and `EQL`/`EQUAL`
+  tables) no longer treat `-0d0` as `0d0`, nor `EQUAL` `-0.0` as `0.0`, and
+  `SXHASH` no longer changes when the garbage collector moves an object
+  ([#388](https://github.com/atgreen/evergreen/pull/388)).
 - A saved image no longer lets newly compiled code redefine the local
   functions of code it saved. Loading the ocicl runtime in the `make image`
   egcl replaced one inside `PARSE-INTEGER`, after which `(parse-integer "1")`
