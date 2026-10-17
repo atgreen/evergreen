@@ -5,7 +5,7 @@
 
 use std::cmp::Ordering;
 use egcl_rt::bignum::{
-    BigInt, big_cmp, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, mag_sub,
+    BigInt, BigRat, big_cmp, bigint_from_val, fixnum_from_i128, mag_add, mag_bitlen, mag_sub,
     ratio_parts_val,
 };
 use egcl_rt::error::EgclError;
@@ -188,4 +188,33 @@ fn shift_right(n: &BigInt, bits: usize) -> BigInt {
         result = mag_add(&result, &[1]);
     }
     BigInt::from_mag(n.sign, result)
+}
+
+/// The exact rational value of a finite float, decoded from its IEEE-754 bits
+/// (a single-float widens to `f64` exactly, so one decoder serves both). Every
+/// float comparison that must agree with `=` goes through this rather than an
+/// `f64` round trip of the rational side, which rounds large integers and
+/// ratios (CLHS 12.1.4.1). The caller ensures `f` is finite.
+pub fn float_exact_rational(f: f64) -> BigRat {
+    if f == 0.0 {
+        return BigRat::from_i64(0);
+    }
+    let bits = f.to_bits();
+    let sign = if bits >> 63 == 1 { -1 } else { 1 };
+    let exponent = ((bits >> 52) & 0x7FF) as i64;
+    let fraction = bits & 0xF_FFFF_FFFF_FFFF;
+    // A subnormal has no implicit leading one and the minimum exponent.
+    let (mantissa, scale) = if exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | 1 << 52, exponent - 1075)
+    };
+    let numerator = BigInt::from_mag(sign, vec![mantissa]);
+    // |scale| <= 1074, so neither shift can approach the OOM guard.
+    if scale >= 0 {
+        BigRat::from_bigint(shift_left(&numerator, scale as usize).expect("small shift"))
+    } else {
+        let denominator = shift_left(&BigInt::from_i64(1), (-scale) as usize).expect("small shift");
+        BigRat::new(numerator, denominator)
+    }
 }

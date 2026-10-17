@@ -30023,26 +30023,7 @@ fn cl_rationalize(v: EgclVal) -> Result<EgclVal, EgclError> {
 /// value. Fixnums and single-floats are immediates (handled by `==`); heap
 /// numbers of the same type are compared by value on the shared representation.
 fn eql_values(a: EgclVal, b: EgclVal) -> bool {
-    if a == b {
-        return true;
-    }
-    // Complex numbers are unordered (numeric_cmp fails on them), so compare
-    // componentwise: EQL iff both parts are EQL (CLHS: same-type numbers with
-    // eql parts). bliss-052e-adjacent.
-    if let (Some(ra), Some(rb)) = (
-        egcl_rt::types::complex_realpart(a),
-        egcl_rt::types::complex_realpart(b),
-    ) {
-        let ia = egcl_rt::types::complex_imagpart(a).unwrap_or(NIL);
-        let ib = egcl_rt::types::complex_imagpart(b).unwrap_or(NIL);
-        return eql_values(ra, rb) && eql_values(ia, ib);
-    }
-    match (heap_numeric_type_id(a), heap_numeric_type_id(b)) {
-        (Some(ta), Some(tb)) if ta == tb => numeric_cmp(a, b)
-            .map(|o| o == Ordering::Equal)
-            .unwrap_or(false),
-        _ => false,
-    }
+    egcl_stdlib::equality::eql(a, b)
 }
 
 // ── Arbitrary-precision integers (little-endian base-2^64 magnitude) ──
@@ -42145,208 +42126,17 @@ fn is_bit_vector_value(v: EgclVal) -> bool {
         || (egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_is_bit(v))
 }
 
-/// The active bit length of a bit vector (simple or complex-bit).
-fn bit_vector_bit_len(v: EgclVal) -> Option<usize> {
-    if let Some(n) = egcl_rt::types::bit_vector_len(v) {
-        return Some(n);
-    }
-    (egcl_stdlib::is_complex_vector(v) && egcl_stdlib::cvec_is_bit(v))
-        .then(|| egcl_stdlib::cvec_fill_pointer(v))
-}
-
-/// Bit `i` of a bit vector (simple or complex-bit): 0 or 1. A complex bit
-/// vector stores its bits as fixnum elements, so read through the
-/// displacement-aware accessor and take the value.
-fn bit_vector_bit(v: EgclVal, i: usize) -> u8 {
-    if let Some(bit) = egcl_rt::types::bit_vector_ref(v, i) {
-        return bit;
-    }
-    egcl_stdlib::cvec_element(v, i)
-        .ok()
-        .filter(|e| e.is_fixnum())
-        .map(|e| (e.as_fixnum() & 1) as u8)
-        .unwrap_or(0)
-}
-
+/// CL `EQUAL` -- the shared definition hash tables also use (see
+/// `egcl_stdlib::equality`), so `(equal a b)` and an EQUAL table agree.
 fn vals_equal(a: EgclVal, b: EgclVal) -> bool {
-    if a == b {
-        return true;
-    }
-    if a.is_fixnum() && b.is_fixnum() {
-        return a.as_fixnum() == b.as_fixnum();
-    }
-    if a.is_single_float() && b.is_single_float() {
-        return a.as_single_float() == b.as_single_float();
-    }
-    // On numbers EQUAL is EQL — delegate so heap numerics (bignum/ratio/complex)
-    // with equal value/type compare EQUAL (e.g. two distinct #C(0 2) objects).
-    if is_number_value(a) && is_number_value(b) {
-        return eql_values(a, b);
-    }
-    if is_string_value(a) && is_string_value(b) {
-        return val_as_str(a) == val_as_str(b);
-    }
-    // Bit-vectors: ANSI EQUAL compares bit-vectors element-wise (like strings),
-    // unlike general arrays which EQUAL treats as EQ. Two bit-vectors of equal
-    // length with the same bits are EQUAL even if distinct objects — e.g.
-    // (equal #*1011 (copy-seq #*1011)). No allocation, so GC-safe (bliss-8z5f).
-    if let (Some(la), Some(lb)) = (bit_vector_bit_len(a), bit_vector_bit_len(b)) {
-        // Compares SIMPLE and COMPLEX (fill-pointer/adjustable/displaced) bit
-        // vectors uniformly, so (equal #*1011 <complex 1011>) holds (bliss-65nx).
-        return la == lb && (0..la).all(|i| bit_vector_bit(a, i) == bit_vector_bit(b, i));
-    }
-    // Pathnames: EQUAL when their components match. Comparing namestrings is the
-    // faithful proxy and matches the EQUAL hash-table's `cl_equal`. ASDF compares
-    // pathnames with EQUAL pervasively (find-system caching, output-file dedup,
-    // and — via actions keyed on components — plan-traversal cycle detection);
-    // returning NIL for equal pathnames made those caches never hit, so
-    // asdf:load-system re-traversed forever (bliss-nad).
-    if egcl_stdlib::is_pathname(a) && egcl_stdlib::is_pathname(b) {
-        // Compare via the non-allocating pathname EQUAL: rendering a namestring
-        // to a Lisp string (the old `egcl_stdlib::namestring` path) allocates
-        // and can fire a relocating minor GC mid-walk, so every list walker
-        // holding bare Rust locals across this call (e.g. ASSOC) was latently
-        // GC-unsafe (bliss-8jt).
-        return egcl_stdlib::pathnames_equal(a, b);
-    }
-    if a.is_cons() && b.is_cons() {
-        let (a_car, a_cdr) = cp(a);
-        let (b_car, b_cdr) = cp(b);
-        return vals_equal(a_car, b_car) && vals_equal(a_cdr, b_cdr);
-    }
-    false
-}
-
-/// Read a packed element through any displacement without boxing it.
-fn packed_element(array: EgclVal, index: usize) -> Option<f64> {
-    egcl_stdlib::sequences::double_float_array_element(array, index)
-}
-
-/// Compare a raw double against a Lisp number without allocating Lisp storage.
-fn raw_double_equalp(raw: f64, value: EgclVal) -> bool {
-    if egcl_rt::types::complexp(value) {
-        let Ok((re, im)) = complex_parts(value) else { return false; };
-        return raw_double_equalp(raw, re) && raw_double_equalp(0.0, im);
-    }
-    if !is_real_number(value) { return false; }
-    if raw.is_finite() && (!egcl_rt::types::floatp(value) || float_f64(value).is_finite()) {
-        return real_to_exact_bigrat(value).is_ok_and(|rhs|
-            bigrat_cmp(&f64_to_bigrat(raw), &rhs) == Ordering::Equal);
-    }
-    num_val(value).is_ok_and(|rhs| raw == rhs)
+    egcl_stdlib::equality::equal(a, b)
 }
 
 /// CL `EQUALP`: like `EQUAL` but numbers compare by value across types
 /// (`1` equalp `1.0`), characters and strings compare case-insensitively,
 /// vectors/arrays compare element-wise, and structures compare slot-wise.
 fn vals_equalp(a: EgclVal, b: EgclVal) -> bool {
-    if a == b {
-        return true;
-    }
-    // Two pathnames are EQUALP iff their components match (compared via the
-    // non-allocating namestring proxy, like EQUAL). Without this, EQUALP fell
-    // through to identity and reported two component-equal pathnames unequal
-    // (ansi merge-pathnames.1 uses EQUALP on pathnames).
-    if egcl_stdlib::is_pathname(a) && egcl_stdlib::is_pathname(b) {
-        return egcl_stdlib::pathnames_equal(a, b);
-    }
-    if is_number_value(a) && is_number_value(b) {
-        // numeric_equal handles COMPLEX (unordered → numeric_cmp fails on it).
-        return numeric_equal(a, b).unwrap_or(false);
-    }
-    if a.is_character() && b.is_character() {
-        return a.as_char().eq_ignore_ascii_case(&b.as_char());
-    }
-    if is_string_value(a) && is_string_value(b) {
-        return val_as_str(a).eq_ignore_ascii_case(&val_as_str(b));
-    }
-    if a.is_cons() && b.is_cons() {
-        let (ac, ad) = cp(a);
-        let (bc, bd) = cp(b);
-        return vals_equalp(ac, bc) && vals_equalp(ad, bd);
-    }
-    // Structures (DEFSTRUCT instances): two structures of the same type are
-    // EQUALP iff their corresponding slots are EQUALP. Only DEFSTRUCT classes
-    // qualify — a general CLOS standard-object is compared by identity (handled
-    // by the `a == b` check above). Placed after the number/char/string/cons
-    // fast paths (an instance is none of those) so the common cases don't pay
-    // the is_instance lookups. No EGCL allocation here, so the recursion is
-    // GC-safe (bliss-rup1).
-    if egcl_stdlib::is_instance(a) && egcl_stdlib::is_instance(b) {
-        let ca = egcl_stdlib::class_of(a);
-        let na = sym_bare_name_rc(egcl_stdlib::class_name(ca));
-        let nb = sym_bare_name_rc(egcl_stdlib::class_name(egcl_stdlib::class_of(b)));
-        if na != nb || !egcl_stdlib::is_structure_class(ca) {
-            return false;
-        }
-        for slot in egcl_stdlib::effective_slots(ca) {
-            match (
-                egcl_stdlib::slot_value(a, slot).ok(),
-                egcl_stdlib::slot_value(b, slot).ok(),
-            ) {
-                (Some(x), Some(y)) if vals_equalp(x, y) => {}
-                _ => return false,
-            }
-        }
-        return true;
-    }
-    // Hash tables: same test, same count, and every entry's value EQUALP.
-    if is_hash_table_value(a) && is_hash_table_value(b) {
-        let counts_match = matches!(
-            (egcl_stdlib::hash_table_count(a), egcl_stdlib::hash_table_count(b)),
-            (Ok(x), Ok(y)) if x == y
-        );
-        let tests_match = matches!(
-            (egcl_stdlib::hash_table_test(a), egcl_stdlib::hash_table_test(b)),
-            (Ok(x), Ok(y)) if x == y
-        );
-        if !counts_match || !tests_match {
-            return false;
-        }
-        return match egcl_stdlib::hash_table_entries(a) {
-            Ok(entries) => entries.into_iter().all(|(k, va)| {
-                matches!(egcl_stdlib::gethash(k, b, NIL), Ok((vb, true)) if vals_equalp(va, vb))
-            }),
-            Err(_) => false,
-        };
-    }
-    // Vectors / arrays (simple and fill-pointer): same length, EQUALP elements.
-    //
-    // Deliberately NOT excluding strings. CLHS compares two ARRAYS by dimensions
-    // and elements; the element TYPE is irrelevant, so a string and a general
-    // vector holding the same characters are EQUALP — `(equalp "ab" #(#\a #\b))`
-    // is true, and so is `(equalp (make-array '(0) :element-type nil) #())`
-    // (ansi EQUALP.5; bliss-4gcm). Two strings never reach here: the
-    // case-insensitive string fast path above already returned. Element
-    // comparison recurses through vals_equalp, so characters stay
-    // case-insensitive.
-    if is_vector_value(a) && is_vector_value(b) {
-        let la = egcl_stdlib::length(a).unwrap_or(usize::MAX);
-        let lb = egcl_stdlib::length(b).unwrap_or(usize::MAX);
-        if la == usize::MAX || la != lb {
-            return false;
-        }
-        for i in 0..la {
-            // Preserve EQUALP's allocation-free traversal: raw numeric elements
-            // need no transient Lisp boxes, including through displacement.
-            let equal = match (packed_element(a, i), packed_element(b, i)) {
-                (Some(x), Some(y)) => x == y,
-                (Some(x), None) => egcl_stdlib::elt(b, i).is_ok_and(|y| raw_double_equalp(x, y)),
-                (None, Some(y)) => egcl_stdlib::elt(a, i).is_ok_and(|x| raw_double_equalp(y, x)),
-                (None, None) => matches!((egcl_stdlib::elt(a, i), egcl_stdlib::elt(b, i)),
-                    (Ok(x), Ok(y)) if vals_equalp(x, y)),
-            };
-            if !equal { return false; }
-        }
-        return true;
-    }
-    // Compare row-major backing vectors without allocating element boxes.
-    if egcl_rt::types::md_array_p(a) && egcl_rt::types::md_array_p(b) {
-        return md_dims(a).ok() == md_dims(b).ok()
-            && matches!((egcl_rt::types::md_array_storage(a), egcl_rt::types::md_array_storage(b)),
-                (Some(sa), Some(sb)) if vals_equalp(sa, sb));
-    }
-    false
+    egcl_stdlib::equality::equalp(a, b)
 }
 
 /// Load the user init file at startup (after the bootstrap prelude, before any

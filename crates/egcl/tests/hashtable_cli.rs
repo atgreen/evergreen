@@ -118,3 +118,75 @@ fn large_tables_match_equivalent_numeric_and_structural_keys() {
         ":OK"
     );
 }
+
+/// A table must find every key its test function calls equal, and no other.
+/// The tables used to carry their own EQUAL/EQUALP, which had drifted from the
+/// predicates: an EQUALP table missed 1d0 for 1, 0.5 for 1/2, a fill-pointer
+/// string, an adjustable vector and an equal structure, while EQL and EQUAL
+/// tables (and EQL itself) took -0d0 for 0d0.
+#[test]
+fn tables_agree_with_their_test_predicates() {
+    assert_eq!(
+        eval(
+            r##"(progn
+      (defstruct ht-point x y)
+      (defun fill-pointer-string (s)
+        (make-array (length s) :element-type 'character :initial-contents s
+                               :fill-pointer (length s)))
+      (defun table-agrees (test a b)
+        (let ((h (make-hash-table :test test)))
+          (setf (gethash a h) :hit)
+          (assert (eq (and (funcall test a b) t) (and (gethash b h) t))
+                  () "~S ~S ~S: predicate ~S, table ~S" test a b (funcall test a b) (gethash b h))
+          (and (funcall test a b) t)))
+      (let ((a (make-hash-table)) (b (make-hash-table)))
+        (setf (gethash 1 a) "x" (gethash 1 b) "X")
+        (list
+         ;; EQUALP: numbers by =, strings and characters ignoring case, arrays
+         ;; by elements whatever their representation, structures by slots.
+         (table-agrees 'equalp 1 1d0)
+         (table-agrees 'equalp 1.5f0 1.5d0)
+         (table-agrees 'equalp 1/2 0.5)
+         (table-agrees 'equalp 1/2 0.5d0)
+         (table-agrees 'equalp (expt 2 70) (float (expt 2 70) 1d0))
+         (table-agrees 'equalp (1+ (expt 2 53)) (float (1+ (expt 2 53)) 1d0))
+         (table-agrees 'equalp #c(1 2) #c(1.0 2.0))
+         (table-agrees 'equalp 1 #c(1.0 0.0))
+         (table-agrees 'equalp 0 -0d0)
+         (table-agrees 'equalp "ABC" (fill-pointer-string "abc"))
+         (table-agrees 'equalp (vector 1 2)
+                       (make-array 2 :initial-contents '(1 2) :adjustable t))
+         (table-agrees 'equalp "abc" (vector #\a #\B #\c))
+         (table-agrees 'equalp #*101 (vector 1 0 1))
+         (table-agrees 'equalp (make-ht-point :x 1 :y "a") (make-ht-point :x 1 :y "A"))
+         (table-agrees 'equalp a b)
+         ;; EQUAL: strings by characters however they are stored; numbers by EQL.
+         (table-agrees 'equal "abc" (fill-pointer-string "abc"))
+         (table-agrees 'equal 0d0 -0d0)
+         (table-agrees 'equal 0.0 -0.0)
+         ;; EQL: same type and representation.
+         (table-agrees 'eql 0d0 -0d0)
+         (table-agrees 'eql (expt 2 70) (expt 2 70))
+         (table-agrees 'eql 1/3 (/ 2 6)))))"##
+        ),
+        "(T T T T T NIL T T T T T T T T T T NIL NIL NIL T T)"
+    );
+}
+
+/// EQUAL compares a non-string, non-bit array by identity, so changing an
+/// element changes neither its EQUAL identity nor its SXHASH. Hashing the
+/// elements of a fill-pointer vector lost the key as soon as one changed.
+#[test]
+fn equal_table_keeps_a_mutated_general_vector_key() {
+    assert_eq!(
+        eval(
+            "(let ((h (make-hash-table :test 'equal)) \
+                   (v (make-array 3 :adjustable t :fill-pointer 3 :initial-element 0))) \
+               (setf (gethash v h) :found) \
+               (let ((before (sxhash v))) \
+                 (setf (aref v 0) 99) \
+                 (list (gethash v h) (= before (sxhash v)))))"
+        ),
+        "(:FOUND T)"
+    );
+}
