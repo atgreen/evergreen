@@ -13061,8 +13061,15 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 // re-evaluating, then reported "already bound non-constant
                 // variable" when the fasl loaded. That is what stopped iolib
                 // loading (bliss-vhr6e).
+                // The walk visits every subform, so this can be data shaped
+                // like a definition — ocicl's linter has the CASE clause
+                // `((defconstant) …)`, whose "name" is NIL. Neither NIL nor T
+                // can be a DEFCONSTANT name, and seeding them panicked.
+                if !cdr.is_cons() {
+                    return;
+                }
                 let (symbol, rest) = cp(cdr);
-                if symbol.is_symbol() {
+                if symbol.is_symbol() && symbol != NIL && symbol != T {
                     if rest.is_cons() {
                         // An init form that cannot be evaluated yet seeds
                         // nothing. A seeded NIL would become
@@ -17534,6 +17541,25 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError
             )
         })?;
     let src = String::from_utf8_lossy(forms).into_owned();
+    // A source-only artifact re-reads text that COMPILE-FILE would have read, so
+    // its read-time `#.` forms see the source file as *COMPILE-FILE-PATHNAME*
+    // and *COMPILE-FILE-TRUENAME*, as they would have during compilation. The
+    // common `(or *compile-file-pathname* *load-pathname*)` idiom otherwise
+    // resolved paths against the fasl cache (ocicl's runtime/ files).
+    let mut source_bindings: Vec<DynBind> = Vec::new();
+    egcl_rt::rooted_ref!(_source_bindings_root = &mut source_bindings);
+    if let Some(source) = unit
+        .section(egcl_rt::bfasl::section::SOURCE_MAP)
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .and_then(|path| load_pathname_value(&path))
+    {
+        egcl_rt::rooted!(source = source);
+        for name in ["*COMPILE-FILE-PATHNAME*", "*COMPILE-FILE-TRUENAME*"] {
+            if let Some(symbol) = resolve_sym(name) {
+                source_bindings.push(DynBind::establish(symbol, *source));
+            }
+        }
+    }
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 

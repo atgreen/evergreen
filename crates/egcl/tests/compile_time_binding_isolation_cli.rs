@@ -62,3 +62,41 @@ fn compile_time_constants_do_not_leak_into_other_packages() {
         "{stdout}\n{stderr}"
     );
 }
+
+/// A CASE key list naming DEFCONSTANT is data, not a definition: ocicl's linter
+/// has `((defconstant) …)`, and compiling it used to panic seeding NIL.
+#[test]
+fn defconstant_shaped_case_keys_compile() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("defconstant-case-key-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("case-keys.lisp");
+    std::fs::write(
+        &source,
+        "(defun classify (head)\n\
+           (case head\n\
+             ((defconstant) :constant)\n\
+             ((defvar defparameter) :special)\n\
+             (t :other)))\n",
+    )
+    .unwrap();
+    let program = format!(
+        r##"(progn
+      (load (compile-file "{source}"))
+      (assert (eq (classify 'defconstant) :constant))
+      (assert (eq (classify 'defvar) :special))
+      (assert (not (constantp 'no-such-constant)))
+      (format t "CASE-KEYS-OK~%"))"##,
+        source = source.display()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &program])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("CASE-KEYS-OK"),
+        "{stdout}\n{stderr}"
+    );
+}

@@ -9565,6 +9565,13 @@ impl BbuConstPool {
         if v.is_string() {
             return Some(self.string(&val_as_str(v)));
         }
+        // A string with a fill pointer or adjustable storage, such as the ones
+        // cl-interpol's `#?"…"` reader builds. Externalizing a vector preserves
+        // its active elements (CLHS 3.2.4.2.2), so it loads as a simple string.
+        // Without this, one such literal made the whole file source-only.
+        if let Some(contents) = egcl_stdlib::cvec_char_contents(v) {
+            return Some(self.string(&contents));
+        }
         if v.is_symbol() {
             let idx = v.as_symbol_index();
             if let Some(r) = self.symbol_by_index(idx) {
