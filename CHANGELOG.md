@@ -49,6 +49,22 @@
   operation as documented; it never did, and the interpreter's shared
   macro-expansion cache is such a table
   ([#398](https://github.com/atgreen/evergreen/pull/398)).
+- A class is an object rather than its own name symbol, so `(symbolp
+  (find-class 'foo))` is false and `DEFCLASS` returns the class as CLHS
+  requires. A class with a user `:METACLASS` is now an instance of it:
+  `TYPEP` holds, a method specialized on the metaclass applies and is
+  preferred over one on `STANDARD-CLASS`, and the class carries the
+  metaclass's slots (issue
+  [#384](https://github.com/atgreen/evergreen/issues/384),
+  [#399](https://github.com/atgreen/evergreen/pull/399)).
+- An inherited slot is reachable when the superclass is defined after the
+  subclass: `(defclass sub (super) ...)` followed by `(defclass super ()
+  ((a)))` left `A` unusable on an instance of `SUB`. Redefining a class now
+  updates its subclasses' instance layouts, and no longer discards its record
+  of them ([#399](https://github.com/atgreen/evergreen/pull/399)).
+- `TYPE-OF` answers the class itself when the class has no proper name, rather
+  than a name that no longer finds it
+  ([#399](https://github.com/atgreen/evergreen/pull/399)).
 - A built-in class is an object rather than an integer. `(find-class
   'integer)` was the fixnum -14, so `(eql -14 (find-class 'integer))` and
   `(integerp (find-class 'standard-class))` were both true, `(class-name -14)`

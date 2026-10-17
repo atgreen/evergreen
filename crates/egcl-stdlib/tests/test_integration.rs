@@ -339,13 +339,24 @@ fn clos_make_instance_and_slots() {
     let _guard = test_guard();
     bootstrap_clos().expect("bootstrap_clos");
 
-    let t_class = find_class(T).expect("T must exist");
+    // STANDARD-OBJECT, not T, as the superclass. A class that does not inherit
+    // STANDARD-OBJECT is not a standard class, and MAKE-INSTANCE refuses one
+    // (CLHS: it does not support built-in classes). This used to pass with `T`
+    // because "built-in" was decided by the class VALUE's representation -- a
+    // negative fixnum -- and a meta handle is not one; it is decided from the
+    // precedence list now (bliss-vsjn1). DEFCLASS has always defaulted to
+    // STANDARD-OBJECT, so this is what a real user class looks like.
+    let standard_object = find_class(EgclVal::from_symbol_index(egcl_rt::symbols::intern(
+        "STANDARD-OBJECT",
+    )))
+    .expect("STANDARD-OBJECT must exist");
     let user_class_name = EgclVal::from_symbol_index(100_200);
     let user_class = EgclVal::from_meta_handle(100_201);
     // Instances have a fixed inline slot layout: declare the slot (reusing the
     // same EgclVal so layout keying by identity resolves it on access).
     let slot_name = make_lisp_string("X");
-    define_class(user_class_name, user_class, &[t_class], &[slot_name]).expect("define_class");
+    define_class(user_class_name, user_class, &[standard_object], &[slot_name])
+        .expect("define_class");
     let instance = make_instance(user_class, &[]).expect("make_instance");
 
     // Slot should be unbound initially
