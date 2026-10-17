@@ -867,13 +867,17 @@
     (values (float q (%float-quotient-proto number divisor)) r)))
 
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
-;; actually stores. BIT, CHARACTER and DOUBLE-FLOAT have specialized storage;
-;; other element types upgrade to T.
+;; actually stores. BIT, BASE-CHAR (8-bit strings), CHARACTER (32-bit strings)
+;; and DOUBLE-FLOAT have specialized storage; other element types upgrade to T.
+;; BASE-CHAR used to upgrade to CHARACTER while MAKE-ARRAY and TYPEP kept the two
+;; widths apart (spec §1.6.3), so (upgraded-array-element-type 'base-char)
+;; disagreed with (array-element-type (make-array 1 :element-type 'base-char)).
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
   (cond ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
         ((eq type 'bit) 'bit)
-        ((member type '(character base-char standard-char)) 'character)
+        ((member type '(base-char standard-char)) 'base-char)
+        ((member type '(character extended-char)) 'character)
         (t t)))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
@@ -2348,10 +2352,26 @@
        ;; are a bit vector or string (ansi make-array.2d): COERCE to VECTOR
        ;; would hand those back as they are.
        (cond (bitp (%bit-vector-from-bits (coerce (car (cdr ic-cell)) 'list)))
+             ;; A BASE-CHAR request copies into a fresh 8-bit string element by
+             ;; element, so a wide character is the TYPE-ERROR the storage
+             ;; signals rather than a silent promotion.
+             ((and stringp (member et '(base-char standard-char)))
+              (let ((v (make-string size :element-type 'base-char))
+                    (i 0))
+                (dolist (e (coerce (car (cdr ic-cell)) 'list))
+                  (setf (aref v i) e)
+                  (setq i (+ i 1)))
+                v))
              (stringp (copy-seq (coerce (car (cdr ic-cell)) 'string)))
              (t (copy-seq (coerce (car (cdr ic-cell)) 'simple-vector)))))
+      ;; BASE-CHAR (and STANDARD-CHAR) ask for the 8-bit SIMPLE-BASE-STRING;
+      ;; CHARACTER and NIL get the 32-bit string (spec §1.6.3). MAKE-STRING
+      ;; carries the width.
       (stringp
-       (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
+       (let ((width (if (member et '(base-char standard-char)) 'base-char 'character)))
+         (if iel-cell
+             (make-string size :initial-element (car (cdr iel-cell)) :element-type width)
+             (make-string size :element-type width))))
       ;; A BIT array is a real SIMPLE-BIT-VECTOR (egcl builds these immutably,
       ;; so the whole content is supplied at construction). Default fill 0.
       (bitp
@@ -2560,7 +2580,14 @@
       ((member head '(list cons null))
        (make-list size :initial-element iel))
       (stringp
-       (if iel-cell (make-string size :initial-element iel) (make-string size)))
+       ;; BASE-STRING, or a vector of BASE-CHAR, is the 8-bit string.
+       (let ((width (if (or (member head '(base-string simple-base-string))
+                            (member elt '(base-char standard-char)))
+                        'base-char
+                        'character)))
+         (if iel-cell
+             (make-string size :initial-element iel :element-type width)
+             (make-string size :element-type width))))
       (bitp
        (make-array size :element-type 'bit :initial-element (if iel-cell iel 0)))
       ((and (member head '(vector array simple-array))
@@ -2611,7 +2638,14 @@
 ;; vector #(0 1 1 1 ...) instead of #*0101011111 (ansi SUBSTITUTE-BIT-VECTOR.24/25
 ;; and the NSUBSTITUTE pairs, which are built on this).
 (defun %coerce-like (list orig)
-  (cond ((stringp orig) (coerce list 'string))
+  (cond ((stringp orig)
+         ;; Same element type as ORIG, width included: an 8-bit base string
+         ;; comes back as one (ansi REMOVE-STRING.4, DELETE-IF-STRING.1,
+         ;; REMOVE-DUPLICATES.STRING.1 compare ARRAY-ELEMENT-TYPE of the
+         ;; result with the input's).
+         (coerce list (if (eq (array-element-type orig) 'base-char)
+                          'simple-base-string
+                          'string)))
         ((bit-vector-p orig) (coerce list 'bit-vector))
         ((listp orig) list)
         (t (coerce list 'vector))))

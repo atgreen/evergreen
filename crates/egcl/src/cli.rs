@@ -11574,13 +11574,24 @@ fn is_base_string_value(v: EgclVal) -> bool {
     if egcl_stdlib::registered_string(v).is_some() {
         return egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize) && v.is_base_string();
     }
-    // An adjustable / fill-pointer CHARACTER vector has element-type CHARACTER
-    // (32-bit), so it is a CHARACTER string, not a base string.
+    // A complex (adjustable, fill-pointer or displaced) string is a base
+    // string when the storage it reads and writes is: a string displaced onto
+    // an 8-bit base string refuses a wide character, so calling it CHARACTER
+    // let (setf subseq) copy wide characters into it and die (ansi strings
+    // RANDOM-STRING-COMPARISON-TESTS). An adjustable string's own store is
+    // 32-bit today, so it stays a CHARACTER string.
     if egcl_stdlib::is_complex_vector(v) {
-        return false;
+        return egcl_stdlib::cvec_is_string(v) && egcl_stdlib::string_storage_is_base(v);
     }
     // A real heap string: only the 8-bit SIMPLE_BASE_STRING type_id qualifies.
     v.is_base_string()
+}
+
+/// True if `v` is a BASE-CHAR: a character whose code point is below 256, the
+/// range an 8-bit `SIMPLE_BASE_STRING` stores (spec §1.6.3). EXTENDED-CHAR is
+/// the rest of CHARACTER.
+fn is_base_char_value(v: EgclVal) -> bool {
+    v.is_character() && (v.as_char() as u32) < 256
 }
 
 /// True if `v` is a registry-backed sentinel (a string/namestring hash wearing
@@ -15612,11 +15623,11 @@ fn numeric_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 // the array/vector/string family to `(simple?, element, dims)` and decides
 // containment. It is allocation-free (no GC), like the numeric algebra above.
 //
-// egcl upgrades every element type to one of exactly three: T, CHARACTER
-// (character/base-char/…) and BIT — matching `upgraded-array-element-type`. So
-// string ≡ base-string ≡ (array character (*)) here; the ansi
-// `:nil-vectors-are-strings` tests that need base-char arrays distinct from
-// character arrays are inherently unsatisfiable under this upgrade policy.
+// egcl upgrades every element type to one of T, CHARACTER (32-bit strings),
+// BASE-CHAR (8-bit strings; standard-char upgrades to it), BIT and
+// DOUBLE-FLOAT — matching `upgraded-array-element-type`. STRING is the union
+// of the character, base-char and nil arms (bliss-7kmw), not a specialized
+// type of its own.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EltU {
@@ -16363,11 +16374,11 @@ fn integer_range_within_bignum(t1: EgclVal) -> Option<(bool, bool)> {
 }
 
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
-    // egcl has no extended characters: EXTENDED-CHAR is the empty type, a
-    // subtype of everything (ansi subtypep.extended-char.1, types.9).
-    if t1.is_symbol() && !t1.is_nil() && sym_bare_name_rc(t1).as_ref() == "EXTENDED-CHAR" {
-        return (true, true);
-    }
+    // BASE-CHAR (code points below 256) is a proper subtype of CHARACTER and
+    // EXTENDED-CHAR is the rest of it; the symbol hierarchy table carries both,
+    // so neither needs a special case here. (EXTENDED-CHAR used to be the empty
+    // type, a subtype of everything, while TYPEP called every character a
+    // BASE-CHAR -- see the TYPEP arms.)
     if t2.is_symbol() && !t2.is_nil() && sym_bare_name_rc(t2).as_ref() == "BIGNUM" {
         if let Some(answer) = canonical_integer_type(t1)
             .or_else(|| t1.is_cons().then_some(t1))
@@ -16391,16 +16402,6 @@ fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
         egcl_rt::rooted!(canonical = canonical);
         egcl_rt::rooted!(t1 = t1);
         return subtypep_relation(*t1, *canonical);
-    }
-    // egcl has no extended characters, so BASE-CHAR and CHARACTER are the same
-    // type in both directions (TYPEP already says so; ansi arrays
-    // upgraded-array-element-type.2 checks the two SUBTYPEP answers agree).
-    if t1.is_symbol()
-        && t2.is_symbol()
-        && matches!(sym_bare_name_rc(t1).as_ref(), "CHARACTER" | "BASE-CHAR")
-        && matches!(sym_bare_name_rc(t2).as_ref(), "CHARACTER" | "BASE-CHAR")
-    {
-        return (true, true);
     }
     if t1.is_cons() && t2.is_cons() {
         let (head1, args1) = cp(t1);
@@ -16827,7 +16828,11 @@ fn typep_matches(
             // BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base strings —
             // every character a BASE-CHAR — not the 32-bit character strings a
             // STRING can also be (bliss-ajb3).
-            "BASE-STRING" | "SIMPLE-BASE-STRING" => is_base_string_value(object),
+            "BASE-STRING" => is_base_string_value(object),
+            // A displaced, adjustable or fill-pointer base string is not SIMPLE.
+            "SIMPLE-BASE-STRING" => {
+                is_base_string_value(object) && !egcl_stdlib::is_complex_vector(object)
+            }
             // Numeric lattice over the real heap numeric types (bignum, ratio,
             // double-float, complex), via the runtime predicates — the earlier
             // checks only recognised fixnum/single-float, so (typep (expt 2 100)
@@ -16892,17 +16897,24 @@ fn typep_matches(
             }
             "CHARACTER" => object.is_character(),
             // STANDARD-CHAR: the 96 standard characters — #\Newline plus the
-            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P). EGCL
-            // has no extended characters, so BASE-CHAR ≡ CHARACTER (its required
-            // superset of STANDARD-CHAR) and EXTENDED-CHAR is empty (bliss-vdtz).
+            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P).
             "STANDARD-CHAR" => {
                 object.is_character() && {
                     let code = object.as_char() as u32;
                     code == 10 || (32..127).contains(&code)
                 }
             }
-            "BASE-CHAR" => object.is_character(),
-            "EXTENDED-CHAR" => false,
+            // BASE-CHAR is the element type of an 8-bit SIMPLE-BASE-STRING: the
+            // code points below 256 (spec §1.6.3, R1.14). EXTENDED-CHAR is the
+            // rest of CHARACTER. TYPEP used to call EVERY character a BASE-CHAR
+            // (bliss-vdtz, "egcl has no extended characters") while BASE-STRING
+            // matched only 8-bit storage (bliss-ajb3), so a string of #\λ was a
+            // vector whose every element was a BASE-CHAR and yet not a
+            // BASE-STRING, and (make-array n :element-type 'base-char) built a
+            // 32-bit string TYPEP refused as a BASE-STRING (ansi sequences
+            // MAP.SPECIALIZED-STRING.3, LENGTH.STRING.6).
+            "BASE-CHAR" => is_base_char_value(object),
+            "EXTENDED-CHAR" => object.is_character() && !is_base_char_value(object),
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
             "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(object),
@@ -17308,6 +17320,9 @@ fn typep_matches(
         // the given length (bliss-ajb3).
         "BASE-STRING" | "SIMPLE-BASE-STRING" => {
             if !is_base_string_value(object) {
+                return Ok(false);
+            }
+            if op.as_ref() == "SIMPLE-BASE-STRING" && egcl_stdlib::is_complex_vector(object) {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))
@@ -23081,10 +23096,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                // Strings hold CHARACTER; bit-vectors (simple OR a
+                // An 8-bit base string holds BASE-CHAR and a 32-bit string
+                // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
                 // fill-pointer/adjustable/displaced complex bit vector, egcl-
                 // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
-                let ty = if is_string_value(v) {
+                let ty = if is_base_string_value(v) {
+                    "BASE-CHAR"
+                } else if is_string_value(v) {
                     "CHARACTER"
                 } else if is_bit_vector_value(v) {
                     "BIT"
@@ -27151,12 +27169,27 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Ok(resolve_sym("READTABLE").unwrap_or(NIL));
                 } else if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
                     // An adjustable or fill-pointered string is not a
-                    // SIMPLE-STRING (ansi coerce.1).
+                    // SIMPLE-STRING (ansi coerce.1). Its element type is the
+                    // storage's: BASE-CHAR when displaced onto a base string.
                     let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    let elt = if is_base_string_value(v) { "BASE-CHAR" } else { "CHARACTER" };
                     return Ok(vec_to_list(&[
                         resolve_sym("VECTOR").unwrap_or(NIL),
-                        resolve_sym("CHARACTER").unwrap_or(NIL),
+                        resolve_sym(elt).unwrap_or(NIL),
                         EgclVal::from_fixnum(size as i64),
+                    ]));
+                } else if is_string_value(v) && !is_base_string_value(v) {
+                    // A 32-bit CHARACTER string is (SIMPLE-ARRAY CHARACTER (n));
+                    // only the 8-bit storage is a SIMPLE-BASE-STRING, which is
+                    // what TYPEP answers for it (bliss-ajb3). TYPE-OF called
+                    // every string SIMPLE-BASE-STRING, so (typep x (type-of x))
+                    // was NIL for a MAKE-STRING result.
+                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    egcl_rt::rooted!(dims = vec_to_list(&[EgclVal::from_fixnum(size as i64)]));
+                    return Ok(vec_to_list(&[
+                        resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+                        resolve_sym("CHARACTER").unwrap_or(NIL),
+                        *dims,
                     ]));
                 }
                 // A general vector's TYPE-OF is (SIMPLE-VECTOR n), or
@@ -31234,20 +31267,34 @@ fn coerce_to_bit_vector_value(value: EgclVal, mut type_val: EgclVal) -> Result<E
 /// COERCE's string result, shared by the bare-symbol arm (`'string`) and the
 /// compound-specifier pre-check (`'(vector character)`) so the two cannot
 /// diverge (bliss-wzfm).
-fn coerce_to_string_value(value: EgclVal) -> Result<EgclVal, EgclError> {
-    if egcl_stdlib::registered_string(value).is_some() {
+/// `base` asks for an 8-bit BASE-STRING: every element must then be a
+/// BASE-CHAR and the result is a SIMPLE-BASE-STRING, where COERCE built the
+/// 32-bit CHARACTER string for every string type -- so `(coerce '(#\a)
+/// 'base-string)` answered a string TYPEP refused as a BASE-STRING.
+fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclError> {
+    if !base && egcl_stdlib::registered_string(value).is_some() {
         return Ok(value);
     }
     let mut s = String::new();
     for e in seq_elements(value)? {
         if e.is_character() {
+            if base && !is_base_char_value(e) {
+                return Err(EgclError::TypeError {
+                    datum: e,
+                    expected: "base-char".into(),
+                });
+            }
             s.push(e.as_char());
         }
     }
     // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
     // :element-type character :initial-contents) must be MUTABLE — an
     // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
-    Ok(egcl_stdlib::make_lisp_string_fresh(&s))
+    Ok(if base {
+        egcl_stdlib::make_lisp_base_string_fresh(&s)
+    } else {
+        egcl_stdlib::make_lisp_string_fresh(&s)
+    })
 }
 
 /// Resolve DEFTYPE and function designators once, for both call paths.
@@ -31363,7 +31410,7 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
                 });
             }
         }
-        return coerce_to_string_value(value);
+        return coerce_to_string_value(value, egcl_stdlib::result_type_is_base_string(type_val));
     }
     // Same gap, one type over: `(vector bit)` / `(simple-array bit (*))` name a
     // bit vector through their ELEMENT TYPE, and the head-symbol dispatch below
@@ -31440,9 +31487,8 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
                 })
             }
         }
-        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
-            coerce_to_string_value(value)
-        }
+        "STRING" | "SIMPLE-STRING" => coerce_to_string_value(value, false),
+        "BASE-STRING" | "SIMPLE-BASE-STRING" => coerce_to_string_value(value, true),
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
             if value.is_character() {
                 return Ok(value);

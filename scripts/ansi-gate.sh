@@ -48,7 +48,10 @@ set -u
 # environment added 2026-10-15: ok (210/210) once FUNCTION-KEYWORDS,
 # INITIALIZE-INSTANCE, NO-APPLICABLE-METHOD and NO-NEXT-METHOD had function
 # objects (documentation.function.t.12 walks every standard generic function).
-ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment)
+# sequences added 2026-10-17: ok (3287/3287) once BASE-CHAR became the element
+# type of an 8-bit base string at every constructor and copy (its last two
+# failures were LENGTH.STRING.6 and MAP.SPECIALIZED-STRING.3).
+ENABLED_CHAPTERS=(cons data-and-control-flow hash-tables characters strings conditions misc files environment sequences)
 
 ANSI_TEST_DIR="${ANSI_TEST_DIR:-$HOME/git/ansi-test}"
 EGCL_BIN="${EGCL_BIN:-target/x86_64-unknown-linux-musl/debug/egcl}"

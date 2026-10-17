@@ -97,6 +97,21 @@
   answered `INTEGER`, a method specialized on `BUILT-IN-CLASS` applied to the
   integer -14, and a class printed as `-40`
   ([#396](https://github.com/atgreen/evergreen/pull/396)).
+- `BASE-CHAR` is the element type of an 8-bit base string, consistently.
+  `TYPEP` called every character a `BASE-CHAR` while `BASE-STRING` matched
+  only 8-bit storage, `MAKE-STRING` ignored `:element-type`, and `MAP`,
+  `COERCE` and `MAKE-SEQUENCE` built 32-bit strings for `BASE-STRING`, so
+  `(make-array 5 :element-type 'base-char)` and `(map 'base-string ...)`
+  answered strings `TYPEP` refused as base strings, and `TYPE-OF` called
+  every string `SIMPLE-BASE-STRING`. `BASE-CHAR` is now the code points
+  below 256 and `EXTENDED-CHAR` the rest, `UPGRADED-ARRAY-ELEMENT-TYPE` and
+  `ARRAY-ELEMENT-TYPE` answer `BASE-CHAR` for 8-bit strings (a string
+  displaced onto one included), the constructors honor the requested width
+  (a wide character is a `TYPE-ERROR`), `COPY-SEQ`, `SUBSEQ`, `REVERSE` and the `REMOVE`,
+  `SUBSTITUTE` and `REMOVE-DUPLICATES` families keep a string's width, and
+  `TYPE-OF` answers `(SIMPLE-ARRAY CHARACTER (n))` for a 32-bit string (ansi
+  sequences `MAP.SPECIALIZED-STRING.3`, `LENGTH.STRING.6`; the sequences
+  chapter now passes completely and joins the gate).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal
