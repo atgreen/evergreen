@@ -17399,6 +17399,13 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
     // on error), which also keeps `current_package` — the reader's bare-symbol
     // resolution context (bliss-lb6.12) and the REPL prompt — consistent.
     let saved_package = env.current_package.clone();
+    // *READTABLE* is bound the same way, so a file's IN-READTABLE (or SETF of
+    // *READTABLE*) does not leak into the code that loaded it. It lives in the
+    // symbol's value cell; the guard restores it on success or error.
+    let mut readtable_binding = egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
+        DynBind::establish(EgclVal::from_symbol_index(index), cli_current_readtable())
+    });
+    egcl_rt::rooted_ref!(_readtable_binding_root = &mut readtable_binding);
     // ANSI LOAD also dynamically binds *LOAD-PATHNAME*/*LOAD-TRUENAME* to the
     // file being loaded.  The binding must live in the symbols' value cells:
     // functions called by the loaded file run in their captured lexical

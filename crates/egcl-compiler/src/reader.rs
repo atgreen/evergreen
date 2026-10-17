@@ -4551,6 +4551,42 @@ pub fn set_macro_character(
     Ok(())
 }
 
+/// Give standard macro character `ch` its built-in syntax in `readtable`, as
+/// SET-MACRO-CHARACTER does when handed the function GET-MACRO-CHARACTER reports
+/// for `ch` in the standard readtable. That function is a stand-in for a reader
+/// written in Rust and reads the object with the STANDARD readtable, so storing
+/// it as a custom macro would read every sub-form of a list with standard
+/// syntax, ignoring the readtable's own macros. named-readtables'
+/// `(:merge :standard)` copies the standard syntax this way, which made a
+/// `"""`-string inside a list read as three ordinary strings.
+pub fn set_standard_macro_syntax(readtable: EgclVal, ch: char, non_terminating: bool) {
+    let key = readtable_key(readtable);
+    {
+        let mut guard = MACRO_CHARS.lock().unwrap();
+        if let Some(table) = guard.as_mut() {
+            table.remove(&(key, ch));
+        }
+    }
+    {
+        let mut guard = CHAR_SYNTAX.lock().unwrap();
+        let table = guard.get_or_insert_with(HashMap::new);
+        let code = if non_terminating { 3 } else { 2 };
+        table.insert((key, ch), (code, ch));
+    }
+    ANY_CHAR_SYNTAX_OVERRIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drop a custom `#` sub-character reader from `readtable`, so the built-in one
+/// applies again. The dispatch-table counterpart of
+/// [`set_standard_macro_syntax`].
+pub fn set_standard_dispatch_macro_character(readtable: EgclVal, disp_char: char, sub_char: char) {
+    let key = readtable_key(readtable);
+    let mut guard = DISPATCH_SUB_CHARS.lock().unwrap();
+    if let Some(table) = guard.as_mut() {
+        table.remove(&(key, disp_char, sub_char.to_ascii_uppercase()));
+    }
+}
+
 pub fn get_macro_character(
     readtable: EgclVal,
     ch: char,

@@ -8,6 +8,18 @@ use super::*;
 
 type Handler = fn(&str, &[EgclVal], &mut Env) -> Result<EgclVal, EgclError>;
 
+/// Whether `function` (a designator as passed to SET-MACRO-CHARACTER, or its
+/// installed function) is the boot.lisp stand-in named `stand_in` that
+/// GET-MACRO-CHARACTER / GET-DISPATCH-MACRO-CHARACTER report for a reader
+/// written in Rust. Looks the symbol up without interning, so it never allocates.
+fn is_standard_reader_stand_in(function: EgclVal, installed: EgclVal, stand_in: &str) -> bool {
+    let Some(index) = reader::find_symbol_index(stand_in) else {
+        return false;
+    };
+    function == EgclVal::from_symbol_index(index)
+        || installed_function(index).is_some_and(|f| f == installed)
+}
+
 pub(super) fn call(
     name: &str,
     args: &[EgclVal],
@@ -524,17 +536,40 @@ fn resolve(name: &str) -> Option<Handler> {
                     "SET-DISPATCH-MACRO-CHARACTER requires disp-char sub-char function".into(),
                 ));
             }
-            let handler = coerce_installed_function(env, args[2]);
+            egcl_rt::rooted!(handler = coerce_installed_function(env, args[2]));
             let rt = args
                 .get(3)
                 .copied()
                 .filter(|v| v.is_heap_object())
                 .unwrap_or_else(cli_current_readtable);
+            // Restoring a standard # sub-character's own reader (named-readtables
+            // merging the standard dispatch table) reinstates the built-in one,
+            // which reads nested forms with the CURRENT readtable; the stand-ins
+            // read with the standard one.
+            if args[0].as_char() == '#'
+                && (is_standard_reader_stand_in(
+                    args[2],
+                    *handler,
+                    "EGCL::%STANDARD-DISPATCH-READER-MACRO",
+                ) || (args[1].as_char() == '\\'
+                    && is_standard_reader_stand_in(
+                        args[2],
+                        *handler,
+                        "EGCL::%STANDARD-CHARACTER-READER",
+                    )))
+            {
+                reader::set_standard_dispatch_macro_character(
+                    rt,
+                    args[0].as_char(),
+                    args[1].as_char(),
+                );
+                return Ok(T);
+            }
             reader::set_dispatch_macro_character(
                 rt,
                 args[0].as_char(),
                 args[1].as_char(),
-                handler,
+                *handler,
             )?;
             Ok(T)
         }),
@@ -656,14 +691,24 @@ fn resolve(name: &str) -> Option<Handler> {
                     "SET-MACRO-CHARACTER requires char function".into(),
                 ));
             }
-            let handler = coerce_installed_function(env, args[1]);
+            egcl_rt::rooted!(handler = coerce_installed_function(env, args[1]));
             let non_term = args.get(2).copied().unwrap_or(NIL) != NIL;
             let rt = args
                 .get(3)
                 .copied()
                 .filter(|v| v.is_heap_object())
                 .unwrap_or_else(cli_current_readtable);
-            reader::set_macro_character(rt, args[0].as_char(), handler, non_term)?;
+            // The stand-in GET-MACRO-CHARACTER reports for a standard macro
+            // character, put back on that same character, means its built-in
+            // syntax (see reader::set_standard_macro_syntax).
+            let ch = args[0].as_char();
+            if reader::standard_macro_char(ch).is_some()
+                && is_standard_reader_stand_in(args[1], *handler, "EGCL::%STANDARD-READER-MACRO")
+            {
+                reader::set_standard_macro_syntax(rt, ch, non_term);
+                return Ok(T);
+            }
+            reader::set_macro_character(rt, ch, *handler, non_term)?;
             Ok(T)
         }),
 
