@@ -2807,6 +2807,35 @@ enum HandlerImpl {
 
 static CONTROL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Where a saved core records `CONTROL_COUNTER`, so a restored process keeps
+/// counting past every token the image already used.
+///
+/// Some tokens become interned names in compiled code: a non-portable FLET
+/// helper is registered as the global function `__FLET___<n>` in the current
+/// package. A restored process restarted the counter at 0, so its 480th FLET in
+/// a package re-minted a name the image had already used, and redefined that
+/// saved helper. PARSE-INTEGER's whitespace test was `__FLET___480`; once an
+/// unrelated FLET replaced it, `(parse-integer "1")` signalled "not an
+/// integer", which broke ASDF's version parsing in the `make image` egcl.
+const IMAGE_CONTROL_COUNTER_VAR: &str = "EGCL-INTERNAL::*IMAGE-CONTROL-COUNTER*";
+
+/// Record the control-token counter in the image being saved.
+fn save_control_counter_floor() {
+    let used = CONTROL_COUNTER.load(std::sync::atomic::Ordering::Relaxed);
+    let idx = egcl_rt::symbols::intern(IMAGE_CONTROL_COUNTER_VAR);
+    egcl_rt::symbols::set_symbol_value(idx, EgclVal::from_fixnum(used as i64));
+}
+
+/// After a restore, never mint a control token the image already used.
+fn restore_control_counter_floor() {
+    let saved = egcl_rt::symbols::find_index(IMAGE_CONTROL_COUNTER_VAR)
+        .and_then(egcl_rt::symbols::symbol_value)
+        .filter(|v| v.is_fixnum() && v.as_fixnum() >= 0);
+    if let Some(saved) = saved {
+        CONTROL_COUNTER.fetch_max(saved.as_fixnum() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // Global definitions and their movable cache keys must be scanned regardless
 // of which native thread initiates collection. Never evaluate or allocate Lisp
 // objects while holding either registry lock.
@@ -42421,6 +42450,7 @@ fn save_core(path: &str, executable: bool, shake: bool, application: bool, env: 
     // The core carries its entry point in the IMAGE_TOPLEVEL_VAR symbol value
     // cell (serialized with the symbol table), not the image entry continuation.
     egcl_rt::gc::set_entry_continuation(NIL);
+    save_control_counter_floor();
 
     let opts = egcl_rt::image::SaveImageOptions {
         executable: false,
@@ -42494,6 +42524,8 @@ fn load_core_image(file: &std::fs::File, offset: u64, len: u64, env: &mut Env) -
     // generic dispatch. This must run after the CLOS state is restored (via the
     // host hook inside load_image_from_bytes above).
     advance_stdlib_class_id_floor(egcl_stdlib::clos::max_metaobject_id());
+    // The same hazard for compiler-minted names such as FLET helpers.
+    restore_control_counter_floor();
     // Re-register the compiled code behind every restored source-free stub
     // (bliss-zz6w): execute the saved bytecode-registry unit through the
     // BBU loader's restore mode, preserving the restored function identities.

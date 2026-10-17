@@ -44,6 +44,11 @@
 
 ### Fixed
 
+- A saved image no longer lets newly compiled code redefine the local
+  functions of code it saved. Loading the ocicl runtime in the `make image`
+  egcl replaced one inside `PARSE-INTEGER`, after which `(parse-integer "1")`
+  signalled "not an integer" and ASDF could not load babel
+  ([#386](https://github.com/atgreen/evergreen/pull/386)).
 - `MAKE-PATHNAME` no longer builds a pathname with a wrong component when a
   garbage collection happens while it runs: with a `:directory` list or a
   namestring `:defaults`, a freshly made `:name` or `:type` string could be
