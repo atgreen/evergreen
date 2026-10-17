@@ -44,6 +44,11 @@
 
 ### Fixed
 
+- Threads running interpreted code no longer crash while another thread
+  collects garbage. A `:synchronized t` hash table now takes its lock on every
+  operation as documented; it never did, and the interpreter's shared
+  macro-expansion cache is such a table
+  ([#398](https://github.com/atgreen/evergreen/pull/398)).
 - A built-in class is an object rather than an integer. `(find-class
   'integer)` was the fixnum -14, so `(eql -14 (find-class 'integer))` and
   `(integerp (find-class 'standard-class))` were both true, `(class-name -14)`
