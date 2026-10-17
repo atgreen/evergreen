@@ -589,6 +589,11 @@ pub struct SysvSiteSnapshot {
 }
 
 impl SysvSiteSnapshot {
+    /// See `TransferSnapshot::clear`: reuse for a later activation.
+    pub fn clear(&mut self) {
+        self.snapshot.clear();
+    }
+
     fn check_pc(
         &self,
         code_base: usize,

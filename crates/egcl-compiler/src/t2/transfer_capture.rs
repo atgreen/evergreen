@@ -96,6 +96,18 @@ impl TransferSnapshot {
         self.captured = false;
     }
 
+    /// Ready this buffer for another activation of the same code: forget the
+    /// capture and every tagged word it copied, so a buffer that nothing
+    /// traces never holds a Lisp value.
+    pub(crate) fn clear(&mut self) {
+        self.captured = false;
+        for slot in &mut self.saved {
+            if let SavedWord::Tagged(word) = &slot.word {
+                word.set(egcl_rt::value::NIL);
+            }
+        }
+    }
+
     pub fn new(map: &TransferCaptureMap) -> Result<Self, CaptureError> {
         let mut saved = Vec::new();
         for frame in &map.frames {

@@ -235,7 +235,7 @@ impl OrdinarySegmentGuard {
             owner: std::ptr::from_ref(code),
             start,
             len,
-            callable: Arc::new(egcl_rt::CrossThreadRoot::new(*function)),
+            callable: code.callable_root(*function),
         });
         self.directory.roots.borrow_mut().push(Rc::clone(&identity));
         Some(OrdinaryRootGuard {
