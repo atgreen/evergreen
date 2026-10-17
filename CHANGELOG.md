@@ -41,6 +41,10 @@
   ([#352](https://github.com/atgreen/evergreen/pull/352),
   [#366](https://github.com/atgreen/evergreen/pull/366);
   issue [#350](https://github.com/atgreen/evergreen/issues/350)).
+- `egcl-ext:chdir` and `egcl-ext:delete-directory`, and through them
+  `uiop:chdir`, `uiop:delete-empty-directory` and `uiop:delete-directory-tree`,
+  which signalled "Not (currently) implemented on EGCL"
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
 
 ### Fixed
 
@@ -71,6 +75,25 @@
   answered `INTEGER`, a method specialized on `BUILT-IN-CLASS` applied to the
   integer -14, and a class printed as `-40`
   ([#396](https://github.com/atgreen/evergreen/pull/396)).
+- A readtable built from the standard syntax with `GET-MACRO-CHARACTER` and
+  `SET-MACRO-CHARACTER`, as named-readtables' `(:merge :standard)` does, reads
+  the forms inside a list with that readtable. It used the standard one, so a
+  pythonic `"""…"""` string inside a form broke apart (40ants-doc). `LOAD` also
+  binds `*READTABLE*`, so a loaded file's `IN-READTABLE` no longer leaks into
+  the code that loaded it
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- A constant one library defines while it compiles no longer becomes the
+  symbol another package reads for that name. ironclad's and flexi-streams'
+  `+BUFFER-SIZE+` turned up in drakma and salza2, and salza2's `DEFPARAMETER`
+  of it failed as an assignment to a constant
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- `COMPILE-FILE` no longer panics on data shaped like a `DEFCONSTANT` form,
+  such as the `CASE` key `((defconstant) …)`. A literal string with a fill
+  pointer, such as cl-interpol's `#?"…"` reads, compiles into the fasl
+  instead of making the whole file source-only, and the read-time `#.` forms
+  of a file that is still source-only see its source as
+  `*COMPILE-FILE-PATHNAME*`
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal
