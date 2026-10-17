@@ -19556,6 +19556,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%SOCKET-WAIT-FOR-INPUT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SOCKET-LISTENER-READY-P" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%STREAM-LISTEN" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%STREAM-EXTERNAL-FORMAT" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%MAKE-STRUCT" => return eval_builtin_arguments(&name, cdr, env),
             "GETF" => return eval_builtin_arguments(&name, cdr, env),
             "WRITE-BYTE" => return eval_builtin_arguments(&name, cdr, env),
@@ -41209,6 +41210,33 @@ struct OpenOptions {
     element_type: EgclVal,
     if_exists: EgclVal,
     if_does_not_exist: EgclVal,
+    external_format: egcl_stdlib::ExternalFormat,
+}
+
+/// The external format an OPEN designator names: a keyword, or a list whose
+/// first element is one, as in cl-pdf's `(:latin-1 :eol-style :lf)` for
+/// LispWorks. `:DEFAULT` is UTF-8, the image's own. A format the stream
+/// layer does not decode is refused here, rather than read as UTF-8 by
+/// accident as every designator used to be.
+fn external_format_from_designator(
+    value: EgclVal,
+) -> Result<egcl_stdlib::ExternalFormat, EgclError> {
+    let designator = if value.is_cons() { cp(value).0 } else { value };
+    let name = if designator.is_symbol() {
+        sym_bare_name_rc(designator).to_string()
+    } else {
+        val_as_str(designator)
+    };
+    match name.to_ascii_uppercase().as_str() {
+        "DEFAULT" | "UTF-8" | "UTF8" => Ok(egcl_stdlib::ExternalFormat::Utf8),
+        "LATIN-1" | "LATIN1" | "ISO-8859-1" | "ISO8859-1" => {
+            Ok(egcl_stdlib::ExternalFormat::Latin1)
+        }
+        "ASCII" | "US-ASCII" => Ok(egcl_stdlib::ExternalFormat::Ascii),
+        other => Err(EgclError::StreamError(format!(
+            "OPEN: external format {other} is not supported; UTF-8, LATIN-1 and ASCII are"
+        ))),
+    }
 }
 
 /// Decode already-EVALUATED `key value` pairs into `OpenOptions`.
@@ -41287,6 +41315,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
     let mut if_exists = T;
     let mut if_does_not_exist = NIL;
     let mut if_dne_supplied = false;
+    let mut external_format = egcl_stdlib::ExternalFormat::Utf8;
 
     let mut i = 0;
     while i + 1 < pairs.len() {
@@ -41305,8 +41334,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
                 if_does_not_exist = value;
                 if_dne_supplied = true;
             }
-            // :EXTERNAL-FORMAT is accepted and ignored — the stream layer is
-            // UTF-8 only for now.
+            "EXTERNAL-FORMAT" => external_format = external_format_from_designator(value)?,
             _ => {}
         }
         i += 2;
@@ -41365,6 +41393,7 @@ fn decode_open_options(pairs: &[EgclVal], env: &Env) -> Result<OpenOptions, Egcl
         element_type,
         if_exists,
         if_does_not_exist,
+        external_format,
     })
 }
 
@@ -41418,7 +41447,7 @@ fn eval_with_open_file(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError
         options.element_type,
         options.if_exists,
         options.if_does_not_exist,
-        egcl_stdlib::ExternalFormat::Utf8,
+        options.external_format,
     )?;
     // Root the stream (a heap object) across the allocating body evaluation:
     // it is dereferenced by `close` after the body runs (moving GC; bliss-8qf).

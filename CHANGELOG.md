@@ -27,6 +27,17 @@
 
 ### Fixed
 
+- `OPEN` and `WITH-OPEN-FILE` honor `:external-format :latin-1` (also
+  `:iso-8859-1`) and `:ascii`, alone or as the first element of a list such
+  as `(:latin-1 :eol-style :lf)`; `:default` and `:utf-8` remain UTF-8. The
+  keyword was accepted and ignored, so a Latin-1 file was decoded as UTF-8
+  and the first accented letter was a `STREAM-ERROR`: cl-pdf opens its font
+  metrics and cl-typesetting its French hyphenation patterns that way, and
+  cl-typesetting could not load. Reading decodes one octet per character,
+  writing refuses a character outside the format's range, and
+  `STREAM-EXTERNAL-FORMAT` answers the format a file stream was opened with
+  instead of `:default`. A format the stream layer cannot decode (`:utf-16`,
+  `:utf-32`) is refused at `OPEN` rather than read as UTF-8.
 - `LISTEN` on a freshly opened octet file stream answers T while bytes remain
   and NIL at the end of the file. With nothing buffered yet it asked the
   handle as if it were a socket, and a regular file always answered NIL, so a

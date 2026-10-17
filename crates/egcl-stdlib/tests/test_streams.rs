@@ -397,7 +397,7 @@ fn open_with_various_formats() {
         ExternalFormat::Utf16,
         ExternalFormat::Utf32,
     ] {
-        let result = open(NIL, StreamDirection::Input, NIL, NIL, NIL, fmt.clone());
+        let result = open(NIL, StreamDirection::Input, NIL, NIL, NIL, *fmt);
         // NIL is not a valid pathname, all should fail.
         assert!(result.is_err());
     }

@@ -98,7 +98,7 @@ pub enum StreamDirection {
     Probe,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExternalFormat {
     Utf8,
     Ascii,
@@ -639,27 +639,23 @@ fn file_read_char_without_parking(
     line: &mut u64,
     col: &mut u64,
     unread: &mut Option<char>,
+    format: ExternalFormat,
 ) -> Result<InputStep<EgclVal>, EgclError> {
     if let Some(c) = unread.take() {
         return Ok(InputStep::Done(EgclVal::from_char(c)));
     }
     loop {
-        for length in 1..=(*buf_fill - *buf_pos).min(4) {
-            match std::str::from_utf8(&read_buf[*buf_pos..*buf_pos + length]) {
-                Ok(text) => {
-                    let ch = text.chars().next().unwrap();
-                    *buf_pos += length;
-                    track_col(ch, line, col);
-                    return Ok(InputStep::Done(EgclVal::from_char(ch)));
-                }
-                Err(error) if error.error_len().is_some() || length == 4 => {
-                    *buf_pos += length;
-                    return Err(EgclError::StreamError(
-                        "invalid UTF-8 in file stream".into(),
-                    ));
-                }
-                Err(_) => {}
+        match decode_char(format, &read_buf[*buf_pos..*buf_fill]) {
+            Decoded::Char(ch, length) => {
+                *buf_pos += length;
+                track_col(ch, line, col);
+                return Ok(InputStep::Done(EgclVal::from_char(ch)));
             }
+            Decoded::Invalid => {
+                *buf_pos += 1;
+                return Err(invalid_octets_error(format));
+            }
+            Decoded::Incomplete => {}
         }
         // Compact the incomplete prefix to the front, exactly as the parking
         // version does, so the retry resumes from a valid position.
@@ -702,6 +698,7 @@ fn file_read_char_buffered(
     col: &mut u64,
     unread: &mut Option<char>,
     wait: bool,
+    format: ExternalFormat,
 ) -> Result<EgclVal, EgclError> {
     if let Some(c) = unread.take() {
         return Ok(EgclVal::from_char(c));
@@ -709,22 +706,17 @@ fn file_read_char_buffered(
     loop {
         // Decode without consuming an incomplete prefix. NO-HANG can return
         // NIL between any two bytes of a character and resume on its next call.
-        for length in 1..=(*buf_fill - *buf_pos).min(4) {
-            match std::str::from_utf8(&read_buf[*buf_pos..*buf_pos + length]) {
-                Ok(text) => {
-                    let ch = text.chars().next().unwrap();
-                    *buf_pos += length;
-                    track_col(ch, line, col);
-                    return Ok(EgclVal::from_char(ch));
-                }
-                Err(error) if error.error_len().is_some() || length == 4 => {
-                    *buf_pos += length;
-                    return Err(EgclError::StreamError(
-                        "invalid UTF-8 in file stream".into(),
-                    ));
-                }
-                Err(_) => {}
+        match decode_char(format, &read_buf[*buf_pos..*buf_fill]) {
+            Decoded::Char(ch, length) => {
+                *buf_pos += length;
+                track_col(ch, line, col);
+                return Ok(EgclVal::from_char(ch));
             }
+            Decoded::Invalid => {
+                *buf_pos += 1;
+                return Err(invalid_octets_error(format));
+            }
+            Decoded::Incomplete => {}
         }
         if !wait
             && !file
@@ -753,14 +745,102 @@ fn file_read_char_buffered(
     }
 }
 
+/// What one decoding attempt at the front of a buffer found.
+enum Decoded {
+    /// A character, and the octets it occupied.
+    Char(char, usize),
+    /// The buffer ends inside a character; more input is needed.
+    Incomplete,
+    /// The octets cannot begin a character of this format.
+    Invalid,
+}
+
+/// Decode the character at the front of `bytes` under `format`: UTF-8 is
+/// tried at every length up to four, LATIN-1 is one octet per character,
+/// ASCII one octet below 128. A format this layer does not decode is
+/// refused at OPEN, so none reaches here; the UTF-8 arm is the default.
+fn decode_char(format: ExternalFormat, bytes: &[u8]) -> Decoded {
+    match format {
+        ExternalFormat::Latin1 => match bytes.first() {
+            Some(&b) => Decoded::Char(b as char, 1),
+            None => Decoded::Incomplete,
+        },
+        ExternalFormat::Ascii => match bytes.first() {
+            Some(&b) if b < 0x80 => Decoded::Char(b as char, 1),
+            Some(_) => Decoded::Invalid,
+            None => Decoded::Incomplete,
+        },
+        _ => {
+            for length in 1..=bytes.len().min(4) {
+                match std::str::from_utf8(&bytes[..length]) {
+                    Ok(text) => return Decoded::Char(text.chars().next().unwrap(), length),
+                    Err(error) if error.error_len().is_some() || length == 4 => {
+                        return Decoded::Invalid;
+                    }
+                    Err(_) => {}
+                }
+            }
+            Decoded::Incomplete
+        }
+    }
+}
+
+/// The STREAM-ERROR for octets that are not a character of `format`.
+fn invalid_octets_error(format: ExternalFormat) -> EgclError {
+    EgclError::StreamError(match format {
+        ExternalFormat::Ascii => "octet above 127 on an ASCII file stream".into(),
+        _ => "invalid UTF-8 in file stream".into(),
+    })
+}
+
+/// Decode a run of octets under `format`, for the bulk line reader.
+fn decode_run(format: ExternalFormat, bytes: Vec<u8>) -> Result<String, EgclError> {
+    match format {
+        ExternalFormat::Latin1 => Ok(bytes.iter().map(|&b| b as char).collect()),
+        ExternalFormat::Ascii => {
+            if bytes.iter().all(|&b| b < 0x80) {
+                Ok(bytes.iter().map(|&b| b as char).collect())
+            } else {
+                Err(invalid_octets_error(format))
+            }
+        }
+        _ => String::from_utf8(bytes).map_err(|_| invalid_octets_error(format)),
+    }
+}
+
+/// Append the octets of `c` under `format` to `out`: one octet for LATIN-1
+/// and ASCII, which refuse a character outside their range with a
+/// STREAM-ERROR, else UTF-8.
+fn encode_char(format: ExternalFormat, c: char, out: &mut Vec<u8>) -> Result<(), EgclError> {
+    let (limit, name) = match format {
+        ExternalFormat::Latin1 => (0x100, "LATIN-1"),
+        ExternalFormat::Ascii => (0x80, "ASCII"),
+        _ => {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            return Ok(());
+        }
+    };
+    let code = c as u32;
+    if code < limit {
+        out.push(code as u8);
+        Ok(())
+    } else {
+        Err(EgclError::StreamError(format!(
+            "character U+{code:04X} cannot be encoded as {name}"
+        )))
+    }
+}
+
 /// Read a whole line (up to and consuming a `\n`, or to EOF) from a buffered
-/// UTF-8/ASCII file input in bulk, instead of decoding and pushing one char at a
+/// UTF-8, ASCII or LATIN-1 file input in bulk, instead of decoding and pushing one char at a
 /// time (the per-char loop paid a UTF-8 decode + a `Vec<char>` push per byte).
 /// The newline byte 0x0A never occurs inside a UTF-8 multi-byte sequence (those
 /// are 0x80–0xBF continuation / 0xC0+ leading bytes), so scanning the raw buffer
 /// for 0x0A splits exactly at line boundaries; the bytes between boundaries are
 /// therefore complete UTF-8 and decode as one `String`. Returns `(line,
 /// missing-newline-p)`; `(EOF, true)` at end of input with nothing buffered.
+#[allow(clippy::too_many_arguments)]
 fn file_read_line_buffered(
     file: &mut StreamHandle,
     read_buf: &mut Vec<u8>,
@@ -769,6 +849,7 @@ fn file_read_line_buffered(
     line: &mut u64,
     col: &mut u64,
     unread: &mut Option<char>,
+    format: ExternalFormat,
 ) -> Result<(EgclVal, bool), EgclError> {
     let mut line_bytes: Vec<u8> = Vec::new();
     // A pushed-back (unread) char is logically the first char of the line.
@@ -778,13 +859,9 @@ fn file_read_line_buffered(
             *col = 0;
             return Ok((make_lisp_string(""), false));
         }
-        let mut tmp = [0u8; 4];
-        line_bytes.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+        encode_char(format, c, &mut line_bytes)?;
     }
-    let decode = |bytes: Vec<u8>| -> Result<String, EgclError> {
-        String::from_utf8(bytes)
-            .map_err(|_| EgclError::StreamError("invalid UTF-8 in file stream".into()))
-    };
+    let decode = |bytes: Vec<u8>| -> Result<String, EgclError> { decode_run(format, bytes) };
     loop {
         if *buf_pos >= *buf_fill {
             read_buf.resize(FILE_BUF_SIZE, 0);
@@ -876,9 +953,10 @@ impl StreamMutableState {
                 line,
                 col,
                 unread,
+                external_format,
                 ..
             } => file_read_char_without_parking(
-                file, read_buf, buf_pos, buf_fill, line, col, unread,
+                file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
             ),
             StreamInner::FileIo {
                 file,
@@ -889,11 +967,12 @@ impl StreamMutableState {
                 line,
                 col,
                 unread,
+                external_format,
                 ..
             } => {
                 file_flush_write_buf(file, write_buf)?;
                 file_read_char_without_parking(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread,
+                    file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
                 )
             }
             _ => self.stream_read_char().map(InputStep::Done),
@@ -1226,10 +1305,11 @@ impl GrayStream for StreamMutableState {
                 line,
                 col,
                 unread,
+                external_format,
                 ..
-            } => {
-                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread, true)
-            }
+            } => file_read_char_buffered(
+                file, read_buf, buf_pos, buf_fill, line, col, unread, true, *external_format,
+            ),
             StreamInner::FileIo {
                 file,
                 read_buf,
@@ -1239,10 +1319,13 @@ impl GrayStream for StreamMutableState {
                 line,
                 col,
                 unread,
+                external_format,
                 ..
             } => {
                 file_flush_write_buf(file, write_buf)?;
-                file_read_char_buffered(file, read_buf, buf_pos, buf_fill, line, col, unread, true)
+                file_read_char_buffered(
+                    file, read_buf, buf_pos, buf_fill, line, col, unread, true, *external_format,
+                )
             }
             // Issue #1: Handle TwoWay and Echo as separate arms to avoid
             // borrow-checker conflict when reading from input then writing to output.
@@ -1463,11 +1546,10 @@ impl GrayStream for StreamMutableState {
                 write_buf,
                 line,
                 col,
+                external_format,
                 ..
             } => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                write_buf.extend_from_slice(encoded.as_bytes());
+                encode_char(*external_format, c, write_buf)?;
                 if c == '\n' {
                     *line += 1;
                     *col = 0;
@@ -1484,11 +1566,10 @@ impl GrayStream for StreamMutableState {
                 write_buf,
                 line,
                 col,
+                external_format,
                 ..
             } => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                write_buf.extend_from_slice(encoded.as_bytes());
+                encode_char(*external_format, c, write_buf)?;
                 if c == '\n' {
                     *line += 1;
                     *col = 0;
@@ -1702,9 +1783,16 @@ impl GrayStream for StreamMutableState {
                 write_buf,
                 line,
                 col,
+                external_format,
                 ..
             } => {
-                write_buf.extend_from_slice(slice);
+                if *external_format == ExternalFormat::Utf8 {
+                    write_buf.extend_from_slice(slice);
+                } else {
+                    for c in str_slice.chars() {
+                        encode_char(*external_format, c, write_buf)?;
+                    }
+                }
                 for c in str_slice.chars() {
                     if c == '\n' {
                         *line += 1;
@@ -1723,9 +1811,16 @@ impl GrayStream for StreamMutableState {
                 write_buf,
                 line,
                 col,
+                external_format,
                 ..
             } => {
-                write_buf.extend_from_slice(slice);
+                if *external_format == ExternalFormat::Utf8 {
+                    write_buf.extend_from_slice(slice);
+                } else {
+                    for c in str_slice.chars() {
+                        encode_char(*external_format, c, write_buf)?;
+                    }
+                }
                 for c in str_slice.chars() {
                     if c == '\n' {
                         *line += 1;
@@ -1925,6 +2020,7 @@ impl GrayStream for StreamMutableState {
             line,
             col,
             unread,
+            external_format,
             ..
         }
         | StreamInner::FileInput {
@@ -1935,6 +2031,7 @@ impl GrayStream for StreamMutableState {
             line,
             col,
             unread,
+            external_format,
             ..
         } = &mut self.inner
         {
@@ -1942,7 +2039,7 @@ impl GrayStream for StreamMutableState {
                 // Do not flush pending writes: a NO-HANG input call must not
                 // block on a peer that has stopped reading our output.
                 return file_read_char_buffered(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread, false,
+                    file, read_buf, buf_pos, buf_fill, line, col, unread, false, *external_format,
                 );
             }
         }
@@ -2006,11 +2103,11 @@ impl GrayStream for StreamMutableState {
             if *element_type == StreamElementType::Character
                 && matches!(
                     external_format,
-                    ExternalFormat::Utf8 | ExternalFormat::Ascii
+                    ExternalFormat::Utf8 | ExternalFormat::Ascii | ExternalFormat::Latin1
                 )
             {
                 return file_read_line_buffered(
-                    file, read_buf, buf_pos, buf_fill, line, col, unread,
+                    file, read_buf, buf_pos, buf_fill, line, col, unread, *external_format,
                 );
             }
         }
@@ -2134,13 +2231,13 @@ impl GrayStream for StreamMutableState {
         match &self.inner {
             StreamInner::FileInput {
                 external_format, ..
-            } => external_format.clone(),
+            } => *external_format,
             StreamInner::FileOutput {
                 external_format, ..
-            } => external_format.clone(),
+            } => *external_format,
             StreamInner::FileIo {
                 external_format, ..
-            } => external_format.clone(),
+            } => *external_format,
             _ => ExternalFormat::Utf8,
         }
     }
