@@ -5794,11 +5794,19 @@ fn handler_bind_evaluates_its_handler_spec() {
 #[test]
 fn package_errors_report_what_failed() {
     let cases = [
-        // The report names the symbol AND the package.
+        // The report names the OPERATION and the package. It used to name the
+        // symbol instead -- "symbol FOO is not accessible in package
+        // NO-SUCH-PKG-ZZ" -- which was downstream of the real fault: EXPORT
+        // created the missing package and then found the symbol inaccessible
+        // in it. With the package no longer created (GitHub #375), the missing
+        // package IS the error, which is also what SBCL reports there
+        // (PACKAGE-DOES-NOT-EXIST, not a symbol complaint). The case still
+        // pins this test's point: a description of what failed, not a bare
+        // "Package error.".
         (
             "(handler-case (export 'foo \"NO-SUCH-PKG-ZZ\") \
                (package-error (c) (princ-to-string c)))",
-            "\"symbol FOO is not accessible in package NO-SUCH-PKG-ZZ\"",
+            "\"EXPORT: there is no package named NO-SUCH-PKG-ZZ\"",
         ),
         // It is no longer the bare string.
         (
