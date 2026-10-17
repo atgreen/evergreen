@@ -226,6 +226,9 @@
   native caller spends about 27% less per call (about 38% when it establishes a
   `HANDLER-CASE`), and a cached `(asdf:load-system :babel)` is about 5% faster
   ([#390](https://github.com/atgreen/evergreen/pull/390)).
+- Compiled code finds its execution-local state with fewer checks per access,
+  so a native call that establishes a `HANDLER-CASE` costs about 7% less again
+  ([#397](https://github.com/atgreen/evergreen/pull/397)).
 
 ## 0.0.9 - 2026-10-15
 

@@ -2550,7 +2550,11 @@ pub fn join_thread_timeout(
 }
 
 pub fn current_thread_id() -> NativeThreadId {
-    ensure_current_native_thread().id()
+    // `current_thread` registers on first use exactly as
+    // `ensure_current_native_thread` does, but answers a registered thread
+    // without cloning (and then dropping) its Arc: this runs on every native
+    // segment entry.
+    current_thread().id()
 }
 
 // Resolve TLS afresh on each call: a fiber may have changed carriers since its

@@ -4,7 +4,6 @@
 //! Host evaluator state owned by a Lisp execution, independent of its carrier.
 //! Native callers must register with `current_thread_id()` before using these
 //! slots; runtime thread teardown retires them. Lisp execution does this already.
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
@@ -22,8 +21,16 @@ fn current_key(fiber: Option<crate::thread::FiberId>) -> Key {
         .unwrap_or_else(|| Key::Native(std::thread::current().id()))
 }
 
+/// Locals with an index below this are cached per carrier; any later ones
+/// always take the registry path. The tree defines about 120.
+const CACHE_SLOTS: usize = 256;
+
 thread_local! {
-    static CACHE: RefCell<Vec<CachedSlot>> = const { RefCell::new(Vec::new()) };
+    // A fixed array of `Cell`s rather than a `RefCell<Vec>`: with no destructor
+    // the thread-local needs no registration-state check, and a hit needs no
+    // borrow flag -- this is read several times per native call.
+    static CACHE: [std::cell::Cell<CachedSlot>; CACHE_SLOTS] =
+        const { [const { std::cell::Cell::new(EMPTY_SLOT) }; CACHE_SLOTS] };
     static NATIVE_RETIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -42,13 +49,12 @@ const EMPTY_SLOT: CachedSlot = CachedSlot {
 // calls, and never retain a cache borrow across a callback or initializer.
 #[inline(never)]
 fn cached_pointer(index: usize, fiber: Option<crate::thread::FiberId>) -> Option<*const ()> {
-    if fiber.is_none() && native_retired() {
-        return None;
-    }
+    // No retirement check here: `retire_native` empties this thread's native
+    // entries, so a retired execution can only miss. This is the hot path of
+    // every execution-local access and now needs one TLS access, not two.
     CACHE
         .try_with(|cache| {
-            let cache = cache.borrow();
-            let entry = cache.get(index)?;
+            let entry = cache.get(index)?.get();
             (entry.fiber == fiber && !entry.pointer.is_null()).then_some(entry.pointer)
         })
         .ok()
@@ -58,11 +64,9 @@ fn cached_pointer(index: usize, fiber: Option<crate::thread::FiberId>) -> Option
 #[inline(never)]
 fn cache_pointer(index: usize, fiber: Option<crate::thread::FiberId>, pointer: *const ()) {
     let _ = CACHE.try_with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.len() <= index {
-            cache.resize(index + 1, EMPTY_SLOT);
+        if let Some(entry) = cache.get(index) {
+            entry.set(CachedSlot { fiber, pointer });
         }
-        cache[index] = CachedSlot { fiber, pointer };
     });
 }
 
@@ -236,6 +240,15 @@ pub(crate) fn retire_fiber(id: crate::thread::FiberId) {
 /// Called at native thread teardown before leaving the safepoint participant set.
 pub(crate) fn retire_native(id: ThreadId) {
     let _ = NATIVE_RETIRED.try_with(|value| value.set(true));
+    // Drop this thread's own cached slots so a later lookup misses and reaches
+    // the retirement checks on the slow path (see `cached_pointer`).
+    let _ = CACHE.try_with(|cache| {
+        for entry in cache {
+            if entry.get().fiber.is_none() {
+                entry.set(EMPTY_SLOT);
+            }
+        }
+    });
     retire(Key::Native(id));
 }
 
@@ -311,7 +324,7 @@ mod tests {
         std::thread::spawn(|| {
             crate::thread::current_thread_id();
             VALUE.with(|_| ());
-            CACHE.with(|cache| cache.borrow_mut().clear());
+            CACHE.with(|cache| cache.iter().for_each(|entry| entry.set(EMPTY_SLOT)));
             let before = VALUE.lookups.load(Ordering::Relaxed);
             for _ in 0..100 {
                 assert_eq!(VALUE.try_with(|v| *v), Some(42));
@@ -346,13 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn a_later_tls_destructor_can_access_slots_after_cache_destruction() {
+    fn a_later_tls_destructor_can_access_its_slot() {
         static VALUE: ExecutionLocal<usize> = unsafe { ExecutionLocal::new(|| 42) };
         static OBSERVED: AtomicUsize = AtomicUsize::new(0);
         struct LaterDestructor;
         impl Drop for LaterDestructor {
             fn drop(&mut self) {
-                assert!(CACHE.try_with(|_| ()).is_err());
+                // The carrier cache has no destructor, so it may still answer
+                // here; either way the slot itself must still be reachable.
                 assert_eq!(VALUE.try_with(|v| *v), Some(42));
                 VALUE.with(|v| OBSERVED.store(*v, Ordering::Relaxed));
             }

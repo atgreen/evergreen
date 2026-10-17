@@ -383,11 +383,11 @@ unsafe fn with_native_segment(
     if !is_supported() {
         return Err(SegmentUnavailable);
     }
+    let carrier = crate::thread::current_thread_id();
     let owner = match crate::thread::current_fiber_id() {
         Some(id) => SegmentOwner::Fiber(id),
-        None => SegmentOwner::Thread(crate::thread::current_thread_id()),
+        None => SegmentOwner::Thread(carrier),
     };
-    let carrier = crate::thread::current_thread_id();
     let previous = current_segment();
     let mut segment = std::pin::pin!(NativeSegment {
         saved_sp: 0,
