@@ -27,6 +27,17 @@
 
 ### Fixed
 
+- A package designator that names no package now signals `PACKAGE-ERROR`
+  instead of creating the package. `INTERN`, `EXPORT`, `IMPORT`, `SHADOW` and
+  `USE-PACKAGE` created it; `FIND-SYMBOL`, `UNUSE-PACKAGE` and
+  `PACKAGE-USE-LIST` answered as though the lookup had simply found nothing. So
+  a typo in a package name, or a library loaded before the package it names,
+  left a live package of that name: `FIND-PACKAGE` then answered it, a later
+  `DEFPACKAGE` of the real one merged into the mistake, and the fault surfaced
+  far from where it was made. `DEFPACKAGE` still resolves a forward `:use`
+  reference, which is what the create-on-miss path exists for
+  ([#379](https://github.com/atgreen/evergreen/pull/379);
+  issue [#375](https://github.com/atgreen/evergreen/issues/375)).
 - `OPEN` and `WITH-OPEN-FILE` honor `:external-format :latin-1` (also
   `:iso-8859-1`) and `:ascii`, alone or as the first element of a list such
   as `(:latin-1 :eol-style :lf)`; `:default` and `:utf-8` remain UTF-8. The

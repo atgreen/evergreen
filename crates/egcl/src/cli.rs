@@ -13953,6 +13953,22 @@ fn present_symbol_with_status(
     None
 }
 
+/// Resolve a package designator's name to its package, or signal the
+/// `PACKAGE-ERROR` that CLHS 11.1.1.2 requires of every package function.
+///
+/// The deliberate counterpart to [`ensure_package_available`], which CREATES a
+/// missing package. DEFPACKAGE needs that for a forward `:use` reference --
+/// ASDF's package graph relies on one resolving later -- but no public package
+/// function may do it: a typo in a package name, or a library loaded before the
+/// package it names, must not mint a live package of that name, because
+/// FIND-PACKAGE then answers it and DEFPACKAGE of the real one merges into the
+/// mistake far from where it was made (GitHub #375).
+fn package_or_package_error(name: &str, operation: &str) -> Result<EgclVal, EgclError> {
+    egcl_stdlib::find_package(name).ok_or_else(|| {
+        EgclError::PackageError(format!("{operation}: there is no package named {name}"))
+    })
+}
+
 fn ensure_package_available(_env: &mut Env, name: &str, uses: &[&str]) {
     let pkg = match egcl_stdlib::find_package(name) {
         Some(p) => p,
@@ -26117,9 +26133,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Err(package_designator_type_error(v));
                 }
                 let pkg_name = normalize_package_name(&string_designator_name(v));
-                let uses = egcl_stdlib::find_package(&pkg_name)
-                    .map(egcl_stdlib::package_use_list)
-                    .unwrap_or_default();
+                // A missing package is a PACKAGE-ERROR, not an empty use-list
+                // (#375).
+                let pkg = package_or_package_error(&pkg_name, "PACKAGE-USE-LIST")?;
+                let uses = egcl_stdlib::package_use_list(pkg);
                 return Ok(vec_to_list(&uses));
             }
             "LIST-ALL-PACKAGES" => {
@@ -26185,7 +26202,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 } else {
                     effective_package_name(env)
                 };
-                ensure_package_available(env, &pkg_name, &[]);
+                // The package must already exist: these are public package
+                // functions, not DEFPACKAGE (#375).
+                package_or_package_error(&pkg_name, &sym_name(car))?;
                 let sym_vals: Vec<EgclVal> = if symbols.is_cons() {
                     list_to_vec(symbols)
                 } else if symbols.is_nil() {
@@ -39908,6 +39927,13 @@ fn apply_builtin_fast(
             // find_symbol_in_package_cased (bliss-961p).
             let bare = val_as_str(args[0]);
             let pkg_name = resolve_package_name(env, &string_designator_name(args[1]));
+            // This fast arm bypasses the FIND-SYMBOL builtin entirely, so the
+            // missing-package check has to be here TOO -- fixing only the
+            // builtin left (find-symbol "Z" "NOSUCH") still answering NIL,
+            // because a two-argument call never reaches it (#375).
+            if let Err(error) = package_or_package_error(&pkg_name, "FIND-SYMBOL") {
+                return Some(Err(error));
+            }
             if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &bare, true) {
                 env.set_mv(vec![sym, package_status_symbol(status)]);
                 Some(Ok(sym))

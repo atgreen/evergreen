@@ -4987,11 +4987,21 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 effective_package_name(env)
             };
-            // ensure_package_available creates the target if needed and adds
-            // each named package to its use-list (creating a placeholder for
-            // any not yet defined).
-            let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            ensure_package_available(env, &target, &name_refs);
+            // Both ends must already exist. This used to go through
+            // ensure_package_available, which created the target AND a
+            // placeholder for every name on the use-list, so (use-package
+            // "NOSUCH") answered T and left a package behind (#375).
+            // DEFPACKAGE keeps the placeholder behaviour; USE-PACKAGE is a
+            // public function and may not.
+            let used = {
+                let mut used = Vec::with_capacity(names.len());
+                for name in &names {
+                    used.push(package_or_package_error(name, "USE-PACKAGE")?);
+                }
+                used
+            };
+            let target_package = package_or_package_error(&target, "USE-PACKAGE")?;
+            egcl_stdlib::use_package(&used, target_package)?;
             Ok(T)
         }),
 
@@ -5011,11 +5021,11 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 vec![pkgs_val]
             };
+            // Both ends must exist. Silently skipping a missing one made
+            // (unuse-package "NOSUCH") answer T (#375).
             for pv in names {
                 let name = resolve_package_name(env, &string_designator_name(pv));
-                if let Some(p) = egcl_stdlib::find_package(&name) {
-                    used.push(p);
-                }
+                used.push(package_or_package_error(&name, "UNUSE-PACKAGE")?);
             }
             let target = if args.len() > 1 {
                 let raw = string_designator_name(args[1]);
@@ -5023,9 +5033,8 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 effective_package_name(env)
             };
-            if let Some(target_pkg) = egcl_stdlib::find_package(&target) {
-                let _ = egcl_stdlib::unuse_package(&used, target_pkg);
-            }
+            let target_pkg = package_or_package_error(&target, "UNUSE-PACKAGE")?;
+            egcl_stdlib::unuse_package(&used, target_pkg)?;
             Ok(T)
         }),
 
@@ -5106,12 +5115,13 @@ fn resolve(name: &str) -> Option<Handler> {
                 env.set_mv(vec![sym, status]);
                 return Ok(sym);
             }
-            // Package behavior belongs to egcl-stdlib. Ensure the package
-            // exists, then let its registry perform the exact-case lookup,
-            // inherited-symbol handling, allocation, and insertion.
-            ensure_package_available(env, &pkg_name, &[]);
+            // Package behavior belongs to egcl-stdlib: let its registry perform
+            // the exact-case lookup, inherited-symbol handling, allocation and
+            // insertion. The package must already EXIST -- this used to call
+            // ensure_package_available first, which created it and so made the
+            // error below unreachable (#375).
             let package = egcl_stdlib::find_package(&pkg_name).ok_or_else(|| {
-                EgclError::PackageError(format!("there is no package named {pkg_name}"))
+                EgclError::PackageError(format!("INTERN: there is no package named {pkg_name}"))
             })?;
             let (mut sym, intern_status) = egcl_stdlib::intern(&name_str, package)?;
             egcl_rt::rooted_ref!(_sym_root = &mut sym);
@@ -5144,6 +5154,11 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 effective_package_name(env)
             };
+            // A designator naming no package is a PACKAGE-ERROR, not "no such
+            // symbol": FIND-SYMBOL answered NIL for a package that did not
+            // exist, which is indistinguishable from the name simply being
+            // absent, so a typo read as a successful lookup (#375).
+            package_or_package_error(&pkg_name, "FIND-SYMBOL")?;
             if let Some((sym, status)) = find_symbol_in_package_cased(env, &pkg_name, &name, true) {
                 env.set_mv(vec![sym, package_status_symbol(status)]);
                 return Ok(sym);
@@ -5208,7 +5223,7 @@ fn resolve(name: &str) -> Option<Handler> {
             } else {
                 effective_package_name(env)
             };
-            ensure_package_available(env, &pkg_name, &[]);
+            package_or_package_error(&pkg_name, "SHADOW")?;
             let mut names = Vec::new();
             // Case-preserving designators: (shadow "foo") shadows |foo|
             // (CLHS; the old symbol_bare_name upcased and shadowed FOO).
