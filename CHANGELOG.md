@@ -56,6 +56,19 @@
   the implementation's. With `CLASS-SLOTS` in the previous release this
   completes [#370](https://github.com/atgreen/evergreen/issues/370)
   ([#383](https://github.com/atgreen/evergreen/pull/383)).
+- `FORMAT`'s `~R` prints bignums in English: `(format nil "~R" (expt 10 20))`
+  signalled a TYPE-ERROR saying its argument was not an integer. It also names
+  every short-scale group through vigintillion, so 10^9 is "one billion", not
+  "one thousand million"
+  ([#381](https://github.com/atgreen/evergreen/pull/381)).
+- `~D`, `~B`, `~O`, `~X` and `~R` keep a pad or comma character outside
+  Latin-1: it was cut to its low byte, so `#\★` padded with a control character
+  ([#381](https://github.com/atgreen/evergreen/pull/381)).
+- `NTH-VALUE` and `DECODE-UNIVERSAL-TIME` signal a TYPE-ERROR for an argument
+  that is not a non-negative integer instead of converting it through a float:
+  a compiled `(nth-value -1 ...)` answered the first value, and
+  `(decode-universal-time 1.5)` decoded a time
+  ([#381](https://github.com/atgreen/evergreen/pull/381)).
 - A library's own `DEFUN` of `CLASS-SLOTS` no longer redefines the
   implementation's. The non-ANSI MOP readers were reachable as a bare name from
   any package, so an internal helper of that name in a package that exports
