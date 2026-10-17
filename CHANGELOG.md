@@ -44,6 +44,12 @@
 
 ### Fixed
 
+- A built-in class is an object rather than an integer. `(find-class
+  'integer)` was the fixnum -14, so `(eql -14 (find-class 'integer))` and
+  `(integerp (find-class 'standard-class))` were both true, `(class-name -14)`
+  answered `INTEGER`, a method specialized on `BUILT-IN-CLASS` applied to the
+  integer -14, and a class printed as `-40`
+  ([#396](https://github.com/atgreen/evergreen/pull/396)).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal

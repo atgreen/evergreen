@@ -235,6 +235,45 @@ unsafe fn set_instance_wrapper(inst: EgclVal, w: *mut ClassWrapper) {
     }
 }
 
+/// Leak a frozen, empty `SlotLayout` plus a `ClassWrapper` naming `class`.
+///
+/// The bootstrap needs wrappers before any class exists to finalize one, and a
+/// class metaobject has no instance slots of its own (its metadata lives in
+/// `ClassMeta`, not in Lisp-visible slots), so an empty layout is the whole
+/// story. `finalize_class_layout` builds the same shape for ordinary classes.
+fn leak_empty_wrapper(class: EgclVal) -> *mut ClassWrapper {
+    let layout: &'static SlotLayout = Box::leak(Box::new(SlotLayout {
+        order: Vec::new(),
+        index: HashMap::new(),
+    }));
+    let wrapper: &'static ClassWrapper = Box::leak(Box::new(ClassWrapper {
+        stamp: next_stamp(),
+        state: AtomicU8::new(WRAPPER_CURRENT),
+        class,
+        slot_count: 0,
+        layout,
+    }));
+    wrapper as *const ClassWrapper as *mut ClassWrapper
+}
+
+/// Allocate a class metaobject: a pinned, zero-slot `STANDARD_OBJECT`.
+///
+/// Pinned rather than nursery-born because a class value is used as a
+/// `HashMap` key all over `ClosState`, so its address has to be an identity.
+/// `alloc_pinned_typed` packs these into dedicated host regions, which is the
+/// difference between bounding the cost to the objects' own bytes and
+/// retaining a whole 1 MiB region per object (bliss-wc4t). Classes are
+/// immortal either way: only `FUNCTION_INTERPRETED` and `SYMBOL` are ever
+/// recycled from a pinned slot.
+///
+/// The wrapper word is left NULL and must be filled in by the caller before
+/// anything reads it — `class_of` dereferences it with no null check.
+fn alloc_class_metaobject() -> Option<EgclVal> {
+    // 16 bytes: the 8-byte header the allocator writes, plus the wrapper word.
+    let body = egcl_rt::gc::alloc_pinned_typed(8, type_id::STANDARD_OBJECT)?;
+    unsafe { Some(EgclVal::from_heap_ptr(body.sub(8))) }
+}
+
 /// Pointer to slot cell `idx` (offset 16 + 8*idx), chasing forwarding.
 ///
 /// # Safety
@@ -1241,24 +1280,28 @@ pub fn max_metaobject_id() -> i64 {
 }
 
 fn is_builtin_class(st: &ClosState, class: EgclVal) -> bool {
-    // Every built-in class handle is a NEGATIVE fixnum (user classes get positive
-    // ids from next_stdlib_class_id, base 300_000), so the sign is the reliable
-    // discriminator and covers the numeric-tower / sequence / array classes added
-    // in bliss-qxfg without enumerating each. The explicit field checks below stay
-    // as documentation of the core classes.
-    if class.is_fixnum() && class.as_fixnum() < 0 {
+    // A built-in class is one whose instances are NOT standard objects, which
+    // is what its precedence list records. The sign of a fixnum used to be the
+    // discriminator ("every built-in class handle is a NEGATIVE fixnum"), and
+    // that stopped being true when these became pinned heap objects
+    // (bliss-rj5o).
+    //
+    // A structure class also fails the standard-object test here, so it is
+    // excluded first — DEFSTRUCT classes are not built-in and must keep
+    // getting a layout.
+    if st.structure_classes.contains(&class) {
+        return false;
+    }
+    if st.standard_object_class == NIL {
+        // Early bootstrap: STANDARD-OBJECT is not registered yet, so no class
+        // can be shown to inherit it. Answer "built-in", which is the
+        // conservative direction: `finalize_class_layout` then declines to
+        // build a layout, and nothing should be instantiated this early.
         return true;
     }
-    class == st.t_class_val
-        || class == st.standard_object_class
-        || class == st.fixnum_class
-        || class == st.character_class
-        || class == st.symbol_class
-        || class == st.null_class
-        || class == st.cons_class
-        || class == st.float_class
-        || class == st.function_class
-        || class == st.heap_object_class
+    c3_linearize(st, class)
+        .map(|cpl| !cpl.contains(&st.standard_object_class))
+        .unwrap_or(true)
 }
 
 // ── CLOS bootstrap ─────────────────────────────────────────────────
@@ -1288,36 +1331,29 @@ pub fn bootstrap_clos() -> Result<(), EgclError> {
 fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     install_clos_state_root_scanner();
 
+    // The built-in class metaobjects. Each is a pinned, zero-slot
+    // STANDARD_OBJECT (see `alloc_class_metaobject`), allocated BEFORE the
+    // `with_state_mut` below: the CLOS definitions lock is (GcWorld, 8) and the
+    // GC heap lock is (GcWorld, 2), so allocating while holding the former
+    // fails the lock-order check in a debug build and inverts the collector's
+    // own 2 -> 8 order in release. Same discipline as the interning above
+    // (bliss-wlf), for the same reason.
+    //
+    // These used to be negative fixnums -1 ..= -47 (with -37 unused), which is
+    // why `(eql -14 (find-class 'integer))` and `(integerp (find-class
+    // 'standard-class))` were both true (bliss-rj5o). Pinning is what lets a
+    // class value go on being a HashMap key in ClosState.
+    //
+    // The wrapper words are filled in below, once the metaclass values those
+    // wrappers must name exist. NOTHING may read a class's wrapper before
+    // then: `class_of` dereferences it with no null check.
     // Built-in class values (negative fixnums avoid collision with user classes)
-    let t_cls = EgclVal::from_fixnum(-1);
-    let std_obj = EgclVal::from_fixnum(-2);
-    let fix_cls = EgclVal::from_fixnum(-3);
-    let chr_cls = EgclVal::from_fixnum(-4);
-    let sym_cls = EgclVal::from_fixnum(-5);
-    let nul_cls = EgclVal::from_fixnum(-6);
-    let con_cls = EgclVal::from_fixnum(-7);
-    let flt_cls = EgclVal::from_fixnum(-8);
-    let fun_cls = EgclVal::from_fixnum(-9);
-    let hpo_cls = EgclVal::from_fixnum(-10);
     // Additional CL built-in classes (bliss-qxfg). find-class previously had no
     // metaobject for the numeric tower / sequence / array classes, so
     // `(find-class 'integer)` — and FIND-METHOD over `(find-class …)` specializers,
     // as ansi-test universe.lsp builds — errored. These are additive: class-of
     // still returns the concrete leaf (FIXNUM/FLOAT/…) and SUBTYPEP uses the type
     // lattice, not the CLOS CPL, so registering them changes neither.
-    let num_cls = EgclVal::from_fixnum(-11);
-    let real_cls = EgclVal::from_fixnum(-12);
-    let ratl_cls = EgclVal::from_fixnum(-13);
-    let int_cls = EgclVal::from_fixnum(-14);
-    let ratio_cls = EgclVal::from_fixnum(-15);
-    let cplx_cls = EgclVal::from_fixnum(-16);
-    let seq_cls = EgclVal::from_fixnum(-17);
-    let list_cls = EgclVal::from_fixnum(-18);
-    let arr_cls = EgclVal::from_fixnum(-19);
-    let vec_cls = EgclVal::from_fixnum(-20);
-    let str_cls = EgclVal::from_fixnum(-21);
-    let bitv_cls = EgclVal::from_fixnum(-22);
-    let htbl_cls = EgclVal::from_fixnum(-23);
     // The remaining standard classes of CLHS 4.3.7 / figure 4-8 that FIND-CLASS
     // must know (ansi symbols cl-types-that-are-classes.*; the objects chapter
     // names STANDARD-GENERIC-FUNCTION while loading). Handles continue the
@@ -1325,29 +1361,98 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     // CLASS-NAME, CLASS-PRECEDENCE-LIST and TYPEP of the metaobject. RESTART is
     // deliberately absent: the runtime defines it as a standard class whose
     // instances are the first-class restart objects (ensure_restart_class).
-    let stream_cls = EgclVal::from_fixnum(-24);
-    let bstream_cls = EgclVal::from_fixnum(-25);
-    let cstream_cls = EgclVal::from_fixnum(-26);
-    let estream_cls = EgclVal::from_fixnum(-27);
-    let fstream_cls = EgclVal::from_fixnum(-28);
-    let sstream_cls = EgclVal::from_fixnum(-29);
-    let ystream_cls = EgclVal::from_fixnum(-30);
-    let tstream_cls = EgclVal::from_fixnum(-31);
-    let path_cls = EgclVal::from_fixnum(-32);
-    let lpath_cls = EgclVal::from_fixnum(-33);
-    let pkg_cls = EgclVal::from_fixnum(-34);
-    let rstate_cls = EgclVal::from_fixnum(-35);
-    let rtable_cls = EgclVal::from_fixnum(-36);
-    let sobj_cls = EgclVal::from_fixnum(-38);
-    let class_cls = EgclVal::from_fixnum(-39);
-    let sclass_cls = EgclVal::from_fixnum(-40);
-    let bclass_cls = EgclVal::from_fixnum(-41);
-    let stclass_cls = EgclVal::from_fixnum(-42);
-    let gf_cls = EgclVal::from_fixnum(-43);
-    let sgf_cls = EgclVal::from_fixnum(-44);
-    let method_cls = EgclVal::from_fixnum(-45);
-    let smethod_cls = EgclVal::from_fixnum(-46);
-    let mcomb_cls = EgclVal::from_fixnum(-47);
+    let t_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let std_obj = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let fix_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let chr_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let sym_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let nul_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let con_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let flt_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let fun_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let hpo_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let num_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let real_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let ratl_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let int_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let ratio_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let cplx_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let seq_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let list_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let arr_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let vec_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let str_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let bitv_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let htbl_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let stream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let bstream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let cstream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let estream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let fstream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let sstream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let ystream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let tstream_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let path_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let lpath_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let pkg_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let rstate_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let rtable_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let sobj_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let class_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let sclass_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let bclass_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let stclass_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let gf_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let sgf_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let method_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let smethod_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let mcomb_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
 
     // Names: interned into the shared registry by their real CL names
     // (bliss-jtc.6 Stage E) so a built-in class's CLASS-NAME / TYPE-OF is the
@@ -1358,6 +1463,41 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     // re-enters CLOS_STATE, so ALL interning happens *before* the `with_state_mut`
     // borrow below (bliss-wlf). Once the borrow is held the closure only stores
     // these already-interned immediates — it never allocates.
+    // Fill in each class metaobject's wrapper word, now that the metaclass
+    // values the wrappers name exist. Two wrappers suffice: a class metaobject
+    // has no instance slots, so they differ only in which class they report.
+    //
+    // Which class each belongs to reproduces exactly what CLASS-OF answered
+    // when these were fixnums (measured as a 34-row table before the change):
+    // the ten AMOP metaobject classes are instances of STANDARD-CLASS, and
+    // every other built-in class — STRUCTURE-OBJECT included — is an instance
+    // of BUILT-IN-CLASS.
+    let standard_class_wrapper = leak_empty_wrapper(sclass_cls);
+    let builtin_class_wrapper = leak_empty_wrapper(bclass_cls);
+    for class in [
+        std_obj,
+        class_cls,
+        sclass_cls,
+        bclass_cls,
+        stclass_cls,
+        gf_cls,
+        sgf_cls,
+        method_cls,
+        smethod_cls,
+        mcomb_cls,
+    ] {
+        unsafe { set_instance_wrapper(class, standard_class_wrapper) };
+    }
+    for class in [
+        t_cls, fix_cls, chr_cls, sym_cls, nul_cls, con_cls, flt_cls, fun_cls, hpo_cls, num_cls,
+        real_cls, ratl_cls, int_cls, ratio_cls, cplx_cls, seq_cls, list_cls, arr_cls, vec_cls,
+        str_cls, bitv_cls, htbl_cls, stream_cls, bstream_cls, cstream_cls, estream_cls,
+        fstream_cls, sstream_cls, ystream_cls, tstream_cls, path_cls, lpath_cls, pkg_cls,
+        rstate_cls, rtable_cls, sobj_cls,
+    ] {
+        unsafe { set_instance_wrapper(class, builtin_class_wrapper) };
+    }
+
     let nm = |name: &str| EgclVal::from_symbol_index(egcl_rt::symbols::intern(name));
     let t_nm = T;
     let std_nm = nm("STANDARD-OBJECT");
@@ -1878,9 +2018,7 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     if egcl_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT) {
         return unsafe { (*instance_wrapper(object)).class };
     }
-    if crate::hash_table_p(object) {
-        return EgclVal::from_fixnum(-23);
-    }
+
     // Arrays, streams, packages and pathnames belong to their standard
     // classes (CLHS 4.3.7), so (typep "abc" (find-class 'string)) and
     // (class-of (make-array 3)) answer as ANSI requires (ansi arrays
@@ -1888,7 +2026,11 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     // name symbols by the bootstrap hierarchy. Decide the name here: the stream
     // state lock sits below the CLOS definitions lock, and interning (a lookup
     // for these bootstrap names) must not happen under with_state either.
-    let standard_name = if egcl_rt::types::stringp(object) {
+    let standard_name = if crate::hash_table_p(object) {
+        // Was a hardcoded `from_fixnum(-23)` that bypassed the registry
+        // entirely; it is just another standard class (bliss-rj5o).
+        Some("HASH-TABLE")
+    } else if egcl_rt::types::stringp(object) {
         Some("STRING")
     } else if egcl_rt::types::bit_vector_p(object) {
         Some("BIT-VECTOR")
