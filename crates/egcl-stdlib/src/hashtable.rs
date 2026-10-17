@@ -12,6 +12,7 @@
 
 use std::collections::HashSet;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
@@ -223,6 +224,90 @@ struct HashTableInner {
     /// per bucket keep false positives uncommon at normal load. Deletion leaves
     /// bits set; clearing or rebuilding removes those harmless false positives.
     miss_filter: Vec<u64>,
+    /// Taken by every operation on a `:synchronized t` table (R5.33).
+    lock: TableLock,
+}
+
+/// The per-table lock of a synchronized hash table (R5.33).
+///
+/// Even a lookup writes the table: after a GC relocates an address-hashed key,
+/// the next access rebuilds the bucket vector in place (`maybe_rehash_for_gc`),
+/// so two threads probing one shared table at once could both replace and free
+/// it. That is how concurrent tree-walker threads corrupted the heap through the
+/// shared macro-expansion cache.
+///
+/// Reentrant, because EQUALP hashes and compares hash-table keys by reading
+/// them while the outer table is held. A holder never allocates or reaches a
+/// safepoint (hashing and `crate::equality` allocate no Lisp objects), so a
+/// waiter spins for one short operation and a stopped world never leaves the
+/// lock held.
+struct TableLock {
+    /// [`lock_owner_token`] of the holding thread, or 0 when free.
+    owner: AtomicUsize,
+    /// Nesting depth; only the owner touches it.
+    depth: AtomicU32,
+}
+
+impl TableLock {
+    const fn new() -> Self {
+        Self {
+            owner: AtomicUsize::new(0),
+            depth: AtomicU32::new(0),
+        }
+    }
+}
+
+/// A nonzero token unique to each live thread: the address of a thread-local.
+fn lock_owner_token() -> usize {
+    thread_local! {
+        static TOKEN: u8 = const { 0 };
+    }
+    TOKEN.with(|token| token as *const u8 as usize)
+}
+
+/// Holds a synchronized table's lock until dropped; a no-op otherwise.
+struct TableGuard(*const TableLock);
+
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        if self.0.is_null() {
+            return;
+        }
+        // Safety: the lock lives in a table that is never freed while in use.
+        let lock = unsafe { &*self.0 };
+        if lock.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+            lock.owner.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Take `ptr`'s lock if the table is synchronized. Every access to its entries,
+/// even a read, must happen while the returned guard is alive.
+fn lock_table(ptr: *mut HashTableInner) -> TableGuard {
+    // Safety: `ptr` came from `get_table_inner`; `synchronized` never changes
+    // and the lock is only reached through atomics.
+    if !unsafe { (*ptr).synchronized } {
+        return TableGuard(std::ptr::null());
+    }
+    let lock = unsafe { &*std::ptr::addr_of!((*ptr).lock) };
+    let me = lock_owner_token();
+    if lock.owner.load(Ordering::Relaxed) != me {
+        let mut spins = 0u32;
+        while lock
+            .owner
+            .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+    lock.depth.fetch_add(1, Ordering::Relaxed);
+    TableGuard(lock)
 }
 
 // Small tables already fit in cache; avoid the extra filter lookup there.
@@ -852,6 +937,7 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<EgclVal, EgclEr
         address_sensitive: false,
         gc_gen: egcl_rt::gc::gc_move_epoch(),
         miss_filter: empty_miss_filter(capacity),
+        lock: TableLock::new(),
     });
 
     let ptr = Box::into_raw(inner) as *mut u8;
@@ -1123,6 +1209,7 @@ pub fn gethash(
     default: EgclVal,
 ) -> Result<(EgclVal, bool), EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
@@ -1201,6 +1288,7 @@ fn resize_table(inner: &mut HashTableInner) {
 /// Set a value in a hash table (CL `(SETF GETHASH)`).
 pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
@@ -1278,6 +1366,7 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
 /// Remove an entry (CL `REMHASH`).
 pub fn remhash(key: EgclVal, table: EgclVal) -> Result<bool, EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
@@ -1382,6 +1471,7 @@ pub fn maphash(function: EgclVal, table: EgclVal) -> Result<(), EgclError> {
 /// Snapshot all live entries in a hash table.
 pub fn hash_table_entries(table: EgclVal) -> Result<Vec<(EgclVal, EgclVal)>, EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: single &mut from raw pointer, valid for the function's duration.
     let inner = unsafe { &mut *ptr };
 
@@ -1395,6 +1485,7 @@ pub fn hash_table_entries(table: EgclVal) -> Result<Vec<(EgclVal, EgclVal)>, Egc
 /// Clear all entries (CL `CLRHASH`).
 pub fn clrhash(table: EgclVal) -> Result<(), EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: single &mut from raw pointer, valid for the function's duration.
     let inner = unsafe { &mut *ptr };
     for entry in inner.entries.iter_mut() {
@@ -1408,6 +1499,7 @@ pub fn clrhash(table: EgclVal) -> Result<(), EgclError> {
 /// Get the number of entries (CL `HASH-TABLE-COUNT`).
 pub fn hash_table_count(table: EgclVal) -> Result<usize, EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     // Safety: single shared read from raw pointer.
     Ok(unsafe { (*ptr).count })
 }
@@ -1427,6 +1519,7 @@ pub fn hash_table_weakness(table: EgclVal) -> Result<Option<Weakness>, EgclError
 /// Get the hash table size (capacity).
 pub fn hash_table_size(table: EgclVal) -> Result<usize, EgclError> {
     let ptr = get_table_inner(table)?;
+    let _lock = lock_table(ptr);
     Ok(unsafe { (*ptr).capacity })
 }
 
@@ -1542,6 +1635,69 @@ mod tests {
         let mut table_hasher = KeyHasher::new(false);
         table_hasher.identity(a);
         assert!(table_hasher.address_sensitive);
+    }
+
+    fn synchronized_table(test: HashTest) -> EgclVal {
+        make_hash_table(&MakeHashTableOptions {
+            test,
+            synchronized: true,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    /// Every operation on a synchronized table holds its lock (R5.33). Writers
+    /// growing one small table from several threads used to replace and free
+    /// its bucket vector under each other.
+    #[test]
+    fn synchronized_table_survives_concurrent_writers() {
+        const THREADS: i64 = 4;
+        const PER_THREAD: i64 = 5000;
+        let table = synchronized_table(HashTest::Eql).0;
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                std::thread::spawn(move || {
+                    let table = EgclVal::from_raw(table);
+                    for i in 0..PER_THREAD {
+                        let key = EgclVal::from_fixnum(thread * PER_THREAD + i);
+                        set_gethash(key, table, key).unwrap();
+                        assert_eq!(gethash(key, table, NIL).unwrap(), (key, true));
+                        hash_table_count(table).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let table = EgclVal::from_raw(table);
+        assert_eq!(
+            hash_table_count(table).unwrap(),
+            (THREADS * PER_THREAD) as usize
+        );
+        for key in 0..THREADS * PER_THREAD {
+            let key = EgclVal::from_fixnum(key);
+            assert_eq!(gethash(key, table, NIL).unwrap(), (key, true));
+        }
+    }
+
+    /// EQUALP hashes and compares a hash-table key by reading it, so an
+    /// operation can re-enter the very table it holds; that must not deadlock.
+    #[test]
+    fn synchronized_equalp_table_can_hold_itself_as_a_key() {
+        let zero = EgclVal::from_fixnum(0);
+        let table = synchronized_table(HashTest::Equalp);
+        set_gethash(zero, table, zero).unwrap();
+        // Hashing the key counts `table` while `table` is held.
+        set_gethash(table, table, EgclVal::from_fixnum(1)).unwrap();
+        assert_eq!(hash_table_count(table).unwrap(), 2);
+        // `other` hashes like the stored key did (EQUALP, one entry), so the
+        // probe compares them, counting `table` again while it is held.
+        let other = synchronized_table(HashTest::Equalp);
+        set_gethash(zero, other, zero).unwrap();
+        KEY_COMPARISONS.with(|count| count.set(0));
+        assert_eq!(gethash(other, table, NIL).unwrap(), (NIL, false));
+        assert!(KEY_COMPARISONS.with(Cell::get) >= 1);
     }
 
     #[test]
