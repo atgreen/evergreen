@@ -16606,6 +16606,21 @@ fn typep_matches(
         if orig.as_ref() != "T"
             && orig.as_ref() != "STANDARD-OBJECT"
             && orig.as_ref() != "STRUCTURE-OBJECT"
+            // A METACLASS question about a class metaobject belongs to the
+            // dedicated arm below, which knows the three-way standard /
+            // built-in / structure split. This generic route would answer it
+            // from the CPL of the class's own metaclass instead, and get it
+            // wrong: a class metaobject became a real STANDARD_OBJECT with
+            // bliss-vsjn1, so `is_instance` above is now true for one and this
+            // branch started swallowing them. ansi-test
+            // STRUCTURE-OBJECT-IS-IN-STRUCTURE-CLASS caught exactly that.
+            //
+            // Checked here rather than in the condition above so it costs
+            // nothing: `orig` is already in hand.
+            && !matches!(
+                orig.as_ref(),
+                "STRUCTURE-CLASS" | "STANDARD-CLASS" | "BUILT-IN-CLASS" | "CLASS" | "METAOBJECT"
+            )
         {
             if let Some(class) = egcl_stdlib::find_class(type_spec) {
                 // Class symbols carry package identity. Comparing their bare
