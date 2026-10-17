@@ -2650,16 +2650,25 @@ fn resolve(name: &str) -> Option<Handler> {
             // Track supplied-p per component so an explicit `:name nil`
             // (override) is distinguished from an unsupplied component (which
             // is taken from :defaults, per ANSI).
-            let (mut host, mut device, mut directory) = (None, None, None);
-            let (mut name_c, mut type_c, mut version) = (None, None, None);
-            let mut defaults: Option<EgclVal> = None;
+            //
+            // Components are remembered as INDICES into the rooted `args`, not
+            // as copies: rendering a :directory list (`arena_str`) and
+            // coercing a :defaults namestring both allocate, and a component
+            // copied out before either could be moved by that GC. Under
+            // EGCL_GC_STRESS, `(make-pathname :name (copy-seq "foo")
+            // :directory '(:absolute "a"))` came back named "/a/".
+            let (mut host, mut device, mut name_c) = (None, None, None);
+            let (mut type_c, mut version, mut defaults) = (None, None, None);
+            let mut directory = NIL;
+            let mut directory_supplied = false;
+            egcl_rt::rooted_ref!(_directory_root = &mut directory);
             let mut i = 0;
             while i + 1 < args.len() {
                 let key = sym_bare_name_rc(args[i]);
                 let val = args[i + 1];
                 match key.as_ref() {
-                    "HOST" => host = Some(val),
-                    "DEVICE" => device = Some(val),
+                    "HOST" => host = Some(i + 1),
+                    "DEVICE" => device = Some(i + 1),
                     // A directory given as (:absolute|:relative comp…) uses
                     // reader keywords the stdlib can't match by hash; render
                     // it to a namestring the stdlib parser accepts.
@@ -2669,15 +2678,16 @@ fn resolve(name: &str) -> Option<Handler> {
                         // `:wild-inferiors`) with a FILE-ERROR before
                         // building the pathname (ansi make-pathname-error-*).
                         validate_make_pathname_directory(val)?;
-                        directory = Some(match directory_designator_to_namestring(val) {
+                        directory = match directory_designator_to_namestring(val) {
                             Some(s) => arena_str(&s),
                             None => val,
-                        });
+                        };
+                        directory_supplied = true;
                     }
-                    "NAME" => name_c = Some(val),
-                    "TYPE" => type_c = Some(val),
-                    "VERSION" => version = Some(val),
-                    "DEFAULTS" => defaults = Some(val),
+                    "NAME" => name_c = Some(i + 1),
+                    "TYPE" => type_c = Some(i + 1),
+                    "VERSION" => version = Some(i + 1),
+                    "DEFAULTS" => defaults = Some(i + 1),
                     _ => {}
                 }
                 i += 2;
@@ -2688,19 +2698,27 @@ fn resolve(name: &str) -> Option<Handler> {
             // components are silently dropped and, e.g., UIOP's
             // `pathname-directory-pathname` (make-pathname :defaults <string>)
             // loses the directory (bliss-aid). A non-coercible value stays
-            // unused, as before.
-            let d = match defaults {
+            // unused, as before. Nothing allocates after this coercion until
+            // make_pathname has every component.
+            let d = match defaults.map(|index| args[index]) {
                 Some(v) if egcl_stdlib::is_pathname(v) => Some(v),
                 Some(v) => coerce_pathname_designator(v).ok(),
                 None => None,
             };
-            let resolve = |supplied: Option<EgclVal>, from: fn(EgclVal) -> EgclVal| {
-                supplied.unwrap_or_else(|| d.map(from).unwrap_or(NIL))
+            let resolve = |supplied: Option<usize>, from: fn(EgclVal) -> EgclVal| {
+                supplied
+                    .map(|index| args[index])
+                    .unwrap_or_else(|| d.map(from).unwrap_or(NIL))
+            };
+            let directory = if directory_supplied {
+                directory
+            } else {
+                d.map(egcl_stdlib::pathname_directory).unwrap_or(NIL)
             };
             egcl_stdlib::make_pathname(
                 resolve(host, egcl_stdlib::pathname_host),
                 resolve(device, egcl_stdlib::pathname_device),
-                resolve(directory, egcl_stdlib::pathname_directory),
+                directory,
                 resolve(name_c, egcl_stdlib::pathname_name),
                 resolve(type_c, egcl_stdlib::pathname_type),
                 resolve(version, egcl_stdlib::pathname_version),
