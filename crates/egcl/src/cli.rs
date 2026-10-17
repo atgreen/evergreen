@@ -24760,7 +24760,10 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             | "METHOD-SPECIALIZERS" | "METHOD-LAMBDA-LIST" | "METHOD-GENERIC-FUNCTION"
             | "COMPUTE-APPLICABLE-METHODS" => return eval_builtin_arguments(&name, cdr, env),
             "SUBTYPEP" => return eval_builtin_arguments(&name, cdr, env),
-            "CLASS-PRECEDENCE-LIST" | "COMPUTE-CLASS-PRECEDENCE-LIST" => {
+            "CLASS-PRECEDENCE-LIST"
+            | "EGCL-MOP:CLASS-PRECEDENCE-LIST"
+            | "EGCL-MOP::CLASS-PRECEDENCE-LIST"
+            | "COMPUTE-CLASS-PRECEDENCE-LIST" => {
                 let (class_form, _) = cp(cdr);
                 let class_input = eval_form(class_form, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
@@ -39247,6 +39250,11 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::PROCLAIMED-OPTIMIZE"
             | "EGCL-EXT:HASH-TABLE-WEAKNESS"
             | "EGCL-EXT::HASH-TABLE-WEAKNESS"
+            // Owned by EGCL-MOP (GitHub #370). Recognised by that identity so a
+            // BARE read of the name inside an unrelated package no longer
+            // reaches the builtin bare-intern path in reader_symbol_resolver.
+            | "EGCL-MOP:CLASS-PRECEDENCE-LIST"
+            | "EGCL-MOP::CLASS-PRECEDENCE-LIST"
             | "EGCL-THREAD:MAKE-THREAD"
             | "EGCL-THREAD::MAKE-THREAD"
             | "EGCL-THREAD:JOIN-THREAD"
