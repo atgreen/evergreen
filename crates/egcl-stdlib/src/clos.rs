@@ -70,6 +70,12 @@ struct ClassMeta {
     /// Frozen, process-lifetime descriptor shared with instances. Built-in
     /// (never-instantiated) classes have no wrapper.
     wrapper: Option<&'static ClassWrapper>,
+    /// The class's metaclass, when DEFCLASS named one with `:metaclass`. NIL
+    /// means the default, STANDARD-CLASS. `class_of` answers this, which is how
+    /// portable code tells a class with a custom metaclass from a plain one --
+    /// Gendl's kernel does exactly that, and the option used to be parsed and
+    /// dropped (GitHub #371).
+    metaclass: EgclVal,
 }
 
 // ── Standard-object instances (heap objects) ───────────────────────
@@ -473,6 +479,11 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
             for value in &mut meta.slots {
                 visit(value);
             }
+            // The metaclass is a class value like any other, so a moving
+            // collection must rewrite it here too -- missing it would leave a
+            // stale class handle behind the first GC after a DEFCLASS with
+            // :metaclass.
+            visit(&mut meta.metaclass);
             // Wrapper class ids and slot-layout names are the same immediate
             // meta-handles/symbols represented above, so they need no rewrite.
         }
@@ -774,7 +785,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
     let mut out = with_state(|st| {
         let mut out = Vec::new();
         out.extend_from_slice(b"CLST");
-        cs_put_u32(&mut out, 2); // format version
+        cs_put_u32(&mut out, 3); // format version (3 adds ClassMeta.metaclass)
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -792,6 +803,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
             cs_put_vals(&mut out, &meta.direct_supers);
             cs_put_vals(&mut out, &meta.direct_subs);
             cs_put_vals(&mut out, &meta.slots);
+            cs_put_val(&mut out, meta.metaclass);
         }
         cs_put_u32(&mut out, st.generic_functions.len() as u32);
         for (gf, data) in &st.generic_functions {
@@ -913,7 +925,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 2 {
+    if version != 3 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -938,6 +950,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let direct_supers = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let direct_subs = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let metaclass = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
         st.class_meta.insert(
             class,
             ClassMeta {
@@ -947,6 +960,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
                 direct_subs,
                 slots,
                 wrapper: None,
+                metaclass,
             },
         );
     }
@@ -1347,6 +1361,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                 direct_subs: vec![],
                 slots: vec![],
                 wrapper: None,
+                metaclass: NIL,
             },
         );
 
@@ -1361,6 +1376,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                 direct_subs: vec![],
                 slots: vec![],
                 wrapper: None,
+                metaclass: NIL,
             },
         );
 
@@ -1401,6 +1417,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: None,
+                    metaclass: NIL,
                 },
             );
         }
@@ -1461,6 +1478,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: None,
+                    metaclass: NIL,
                 },
             );
         }
@@ -1599,6 +1617,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
                     direct_subs: vec![],
                     slots: vec![],
                     wrapper: None,
+                    metaclass: NIL,
                 },
             );
         } else {
@@ -1713,6 +1732,7 @@ pub fn define_class_with_shared_slots(
                 direct_subs: vec![],
                 slots: slots.to_vec(),
                 wrapper: None,
+                metaclass: NIL,
             },
         );
 
@@ -1880,6 +1900,30 @@ pub fn compute_class_precedence_list(class: EgclVal) -> Result<Vec<EgclVal>, Egc
         }
         Ok(cpl)
     })
+}
+
+/// The metaclass DEFCLASS named for `class`, or NIL for the default.
+pub fn class_metaclass(class: EgclVal) -> EgclVal {
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .map(|m| m.metaclass)
+            .unwrap_or(NIL)
+    })
+}
+
+/// Record the metaclass DEFCLASS named for `class`.
+///
+/// Separate from `define_class` because the metaclass is resolved by the
+/// interpreter (it is a class NAME in the source, which may not be defined
+/// until after this class is) and because every existing caller of
+/// `define_class` means the default.
+pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+    with_state_mut(|st| {
+        if let Some(meta) = st.class_meta.get_mut(&class) {
+            meta.metaclass = metaclass;
+        }
+    });
 }
 
 /// Get the direct superclasses of a class.
