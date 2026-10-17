@@ -36410,9 +36410,12 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     } else {
         NIL
     };
-    let class = match egcl_stdlib::find_class(name_form) {
-        Some(existing) => existing,
-        None => egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
+    let (class, class_is_fresh) = match egcl_stdlib::find_class(name_form) {
+        Some(existing) => (existing, false),
+        None => (
+            egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
+            true,
+        ),
     };
     egcl_stdlib::clos::define_class_with_shared_slots(
         name_form,
@@ -36434,6 +36437,22 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         && let Some(metaclass) = egcl_stdlib::find_class(metaclass_name)
     {
         egcl_stdlib::clos::set_class_metaclass(class, metaclass);
+        // The class metaobject is an instance of its metaclass, so the
+        // metaclass's slot :initforms apply to it -- that is what makes
+        // `(meta-x (find-class 'foo))` answer the initform rather than
+        // signalling UNBOUND-SLOT (GitHub #384). Same path MAKE-INSTANCE uses.
+        //
+        // Only for a freshly allocated metaobject: re-running them on a
+        // redefinition would clobber whatever the program has since stored in
+        // those slots, and a metaclass protocol keeps its per-class state
+        // exactly there.
+        //
+        // After `set_class_metaclass`, which is what points the object's
+        // wrapper at the metaclass and so decides which slot cells exist.
+        if class_is_fresh {
+            let metaclass_name = class_name_for_instance_class(metaclass);
+            apply_class_initforms(class, &metaclass_name, env, None, &[])?;
+        }
     }
 
     // Install real generic methods for slot readers/writers/accessors so they

@@ -126,11 +126,12 @@ fn a_forward_referenced_superclass_resolves_when_it_is_defined() {
 /// applies and wins over one on STANDARD-CLASS, and the class carries the
 /// metaclass's slots.
 ///
-/// The `:initform` is deliberately NOT asserted to have run: the class
-/// metaobject is allocated as an instance of its metaclass but
-/// INITIALIZE-INSTANCE is not called on it, so the slot starts unbound and a
-/// read signals. Writing then reading works. Finishing that is the remaining
-/// piece of #384.
+/// The metaclass's slot `:initform`s run on the class metaobject too, through
+/// the same path MAKE-INSTANCE uses, so a read before any write answers the
+/// initform rather than signalling UNBOUND-SLOT. Only for a freshly allocated
+/// metaobject: re-running them on a redefinition would clobber whatever the
+/// program has stored in those slots, which for a metaclass protocol is its
+/// entire per-class state.
 #[test]
 fn a_class_with_a_user_metaclass_is_an_instance_of_it() {
     let stdout = run(r#"
@@ -147,6 +148,13 @@ fn a_class_with_a_user_metaclass_is_an_instance_of_it() {
       (format t "DISPATCH-META ~a~%" (cc2 (find-class 'foo)))
       (defmethod cc2 ((c standard-class)) :std)
       (format t "DISPATCH-PREFERS-META ~a~%" (cc2 (find-class 'foo)))
+      ;; The metaclass's :initform ran on the class metaobject.
+      (format t "INITFORM ~a~%" (slot-value (find-class 'foo) 'x))
+      (format t "INITFORM-VIA-ACCESSOR ~a~%" (meta-x (find-class 'foo)))
+      ;; A redefinition must NOT re-run it over a stored value.
+      (setf (meta-x (find-class 'foo)) 99)
+      (eval '(defclass foo () () (:metaclass meta)))
+      (format t "REDEF-KEEPS-SLOT ~a~%" (meta-x (find-class 'foo)))
       ;; The class carries the metaclass's slot: writing then reading works.
       (setf (slot-value (find-class 'foo) 'x) 42)
       (format t "SLOT-ROUNDTRIP ~a~%" (slot-value (find-class 'foo) 'x))
@@ -162,6 +170,9 @@ fn a_class_with_a_user_metaclass_is_an_instance_of_it() {
         "TYPEP-META T",
         "TYPEP-STD T",
         "SLOT-EXISTS T",
+        "INITFORM 1",
+        "INITFORM-VIA-ACCESSOR 1",
+        "REDEF-KEEPS-SLOT 99",
         "DISPATCH-META META",
         "DISPATCH-PREFERS-META META",
         "SLOT-ROUNDTRIP 42",
