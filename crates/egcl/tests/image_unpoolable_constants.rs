@@ -74,6 +74,58 @@ fn saved_image_keeps_functions_with_unpoolable_constants() {
     );
 }
 
+/// A function compiled from source after it ran hot, whose capturing handler
+/// lambda the portable lowering leaves to MakeClosureEnv — UIOP's
+/// CALL-WITH-MUFFLED-CONDITIONS — is saved, not left out of the image.
+#[test]
+fn saved_image_keeps_functions_that_build_closures_from_source() {
+    let dir = std::env::temp_dir().join(format!("egcl-closure-env-image-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let _fixture = Fixture(dir.clone());
+    let source = dir.join("muffled.lisp");
+    let core = dir.join("muffled.core");
+    fs::write(
+        &source,
+        r#"(defun call-muffled (thunk conditions)
+  (handler-bind ((t #'(lambda (c) (when (member (type-of c) conditions)
+                                    (muffle-warning c)))))
+    (funcall thunk)))
+"#,
+    )
+    .unwrap();
+    let build = format!(
+        r#"(progn
+      (load {source:?})
+      (dotimes (i 50) (call-muffled (lambda () i) '(simple-warning)))
+      (egcl-ext:save-lisp-and-die {core:?}))"#
+    );
+    let built = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", &build])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&built.stderr);
+    assert!(built.status.success(), "{stderr}");
+    assert!(!stderr.contains("left out"), "{stderr}");
+    let restored = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--image"])
+        .arg(&core)
+        .args([
+            "--eval",
+            r#"(progn
+          (assert (eq (call-muffled (lambda () (warn "muffled") :ran) '(simple-warning)) :ran))
+          (format t "CLOSURE-ENV-OK~%"))"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success()
+            && String::from_utf8_lossy(&restored.stdout).contains("CLOSURE-ENV-OK"),
+        "{}\n{}",
+        String::from_utf8_lossy(&restored.stdout),
+        String::from_utf8_lossy(&restored.stderr)
+    );
+}
+
 /// A fasl never carries a saved heap reference (only an image's own restore can
 /// give the address meaning): its LOAD-TIME-VALUE forms are evaluated again
 /// when it loads.

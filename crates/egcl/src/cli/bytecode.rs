@@ -9187,6 +9187,9 @@ const BBU_AUX_RESTART_TABLES: u16 = 7;
 const BBU_AUX_HANDLER_CASES: u16 = 9;
 // Optional: older units conservatively retain dynamic named calls.
 const BBU_AUX_SELF_CALL_SITES: u16 = 10;
+// Per function, each HANDLER-BIND's condition type names (0x0203). Absent from
+// older units, whose functions could not contain PUSH_HANDLER_BIND.
+const BBU_AUX_HANDLER_BINDS: u16 = 11;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -9735,6 +9738,8 @@ struct BbuFunction {
     // Per `handler-case` form: its clauses as (type-name string ref, clause body
     // byte offset, var slot or NO_INDEX).
     handler_cases: Vec<Vec<(u32, u32, u32)>>,
+    // Per `handler-bind` form: its condition type names as string refs.
+    handler_binds: Vec<Vec<u32>>,
 }
 
 fn bbu_instr_len(i: &Instr) -> Option<usize> {
@@ -9819,11 +9824,13 @@ fn serialize_bbu_function(
     // `serialize_bbu_function_tree`, which serializes children before the owner.
     nested_global: &[u32],
 ) -> Option<BbuFunction> {
-    // Handler-bind tables do not yet have a BBU encoding. Handler-case clauses
-    // are serialized below.
-    if !bf.handler_binds.is_empty() {
-        return None;
-    }
+    // Each handler-bind's type names; the handler functions themselves are
+    // operands on the stack, so the table is all PUSH_HANDLER_BIND needs.
+    let handler_binds: Vec<Vec<u32>> = bf
+        .handler_binds
+        .iter()
+        .map(|info| info.types.iter().map(|name| pool.string(name)).collect())
+        .collect();
     let mut literal_refs = Vec::with_capacity(bf.constants.len());
     for &c in &bf.constants {
         match pool.value(c) {
@@ -9844,9 +9851,17 @@ fn serialize_bbu_function(
 
     let mut offsets = Vec::with_capacity(bf.code.len());
     let mut pc = 0u32;
+    // A core image may keep closures built from a source form (EvalHost,
+    // MakeClosureEnv): it already carries such source-based functions, and
+    // leaving the function out would leave a stub that answers NIL.
+    let image = pool.saved_heap_refs;
     for instr in &bf.code {
         offsets.push(pc);
-        let len = match bbu_instr_len(instr) {
+        let len = match instr {
+            Instr::EvalHost(_) | Instr::MakeClosureEnv(_) if image => Some(5),
+            _ => bbu_instr_len(instr),
+        };
+        let len = match len {
             Some(len) => len,
             None => {
                 if std::env::var_os("EGCL_BFASL_FORM").is_some() {
@@ -10081,6 +10096,10 @@ fn serialize_bbu_function(
                 // heap frame is captured), so no slot payload follows.
                 put_u16(&mut code, u16::from(*capture_env));
             }
+            Instr::EvalHost(idx) | Instr::MakeClosureEnv(idx) if image => {
+                put_u8(&mut code, if matches!(instr, Instr::EvalHost(_)) { 0x46 } else { 0x47 });
+                put_u32(&mut code, *idx as u32);
+            }
             Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => {
                 if std::env::var_os("EGCL_BFASL_FORM").is_some() {
                     eprintln!("[bfasl] serialize: non-portable instr {instr:?}");
@@ -10142,6 +10161,7 @@ fn serialize_bbu_function(
             }
             tables
         },
+        handler_binds,
     })
 }
 
@@ -10352,6 +10372,21 @@ fn serialize_bbu_restart_tables(functions: &[BbuFunction]) -> Vec<u8> {
             for &(name_ref, function_ref) in table {
                 put_u32(&mut out, name_ref);
                 put_u32(&mut out, function_ref);
+            }
+        }
+    }
+    out
+}
+
+fn serialize_bbu_handler_binds(functions: &[BbuFunction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, functions.len() as u32);
+    for function in functions {
+        put_u32(&mut out, function.handler_binds.len() as u32);
+        for types in &function.handler_binds {
+            put_u32(&mut out, types.len() as u32);
+            for &type_ref in types {
+                put_u32(&mut out, type_ref);
             }
         }
     }
@@ -10851,7 +10886,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 4);
+    put_u32(&mut out, 5);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -10888,6 +10923,11 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, self_calls.len() as u32);
     out.extend_from_slice(&self_calls);
+    let handler_binds = serialize_bbu_handler_binds(&functions);
+    put_u16(&mut out, BBU_AUX_HANDLER_BINDS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, handler_binds.len() as u32);
+    out.extend_from_slice(&handler_binds);
     Ok(Some(out))
 }
 
@@ -10909,7 +10949,7 @@ fn assemble_bbu(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 4);
+    put_u32(&mut out, 5);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(content_tag));
     for entry in &pool.entries {
@@ -10945,6 +10985,11 @@ fn assemble_bbu(
     put_u16(&mut out, 0);
     put_u32(&mut out, self_calls.len() as u32);
     out.extend_from_slice(&self_calls);
+    let handler_binds = serialize_bbu_handler_binds(functions);
+    put_u16(&mut out, BBU_AUX_HANDLER_BINDS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, handler_binds.len() as u32);
+    out.extend_from_slice(&handler_binds);
     out
 }
 
@@ -11999,6 +12044,36 @@ fn parse_bbu_handler_cases(
     Ok(functions)
 }
 
+fn parse_bbu_handler_binds(
+    bytes: &[u8],
+    function_count: usize,
+) -> Result<Vec<Vec<Vec<u32>>>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.u32()? as usize != function_count {
+        return Err(bbu_error(
+            "handler-bind function count does not match function table",
+        ));
+    }
+    let mut functions = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        let table_count = cursor.u32()? as usize;
+        let mut tables = Vec::with_capacity(table_count.min(bytes.len()));
+        for _ in 0..table_count {
+            let type_count = cursor.u32()? as usize;
+            let mut types = Vec::with_capacity(type_count.min(bytes.len()));
+            for _ in 0..type_count {
+                types.push(cursor.u32()?);
+            }
+            tables.push(types);
+        }
+        functions.push(tables);
+    }
+    if !cursor.done() {
+        return Err(bbu_error("trailing handler-bind metadata"));
+    }
+    Ok(functions)
+}
+
 fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, EgclError> {
     let mut values = allocate_bbu_constants(constants)?;
     egcl_rt::rooted_ref!(_values_root = &mut values);
@@ -12261,6 +12336,7 @@ fn decode_bbu_function(
     encoded: &EncodedBbuFunction,
     constants: &[EgclVal],
     handler_case_table: &[Vec<(u32, u32, u32)>],
+    handler_bind_table: &[Vec<u32>],
     bytecode_version: u16,
 ) -> Result<BytecodeFunction, EgclError> {
     let mut cursor = BbuCursor::new(&encoded.code);
@@ -12424,11 +12500,31 @@ fn decode_bbu_function(
                 MemoryFenceKind::from_u8(cursor.u8()?)
                     .ok_or_else(|| bbu_error("invalid memory-fence kind"))?,
             ),
+            // Core-image only; the loader rejects them in a fasl.
+            0x46 | 0x47 if bytecode_version >= 0x0203 => {
+                let literal = cursor.u32()?;
+                if literal > u16::MAX as u32 || literal as usize >= encoded.literal_refs.len() {
+                    return Err(bbu_error("closure-form operand out of bounds"));
+                }
+                if opcode == 0x46 {
+                    Instr::EvalHost(literal as u16)
+                } else {
+                    Instr::MakeClosureEnv(literal as u16)
+                }
+            }
             0x28 => Instr::PushHandlerCase {
                 hc: cursor.u32()?,
                 sp_restore: cursor.u16()?,
             },
             0x29 => Instr::PopHandlerCase,
+            0x2a if bytecode_version >= 0x0203 => {
+                let hb = cursor.u32()?;
+                if hb as usize >= handler_bind_table.len() {
+                    return Err(bbu_error("handler-bind index out of bounds"));
+                }
+                Instr::PushHandlerBind { hb }
+            }
+            0x2b if bytecode_version >= 0x0203 => Instr::PopHandlerBind,
             0x2c => Instr::PushRestartCase {
                 rc: cursor.u32()?,
                 resume_bcp: cursor.u32()?,
@@ -12521,6 +12617,16 @@ fn decode_bbu_function(
         }
         handler_cases.push(HandlerCaseInfo { clauses: infos });
     }
+    let handler_binds = handler_bind_table
+        .iter()
+        .map(|types| {
+            types
+                .iter()
+                .map(|&type_ref| bbu_string_from_values(constants, type_ref))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|types| HandlerBindInfo { types })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let literal_values = encoded
         .literal_refs
@@ -12575,7 +12681,7 @@ fn decode_bbu_function(
         constants: literal_values,
         load_time_values: Vec::new(),
         handler_cases,
-        handler_binds: Vec::new(),
+        handler_binds,
         names,
         restart_cases: Vec::new(),
         // Filled during reconstruction once `MakeClosure` global references are
@@ -14221,6 +14327,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut function_metadata = None;
     let mut restart_tables = None;
     let mut handler_case_tables = None;
+    let mut handler_bind_tables = None;
     let mut self_call_tables = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
@@ -14248,10 +14355,17 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate handler-case metadata"));
             }
             handler_case_tables = Some(parse_bbu_handler_cases(bytes, function_count)?);
+        } else if kind == BBU_AUX_HANDLER_BINDS {
+            if handler_bind_tables.is_some() {
+                return Err(bbu_error("duplicate handler-bind metadata"));
+            }
+            handler_bind_tables = Some(parse_bbu_handler_binds(bytes, function_count)?);
         }
     }
     let handler_case_tables =
         handler_case_tables.unwrap_or_else(|| vec![Vec::new(); function_count]);
+    let handler_bind_tables =
+        handler_bind_tables.unwrap_or_else(|| vec![Vec::new(); function_count]);
     if !cursor.done() {
         return Err(bbu_error("trailing bytes"));
     }
@@ -14495,8 +14609,22 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
         let mut function = decode_bbu_function(
-            encoded, &constants, &handler_case_tables[index], bytecode_version,
+            encoded,
+            &constants,
+            &handler_case_tables[index],
+            &handler_bind_tables[index],
+            bytecode_version,
         )?;
+        // These build a closure by evaluating a source form; a fasl must stay
+        // source-free, so only a core image's registry unit may carry them.
+        if !restoring
+            && function
+                .code
+                .iter()
+                .any(|instr| matches!(instr, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
+        {
+            return Err(bbu_error("host-evaluated closure outside a core image"));
+        }
         function.restart_cases = restart_tables[index]
             .iter()
             .map(|table| {
