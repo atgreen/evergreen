@@ -128,73 +128,166 @@ Pinning also makes a class usable as an `EQ` hash-table key for free:
 pinned heap object as stable, so such a table is never marked
 `address_sensitive` and never needs `maybe_rehash_for_gc`.
 
-## 3. Prerequisites
+## 3. What pinning buys, and the comments that must change
 
-These are **not** follow-ups. Each is a latent correctness hole that the
-representation change converts into a live one, and none is fixed by pinning.
+An earlier draft of this document listed the three items below as
+*prerequisites*, on the reasoning that a heap class value must be traced and
+rehashed like any other. That reasoning assumed a **movable** class. With a
+pinned class it does not hold, and the distinction is the main reason to pin
+rather than to allocate ordinarily. Recorded here because the wrong version is
+an easy and expensive mistake to make: it would add an O(classes) map rebuild
+to every minor GC, twice per collection, for no benefit.
 
-### 3.1 The CLOS root scanner visits no map keys
+Two facts settle all three, both checked against the source rather than assumed:
+
+- **A pinned class never moves.** Never evacuated (`gc.rs:2671`), never freed
+  (`gc.rs:2862`), and a pinned nursery region is retained in place
+  (`gc.rs:1782`). So no copy of a class value anywhere can go stale, in a map
+  key or outside the heap.
+- **Every class is reachable through `class_registry`, whose values the scanner
+  already visits** (`clos.rs:465`). All seven `class_meta.insert` sites
+  (`clos.rs:954, 1355, 1370, 1411, 1472, 1611, 1726`) are paired with a
+  `class_registry.insert` of the same class value, so no class is reachable
+  *only* as a key.
+
+### 3.1 No rehash, but keys still need MARKING
 
 `visit_clos_roots` (`clos.rs:456-537`) iterates `values_mut()` everywhere and
-rests on a stated premise that the change removes — `clos.rs:463`:
+never visits a map key; `structure_classes` (`clos.rs:383`) is not referenced at
+all. Under pinning no key can go **stale**, so no rehash is needed — and that
+matters, because an unconditional `mem::take`-and-rebuild of `class_meta` would
+cost O(classes) twice per collection forever.
 
-> *"Registry keys are symbols or private meta-handles and never move."*
+But marking is a separate question from relocation, and the pairing argument
+above has a hole I missed on the first pass: it covers every
+`class_meta.insert`, and **not removal**. `bind_class_name(name, NIL)` —
+i.e. `(setf (find-class 'foo) nil)`, which CLHS requires — removes the entry
+from `class_registry` and `class_by_name` and **leaves `class_meta` alone**
+(`clos.rs:1642-1648`). After that call the class is reachable *only* as a
+`class_meta` key. Obsolete pre-redefinition classes are a second route to the
+same state.
 
-Specifically unvisited:
+In-process that is harmless, because a pinned `STANDARD_OBJECT` is immortal
+(§2.2). For a **shaken image** it is not: `save_reachable_image` retains only
+what `reachable_heap_objects` reaches (`gc.rs:6536`), so an orphaned class is
+omitted from disk while the restored `class_meta` still names its address.
 
-- **`class_meta`'s keys** (`clos.rs:471` visits only values). These *are* the
-  class values. After a relocation the key keeps the old bits while every
-  visited copy is updated, so `st.class_meta.get(&class)` misses — breaking
-  `finalize_class_layout` (`clos.rs:1771`), `allocate_instance_pinned_gc`
-  (`clos.rs:2204`, which then errors "cannot allocate an instance of a class
-  with no slot layout"), `struct_slot_order` (`clos.rs:2281`) and subclass
-  registration (`clos.rs:1710`).
-- **`structure_classes`** (`clos.rs:383`) — not referenced by the scanner at
-  all. Its elements are class values. Unrooted and unrewritten, a live struct
-  class answers `false` to `is_struct_class` (`clos.rs:1585`), changing
-  `EQUALP` descent and `#S(...)` printing (the bliss-i1i9 behaviour).
-- **`ClassMeta.shared_slots`** (`clos.rs:69`) — unvisited. Safe today because
-  slot names are pinned symbols. See also bliss-dfm5f: it is not serialized
-  either, which is a live bug independent of this work.
+The cheap fix follows from pinning: because a pinned key never changes value,
+the scanner can **visit a copy** of each key purely to mark it, and discard the
+copy. O(n) marking, no rehash, no map rebuild:
 
-A map keyed on a relocatable pointer cannot be fixed in place — it needs
-rehashing. The repo's reference implementation is
-`crates/egcl-stdlib/src/devtools.rs:2769-2785`: `std::mem::take`, `visit(&mut
-key)`, reinsert. **It must be idempotent**, because scanners run twice per
-collection — once for marking and once for relocation (`gc.rs:1685`/`1961`
-minor, `gc.rs:2480`/`2753` major).
+```rust
+// Keys are class values. Pinned, so they never move and need no rehash -- but
+// a class orphaned by (setf (find-class 'x) nil) is reachable ONLY here, so
+// mark through a copy to keep it in a shaken image.
+for &key in state.class_meta.keys() {
+    let mut marked = key;
+    visit(&mut marked);
+    debug_assert_eq!(marked, key, "a pinned class moved");
+}
+```
 
-Pinning makes rehashing unnecessary in the steady state, but the scanner is
-still the only thing that makes a class *reachable*, which §3.3 covers.
+The `debug_assert` is the test for the load-bearing invariant: if a class ever
+becomes movable, this fires rather than silently corrupting the map. The same
+treatment applies to `structure_classes`. If classes ever do become movable the
+rehash becomes mandatory, and the pattern is
+`crates/egcl-stdlib/src/devtools.rs:2769-2785` (`std::mem::take`, visit,
+reinsert), which must be idempotent because scanners run twice per collection
+(`gc.rs:1685`/`1961` minor, `gc.rs:2480`/`2753` major).
 
-### 3.2 `ClassWrapper.class` is an untraced `EgclVal` outside the heap
+### 3.2 `ClassWrapper.class` needs no tracing story, only a corrected comment
 
-`ClassWrapper` (`clos.rs:118`) holds `class: EgclVal` and is a leaked Rust
-`Box` (`clos.rs:1786`). The scanner deliberately skips it — `clos.rs:489`:
+`ClassWrapper` (`clos.rs:118`) holds `class: EgclVal` in a leaked Rust `Box`
+(`clos.rs:1786`) that no scanner visits — declined at `clos.rs:489` — and it is
+the word `class_of` reads (`clos.rs:1814`). For a *movable* class that would be
+a GC-invisible reference going stale on the first collection after a
+`DEFCLASS`. For a pinned, immortal class the raw copy stays valid for the
+process lifetime. The comment's stated reason ("the same immediate
+meta-handles/symbols") stops being true and must be rewritten to name the pin.
 
-> *"Wrapper class ids and slot-layout names are the same immediate
-> meta-handles/symbols represented above, so they need no rewrite."*
+This word is also the one `trace_object` treats as raw for a `STANDARD_OBJECT`
+(`gc.rs:1316`), which is why **instances do not root their own class** —
+the registry, not the instance, is responsible for that.
 
-That is the single most load-bearing assumption being removed. It is also the
-word `class_of` reads (`clos.rs:1814`), and the word `trace_object` treats as
-raw for a `STANDARD_OBJECT` (`gc.rs:1316`) — so **instances do not root their
-own class**. A heap class stored there is a GC-invisible reference that goes
-stale on the first collection after a `DEFCLASS`.
+### 3.3 Redefinition leaks, by construction
 
-Either give `ClassWrapper`/`SlotLayout` a tracing story, or stop storing a
-class *value* there (e.g. store a stable class id and resolve through the
-registry). Pinning makes the stored pointer valid; it does not make it a root.
+A pinned `STANDARD_OBJECT` is never reclaimed: only `FUNCTION_INTERPRETED` and
+`SYMBOL` are admitted to `free_pinned_slots` (`gc.rs:5214`) and
+`dead_function_slots` is populated only for those (`gc.rs:2555`, `:2579`), and
+a region holding any pin is never freed (`gc.rs:2862`). So **every `DEFCLASS`
+redefinition leaks a class object and permanently retains its host region.**
 
-### 3.3 Reachability is still required
+That is acceptable for a bounded class population and unacceptable for a
+program that redefines classes in a loop. The cost is bounded by packing
+(`ceil(total pinned bytes / 1 MiB)`, `gc.rs:5236`), and a class object is small
+(16 bytes plus the metaclass's slots), so thousands of redefinitions cost
+single-digit MiB. Record it as a known limit rather than designing around it;
+revisit if a workload shows up. Note the general doc comment at `gc.rs:5162`
+says pinned slots *can* be reclaimed once unreachable — that is true for
+interpreted functions and symbols only, and does not apply here.
 
-Pinning stops relocation, not collection *semantics*. An unreachable pinned
-object is never freed and never zeroed (`gc.rs:2862`), yet its slots keep being
-traced at every minor GC (`gc.rs:1707`) — a permanently-traced zombie holding
-dangling slots. A class must stay reachable from a root scanner for its whole
-life. This also matters for the shaken image: `save_reachable_image` retains
-only what `reachable_heap_objects` reaches (`gc.rs:6536`), so a class reachable
-*only* as a `class_meta` key would be omitted from disk while the restored
-registry still names its address. Verify with a **shaken** core, not a plain one.
+### 3.4 The decision that dominates everything: which `type_id`?
+
+This is the fork to settle before any code is written, and it was not obvious
+until the call-site audit: **a class allocated as `STANDARD_OBJECT` makes
+`egcl_stdlib::is_instance` answer true for every class.** That predicate is
+just a header test (`clos.rs:1803`), there is no dedicated class `type_id`
+today, and roughly 38 sites gate on it.
+
+Type ids run to `PYTHON_OBJECT = 0x1E` (`crates/egcl-rt/src/object.rs:169-211`),
+so `0x1F` and up are free. The two options:
+
+**(a) `STANDARD_OBJECT`.** Semantically right — CLHS makes a class an instance
+of `STANDARD-OBJECT` — and #384's four symptoms then fix themselves, because
+`TYPEP` and dispatch already route instances through the class hierarchy and
+`class_of` already reads the wrapper. The cost is the `is_instance` cascade:
+every site that uses `is_instance` to mean *"an ordinary user instance"* now
+admits classes, and several answer wrongly **with no diagnostic**. The worst,
+all verified:
+
+- `is_standard_class_metaobject` (`cli.rs:14951`) short-circuits on
+  `class.is_symbol()` at `:14955`. Once a class is not a symbol a user class
+  falls through to a hardcoded name whitelist that cannot contain it, so it
+  answers `false` — and that one function drives `(class-of (find-class 'foo))`
+  ⇒ `BUILT-IN-CLASS` (`cli.rs:14904`), `(typep c 'standard-class)` ⇒ NIL and
+  `(typep c 'built-in-class)` ⇒ T (`cli.rs:16494`), the specializer table
+  (`cli.rs:6986`), and DEFCLASS's own "is a system class" rejection
+  (`cli.rs:35807`), which would refuse every user superclass and break
+  `boot.lisp`. **Fix this first; it is four wrong answers from one line.**
+- `TYPEP` ordering: the `is_instance` CPL branch at `cli.rs:16432` fires and
+  returns *before* the dedicated metaclass arm at `cli.rs:16477`, making that
+  arm dead code.
+- `cli.rs:6611` computes `built_in = !is_instance(x) && !class_of(x).is_symbol()`,
+  whose own comment (`:6607`) names the invariant being removed; it collapses to
+  `!is_instance(x)`, routing conditions and structures to SLOT-MISSING.
+- `coerce_condition_designator` (`cli.rs:5339`) returns an `is_instance` datum
+  as the condition, so `(error (find-class 'my-error))` would signal the class
+  object itself.
+- `is_builtin_class` (`clos.rs:1179`) discriminates on the fixnum *sign*; the
+  explicit fallback covers 10 of the 47 built-in classes, so
+  `(make-instance (find-class 'integer))` stops erroring (`clos.rs:2320`).
+- `conditions.rs:438` does `define_class(sym, sym, …); Ok(sym)` for every
+  built-in condition type, which would build a parallel symbol-keyed class
+  universe silently.
+- `sym_name(class)` at `cli.rs:20511` feeds `env.classes.get(&class_name)`, so
+  the whole EGCL-MOP slot-descriptor surface quietly returns an empty list.
+- `SXHASH` of a class moves from name-based to address-based
+  (`hashtable.rs:781` vs `:816`) — i.e. no longer image-portable.
+
+**(b) A dedicated `CLASS` type_id (0x1F).** `is_instance` stays false, the
+cascade evaporates, and the ~38 sites keep their current meaning. The cost is
+that none of #384 fixes itself: `TYPEP`, dispatch, `slot-value`,
+`slot-exists-p` and the accessor path each need an explicit class arm, and
+`(typep c 'standard-object)` must be made true by hand.
+
+**Recommendation: (a), with the `is_standard_class_metaobject` fix landed
+first and separately.** The cascade is largely *correct* behaviour arriving by
+the right route — `TYPE-OF` answering `STANDARD-CLASS`, a class being a
+`STANDARD-OBJECT` — and option (b) buys a smaller diff by making the
+representation less true, which is what the current design already does. But
+the list above is the real cost of (a) and it should be budgeted, not
+discovered. Several items are latent-today bugs whose comments already name the
+assumption, so they are worth fixing on their own.
 
 ## 4. Lock ordering and the bootstrap
 
@@ -281,7 +374,41 @@ What must change:
    function's pool — at `:9614`. A class literal is encodable today *only*
    because it is a symbol. Either add a by-name class encoding (as pathnames do
    at `:9606`) or prove with a test that no compiled literal holds a class.
-5. **Test the wrapper walk over class objects.** The save/restore wrapper table
+6. **Expect a T2 coverage regression, and decide whether to accept it.** A
+   class constant is baked into native code today as an immediate: `emit_const`
+   routes `TAG_SYMBOL` to `ConstSymbol` and a fixnum to `ConstFixnum`
+   (`crates/egcl-compiler/src/t2/build.rs:3061-3084`), so `(find-class
+   'hash-table)` is currently even *inferred as a fixnum type*. After the change
+   both fall to the `ConstHeapObj`/`HeapLiteral` arm (`build.rs:3086`), which is
+   GC-correct — T1 already gates on `is_heap_ref` in all five lowerers — but
+   deopt and transfer metadata deliberately refuse heap-object constants
+   (`crates/egcl-compiler/src/t2/deopt.rs:282`, `LowerError::MovingConst`;
+   `transfer_capture.rs:234`). So **any function whose deopt frame state holds a
+   class constant loses T2.** Pinned constants are exactly the case that refusal
+   need not cover, so the clean fix is to admit a pinned heap constant there
+   rather than to accept the regression.
+7. **Two leaked, untraced caches hold class bits compared by address**, both
+   sound only while classes are pinned, and both worth a comment naming that:
+   `GF_DISPATCH_CACHE`'s `GfKey.classes` (`cli.rs:8113`) and the receiver type
+   profile `ReceiverTypeProfileEntry { receiver_type: AtomicU64 }`
+   (`cli/bytecode.rs:19170`, fed from `cli.rs:8042`, compared at `:19217`).
+   Immortality is what makes them safe: an address is never recycled, so there
+   is no ABA hazard.
+8. **One image-ordering hazard, latent today.** `run_offheap_populate()`
+   rehashes every Lisp hash table (`crates/egcl-rt/src/image.rs:1021`) *before*
+   the host hook restores CLOS (`image.rs:1037`), and at that instant every
+   restored instance's wrapper word still holds a save-time address, rewritten
+   only later (`clos.rs:1106`). Harmless while key hashing never consults CLOS;
+   any class-aware or slot-wise `EQUALP` hashing would dereference a dangling
+   wrapper there.
+9. **Keep raw, untagged words out of a class object's body.** The restore path
+   remaps *every* 8-byte body word (`gc.rs:7009`) and treats `tag == 0` as a
+   bare address (`crates/egcl-rt/src/image_relocation.rs:103`), so a stamp or a
+   slot count stored in the body can be silently rewritten if its bits alias a
+   saved heap address. Metadata belongs in `ClassMeta` or the wrapper, which is
+   where §2 already puts it.
+
+10. **Test the wrapper walk over class objects.** The save/restore wrapper table
    is keyed by save-time address and rewrites word 0 of every
    `STANDARD_OBJECT` found by `walk_heap` (`clos.rs:876`, `:1105`). Once a
    class *is* one, it is visited too — which is what we want, but it is the
@@ -314,11 +441,12 @@ on their own.
 
 | # | Stage | Lands | Validation |
 |---|---|---|---|
-| 1 | Root-scanner completeness: visit `class_meta` keys (idempotent rehash), `structure_classes`, `ClassMeta.shared_slots` | no behaviour change today (all immediates) | GC stress over DEFCLASS/DEFSTRUCT; a probe asserting the rehash is idempotent across both scanner passes |
-| 2 | `ClassWrapper.class` tracing story | no behaviour change today | as above, plus a class-redefinition probe |
-| 3 | `shared_slots` serialization + CLST version 4 (bliss-dfm5f) | fixes a live image bug | save/restore round-trip over an `:allocation :class` shadowing class |
-| 4 | The representation switch: pinned class objects, bootstrap order, `find_class` returning them | the whole of bliss-rj5o | §8 |
-| 5 | Printing (`#<STANDARD-CLASS FOO>`), `TYPE-OF`, disjointness from `SYMBOL`/`INTEGER` | the §1 symptoms | ANSI objects + types-and-classes |
+| 0 | Settle §3.4 (`type_id`), then fix `is_standard_class_metaobject` (`cli.rs:14951`) to stop using `is_symbol()` as "is a user class" | a latent bug today; four wrong answers avoided later | `(class-of (find-class 'foo))`, `(typep c 'standard-class)`, DEFCLASS with a user superclass, both tiers |
+| 1 | Mark `class_meta` keys and `structure_classes` through a copy, with the `debug_assert` pinning invariant; visit `ClassMeta.shared_slots`; correct the `clos.rs:463` and `:489` comments | no behaviour change today | GC stress over DEFCLASS/DEFSTRUCT; a shaken core after `(setf (find-class 'x) nil)` |
+| 2 | `shared_slots` serialization + CLST version 4 (bliss-dfm5f) | fixes a live image bug | save/restore round-trip over an `:allocation :class` shadowing class |
+| 3 | The representation switch: pinned class objects, bootstrap order, `find_class` returning them, the `is_instance`-cascade sites of §3.4 | the whole of bliss-rj5o | §8 |
+| 4 | Printing (`#<STANDARD-CLASS FOO>`), `TYPE-OF`, disjointness from `SYMBOL`/`INTEGER` | the §1 symptoms | ANSI objects + types-and-classes |
+| 5 | BBU constant-pool encoding for a class, or a test proving no compiled literal holds one | BFASL caching keeps working | a BFASL round-trip over a function with a class constant |
 | 6 | Retire the negative-fixnum ids and `fixnum_registrations`' diamond heuristic | removes the last immediate-class path | ANSI arrays + objects |
 | 7 | #384's four symptoms as regression tests (bliss-r894g) | the external consumer | the §1.2 program, both evaluator tiers |
 
