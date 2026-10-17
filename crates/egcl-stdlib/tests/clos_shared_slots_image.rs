@@ -117,15 +117,15 @@ fn a_wrong_version_or_a_truncated_block_is_refused() {
     assert_eq!(&bytes[..4], b"CLST");
     assert_eq!(
         u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        4,
-        "version 4 is what adds shared_slots"
+        5,
+        "4 added shared_slots; 5 adds ClosState's standard_class and structure_class"
     );
 
     let mut wrong = bytes.clone();
-    wrong[4..8].copy_from_slice(&3u32.to_le_bytes());
+    wrong[4..8].copy_from_slice(&4u32.to_le_bytes());
     let error = restore_clos_state(&wrong, &|raw| raw).unwrap_err();
     assert!(
-        format!("{error}").contains("unsupported version 3"),
+        format!("{error}").contains("unsupported version 4"),
         "expected a version complaint, got: {error}"
     );
 

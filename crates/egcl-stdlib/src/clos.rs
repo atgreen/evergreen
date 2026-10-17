@@ -427,6 +427,12 @@ struct ClosState {
     null_class: EgclVal,
     t_class_val: EgclVal,
     standard_object_class: EgclVal,
+    /// STANDARD-CLASS and STRUCTURE-CLASS, the two metaclasses a class
+    /// metaobject's own wrapper has to be able to name. Kept as values rather
+    /// than wrapper pointers because a raw pointer cannot survive a saved
+    /// image, while these go through the same remap as any other class value.
+    standard_class: EgclVal,
+    structure_class: EgclVal,
     cons_class: EgclVal,
     float_class: EgclVal,
     function_class: EgclVal,
@@ -456,6 +462,8 @@ impl ClosState {
             null_class: NIL,
             t_class_val: NIL,
             standard_object_class: NIL,
+            standard_class: NIL,
+            structure_class: NIL,
             cons_class: NIL,
             float_class: NIL,
             function_class: NIL,
@@ -625,6 +633,8 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
         visit(&mut state.null_class);
         visit(&mut state.t_class_val);
         visit(&mut state.standard_object_class);
+        visit(&mut state.standard_class);
+        visit(&mut state.structure_class);
         visit(&mut state.cons_class);
         visit(&mut state.float_class);
         visit(&mut state.function_class);
@@ -878,7 +888,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
     let mut out = with_state(|st| {
         let mut out = Vec::new();
         out.extend_from_slice(b"CLST");
-        // 3 added ClassMeta.metaclass; 4 adds ClassMeta.shared_slots.
+        // 3 added ClassMeta.metaclass; 4 added ClassMeta.shared_slots; 5 adds
+        // ClosState::standard_class and ::structure_class.
         //
         // No reader compatibility with 3 is kept, and none is possible to
         // need: an image also carries a hash of the runtime's source and is
@@ -886,7 +897,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
         // core written by any other build never reaches this version check.
         // Measured — a core from the previous commit's binary is rejected at
         // the header, not here.
-        cs_put_u32(&mut out, 4);
+        cs_put_u32(&mut out, 5);
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -950,6 +961,8 @@ pub fn serialize_clos_state() -> Vec<u8> {
             st.null_class,
             st.t_class_val,
             st.standard_object_class,
+            st.standard_class,
+            st.structure_class,
             st.cons_class,
             st.float_class,
             st.function_class,
@@ -1027,7 +1040,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 4 {
+    if version != 5 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -1142,6 +1155,8 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     st.null_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.t_class_val = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.standard_object_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.standard_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+    st.structure_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.cons_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.float_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
     st.function_class = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
@@ -1689,6 +1704,8 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
 
         st.t_class_val = t_cls;
         st.standard_object_class = std_obj;
+        st.standard_class = sclass_cls;
+        st.structure_class = stclass_cls;
         st.fixnum_class = fix_cls;
         st.character_class = chr_cls;
         st.symbol_class = sym_cls;
@@ -1776,9 +1793,15 @@ pub fn find_class(name: EgclVal) -> Option<EgclVal> {
 
 /// Mark `class` as a structure class (created by DEFSTRUCT). Idempotent.
 pub fn set_structure_class(class: EgclVal) {
-    with_state_mut(|st| {
+    let structure_class = with_state_mut(|st| {
         st.structure_classes.insert(class);
+        st.structure_class
     });
+    // A DEFSTRUCT class is an instance of STRUCTURE-CLASS, so CLASS-OF must
+    // answer that and not the STANDARD-CLASS its metaobject was born with.
+    if structure_class != NIL {
+        repoint_class_metaclass(class, structure_class);
+    }
 }
 
 /// Whether `class` is a structure class (DEFSTRUCT). NIL / unknown → false.
@@ -1927,13 +1950,23 @@ pub fn define_class_with_shared_slots(
             .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
 
+        // Subclasses already recorded for this class survive a redefinition.
+        // The insert below used to reset them to empty, which silently cut a
+        // class off from its own subclasses -- and they are what the layout
+        // refresh at the end of this function walks.
+        let prev_subs = st
+            .class_meta
+            .get(&class)
+            .map(|m| m.direct_subs.clone())
+            .unwrap_or_default();
+
         st.class_meta.insert(
             class,
             ClassMeta {
                 shared_slots: shared_slots.to_vec(),
                 name,
                 direct_supers: supers,
-                direct_subs: vec![],
+                direct_subs: prev_subs,
                 slots: slots.to_vec(),
                 wrapper: None,
                 metaclass: NIL,
@@ -1950,6 +1983,53 @@ pub fn define_class_with_shared_slots(
                 (*prev_wrapper)
                     .state
                     .store(WRAPPER_OBSOLETE, Ordering::Release);
+            }
+        }
+
+        // Propagate to the subclasses (CLHS 4.3.6: redefining a class updates
+        // the instance structure of its subclasses too). A subclass's layout is
+        // frozen in its wrapper at ITS definition, so a subclass defined before
+        // this class had slots -- a forward-referenced superclass, say -- would
+        // otherwise keep a layout with none of them and `slot-value` would
+        // report the inherited slot as not present in the layout. Measured:
+        // (defclass sub (super) ...) then (defclass super () ((a))) left A
+        // unreachable on an instance of SUB.
+        //
+        // Breadth-first over the recorded subclass graph, visiting each class
+        // once so a diamond or a cycle cannot loop. Only classes that already
+        // have a wrapper are re-finalized; one that has never been instantiated
+        // builds its layout on first use anyway.
+        let mut queue: Vec<EgclVal> = st
+            .class_meta
+            .get(&class)
+            .map(|m| m.direct_subs.clone())
+            .unwrap_or_default();
+        let mut seen: HashSet<EgclVal> = HashSet::new();
+        seen.insert(class);
+        while let Some(sub) = queue.pop() {
+            if !seen.insert(sub) {
+                continue;
+            }
+            let (had_wrapper, subs) = match st.class_meta.get(&sub) {
+                Some(meta) => (meta.wrapper.is_some(), meta.direct_subs.clone()),
+                None => continue,
+            };
+            queue.extend(subs);
+            if !had_wrapper {
+                continue;
+            }
+            let stale = st
+                .class_meta
+                .get(&sub)
+                .and_then(|m| m.wrapper)
+                .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
+                .unwrap_or(std::ptr::null_mut());
+            if let Some(meta) = st.class_meta.get_mut(&sub) {
+                meta.wrapper = None;
+            }
+            finalize_class_layout(st, sub);
+            if !stale.is_null() {
+                unsafe { (*stale).state.store(WRAPPER_OBSOLETE, Ordering::Release) };
             }
         }
 
@@ -2131,6 +2211,94 @@ pub fn class_inherits_standard_object(class: EgclVal) -> bool {
         .unwrap_or(false)
 }
 
+/// Allocate a class metaobject for a class the program is about to define.
+///
+/// The object is an instance of `STANDARD-CLASS` to begin with, which is the
+/// default metaclass; `set_class_metaclass` and `set_structure_class` re-point
+/// its wrapper when the class turns out to be something else. Every class gets
+/// its own wrapper — they are small leaked allocations, and the alternative is
+/// memoizing a wrapper per metaclass in `ClosState`, which cannot hold a raw
+/// pointer across a saved image.
+///
+/// Must be called with no CLOS lock held: it allocates (see
+/// `alloc_class_metaobject`).
+pub fn new_class_metaobject(metaclass: EgclVal) -> Result<EgclVal, EgclError> {
+    let metaclass = if metaclass == NIL {
+        with_state(|st| st.standard_class)
+    } else {
+        metaclass
+    };
+    if metaclass == NIL {
+        return Err(EgclError::Internal(
+            "no metaclass available for a class metaobject".into(),
+        ));
+    }
+    // A class metaobject IS an instance of its metaclass, so allocate it as
+    // one: that gives it the metaclass's wrapper, a slot cell for each of the
+    // metaclass's effective instance slots, and UNBOUND in each. A plain
+    // STANDARD-CLASS has no slots, so the common case is still 16 bytes.
+    //
+    // This is what makes a (:metaclass M) class able to CARRY M's slots, which
+    // is the half of GitHub #384 that no amount of checking could provide.
+    allocate_instance_pinned_gc(metaclass)
+}
+
+/// Re-point `class`'s own wrapper so `CLASS-OF` answers `metaclass`.
+///
+/// A class metaobject's wrapper names the class it is an INSTANCE of, which is
+/// its metaclass — the same word `class_of` reads for any other instance. This
+/// is how a `(:metaclass M)` class comes to answer M without a special case
+/// anywhere (GitHub #384).
+fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+    if egcl_rt::gc::heap_object_type_id(class) != Some(type_id::STANDARD_OBJECT) {
+        return;
+    }
+    if metaclass == NIL {
+        return;
+    }
+    // How many slot cells this object actually HAS. A class metaobject is
+    // allocated as an instance of its metaclass, so the capacity is fixed at
+    // allocation and cannot grow: pointing it at a layout with more slots than
+    // that would read and write past the allocation.
+    let capacity = unsafe {
+        let current = instance_wrapper(class);
+        if current.is_null() {
+            0
+        } else {
+            if (*current).class == metaclass {
+                // Already an instance of this metaclass -- it was allocated
+                // that way. Nothing to do, and replacing the wrapper here
+                // would discard the layout it was sized for.
+                return;
+            }
+            (*current).slot_count
+        }
+    };
+    // The metaclass's own wrapper, finalized if it has none yet, so the class
+    // object shares the layout its metaclass's instances use.
+    let target = with_state_mut(|st| {
+        if st.class_meta.get(&metaclass).and_then(|m| m.wrapper).is_none() {
+            finalize_class_layout(st, metaclass);
+        }
+        st.class_meta
+            .get(&metaclass)
+            .and_then(|m| m.wrapper)
+            .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
+            .unwrap_or(std::ptr::null_mut())
+    });
+    if target.is_null() {
+        return;
+    }
+    if unsafe { (*target).slot_count } > capacity {
+        // The metaclass gained slots after this class was allocated -- or the
+        // metaclass was not yet defined when it was, which DEFCLASS already
+        // treats as "accepted, with CLASS-OF answering STANDARD-CLASS". Leave
+        // the object alone rather than hand it a layout it cannot hold.
+        return;
+    }
+    unsafe { set_instance_wrapper(class, target) };
+}
+
 /// The metaclass DEFCLASS named for `class`, or NIL for the default.
 pub fn class_metaclass(class: EgclVal) -> EgclVal {
     with_state(|st| {
@@ -2153,6 +2321,10 @@ pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
             meta.metaclass = metaclass;
         }
     });
+    // Outside the lock: leaking a wrapper is a Rust allocation, but keeping the
+    // two in one critical section would invite a GC allocation under the CLOS
+    // lock later. The recorded metaclass above stays the source of truth.
+    repoint_class_metaclass(class, metaclass);
 }
 
 /// Get the direct superclasses of a class.

@@ -6105,6 +6105,53 @@ fn complex_inverse(name: &str, z: Cx) -> Option<Cx> {
     })
 }
 
+/// Resolve a DEFCLASS superclass name, minting a metaobject for one that is
+/// not defined yet.
+///
+/// AMOP calls this a forward-referenced class, and registering it is what SBCL
+/// does too: `(find-class 'c2)` answers the placeholder, and the eventual
+/// `(defclass c2 ...)` reuses it, so the subclass's recorded superclass stays
+/// valid. A name never mentioned at all still has no class.
+///
+/// None of this was needed while a class value WAS its name symbol: a forward
+/// reference recorded the symbol, and the later definition made that symbol
+/// the class (bliss-vsjn1). ansi-test DEFCLASS.FORWARD-REF.1-3 is the
+/// difference.
+///
+/// The placeholder is an ordinary class rather than an instance of a distinct
+/// FORWARD-REFERENCED-CLASS metaclass, which AMOP would have; that refinement
+/// is separate.
+fn resolve_superclass_metaobject(env: &Env, super_name: EgclVal) -> Result<EgclVal, EgclError> {
+    let resolved = resolve_class_metaobject(env, super_name)?;
+    if !resolved.is_symbol() || !super_name.is_symbol() {
+        return Ok(resolved);
+    }
+    // Only after the prelude. During bootstrap, lib/boot.lisp and the lazily
+    // registered condition classes define classes in an order where a
+    // superclass legitimately does not exist yet, and minting a placeholder
+    // there registers the NAME -- which then shadows the real definition's
+    // metadata and truncates its precedence list. Measured: it cost ERROR its
+    // SERIOUS-CONDITION and CONDITION supers, so `(defclass program-error ...)`
+    // stopped being refused. Before this change an unresolved super recorded
+    // the bare symbol and that happened to work, because a class WAS its name
+    // symbol.
+    if !BOOT_COMPLETE.with(|c| c.get()) {
+        return Ok(resolved);
+    }
+    // Never for a name the core defines lazily. A builtin condition class is
+    // registered on first use, so minting a placeholder under its name
+    // SHADOWS that registration: the placeholder's default supers
+    // (STANDARD-OBJECT) stick, and ERROR loses SERIOUS-CONDITION and
+    // CONDITION from its precedence list -- measured, and it silently stopped
+    // `(defclass program-error ...)` from being refused.
+    if builtin_condition_definition(&sym_name(super_name)).is_some() {
+        return Ok(resolved);
+    }
+    let class = egcl_stdlib::clos::new_class_metaobject(NIL)?;
+    egcl_stdlib::define_class(super_name, class, &[], &[])?;
+    Ok(class)
+}
+
 fn resolve_class_metaobject(env: &Env, class: EgclVal) -> Result<EgclVal, EgclError> {
     if !class.is_symbol() {
         return Ok(class);
@@ -26923,10 +26970,24 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         .expect("condition-variable type symbol"));
                 }
                 // Preserve the defining symbol, including its home package.
+                //
+                // CLHS TYPE-OF: the answer is the class's PROPER name, and if
+                // the class has none, the class itself. A name is proper only
+                // while FIND-CLASS maps it back to this class, so a class
+                // whose name has been unbound with
+                // `(setf (find-class 'x) nil)` answers the metaobject. That
+                // distinction was unobservable while a class WAS its name
+                // symbol -- the two answers were the same object, which is why
+                // ansi-test TYPE-OF.9 passed before bliss-vsjn1 and needs this
+                // after.
                 if egcl_stdlib::is_instance(v) {
-                    let name = egcl_stdlib::class_name(egcl_stdlib::class_of(v));
+                    let class = egcl_stdlib::class_of(v);
+                    let name = egcl_stdlib::class_name(class);
                     if !name.is_nil() {
-                        return Ok(name);
+                        if egcl_stdlib::find_class(name) == Some(class) {
+                            return Ok(name);
+                        }
+                        return Ok(class);
                     }
                 }
                 if egcl_stdlib::sequences::is_double_float_array(v) {
@@ -35940,10 +36001,19 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     check_defclass_syntax(&name, slots_form, class_options)?;
     // CLHS DEFCLASS: a built-in or condition class is not redefined as a
     // standard class, nor used as a direct superclass of one (ansi
-    // defclass.error.23/24). A DEFCLASS class is its own name symbol; any
-    // other metaobject the core knows for the name is a system class.
+    // defclass.error.23/24).
+    //
+    // This asked `!class.is_symbol()`, i.e. "the core knows a metaobject for
+    // this name that is not a DEFCLASS class". That was the same question
+    // while a DEFCLASS class WAS its name symbol; now every class is a heap
+    // object, so it would refuse any registered class at all -- including a
+    // forward-referenced superclass placeholder, which made
+    // `(defclass sub (super))` followed by `(defclass super)` fail outright.
+    // Ask what the class IS instead (bliss-vsjn1).
     if !env.classes.borrow().contains_key(&name)
-        && egcl_stdlib::find_class(name_form).is_some_and(|class| !class.is_symbol())
+        && egcl_stdlib::find_class(name_form).is_some_and(|class| {
+            is_built_in_class_metaobject(class) || is_condition_class(class)
+        })
     {
         return Err(EgclError::ProgramError(format!(
             "DEFCLASS {name}: a system class cannot be redefined"
@@ -36291,7 +36361,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     bump_accessor_slot_gen();
     let direct_supers: Result<Vec<EgclVal>, EgclError> = super_list
         .iter()
-        .map(|super_name| resolve_class_metaobject(env, *super_name))
+        .map(|super_name| resolve_superclass_metaobject(env, *super_name))
         .collect();
     // Rooted: define_class and the slot_names interning below allocate, and
     // class metaobjects can be heap values (bliss-wlf).
@@ -36320,9 +36390,33 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         .iter()
         .map(|name| resolve_sym(name).unwrap_or(NIL))
         .collect();
+    // The class METAOBJECT. A redefinition keeps the existing one, as CLHS
+    // requires: instances of the old class must go on naming the same class,
+    // and every table keyed by the class value would otherwise orphan its
+    // entry. A new name allocates (bliss-vsjn1) -- a DEFCLASS class used to BE
+    // this symbol, which is why `(symbolp (find-class 'foo))` answered T.
+    //
+    // Allocated here rather than inside `define_class_with_shared_slots`
+    // because that function takes the CLOS lock, and allocating under it is a
+    // lock-order violation: CLOS definitions is (GcWorld, 8), the GC heap lock
+    // (GcWorld, 2).
+    //
+    // Sized by the metaclass, so resolve that FIRST -- a `(:metaclass M)` class
+    // needs a slot cell for each of M's instance slots, and the object cannot
+    // be resized afterwards. (The recording below stays where it is: it is
+    // also what makes CLASS-OF answer M.)
+    let metaclass_for_layout = if metaclass_name != NIL {
+        egcl_stdlib::find_class(metaclass_name).unwrap_or(NIL)
+    } else {
+        NIL
+    };
+    let class = match egcl_stdlib::find_class(name_form) {
+        Some(existing) => existing,
+        None => egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
+    };
     egcl_stdlib::clos::define_class_with_shared_slots(
         name_form,
-        name_form,
+        class,
         &direct_supers,
         &slot_names,
         &shared_slot_names,
@@ -36352,7 +36446,14 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         let (slot_sym, method_name) = method_specs[i];
         install_slot_accessor_method(env, method_name, name_form, slot_sym, method_spec_writer[i])?;
     }
-    Ok(name_form)
+    // DEFCLASS returns the CLASS, not its name (CLHS DEFCLASS). Returning the
+    // name was indistinguishable while a class WAS its name symbol, and
+    // ansi-test could not tell: DEFCLASS-n-DEFCLASS-RETURNS-CLASS,
+    // FIND-CLASS.15/16/18-21 and CLASS-REDEFINITION.1-3 all compare the value
+    // DEFCLASS returned against (find-class name) with EQ, and all of them
+    // passed by accident. Re-read it from the registry rather than reusing the
+    // local: a redefinition may have been handed the existing metaobject.
+    Ok(egcl_stdlib::find_class(name_form).unwrap_or(name_form))
 }
 
 /// Install the structural payload of a source-free DEFINE-CONDITION load

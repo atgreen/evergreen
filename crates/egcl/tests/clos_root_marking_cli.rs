@@ -36,7 +36,12 @@ const PROGRAM: &str = r#"
   (dotimes (i 2000) (list i i i))
   (format t "SLOT ~a~%" (slot-value *i* 'a))
   (format t "NAME ~a~%" (class-name (class-of *i*)))
-  (format t "TYPE ~a~%" (type-of *i*))
+  ;; TYPE-OF answers the CLASS, not the name: `(setf (find-class 'orphan) nil)`
+  ;; took away the name, and CLHS gives the class itself when it has no proper
+  ;; name. This row said ORPHAN before bliss-vsjn1, when a class WAS its name
+  ;; symbol and the two answers were the same object (ansi-test TYPE-OF.9 is
+  ;; the same point).
+  (format t "TYPE ~a~%" (eq (type-of *i*) (class-of *i*)))
   (format t "KEEPER ~a~%" (slot-value *k* 'b))
   ;; Deliberately NOT asserted here: that the old instance keeps slot A after
   ;; a new (defclass orphan ...) under the freed name. A conforming CL gives
@@ -76,7 +81,7 @@ const ROWS: &[&str] = &[
     "GONE NIL",
     "SLOT 7",
     "NAME ORPHAN",
-    "TYPE ORPHAN",
+    "TYPE T",
     "KEEPER 9",
     "ROOT-MARKING-OK",
 ];
