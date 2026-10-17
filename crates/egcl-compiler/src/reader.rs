@@ -391,7 +391,7 @@ fn resolve_symbol_via_hook(pkg: Option<&str>, name: &str) -> Option<u32> {
 // in which case the prefix is looked up globally as before.
 type PackageResolver = fn(&str) -> Option<String>;
 static PACKAGE_RESOLVER: OrderedMutex<Option<PackageResolver>> =
-    OrderedMutex::new(LockLevel::CodeCache, 3, "reader package resolver", None);
+    OrderedMutex::new(LockLevel::CodeCache, 12, "reader package resolver", None);
 
 pub fn set_package_resolver(hook: Option<PackageResolver>) {
     *PACKAGE_RESOLVER.lock().unwrap() = hook;
