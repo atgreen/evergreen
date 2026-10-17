@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How EGCL calls a function — T2, T1, T0 and the tree walker</title>
+<style>
+:root{color-scheme:light;--ink:#162b40;--muted:#4b6074;--accent:#005b8f;--line:#d4e0ea}*{box-sizing:border-box}body{margin:0;background:#f4f7fa;color:var(--ink);font:17px/1.65 system-ui,sans-serif}main{max-width:1120px;margin:auto;background:white;padding:48px 56px}h1{font-size:2.65rem;line-height:1.12;letter-spacing:-.035em;margin:.3em 0 .6em}h2{font-size:1.7rem;margin-top:2.5em;border-top:1px solid var(--line);padding-top:1.1em}h3{margin-top:1.6em}p{max-width:85ch}a{color:var(--accent);text-underline-offset:3px}code,pre{font-family:ui-monospace,monospace;font-size:.9em}code{background:#eef3f7;padding:.1em .25em;border-radius:3px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#eef3f7;padding:16px}nav{padding:18px 24px;background:#eef4fb;border-radius:10px}nav a{display:inline-block;margin-right:20px}.eyebrow{font-size:.8rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent)}.lead{font-size:1.2rem}.note{padding:16px 22px;border-left:4px solid #2684a1;background:#eef8fa}.sources{font-size:.8rem;color:var(--muted)}.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.94rem;margin:1.3em 0}th,td{border:1px solid var(--line);padding:12px;text-align:left;vertical-align:top}th{background:#eef4fb}figure{margin:28px 0;padding:20px 12px;border:1px solid var(--line);border-radius:10px}.diagram{overflow-x:auto;text-align:center}.diagram svg{max-width:100%;height:auto}figcaption{font-size:.9rem;padding:12px 10px;color:var(--muted)}details{font-size:.8rem;padding:0 10px}summary{cursor:pointer;color:var(--accent)}.small{font-size:.85rem;color:var(--muted)}footer{border-top:1px solid var(--line);margin-top:3em;padding-top:1em}section{scroll-margin-top:16px}@media(max-width:700px){main{padding:24px 18px}h1{font-size:2rem}th,td{padding:8px}.diagram svg{min-width:620px}}@media print{body{background:white}main{padding:0;max-width:none;font-size:11pt}h2{break-after:avoid}figure, tr{break-inside:avoid}details,nav{display:none}a{color:inherit}.diagram svg{max-height:650px}}
+</style></head><body><main>
+<header><p class="eyebrow">EGCL · an implementation guide</p><h1>How a function call travels<br>through the four execution tiers</h1>
+<p class="lead">A function call must deliver arguments, remember where to return, and keep live objects safe. EGCL does this in several ways, depending on how the caller and callee execute.</p>
+<p class="small">Source snapshot: <code>4091e35d233e9</code> · 17 October 2026. This describes the implementation at that revision. Register names and byte offsets below are for <strong>x86-64 Linux</strong>; the tier-level routes apply more broadly, but other platforms have different machine adapters.</p></header>
+<nav aria-label="Contents"><a href="#start">Start here</a><a href="#matrix">16 call combinations</a><a href="#native">Native calls</a><a href="#interpreted">Interpreted calls</a><a href="#bridges">Crossing tiers</a><a href="#returns">Returning values</a><a href="#gc">GC and metadata</a><a href="#exceptions">Other paths</a><a href="#reading">Source map</a></nav>
+<section id="start"><h2>1. Four ways to run the same Lisp function</h2>
+<p>In <code>(f 10 20)</code>, the code evaluating that expression is the <b>caller</b>; <code>f</code> is the <b>callee</b>. Each may run at a different tier. A higher tier changes how the body executes, while preserving the Lisp meaning.</p>
+<table><thead><tr><th>Tier</th><th>What executes?</th><th>Where to start reading</th></tr></thead><tbody>
+<tr><td><b>Tree walker</b></td><td>Rust code walks Lisp forms such as <code>IF</code> and function calls directly.</td><td><code>cli.rs</code>: <code>eval_form</code>, <code>eval_list</code>, <code>apply_function_impl</code></td></tr>
+<tr><td><b>T0</b></td><td>A Rust loop interprets bytecode: a simpler sequence of instructions with locals and an operand stack.</td><td><code>cli/bytecode.rs</code>: <code>run_with_binding</code>, <code>run_loop</code></td></tr>
+<tr><td><b>T1</b></td><td>Baseline native machine code. Compilation aims to get execution out of the interpreter quickly.</td><td><code>native_transfer_entry.rs</code> and the baseline emitters</td></tr>
+<tr><td><b>T2</b></td><td>Optimized native machine code. It may rely on checked assumptions and return to T0 when one fails.</td><td><code>egcl-compiler/src/t2/</code></td></tr>
+</tbody></table>
+<p>A <b>calling convention</b> (part of an ABI, or application binary interface) is the agreement at a function's entrance and exit: where arguments go, what a return looks like, and which registers must survive. A <b>register</b> is a small, fast storage location inside the CPU. A <b>stack frame</b> is storage belonging to one active call. <b>Metadata</b> describes that storage so the runtime can inspect it.</p>
+<p class="note"><b>Tier and calling convention are different choices.</b> Eligible T1 and T2 bodies share the ordinary native convention. Other bodies use compatible mapped or legacy entries. Even an interpreted body can sit behind a native adapter. A native-looking entrance does not prove the body runs natively.</p>
+
+<figure id="overview"><div class="diagram"><svg role="img" aria-labelledby="overview-title overview-desc" width="742pt" height="214pt"
+ viewBox="0.00 0.00 742.00 214.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="overview-title">The same language, different execution engines</title><desc id="overview-desc">Arrows show possible calls, not mandatory promotion steps. Adapters translate between representations.</desc>
+<g id="overview-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 199.93)">
+<title>G</title>
+<!-- t -->
+<g id="overview-node1" class="node">
+<title>t</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M209.67,-147.78C209.67,-147.78 12,-147.78 12,-147.78 6,-147.78 0,-141.78 0,-135.78 0,-135.78 0,-114 0,-114 0,-108 6,-102 12,-102 12,-102 209.67,-102 209.67,-102 215.67,-102 221.67,-108 221.67,-114 221.67,-114 221.67,-135.78 221.67,-135.78 221.67,-141.78 215.67,-147.78 209.67,-147.78"/>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-127.74" font-family="DejaVu Sans" font-size="12.00">Tree walker</text>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-113.49" font-family="DejaVu Sans" font-size="12.00">Lisp forms + lexical environment</text>
+</g>
+<!-- t&#45;&gt;t -->
+<g id="overview-edge6" class="edge">
+<title>t&#45;&gt;t</title>
+<path fill="none" stroke="#526880" d="M87.75,-148.05C83.43,-160.92 91.13,-172.78 110.84,-172.78 124.38,-172.78 132.25,-167.18 134.45,-159.49"/>
+<polygon fill="#526880" stroke="#526880" points="137.95,-159.39 133.99,-149.56 130.95,-159.71 137.95,-159.39"/>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-176.03" font-family="DejaVu Sans" font-size="10.00">source&#45;body calls</text>
+</g>
+<!-- a -->
+<g id="overview-node4" class="node">
+<title>a</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M452.59,-102.91C452.59,-102.91 270.67,-102.91 270.67,-102.91 264.67,-102.91 258.67,-96.91 258.67,-90.91 258.67,-90.91 258.67,-54.88 258.67,-54.88 258.67,-48.88 264.67,-42.88 270.67,-42.88 270.67,-42.88 452.59,-42.88 452.59,-42.88 458.59,-42.88 464.59,-48.88 464.59,-54.88 464.59,-54.88 464.59,-90.91 464.59,-90.91 464.59,-96.91 458.59,-102.91 452.59,-102.91"/>
+<text xml:space="preserve" text-anchor="middle" x="361.63" y="-82.86" font-family="DejaVu Sans" font-size="12.00">Dispatch and adapters</text>
+<text xml:space="preserve" text-anchor="middle" x="361.63" y="-68.61" font-family="DejaVu Sans" font-size="12.00">select target, bind arguments,</text>
+<text xml:space="preserve" text-anchor="middle" x="361.63" y="-54.37" font-family="DejaVu Sans" font-size="12.00">translate results</text>
+</g>
+<!-- t&#45;&gt;a -->
+<g id="overview-edge1" class="edge">
+<title>t&#45;&gt;a</title>
+<path fill="none" stroke="#526880" d="M233.13,-99.54C237.89,-98.54 242.65,-97.55 247.39,-96.56"/>
+<polygon fill="#526880" stroke="#526880" points="232.6,-96.07 223.53,-101.55 234.03,-102.93 232.6,-96.07"/>
+<polygon fill="#526880" stroke="#526880" points="247.83,-100.04 256.91,-94.57 246.4,-93.19 247.83,-100.04"/>
+</g>
+<!-- z -->
+<g id="overview-node2" class="node">
+<title>z</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M192.05,-45.78C192.05,-45.78 29.63,-45.78 29.63,-45.78 23.63,-45.78 17.63,-39.78 17.63,-33.78 17.63,-33.78 17.63,-12 17.63,-12 17.63,-6 23.63,0 29.63,0 29.63,0 192.05,0 192.05,0 198.05,0 204.05,-6 204.05,-12 204.05,-12 204.05,-33.78 204.05,-33.78 204.05,-39.78 198.05,-45.78 192.05,-45.78"/>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-25.74" font-family="DejaVu Sans" font-size="12.00">T0</text>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-11.49" font-family="DejaVu Sans" font-size="12.00">bytecode + managed slots</text>
+</g>
+<!-- z&#45;&gt;z -->
+<g id="overview-edge5" class="edge">
+<title>z&#45;&gt;z</title>
+<path fill="none" stroke="#526880" d="M87.75,-46.05C83.43,-58.92 91.13,-70.78 110.84,-70.78 124.38,-70.78 132.25,-65.18 134.45,-57.49"/>
+<polygon fill="#526880" stroke="#526880" points="137.95,-57.39 133.99,-47.56 130.95,-57.71 137.95,-57.39"/>
+<text xml:space="preserve" text-anchor="middle" x="110.84" y="-74.03" font-family="DejaVu Sans" font-size="10.00">flat bytecode calls</text>
+</g>
+<!-- z&#45;&gt;a -->
+<g id="overview-edge2" class="edge">
+<title>z&#45;&gt;a</title>
+<path fill="none" stroke="#526880" d="M215.69,-43.76C226.04,-45.84 236.58,-47.96 247.02,-50.06"/>
+<polygon fill="#526880" stroke="#526880" points="216.45,-40.35 205.96,-41.81 215.08,-47.21 216.45,-40.35"/>
+<polygon fill="#526880" stroke="#526880" points="246.32,-53.49 256.81,-52.03 247.7,-46.62 246.32,-53.49"/>
+</g>
+<!-- n -->
+<g id="overview-node3" class="node">
+<title>n</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M700.76,-95.78C700.76,-95.78 513.59,-95.78 513.59,-95.78 507.59,-95.78 501.59,-89.78 501.59,-83.78 501.59,-83.78 501.59,-62 501.59,-62 501.59,-56 507.59,-50 513.59,-50 513.59,-50 700.76,-50 700.76,-50 706.76,-50 712.76,-56 712.76,-62 712.76,-62 712.76,-83.78 712.76,-83.78 712.76,-89.78 706.76,-95.78 700.76,-95.78"/>
+<text xml:space="preserve" text-anchor="middle" x="607.17" y="-75.74" font-family="DejaVu Sans" font-size="12.00">T1 and T2</text>
+<text xml:space="preserve" text-anchor="middle" x="607.17" y="-61.49" font-family="DejaVu Sans" font-size="12.00">machine code + native frames</text>
+</g>
+<!-- n&#45;&gt;n -->
+<g id="overview-edge4" class="edge">
+<title>n&#45;&gt;n</title>
+<path fill="none" stroke="#526880" d="M585.02,-96.05C580.89,-108.92 588.27,-120.78 607.17,-120.78 620.17,-120.78 627.72,-115.18 629.83,-107.49"/>
+<polygon fill="#526880" stroke="#526880" points="633.33,-107.4 629.39,-97.56 626.34,-107.71 633.33,-107.4"/>
+<text xml:space="preserve" text-anchor="middle" x="607.17" y="-124.03" font-family="DejaVu Sans" font-size="10.00">eligible native calls</text>
+</g>
+<!-- a&#45;&gt;n -->
+<g id="overview-edge3" class="edge">
+<title>a&#45;&gt;n</title>
+<path fill="none" stroke="#526880" d="M476.27,-72.89C480.86,-72.89 485.48,-72.89 490.08,-72.89"/>
+<polygon fill="#526880" stroke="#526880" points="476.37,-69.39 466.37,-72.89 476.37,-76.39 476.37,-69.39"/>
+<polygon fill="#526880" stroke="#526880" points="489.96,-76.39 499.96,-72.89 489.96,-69.39 489.96,-76.39"/>
+</g>
+</g>
+</svg>
+</div><figcaption><b>The same language, different execution engines.</b> Arrows show possible calls, not mandatory promotion steps. Adapters translate between representations.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; t [label=&quot;Tree walker
+Lisp forms + lexical environment&quot;,fillcolor=&quot;#edf7ed&quot;]; z [label=&quot;T0
+bytecode + managed slots&quot;,fillcolor=&quot;#edf7ed&quot;]; n [label=&quot;T1 and T2
+machine code + native frames&quot;]; a [label=&quot;Dispatch and adapters
+select target, bind arguments,
+translate results&quot;,fillcolor=&quot;#fff3dc&quot;]; t -&gt; a [dir=both]; z -&gt; a [dir=both]; a -&gt; n [dir=both]; n -&gt; n [label=&quot;eligible native calls&quot;]; z -&gt; z [label=&quot;flat bytecode calls&quot;]; t -&gt; t [label=&quot;source-body calls&quot;]; }</pre></details></figure>
+</section><section id="matrix"><h2>2. All sixteen caller → callee combinations</h2>
+<p>Read a row as the caller and a column as the body that actually executes. These are the principal routes, not a promise that every source function can compile at every tier. A call can fall back when the body, entry signature, control state, or platform is unsupported.</p>
+<div class="table-wrap"><table><caption>Dispatch matrix — follow the links for the layouts used by each route</caption><thead><tr><th>Caller ↓ / callee →</th><th>T2</th><th>T1</th><th>T0</th><th>Tree walker</th></tr></thead><tbody>
+<tr><th>T2</th><td><a href="#native">Native → native</a>; ordinary entry when eligible</td><td><a href="#native">Native → native</a>; same ordinary ABI</td><td><a href="#bridges">Native → runtime adapter → T0</a></td><td><a href="#bridges">Native → runtime adapter → source evaluator</a></td></tr>
+<tr><th>T1</th><td><a href="#native">Native → native</a>; same ordinary ABI</td><td><a href="#native">Native → native</a>; ordinary entry when eligible</td><td><a href="#bridges">Native → runtime adapter → T0</a></td><td><a href="#bridges">Native → runtime adapter → source evaluator</a></td></tr>
+<tr><th>T0</th><td><a href="#bridges">Native entry adapter → T2</a></td><td><a href="#bridges">Native entry adapter → T1</a></td><td><a href="#interpreted">Push managed activation in the same bytecode loop</a> for registered named calls; generic dispatch otherwise</td><td><a href="#bridges">Generic callable dispatch → source evaluator</a></td></tr>
+<tr><th>Tree walker</th><td><a href="#bridges">Callable dispatch → native entry adapter → T2</a></td><td><a href="#bridges">Callable dispatch → native entry adapter → T1</a></td><td><a href="#bridges">Callable dispatch → bytecode runner</a></td><td><a href="#interpreted">Source evaluator with child lexical environment</a>; function-object calls go through callable dispatch</td></tr>
+</tbody></table></div>
+<p>T1 → T2 and T2 → T1 calls do not inherently need an interpreter between them: compatible ordinary entries agree on arguments and results. A <em>different</em> operation, switching the tier of a loop already running, is <a href="#exceptions">OSR</a>, not an ordinary function call.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L15789">T0 call selection</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/call_table.rs#L535">ordinary target dispatch</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli.rs#L38857">callable dispatch</a></p>
+</section><section id="native"><h2>3. Native → native: a five-argument example</h2>
+<p>Imagine <code>(f a b c d e)</code> calling an eligible environment-free T1 or T2 body. The first three values go into CPU registers; the remaining two go on the machine stack. Every argument is a 64-bit <code>EgclVal</code>: a tagged word that represents a Lisp value. A small integer may fit directly in that word; a heap object is reached through a tagged pointer.</p>
+
+<figure id="entry"><div class="diagram"><svg role="img" aria-labelledby="entry-title entry-desc" width="677pt" height="277pt"
+ viewBox="0.00 0.00 677.00 277.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="entry-title">At the ordinary native entry</title><desc id="entry-desc">This is immediately after CALL, before the callee creates its frame. Values a–e are tagged Lisp words. Counts, addresses and context pointers are raw machine data.</desc>
+<g id="entry-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 262.27)">
+<title>G</title>
+<!-- r -->
+<g id="entry-node1" class="node">
+<title>r</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M12,-26.66C12,-26.66 208.17,-26.66 208.17,-26.66 214.17,-26.66 220.17,-32.66 220.17,-38.66 220.17,-38.66 220.17,-235.37 220.17,-235.37 220.17,-241.37 214.17,-247.37 208.17,-247.37 208.17,-247.37 12,-247.37 12,-247.37 6,-247.37 0,-241.37 0,-235.37 0,-235.37 0,-38.66 0,-38.66 0,-32.66 6,-26.66 12,-26.66"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-227.33" font-family="DejaVu Sans" font-size="12.00">CPU registers</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-215.84 220.17,-215.84"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-195.8" font-family="DejaVu Sans" font-size="12.00">RDI = a (argument 1)</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-184.31 220.17,-184.31"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-164.27" font-family="DejaVu Sans" font-size="12.00">RSI = b (argument 2)</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-152.78 220.17,-152.78"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-132.74" font-family="DejaVu Sans" font-size="12.00">RDX = c (argument 3)</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-121.25 220.17,-121.25"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-101.21" font-family="DejaVu Sans" font-size="12.00">RCX = 5 (supplied count)</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-89.72 220.17,-89.72"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-69.68" font-family="DejaVu Sans" font-size="12.00">RAX = NIL (no closure)</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-58.19 220.17,-58.19"/>
+<text xml:space="preserve" text-anchor="middle" x="110.09" y="-38.15" font-family="DejaVu Sans" font-size="12.00">R13 = execution context pointer</text>
+</g>
+<!-- s -->
+<g id="entry-node2" class="node">
+<title>s</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M403.17,-85.95C403.17,-85.95 636.09,-85.95 636.09,-85.95 642.09,-85.95 648.09,-91.95 648.09,-97.95 648.09,-97.95 648.09,-200.07 648.09,-200.07 648.09,-206.07 642.09,-212.07 636.09,-212.07 636.09,-212.07 403.17,-212.07 403.17,-212.07 397.17,-212.07 391.17,-206.07 391.17,-200.07 391.17,-200.07 391.17,-97.95 391.17,-97.95 391.17,-91.95 397.17,-85.95 403.17,-85.95"/>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-192.03" font-family="DejaVu Sans" font-size="12.00">Machine stack: increasing addresses ↓</text>
+<polyline fill="none" stroke="#7a95b3" points="391.17,-180.54 648.09,-180.54"/>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-160.5" font-family="DejaVu Sans" font-size="12.00">entry RSP + 0: return address</text>
+<polyline fill="none" stroke="#7a95b3" points="391.17,-149.01 648.09,-149.01"/>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-128.97" font-family="DejaVu Sans" font-size="12.00">entry RSP + 8: d (argument 4)</text>
+<polyline fill="none" stroke="#7a95b3" points="391.17,-117.48 648.09,-117.48"/>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-97.44" font-family="DejaVu Sans" font-size="12.00">entry RSP + 16: e (argument 5)</text>
+</g>
+<!-- r&#45;&gt;s -->
+<g id="entry-edge2" class="edge">
+<title>r&#45;&gt;s</title>
+<path fill="none" stroke="#526880" stroke-dasharray="5,2" d="M220.57,-140.24C269.44,-141.68 327.6,-143.39 379.51,-144.92"/>
+<polygon fill="#526880" stroke="#526880" points="379.22,-148.41 389.31,-145.21 379.42,-141.41 379.22,-148.41"/>
+<text xml:space="preserve" text-anchor="middle" x="305.67" y="-147.69" font-family="DejaVu Sans" font-size="10.00">CALL pushes return address</text>
+</g>
+<!-- c -->
+<g id="entry-node3" class="node">
+<title>c</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M631.97,-60.03C631.97,-60.03 407.3,-60.03 407.3,-60.03 401.3,-60.03 395.3,-54.03 395.3,-48.03 395.3,-48.03 395.3,-12 395.3,-12 395.3,-6 401.3,0 407.3,0 407.3,0 631.97,0 631.97,0 637.97,0 643.97,-6 643.97,-12 643.97,-12 643.97,-48.03 643.97,-48.03 643.97,-54.03 637.97,-60.03 631.97,-60.03"/>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-39.99" font-family="DejaVu Sans" font-size="12.00">Stable execution context</text>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-25.74" font-family="DejaVu Sans" font-size="12.00">execution identity, carrier,</text>
+<text xml:space="preserve" text-anchor="middle" x="519.63" y="-11.49" font-family="DejaVu Sans" font-size="12.00">yield / poll state, active native control</text>
+</g>
+<!-- r&#45;&gt;c -->
+<g id="entry-edge1" class="edge">
+<title>r:ctx&#45;&gt;c</title>
+<path fill="none" stroke="#526880" d="M220.17,-42.42C273.57,-42.42 332.29,-40.42 383.42,-38.02"/>
+<polygon fill="#526880" stroke="#526880" points="383.55,-41.52 393.37,-37.54 383.22,-34.52 383.55,-41.52"/>
+<text xml:space="preserve" text-anchor="middle" x="305.67" y="-45.55" font-family="DejaVu Sans" font-size="10.00">R13 points here</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>At the ordinary native entry.</b> This is immediately after CALL, before the callee creates its frame. Values a–e are tagged Lisp words. Counts, addresses and context pointers are raw machine data.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; r [shape=record,label=&quot;CPU registers|RDI = a (argument 1)|RSI = b (argument 2)|RDX = c (argument 3)|RCX = 5 (supplied count)|RAX = NIL (no closure)|&lt;ctx&gt; R13 = execution context pointer&quot;]; s [shape=record,label=&quot;Machine stack: increasing addresses ↓|entry RSP + 0: return address|entry RSP + 8: d (argument 4)|entry RSP + 16: e (argument 5)&quot;]; c [label=&quot;Stable execution context
+execution identity, carrier,
+yield / poll state, active native control&quot;,fillcolor=&quot;#fff3dc&quot;]; r:ctx -&gt; c [label=&quot;R13 points here&quot;]; r -&gt; s [style=dashed,label=&quot;CALL pushes return address&quot;]; }</pre></details></figure>
+<p>The <b>supplied count</b> excludes the closure and context. For a closure entry, <code>RAX</code> holds the tagged callable/closure object instead of <code>NIL</code>. This lets an adapter find captured variables. It does not mean every closure body has ordinary native code.</p>
+<p>The caller rounds overflow-argument storage up to a multiple of 16 bytes and aligns <code>RSP</code> before <code>CALL</code>. With five arguments, two overflow words use 16 bytes. With four arguments, the one overflow word is followed by eight bytes of padding. Padding follows the arguments and is not a Lisp value. <code>CALL</code> pushes an eight-byte return address, so entry <code>RSP</code> is eight bytes off a 16-byte boundary.</p>
+<table><thead><tr><th>Register group</th><th>What survives a call?</th></tr></thead><tbody>
+<tr><td><code>RAX RCX RDX RDI RSI R8 R9 R10 R11</code></td><td>Caller-clobbered: the caller must save any value it still needs. Some carry the result at return.</td></tr>
+<tr><td><code>RBX R12 R14 R15 RBP</code></td><td>Callee-preserved: if used, their incoming state must be saved and restored. Backend reservations still apply; “preserved” does not mean freely allocatable everywhere.</td></tr>
+<tr><td><code>R13</code></td><td>Preserved execution-context pointer, shared by ordinary calls within the execution.</td></tr>
+<tr><td><code>XMM0–XMM15</code></td><td>No baseline tagged Lisp argument role; caller-clobbered. Specialized numeric paths have separate rules.</td></tr>
+</tbody></table>
+
+<figure id="frame"><div class="diagram"><svg role="img" aria-labelledby="frame-title frame-desc" width="731pt" height="282pt"
+ viewBox="0.00 0.00 731.00 282.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="frame-title">After the native prologue</title><desc id="frame-desc">A prologue is the entry code that makes room for the call. This is a schematic physical frame; the amount and ordering of private storage vary with emitted code.</desc>
+<g id="frame-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 267.64)">
+<title>G</title>
+<!-- s -->
+<g id="frame-node1" class="node">
+<title>s</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M402.42,-0.5C402.42,-0.5 690.09,-0.5 690.09,-0.5 696.09,-0.5 702.09,-6.5 702.09,-12.5 702.09,-12.5 702.09,-240.74 702.09,-240.74 702.09,-246.74 696.09,-252.74 690.09,-252.74 690.09,-252.74 402.42,-252.74 402.42,-252.74 396.42,-252.74 390.42,-246.74 390.42,-240.74 390.42,-240.74 390.42,-12.5 390.42,-12.5 390.42,-6.5 396.42,-0.5 402.42,-0.5"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-232.7" font-family="DejaVu Sans" font-size="12.00">Higher addresses</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-221.21 702.09,-221.21"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-201.17" font-family="DejaVu Sans" font-size="12.00">Caller&#45;owned overflow: argument 4 at RBP + 16</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-189.68 702.09,-189.68"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-169.64" font-family="DejaVu Sans" font-size="12.00">Return address: RBP + 8</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-158.15 702.09,-158.15"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-138.11" font-family="DejaVu Sans" font-size="12.00">Saved caller RBP: RBP + 0</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-126.62 702.09,-126.62"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-106.58" font-family="DejaVu Sans" font-size="12.00">Other used callee&#45;preserved register saves</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-95.09 702.09,-95.09"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-75.05" font-family="DejaVu Sans" font-size="12.00">Optional alignment word</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-63.56 702.09,-63.56"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-43.52" font-family="DejaVu Sans" font-size="12.00">Native value slots / spills / private scratch</text>
+<polyline fill="none" stroke="#7a95b3" points="390.42,-32.03 702.09,-32.03"/>
+<text xml:space="preserve" text-anchor="middle" x="546.25" y="-11.99" font-family="DejaVu Sans" font-size="12.00">Lower addresses: body RSP</text>
+</g>
+<!-- m -->
+<g id="frame-node2" class="node">
+<title>m</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M203.67,-156.63C203.67,-156.63 12,-156.63 12,-156.63 6,-156.63 0,-150.63 0,-144.63 0,-144.63 0,-108.61 0,-108.61 0,-102.61 6,-96.61 12,-96.61 12,-96.61 203.67,-96.61 203.67,-96.61 209.67,-96.61 215.67,-102.61 215.67,-108.61 215.67,-108.61 215.67,-144.63 215.67,-144.63 215.67,-150.63 209.67,-156.63 203.67,-156.63"/>
+<text xml:space="preserve" text-anchor="middle" x="107.84" y="-136.59" font-family="DejaVu Sans" font-size="12.00">Retained code metadata</text>
+<text xml:space="preserve" text-anchor="middle" x="107.84" y="-122.34" font-family="DejaVu Sans" font-size="12.00">exact return&#45;PC maps</text>
+<text xml:space="preserve" text-anchor="middle" x="107.84" y="-108.09" font-family="DejaVu Sans" font-size="12.00">value locations + unwind recipe</text>
+</g>
+<!-- m&#45;&gt;s -->
+<g id="frame-edge1" class="edge">
+<title>m&#45;&gt;s</title>
+<path fill="none" stroke="#526880" d="M216.15,-126.62C265.15,-126.62 324.3,-126.62 378.86,-126.62"/>
+<polygon fill="#526880" stroke="#526880" points="378.56,-130.12 388.56,-126.62 378.56,-123.12 378.56,-130.12"/>
+<text xml:space="preserve" text-anchor="middle" x="303.05" y="-142.62" font-family="DejaVu Sans" font-size="10.00">describes how to find values</text>
+<text xml:space="preserve" text-anchor="middle" x="303.05" y="-129.87" font-family="DejaVu Sans" font-size="10.00">and the previous frame</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>After the native prologue.</b> A prologue is the entry code that makes room for the call. This is a schematic physical frame; the amount and ordering of private storage vary with emitted code.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; s [shape=record,label=&quot;Higher addresses|Caller-owned overflow: argument 4 at RBP + 16|Return address: RBP + 8|Saved caller RBP: RBP + 0|Other used callee-preserved register saves|Optional alignment word|Native value slots / spills / private scratch|Lower addresses: body RSP&quot;]; m [label=&quot;Retained code metadata
+exact return-PC maps
+value locations + unwind recipe&quot;,fillcolor=&quot;#fff3dc&quot;]; m -&gt; s [label=&quot;describes how to find values
+and the previous frame&quot;]; }</pre></details></figure>
+<p>The stack grows toward lower addresses. <code>RBP</code> provides a frame-chain anchor; <code>RSP</code> moves as storage is reserved. A <b>spill</b> is a value temporarily stored in memory instead of a register. Before a nested call, the caller prepares a separate outgoing argument area. That area is callee-clobberable: a value needed later must also have a surviving home.</p>
+<p>Named calls use a stable <code>CallCell</code>. Its ordinary-entry slot selects a retained <code>OrdinaryEntryDescriptor</code>: ABI kind/version, definition revision, entry address, code range, arity, environment kind, owner, and required stack space. Publication validates the immutable ABI kind/version and code-owner information; generated calls check the selected descriptor, definition revision, arity/environment, and stack/poll admission. They do not treat any machine address as callable. Eligible source-proven self-calls can use their own retained entry directly; dynamic calls must respect redefinition.</p>
+<p><b>No managed child frame is eagerly created for each eligible ordinary native call.</b> The native machine frame and its separately retained maps carry the state. An outer native segment provides a runtime boundary around a run of native calls.</p><p>The frame diagram shows an ordinary <code>CALL</code>. Some eligible forwarding tail calls instead retire the current frame and jump to the target, reusing the original return address. The arguments must fit the existing incoming overflow capacity, and no pending control obligation may require the frame; otherwise the path falls back to a call and return.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/emit.rs#L5756">ordinary argument entry</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/emit.rs#L5580">prologue and epilogue</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-rt/src/call_table.rs#L51">entry descriptor</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-rt/src/native_transfer/ordinary_x64.rs#L29">outer argument marshaling</a></p>
+</section><section id="interpreted"><h2>4. T0 and the tree walker: no fixed Lisp argument registers</h2>
+<p>Both engines are implemented in Rust. Rust's compiler chooses their internal machine registers. Their stable, useful layouts are the runtime data structures below—not an imagined set of T0 or tree-walker CPU registers.</p>
+<h3>T0 keeps values and execution bookkeeping separately</h3>
+<p>T0's operand stack holds intermediate expression results. A registered named T0 → T0 call takes evaluated arguments from the caller's operands, roots them, creates and binds a callee frame, and pushes an <code>Activation</code> record. The same <code>run_loop</code> then executes the callee. On return it pops the callee and pushes the primary result onto the caller's operand stack.</p>
+
+<figure id="t0"><div class="diagram"><svg role="img" aria-labelledby="t0-title t0-desc" width="695pt" height="367pt"
+ viewBox="0.00 0.00 695.00 367.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="t0-title">T0 has a managed value stack plus Rust bookkeeping</title><desc id="t0-desc">EgclStack is a separate runtime allocation, not the CPU stack addressed by RSP. Header offsets shown are for the 64-bit layout. Rooted means registered so the moving collector can update Lisp references.</desc>
+<g id="t0-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 353.03)">
+<title>G</title>
+<!-- a -->
+<g id="t0-node1" class="node">
+<title>a</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M12,-10.66C12,-10.66 283.17,-10.66 283.17,-10.66 289.17,-10.66 295.17,-16.66 295.17,-22.66 295.17,-22.66 295.17,-219.37 295.17,-219.37 295.17,-225.37 289.17,-231.37 283.17,-231.37 283.17,-231.37 12,-231.37 12,-231.37 6,-231.37 0,-225.37 0,-219.37 0,-219.37 0,-22.66 0,-22.66 0,-16.66 6,-10.66 12,-10.66"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-211.33" font-family="DejaVu Sans" font-size="12.00">Rooted Vec of Activation records</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-199.84 295.17,-199.84"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-179.8" font-family="DejaVu Sans" font-size="12.00">frame pointer</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-168.31 295.17,-168.31"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-148.27" font-family="DejaVu Sans" font-size="12.00">BytecodeFunction owner</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-136.78 295.17,-136.78"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-116.74" font-family="DejaVu Sans" font-size="12.00">bcp: next bytecode position</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-105.25 295.17,-105.25"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-85.21" font-family="DejaVu Sans" font-size="12.00">sp_top and n_locals</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-73.72 295.17,-73.72"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-53.68" font-family="DejaVu Sans" font-size="12.00">handlers / cleanups / dynamic bindings</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-42.19 295.17,-42.19"/>
+<text xml:space="preserve" text-anchor="middle" x="147.59" y="-22.15" font-family="DejaVu Sans" font-size="12.00">optional captured EnvFrame / function object</text>
+</g>
+<!-- f -->
+<g id="t0-node2" class="node">
+<title>f</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M372.42,-85.89C372.42,-85.89 654.09,-85.89 654.09,-85.89 660.09,-85.89 666.09,-91.89 666.09,-97.89 666.09,-97.89 666.09,-326.13 666.09,-326.13 666.09,-332.13 660.09,-338.13 654.09,-338.13 654.09,-338.13 372.42,-338.13 372.42,-338.13 366.42,-338.13 360.42,-332.13 360.42,-326.13 360.42,-326.13 360.42,-97.89 360.42,-97.89 360.42,-91.89 366.42,-85.89 372.42,-85.89"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-318.1" font-family="DejaVu Sans" font-size="12.00">EgclStack frame: increasing addresses ↓</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-306.61 666.09,-306.61"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-286.56" font-family="DejaVu Sans" font-size="12.00">+0x00 previous frame pointer</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-275.07 666.09,-275.07"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-255.03" font-family="DejaVu Sans" font-size="12.00">+0x08 return_pc</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-243.54 666.09,-243.54"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-223.5" font-family="DejaVu Sans" font-size="12.00">+0x10 function (EgclVal)</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-212.01 666.09,-212.01"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-191.97" font-family="DejaVu Sans" font-size="12.00">+0x18 code_info (null for T0)</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-180.48 666.09,-180.48"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-160.44" font-family="DejaVu Sans" font-size="12.00">+0x20 flags u32; num_locals u16; padding u16</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-148.95 666.09,-148.95"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-128.91" font-family="DejaVu Sans" font-size="12.00">+0x28 slots[0] … locals</text>
+<polyline fill="none" stroke="#7a95b3" points="360.42,-117.42 666.09,-117.42"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-97.38" font-family="DejaVu Sans" font-size="12.00">… operand stack / reserved slots</text>
+</g>
+<!-- a&#45;&gt;f -->
+<g id="t0-edge1" class="edge">
+<title>a&#45;&gt;f</title>
+<path fill="none" stroke="#526880" d="M295.46,-157.77C313.09,-162.18 331.17,-166.7 349.02,-171.17"/>
+<polygon fill="#526880" stroke="#526880" points="348.07,-174.54 358.62,-173.57 349.77,-167.75 348.07,-174.54"/>
+<text xml:space="preserve" text-anchor="middle" x="327.8" y="-172.49" font-family="DejaVu Sans" font-size="10.00">frame</text>
+</g>
+<!-- b -->
+<g id="t0-node3" class="node">
+<title>b</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M608.34,-60.03C608.34,-60.03 418.17,-60.03 418.17,-60.03 412.17,-60.03 406.17,-54.03 406.17,-48.03 406.17,-48.03 406.17,-12 406.17,-12 406.17,-6 412.17,0 418.17,0 418.17,0 608.34,0 608.34,0 614.34,0 620.34,-6 620.34,-12 620.34,-12 620.34,-48.03 620.34,-48.03 620.34,-54.03 614.34,-60.03 608.34,-60.03"/>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-39.99" font-family="DejaVu Sans" font-size="12.00">BytecodeFunction</text>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-25.74" font-family="DejaVu Sans" font-size="12.00">bytecode, constants,</text>
+<text xml:space="preserve" text-anchor="middle" x="513.26" y="-11.49" font-family="DejaVu Sans" font-size="12.00">parameter and slot information</text>
+</g>
+<!-- a&#45;&gt;b -->
+<g id="t0-edge2" class="edge">
+<title>a&#45;&gt;b</title>
+<path fill="none" stroke="#526880" d="M295.46,-84.26C328.52,-75.99 363.19,-67.32 394.86,-59.39"/>
+<polygon fill="#526880" stroke="#526880" points="395.61,-62.81 404.46,-56.99 393.91,-56.02 395.61,-62.81"/>
+<text xml:space="preserve" text-anchor="middle" x="327.8" y="-81.49" font-family="DejaVu Sans" font-size="10.00">func</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>T0 has a managed value stack plus Rust bookkeeping.</b> EgclStack is a separate runtime allocation, not the CPU stack addressed by RSP. Header offsets shown are for the 64-bit layout. Rooted means registered so the moving collector can update Lisp references.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; a [shape=record,fillcolor=&quot;#fff3dc&quot;,label=&quot;Rooted Vec of Activation records|frame pointer|BytecodeFunction owner|bcp: next bytecode position|sp_top and n_locals|handlers / cleanups / dynamic bindings|optional captured EnvFrame / function object&quot;]; f [shape=record,fillcolor=&quot;#edf7ed&quot;,label=&quot;EgclStack frame: increasing addresses ↓|+0x00 previous frame pointer|+0x08 return_pc|+0x10 function (EgclVal)|+0x18 code_info (null for T0)|+0x20 flags u32; num_locals u16; padding u16|+0x28 slots[0] … locals|… operand stack / reserved slots&quot;]; b [label=&quot;BytecodeFunction
+bytecode, constants,
+parameter and slot information&quot;,fillcolor=&quot;#fff3dc&quot;]; a -&gt; f [label=&quot;frame&quot;]; a -&gt; b [label=&quot;func&quot;]; }</pre></details></figure>
+<p>The managed header is 40 bytes. Its <code>num_locals</code> field counts the reserved frame slots, despite its name; T0's <code>Activation.n_locals</code> separates actual locals from operands. The managed header's <code>return_pc</code> is not T0's live instruction cursor: <code>Activation.bcp</code> tracks bytecode progress. A generic call can leave the flat T0 loop and use callable dispatch.</p>
+<h3>The tree walker binds a lexical environment</h3>
+<p>The tree walker first evaluates argument expressions, then binds their values to parameters in a child <code>EnvFrame</code>. A lexical environment is the set of variable bindings visible at that place in the source. Closures retain a captured environment and lexical control information. Evaluating the body recursively uses Rust calls, rooted temporary argument storage, and environment structures.</p>
+
+<figure id="tree"><div class="diagram"><svg role="img" aria-labelledby="tree-title tree-desc" width="1084pt" height="174pt"
+ viewBox="0.00 0.00 1084.00 174.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="tree-title">Tree-walker call state</title><desc id="tree-desc">There is no fixed native Lisp frame layout for source evaluation. Lisp values in Rust temporaries and environments must remain visible to the collector.</desc>
+<g id="tree-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 159.43)">
+<title>G</title>
+<!-- a -->
+<g id="tree-node1" class="node">
+<title>a</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M157.92,-94.91C157.92,-94.91 12,-94.91 12,-94.91 6,-94.91 0,-88.91 0,-82.91 0,-82.91 0,-61.12 0,-61.12 0,-55.12 6,-49.12 12,-49.12 12,-49.12 157.92,-49.12 157.92,-49.12 163.92,-49.12 169.92,-55.12 169.92,-61.12 169.92,-61.12 169.92,-82.91 169.92,-82.91 169.92,-88.91 163.92,-94.91 157.92,-94.91"/>
+<text xml:space="preserve" text-anchor="middle" x="84.96" y="-74.86" font-family="DejaVu Sans" font-size="12.00">Rooted argument buffer</text>
+<text xml:space="preserve" text-anchor="middle" x="84.96" y="-60.62" font-family="DejaVu Sans" font-size="12.00">a, b, c, d, e</text>
+</g>
+<!-- b -->
+<g id="tree-node2" class="node">
+<title>b</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M395.59,-94.91C395.59,-94.91 218.92,-94.91 218.92,-94.91 212.92,-94.91 206.92,-88.91 206.92,-82.91 206.92,-82.91 206.92,-61.12 206.92,-61.12 206.92,-55.12 212.92,-49.12 218.92,-49.12 218.92,-49.12 395.59,-49.12 395.59,-49.12 401.59,-49.12 407.59,-55.12 407.59,-61.12 407.59,-61.12 407.59,-82.91 407.59,-82.91 407.59,-88.91 401.59,-94.91 395.59,-94.91"/>
+<text xml:space="preserve" text-anchor="middle" x="307.26" y="-74.86" font-family="DejaVu Sans" font-size="12.00">bind_lambda_list</text>
+<text xml:space="preserve" text-anchor="middle" x="307.26" y="-60.62" font-family="DejaVu Sans" font-size="12.00">required / optional / rest / key</text>
+</g>
+<!-- a&#45;&gt;b -->
+<g id="tree-edge1" class="edge">
+<title>a&#45;&gt;b</title>
+<path fill="none" stroke="#526880" d="M170.19,-72.02C178.37,-72.02 186.76,-72.02 195.15,-72.02"/>
+<polygon fill="#526880" stroke="#526880" points="195.07,-75.52 205.07,-72.02 195.07,-68.52 195.07,-75.52"/>
+</g>
+<!-- c -->
+<g id="tree-node3" class="node">
+<title>c</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M456.59,-8.95C456.59,-8.95 665.51,-8.95 665.51,-8.95 671.51,-8.95 677.51,-14.95 677.51,-20.95 677.51,-20.95 677.51,-123.07 677.51,-123.07 677.51,-129.07 671.51,-135.07 665.51,-135.07 665.51,-135.07 456.59,-135.07 456.59,-135.07 450.59,-135.07 444.59,-129.07 444.59,-123.07 444.59,-123.07 444.59,-20.95 444.59,-20.95 444.59,-14.95 450.59,-8.95 456.59,-8.95"/>
+<text xml:space="preserve" text-anchor="middle" x="561.05" y="-115.03" font-family="DejaVu Sans" font-size="12.00">Child EnvFrame</text>
+<polyline fill="none" stroke="#7a95b3" points="444.59,-103.55 677.51,-103.55"/>
+<text xml:space="preserve" text-anchor="middle" x="561.05" y="-83.5" font-family="DejaVu Sans" font-size="12.00">parameter bindings</text>
+<polyline fill="none" stroke="#7a95b3" points="444.59,-72.02 677.51,-72.02"/>
+<text xml:space="preserve" text-anchor="middle" x="561.05" y="-51.98" font-family="DejaVu Sans" font-size="12.00">local lexical bindings</text>
+<polyline fill="none" stroke="#7a95b3" points="444.59,-40.48 677.51,-40.48"/>
+<text xml:space="preserve" text-anchor="middle" x="561.05" y="-20.45" font-family="DejaVu Sans" font-size="12.00">parent / captured environment link</text>
+</g>
+<!-- b&#45;&gt;c -->
+<g id="tree-edge2" class="edge">
+<title>b&#45;&gt;c</title>
+<path fill="none" stroke="#526880" d="M407.77,-72.02C415.99,-72.02 424.37,-72.02 432.76,-72.02"/>
+<polygon fill="#526880" stroke="#526880" points="432.67,-75.52 442.67,-72.02 432.67,-68.52 432.67,-75.52"/>
+</g>
+<!-- d -->
+<g id="tree-node4" class="node">
+<title>d</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M1021.81,-145.03C1021.81,-145.03 868.38,-145.03 868.38,-145.03 862.38,-145.03 856.38,-139.03 856.38,-133.03 856.38,-133.03 856.38,-97 856.38,-97 856.38,-91 862.38,-85 868.38,-85 868.38,-85 1021.81,-85 1021.81,-85 1027.81,-85 1033.81,-91 1033.81,-97 1033.81,-97 1033.81,-133.03 1033.81,-133.03 1033.81,-139.03 1027.81,-145.03 1021.81,-145.03"/>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-124.99" font-family="DejaVu Sans" font-size="12.00">eval_progn(body)</text>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-110.74" font-family="DejaVu Sans" font-size="12.00">Rust evaluation call chain</text>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-96.49" font-family="DejaVu Sans" font-size="12.00">Result(primary, or error)</text>
+</g>
+<!-- c&#45;&gt;d -->
+<g id="tree-edge3" class="edge">
+<title>c&#45;&gt;d</title>
+<path fill="none" stroke="#526880" d="M677.97,-85.06C731.15,-91.05 793.56,-98.07 844.58,-103.81"/>
+<polygon fill="#526880" stroke="#526880" points="844.11,-107.28 854.44,-104.92 844.9,-100.33 844.11,-107.28"/>
+</g>
+<!-- e -->
+<g id="tree-node5" class="node">
+<title>e</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M1043.18,-60.03C1043.18,-60.03 847.01,-60.03 847.01,-60.03 841.01,-60.03 835.01,-54.03 835.01,-48.03 835.01,-48.03 835.01,-12 835.01,-12 835.01,-6 841.01,0 847.01,0 847.01,0 1043.18,0 1043.18,0 1049.18,0 1055.18,-6 1055.18,-12 1055.18,-12 1055.18,-48.03 1055.18,-48.03 1055.18,-54.03 1049.18,-60.03 1043.18,-60.03"/>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-39.99" font-family="DejaVu Sans" font-size="12.00">Elsewhere in Env</text>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-25.74" font-family="DejaVu Sans" font-size="12.00">closure/control records</text>
+<text xml:space="preserve" text-anchor="middle" x="945.1" y="-11.49" font-family="DejaVu Sans" font-size="12.00">multiple values: mv + mv_active</text>
+</g>
+<!-- c&#45;&gt;e -->
+<g id="tree-edge4" class="edge">
+<title>c&#45;&gt;e</title>
+<path fill="none" stroke="#526880" stroke-dasharray="5,2" d="M677.97,-59.27C723.92,-54.22 776.76,-48.41 823.18,-43.31"/>
+<polygon fill="#526880" stroke="#526880" points="823.47,-46.8 833.02,-42.23 822.7,-39.84 823.47,-46.8"/>
+<text xml:space="preserve" text-anchor="middle" x="756.26" y="-60.48" font-family="DejaVu Sans" font-size="10.00">associated runtime state</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>Tree-walker call state.</b> There is no fixed native Lisp frame layout for source evaluation. Lisp values in Rust temporaries and environments must remain visible to the collector.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; a [label=&quot;Rooted argument buffer
+a, b, c, d, e&quot;,fillcolor=&quot;#edf7ed&quot;]; b [label=&quot;bind_lambda_list
+required / optional / rest / key&quot;,fillcolor=&quot;#fff3dc&quot;]; c [shape=record,fillcolor=&quot;#edf7ed&quot;,label=&quot;Child EnvFrame|parameter bindings|local lexical bindings|parent / captured environment link&quot;]; d [label=&quot;eval_progn(body)
+Rust evaluation call chain
+Result(primary, or error)&quot;]; e [label=&quot;Elsewhere in Env
+closure/control records
+multiple values: mv + mv_active&quot;,fillcolor=&quot;#fff3dc&quot;]; a -&gt; b -&gt; c -&gt; d; c -&gt; e [style=dashed,label=&quot;associated runtime state&quot;]; }</pre></details></figure>
+<p>Local source-body calls can enter <code>eval_named_call_ex</code> directly. Function-object calls normally go through <code>apply_function</code>. On x86-64 Linux that wrapper enters an ordinary callable adapter before <code>apply_function_impl</code> selects the body. Therefore even a tree → tree call may cross a native assembly boundary while still evaluating both bodies as source.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L14708">Activation</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-rt/src/stack.rs#L551">managed Frame</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L15789">T0 call / return</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli.rs#L10301">lambda binding and evaluation</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli.rs#L27114">source call selection</a></p>
+</section><section id="bridges"><h2>5. Crossing between native and interpreted code</h2>
+<p>An <b>adapter</b> translates one entry convention into another. It also establishes roots and a safe error boundary. It is more than a few register moves.</p>
+
+<figure id="bridge-layout"><div class="diagram"><svg role="img" aria-labelledby="bridge-layout-title bridge-layout-desc" width="983pt" height="255pt"
+ viewBox="0.00 0.00 983.00 255.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="bridge-layout-title">Two directions across the boundary</title><desc id="bridge-layout-desc">These are logical steps. Dispatch can choose different native entries, and generic calls may pass through the outer callable adapter before this selection.</desc>
+<g id="bridge-layout-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 240.4)">
+<title>G</title>
+<g id="bridge-layout-clust1" class="cluster">
+<title>cluster_i</title>
+<polygon fill="none" stroke="#c7d8e6" points="17.38,-8 17.38,-109 900.93,-109 900.93,-8 17.38,-8"/>
+<text xml:space="preserve" text-anchor="middle" x="459.15" y="-91.7" font-family="Times,serif" font-size="14.00">T0 or tree → T1 or T2</text>
+</g>
+<g id="bridge-layout-clust2" class="cluster">
+<title>cluster_n</title>
+<polygon fill="none" stroke="#c7d8e6" points="8,-117 8,-218 946.68,-218 946.68,-117 8,-117"/>
+<text xml:space="preserve" text-anchor="middle" x="477.34" y="-200.7" font-family="Times,serif" font-size="14.00">T1 or T2 → T0 or tree</text>
+</g>
+<!-- i -->
+<g id="bridge-layout-node1" class="node">
+<title>i</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M166.8,-68.89C166.8,-68.89 37.38,-68.89 37.38,-68.89 31.38,-68.89 25.38,-62.89 25.38,-56.89 25.38,-56.89 25.38,-35.11 25.38,-35.11 25.38,-29.11 31.38,-23.11 37.38,-23.11 37.38,-23.11 166.8,-23.11 166.8,-23.11 172.8,-23.11 178.8,-29.11 178.8,-35.11 178.8,-35.11 178.8,-56.89 178.8,-56.89 178.8,-62.89 172.8,-68.89 166.8,-68.89"/>
+<text xml:space="preserve" text-anchor="middle" x="102.09" y="-48.85" font-family="DejaVu Sans" font-size="12.00">Evaluated arguments</text>
+<text xml:space="preserve" text-anchor="middle" x="102.09" y="-34.6" font-family="DejaVu Sans" font-size="12.00">rooted Rust slice</text>
+</g>
+<!-- j -->
+<g id="bridge-layout-node2" class="node">
+<title>j</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M454.09,-68.89C454.09,-68.89 236.17,-68.89 236.17,-68.89 230.17,-68.89 224.17,-62.89 224.17,-56.89 224.17,-56.89 224.17,-35.11 224.17,-35.11 224.17,-29.11 230.17,-23.11 236.17,-23.11 236.17,-23.11 454.09,-23.11 454.09,-23.11 460.09,-23.11 466.09,-29.11 466.09,-35.11 466.09,-35.11 466.09,-56.89 466.09,-56.89 466.09,-62.89 460.09,-68.89 454.09,-68.89"/>
+<text xml:space="preserve" text-anchor="middle" x="345.13" y="-48.85" font-family="DejaVu Sans" font-size="12.00">Select callable / native code</text>
+<text xml:space="preserve" text-anchor="middle" x="345.13" y="-34.6" font-family="DejaVu Sans" font-size="12.00">check signature and bind as needed</text>
+</g>
+<!-- i&#45;&gt;j -->
+<g id="bridge-layout-edge1" class="edge">
+<title>i&#45;&gt;j</title>
+<path fill="none" stroke="#526880" d="M179.02,-46C189.79,-46 201.1,-46 212.55,-46"/>
+<polygon fill="#526880" stroke="#526880" points="212.52,-49.5 222.52,-46 212.52,-42.5 212.52,-49.5"/>
+</g>
+<!-- k -->
+<g id="bridge-layout-node3" class="node">
+<title>k</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M690.01,-76.02C690.01,-76.02 514.09,-76.02 514.09,-76.02 508.09,-76.02 502.09,-70.02 502.09,-64.02 502.09,-64.02 502.09,-27.98 502.09,-27.98 502.09,-21.98 508.09,-15.98 514.09,-15.98 514.09,-15.98 690.01,-15.98 690.01,-15.98 696.01,-15.98 702.01,-21.98 702.01,-27.98 702.01,-27.98 702.01,-64.02 702.01,-64.02 702.01,-70.02 696.01,-76.02 690.01,-76.02"/>
+<text xml:space="preserve" text-anchor="middle" x="602.05" y="-55.98" font-family="DejaVu Sans" font-size="12.00">Entry adapter</text>
+<text xml:space="preserve" text-anchor="middle" x="602.05" y="-41.73" font-family="DejaVu Sans" font-size="12.00">ordinary registers + overflow</text>
+<text xml:space="preserve" text-anchor="middle" x="602.05" y="-27.48" font-family="DejaVu Sans" font-size="12.00">OR mapped / checked slots</text>
+</g>
+<!-- j&#45;&gt;k -->
+<g id="bridge-layout-edge2" class="edge">
+<title>j&#45;&gt;k</title>
+<path fill="none" stroke="#526880" d="M466.5,-46C474.56,-46 482.66,-46 490.67,-46"/>
+<polygon fill="#526880" stroke="#526880" points="490.4,-49.5 500.4,-46 490.4,-42.5 490.4,-49.5"/>
+</g>
+<!-- l -->
+<g id="bridge-layout-node4" class="node">
+<title>l</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M880.93,-64C880.93,-64 795.76,-64 795.76,-64 789.76,-64 783.76,-58 783.76,-52 783.76,-52 783.76,-40 783.76,-40 783.76,-34 789.76,-28 795.76,-28 795.76,-28 880.93,-28 880.93,-28 886.93,-28 892.93,-34 892.93,-40 892.93,-40 892.93,-52 892.93,-52 892.93,-58 886.93,-64 880.93,-64"/>
+<text xml:space="preserve" text-anchor="middle" x="838.34" y="-41.73" font-family="DejaVu Sans" font-size="12.00">T1 or T2 body</text>
+</g>
+<!-- k&#45;&gt;l -->
+<g id="bridge-layout-edge3" class="edge">
+<title>k&#45;&gt;l</title>
+<path fill="none" stroke="#526880" d="M702.41,-46C725.99,-46 750.55,-46 772.15,-46"/>
+<polygon fill="#526880" stroke="#526880" points="771.98,-49.5 781.98,-46 771.98,-42.5 771.98,-49.5"/>
+</g>
+<!-- n -->
+<g id="bridge-layout-node5" class="node">
+<title>n</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M176.17,-177.89C176.17,-177.89 28,-177.89 28,-177.89 22,-177.89 16,-171.89 16,-165.89 16,-165.89 16,-144.11 16,-144.11 16,-138.11 22,-132.11 28,-132.11 28,-132.11 176.17,-132.11 176.17,-132.11 182.17,-132.11 188.17,-138.11 188.17,-144.11 188.17,-144.11 188.17,-165.89 188.17,-165.89 188.17,-171.89 182.17,-177.89 176.17,-177.89"/>
+<text xml:space="preserve" text-anchor="middle" x="102.09" y="-157.85" font-family="DejaVu Sans" font-size="12.00">Native caller</text>
+<text xml:space="preserve" text-anchor="middle" x="102.09" y="-143.6" font-family="DejaVu Sans" font-size="12.00">publish live value homes</text>
+</g>
+<!-- o -->
+<g id="bridge-layout-node6" class="node">
+<title>o</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M442.46,-185.01C442.46,-185.01 247.8,-185.01 247.8,-185.01 241.8,-185.01 235.8,-179.01 235.8,-173.01 235.8,-173.01 235.8,-136.99 235.8,-136.99 235.8,-130.99 241.8,-124.98 247.8,-124.98 247.8,-124.98 442.46,-124.98 442.46,-124.98 448.46,-124.98 454.46,-130.99 454.46,-136.99 454.46,-136.99 454.46,-173.01 454.46,-173.01 454.46,-179.01 448.46,-185.01 442.46,-185.01"/>
+<text xml:space="preserve" text-anchor="middle" x="345.13" y="-164.97" font-family="DejaVu Sans" font-size="12.00">Named or callable veneer</text>
+<text xml:space="preserve" text-anchor="middle" x="345.13" y="-150.72" font-family="DejaVu Sans" font-size="12.00">root closure + actual arguments</text>
+<text xml:space="preserve" text-anchor="middle" x="345.13" y="-136.47" font-family="DejaVu Sans" font-size="12.00">enter runtime dispatcher</text>
+</g>
+<!-- n&#45;&gt;o -->
+<g id="bridge-layout-edge4" class="edge">
+<title>n&#45;&gt;o</title>
+<path fill="none" stroke="#526880" d="M188.41,-155C200.12,-155 212.33,-155 224.52,-155"/>
+<polygon fill="#526880" stroke="#526880" points="224.18,-158.5 234.18,-155 224.18,-151.5 224.18,-158.5"/>
+</g>
+<!-- p -->
+<g id="bridge-layout-node7" class="node">
+<title>p</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M672.76,-177.89C672.76,-177.89 531.34,-177.89 531.34,-177.89 525.34,-177.89 519.34,-171.89 519.34,-165.89 519.34,-165.89 519.34,-144.11 519.34,-144.11 519.34,-138.11 525.34,-132.11 531.34,-132.11 531.34,-132.11 672.76,-132.11 672.76,-132.11 678.76,-132.11 684.76,-138.11 684.76,-144.11 684.76,-144.11 684.76,-165.89 684.76,-165.89 684.76,-171.89 678.76,-177.89 672.76,-177.89"/>
+<text xml:space="preserve" text-anchor="middle" x="602.05" y="-157.85" font-family="DejaVu Sans" font-size="12.00">T0: bind managed slots</text>
+<text xml:space="preserve" text-anchor="middle" x="602.05" y="-143.6" font-family="DejaVu Sans" font-size="12.00">or tree: bind EnvFrame</text>
+</g>
+<!-- o&#45;&gt;p -->
+<g id="bridge-layout-edge5" class="edge">
+<title>o&#45;&gt;p</title>
+<path fill="none" stroke="#526880" d="M454.61,-155C472.28,-155 490.46,-155 507.73,-155"/>
+<polygon fill="#526880" stroke="#526880" points="507.42,-158.5 517.42,-155 507.42,-151.5 507.42,-158.5"/>
+</g>
+<!-- q -->
+<g id="bridge-layout-node8" class="node">
+<title>q</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M926.68,-185.01C926.68,-185.01 750.01,-185.01 750.01,-185.01 744.01,-185.01 738.01,-179.01 738.01,-173.01 738.01,-173.01 738.01,-136.99 738.01,-136.99 738.01,-130.99 744.01,-124.98 750.01,-124.98 750.01,-124.98 926.68,-124.98 926.68,-124.98 932.68,-124.98 938.68,-130.99 938.68,-136.99 938.68,-136.99 938.68,-173.01 938.68,-173.01 938.68,-179.01 932.68,-185.01 926.68,-185.01"/>
+<text xml:space="preserve" text-anchor="middle" x="838.34" y="-164.97" font-family="DejaVu Sans" font-size="12.00">Translate primary + MV state</text>
+<text xml:space="preserve" text-anchor="middle" x="838.34" y="-150.72" font-family="DejaVu Sans" font-size="12.00">finish Rust frames</text>
+<text xml:space="preserve" text-anchor="middle" x="838.34" y="-136.47" font-family="DejaVu Sans" font-size="12.00">return or transfer</text>
+</g>
+<!-- p&#45;&gt;q -->
+<g id="bridge-layout-edge6" class="edge">
+<title>p&#45;&gt;q</title>
+<path fill="none" stroke="#526880" d="M685,-155C698.43,-155 712.54,-155 726.53,-155"/>
+<polygon fill="#526880" stroke="#526880" points="726.2,-158.5 736.2,-155 726.2,-151.5 726.2,-158.5"/>
+</g>
+</g>
+</svg>
+</div><figcaption><b>Two directions across the boundary.</b> These are logical steps. Dispatch can choose different native entries, and generic calls may pass through the outer callable adapter before this selection.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; subgraph cluster_i { label=&quot;T0 or tree → T1 or T2&quot;; color=&quot;#c7d8e6&quot;; i [label=&quot;Evaluated arguments
+rooted Rust slice&quot;,fillcolor=&quot;#edf7ed&quot;]; j [label=&quot;Select callable / native code
+check signature and bind as needed&quot;,fillcolor=&quot;#fff3dc&quot;]; k [label=&quot;Entry adapter
+ordinary registers + overflow
+OR mapped / checked slots&quot;,fillcolor=&quot;#fff3dc&quot;]; l [label=&quot;T1 or T2 body&quot;]; i -&gt; j -&gt; k -&gt; l; } subgraph cluster_n { label=&quot;T1 or T2 → T0 or tree&quot;; color=&quot;#c7d8e6&quot;; n [label=&quot;Native caller
+publish live value homes&quot;]; o [label=&quot;Named or callable veneer
+root closure + actual arguments
+enter runtime dispatcher&quot;,fillcolor=&quot;#fff3dc&quot;]; p [label=&quot;T0: bind managed slots
+or tree: bind EnvFrame&quot;,fillcolor=&quot;#edf7ed&quot;]; q [label=&quot;Translate primary + MV state
+finish Rust frames
+return or transfer&quot;,fillcolor=&quot;#fff3dc&quot;]; n -&gt; o -&gt; p -&gt; q; } }</pre></details></figure>
+<h3>Interpreted caller → native callee</h3>
+<p>T0's native branch uses <code>run_native_callable</code>. Tree-call dispatch uses <code>call_registered</code> when compiled code exists. The selected native code chooses a suitable entry. The ordinary bridge marshals the arguments into the register/overflow layout. Compatible mapped paths can import activation state; the legacy checked path explicitly builds an <code>EgclStack</code> frame and binds its slots before entering machine code.</p>
+<h3>Native caller → interpreted callee</h3>
+<p>An ordinary named-call veneer reaches <code>ordinary_calls::named_entry</code>, which publishes native roots, roots all supplied arguments and the closure, copies arguments into a rooted buffer, polls the runtime, and calls <code>call_table::ordinary_call</code>. A bytecode target uses the T0 runner; a function-object target uses callable dispatch. The callable-object veneer similarly reaches <code>apply_function_impl</code>.</p>
+<p>A <b>veneer</b> is a small assembly adapter. A <b>poll</b> is a controlled point where execution checks for work such as collection, signals, or yielding. The veneer cannot assume an incorrect argument count is safe: even an arity-error path must protect all supplied values before an allocating helper runs.</p>
+<p>When interpreted work finishes, the adapter translates <code>Result&lt;EgclVal, EgclError&gt;</code> and the environment's multiple-value state into the native outcome. Rust helper frames finish before assembly performs a non-local native transfer.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/native_transfer_entry/ordinary_calls.rs#L218">ordinary named ingress</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/call_table.rs#L535">target selection</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/native_callable.rs#L186">callable ingress</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L20915">native entry selection</a></p>
+</section><section id="returns"><h2>6. Coming back: one, zero, or many values</h2>
+<p>Common Lisp functions can return more than one value. For example, <code>(values 10 20)</code> returns two; <code>(values)</code> returns zero. In a context that asks only for the primary value, zero values behave as <code>NIL</code>.</p>
+<table><thead><tr><th>Ordinary native return</th><th>Carry flag (CF)</th><th>RAX</th><th>RDX</th><th>RCX</th></tr></thead><tbody>
+<tr><td>Exactly one value</td><td>0 (clear)</td><td>The value</td><td>Unspecified</td><td>Unspecified</td></tr>
+<tr><td>Zero values</td><td>1 (set)</td><td>NIL</td><td>0</td><td>Null pointer</td></tr>
+<tr><td>Two or more values</td><td>1 (set)</td><td>Primary value</td><td>Full value count</td><td>Pointer to complete tuple, including primary</td></tr>
+</tbody></table>
+<p>The <b>carry flag</b> is one bit in the CPU's status flags. Here it distinguishes a single value from zero/many values; it does <em>not</em> mean “error.” Cleanup must preserve that bit and the meaningful result registers. This is why ordinary epilogues can use <code>LEA</code> to adjust the stack without changing flags.</p>
+
+<figure id="mv"><div class="diagram"><svg role="img" aria-labelledby="mv-title mv-desc" width="486pt" height="235pt"
+ viewBox="0.00 0.00 486.00 235.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="mv-title">Returning (values 10 20)</title><desc id="mv-desc">The tuple storage is owned and traced by Env. RCX borrows its address; it is not itself a GC root and must not be retained across collection, suspension, or buffer mutation.</desc>
+<g id="mv-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 220.29)">
+<title>G</title>
+<!-- r -->
+<g id="mv-node1" class="node">
+<title>r</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M12,-47.73C12,-47.73 131.67,-47.73 131.67,-47.73 137.67,-47.73 143.67,-53.73 143.67,-59.73 143.67,-59.73 143.67,-193.38 143.67,-193.38 143.67,-199.38 137.67,-205.38 131.67,-205.38 131.67,-205.38 12,-205.38 12,-205.38 6,-205.38 0,-199.38 0,-193.38 0,-193.38 0,-59.74 0,-59.74 0,-53.74 6,-47.73 12,-47.73"/>
+<text xml:space="preserve" text-anchor="middle" x="71.83" y="-185.34" font-family="DejaVu Sans" font-size="12.00">Native result</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-173.86 143.67,-173.86"/>
+<text xml:space="preserve" text-anchor="middle" x="71.83" y="-153.81" font-family="DejaVu Sans" font-size="12.00">CF = 1</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-142.32 143.67,-142.32"/>
+<text xml:space="preserve" text-anchor="middle" x="71.83" y="-122.28" font-family="DejaVu Sans" font-size="12.00">RAX = tagged 10</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-110.8 143.67,-110.8"/>
+<text xml:space="preserve" text-anchor="middle" x="71.83" y="-90.75" font-family="DejaVu Sans" font-size="12.00">RDX = 2</text>
+<polyline fill="none" stroke="#7a95b3" points="0,-79.27 143.67,-79.27"/>
+<text xml:space="preserve" text-anchor="middle" x="71.83" y="-59.23" font-family="DejaVu Sans" font-size="12.00">RCX = tuple pointer</text>
+</g>
+<!-- e -->
+<g id="mv-node2" class="node">
+<title>e</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M312.42,-0.5C312.42,-0.5 445.59,-0.5 445.59,-0.5 451.59,-0.5 457.59,-6.5 457.59,-12.5 457.59,-12.5 457.59,-114.62 457.59,-114.62 457.59,-120.62 451.59,-126.62 445.59,-126.62 445.59,-126.62 312.42,-126.62 312.42,-126.62 306.42,-126.62 300.42,-120.62 300.42,-114.62 300.42,-114.62 300.42,-12.5 300.42,-12.5 300.42,-6.5 306.42,-0.5 312.42,-0.5"/>
+<text xml:space="preserve" text-anchor="middle" x="379" y="-106.58" font-family="DejaVu Sans" font-size="12.00">Env, stored elsewhere</text>
+<polyline fill="none" stroke="#7a95b3" points="300.42,-95.09 457.59,-95.09"/>
+<text xml:space="preserve" text-anchor="middle" x="379" y="-75.05" font-family="DejaVu Sans" font-size="12.00">mv_active = true</text>
+<polyline fill="none" stroke="#7a95b3" points="300.42,-63.56 457.59,-63.56"/>
+<text xml:space="preserve" text-anchor="middle" x="379" y="-43.52" font-family="DejaVu Sans" font-size="12.00">mv[0] = tagged 10</text>
+<polyline fill="none" stroke="#7a95b3" points="300.42,-32.03 457.59,-32.03"/>
+<text xml:space="preserve" text-anchor="middle" x="379" y="-11.99" font-family="DejaVu Sans" font-size="12.00">mv[1] = tagged 20</text>
+</g>
+<!-- r&#45;&gt;e -->
+<g id="mv-edge1" class="edge">
+<title>r:tuple&#45;&gt;e</title>
+<path fill="none" stroke="#526880" d="M143.67,-63.5C191.57,-63.5 244.97,-63.51 288.68,-63.53"/>
+<polygon fill="#526880" stroke="#526880" points="288.65,-67.03 298.65,-63.53 288.65,-60.03 288.65,-67.03"/>
+<text xml:space="preserve" text-anchor="middle" x="222.04" y="-66.77" font-family="DejaVu Sans" font-size="10.00">RCX borrows mv storage</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>Returning (values 10 20).</b> The tuple storage is owned and traced by Env. RCX borrows its address; it is not itself a GC root and must not be retained across collection, suspension, or buffer mutation.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; r [shape=record,label=&quot;Native result|CF = 1|RAX = tagged 10|RDX = 2|&lt;tuple&gt; RCX = tuple pointer&quot;]; e [shape=record,fillcolor=&quot;#edf7ed&quot;,label=&quot;Env, stored elsewhere|mv_active = true|mv[0] = tagged 10|mv[1] = tagged 20&quot;]; r:tuple -&gt; e [label=&quot;RCX borrows mv storage&quot;]; }</pre></details></figure>
+<p>T0 and the tree walker carry the primary result directly and keep additional-value state in <code>Env.mv</code> and <code>mv_active</code>. In T0 the primary also enters the caller's operand stack. Adapters normalize this into the native descriptor: single returns leave the buffer inactive; zero returns have an active empty buffer; many returns have an active full tuple. A caller that needs values after another call must copy them into traced storage first.</p>
+<p>Ordinary native bodies do not yet support every multiple-value consumer. Some can forward a callee's whole return unchanged; more complex contexts retain a compatible execution path.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/native_return.rs#L8">native return emission</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli.rs#L10094">Env return normalization</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/native_transfer_entry/ordinary_calls.rs#L86">adapter completion</a></p>
+</section><section id="gc"><h2>7. Why the maps matter: objects can move</h2>
+<p>EGCL has a moving garbage collector. If a live object moves from address A to B, every reference that execution will use must be updated. A <b>root</b> is a location the collector knows contains a live Lisp value. A raw address that the collector does not know about can become stale.</p>
+<p>For native code, “the value is in <code>RBX</code>” is not enough. A callee may have saved the caller's <code>RBX</code> on its own stack and reused the register. The runtime combines each frame's exact-PC value map with the unwind recipe—the instructions for finding saved registers and the previous frame—to find the authoritative, writable copy.</p>
+
+<figure id="metadata"><div class="diagram"><svg role="img" aria-labelledby="metadata-title metadata-desc" width="1758pt" height="177pt"
+ viewBox="0.00 0.00 1758.00 177.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title id="metadata-title">What lives elsewhere, and what points to it</title><desc id="metadata-desc">Solid arrows indicate lookup or ownership relationships. The collector updates mapped value homes; raw control pointers, padding and dead words are not automatically roots.</desc>
+<g id="metadata-graph0" class="graph" transform="scale(1 1) rotate(0) translate(14.4 162.97)">
+<title>G</title>
+<!-- cell -->
+<g id="metadata-node1" class="node">
+<title>cell</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M169.17,-60.03C169.17,-60.03 12,-60.03 12,-60.03 6,-60.03 0,-54.03 0,-48.03 0,-48.03 0,-26.25 0,-26.25 0,-20.25 6,-14.25 12,-14.25 12,-14.25 169.17,-14.25 169.17,-14.25 175.17,-14.25 181.17,-20.25 181.17,-26.25 181.17,-26.25 181.17,-48.03 181.17,-48.03 181.17,-54.03 175.17,-60.03 169.17,-60.03"/>
+<text xml:space="preserve" text-anchor="middle" x="90.59" y="-39.99" font-family="DejaVu Sans" font-size="12.00">CallCell</text>
+<text xml:space="preserve" text-anchor="middle" x="90.59" y="-25.74" font-family="DejaVu Sans" font-size="12.00">atomic ordinary&#45;entry slot</text>
+</g>
+<!-- desc -->
+<g id="metadata-node2" class="node">
+<title>desc</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M415.09,-74.28C415.09,-74.28 230.17,-74.28 230.17,-74.28 224.17,-74.28 218.17,-68.28 218.17,-62.28 218.17,-62.28 218.17,-12 218.17,-12 218.17,-6 224.17,0 230.17,0 230.17,0 415.09,0 415.09,0 421.09,0 427.09,-6 427.09,-12 427.09,-12 427.09,-62.28 427.09,-62.28 427.09,-68.28 421.09,-74.28 415.09,-74.28"/>
+<text xml:space="preserve" text-anchor="middle" x="322.63" y="-54.24" font-family="DejaVu Sans" font-size="12.00">OrdinaryEntryDescriptor</text>
+<text xml:space="preserve" text-anchor="middle" x="322.63" y="-39.99" font-family="DejaVu Sans" font-size="12.00">ABI version / revision</text>
+<text xml:space="preserve" text-anchor="middle" x="322.63" y="-25.74" font-family="DejaVu Sans" font-size="12.00">arity / environment / stack size</text>
+<text xml:space="preserve" text-anchor="middle" x="322.63" y="-11.49" font-family="DejaVu Sans" font-size="12.00">entry + code owner</text>
+</g>
+<!-- cell&#45;&gt;desc -->
+<g id="metadata-edge1" class="edge">
+<title>cell&#45;&gt;desc</title>
+<path fill="none" stroke="#526880" d="M181.51,-37.14C189.75,-37.14 198.16,-37.14 206.57,-37.14"/>
+<polygon fill="#526880" stroke="#526880" points="206.51,-40.64 216.51,-37.14 206.51,-33.64 206.51,-40.64"/>
+</g>
+<!-- code -->
+<g id="metadata-node3" class="node">
+<title>code</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M670.01,-67.16C670.01,-67.16 476.09,-67.16 476.09,-67.16 470.09,-67.16 464.09,-61.16 464.09,-55.16 464.09,-55.16 464.09,-19.12 464.09,-19.12 464.09,-13.12 470.09,-7.12 476.09,-7.12 476.09,-7.12 670.01,-7.12 670.01,-7.12 676.01,-7.12 682.01,-13.12 682.01,-19.12 682.01,-19.12 682.01,-55.16 682.01,-55.16 682.01,-61.16 676.01,-67.16 670.01,-67.16"/>
+<text xml:space="preserve" text-anchor="middle" x="573.05" y="-47.12" font-family="DejaVu Sans" font-size="12.00">Retained code owner</text>
+<text xml:space="preserve" text-anchor="middle" x="573.05" y="-32.87" font-family="DejaVu Sans" font-size="12.00">machine code + exact&#45;PC maps</text>
+<text xml:space="preserve" text-anchor="middle" x="573.05" y="-18.62" font-family="DejaVu Sans" font-size="12.00">unwind + deopt recipes</text>
+</g>
+<!-- desc&#45;&gt;code -->
+<g id="metadata-edge2" class="edge">
+<title>desc&#45;&gt;code</title>
+<path fill="none" stroke="#526880" d="M427.54,-37.14C435.77,-37.14 444.12,-37.14 452.44,-37.14"/>
+<polygon fill="#526880" stroke="#526880" points="452.24,-40.64 462.24,-37.14 452.24,-33.64 452.24,-40.64"/>
+</g>
+<!-- gc -->
+<g id="metadata-node6" class="node">
+<title>gc</title>
+<path fill="#edf7ed" stroke="#7a95b3" d="M989.93,-107.03C989.93,-107.03 823.76,-107.03 823.76,-107.03 817.76,-107.03 811.76,-101.03 811.76,-95.03 811.76,-95.03 811.76,-73.25 811.76,-73.25 811.76,-67.25 817.76,-61.25 823.76,-61.25 823.76,-61.25 989.93,-61.25 989.93,-61.25 995.93,-61.25 1001.93,-67.25 1001.93,-73.25 1001.93,-73.25 1001.93,-95.03 1001.93,-95.03 1001.93,-101.03 995.93,-107.03 989.93,-107.03"/>
+<text xml:space="preserve" text-anchor="middle" x="906.85" y="-86.99" font-family="DejaVu Sans" font-size="12.00">Moving collector</text>
+<text xml:space="preserve" text-anchor="middle" x="906.85" y="-72.74" font-family="DejaVu Sans" font-size="12.00">locate → update live homes</text>
+</g>
+<!-- code&#45;&gt;gc -->
+<g id="metadata-edge5" class="edge">
+<title>code&#45;&gt;gc</title>
+<path fill="none" stroke="#526880" d="M682.23,-52.46C720.19,-57.84 762.74,-63.87 800.46,-69.21"/>
+<polygon fill="#526880" stroke="#526880" points="799.59,-72.62 809.98,-70.56 800.57,-65.69 799.59,-72.62"/>
+<text xml:space="preserve" text-anchor="middle" x="746.89" y="-70.85" font-family="DejaVu Sans" font-size="10.00">describes locations</text>
+</g>
+<!-- stack -->
+<g id="metadata-node4" class="node">
+<title>stack</title>
+<path fill="#eef4fb" stroke="#7a95b3" d="M1716.77,-114.16C1716.77,-114.16 1555.85,-114.16 1555.85,-114.16 1549.85,-114.16 1543.85,-108.16 1543.85,-102.16 1543.85,-102.16 1543.85,-66.12 1543.85,-66.12 1543.85,-60.12 1549.85,-54.12 1555.85,-54.12 1555.85,-54.12 1716.77,-54.12 1716.77,-54.12 1722.77,-54.12 1728.77,-60.12 1728.77,-66.12 1728.77,-66.12 1728.77,-102.16 1728.77,-102.16 1728.77,-108.16 1722.77,-114.16 1716.77,-114.16"/>
+<text xml:space="preserve" text-anchor="middle" x="1636.31" y="-94.11" font-family="DejaVu Sans" font-size="12.00">Paused native frames</text>
+<text xml:space="preserve" text-anchor="middle" x="1636.31" y="-79.86" font-family="DejaVu Sans" font-size="12.00">return addresses</text>
+<text xml:space="preserve" text-anchor="middle" x="1636.31" y="-65.61" font-family="DejaVu Sans" font-size="12.00">saved registers + live slots</text>
+</g>
+<!-- stack&#45;&gt;code -->
+<g id="metadata-edge3" class="edge">
+<title>stack&#45;&gt;code</title>
+<path fill="none" stroke="#526880" d="M1543.38,-60.77C1508.12,-52.9 1467.36,-45.11 1429.85,-41.14 1168.24,-13.44 859.14,-22.14 693.37,-30.14"/>
+<polygon fill="#526880" stroke="#526880" points="693.5,-26.63 683.69,-30.62 693.85,-33.63 693.5,-26.63"/>
+<text xml:space="preserve" text-anchor="middle" x="1087.43" y="-27.2" font-family="DejaVu Sans" font-size="10.00">return PC identifies map</text>
+</g>
+<!-- boundary -->
+<g id="metadata-node5" class="node">
+<title>boundary</title>
+<path fill="#fff3dc" stroke="#7a95b3" d="M1417.85,-114.16C1417.85,-114.16 1184.93,-114.16 1184.93,-114.16 1178.93,-114.16 1172.93,-108.16 1172.93,-102.16 1172.93,-102.16 1172.93,-66.12 1172.93,-66.12 1172.93,-60.12 1178.93,-54.12 1184.93,-54.12 1184.93,-54.12 1417.85,-54.12 1417.85,-54.12 1423.85,-54.12 1429.85,-60.12 1429.85,-66.12 1429.85,-66.12 1429.85,-102.16 1429.85,-102.16 1429.85,-108.16 1423.85,-114.16 1417.85,-114.16"/>
+<text xml:space="preserve" text-anchor="middle" x="1301.39" y="-94.11" font-family="DejaVu Sans" font-size="12.00">Published native boundary</text>
+<text xml:space="preserve" text-anchor="middle" x="1301.39" y="-79.86" font-family="DejaVu Sans" font-size="12.00">writable register context</text>
+<text xml:space="preserve" text-anchor="middle" x="1301.39" y="-65.61" font-family="DejaVu Sans" font-size="12.00">segment anchor + execution directory</text>
+</g>
+<!-- boundary&#45;&gt;stack -->
+<g id="metadata-edge4" class="edge">
+<title>boundary&#45;&gt;stack</title>
+<path fill="none" stroke="#526880" d="M1430.15,-84.14C1463.94,-84.14 1499.99,-84.14 1532.28,-84.14"/>
+<polygon fill="#526880" stroke="#526880" points="1532.03,-87.64 1542.03,-84.14 1532.03,-80.64 1532.03,-87.64"/>
+<text xml:space="preserve" text-anchor="middle" x="1486.85" y="-87.39" font-family="DejaVu Sans" font-size="10.00">start stack walk</text>
+</g>
+<!-- gc&#45;&gt;stack -->
+<g id="metadata-edge6" class="edge">
+<title>gc&#45;&gt;stack</title>
+<path fill="none" stroke="#526880" d="M1002.31,-100.24C1008.27,-101.23 1014.18,-102.2 1019.93,-103.14 1200.05,-132.53 1248.32,-145.93 1429.85,-127.14 1463.56,-123.65 1499.89,-117.02 1532.48,-110"/>
+<polygon fill="#526880" stroke="#526880" points="1532.89,-113.49 1541.91,-107.93 1531.39,-106.65 1532.89,-113.49"/>
+<text xml:space="preserve" text-anchor="middle" x="1301.39" y="-139.07" font-family="DejaVu Sans" font-size="10.00">writes relocated references</text>
+</g>
+<!-- gc&#45;&gt;boundary -->
+<g id="metadata-edge7" class="edge">
+<title>gc&#45;&gt;boundary</title>
+<path fill="none" stroke="#526880" d="M1002.37,-84.14C1049.92,-84.14 1108.49,-84.14 1161.09,-84.14"/>
+<polygon fill="#526880" stroke="#526880" points="1161.05,-87.64 1171.05,-84.14 1161.05,-80.64 1161.05,-87.64"/>
+<text xml:space="preserve" text-anchor="middle" x="1087.43" y="-87.39" font-family="DejaVu Sans" font-size="10.00">updates published registers</text>
+</g>
+</g>
+</svg>
+</div><figcaption><b>What lives elsewhere, and what points to it.</b> Solid arrows indicate lookup or ownership relationships. The collector updates mapped value homes; raw control pointers, padding and dead words are not automatically roots.</figcaption><details><summary>Graphviz DOT source</summary><pre>digraph G { graph [rankdir=LR, bgcolor=&quot;transparent&quot;, pad=&quot;0.2&quot;, nodesep=&quot;0.35&quot;, ranksep=&quot;0.5&quot;]; node [shape=box, style=&quot;rounded,filled&quot;, fillcolor=&quot;#eef4fb&quot;, color=&quot;#7a95b3&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=12, margin=&quot;0.18,0.12&quot;]; edge [color=&quot;#526880&quot;, fontname=&quot;DejaVu Sans&quot;, fontsize=10]; cell [label=&quot;CallCell
+atomic ordinary-entry slot&quot;,fillcolor=&quot;#fff3dc&quot;]; desc [label=&quot;OrdinaryEntryDescriptor
+ABI version / revision
+arity / environment / stack size
+entry + code owner&quot;,fillcolor=&quot;#fff3dc&quot;]; code [label=&quot;Retained code owner
+machine code + exact-PC maps
+unwind + deopt recipes&quot;,fillcolor=&quot;#fff3dc&quot;]; stack [label=&quot;Paused native frames
+return addresses
+saved registers + live slots&quot;]; boundary [label=&quot;Published native boundary
+writable register context
+segment anchor + execution directory&quot;,fillcolor=&quot;#fff3dc&quot;]; gc [label=&quot;Moving collector
+locate → update live homes&quot;,fillcolor=&quot;#edf7ed&quot;]; cell -&gt; desc -&gt; code; stack -&gt; code [label=&quot;return PC identifies map&quot;]; boundary -&gt; stack [label=&quot;start stack walk&quot;]; code -&gt; gc [label=&quot;describes locations&quot;]; gc -&gt; stack [label=&quot;writes relocated references&quot;]; gc -&gt; boundary [label=&quot;updates published registers&quot;]; }</pre></details></figure>
+<p>The code owner remains retained while an active or suspended segment could still refer to it, even if the function is redefined. The machine frame does not contain a copy of all these tables. Its return address connects it to the retained metadata.</p>
+<p>T0's managed slots and rooted activation records provide its roots. Tree evaluation roots its temporary values and environments. Legacy T2 paths can copy live values into <b>shadow root slots</b> appended to an <code>EgclStack</code> activation, then reload after an allocating call. Fully published native paths can instead describe native stack/register homes directly. These are distinct mechanisms; not every native frame has shadow slots.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/x64_calls.rs#L55">exact return-PC index</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/x64_value_maps.rs#L13">value locations</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/call_table_ordinary.rs#L16">retained owners</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/native_transfer_entry/root_publication.rs#L1">root publication</a></p>
+</section><section id="exceptions"><h2>8. Other entries you will encounter in the source</h2>
+<p>The ordinary convention is the main x86-64 Linux route for supported tagged T1/T2 bodies. The repository also contains these entry families. Never substitute one entry address for another merely because both belong to the same function.</p>
+<table><thead><tr><th>Entry family</th><th>Incoming data</th><th>Why it exists</th></tr></thead><tbody>
+<tr><td><b>Ordinary native</b></td><td>RDI/RSI/RDX, stack overflow, RCX count, RAX closure, R13 context</td><td>Eligible native calls and ordinary interpreted/binding adapters.</td></tr>
+<tr><td><b>Legacy managed-slot entry</b></td><td>Actual runtime call: <code>fn(slots_ptr, EgclStack_ptr) → u64</code>; on SysV x86-64, RDI and RSI</td><td>A managed activation is already allocated and bound. Legacy T1 uses R14 for slots, R15 for operand-stack position, and R12 for EgclStack. T2 loads parameters into chosen value homes.</td></tr>
+<tr><td><b>Legacy T2 register entry</b></td><td>Up to four arguments in RCX/R8/R9/R10</td><td>Restricted direct self-calls; incompatible with ordinary entry. Availability depends on body shape and root/activation needs.</td></tr>
+<tr><td><b>Mapped native-transfer entry</b></td><td>Explicit activation/control and per-site transfer metadata; its adapter defines the machine layout</td><td>Compatible native execution for bodies needing protected control scopes or representation-specific state. This is not another name for the ordinary ABI.</td></tr>
+<tr><td><b>OSR entry</b></td><td>Live state from an existing activation</td><td>On-stack replacement: switch a running loop to compiled code without calling the function again.</td></tr>
+</tbody></table>
+<p>Legacy <code>c2i</code> helpers mean “compiled to interpreter/runtime.” Small checked calls can pass a symbol, count, and up to three values in host-ABI registers; wider calls use a rooted argument slice. The checked path records errors in <code>NATIVE_ERROR</code>, returns a placeholder, and relies on generated checks. Ordinary native segment transfers use their explicit outcome/landing machinery instead. A C helper's flags are not a Lisp return descriptor.</p>
+<h3>Optimization failure is a continuation, not a fresh call</h3>
+<p><b>Deoptimization</b> happens when a compiled assumption fails. T2's frame-state metadata describes the bytecode position, locals, and operand stack needed to resume in T0. After side effects, recovery must resume at the correct continuation rather than restart and repeat completed calls. This is distinct from selecting T0 as the callee at a normal call boundary.</p>
+<h3>Errors and non-local exits</h3>
+<p>A normal return goes back to the immediate caller. Lisp <code>THROW</code>, <code>RETURN-FROM</code>, and error handling may leave several calls, running cleanups and restoring dynamic bindings along the way. T0 uses explicit handler/unwind bookkeeping; the tree evaluator propagates Rust results; native mapped/segment paths use recorded transfer sites and cold landings. They must not jump across still-live Rust helper frames.</p>
+<h3>Current limits</h3>
+<p>The general ordinary native body emitter admits a subset: tagged values, fixed parameters, supported operations and control flow. Captured environments, variadic native bodies, protected control regions, raw numeric representations, and some frame-state shapes require other paths. Ordinary adapters can still handle closures, optional/rest binding, generic functions, or interpreted bodies. The current build stage is 5; the broader Stage 6 ABI specification is not evidence that every target requirement is implemented.</p>
+<p>Other architectures and Windows have their own native adapters, including mapped-transfer implementations. This document deliberately does not assign x86 registers to those platforms. The all-tier matrix describes semantic routes; the physical diagrams describe x86-64 Linux.</p>
+
+<p class="sources">Source: <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L21005">managed entry and binding</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/emit.rs#L49">legacy entries</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L17788">checked c2i dispatch</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/native_transfer_entry.rs#L1630">parameter admission</a> · <a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/spec/04-07-x86-64-lisp-abi.md#L72">documented implementation scope</a></p>
+</section><section id="reading"><h2>9. A short reading route through the source</h2>
+<p>Start with the interpreter dispatch, then follow one native entry. The very large <code>bytecode.rs</code> contains both T0 execution and native integration; its name does not mean everything inside runs as bytecode.</p><ol>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli.rs#L38857">apply_function → apply_function_impl</a> — How a function object is selected and executed.</li>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode.rs#L15789">T0 CallNamed</a> — How arguments leave the operand stack and a destination is selected.</li>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl/src/cli/bytecode/call_table.rs#L535">ordinary_call</a> — How stable call-table linkage chooses bytecode, native code, or a function object.</li>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/emit.rs#L5756">ordinary machine entry</a> — Where the register and overflow arguments become native value homes.</li>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/native_return.rs#L8">native returns</a> — The short assembly sequences encoding one or multiple values.</li>
+<li><a href="https://github.com/atgreen/evergreen/blob/4091e35d233e956ff5a16002e9cd2d3b0ed4e1e5/crates/egcl-compiler/src/t2/x64_calls.rs#L55">native call maps</a> — How return addresses connect frames to value and unwind metadata.</li>
+</ol><p>The source links are pinned to this document's audited revision so later changes do not silently change what an anchor means. The diagrams are embedded SVG generated by Graphviz; each includes its editable DOT source. The document opens offline without scripts, fonts, or diagram services.</p></section>
+<footer><p class="small">Documentation audit only: source paths, entry layouts and dispatch were inspected. This document does not claim new runtime test coverage or complete Stage 6 conformance.</p></footer></main></body></html>
