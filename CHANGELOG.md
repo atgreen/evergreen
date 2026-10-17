@@ -44,6 +44,11 @@
 
 ### Fixed
 
+- `MAKE-PATHNAME` no longer builds a pathname with a wrong component when a
+  garbage collection happens while it runs: with a `:directory` list or a
+  namestring `:defaults`, a freshly made `:name` or `:type` string could be
+  replaced by unrelated data, such as the directory's namestring
+  ([#382](https://github.com/atgreen/evergreen/pull/382)).
 - A library's own `DEFUN` of `CLASS-PRECEDENCE-LIST` no longer redefines the
   implementation's. `EGCL-MOP` owns and exports the name now, and the
   interpreter dispatches that spelling, so a bare read of it inside a package
