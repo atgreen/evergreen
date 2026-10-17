@@ -839,7 +839,15 @@ pub fn serialize_clos_state() -> Vec<u8> {
     let mut out = with_state(|st| {
         let mut out = Vec::new();
         out.extend_from_slice(b"CLST");
-        cs_put_u32(&mut out, 3); // format version (3 adds ClassMeta.metaclass)
+        // 3 added ClassMeta.metaclass; 4 adds ClassMeta.shared_slots.
+        //
+        // No reader compatibility with 3 is kept, and none is possible to
+        // need: an image also carries a hash of the runtime's source and is
+        // refused outright on a mismatch ("runtime source mismatch"), so a
+        // core written by any other build never reaches this version check.
+        // Measured — a core from the previous commit's binary is rejected at
+        // the header, not here.
+        cs_put_u32(&mut out, 4);
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -858,6 +866,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
             cs_put_vals(&mut out, &meta.direct_subs);
             cs_put_vals(&mut out, &meta.slots);
             cs_put_val(&mut out, meta.metaclass);
+            cs_put_vals(&mut out, &meta.shared_slots);
         }
         cs_put_u32(&mut out, st.generic_functions.len() as u32);
         for (gf, data) in &st.generic_functions {
@@ -979,7 +988,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 3 {
+    if version != 4 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -1005,10 +1014,11 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let direct_subs = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let metaclass = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
+        let shared_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         st.class_meta.insert(
             class,
             ClassMeta {
-                shared_slots: Vec::new(),
+                shared_slots,
                 name,
                 direct_supers,
                 direct_subs,
