@@ -75,6 +75,21 @@ const PROGRAM: &str = r#"
   ;; so that spelling has to keep resolving.
   (format t "CL-USER-REACHABLE ~a~%" (and (fboundp 'cl-user::class-slots) t))
 
+  ;; #370's other half: CLASS-PRECEDENCE-LIST too. A (:use :cl)-only package
+  ;; defining that name must get its OWN symbol, and ours must survive. This
+  ;; needs a FILE rather than one --eval form: in-package only affects
+  ;; SUBSEQUENT reads, so a single (progn (in-package :p) (defun ...)) is read
+  ;; entirely in the old package and cannot test this at all.
+  (with-open-file (o "CPLPROBE" :direction :output :if-exists :supersede)
+    (write-line "(defpackage :mop-cpl-clob (:use :cl))" o)
+    (write-line "(in-package :mop-cpl-clob)" o)
+    (write-line "(defun class-precedence-list (c) (list :mine c))" o)
+    (write-line "(in-package :cl-user)" o)
+    (write-line "(format t \"CPL-OWN ~a~%\" (eq (symbol-package (find-symbol \"CLASS-PRECEDENCE-LIST\" :mop-cpl-clob)) (find-package :mop-cpl-clob)))" o)
+    (write-line "(format t \"CPL-IMPL-INTACT ~a~%\" (mapcar #'class-name (class-precedence-list (find-class 'probe-b))))" o))
+  (load "CPLPROBE")
+  (delete-file "CPLPROBE")
+
   ;; A program can USE the package, which is the point of having one.
   (defpackage :mop-user (:use :cl :egcl-mop))
   (format t "USABLE ~a~%" (and (find-symbol "CLASS-DIRECT-SUPERCLASSES" :mop-user) t))
@@ -83,10 +98,13 @@ const PROGRAM: &str = r#"
 
 #[test]
 fn egcl_mop_provides_the_introspection_and_an_effective_metaclass() {
+    let probe = std::env::temp_dir().join(format!("egcl-cpl-probe-{}.lisp", std::process::id()));
+    let program = PROGRAM.replace("CPLPROBE", &probe.display().to_string());
     let output = Command::new(BIN)
-        .args(["--no-init", "--eval", PROGRAM])
+        .args(["--no-init", "--eval", &program])
         .output()
         .expect("run egcl");
+    let _ = std::fs::remove_file(&probe);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
@@ -107,15 +125,21 @@ fn egcl_mop_provides_the_introspection_and_an_effective_metaclass() {
         "IMPL-INTACT 2",
         "CL-USER-REACHABLE T",
         "USABLE T",
+        "CPL-OWN T",
+        "CPL-IMPL-INTACT (PROBE-B PROBE-A STANDARD-OBJECT T)",
         "EGCL-MOP-OK",
     ] {
         assert!(stdout.contains(expected), "missing {expected:?} in:\n{stdout}");
     }
 }
 
-/// CLASS-PRECEDENCE-LIST and METHOD-SPECIALIZERS deliberately STAY in
-/// COMMON-LISP, and this pins that so the next person does not "finish" the
-/// move without the piece it needs.
+/// METHOD-SPECIALIZERS deliberately STAYS unowned, and this pins that so the
+/// next person does not "finish" the move without the piece it needs.
+///
+/// CLASS-PRECEDENCE-LIST no longer does: it is owned by EGCL-MOP now, which is
+/// what stops a library's own DEFUN of that name from redefining ours (#370).
+/// The piece that made it safe is dispatching the EGCL-MOP spelling as well, so
+/// the exported symbol is the builtin itself.
 ///
 /// They are name-dispatched Rust builtins: the dispatch matches the bare symbol
 /// name and ignores the package, so moving the symbol out of COMMON-LISP does
@@ -143,7 +167,7 @@ fn the_builtin_mop_names_stay_in_common_lisp_until_dispatch_respects_packages() 
         .expect("run egcl");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}");
-    assert!(stdout.contains("CPL-HOME COMMON-LISP"), "{stdout}");
+    assert!(stdout.contains("CPL-HOME EGCL-MOP"), "{stdout}");
     assert!(stdout.contains("MS-HOME COMMON-LISP"), "{stdout}");
     assert!(stdout.contains("CPL-CALLABLE T"), "{stdout}");
     // Not accessible in EGCL-MOP at all. They are INTERNAL symbols of
@@ -152,5 +176,7 @@ fn the_builtin_mop_names_stay_in_common_lisp_until_dispatch_respects_packages() 
     // from package inheritance. What matters here is that EGCL-MOP does not
     // intern its own: listing them in its :export did, and those functionless
     // symbols shadowed the real builtins in COMMON-LISP-USER.
-    assert!(stdout.contains("NOT-EXPORTED (NIL NIL)"), "{stdout}");
+    // CPL is EXTERNAL in EGCL-MOP now; METHOD-SPECIALIZERS is still not
+    // accessible there at all.
+    assert!(stdout.contains("NOT-EXPORTED (EXTERNAL NIL)"), "{stdout}");
 }

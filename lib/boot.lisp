@@ -4870,15 +4870,21 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; One honest limit: SLOT-DEFINITION-TYPE answers T for every slot, because
 (defpackage :egcl-mop
   (:use :common-lisp)
-  ;; Only names this package OWNS. CLASS-PRECEDENCE-LIST and
-  ;; METHOD-SPECIALIZERS are name-dispatched Rust builtins whose symbols live in
-  ;; COMMON-LISP; listing them here interned fresh, FUNCTIONLESS symbols in
-  ;; EGCL-MOP, which then shadowed the real ones in COMMON-LISP-USER and made
-  ;; (class-precedence-list ...) undefined there -- the shape bliss-8eq9b
-  ;; describes. Moving those two out of COMMON-LISP needs the builtin dispatch
-  ;; to respect packages first (bliss-7l7cn); until then they stay in CL, which
-  ;; is where portable code already finds them.
-  (:export #:class-slots #:class-direct-slots
+  ;; Only names this package OWNS.
+  ;;
+  ;; CLASS-PRECEDENCE-LIST is one: exporting it here gives the builtin's own
+  ;; identity a package that owns it, and the interpreter also dispatches the
+  ;; EGCL-MOP spelling, so the exported symbol IS the builtin rather than a
+  ;; fresh functionless lookalike. Exporting it WITHOUT that dispatch shadowed
+  ;; the real builtin in COMMON-LISP-USER and made (class-precedence-list ...)
+  ;; undefined there -- the shape bliss-8eq9b describes. With both in place, a
+  ;; bare read of the name in an unrelated package interns that package's own
+  ;; symbol, so a library's DEFUN of it no longer redefines ours (#370).
+  ;;
+  ;; METHOD-SPECIALIZERS is still dispatched only by its bare name and has no
+  ;; owner, so it keeps the old behaviour; the same treatment for the remaining
+  ;; extension builtins is bliss-7l7cn.
+  (:export #:class-slots #:class-direct-slots #:class-precedence-list
            #:class-direct-superclasses #:class-direct-subclasses
            #:class-finalized-p #:finalize-inheritance
            #:generic-function-methods

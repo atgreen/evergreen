@@ -44,6 +44,13 @@
 
 ### Fixed
 
+- A library's own `DEFUN` of `CLASS-PRECEDENCE-LIST` no longer redefines the
+  implementation's. `EGCL-MOP` owns and exports the name now, and the
+  interpreter dispatches that spelling, so a bare read of it inside a package
+  that does not inherit `EGCL-MOP` interns that package's own symbol instead of
+  the implementation's. With `CLASS-SLOTS` in the previous release this
+  completes [#370](https://github.com/atgreen/evergreen/issues/370)
+  ([#383](https://github.com/atgreen/evergreen/pull/383)).
 - A library's own `DEFUN` of `CLASS-SLOTS` no longer redefines the
   implementation's. The non-ANSI MOP readers were reachable as a bare name from
   any package, so an internal helper of that name in a package that exports
