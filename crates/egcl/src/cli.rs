@@ -6283,15 +6283,21 @@ fn resolve_slot_symbol(class_name: &str, key: EgclVal, env: &Env) -> Result<Egcl
 }
 
 fn class_name_for_instance_class(class: EgclVal) -> String {
+    // The class's RECORDED name first. For a DEFCLASS or DEFSTRUCT class that
+    // is the same symbol as the class value itself — `define_class` is handed
+    // the name as both arguments — so this answers exactly what the old
+    // `class.is_symbol()` shortcut did, without asking what the class value's
+    // tag happens to be (bliss-rj5o).
+    let name = egcl_stdlib::class_name(class);
+    if name.is_symbol() {
+        return sym_name(name);
+    }
+    // A symbol that names no registered class keeps its old answer rather than
+    // falling to `val_as_str`.
     if class.is_symbol() {
         return sym_name(class);
     }
-    let name = egcl_stdlib::class_name(class);
-    if name.is_symbol() {
-        sym_name(name)
-    } else {
-        val_as_str(class)
-    }
+    val_as_str(class)
 }
 
 fn lookup_slot_def(env: &Env, class_name: &str, slot_name: &str) -> Option<SlotDef> {
@@ -20667,7 +20673,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (af, rest) = cp(cdr);
                 let class_input = eval_form(af, env)?;
                 let class = resolve_class_metaobject(env, class_input)?;
-                let class_name = sym_name(class);
+                // The class's recorded name, not `sym_name` of the class value.
+                // Identical today (a DEFCLASS class is its name symbol) and the
+                // difference between working and silently answering an empty
+                // slot list once it is not (bliss-rj5o).
+                let class_name = class_name_for_instance_class(class);
                 // Optional second argument: non-NIL asks for this class's DIRECT
                 // slots only. AMOP draws a real distinction here — CLASS-SLOTS
                 // yields effective slot definitions, CLASS-DIRECT-SLOTS yields
@@ -35942,8 +35952,14 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         // The standard classes whose metaclass is STANDARD-CLASS (such as
         // STANDARD-GENERIC-FUNCTION) may be subclassed; built-in and
         // structure classes may not.
+        // `!class.is_symbol()` used to stand in for "this is a built-in class",
+        // because a DEFCLASS class IS its name symbol. It is equivalent to the
+        // predicate below for every kind of class — checked case by case: user,
+        // condition, structure, built-in and RESTART — and it is the class
+        // VALUE's tag rather than the class's metadata, so it inverts once a
+        // class metaobject stops being an immediate (bliss-rj5o).
         if egcl_stdlib::find_class(super_form)
-            .is_some_and(|class| !class.is_symbol() && !is_standard_class_metaobject(class))
+            .is_some_and(is_built_in_class_metaobject)
         {
             return Err(EgclError::ProgramError(format!(
                 "DEFCLASS {name}: {} is a system class and cannot be a direct superclass",
