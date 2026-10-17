@@ -352,269 +352,20 @@ fn extract_string_bytes(v: EgclVal) -> Option<Vec<u8>> {
     }
 }
 
-fn is_simple_vector(v: EgclVal) -> bool {
-    if !v.is_heap_object() {
-        return false;
-    }
-    // Safety: heap objects start with an ObjectHeader.
-    let header = unsafe { *(v.as_ptr() as *const ObjectHeader) };
-    header.type_id() == type_id::SIMPLE_VECTOR
-}
-
-fn vector_length(v: EgclVal) -> usize {
-    let ptr = unsafe { v.as_ptr() };
-    unsafe { *(ptr.add(8) as *const u64) as usize }
-}
-
-fn vector_elt(v: EgclVal, idx: usize) -> EgclVal {
-    let ptr = unsafe { v.as_ptr() };
-    unsafe { *(ptr.add(16 + idx * 8) as *const EgclVal) }
-}
-
-/// CL `EQUAL` — structural equality.
-///
-/// Recurses into cons cells and compares strings by content
-/// (case-sensitive).  All other types fall back to bit (EQL) equality.
-/// Value equality for two heap numerics of the SAME type (bignum/ratio/complex/
-/// double-float) — so two distinct objects with equal value compare equal under
-/// EQL/EQUAL/EQUALP. Returns false for non-heap-numeric or mismatched types.
-fn heap_numeric_equal(a: EgclVal, b: EgclVal) -> bool {
-    if !a.is_heap_object() || !b.is_heap_object() {
-        return false;
-    }
-    let (ta, tb) = unsafe {
-        (
-            (*(a.as_ptr() as *const ObjectHeader)).type_id(),
-            (*(b.as_ptr() as *const ObjectHeader)).type_id(),
-        )
-    };
-    if ta != tb {
-        return false;
-    }
-    unsafe {
-        let (pa, pb) = (a.as_ptr(), b.as_ptr());
-        match ta {
-            type_id::BIGNUM => {
-                let (sa, na) = (
-                    *(pa.add(8) as *const i32),
-                    *(pa.add(12) as *const u32) as usize,
-                );
-                let (sb, nb) = (
-                    *(pb.add(8) as *const i32),
-                    *(pb.add(12) as *const u32) as usize,
-                );
-                sa == sb
-                    && na == nb
-                    && (0..na).all(|i| {
-                        *(pa.add(16 + i * 8) as *const u64) == *(pb.add(16 + i * 8) as *const u64)
-                    })
-            }
-            type_id::RATIO | type_id::COMPLEX => {
-                let a0 = *(pa.add(8) as *const EgclVal);
-                let a1 = *(pa.add(16) as *const EgclVal);
-                let b0 = *(pb.add(8) as *const EgclVal);
-                let b1 = *(pb.add(16) as *const EgclVal);
-                (a0.0 == b0.0 || heap_numeric_equal(a0, b0))
-                    && (a1.0 == b1.0 || heap_numeric_equal(a1, b1))
-            }
-            type_id::DOUBLE_FLOAT => *(pa.add(8) as *const f64) == *(pb.add(8) as *const f64),
-            _ => false,
-        }
-    }
-}
-
-fn cl_equal(a: EgclVal, b: EgclVal) -> bool {
-    // Fast path: identical bits ⇒ always equal.
-    if a.0 == b.0 {
-        return true;
-    }
-    // Distinct heap numerics with equal value (EQUAL is EQL on numbers).
-    if heap_numeric_equal(a, b) {
-        return true;
-    }
-
-    // Cons cells: compare car and cdr recursively.
-    if a.tag() == TAG_CONS && b.tag() == TAG_CONS {
-        unsafe {
-            let ca = &*(a.as_ptr() as *const ConsCell);
-            let cb = &*(b.as_ptr() as *const ConsCell);
-            return cl_equal(ca.car, cb.car) && cl_equal(ca.cdr, cb.cdr);
-        }
-    }
-
-    if a.is_heap_object() && b.is_heap_object() {
-        // Pathnames compare by components. Without this the EQUAL hash table's
-        // key comparison fell through to `false`, so even a correct hash would
-        // not have made a pathname-keyed lookup hit (bliss-kssh). The CLI's own
-        // EQUAL already routed here via `pathnames_equal`; the stdlib table did
-        // not, which is how the two came apart.
-        if crate::pathnames::is_pathname(a) || crate::pathnames::is_pathname(b) {
-            return crate::pathnames::pathnames_equal(a, b);
-        }
-        // Strings: byte-level content comparison (case-sensitive).
-        {
-            if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
-                return sa == sb;
-            }
-        }
-        // Bit-vectors compare by bit content (ANSI EQUAL treats bit-vectors and
-        // strings specially — but NOT general arrays, which are EQ).
-        if let (Some(la), Some(lb)) = (
-            egcl_rt::types::bit_vector_len(a),
-            egcl_rt::types::bit_vector_len(b),
-        ) {
-            return la == lb
-                && (0..la).all(|i| {
-                    egcl_rt::types::bit_vector_ref(a, i) == egcl_rt::types::bit_vector_ref(b, i)
-                });
-        }
-    }
-
-    // Everything else — including a SIMPLE general vector, which ANSI EQUAL
-    // treats as EQ (compared by identity, already handled by the bit fast path
-    // at the top) — is bit equality (matches EQL for fixnums, characters,
-    // symbols, single-floats, etc.).
-    false
-}
-
-/// CL `EQUALP` — case-insensitive structural equality.
-///
-/// Like `EQUAL`, but characters and strings are compared case-insensitively
-/// and numbers of different types are compared by numeric value.
-fn raw_double_equalp(raw: f64, other: EgclVal) -> bool {
-    if other.is_double_float() {
-        raw == other.as_double_float()
-    } else if other.is_single_float() {
-        raw == f64::from(other.as_single_float())
-    } else if other.is_fixnum() {
-        // Check the integer too: conversion to f64 alone rounds large fixnums.
-        raw.is_finite() && raw as i64 == other.as_fixnum()
-            && raw == other.as_fixnum() as f64
-    } else {
-        false
-    }
-}
-
-fn cl_equalp(a: EgclVal, b: EgclVal) -> bool {
-    // Fast path: identical bits ⇒ always equal.
-    if a.0 == b.0 {
-        return true;
-    }
-
-    if egcl_rt::types::md_array_p(a) && egcl_rt::types::md_array_p(b) {
-        return cl_equalp(egcl_rt::types::md_array_dims(a).unwrap(), egcl_rt::types::md_array_dims(b).unwrap())
-            && cl_equalp(egcl_rt::types::md_array_storage(a).unwrap(), egcl_rt::types::md_array_storage(b).unwrap());
-    }
-    let packed_a = crate::sequences::is_double_float_array(a);
-    let packed_b = crate::sequences::is_double_float_array(b);
-    if (packed_a || packed_b) && !egcl_rt::types::md_array_p(a) && !egcl_rt::types::md_array_p(b) {
-        let (Ok(na), Ok(nb)) = (crate::sequences::length(a), crate::sequences::length(b)) else {
-            return false;
-        };
-        if na != nb || !(is_simple_vector(a) || crate::sequences::is_complex_vector(a) || packed_a)
-            || !(is_simple_vector(b) || crate::sequences::is_complex_vector(b) || packed_b) {
-            return false;
-        }
-        return (0..na).all(|i| {
-            match (crate::sequences::double_float_array_element(a, i), crate::sequences::double_float_array_element(b, i)) {
-                (Some(x), Some(y)) => x == y,
-                (Some(x), None) => crate::sequences::elt(b, i).is_ok_and(|y| raw_double_equalp(x, y)),
-                (None, Some(y)) => crate::sequences::elt(a, i).is_ok_and(|x| raw_double_equalp(y, x)),
-                _ => false,
-            }
-        });
-    }
-
-    // Characters: case-insensitive comparison.
-    if a.is_character() && b.is_character() {
-        let ca = a.as_char().to_ascii_lowercase();
-        let cb = b.as_char().to_ascii_lowercase();
-        return ca == cb;
-    }
-
-    // Numeric cross-type equality.
-    // Fixnum vs fixnum with same value would have same bits (caught above).
-    // Fixnum vs single-float: compare numerically.
-    if a.is_fixnum() && b.is_single_float() {
-        return (a.as_fixnum() as f64) == (b.as_single_float() as f64);
-    }
-    if a.is_single_float() && b.is_fixnum() {
-        return (a.as_single_float() as f64) == (b.as_fixnum() as f64);
-    }
-    // Two single-floats with different bit patterns but same numeric value
-    // (e.g. +0.0 and -0.0 are == in Rust but have different bits).
-    if a.is_single_float() && b.is_single_float() {
-        return a.as_single_float() == b.as_single_float();
-    }
-    // Distinct heap numerics (bignum/ratio/complex/double) with equal value.
-    if heap_numeric_equal(a, b) {
-        return true;
-    }
-
-    // Cons cells: recurse with equalp semantics.
-    if a.tag() == TAG_CONS && b.tag() == TAG_CONS {
-        unsafe {
-            let ca = &*(a.as_ptr() as *const ConsCell);
-            let cb = &*(b.as_ptr() as *const ConsCell);
-            return cl_equalp(ca.car, cb.car) && cl_equalp(ca.cdr, cb.cdr);
-        }
-    }
-
-    // Strings: case-insensitive byte comparison.
-    if a.is_heap_object() && b.is_heap_object() {
-        // Two pathnames are EQUALP exactly when they are EQUAL — their
-        // components match (ansi merge-pathnames.1 compares pathnames with
-        // EQUALP). Must mirror the pathname case in `equalp_hash` or an EQUALP
-        // table keyed by a pathname hashes to the right bucket and then fails
-        // the key comparison (bliss-kssh).
-        if crate::pathnames::is_pathname(a) || crate::pathnames::is_pathname(b) {
-            return crate::pathnames::pathnames_equal(a, b);
-        }
-        {
-            if let (Some(sa), Some(sb)) = (extract_string_bytes(a), extract_string_bytes(b)) {
-                if sa.len() != sb.len() {
-                    return false;
-                }
-                return sa
-                    .iter()
-                    .zip(sb.iter())
-                    .all(|(&x, &y)| x.eq_ignore_ascii_case(&y));
-            }
-        }
-        if is_simple_vector(a) && is_simple_vector(b) {
-            let len = vector_length(a);
-            if len != vector_length(b) {
-                return false;
-            }
-            for i in 0..len {
-                if !cl_equalp(vector_elt(a, i), vector_elt(b, i)) {
-                    return false;
-                }
-            }
-            return true;
-        }
-    }
-
-    // All other types: bit equality.
-    false
-}
-
 /// Check if two keys are equal according to the given hash test.
 ///
-/// - Eq / Eql: identity (raw bit equality) — correct for fixnums, symbols, etc.
-/// - Equal: structural equality — recurses into conses and compares strings
-///   by content (case-sensitive).
-/// - Equalp: case-insensitive structural equality — case-insensitive strings
-///   and characters, numeric cross-type comparison.
+/// EQL, EQUAL and EQUALP are the shared definitions in [`crate::equality`],
+/// the same ones the evaluator's predicates use, so a table finds exactly the
+/// keys its test function calls equal. The table used to carry its own copy,
+/// which had drifted: an EQUALP table missed `1d0` for a key of `1`.
 fn keys_equal(a: EgclVal, b: EgclVal, test: HashTest) -> bool {
     #[cfg(test)]
     tests::KEY_COMPARISONS.with(|count| count.set(count.get() + 1));
     match test {
         HashTest::Eq => a.0 == b.0,
-        // EQL of two distinct heap numerics is T by value (e.g. two bignums).
-        HashTest::Eql => a.0 == b.0 || heap_numeric_equal(a, b),
-        HashTest::Equal => cl_equal(a, b),
-        HashTest::Equalp => cl_equalp(a, b),
+        HashTest::Eql => crate::equality::eql(a, b),
+        HashTest::Equal => crate::equality::equal(a, b),
+        HashTest::Equalp => crate::equality::equalp(a, b),
     }
 }
 
@@ -709,211 +460,295 @@ fn numeric_or_scalar_hash(object: EgclVal, depth: usize) -> u64 {
     numeric_value_hash(object, depth).unwrap_or_else(|| scalar_leaf_hash(object))
 }
 
-/// Hash the active-element sequence of a bit-vector (simple or fill-pointered)
-/// so an equal simple bit-vector and complex bit-vector hash alike (ANSI SXHASH
-/// similarity, sxhash.4/.6/.22). Each bit is hashed as its fixnum value, matching
-/// the per-element hash a complex (fixnum-backed) bit-vector produces. Returns
-/// `None` if `object` is not a bit-vector.
+/// Hash the active bits of a bit vector, simple or fill-pointered, so the two
+/// hash alike when EQUAL says they are (ANSI SXHASH similarity,
+/// sxhash.4/.6/.22). `None` if `object` is not a bit vector.
 fn bit_vector_content_hash(object: EgclVal) -> Option<u64> {
-    let n = egcl_rt::types::bit_vector_len(object)?;
+    let n = crate::equality::bit_vector_length(object)?;
     let mut h = hash_u64(n as u64);
     for i in 0..n {
-        let bit = egcl_rt::types::bit_vector_ref(object, i).unwrap_or(0);
-        h = combine_hashes(h, hash_u64(bit as u64));
-    }
-    Some(h)
-}
-
-/// Hash the active elements (0..fill-pointer) of a NON-string complex vector by
-/// value. A fill-pointer bit-vector is backed by a general complex vector of
-/// fixnum bits, so hashing its active fixnum elements the same way
-/// `bit_vector_content_hash` hashes each bit keeps the two consistent.
-fn complex_vector_content_hash(object: EgclVal, depth: usize, equalp: bool) -> Option<u64> {
-    if !crate::sequences::is_complex_vector(object) || crate::sequences::cvec_is_string(object) {
-        return None;
-    }
-    let n = crate::sequences::cvec_fill_pointer(object);
-    let mut h = hash_u64(n as u64);
-    for i in 0..n {
-        if let Some(raw) = crate::sequences::double_float_array_element(object, i) {
-            let bits = if raw == 0.0 { if equalp { 0 } else { FLOAT_ZERO_HASH } } else { raw.to_bits() };
-            h = combine_hashes(h, if depth <= 1 { 0 } else { hash_u64(bits) });
-            continue;
-        }
-        let e = crate::sequences::elt(object, i).ok()?;
-        // A fixnum bit hashes as its integer value, matching bit_vector_content_hash.
-        let eh = if equalp {
-            equalp_hash(e, depth.saturating_sub(1))
-        } else if let Some(bits) = e.is_fixnum().then(|| hash_u64(e.as_fixnum() as u64)) {
-            bits
-        } else {
-            equal_hash(e, depth.saturating_sub(1))
-        };
-        h = combine_hashes(h, eh);
-    }
-    Some(h)
-}
-
-fn equal_hash(object: EgclVal, depth: usize) -> u64 {
-    if depth == 0 {
-        return 0;
-    }
-    // Signed float zeros are similar per ANSI: hash +0.0 and -0.0 alike.
-    if object.is_single_float() && object.as_single_float() == 0.0 {
-        return hash_u64(FLOAT_ZERO_HASH);
-    }
-    if let Some(h) = numeric_value_hash(object, depth) {
-        return h;
-    }
-    if object.tag() == TAG_CONS {
-        unsafe {
-            let cell = &*(object.as_ptr() as *const ConsCell);
-            return combine_hashes(
-                equal_hash(cell.car, depth - 1),
-                equal_hash(cell.cdr, depth - 1),
-            );
-        }
-    }
-    // A symbol hashes by its NAME so two symbols with the same name (in any
-    // package, interned or uninterned) hash alike (ANSI; sxhash.13/.15/.23).
-    // Only real TAG_SYMBOL values carry a symbol index — NIL/T are represented
-    // specially and hash by their (stable) bits.
-    if object.tag() == TAG_SYMBOL {
-        if let Some(name) = egcl_rt::symbols::symbol_name(object.as_symbol_index()) {
-            return hash_bytes(name.as_bytes(), false);
-        }
-    }
-    if object.is_heap_object() {
-        // A pathname hashes by the SAME namestring `pathnames_equal` compares,
-        // or EQUAL and SXHASH disagree and every EQUAL hash table keyed by a
-        // pathname misses (bliss-kssh). Checked before the string branch so a
-        // pathname hashes identically whether it reaches here as a PATHNAME heap
-        // object or as a registry-backed namestring sentinel.
-        if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
-            hash_bytes(key.as_bytes(), false)
-        }) {
-            return h;
-        }
-        // Any string (simple or complex/fill-pointer/displaced) — and a
-        // registry-backed string sentinel such as a pathname namestring, which
-        // `extract_string_bytes` resolves without dereferencing (sxhash.20) —
-        // hashes by its characters.
-        if let Some(bytes) =
-            extract_string_bytes(object).or_else(|| crate::sequences::string_content_bytes(object))
-        {
-            return hash_bytes(&bytes, false);
-        }
-        if let Some(h) = bit_vector_content_hash(object) {
-            return h;
-        }
-        if let Some(h) = complex_vector_content_hash(object, depth, false) {
-            return h;
-        }
-        // A SIMPLE general vector (and every other array) is EQUAL only to itself
-        // (ANSI treats non-string/non-bit arrays as EQ), so it hashes by identity
-        // — and stays stable when its contents change (sxhash.7).
-    }
-    hash_u64(object.0)
-}
-
-fn equalp_hash(object: EgclVal, depth: usize) -> u64 {
-    if depth == 0 {
-        return 0;
-    }
-    if object.is_double_float() {
-        let raw = object.as_double_float();
-        return hash_u64(if raw == 0.0 { 0 } else { raw.to_bits() });
-    }
-    if let Some(storage) = egcl_rt::types::md_array_storage(object) {
-        return combine_hashes(
-            equalp_hash(egcl_rt::types::md_array_dims(object).unwrap(), depth - 1),
-            equalp_hash(storage, depth - 1),
+        h = combine_hashes(
+            h,
+            hash_u64(u64::from(crate::equality::bit_vector_bit(object, i))),
         );
     }
-    if crate::sequences::is_double_float_array(object) {
-        let n = crate::sequences::length(object).expect("packed vector length");
-        let mut h = hash_u64(n as u64);
-        for i in 0..n {
-            let raw = crate::sequences::double_float_array_element(object, i).unwrap();
-            let element_hash = if depth == 1 { 0 } else { hash_u64(if raw == 0.0 { 0 } else { raw.to_bits() }) };
-            h = combine_hashes(h, element_hash);
+    Some(h)
+}
+
+/// EQUALP hash of a float's value; both signed zeros hash like integer 0.
+fn equalp_float_hash(f: f64) -> u64 {
+    hash_u64(if f == 0.0 { 0 } else { f.to_bits() })
+}
+
+/// EQUALP hash of a real, by value: EQUALP compares numbers with `=`, so `1`,
+/// `1.0`, `1d0`, `2/2` -- and `1/2` with `0.5` -- must hash alike. A real that
+/// some double denotes exactly hashes as that double; any other (a fixnum or
+/// bignum past 2^53, a ratio like 1/3) can only be `=` to rationals, so it
+/// hashes as its exact rational.
+fn equalp_real_hash(v: EgclVal) -> u64 {
+    if v.is_fixnum() {
+        let n = v.as_fixnum();
+        let f = n as f64;
+        if f as i128 == i128::from(n) {
+            return equalp_float_hash(f);
         }
-        return h;
     }
-    if let Some(h) = complex_vector_content_hash(object, depth, true) {
-        return h;
+    if let Some(f) = crate::equality::float_value(v) {
+        return equalp_float_hash(f);
     }
-    if object.is_character() {
-        return hash_u64(object.as_char().to_ascii_lowercase() as u64);
+    let Some(r) = egcl_rt::bignum::as_bigrat(v) else {
+        return hash_u64(v.0);
+    };
+    let f = r.to_f64();
+    if f.is_finite()
+        && egcl_rt::bignum::bigrat_cmp(&crate::numbers::float_exact_rational(f), &r)
+            == std::cmp::Ordering::Equal
+    {
+        return equalp_float_hash(f);
     }
-    if object.is_fixnum() {
-        return hash_u64((object.as_fixnum() as f64).to_bits());
+    let integer_hash = |n: &egcl_rt::bignum::BigInt| {
+        n.mag.iter().fold(hash_u64(n.sign as u64), |h, &limb| {
+            combine_hashes(h, hash_u64(limb))
+        })
+    };
+    combine_hashes(integer_hash(&r.num), integer_hash(&r.den))
+}
+
+/// EQUALP hash of any number. A complex with a zero imaginary part is `=` to
+/// its real part, so it hashes as that real.
+fn equalp_number_hash(v: EgclVal) -> Option<u64> {
+    if !crate::equality::numberp(v) {
+        return None;
     }
-    if object.is_single_float() {
-        let value = object.as_single_float() as f64;
-        // EQUALP equates both signed zeros with integer zero.
-        return hash_u64(if value == 0.0 { 0 } else { value.to_bits() });
+    let (re, im) = crate::equality::number_parts(v);
+    let h = equalp_real_hash(re);
+    Some(
+        if crate::equality::number_equal(im, EgclVal::from_fixnum(0)) {
+            h
+        } else {
+            combine_hashes(h, equalp_real_hash(im))
+        },
+    )
+}
+
+/// EQUALP hash of a character, case-folded the way EQUALP compares.
+fn equalp_char_hash(c: char) -> u64 {
+    hash_u64(c.to_ascii_lowercase() as u64)
+}
+
+/// Seed for [`KeyHasher::identity`]'s per-type SXHASH value.
+const STABLE_IDENTITY_HASH: u64 = 0x51a6_1e1d_e47e_4a5b;
+
+/// Computes a key's hash under a table test, and records whether that hash
+/// depended on the ADDRESS of an object the GC can move (bliss-jtc.22 /
+/// bliss-cpje). Deriving that flag from the very hash that consulted the
+/// address keeps the two in step; it used to be a separate predicate that had
+/// to mirror every fall-through by hand.
+struct KeyHasher {
+    /// SXHASH: hash an identity-compared object by its type, never its
+    /// address. SXHASH must not change while the object is unmodified, and a
+    /// moving GC changes addresses.
+    stable: bool,
+    address_sensitive: bool,
+}
+
+impl KeyHasher {
+    fn new(stable: bool) -> Self {
+        KeyHasher {
+            stable,
+            address_sensitive: false,
+        }
     }
-    if let Some(h) = numeric_value_hash(object, depth) {
-        return h;
+
+    /// Hash an object that is equal only to itself.
+    fn identity(&mut self, object: EgclVal) -> u64 {
+        if is_movable_pointer(object) {
+            if self.stable {
+                let kind = egcl_rt::gc::heap_object_type_id(object).map_or(object.tag(), u64::from);
+                return hash_u64(STABLE_IDENTITY_HASH ^ kind);
+            }
+            self.address_sensitive = true;
+        }
+        hash_u64(object.0)
     }
-    if object.tag() == TAG_CONS {
-        unsafe {
-            let cell = &*(object.as_ptr() as *const ConsCell);
+
+    fn eql(&mut self, object: EgclVal) -> u64 {
+        // EQL of two distinct heap numerics is T by value, so they hash by value.
+        numeric_value_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT)
+            .unwrap_or_else(|| self.identity(object))
+    }
+
+    fn equal(&mut self, object: EgclVal, depth: usize) -> u64 {
+        if depth == 0 {
+            return 0;
+        }
+        // Signed float zeros are similar per ANSI: hash +0.0 and -0.0 alike.
+        if object.is_single_float() && object.as_single_float() == 0.0 {
+            return hash_u64(FLOAT_ZERO_HASH);
+        }
+        if let Some(h) = numeric_value_hash(object, depth) {
+            return h;
+        }
+        if object.tag() == TAG_CONS {
+            // Safety: a TAG_CONS value points at a ConsCell.
+            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
             return combine_hashes(
-                equalp_hash(cell.car, depth - 1),
-                equalp_hash(cell.cdr, depth - 1),
+                self.equal(cell.car, depth - 1),
+                self.equal(cell.cdr, depth - 1),
             );
         }
-    }
-    if object.is_heap_object() {
-        // Pathnames are EQUALP exactly when they are EQUAL (components match),
-        // so they must hash alike here too. Case-folded like every other EQUALP
-        // string hash.
-        if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
-            hash_bytes(key.as_bytes(), true)
-        }) {
-            return h;
-        }
-        {
-            if let Some(bytes) = extract_string_bytes(object) {
-                return hash_bytes(&bytes, true);
+        // A symbol hashes by its NAME so two symbols with the same name (in any
+        // package, interned or uninterned) hash alike (ANSI; sxhash.13/.15/.23).
+        // Only real TAG_SYMBOL values carry a symbol index — NIL/T are represented
+        // specially and hash by their (stable) bits.
+        if object.tag() == TAG_SYMBOL {
+            if let Some(name) = egcl_rt::symbols::symbol_name(object.as_symbol_index()) {
+                return hash_bytes(name.as_bytes(), false);
             }
         }
-        if is_simple_vector(object) {
-            let mut h = hash_u64(vector_length(object) as u64);
-            for i in 0..vector_length(object) {
-                h = combine_hashes(h, equalp_hash(vector_elt(object, i), depth - 1));
+        if object.is_heap_object() {
+            // A pathname hashes by the SAME namestring `pathnames_equal` compares,
+            // or EQUAL and SXHASH disagree and every EQUAL hash table keyed by a
+            // pathname misses (bliss-kssh). Checked before the string branch so a
+            // pathname hashes identically whether it reaches here as a PATHNAME heap
+            // object or as a registry-backed namestring sentinel.
+            if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
+                hash_bytes(key.as_bytes(), false)
+            }) {
+                return h;
             }
+            // Any string (simple or complex/fill-pointer/displaced) — and a
+            // registry-backed string sentinel such as a pathname namestring, which
+            // `extract_string_bytes` resolves without dereferencing (sxhash.20) —
+            // hashes by its characters.
+            if let Some(bytes) = extract_string_bytes(object)
+                .or_else(|| crate::sequences::string_content_bytes(object))
+            {
+                return hash_bytes(&bytes, false);
+            }
+            if let Some(h) = bit_vector_content_hash(object) {
+                return h;
+            }
+        }
+        // Every other array -- simple or not -- is EQUAL only to itself, so it
+        // hashes by identity. Hashing a fill-pointer vector's ELEMENTS made the
+        // key unfindable once one was changed (and changed its SXHASH, which
+        // must not change while EQUAL could not see a difference).
+        self.identity(object)
+    }
+
+    fn equalp(&mut self, object: EgclVal, depth: usize) -> u64 {
+        if depth == 0 {
+            return 0;
+        }
+        if let Some(h) = equalp_number_hash(object) {
             return h;
         }
+        if object.is_character() {
+            return equalp_char_hash(object.as_char());
+        }
+        if object.tag() == TAG_CONS {
+            // Safety: a TAG_CONS value points at a ConsCell.
+            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
+            return combine_hashes(
+                self.equalp(cell.car, depth - 1),
+                self.equalp(cell.cdr, depth - 1),
+            );
+        }
+        if object.is_heap_object() {
+            // Pathnames are EQUALP exactly when they are EQUAL (components match),
+            // so they must hash alike here too. Case-folded like every other EQUALP
+            // string hash.
+            if let Some(h) = crate::pathnames::with_pathname_equal_key(object, |key| {
+                hash_bytes(key.as_bytes(), true)
+            }) {
+                return h;
+            }
+            // A string is EQUALP to a general vector holding the same characters,
+            // so both hash as a length followed by per-element hashes.
+            if let Some(text) = crate::equality::string_text(object) {
+                let mut h = hash_u64(text.chars().count() as u64);
+                for c in text.chars() {
+                    h = combine_hashes(h, if depth == 1 { 0 } else { equalp_char_hash(c) });
+                }
+                return h;
+            }
+            if crate::equality::vectorp(object) {
+                let n = crate::sequences::length(object).unwrap_or(0);
+                let mut h = hash_u64(n as u64);
+                for i in 0..n {
+                    let element = if depth == 1 {
+                        0
+                    } else if let Some(raw) =
+                        crate::sequences::double_float_array_element(object, i)
+                    {
+                        // Read unboxed: boxing a double would allocate.
+                        equalp_float_hash(raw)
+                    } else {
+                        crate::sequences::elt(object, i).map_or(0, |e| self.equalp(e, depth - 1))
+                    };
+                    h = combine_hashes(h, element);
+                }
+                return h;
+            }
+            if let (Some(dims), Some(storage)) = (
+                egcl_rt::types::md_array_dims(object),
+                egcl_rt::types::md_array_storage(object),
+            ) {
+                return combine_hashes(
+                    self.equalp(dims, depth - 1),
+                    self.equalp(storage, depth - 1),
+                );
+            }
+            // A structure is EQUALP to another of its type with EQUALP slots.
+            if let Some(class) = crate::equality::structure_class(object) {
+                let mut h = hash_u64(crate::clos::class_name(class).0);
+                for slot in crate::clos::effective_slots(class) {
+                    let slot_hash = crate::clos::slot_value(object, slot)
+                        .map_or(0, |value| self.equalp(value, depth - 1));
+                    h = combine_hashes(h, slot_hash);
+                }
+                return h;
+            }
+            // Hash tables are EQUALP by test, count and values; the first two
+            // are enough to agree with that.
+            if hash_table_p(object) {
+                let test = hash_table_test(object).map_or(0, test_to_u8);
+                let count = hash_table_count(object).unwrap_or(0);
+                return combine_hashes(hash_u64(u64::from(test)), hash_u64(count as u64));
+            }
+        }
+        self.identity(object)
     }
-    hash_u64(object.0)
+}
+
+/// A key's hash under `test`, and whether it depends on a movable address.
+fn hash_key(object: EgclVal, test: HashTest) -> (u64, bool) {
+    let mut hasher = KeyHasher::new(false);
+    let hash = match test {
+        HashTest::Eq => hasher.identity(object),
+        HashTest::Eql => hasher.eql(object),
+        HashTest::Equal => hasher.equal(object, STRUCTURAL_HASH_DEPTH_LIMIT),
+        HashTest::Equalp => hasher.equalp(object, STRUCTURAL_HASH_DEPTH_LIMIT),
+    };
+    (hash, hasher.address_sensitive)
 }
 
 fn hash_for_test(object: EgclVal, test: HashTest) -> u64 {
-    match test {
-        // EQL of two distinct heap numerics (bignum/ratio/complex) is T by value,
-        // so they must hash by value, not address (EQ stays identity-based).
-        HashTest::Eq => hash_u64(object.0),
-        HashTest::Eql => numeric_value_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT)
-            .unwrap_or_else(|| hash_u64(object.0)),
-        HashTest::Equal => equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
-        HashTest::Equalp => equalp_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT),
-    }
+    hash_key(object, test).0
 }
 
 // ── Moving-GC hash stability (bliss-jtc.22 / bliss-cpje) ──────────────
 //
-// `hash_for_test` falls through to `hash_u64(object.0)` — the raw EgclVal bits,
-// i.e. the object's ADDRESS — for any heap object it can't hash structurally
-// (a CLOS instance, a function, a cons under EQ, …). The moving GC relocates
-// such objects and rewrites the pointer stored in the table's entry, but never
-// recomputes the entry's bucket, so a later probe (which hashes the NEW address)
-// looks in the wrong bucket and misses a live key. We detect keys that hash by a
-// *movable* address and rehash the whole table in place the first time it is
-// touched in a new GC generation. Symbols and their name strings are pinned and
-// immortal, so symbol/string keys are stable and never trigger a rehash.
+// A key hashed by identity hashes by its ADDRESS when it is a movable heap
+// object (a CLOS instance, a function, a cons under EQ, …). The moving GC
+// relocates such objects and rewrites the pointer stored in the table's entry,
+// but never recomputes the entry's bucket, so a later probe (which hashes the
+// NEW address) looks in the wrong bucket and misses a live key. `hash_key`
+// reports which keys those are, and a table holding one is rehashed in place
+// the first time it is touched in a new GC generation. Symbols and their name
+// strings are pinned and immortal, so symbol/string keys are stable and never
+// trigger a rehash.
 
 /// True if `object` is a heap pointer the GC may relocate: a cons (never
 /// pinned), or a `TAG_HEAP_OBJECT` whose header is not pinned. Immediates
@@ -927,65 +762,6 @@ fn is_movable_pointer(object: EgclVal) -> bool {
         return unsafe { !(*(object.as_ptr() as *const ObjectHeader)).is_pinned() };
     }
     false
-}
-
-/// Whether hashing `object` under `test` would depend on a movable object's
-/// address (mirrors the address fall-throughs in `equal_hash`/`equalp_hash`/
-/// `hash_for_test`). If so, a table holding this key must be rehashed after the
-/// GC relocates it.
-fn key_address_sensitive(object: EgclVal, test: HashTest) -> bool {
-    fn structural(object: EgclVal, depth: usize, equalp: bool) -> bool {
-        if depth == 0 {
-            return false; // hash returns a constant here too — stable
-        }
-        if equalp && crate::sequences::is_double_float_array(object) {
-            return false;
-        }
-        // Value-hashed leaves never depend on an address.
-        if numeric_value_hash(object, depth).is_some() {
-            return false;
-        }
-        if equalp && (object.is_character() || object.is_fixnum() || object.is_single_float()) {
-            return false;
-        }
-        if object.tag() == TAG_CONS {
-            // Safety: TAG_CONS points at a ConsCell.
-            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
-            return structural(cell.car, depth - 1, equalp)
-                || structural(cell.cdr, depth - 1, equalp);
-        }
-        if object.is_heap_object() {
-            if extract_string_bytes(object).is_some() {
-                return false; // content-hashed
-            }
-            if is_simple_vector(object) {
-                // EQUALP hashes a simple vector element-wise, so its
-                // address-sensitivity follows its elements'. EQUAL hashes it by
-                // identity (ANSI treats non-string/non-bit arrays as EQ), so it is
-                // address-sensitive iff it is a movable pointer.
-                if equalp {
-                    for i in 0..vector_length(object) {
-                        if structural(vector_elt(object, i), depth - 1, equalp) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-                return is_movable_pointer(object);
-            }
-        }
-        // Fall-through: hashed by address iff it is a movable pointer.
-        is_movable_pointer(object)
-    }
-    match test {
-        HashTest::Eq => is_movable_pointer(object),
-        HashTest::Eql => {
-            numeric_value_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT).is_none()
-                && is_movable_pointer(object)
-        }
-        HashTest::Equal => structural(object, STRUCTURAL_HASH_DEPTH_LIMIT, false),
-        HashTest::Equalp => structural(object, STRUCTURAL_HASH_DEPTH_LIMIT, true),
-    }
 }
 
 /// Rebuild the table's bucket placement at the current capacity from the live
@@ -1431,12 +1207,12 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
     maybe_rehash_for_gc(inner);
     // A key hashed by a movable object's address makes this table need
     // rehashing after every GC that relocates it (bliss-jtc.22 / bliss-cpje).
-    if !inner.address_sensitive && key_address_sensitive(key, inner.test) {
+    let test = inner.test;
+    let (key_hash, address_sensitive) = hash_key(key, test);
+    if address_sensitive && !inner.address_sensitive {
         inner.address_sensitive = true;
         inner.gc_gen = egcl_rt::gc::gc_move_epoch();
     }
-    let test = inner.test;
-    let key_hash = hash_for_test(key, test);
 
     // Check if key already exists and update in place
     {
@@ -1672,7 +1448,8 @@ pub fn hash_table_rehash_threshold(table: EgclVal) -> Result<f64, EgclError> {
 /// Returns a non-negative fixnum.
 pub fn sxhash(object: EgclVal) -> EgclVal {
     EgclVal::from_fixnum(
-        (equal_hash(object, STRUCTURAL_HASH_DEPTH_LIMIT) & MOST_POSITIVE_FIXNUM_MASK) as i64,
+        (KeyHasher::new(true).equal(object, STRUCTURAL_HASH_DEPTH_LIMIT)
+            & MOST_POSITIVE_FIXNUM_MASK) as i64,
     )
 }
 
@@ -1684,6 +1461,87 @@ mod tests {
 
     thread_local! {
         pub(super) static KEY_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
+        let body = egcl_rt::alloc_typed(16, type_id::CONS).expect("alloc cons");
+        // Safety: a fresh 16-byte cons body [car | cdr].
+        unsafe {
+            *(body as *mut EgclVal) = car;
+            *(body as *mut EgclVal).add(1) = cdr;
+            EgclVal::from_cons_ptr(body)
+        }
+    }
+
+    /// Two numbers EQUALP calls equal must land in the same bucket of an
+    /// EQUALP table, whatever their types.
+    #[test]
+    fn equalp_numbers_hash_alike_when_equalp() {
+        use egcl_rt::bignum::{BigInt, BigRat};
+        let numbers = [
+            EgclVal::from_fixnum(1),
+            EgclVal::from_single_float(1.0),
+            egcl_rt::gc::alloc_double_float(1.0),
+            EgclVal::from_fixnum(0),
+            EgclVal::from_single_float(-0.0),
+            egcl_rt::gc::alloc_double_float(-0.0),
+            BigRat::new(BigInt::from_i64(1), BigInt::from_i64(2)).to_val(),
+            EgclVal::from_single_float(0.5),
+            egcl_rt::gc::alloc_double_float(0.5),
+            BigRat::new(BigInt::from_i64(1), BigInt::from_i64(3)).to_val(),
+            BigInt::from_mag(1, vec![0, 1]).to_val(),
+            egcl_rt::gc::alloc_double_float(18446744073709551616.0),
+            EgclVal::from_fixnum((1 << 53) + 1),
+            egcl_rt::gc::alloc_double_float(9007199254740992.0),
+        ];
+        let mut equal_pairs = 0;
+        for &a in &numbers {
+            for &b in &numbers {
+                if crate::equality::equalp(a, b) {
+                    equal_pairs += 1;
+                    assert_eq!(
+                        hash_for_test(a, HashTest::Equalp),
+                        hash_for_test(b, HashTest::Equalp),
+                        "{a:?} and {b:?} are EQUALP but hash differently"
+                    );
+                }
+            }
+        }
+        // 3 ones, 3 zeros, 3 halves (each pair both ways), 2^64 twice; the
+        // rest only equal themselves.
+        assert_eq!(equal_pairs, 9 + 9 + 9 + 4 + 1 + 1 + 1);
+    }
+
+    /// The address flag comes from the hash that consulted the address: a
+    /// cons is hashed by address under EQ, but by contents under EQUAL and
+    /// EQUALP, and an immediate never by a movable address.
+    #[test]
+    fn address_sensitivity_follows_the_hash() {
+        let pair = cons(EgclVal::from_fixnum(1), EgclVal::from_fixnum(2));
+        assert!(hash_key(pair, HashTest::Eq).1);
+        assert!(hash_key(pair, HashTest::Eql).1);
+        assert!(!hash_key(pair, HashTest::Equal).1);
+        assert!(!hash_key(pair, HashTest::Equalp).1);
+        assert!(!hash_key(EgclVal::from_fixnum(7), HashTest::Eq).1);
+        // A cons nested in a cons is still content-hashed.
+        let nested = cons(pair, NIL);
+        assert!(!hash_key(nested, HashTest::Equalp).1);
+    }
+
+    /// SXHASH may not depend on an address the GC can change: an object
+    /// compared by identity hashes by its type, so two distinct conses with no
+    /// structure left to hash (past the depth limit) agree.
+    #[test]
+    fn stable_identity_hash_ignores_the_address() {
+        let a = cons(EgclVal::from_fixnum(1), NIL);
+        let b = cons(EgclVal::from_fixnum(2), NIL);
+        assert_eq!(
+            KeyHasher::new(true).identity(a),
+            KeyHasher::new(true).identity(b)
+        );
+        let mut table_hasher = KeyHasher::new(false);
+        table_hasher.identity(a);
+        assert!(table_hasher.address_sensitive);
     }
 
     #[test]

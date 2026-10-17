@@ -103,7 +103,7 @@ fn is_vector(v: EgclVal) -> bool {
 /// The character content of a string value — a real heap string OR a
 /// registry-backed sentinel (whose bits are a hash, never dereferenced) — or
 /// None for a non-string. Pathnames are excluded (they are not sequences).
-fn string_content(v: EgclVal) -> Option<String> {
+pub(crate) fn string_content(v: EgclVal) -> Option<String> {
     if crate::pathnames::is_pathname(v) {
         return None;
     }
