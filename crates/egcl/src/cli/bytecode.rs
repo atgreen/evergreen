@@ -971,7 +971,10 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
 /// serializable. Pool encoding is Rust-only (no EGCL allocation) — GC-safe
 /// post-STW-GC.
 pub(super) fn serialize_registry_unit() -> Vec<u8> {
-    let mut pool = BbuConstPool::default();
+    let mut pool = BbuConstPool {
+        saved_heap_refs: true,
+        ..BbuConstPool::default()
+    };
     egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string("<core-registry>");
     let mut functions: Vec<BbuFunction> = Vec::new();
@@ -1084,10 +1087,15 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
             }
         }
     }
-    if (sk_pool + sk_tree) > 0 && dbg {
+    // A function left out here is a restored stub that answers NIL, so say so
+    // whenever it happens, not only under the debug variable.
+    if (sk_pool + sk_tree) > 0 {
         eprintln!(
-            ";; core save: bytecode-registry skips — unpoolable-name {sk_pool}, unserializable-tree {sk_tree}, kept {}",
-            load_actions.len()
+            ";; warning: core save left out {} compiled function(s) it could not serialize \
+             (unpoolable name {sk_pool}, unserializable body {sk_tree}); they will not work \
+             in the restored image{}",
+            sk_pool + sk_tree,
+            if dbg { "" } else { " — set EGCL_HOSTREG_DBG=1 to list them" }
         );
     }
     if load_actions.is_empty() {
@@ -9159,7 +9167,10 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0201: function metadata gains a tag-3 literal fixnum range, followed by
 // its two i64 endpoints. Older readers must reject the changed record layout.
 // 0x0202: primary-preserving primitive result assertions (opcode 0x45).
-const BBU_BYTECODE_VERSION: u16 = 0x0202;
+// 0x0203: package-object constants (tag 20), resolved by name on load; saved
+// heap-reference constants (tag 21), valid only in a core image's registry
+// unit; hash-table constants (tag 22): test plus key/value refs.
+const BBU_BYTECODE_VERSION: u16 = 0x0203;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -9214,11 +9225,20 @@ struct BbuConstPool {
     // Keep movable keys in a rooted vector, never in a persistent pointer map.
     graph_values: Vec<EgclVal>,
     graph_refs: Vec<u32>,
+    /// A core image's registry unit: a heap constant the pool cannot encode is
+    /// written as a saved heap reference (tag 21) instead of failing. The heap
+    /// snapshot carries the object itself, and the restore remaps the
+    /// reference, so the function keeps its exact constant.
+    saved_heap_refs: bool,
+    /// Hash tables whose entries are being encoded, so one that contains itself
+    /// is refused instead of recursing forever.
+    open_tables: Vec<EgclVal>,
 }
 
 impl egcl_rt::gc::TraceHostRoots for BbuConstPool {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.graph_values, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.open_tables, visit);
     }
 }
 
@@ -9513,6 +9533,52 @@ impl BbuConstPool {
         references[0]
     }
 
+    /// Tag 22: a hash table's test, then its key/value pairs as constant refs.
+    /// Each entry is encoded before the table, so its refs point backwards.
+    fn hash_table(&mut self, mut table: EgclVal) -> Option<u32> {
+        egcl_rt::rooted_ref!(_table_root = &mut table);
+        if egcl_stdlib::hash_table_weakness(table).ok()?.is_some()
+            || self.open_tables.contains(&table)
+        {
+            return None;
+        }
+        let test = match egcl_stdlib::hash_table_test(table).ok()? {
+            egcl_stdlib::HashTest::Eq => 0u8,
+            egcl_stdlib::HashTest::Eql => 1,
+            egcl_stdlib::HashTest::Equal => 2,
+            egcl_stdlib::HashTest::Equalp => 3,
+        };
+        // Encoding an entry can allocate, so keep the entries rooted as a flat
+        // key, value, key, value… vector.
+        egcl_rt::rooted!(
+            entries = egcl_stdlib::hash_table_entries(table)
+                .ok()?
+                .into_iter()
+                .flat_map(|(key, value)| [key, value])
+                .collect::<Vec<EgclVal>>()
+        );
+        self.open_tables.push(table);
+        let mut refs = Vec::with_capacity(entries.len());
+        for index in 0..entries.len() {
+            match self.value(entries[index]) {
+                Some(reference) => refs.push(reference),
+                None => {
+                    self.open_tables.pop();
+                    return None;
+                }
+            }
+        }
+        self.open_tables.pop();
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 22);
+        put_u8(&mut bytes, test);
+        put_u32(&mut bytes, u32::try_from(refs.len() / 2).ok()?);
+        for reference in refs {
+            put_u32(&mut bytes, reference);
+        }
+        Some(self.intern_encoded(bytes))
+    }
+
     fn value_leaf(&mut self, mut v: EgclVal) -> Option<u32> {
         egcl_rt::rooted_ref!(_v_root = &mut v);
         if v.is_nil() {
@@ -9616,6 +9682,35 @@ impl BbuConstPool {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 18);
             put_u32(&mut bytes, name_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        // A package object, as `(load-time-value (find-package …))` or `#.` yields:
+        // by name, resolved again on load (CLHS 3.2.4.2.2 makes packages similar
+        // by name).
+        if let Some(name) = egcl_stdlib::package_name(v) {
+            let name_ref = self.string(&name);
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 20);
+            put_u32(&mut bytes, name_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        // A hash table, such as a `#.(make-hash-table)` literal or a load-time
+        // cache: its test and its entries, which is what similarity requires of
+        // a hash table (CLHS 3.2.4.2.2). A weak table, or one containing itself,
+        // is left to the caller's fallback. A core image keeps the table itself
+        // (below): it may be shared mutable state, which a copy would split.
+        if egcl_stdlib::hash_table_p(v) && !self.saved_heap_refs {
+            return self.hash_table(v);
+        }
+        // Only for a core image, whose heap snapshot holds the object: a package
+        // from `(load-time-value (find-package …))`, a hash table, an instance.
+        // Without this the function was left out of the image, and its restored
+        // stub silently ran a NIL body — ironclad's MASSAGE-SYMBOL answered NIL
+        // for every digest name in a saved executable.
+        if self.saved_heap_refs && v.is_heap_object() {
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 21);
+            put_u64(&mut bytes, v.0);
             return Some(self.intern_encoded(bytes));
         }
         None
@@ -11469,6 +11564,20 @@ enum BbuConstant {
     Pathname {
         name_ref: u32,
     },
+    /// A package object, by name: load resolves it with the package registry,
+    /// so the constant is the same object FIND-PACKAGE returns there.
+    PackageObject {
+        name_ref: u32,
+    },
+    /// A core image's heap object, by its saved tagged value; accepted only
+    /// while restoring that image, which remaps it to the object's new address.
+    SavedHeapRef(u64),
+    /// A hash table: its test (0 EQ, 1 EQL, 2 EQUAL, 3 EQUALP) and its entries
+    /// as alternating key and value refs, all to earlier constants.
+    HashTable {
+        test: u8,
+        entry_refs: Vec<u32>,
+    },
     /// A general multidimensional array: dimensions plus row-major element refs.
     MdArray {
         dimensions: Vec<u64>,
@@ -11673,6 +11782,24 @@ fn parse_bbu_constant(
         18 => BbuConstant::Pathname {
             name_ref: cursor.u32()?,
         },
+        20 if bytecode_version >= 0x0203 => BbuConstant::PackageObject {
+            name_ref: cursor.u32()?,
+        },
+        21 if bytecode_version >= 0x0203 => BbuConstant::SavedHeapRef(cursor.u64()?),
+        22 if bytecode_version >= 0x0203 => {
+            let test = cursor.u8()?;
+            if test > 3 {
+                return Err(bbu_error("invalid hash table test"));
+            }
+            let count = cursor.u32()? as usize;
+            // Bounds-check against the file before allocating the ref buffer.
+            let bytes = cursor.take(count.checked_mul(8).ok_or_else(|| bbu_error("hash table too large"))?)?;
+            let entry_refs = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            BbuConstant::HashTable { test, entry_refs }
+        }
         19 if bytecode_version >= 0x010d => {
             let rank = cursor.u32()? as usize;
             if rank > 1024 {
@@ -11876,7 +12003,29 @@ fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, 
     let mut values = allocate_bbu_constants(constants)?;
     egcl_rt::rooted_ref!(_values_root = &mut values);
     fill_bbu_constant_edges(constants, &values)?;
+    fill_bbu_hash_tables(constants, &values)?;
     Ok(values)
+}
+
+// Last, once every cons and vector is complete: EQUAL and EQUALP tables hash a
+// key's contents. Entries refer only to earlier constants (the encoder writes
+// them first), so a table used as another table's key is already filled. An
+// insertion can allocate; `values` is rooted by the caller and each entry is
+// read from it afresh.
+fn fill_bbu_hash_tables(constants: &[BbuConstant], values: &[EgclVal]) -> Result<(), EgclError> {
+    for (index, constant) in constants.iter().enumerate() {
+        let BbuConstant::HashTable { entry_refs, .. } = constant else {
+            continue;
+        };
+        for pair in entry_refs.chunks_exact(2) {
+            let (key, value) = (pair[0] as usize, pair[1] as usize);
+            if key >= index || value >= index {
+                return Err(bbu_error("hash table entry refers forward"));
+            }
+            egcl_stdlib::set_gethash(values[key], values[index], values[value])?;
+        }
+    }
+    Ok(())
 }
 
 // Allocate every aggregate before installing its edges. A constant graph can
@@ -12015,6 +12164,28 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                 let mut ns = arena_str(bbu_string(constants, *name_ref)?);
                 egcl_rt::rooted_ref!(_ns_root = &mut ns);
                 egcl_stdlib::pathnames::parse_namestring(ns, None, None)?.0
+            }
+            BbuConstant::SavedHeapRef(raw) => {
+                EgclVal::from_raw(egcl_rt::gc::remap_saved_pointer(*raw))
+            }
+            // A package not defined yet is created empty, as a symbol constant's
+            // home package is, so its later DEFPACKAGE reconciles into this
+            // same object.
+            BbuConstant::PackageObject { name_ref } => {
+                super::package_object(bbu_string(constants, *name_ref)?)
+            }
+            // Empty here; fill_bbu_hash_tables inserts the entries once every
+            // key is complete, since EQUAL and EQUALP hash a key's contents.
+            BbuConstant::HashTable { test, .. } => {
+                egcl_stdlib::make_hash_table(&egcl_stdlib::MakeHashTableOptions {
+                    test: match test {
+                        0 => egcl_stdlib::HashTest::Eq,
+                        1 => egcl_stdlib::HashTest::Eql,
+                        2 => egcl_stdlib::HashTest::Equal,
+                        _ => egcl_stdlib::HashTest::Equalp,
+                    },
+                    ..Default::default()
+                })?
             }
             BbuConstant::Cons(_, _) => arena_cons(NIL, NIL),
             BbuConstant::Vector(refs) => egcl_stdlib::build_simple_vector(&vec![NIL; refs.len()]),
@@ -13923,6 +14094,15 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     for _ in 0..constant_count {
         encoded_constants.push(parse_bbu_constant(&mut cursor, bytecode_version)?);
     }
+    // A saved heap reference names an object in the image being restored; in a
+    // fasl it would be an arbitrary address.
+    if !restoring
+        && encoded_constants
+            .iter()
+            .any(|constant| matches!(constant, BbuConstant::SavedHeapRef(_)))
+    {
+        return Err(bbu_error("saved heap reference outside a core image"));
+    }
     if source_file_ref != BBU_NO_INDEX {
         bbu_string(&encoded_constants, source_file_ref)?;
     }
@@ -13971,6 +14151,14 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
             BbuConstant::MdArray { element_refs, .. } => {
                 for &reference in element_refs {
                     bbu_index(reference, encoded_constants.len(), "array element")?;
+                }
+            }
+            BbuConstant::PackageObject { name_ref } => {
+                bbu_string(&encoded_constants, *name_ref)?;
+            }
+            BbuConstant::HashTable { entry_refs, .. } => {
+                for &reference in entry_refs {
+                    bbu_index(reference, encoded_constants.len(), "hash table entry")?;
                 }
             }
             _ => {}

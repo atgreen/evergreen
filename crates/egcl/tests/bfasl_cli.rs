@@ -264,7 +264,7 @@ fn memory_fence_call_persists_without_source_fallback() {
         "must not embed legacy source"
     );
     let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
-    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0202);
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0203);
     let start = bbu_action_start(bbu);
     let (_, _, count) = bbu_counts(&bytes);
     for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
@@ -3700,7 +3700,7 @@ fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
     );
     let bytes = fs::read(&good).unwrap();
     let image = egcl_rt::bfasl::load(&bytes).unwrap();
-    for version in [0x0100u16, 0x010e, 0x010f, 0x0203, 0x0300] {
+    for version in [0x0100u16, 0x010e, 0x010f, 0x0204, 0x0300] {
         let bad = dir.join(format!("version-{version:04x}.bfasl"));
         let mut builder = egcl_rt::bfasl::BfaslBuilder::new();
         for (kind, section) in image.sections() {

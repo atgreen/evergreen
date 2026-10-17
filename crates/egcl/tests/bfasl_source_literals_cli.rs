@@ -62,7 +62,7 @@ fn source_only_fasl_reads_against_the_source_file() {
     std::fs::create_dir_all(dir.join("out")).unwrap();
     std::fs::write(
         dir.join("here.lisp"),
-        "(defparameter *table* #.(make-hash-table))\n\
+        "(defparameter *function* #.#'car)\n\
          (defparameter *here* #.(namestring (or *compile-file-pathname* *load-pathname*)))\n",
     )
     .unwrap();
@@ -70,7 +70,7 @@ fn source_only_fasl_reads_against_the_source_file() {
         &dir,
         r##"(let ((fasl (compile-file "here.lisp" :output-file "out/here.fasl")))
       (load fasl)
-      (assert (hash-table-p *table*))
+      (assert (eq *function* #'car))
       (assert (string= (pathname-name *here*) "here"))
       (assert (string= (pathname-type *here*) "lisp"))
       (assert (null *compile-file-pathname*))
