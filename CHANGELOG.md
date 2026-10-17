@@ -4,6 +4,16 @@
 
 ### Added
 
+- Package-local nicknames (CDR 10). `DEFPACKAGE` accepted `:LOCAL-NICKNAMES`
+  and dropped it, so a library's `(:local-nicknames (:a :alexandria))` left
+  `a:define-constant` unreadable: "package not found: A". The option now
+  takes effect, the reader, `FIND-PACKAGE`, `INTERN` and `FIND-SYMBOL`
+  resolve a prefix through the current package's local nicknames before the
+  global names, `EGCL-EXT` exports `ADD-PACKAGE-LOCAL-NICKNAME`,
+  `REMOVE-PACKAGE-LOCAL-NICKNAME`, `PACKAGE-LOCAL-NICKNAMES` and
+  `PACKAGE-LOCALLY-NICKNAMED-BY-LIST` as the API document already listed
+  them, `:PACKAGE-LOCAL-NICKNAMES` is on `*FEATURES*`, and UIOP's
+  `DEFINE-PACKAGE` finds the functions in `EGCL-EXT`.
 - Socket endpoint queries: `(egcl::%socket-listener-local-name listener)`,
   `(egcl::%socket-local-name stream)` and `(egcl::%socket-peer-name stream)`
   report an endpoint as an octet vector and a port together, four elements for

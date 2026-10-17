@@ -112,12 +112,14 @@ pub use hashtable::{
 };
 pub use packages::PackageRegistry;
 pub use packages::{
-    InternStatus, accessible_symbols, add_nickname, add_symbol, delete_package, export,
-    external_symbols_of, find_package, find_present_symbol, find_symbol, import, intern,
-    intern_present, is_external_symbol, is_package, list_all_packages, make_package, package_name,
-    package_name_eq, package_nicknames, package_shadowing_symbols, package_use_list,
-    present_symbols, rename_package, seed_ansi_symbols, shadow, shadowing_import, unexport,
-    unintern, unuse_package, use_package, use_package_by_name,
+    InternStatus, accessible_symbols, add_nickname, add_package_local_nickname, add_symbol,
+    any_package_local_nicknames, delete_package, export, external_symbols_of, find_package,
+    find_package_from, find_present_symbol, find_symbol, import, intern, intern_present,
+    is_external_symbol, is_package, list_all_packages, local_nickname_target, make_package,
+    package_local_nicknames, package_locally_nicknamed_by_list, package_name, package_name_eq,
+    package_nicknames, package_shadowing_symbols, package_use_list, present_symbols,
+    remove_package_local_nickname, rename_package, seed_ansi_symbols, shadow, shadowing_import,
+    unexport, unintern, unuse_package, use_package, use_package_by_name,
 };
 pub use pathnames::translated_physical;
 pub use pathnames::{

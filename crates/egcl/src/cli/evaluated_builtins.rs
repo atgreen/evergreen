@@ -4444,6 +4444,94 @@ fn resolve(name: &str) -> Option<Handler> {
             )))
         }),
 
+        // ── Package-local nicknames (CDR 10) ──
+        //
+        // The registry primitives behind the EGCL-EXT functions that
+        // docs/egcl-lisp-api.md lists. Those are DEFUNs in boot.lisp over
+        // these, so that they are symbols with function cells: a package may
+        // import them, as UIOP's UIOP/PACKAGE-LOCAL-NICKNAMES does, where a
+        // name-dispatched builtin would be forked into an undefined symbol.
+        "EGCL::%ADD-PACKAGE-LOCAL-NICKNAME" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%add-package-local-nickname local-nickname actual-package package)
+            //   → package
+            if args.len() != 3 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL::%ADD-PACKAGE-LOCAL-NICKNAME requires a nickname, a package and the owning package; got {}",
+                    args.len()
+                )));
+            }
+            let nickname = normalize_package_name(&string_designator_name(args[0]));
+            if matches!(nickname.as_str(), "CL" | "COMMON-LISP" | "KEYWORD") {
+                return Err(EgclError::PackageError(format!(
+                    "ADD-PACKAGE-LOCAL-NICKNAME: {nickname} may not be a package-local nickname"
+                )));
+            }
+            let actual = designated_package(env, args[1], "ADD-PACKAGE-LOCAL-NICKNAME")?;
+            let owner = designated_package(env, args[2], "ADD-PACKAGE-LOCAL-NICKNAME")?;
+            egcl_stdlib::add_package_local_nickname(owner, &nickname, actual)?;
+            Ok(owner)
+        }),
+
+        "EGCL::%REMOVE-PACKAGE-LOCAL-NICKNAME" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%remove-package-local-nickname local-nickname package) → T | NIL
+            if args.len() != 2 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL::%REMOVE-PACKAGE-LOCAL-NICKNAME requires a nickname and the owning package; got {}",
+                    args.len()
+                )));
+            }
+            let nickname = normalize_package_name(&string_designator_name(args[0]));
+            let owner = designated_package(env, args[1], "REMOVE-PACKAGE-LOCAL-NICKNAME")?;
+            Ok(if egcl_stdlib::remove_package_local_nickname(owner, &nickname)?.is_some() {
+                T
+            } else {
+                NIL
+            })
+        }),
+
+        "EGCL::%PACKAGE-LOCAL-NICKNAMES" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%package-local-nicknames package)
+            //   → alist of ("NICKNAME" . package), sorted by nickname
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL::%PACKAGE-LOCAL-NICKNAMES requires one argument; got {}",
+                    args.len()
+                )));
+            }
+            let owner = designated_package(env, args[0], "PACKAGE-LOCAL-NICKNAMES")?;
+            let pairs = egcl_stdlib::package_local_nicknames(owner)?;
+            // Each nickname string and each cell is allocated in turn, and
+            // any allocation can move the ones before it: root the cells
+            // built so far and the string of the cell being built.
+            let mut cells: Vec<EgclVal> = Vec::with_capacity(pairs.len());
+            egcl_rt::rooted_ref!(_cells_root = &mut cells);
+            for (nickname, package) in &pairs {
+                egcl_rt::rooted!(name = arena_str(nickname));
+                cells.push(arena_cons(*name, *package));
+            }
+            Ok(vec_to_list(&cells))
+        }),
+
+        "EGCL::%PACKAGE-LOCALLY-NICKNAMED-BY-LIST" => Some(|_operator, args, env| {
+            let args = RootedVals::new(args.to_vec());
+
+            // (%package-locally-nicknamed-by-list package) → list of packages
+            if args.len() != 1 {
+                return Err(EgclError::ProgramError(format!(
+                    "EGCL::%PACKAGE-LOCALLY-NICKNAMED-BY-LIST requires one argument; got {}",
+                    args.len()
+                )));
+            }
+            let target = designated_package(env, args[0], "PACKAGE-LOCALLY-NICKNAMED-BY-LIST")?;
+            Ok(vec_to_list(&egcl_stdlib::package_locally_nicknamed_by_list(target)?))
+        }),
+
         "EGCL-EXT:PROCLAIMED-OPTIMIZE" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
