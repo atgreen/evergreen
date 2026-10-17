@@ -794,6 +794,12 @@ fn invalid_octets_error(format: ExternalFormat) -> EgclError {
 }
 
 /// Decode a run of octets under `format`, for the bulk line reader.
+///
+/// The line reader hands this the octets between two `0x0A`s, which is a
+/// line only because none of UTF-8, LATIN-1 and ASCII can put `0x0A` inside
+/// a character. `OPEN` refuses UTF-16 and UTF-32 for that reason among
+/// others: a format that can is not safe to give the line reader, and
+/// whoever adds one must route it past the scan, not through it.
 fn decode_run(format: ExternalFormat, bytes: Vec<u8>) -> Result<String, EgclError> {
     match format {
         ExternalFormat::Latin1 => Ok(bytes.iter().map(|&b| b as char).collect()),
@@ -836,10 +842,15 @@ fn encode_char(format: ExternalFormat, c: char, out: &mut Vec<u8>) -> Result<(),
 /// UTF-8, ASCII or LATIN-1 file input in bulk, instead of decoding and pushing one char at a
 /// time (the per-char loop paid a UTF-8 decode + a `Vec<char>` push per byte).
 /// The newline byte 0x0A never occurs inside a UTF-8 multi-byte sequence (those
-/// are 0x80–0xBF continuation / 0xC0+ leading bytes), so scanning the raw buffer
-/// for 0x0A splits exactly at line boundaries; the bytes between boundaries are
-/// therefore complete UTF-8 and decode as one `String`. Returns `(line,
-/// missing-newline-p)`; `(EOF, true)` at end of input with nothing buffered.
+/// are 0x80–0xBF continuation / 0xC0+ leading bytes), nor inside a LATIN-1 or
+/// ASCII character, so scanning the raw buffer for 0x0A splits exactly at line
+/// boundaries; the bytes between boundaries are therefore complete characters
+/// and decode as one `String`. That holds ONLY for those three formats: a
+/// UTF-16 or UTF-32 stream carries 0x0A inside other characters, and today
+/// `OPEN` refuses both, which is what keeps this scan correct. A future format
+/// with that property must not reach this function (see `stream_read_line`'s
+/// guard and `decode_run`). Returns `(line, missing-newline-p)`; `(EOF, true)`
+/// at end of input with nothing buffered.
 #[allow(clippy::too_many_arguments)]
 fn file_read_line_buffered(
     file: &mut StreamHandle,
