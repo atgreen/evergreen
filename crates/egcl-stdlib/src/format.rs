@@ -1982,6 +1982,17 @@ fn pad_format_field(
     }
 }
 
+/// A character prefix parameter (padchar, commachar), which `resolve_param`
+/// delivers as a code point. Narrowing it with `as u8` kept only the low byte,
+/// so `~5,'★D` padded with U+0005; only a value that is not a character at all
+/// falls back to the directive's default.
+fn param_char(code: i64, default: char) -> char {
+    u32::try_from(code)
+        .ok()
+        .and_then(char::from_u32)
+        .unwrap_or(default)
+}
+
 fn insert_commas(s: &str, commachar: char, interval: usize) -> String {
     if interval == 0 {
         return s.to_string();
@@ -1996,16 +2007,35 @@ fn insert_commas(s: &str, commachar: char, interval: usize) -> String {
     result.chars().rev().collect()
 }
 
-fn cardinal(n: i64) -> String {
-    if n == 0 {
-        return "zero".into();
-    }
-    let mut result = String::new();
-    let mut v = n;
-    if v < 0 {
-        result.push_str("negative ");
-        v = -v;
-    }
+/// The short-scale names `~R` gives each group of three digits, as SBCL spells
+/// them; anything past the vigintillions has no name and is a FORMAT error.
+const CARDINAL_SCALES: [&str; 22] = [
+    "",
+    " thousand",
+    " million",
+    " billion",
+    " trillion",
+    " quadrillion",
+    " quintillion",
+    " sextillion",
+    " septillion",
+    " octillion",
+    " nonillion",
+    " decillion",
+    " undecillion",
+    " duodecillion",
+    " tredecillion",
+    " quattuordecillion",
+    " quindecillion",
+    " sexdecillion",
+    " septendecillion",
+    " octodecillion",
+    " novemdecillion",
+    " vigintillion",
+];
+
+/// English for 1..=999.
+fn cardinal_below_thousand(mut v: usize) -> String {
     let ones = [
         "",
         "one",
@@ -2031,24 +2061,9 @@ fn cardinal(n: i64) -> String {
     let tens = [
         "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety",
     ];
-    if v >= 1_000_000 {
-        result.push_str(&cardinal(v / 1_000_000));
-        result.push_str(" million");
-        v %= 1_000_000;
-        if v > 0 {
-            result.push(' ');
-        }
-    }
-    if v >= 1000 {
-        result.push_str(&cardinal(v / 1000));
-        result.push_str(" thousand");
-        v %= 1000;
-        if v > 0 {
-            result.push(' ');
-        }
-    }
+    let mut result = String::new();
     if v >= 100 {
-        result.push_str(ones[v as usize / 100]);
+        result.push_str(ones[v / 100]);
         result.push_str(" hundred");
         v %= 100;
         if v > 0 {
@@ -2056,20 +2071,50 @@ fn cardinal(n: i64) -> String {
         }
     }
     if v >= 20 {
-        result.push_str(tens[v as usize / 10]);
+        result.push_str(tens[v / 10]);
         v %= 10;
         if v > 0 {
             result.push('-');
-            result.push_str(ones[v as usize]);
+            result.push_str(ones[v]);
         }
     } else if v > 0 {
-        result.push_str(ones[v as usize]);
+        result.push_str(ones[v]);
     }
     result
 }
 
-fn ordinal(n: i64) -> String {
-    let c = cardinal(n);
+/// `~R` English for an integer given as its sign and decimal digits, so a
+/// bignum spells out like a fixnum. Each three-digit group is named by
+/// [`CARDINAL_SCALES`]; `None` means the number is too large to name.
+fn cardinal(negative: bool, digits: &str) -> Option<String> {
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some("zero".into());
+    }
+    let groups = digits.len().div_ceil(3);
+    if groups > CARDINAL_SCALES.len() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(groups);
+    let mut start = 0;
+    let mut len = digits.len() - (groups - 1) * 3;
+    for scale in CARDINAL_SCALES[..groups].iter().rev() {
+        let chunk: usize = digits[start..start + len].parse().ok()?;
+        if chunk > 0 {
+            parts.push(format!("{}{}", cardinal_below_thousand(chunk), scale));
+        }
+        start += len;
+        len = 3;
+    }
+    let body = parts.join(" ");
+    Some(if negative {
+        format!("negative {body}")
+    } else {
+        body
+    })
+}
+
+fn ordinal(c: String) -> String {
     if c.ends_with("one") {
         format!("{}first", &c[..c.len() - 3])
     } else if c.ends_with("two") {
@@ -2758,7 +2803,7 @@ fn format_impl(
                     0
                 };
                 let padchar = if params.len() > 1 {
-                    resolve_param(&params[1], ' ' as i64, arg_idx)? as u8 as char
+                    param_char(resolve_param(&params[1], ' ' as i64, arg_idx)?, ' ')
                 } else {
                     ' '
                 };
@@ -2766,7 +2811,7 @@ fn format_impl(
                 // interval (CLHS 22.3.2.1); `~,,' ,4:d` groups every 4 digits
                 // with a space. Previously both were ignored (hardcoded ",", 3).
                 let commachar = if params.len() > 2 {
-                    resolve_param(&params[2], ',' as i64, arg_idx)? as u8 as char
+                    param_char(resolve_param(&params[2], ',' as i64, arg_idx)?, ',')
                 } else {
                     ','
                 };
@@ -2844,12 +2889,12 @@ fn format_impl(
                     .max(0) as usize;
                 let padchar = params
                     .get(2)
-                    .map_or(Ok(' ' as i64), |p| resolve_param(p, ' ' as i64, arg_idx))?
-                    as u8 as char;
+                    .map_or(Ok(' ' as i64), |p| resolve_param(p, ' ' as i64, arg_idx))
+                    .map(|code| param_char(code, ' '))?;
                 let commachar = params
                     .get(3)
-                    .map_or(Ok(',' as i64), |p| resolve_param(p, ',' as i64, arg_idx))?
-                    as u8 as char;
+                    .map_or(Ok(',' as i64), |p| resolve_param(p, ',' as i64, arg_idx))
+                    .map(|code| param_char(code, ','))?;
                 let comma_interval = params
                     .get(4)
                     .map_or(Ok(3), |p| resolve_param(p, 3, arg_idx))?
@@ -2881,22 +2926,35 @@ fn format_impl(
                     ));
                     continue;
                 }
-                if !val.is_fixnum() {
+                // Bignums are integers too: `~R` used to accept only fixnums
+                // and signal a TYPE-ERROR claiming 10^20 was not an integer.
+                let Some((negative, digits)) = integer_magnitude(val, 10) else {
                     return Err(EgclError::TypeError {
                         datum: val,
                         expected: "integer".into(),
                     });
+                };
+                if at_sign {
+                    // Roman numerals stop at 4999; to_roman prints anything
+                    // outside that range in decimal, bignums included.
+                    if val.is_fixnum() {
+                        output.push_str(&to_roman(val.as_fixnum(), colon));
+                    } else {
+                        if negative {
+                            output.push('-');
+                        }
+                        output.push_str(&digits);
+                    }
+                    continue;
                 }
-                let n = val.as_fixnum();
-                if colon && at_sign {
-                    output.push_str(&to_roman(n, true));
-                } else if at_sign {
-                    output.push_str(&to_roman(n, false));
-                } else if colon {
-                    output.push_str(&ordinal(n));
-                } else {
-                    output.push_str(&cardinal(n));
-                }
+                let english = cardinal(negative, &digits).ok_or_else(|| {
+                    EgclError::ControlError(format!(
+                        "~R cannot print {}{} in English: it is too large",
+                        if negative { "-" } else { "" },
+                        digits
+                    ))
+                })?;
+                output.push_str(&if colon { ordinal(english) } else { english });
             }
             'F' => {
                 // ~w,d,k,overflowchar,padcharF (CLHS 22.3.3.1).  Parameters are

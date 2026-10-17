@@ -24507,7 +24507,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let (nf, r) = cp(cdr);
                 egcl_rt::rooted!(form = cp(r).0);
                 let n = eval_form(nf, env)?;
-                let idx = num_val(n)? as usize;
+                // N is a non-negative integer. Narrowing through a float let
+                // `(nth-value -1 ...)` and `(nth-value 1.5 ...)` pick a value
+                // where the compiled (NTH n (MULTIPLE-VALUE-LIST ...)) path
+                // signals; a bignum N is past every value, so the answer is NIL.
+                let idx = if n.is_fixnum() && n.as_fixnum() >= 0 {
+                    n.as_fixnum() as usize
+                } else if egcl_rt::bignum::bigint_from_val(n).is_some_and(|b| b.sign > 0) {
+                    usize::MAX
+                } else {
+                    return Err(EgclError::TypeError {
+                        datum: n,
+                        expected: "(integer 0 *)".into(),
+                    });
+                };
                 let (_, values) = eval_form_collecting_values(*form, env)?;
                 return Ok(values.get(idx).copied().unwrap_or(NIL));
             }
