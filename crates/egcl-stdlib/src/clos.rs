@@ -1902,6 +1902,29 @@ pub fn compute_class_precedence_list(class: EgclVal) -> Result<Vec<EgclVal>, Egc
     })
 }
 
+/// Whether `class`'s precedence list includes `STANDARD-OBJECT` — i.e. its
+/// instances are standard objects, which is what makes it a standard class
+/// rather than a built-in one.
+///
+/// Reads the class GRAPH, not the class value's tag. That matters because a
+/// `DEFCLASS` class is currently its own name symbol and a built-in class a
+/// negative fixnum, so callers used to discriminate the two with
+/// `class.is_symbol()` — a test that silently inverts the moment a class
+/// metaobject stops being an immediate (bliss-lkf8l, bliss-rj5o).
+///
+/// A structure class also inherits `STANDARD-OBJECT` here, so a caller that
+/// needs the three-way standard/built-in/structure split must test
+/// [`is_structure_class`] first.
+pub fn class_inherits_standard_object(class: EgclVal) -> bool {
+    let standard_object = with_state(|st| st.standard_object_class);
+    if standard_object == NIL {
+        return false;
+    }
+    compute_class_precedence_list(class)
+        .map(|cpl| cpl.contains(&standard_object))
+        .unwrap_or(false)
+}
+
 /// The metaclass DEFCLASS named for `class`, or NIL for the default.
 pub fn class_metaclass(class: EgclVal) -> EgclVal {
     with_state(|st| {

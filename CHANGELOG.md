@@ -49,6 +49,11 @@
   egcl replaced one inside `PARSE-INTEGER`, after which `(parse-integer "1")`
   signalled "not an integer" and ASDF could not load babel
   ([#386](https://github.com/atgreen/evergreen/pull/386)).
+- `RESTART` is consistently a standard class. Its class precedence list has
+  always been `(RESTART STANDARD-OBJECT T)`, but `(class-of (find-class
+  'restart))` answered `BUILT-IN-CLASS` and `(subtypep 'restart
+  'standard-object)` answered false. All three agree now
+  ([#387](https://github.com/atgreen/evergreen/pull/387)).
 - `MAKE-PATHNAME` no longer builds a pathname with a wrong component when a
   garbage collection happens while it runs: with a `:directory` list or a
   namestring `:defaults`, a freshly made `:name` or `:type` string could be
