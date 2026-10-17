@@ -4868,31 +4868,117 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
 ;;; rather than a different answer.
 ;;;
 ;;; One honest limit: SLOT-DEFINITION-TYPE answers T for every slot, because
+(defpackage :egcl-mop
+  (:use :common-lisp)
+  ;; Only names this package OWNS. CLASS-PRECEDENCE-LIST and
+  ;; METHOD-SPECIALIZERS are name-dispatched Rust builtins whose symbols live in
+  ;; COMMON-LISP; listing them here interned fresh, FUNCTIONLESS symbols in
+  ;; EGCL-MOP, which then shadowed the real ones in COMMON-LISP-USER and made
+  ;; (class-precedence-list ...) undefined there -- the shape bliss-8eq9b
+  ;; describes. Moving those two out of COMMON-LISP needs the builtin dispatch
+  ;; to respect packages first (bliss-7l7cn); until then they stay in CL, which
+  ;; is where portable code already finds them.
+  (:export #:class-slots #:class-direct-slots
+           #:class-direct-superclasses #:class-direct-subclasses
+           #:class-finalized-p #:finalize-inheritance
+           #:generic-function-methods
+           #:intern-eql-specializer #:validate-superclass
+           #:slot-definition-name #:slot-definition-initargs
+           #:slot-definition-initform #:slot-definition-allocation
+           #:slot-definition-readers #:slot-definition-writers
+           #:slot-definition-type))
+
+;;; COMMON-LISP-USER uses it, so the names stay reachable without qualification
+;;; where a person is typing -- and so closer-mop's EGCL arm, which is
+;;; (defun class-slots (class) (cl-user::class-slots class)), keeps resolving.
+;;; A library package that does (:use :cl) and nothing else does not inherit
+;;; them, which is the point of the move (GitHub #370).
+(use-package :egcl-mop :common-lisp-user)
+
+;;; These names are NOT ANSI -- CL has no CLASS-SLOTS or SLOT-DEFINITION-NAME --
+;;; and they used to be interned in COMMON-LISP, so every package that did
+;;; (:use :cl) inherited them. A library's own DEFUN of one then redefined the
+;;; IMPLEMENTATION's, process-wide and silently (GitHub #370). They live in
+;;; EGCL-MOP now; COMMON-LISP-USER uses that package, so interactive use and
+;;; closer-mop's (cl-user::class-slots ...) keep working, while a library
+;;; package that only uses CL no longer inherits them.
+;;;
 ;;; DEFCLASS currently discards the :type option (bliss-52ze). T is the correct
 ;;; default, and wrong for a slot that declared a type.
-(defclass slot-definition ()
-  ((name :initarg :name :reader slot-definition-name)
-   (initargs :initarg :initargs :reader slot-definition-initargs)
-   (initform :initarg :initform :reader slot-definition-initform)
-   (allocation :initarg :allocation :reader slot-definition-allocation)
-   (readers :initarg :readers :reader slot-definition-readers)
-   (writers :initarg :writers :reader slot-definition-writers)))
+(defclass egcl-mop::slot-definition ()
+  ((name :initarg :name :reader egcl-mop:slot-definition-name)
+   (initargs :initarg :initargs :reader egcl-mop:slot-definition-initargs)
+   (initform :initarg :initform :reader egcl-mop:slot-definition-initform)
+   (allocation :initarg :allocation :reader egcl-mop:slot-definition-allocation)
+   (readers :initarg :readers :reader egcl-mop:slot-definition-readers)
+   (writers :initarg :writers :reader egcl-mop:slot-definition-writers)))
 
-(defun class-slots (class)
+(defun egcl-mop:class-slots (class)
   "Effective slot definitions of CLASS, in class-precedence order."
   (mapcar (lambda (descriptor)
-            (apply #'make-instance 'slot-definition descriptor))
+            (apply #'make-instance 'egcl-mop::slot-definition descriptor))
           (egcl-internal::%class-slot-descriptors class)))
 
-(defun class-direct-slots (class)
+(defun egcl-mop:class-direct-slots (class)
   "Slot definitions CLASS itself declares, excluding inherited slots."
   (mapcar (lambda (descriptor)
-            (apply #'make-instance 'slot-definition descriptor))
+            (apply #'make-instance 'egcl-mop::slot-definition descriptor))
           (egcl-internal::%class-slot-descriptors class t)))
 
-(defun slot-definition-type (slot)
+(defun egcl-mop:slot-definition-type (slot)
   "Declared type of SLOT. Always T: DEFCLASS discards :type (bliss-52ze)."
   (declare (ignore slot))
+  t)
+
+;;; ── EGCL-MOP ──────────────────────────────────────────────────────
+;;;
+;;; The metaobject-protocol surface docs/egcl-lisp-api.md specifies. A program
+;;; that wants these names asks for them -- (:use :egcl-mop), or a package-local
+;;; nickname -- rather than inheriting them from COMMON-LISP, which is where the
+;;; non-ANSI ones used to live and is why a library's own DEFUN of one
+;;; redefined the implementation's (GitHub #370, #371).
+;;;
+;;; The introspection readers are real functions over the %-builtins, not
+;;; name-dispatched builtins re-exported: an imported name-dispatched builtin
+;;; forks into an undefined symbol at the call site, which is what made UIOP's
+;;; import of the package-local-nickname API fail until those became real
+;;; functions too (bliss-8eq9b).
+;; (defpackage moved above the definitions it owns)
+
+(defun egcl-mop:class-direct-superclasses (class)
+  "The direct superclasses of CLASS, as class metaobjects."
+  (egcl-internal::%class-direct-superclasses class))
+
+(defun egcl-mop:class-direct-subclasses (class)
+  "The direct subclasses of CLASS, as class metaobjects."
+  (egcl-internal::%class-direct-subclasses class))
+
+(defun egcl-mop:generic-function-methods (generic-function)
+  "The methods of GENERIC-FUNCTION, as the method objects METHOD-SPECIALIZERS
+takes."
+  (egcl-internal::%generic-function-methods generic-function))
+
+(defun egcl-mop:class-finalized-p (class)
+  "T: classes finalize eagerly here, so a class that exists is finalized.
+Portable code that finalizes before reading the precedence list runs unchanged."
+  (declare (ignore class))
+  t)
+
+(defun egcl-mop:finalize-inheritance (class)
+  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits."
+  class)
+
+(defun egcl-mop:intern-eql-specializer (object)
+  "The EQL specializer for OBJECT, in the shape METHOD-SPECIALIZERS answers it,
+so the two compare with EQUAL as they do on other hosts."
+  (list 'eql object))
+
+(defgeneric egcl-mop:validate-superclass (class superclass)
+  (:documentation "Whether CLASS may inherit from SUPERCLASS. T by default; a
+metaclass specializes this to accept a superclass of another metaclass."))
+
+(defmethod egcl-mop:validate-superclass (class superclass)
+  (declare (ignore class superclass))
   t)
 
 ;;; Image lifecycle hooks belong to the implementation; libraries register here.
@@ -5255,7 +5341,8 @@ sorted by nickname."
   (let* ((class (class-of object))
          (names (if slot-names-p
                     slot-names
-                    (mapcar #'slot-definition-name (class-slots class)))))
+                    (mapcar #'egcl-mop:slot-definition-name
+                            (egcl-mop:class-slots class)))))
     (values `(allocate-instance (find-class ',(class-name class)))
             `(progn
                ,@(loop for name in names

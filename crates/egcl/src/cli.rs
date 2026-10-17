@@ -14890,6 +14890,15 @@ fn is_random_state_value(v: EgclVal) -> bool {
 /// bignums, readtables and random states.
 fn class_of_value(object: EgclVal) -> EgclVal {
     let refined = if let Some(class) = class_metaobject_of(object) {
+        // A class that DEFCLASS gave a `:metaclass` answers THAT, not
+        // STANDARD-CLASS. Gendl's kernel distinguishes one of its own classes
+        // from a plain one with
+        // (eql (class-of (find-class name)) (find-class 'gdl-class)),
+        // and the option used to be parsed and dropped (GitHub #371).
+        let metaclass = egcl_stdlib::clos::class_metaclass(class);
+        if metaclass != NIL {
+            return metaclass;
+        }
         if egcl_stdlib::is_structure_class(class) {
             "STRUCTURE-CLASS"
         } else if is_standard_class_metaobject(class) {
@@ -20440,6 +20449,60 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // Takes a class DESIGNATOR, like MAKE-INSTANCE and ALLOCATE-INSTANCE:
             // FIND-CLASS returns the symbol here (bliss-rj5o), so a caller has no
             // separate class object to pass.
+            // The MOP introspection Gendl's glisp layer asks the host for
+            // (GitHub #371). Thin readers over state the CLOS registry already
+            // keeps; EGCL-MOP in boot.lisp is the public surface.
+            "EGCL-INTERNAL::%CLASS-DIRECT-SUPERCLASSES"
+            | "EGCL-INTERNAL:%CLASS-DIRECT-SUPERCLASSES"
+            | "%CLASS-DIRECT-SUPERCLASSES" => {
+                let (af, _) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                let supers = egcl_stdlib::clos::class_direct_superclasses(class);
+                return Ok(vec_to_list(&supers));
+            }
+            "EGCL-INTERNAL::%CLASS-DIRECT-SUBCLASSES"
+            | "EGCL-INTERNAL:%CLASS-DIRECT-SUBCLASSES"
+            | "%CLASS-DIRECT-SUBCLASSES" => {
+                let (af, _) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                let subs = egcl_stdlib::clos::class_direct_subclasses(class);
+                return Ok(vec_to_list(&subs));
+            }
+            "EGCL-INTERNAL::%GENERIC-FUNCTION-METHODS"
+            | "EGCL-INTERNAL:%GENERIC-FUNCTION-METHODS"
+            | "%GENERIC-FUNCTION-METHODS" => {
+                let (af, _) = cp(cdr);
+                let gf = eval_form(af, env)?;
+                // Resolved by NAME, like COMPUTE-APPLICABLE-METHODS and
+                // REMOVE-METHOD: the method registry the interpreter dispatches
+                // on is `env.methods`, keyed by the generic function's name.
+                // The stdlib's own generic_functions map is not it, and reading
+                // that one answers an empty list for every generic DEFMETHOD
+                // defined -- measured before this was keyed correctly.
+                let Some(gf_name) = generic_function_name_of(env, gf) else {
+                    return Err(EgclError::TypeError {
+                        datum: gf,
+                        expected: "GENERIC-FUNCTION".into(),
+                    });
+                };
+                let ids: Vec<EgclVal> = env
+                    .methods
+                    .borrow()
+                    .get(&gf_name)
+                    .map(|defs| defs.iter().map(|def| def.method_id).collect())
+                    .unwrap_or_default();
+                return Ok(vec_to_list(&ids));
+            }
+            "EGCL-INTERNAL::%CLASS-METACLASS"
+            | "EGCL-INTERNAL:%CLASS-METACLASS"
+            | "%CLASS-METACLASS" => {
+                let (af, _) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                return Ok(egcl_stdlib::clos::class_metaclass(class));
+            }
             "EGCL-INTERNAL::%CLASS-SLOT-DESCRIPTORS"
             | "EGCL-INTERNAL:%CLASS-SLOT-DESCRIPTORS"
             | "%CLASS-SLOT-DESCRIPTORS" => {
@@ -35748,6 +35811,12 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // in its own package — closer-mop's `c2mop:funcallable-standard-class` (what
     // iparse writes), `sb-mop:`, or the bare name — and they all mean this.
     let mut funcallable = false;
+    // A named metaclass other than FUNCALLABLE-STANDARD-CLASS used to be
+    // matched and dropped. It is recorded now and answered by CLASS-OF, which
+    // is how portable code tells a class with a custom metaclass from a plain
+    // one (GitHub #371). Kept as the SYMBOL: the metaclass need not be defined
+    // yet when this DEFCLASS is read, so it is resolved after the class exists.
+    let mut metaclass_name = NIL;
     for option in list_to_vec(class_options) {
         if !option.is_cons() {
             continue;
@@ -35758,10 +35827,14 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         }
         if sym_bare_name_rc(opt_key).as_ref() == "METACLASS" {
             let (metaclass, _) = cp(opt_rest);
-            if metaclass.is_symbol()
-                && sym_bare_name_rc(metaclass).as_ref() == "FUNCALLABLE-STANDARD-CLASS"
-            {
-                funcallable = true;
+            if metaclass.is_symbol() {
+                if sym_bare_name_rc(metaclass).as_ref() == "FUNCALLABLE-STANDARD-CLASS" {
+                    funcallable = true;
+                } else if sym_bare_name_rc(metaclass).as_ref() != "STANDARD-CLASS" {
+                    // STANDARD-CLASS is the default, so naming it explicitly
+                    // records nothing and CLASS-OF keeps its ordinary answer.
+                    metaclass_name = metaclass;
+                }
             }
             continue;
         }
@@ -36068,6 +36141,20 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         &slot_names,
         &shared_slot_names,
     )?;
+
+    // Record the named metaclass now that the class exists, resolving the name
+    // to its class metaobject. Deliberately AFTER define_class: the metaclass
+    // may itself have been defined by an earlier form in the same file, and a
+    // name that resolves to no class is left unrecorded rather than signalling,
+    // so a :metaclass naming a class defined later behaves as it did before
+    // (accepted, with CLASS-OF answering STANDARD-CLASS) instead of breaking a
+    // load that used to work (GitHub #371).
+    if metaclass_name != NIL
+        && let Some(class) = egcl_stdlib::find_class(name_form)
+        && let Some(metaclass) = egcl_stdlib::find_class(metaclass_name)
+    {
+        egcl_stdlib::clos::set_class_metaclass(class, metaclass);
+    }
 
     // Install real generic methods for slot readers/writers/accessors so they
     // work as function values (`#'reader`, funcall/apply/map), not only in

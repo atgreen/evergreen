@@ -4,6 +4,23 @@
 
 ### Added
 
+- `EGCL-MOP`, the metaobject-protocol package `docs/egcl-lisp-api.md`
+  specified but the bootstrap never installed. It provides
+  `CLASS-DIRECT-SUPERCLASSES`, `CLASS-DIRECT-SUBCLASSES`,
+  `GENERIC-FUNCTION-METHODS`, `CLASS-FINALIZED-P`, `FINALIZE-INHERITANCE`,
+  `INTERN-EQL-SPECIALIZER` and `VALIDATE-SUPERCLASS`, and is the home of
+  `CLASS-SLOTS`, `CLASS-DIRECT-SLOTS` and the `SLOT-DEFINITION-*` readers.
+  `COMMON-LISP-USER` uses it, so those names stay reachable unqualified where a
+  person is typing ([#380](https://github.com/atgreen/evergreen/pull/380);
+  issue [#371](https://github.com/atgreen/evergreen/issues/371)).
+- `DEFCLASS`'s `:METACLASS` takes effect: `CLASS-OF` answers the named
+  metaclass instead of `STANDARD-CLASS`. The option was parsed and discarded,
+  so a kernel that tells its own classes from plain ones with
+  `(eql (class-of (find-class name)) (find-class 'its-metaclass))` -- Gendl's
+  does -- saw every class as plain
+  ([#380](https://github.com/atgreen/evergreen/pull/380);
+  issue [#371](https://github.com/atgreen/evergreen/issues/371)).
+
 - Package-local nicknames (CDR 10). `DEFPACKAGE` accepted `:LOCAL-NICKNAMES`
   and dropped it, so a library's `(:local-nicknames (:a :alexandria))` left
   `a:define-constant` unreadable: "package not found: A". The option now
@@ -27,6 +44,15 @@
 
 ### Fixed
 
+- A library's own `DEFUN` of `CLASS-SLOTS` no longer redefines the
+  implementation's. The non-ANSI MOP readers were reachable as a bare name from
+  any package, so an internal helper of that name in a package that exports
+  nothing hijacked the implementation's function, process-wide and silently.
+  They live in `EGCL-MOP` now. `CLASS-PRECEDENCE-LIST` and
+  `METHOD-SPECIALIZERS` are unchanged: they are name-dispatched builtins whose
+  dispatch ignores the package, so moving the symbol does not stop the override
+  ([#380](https://github.com/atgreen/evergreen/pull/380);
+  issue [#370](https://github.com/atgreen/evergreen/issues/370)).
 - A package designator that names no package now signals `PACKAGE-ERROR`
   instead of creating the package. `INTERN`, `EXPORT`, `IMPORT`, `SHADOW` and
   `USE-PACKAGE` created it; `FIND-SYMBOL`, `UNUSE-PACKAGE` and
