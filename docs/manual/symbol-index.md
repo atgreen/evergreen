@@ -24,6 +24,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ffi:callback-error` | [Dictionary entry](foreign.md#callbacks) |
 | `egcl-ffi:callback-pointer` | [Dictionary entry](foreign.md#callbacks) |
 | `egcl-ext:cancel-finalization` | [Dictionary entry](memory.md#cancel-finalization) |
+| `egcl-ext:chdir` | [Dictionary entry](user/reference/extensions.md#chdir) |
 | `egcl-ffi:close-foreign-library` | [Dictionary entry](foreign.md#libraries) |
 | `compile` | [Dictionary entry](compiler.md#compile) |
 | `compile-file` | [Dictionary entry](compiler.md#compile-file) |
@@ -35,6 +36,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-thread:current-thread` | [Dictionary entry](concurrency.md#thread-observations) |
 | `java:define-call` | [Dictionary entry](java.md#bindings) |
 | `java:define-class` | [Dictionary entry](java.md#classes) |
+| `egcl-ext:delete-directory` | [Dictionary entry](user/reference/extensions.md#delete-directory) |
 | `egcl-ext:deopt-count` | [Dictionary entry](compiler.md#counters) |
 | `java:describe-class` | [Dictionary entry](java.md#bindings) |
 | `java:error-message` | [Dictionary entry](java.md#java-conditions) |

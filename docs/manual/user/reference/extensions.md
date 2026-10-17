@@ -30,6 +30,24 @@ Returns the process working directory as a string with a trailing slash, or
 `nil` if the host query fails. This is process state; it is not the same thing
 as a dynamically bound Lisp `*default-pathname-defaults*`.
 
+### `egcl-ext:chdir` { #chdir }
+
+**Function** `(egcl-ext:chdir namestring)` → `t`
+
+Changes the process working directory, as POSIX `chdir(2)`, and signals a
+`file-error` if it cannot. It does not change `*default-pathname-defaults*`.
+`uiop:chdir` uses it.
+
+## Directories
+
+### `egcl-ext:delete-directory` { #delete-directory }
+
+**Function** `(egcl-ext:delete-directory namestring)` → `t`
+
+Removes an empty directory, as POSIX `rmdir(2)`, and signals a `file-error`
+if it cannot. `uiop:delete-empty-directory` uses it, and through it
+`uiop:delete-directory-tree`.
+
 ## Subprocesses
 
 ### `egcl-ext:run-program` { #run-program }

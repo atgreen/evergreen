@@ -2387,12 +2387,13 @@ suitable for use as a directory name to segregate Lisp FASLs, C dynamic librarie
       #+cormanlisp (unless (zerop (win32::_chdir (namestring x)))
                      (error "Could not set current directory to ~A" x))
       #+ecl (ext:chdir x)
+      #+egcl (egcl-ext:chdir (namestring x))
       #+clasp (ext:chdir x t)
       #+gcl (system:chdir x)
       #+lispworks (hcl:change-directory x)
       #+mkcl (mk-ext:chdir x)
       #+sbcl (progn (require :sb-posix) (symbol-call :sb-posix :chdir (sb-ext:native-namestring x)))
-      #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl gcl genera lispworks mkcl sbcl scl xcl)
+      #-(or abcl allegro clasp clisp clozure cmucl cormanlisp ecl egcl gcl genera lispworks mkcl sbcl scl xcl)
       (not-implemented-error 'chdir))))
 
 
@@ -3866,6 +3867,7 @@ in an atomic way if the implementation allows."
                                     directory-pathname (unix:get-unix-error-msg errno))))
     #+cormanlisp (win32:delete-directory directory-pathname)
     #+(or clasp ecl) (si:rmdir directory-pathname)
+    #+egcl (egcl-ext:delete-directory (native-namestring directory-pathname))
     #+genera (fs:delete-directory directory-pathname)
     #+lispworks (lw:delete-directory directory-pathname)
     #+mkcl (mkcl:rmdir directory-pathname)
@@ -3873,7 +3875,7 @@ in an atomic way if the implementation allows."
                `(,dd directory-pathname) ;; requires SBCL 1.0.44 or later
                `(progn (require :sb-posix) (symbol-call :sb-posix :rmdir directory-pathname)))
     #+xcl (symbol-call :uiop :run-program `("rmdir" ,(native-namestring directory-pathname)))
-    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp digitool ecl gcl genera lispworks mkcl sbcl scl xcl)
+    #-(or abcl allegro clasp clisp clozure cmucl cormanlisp digitool ecl egcl gcl genera lispworks mkcl sbcl scl xcl)
     (not-implemented-error 'delete-empty-directory "(on your platform)")) ; genera
 
   (defun delete-directory-tree (directory-pathname &key (validate nil validatep) (if-does-not-exist :error))

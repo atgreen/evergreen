@@ -25855,6 +25855,30 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     })
                     .unwrap_or(NIL));
             }
+            "EGCL-EXT:CHDIR" => {
+                // (egcl-ext:chdir namestring) — change the process working
+                // directory, as POSIX chdir(2), for ASDF's chdir (#+egcl). Like
+                // GETCWD this is process state: it does not touch
+                // *DEFAULT-PATHNAME-DEFAULTS*, as sb-posix:chdir does not.
+                let (dir_form, _) = cp(cdr);
+                let dir = val_as_str(eval_form(dir_form, env)?);
+                std::env::set_current_dir(&dir).map_err(|e| {
+                    EgclError::FileError(format!("cannot change directory to {dir}: {e}"))
+                })?;
+                return Ok(T);
+            }
+            "EGCL-EXT:DELETE-DIRECTORY" => {
+                // (egcl-ext:delete-directory namestring) — remove an EMPTY
+                // directory, as POSIX rmdir(2), for ASDF's
+                // delete-empty-directory (#+egcl); delete-directory-tree
+                // empties the tree first.
+                let (dir_form, _) = cp(cdr);
+                let dir = val_as_str(eval_form(dir_form, env)?);
+                std::fs::remove_dir(&dir).map_err(|e| {
+                    EgclError::FileError(format!("cannot delete directory {dir}: {e}"))
+                })?;
+                return Ok(T);
+            }
             "EGCL-EXT:RUN-PROGRAM" => {
                 // (egcl-ext:run-program command) — run a subprocess synchronously,
                 // capturing stdout/stderr. COMMAND is a list of strings (program +
