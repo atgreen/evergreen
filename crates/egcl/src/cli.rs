@@ -7018,7 +7018,7 @@ fn builtin_type_specializer_distance(name: &str, arg: EgclVal) -> Option<usize> 
             .filter(|class| egcl_stdlib::is_structure_class(*class))
             .map(|_| 1),
         "BUILT-IN-CLASS" => class_metaobject_of(arg)
-            .filter(|class| !class.is_symbol())
+            .filter(|class| is_built_in_class_metaobject(*class))
             .map(|_| 1),
         "CLASS" | "METAOBJECT" => class_metaobject_of(arg).map(|_| 3),
         "PACKAGE" => egcl_rt::types::packagep(arg).then_some(1),
@@ -14769,7 +14769,22 @@ fn builtin_supertypes(name: &str) -> Option<&'static [&'static str]> {
         "ARRAY" => &["ATOM", "T"],
         "SEQUENCE" => &["T"],
         "HASH-TABLE" | "FUNCTION" | "PACKAGE" | "PATHNAME" | "STREAM" | "READTABLE"
-        | "RANDOM-STATE" | "RESTART" | "STRUCTURE-OBJECT" => &["ATOM", "T"],
+        | "RANDOM-STATE" | "STRUCTURE-OBJECT" => &["ATOM", "T"],
+        // RESTART's instances ARE standard objects here: the runtime defines it
+        // as a standard class whose instances are the first-class restart
+        // objects (`ensure_restart_class`), which is why the bootstrap leaves it
+        // out of the built-in class ids, and why its precedence list has always
+        // been (RESTART STANDARD-OBJECT T).
+        //
+        // SUBTYPEP alone disagreed, answering (NIL T) for
+        // (subtypep 'restart 'standard-object) while the precedence list said
+        // otherwise. That was invisible while CLASS-OF reported RESTART as a
+        // BUILT-IN-CLASS -- ansi-test's
+        // ALL-STANDARD-CLASSES-ARE-SUBTYPES-OF-STANDARD-OBJECT only examines a
+        // class it is told is standard, so it never asked. Deciding
+        // standard-ness from the class graph (bliss-lkf8l) makes CLASS-OF agree
+        // with the precedence list, which exposes the contradiction here.
+        "RESTART" => &["STANDARD-OBJECT", "ATOM", "T"],
         // Condition classes are standard objects here (ansi
         // all-standard-classes-are-subtypes-of-standard-object).
         "CONDITION" => &["STANDARD-OBJECT", "ATOM", "T"],
@@ -14981,29 +14996,42 @@ fn is_standard_class_metaobject(class: EgclVal) -> bool {
     if egcl_stdlib::is_structure_class(class) {
         return false;
     }
-    if class.is_symbol() {
-        return true;
-    }
     // Condition classes are standard classes here, not built-in ones (ansi
     // defclass.error.24 would otherwise redefine PROGRAM-ERROR).
     if is_condition_class(class) {
         return true;
     }
-    let name = egcl_stdlib::class_name(class);
-    name.is_symbol()
-        && matches!(
-            sym_bare_name_rc(name).as_ref(),
-            "STANDARD-OBJECT"
-                | "CLASS"
-                | "STANDARD-CLASS"
-                | "BUILT-IN-CLASS"
-                | "STRUCTURE-CLASS"
-                | "GENERIC-FUNCTION"
-                | "STANDARD-GENERIC-FUNCTION"
-                | "METHOD"
-                | "STANDARD-METHOD"
-                | "METHOD-COMBINATION"
-        )
+    // A standard class is one whose instances are STANDARD-OBJECTs, which is
+    // precisely what the class's own precedence list records.
+    //
+    // This used to short-circuit on `class.is_symbol()`, because a DEFCLASS
+    // class IS its name symbol while a built-in class is a negative fixnum.
+    // That made the representation the discriminator, and it inverts the moment
+    // a class metaobject stops being an immediate: a user class would fall
+    // through to the hardcoded list of metaobject-class names this function
+    // used to end with, which by construction cannot contain a user class, and
+    // answer `false` — wrongly reporting every user class as built-in. One
+    // line, four silent wrong answers: `class_of_value` below,
+    // TYPEP of a metaclass, the specializer-distance table, and DEFCLASS's own
+    // "is a system class" rejection, which would then refuse every user
+    // superclass (bliss-lkf8l, the first stage of bliss-rj5o).
+    //
+    // The precedence list gives the same answers for every class that list
+    // named, and for user and condition classes too, without consulting the
+    // value's tag. See docs/design/class-metaobjects.md.
+    egcl_stdlib::clos::class_inherits_standard_object(class)
+}
+
+/// Whether `class` is an instance of `BUILT-IN-CLASS`: a class metaobject that
+/// is neither a standard class nor a structure class.
+///
+/// The counterpart of [`is_standard_class_metaobject`], and deliberately
+/// defined in terms of it so the two can never disagree. They used to: TYPEP
+/// asked `!is_struct && !is_standard_class_metaobject(class)` while the
+/// specializer-distance table asked `!class.is_symbol()`, which agreed only by
+/// accident of the current representation.
+fn is_built_in_class_metaobject(class: EgclVal) -> bool {
+    !egcl_stdlib::is_structure_class(class) && !is_standard_class_metaobject(class)
 }
 
 fn class_metaobject_of(object: EgclVal) -> Option<EgclVal> {
@@ -16517,11 +16545,8 @@ fn typep_matches(
                                 && sym_bare_name_rc(name).as_ref() == "STRUCTURE-OBJECT"
                         }
                     }
-                    // Built-in classes are handle-valued (non-symbol); a
-                    // symbol-valued metaobject that is not a struct is a
-                    // DEFCLASS standard class.
                     "STANDARD-CLASS" => is_standard_class_metaobject(class),
-                    "BUILT-IN-CLASS" => !is_struct && !is_standard_class_metaobject(class),
+                    "BUILT-IN-CLASS" => is_built_in_class_metaobject(class),
                     _ => true, // CLASS / METAOBJECT
                 });
             }
