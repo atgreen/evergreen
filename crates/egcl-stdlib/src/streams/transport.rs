@@ -151,36 +151,56 @@ impl StreamHandle {
     }
 
     /// LISTEN distinguishes readable data from EOF without consuming a byte.
+    ///
+    /// Asked only when the stream's own buffer is empty, so for a regular
+    /// file the handle's position is the stream's: the file has input while
+    /// that position is short of its length. The same goes for an
+    /// image-embedded file. A descriptor that is not a regular file (a
+    /// device, a FIFO opened by name) is polled like a pipe.
     pub(super) fn socket_has_input(&self) -> io::Result<bool> {
-        if let Self::Pipe(pipe) = self {
-            let file = &pipe.file;
-            #[cfg(windows)]
-            return Ok(pipe_available(file)?.is_some_and(|count| count > 0));
-            #[cfg(unix)]
-            {
-                use egcl_rt::syscall::{POLLIN, PollFd};
-                let mut descriptor = PollFd {
-                    fd: file.as_raw_fd(),
-                    events: POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: this live pipe owns the descriptor for the call.
-                unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, 0) }
-                    .map_err(|errno| io::Error::from_raw_os_error(errno.abs()))?;
-                return Ok(descriptor.revents & POLLIN != 0);
+        match self {
+            Self::File(file) => {
+                let metadata = file.metadata()?;
+                if metadata.file_type().is_file() {
+                    let mut handle = file;
+                    return Ok(handle.stream_position()? < metadata.len());
+                }
+                descriptor_has_input(file)
             }
+            Self::Memory(cursor) => Ok(cursor.position() < cursor.get_ref().len() as u64),
+            Self::Pipe(pipe) => descriptor_has_input(&pipe.file),
+            Self::Socket(socket) => {
+                if !self.wait_readable(Some(0))? {
+                    return Ok(false);
+                }
+                match socket.peek(&mut [0]) {
+                    Ok(count) => Ok(count > 0),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+                    Err(e) => Err(e),
+                }
+            }
+            Self::Closed => Ok(false),
         }
-        let Self::Socket(socket) = self else {
-            return Ok(false);
+    }
+}
+
+/// Whether a pipe or device descriptor has a byte to read right now: a
+/// zero-timeout poll for input, which does not consume anything.
+fn descriptor_has_input(file: &File) -> io::Result<bool> {
+    #[cfg(windows)]
+    return Ok(pipe_available(file)?.is_some_and(|count| count > 0));
+    #[cfg(unix)]
+    {
+        use egcl_rt::syscall::{POLLIN, PollFd};
+        let mut descriptor = PollFd {
+            fd: file.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
         };
-        if !self.wait_readable(Some(0))? {
-            return Ok(false);
-        }
-        match socket.peek(&mut [0]) {
-            Ok(count) => Ok(count > 0),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
-            Err(e) => Err(e),
-        }
+        // SAFETY: the caller's live handle owns the descriptor for the call.
+        unsafe { egcl_rt::syscall::poll(&mut descriptor, 1, 0) }
+            .map_err(|errno| io::Error::from_raw_os_error(errno.abs()))?;
+        Ok(descriptor.revents & POLLIN != 0)
     }
 }
 
