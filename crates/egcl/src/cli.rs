@@ -13104,10 +13104,16 @@ fn seed_compile_time_binding(env: &mut Env, symbol: EgclVal, value: EgclVal) {
     let name = sym_name(symbol);
     env.set_var(&name, value);
     // Mirror to the bare name for package-qualified symbols, but never for
-    // keywords (see lookup_var_symbol).
+    // keywords (see lookup_var_symbol). The mirror is a frame binding only:
+    // `set_var` would intern a homeless symbol of that bare name, or assign the
+    // global value of one that exists, and the reader then hands such a valued
+    // homeless symbol to every package reading the name without a symbol of its
+    // own — ironclad's compile-time `+BUFFER-SIZE+` became drakma's and then
+    // salza2's, whose DEFPARAMETER of it failed as a constant redefinition.
     let bare = symbol_bare_name(&name);
-    if bare != name && !name.starts_with("KEYWORD:") {
-        env.set_var(&bare, value);
+    if bare != name && !name.starts_with("KEYWORD:") && !Env::set_frame_var(&env.frame, &bare, value)
+    {
+        env.frame.borrow_mut().vars.insert(bare, value);
     }
 }
 
