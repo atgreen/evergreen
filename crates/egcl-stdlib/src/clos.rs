@@ -460,13 +460,53 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
         // tracing a second copy of every cached class reference. Queries cannot
         // run concurrently while the collector holds this registry's lock.
         state.cpl_cache.get_mut().clear();
-        // Registry keys are symbols or private meta-handles and never move.
-        // Payloads can include reader-built lambda lists and other heap values.
+        // `class_registry`'s keys are class NAME symbols and `class_by_name`'s
+        // are Rust strings, so neither needs visiting; the values are class
+        // values and do.
+        //
+        // What this used to say was "registry keys are symbols or private
+        // meta-handles and never move", which was the justification for
+        // visiting no key at all. It stops being true once a class metaobject
+        // is a heap object (bliss-rj5o), and `class_meta` is keyed by the class
+        // VALUE. See the key-marking loops below.
         for value in state.class_registry.values_mut() {
             visit(value);
         }
         for value in state.class_by_name.values_mut() {
             visit(value);
+        }
+        // `class_meta`'s keys and `structure_classes`' members ARE class
+        // values, and a class can be reachable through nothing else:
+        // `bind_class_name(name, NIL)` — `(setf (find-class 'x) nil)`, which
+        // CLHS requires — drops the `class_registry` and `class_by_name`
+        // entries and leaves `class_meta` alone. An obsolete
+        // pre-redefinition class reaches the same state.
+        //
+        // Marked through a COPY, which is the whole trick. A `HashMap` key
+        // cannot be handed out as `&mut` (rewriting it would need a rehash),
+        // and classes do not need one: they never move. So yield a throwaway
+        // copy purely so the collector marks the object, and assert the copy
+        // came back unchanged — that assert IS the test for the invariant.
+        // If a class ever becomes movable it fires here, loudly, instead of
+        // silently leaving a stale key behind; at that point this has to
+        // become a real take/visit/reinsert rehash (the pattern is in
+        // devtools.rs `scan_devtools_roots`), which must be idempotent because
+        // scanners run twice per collection, once to mark and once to relocate.
+        for key in state.class_meta.keys() {
+            let mut marked = *key;
+            visit(&mut marked);
+            debug_assert_eq!(
+                marked, *key,
+                "a class metaobject moved: class_meta's keys need rehashing, not marking"
+            );
+        }
+        for class in &state.structure_classes {
+            let mut marked = *class;
+            visit(&mut marked);
+            debug_assert_eq!(
+                marked, *class,
+                "a structure class moved: structure_classes needs rehashing, not marking"
+            );
         }
         for meta in state.class_meta.values_mut() {
             visit(&mut meta.name);
@@ -479,13 +519,27 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
             for value in &mut meta.slots {
                 visit(value);
             }
+            // `:allocation :class` slot NAMES. Symbols today, so this is
+            // currently a no-op — but the field was simply missed, and the
+            // scanner is the wrong place to rely on a value's representation.
+            for value in &mut meta.shared_slots {
+                visit(value);
+            }
             // The metaclass is a class value like any other, so a moving
             // collection must rewrite it here too -- missing it would leave a
             // stale class handle behind the first GC after a DEFCLASS with
             // :metaclass.
             visit(&mut meta.metaclass);
-            // Wrapper class ids and slot-layout names are the same immediate
-            // meta-handles/symbols represented above, so they need no rewrite.
+            // `meta.wrapper` is deliberately not visited. It is a leaked Rust
+            // Box holding its own `class: EgclVal` copy, plus a `SlotLayout`
+            // of slot-name symbols, all outside the GC heap where no scanner
+            // can reach them — and `class_of` reads that very word. What makes
+            // the copy safe is not that it is an immediate (the old reason
+            // given here, and wrong once a class is a heap object) but that a
+            // class is immortal and never moves: registry-reachable for the
+            // process lifetime, and pinned once bliss-vsjn1 lands. It is also
+            // the word `trace_object` treats as raw for a STANDARD_OBJECT, so
+            // an instance does not root its own class; the registry does.
         }
         if root_definitions {
             for data in state.generic_functions.values_mut() {
