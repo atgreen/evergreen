@@ -7853,6 +7853,11 @@ struct GfMeta {
     generation: u64,
     combination: egcl_stdlib::MethodCombinationType,
     cacheable: bool,
+    /// True if any method on the generic specializes a parameter on a
+    /// METACLASS. Only then does the dispatch key need the more expensive
+    /// per-argument class (see `dispatch_key_class`); for every other generic
+    /// `class_of` is both cheaper and sufficient.
+    metaclass_sensitive: bool,
     /// The generic's argument precedence order (bliss-nj6id). Shared rather than
     /// cloned: dispatch only reads it, and most generics leave it empty.
     precedence: Rc<[usize]>,
@@ -7902,6 +7907,84 @@ fn generic_has_eql_specializer(env: &Env, name: &str) -> bool {
                 .any(|s| matches!(s, MethodSpecializer::Eql(_)))
         })
     })
+}
+
+/// True if any method on `name` specializes a parameter on a metaclass — the
+/// classes whose instances are themselves class metaobjects.
+///
+/// Such a generic answers differently for two arguments that `class_of` and
+/// `dispatch_builtin_discriminator` cannot tell apart, because a class
+/// metaobject IS its own name symbol (or, for a built-in class, a negative
+/// fixnum). `STANDARD-OBJECT` is in the list because its arm in
+/// `builtin_type_specializer_distance` admits any class metaobject too.
+///
+/// A method specialized on a USER metaclass -- `(defclass m (standard-class)
+/// ())` and then `((c m))` -- is deliberately NOT in this list, and that is not
+/// an omission to "complete". Such a method is not applicable to a class
+/// metaobject at all today (GitHub #384 / bliss-r894g): the class is a symbol,
+/// so the specializer never matches and there is nothing for a key to
+/// separate. Once a class metaobject becomes a real instance of its metaclass
+/// (bliss-vsjn1), `egcl_stdlib::is_instance` is true for it, so
+/// `dispatch_builtin_discriminator` returns 0 and the key already holds the
+/// metaclass exactly -- correct without this gate. Listing user metaclasses
+/// here now would mean walking each specializer's precedence list per generic
+/// to ask whether it is a subclass of CLASS, and buying nothing.
+fn generic_dispatches_on_a_metaclass(env: &Env, name: &str) -> bool {
+    env.methods.borrow().get(name).is_some_and(|methods| {
+        methods.iter().any(|m| {
+            m.specializers.iter().any(|s| match s {
+                MethodSpecializer::Class(class) => matches!(
+                    symbol_bare_name(class).as_str(),
+                    "STANDARD-CLASS"
+                        | "STRUCTURE-CLASS"
+                        | "BUILT-IN-CLASS"
+                        | "CLASS"
+                        | "METAOBJECT"
+                        | "STANDARD-OBJECT"
+                ),
+                _ => false,
+            })
+        })
+    })
+}
+
+/// `builtin` bit marking an argument that is a class metaobject.
+///
+/// Needed as well as a distinct `classes` entry, because a class metaobject's
+/// own value can equal another argument's `class_of` answer: `(find-class
+/// 'fixnum)` IS the fixnum class, which is exactly what `class_of` reports for
+/// the integer 7. Keying the class on itself alone would hand those two the
+/// same entry, with identical type bits. Bit 21 — `dispatch_builtin_discriminator`
+/// uses 0..=20.
+const DISPATCH_BIT_CLASS_METAOBJECT: u32 = 1 << 21;
+
+/// The `classes` entry a dispatch-cache key records for one argument.
+///
+/// `egcl_stdlib::class_of` is the wrong answer for a class metaobject: a
+/// DEFCLASS or DEFSTRUCT class is its own name symbol, so `class_of` reports
+/// the SYMBOL class for every one of them, and a built-in class is a negative
+/// fixnum, so it reports FIXNUM — the same answers an unrelated symbol or
+/// integer gives. Two arguments that need DIFFERENT effective methods then
+/// produce a bit-identical key, and the first one dispatched decides for the
+/// other (bliss-xv37u).
+///
+/// A class metaobject is keyed on ITSELF, which is maximally distinct and
+/// costs one registry lookup. Keying it on its metaclass would also be
+/// correct and is what the bead proposed, but `class_of_value` has to derive
+/// that — a second registry lookup plus, since bliss-lkf8l, a precedence-list
+/// walk — and measured ~21% on such a generic where this costs ~1%. A finer
+/// key is always sound: it can only split cache entries, never merge them.
+///
+/// Only ever used to build the key; applicability is computed by
+/// `method_specificity_vector` and is untouched, so the effect is strictly to
+/// stop one argument reusing another argument's decision.
+fn dispatch_key_entry(arg: EgclVal) -> (u64, u32) {
+    let bits = dispatch_builtin_discriminator(arg);
+    if class_metaobject_of(arg).is_some() {
+        (arg.0, bits | DISPATCH_BIT_CLASS_METAOBJECT)
+    } else {
+        (egcl_stdlib::class_of(arg).0, bits)
+    }
 }
 
 /// Map a FIND-METHOD `qualifiers` list to the standard `MethodQualifier`.
@@ -8081,13 +8164,20 @@ fn invoke_generic_function_inner(
     // AND generic_has_eql_specializer iterating EVERY method on every dispatch —
     // O(methods) per call, measurable on many-method generics (asdf). Memoize it,
     // gen-stamped, keyed by the generic's interned symbol index.
-    let (combination, cacheable, precedence) = match gf_idx {
+    let (combination, cacheable, metaclass_sensitive, precedence) = match gf_idx {
         Some(idx) => {
             let hit = GF_META_CACHE.with(|c| {
                 c.borrow()
                     .get(&idx)
                     .filter(|m| m.generation == generation)
-                    .map(|m| (m.combination, m.cacheable, Rc::clone(&m.precedence)))
+                    .map(|m| {
+                        (
+                            m.combination,
+                            m.cacheable,
+                            m.metaclass_sensitive,
+                            Rc::clone(&m.precedence),
+                        )
+                    })
             });
             hit.unwrap_or_else(|| {
                 let combination = env
@@ -8099,6 +8189,7 @@ fn invoke_generic_function_inner(
                 let cacheable =
                     matches!(combination, egcl_stdlib::MethodCombinationType::Standard)
                         && !generic_has_eql_specializer(env, name);
+                let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
                 let precedence: Rc<[usize]> =
                     egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx))
                         .into();
@@ -8109,11 +8200,12 @@ fn invoke_generic_function_inner(
                             generation,
                             combination,
                             cacheable,
+                            metaclass_sensitive,
                             precedence: Rc::clone(&precedence),
                         },
                     );
                 });
-                (combination, cacheable, precedence)
+                (combination, cacheable, metaclass_sensitive, precedence)
             })
         }
         None => {
@@ -8127,7 +8219,11 @@ fn invoke_generic_function_inner(
                 .unwrap_or(egcl_stdlib::MethodCombinationType::Standard);
             let cacheable = matches!(combination, egcl_stdlib::MethodCombinationType::Standard)
                 && !generic_has_eql_specializer(env, name);
-            (combination, cacheable, Rc::from(&[][..]))
+            // No key is built on this path (it needs `gf_idx`), so the flag is
+            // unused here — computed anyway rather than hardcoded, so that
+            // building a key here later cannot silently inherit a wrong value.
+            let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
+            (combination, cacheable, metaclass_sensitive, Rc::from(&[][..]))
         }
     };
     // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
@@ -8139,8 +8235,16 @@ fn invoke_generic_function_inner(
             let mut classes = [0u64; GF_KEY_MAX_ARGS];
             let mut builtin = [0u32; GF_KEY_MAX_ARGS];
             for ((slot, bits), a) in classes.iter_mut().zip(builtin.iter_mut()).zip(args.iter()) {
-                *slot = egcl_stdlib::class_of(*a).0;
-                *bits = dispatch_builtin_discriminator(*a);
+                // `dispatch_key_entry` costs a class-registry lookup per
+                // argument, so it is used only for the generics that need it:
+                // one whose methods specialize on a metaclass, where two class
+                // metaobjects would otherwise share a key (bliss-xv37u).
+                if metaclass_sensitive {
+                    (*slot, *bits) = dispatch_key_entry(*a);
+                } else {
+                    *slot = egcl_stdlib::class_of(*a).0;
+                    *bits = dispatch_builtin_discriminator(*a);
+                }
             }
             GfKey {
                 gf,

@@ -52,6 +52,12 @@
   tables) no longer treat `-0d0` as `0d0`, nor `EQUAL` `-0.0` as `0.0`, and
   `SXHASH` no longer changes when the garbage collector moves an object
   ([#388](https://github.com/atgreen/evergreen/pull/388)).
+- A generic function dispatched on a class object no longer answers whatever
+  the first such call decided. With methods on `STANDARD-CLASS` and
+  `STRUCTURE-CLASS`, whichever class was passed first fixed the answer for
+  every class passed after it, and a method on `BUILT-IN-CLASS` traded
+  decisions with one on `INTEGER` the same way
+  ([#389](https://github.com/atgreen/evergreen/pull/389)).
 - A saved image no longer lets newly compiled code redefine the local
   functions of code it saved. Loading the ocicl runtime in the `make image`
   egcl replaced one inside `PARSE-INTEGER`, after which `(parse-integer "1")`
