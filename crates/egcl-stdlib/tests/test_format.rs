@@ -1398,6 +1398,95 @@ fn format_directive_tilde_colon_at_r_old_roman() {
     );
 }
 
+// ~R English names each three-digit group on the short scale, as SBCL does;
+// it used to say "one thousand million" for 10^9.
+#[test]
+fn format_directive_tilde_r_names_short_scale_groups() {
+    for (n, expected) in [
+        (0, "zero"),
+        (1_001, "one thousand one"),
+        (1_000_000, "one million"),
+        (1_000_000_000, "one billion"),
+        (2_000_003_000_000, "two trillion three million"),
+        (
+            -1_234_567,
+            "negative one million two hundred thirty-four thousand five hundred sixty-seven",
+        ),
+    ] {
+        assert_eq!(
+            format_nil_string("~R", &[EgclVal::from_fixnum(n)]),
+            expected
+        );
+    }
+    assert_eq!(
+        format_nil_string("~:R", &[EgclVal::from_fixnum(1_000_000_000)]),
+        "one billionth"
+    );
+}
+
+// ~R accepts bignums: it used to signal a TYPE-ERROR saying 10^20 was not an
+// integer, and only past the vigintillions is a number too large to name.
+#[test]
+fn format_directive_tilde_r_accepts_bignums() {
+    egcl_rt::rooted!(
+        e20 = egcl_rt::bignum::BigInt::from_mag(1, vec![0x6bc7_5e2d_6310_0000, 5]).to_val()
+    );
+    assert_eq!(format_nil_string("~R", &[*e20]), "one hundred quintillion");
+    assert_eq!(
+        format_nil_string("~:R", &[*e20]),
+        "one hundred quintillionth"
+    );
+    assert_eq!(format_nil_string("~@R", &[*e20]), "100000000000000000000");
+    egcl_rt::rooted!(
+        largest = egcl_rt::bignum::BigInt::from_mag(
+            1,
+            vec![
+                u64::MAX,
+                0x0e3c_bb5a_c574_1c63,
+                0x1cfd_a3a5_6977_58bf,
+                0x097e_dd87
+            ],
+        )
+        .to_val()
+    );
+    assert!(
+        format_nil_string("~R", &[*largest]).starts_with("nine hundred ninety-nine vigintillion ")
+    );
+    egcl_rt::rooted!(
+        too_large = egcl_rt::bignum::BigInt::from_mag(
+            1,
+            vec![0, 0x0e3c_bb5a_c574_1c64, 0x1cfd_a3a5_6977_58bf, 0x097e_dd87],
+        )
+        .to_val()
+    );
+    assert!(format_nil("~R", &[*too_large]).is_err());
+}
+
+// Pad and comma characters are code points, not bytes: `as u8` turned a
+// non-Latin-1 character into a control character.
+#[test]
+fn format_integer_directives_keep_non_latin1_pad_and_comma_chars() {
+    let star = EgclVal::from_char('★');
+    let one = EgclVal::from_fixnum(1);
+    assert_eq!(format_nil_string("~3,vD", &[star, one]), "★★1");
+    assert_eq!(
+        format_nil_string("~3,vX", &[star, EgclVal::from_fixnum(255)]),
+        "★FF"
+    );
+    assert_eq!(
+        format_nil_string("~,,v:D", &[star, EgclVal::from_fixnum(1_234_567)]),
+        "1★234★567"
+    );
+    assert_eq!(
+        format_nil_string("~10,3,vR", &[star, EgclVal::from_fixnum(9)]),
+        "★★9"
+    );
+    assert_eq!(
+        format_nil_string("~10,,,v:R", &[star, EgclVal::from_fixnum(1_234)]),
+        "1★234"
+    );
+}
+
 // ~:P — backs up one arg then plural
 #[test]
 fn format_directive_tilde_colon_p_backup_plural() {

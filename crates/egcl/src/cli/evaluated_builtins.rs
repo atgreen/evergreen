@@ -2852,7 +2852,22 @@ fn resolve(name: &str) -> Option<Handler> {
                     "DECODE-UNIVERSAL-TIME requires a universal time".into(),
                 ));
             }
-            let universal = num_val(args[0])? as i64;
+            // A universal time is a non-negative integer (CLHS 25.1.4.2), the
+            // same range ENCODE-UNIVERSAL-TIME produces. Narrowing through a
+            // float accepted 1.5 and -1 and rounded large values.
+            let universal = args[0];
+            if !(universal.is_fixnum() && universal.as_fixnum() >= 0) {
+                if egcl_rt::bignum::bigint_from_val(universal).is_some_and(|b| b.sign > 0) {
+                    return Err(EgclError::ProgramError(
+                        "DECODE-UNIVERSAL-TIME: universal time too large to decode".into(),
+                    ));
+                }
+                return Err(EgclError::TypeError {
+                    datum: universal,
+                    expected: "unsigned-byte".into(),
+                });
+            }
+            let universal = universal.as_fixnum();
             // The zone is a rational number of hours (ansi decode-universal-time.4
             // uses -70571/3600); convert it exactly to seconds.
             let zone_arg = args.get(1).copied().filter(|v| !v.is_nil());
