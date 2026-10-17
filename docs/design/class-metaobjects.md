@@ -374,7 +374,7 @@ What must change:
    function's pool — at `:9614`. A class literal is encodable today *only*
    because it is a symbol. Either add a by-name class encoding (as pathnames do
    at `:9606`) or prove with a test that no compiled literal holds a class.
-6. **Expect a T2 coverage regression, and decide whether to accept it.** A
+5. **Expect a T2 coverage regression, and decide whether to accept it.** A
    class constant is baked into native code today as an immediate: `emit_const`
    routes `TAG_SYMBOL` to `ConstSymbol` and a fixnum to `ConstFixnum`
    (`crates/egcl-compiler/src/t2/build.rs:3061-3084`), so `(find-class
@@ -387,28 +387,28 @@ What must change:
    class constant loses T2.** Pinned constants are exactly the case that refusal
    need not cover, so the clean fix is to admit a pinned heap constant there
    rather than to accept the regression.
-7. **Two leaked, untraced caches hold class bits compared by address**, both
+6. **Two leaked, untraced caches hold class bits compared by address**, both
    sound only while classes are pinned, and both worth a comment naming that:
    `GF_DISPATCH_CACHE`'s `GfKey.classes` (`cli.rs:8113`) and the receiver type
    profile `ReceiverTypeProfileEntry { receiver_type: AtomicU64 }`
    (`cli/bytecode.rs:19170`, fed from `cli.rs:8042`, compared at `:19217`).
    Immortality is what makes them safe: an address is never recycled, so there
    is no ABA hazard.
-8. **One image-ordering hazard, latent today.** `run_offheap_populate()`
+7. **One image-ordering hazard, latent today.** `run_offheap_populate()`
    rehashes every Lisp hash table (`crates/egcl-rt/src/image.rs:1021`) *before*
    the host hook restores CLOS (`image.rs:1037`), and at that instant every
    restored instance's wrapper word still holds a save-time address, rewritten
    only later (`clos.rs:1106`). Harmless while key hashing never consults CLOS;
    any class-aware or slot-wise `EQUALP` hashing would dereference a dangling
    wrapper there.
-9. **Keep raw, untagged words out of a class object's body.** The restore path
+8. **Keep raw, untagged words out of a class object's body.** The restore path
    remaps *every* 8-byte body word (`gc.rs:7009`) and treats `tag == 0` as a
    bare address (`crates/egcl-rt/src/image_relocation.rs:103`), so a stamp or a
    slot count stored in the body can be silently rewritten if its bits alias a
    saved heap address. Metadata belongs in `ClassMeta` or the wrapper, which is
    where §2 already puts it.
 
-10. **Test the wrapper walk over class objects.** The save/restore wrapper table
+9. **Test the wrapper walk over class objects.** The save/restore wrapper table
    is keyed by save-time address and rewrites word 0 of every
    `STANDARD_OBJECT` found by `walk_heap` (`clos.rs:876`, `:1105`). Once a
    class *is* one, it is visited too — which is what we want, but it is the
