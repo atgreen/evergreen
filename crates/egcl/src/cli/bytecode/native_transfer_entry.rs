@@ -281,6 +281,19 @@ pub(super) struct TransferCode {
     cleanup_depths: std::collections::HashMap<u32, usize>,
     control_scopes: egcl_compiler::control_scope::ScopeMap,
     guard_handler_capacity: usize,
+    /// `BindSpecial` instructions in `body` (sizes each activation's specials).
+    special_binds: usize,
+    /// `PushCatch` instructions in `body` (sizes each activation's catches).
+    catch_pushes: usize,
+    /// Buffers of finished activations, reused by later calls of this code so
+    /// a call does not rebuild them. Only quiescent states with no Lisp value
+    /// left in them are kept; see `ActivationState::recycle`.
+    state_pool: std::cell::RefCell<Vec<ActivationState>>,
+    /// The callable root this code's ordinary segment last retained. Code runs
+    /// for the same function on nearly every call, so `callable_root` hands the
+    /// same root back instead of registering a fresh cross-thread root -- a
+    /// global lock and hash insert, then another to remove it -- per call.
+    last_callable: std::cell::RefCell<Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>>>,
     #[cfg(test)]
     unavailable_catch: Option<u32>,
     #[cfg(test)]
@@ -1079,6 +1092,12 @@ impl TransferCode {
                 })
                 .map(|entry| (site.return_offset, entry.bcp))
         }).collect();
+        // Fixed for this code's lifetime, and every activation sizes buffers by
+        // them: count once here, not by scanning the bytecode on each call.
+        let special_binds = body.code.iter()
+            .filter(|op| matches!(op, Instr::BindSpecial(_))).count();
+        let catch_pushes = body.code.iter()
+            .filter(|op| matches!(op, Instr::PushCatch { .. })).count();
         Some(Self {
             installed_symbol: None,
             is_t2: matches!(tier, CompilationTier::T2),
@@ -1125,7 +1144,29 @@ impl TransferCode {
             cleanup_depths,
             control_scopes: scopes,
             guard_handler_capacity,
+            special_binds,
+            catch_pushes,
+            state_pool: std::cell::RefCell::new(Vec::new()),
+            last_callable: std::cell::RefCell::new(None),
         })
+    }
+
+    /// A root for `function` as this code's callable identity, reusing the one
+    /// from the previous activation when it names the same function.
+    pub(super) fn callable_root(
+        &self,
+        function: EgclVal,
+    ) -> Arc<egcl_rt::CrossThreadRoot<EgclVal>> {
+        egcl_rt::rooted!(function = function);
+        let previous = self.last_callable.borrow().clone();
+        if let Some(root) = previous {
+            if root.with_gc_stable_mutator(|value| *value == *function) {
+                return root;
+            }
+        }
+        let root = Arc::new(egcl_rt::CrossThreadRoot::new(*function));
+        *self.last_callable.borrow_mut() = Some(Arc::clone(&root));
+        root
     }
 
     pub(super) fn run(&self, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {

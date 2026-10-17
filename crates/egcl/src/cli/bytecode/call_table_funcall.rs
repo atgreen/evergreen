@@ -206,7 +206,13 @@ impl Cache {
 }
 
 pub(super) fn is_builtin(symbol: u32) -> bool {
-    egcl_rt::symbols::find_index("FUNCALL") == Some(symbol)
+    // Asked on every mapped native call, so the name is resolved once per
+    // thread rather than hashed into the registry each time.
+    thread_local! {
+        static FUNCALL: std::cell::RefCell<egcl_rt::symbols::ResolvedSymbolName> =
+            std::cell::RefCell::new(egcl_rt::symbols::ResolvedSymbolName::new("FUNCALL"));
+    }
+    FUNCALL.with(|name| name.borrow_mut().refreshed_index()) == Some(symbol)
         && super::super::installed_function(symbol).is_none()
 }
 

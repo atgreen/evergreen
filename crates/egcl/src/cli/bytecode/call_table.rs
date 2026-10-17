@@ -408,8 +408,13 @@ pub(super) unsafe fn is_builtin_funcall(cell: u64) -> bool {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn is_builtin_apply(cell: u64) -> bool {
+    // Asked on every mapped native call; see call_table_funcall::is_builtin.
+    thread_local! {
+        static APPLY: std::cell::RefCell<egcl_rt::symbols::ResolvedSymbolName> =
+            std::cell::RefCell::new(egcl_rt::symbols::ResolvedSymbolName::new("APPLY"));
+    }
     let symbol = unsafe { state(cell) }.symbol;
-    egcl_rt::symbols::find_index("APPLY") == Some(symbol)
+    APPLY.with(|name| name.borrow_mut().refreshed_index()) == Some(symbol)
         && super::super::installed_function(symbol).is_none()
 }
 

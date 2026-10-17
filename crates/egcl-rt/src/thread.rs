@@ -1270,6 +1270,21 @@ fn fiber_registry() -> &'static OrderedMutex<HashMap<FiberId, Arc<Fiber>>> {
 // The fiber mounted on this carrier, if any.
 thread_local! {
     static ACTIVE_FIBER: RefCell<Option<Arc<Fiber>>> = const { RefCell::new(None) };
+    // `ACTIVE_FIBER`'s id (0 = none; fiber ids start at 1), kept in step by
+    // `set_active_fiber`. Every execution-local access asks for the current
+    // fiber id -- several times per native call -- and this answers without a
+    // RefCell borrow or an Arc dereference.
+    static ACTIVE_FIBER_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Mount `fiber` on this carrier (or unmount, with `None`), returning the
+/// previously mounted one. The only writer of `ACTIVE_FIBER`, so its id mirror
+/// can never disagree with it.
+fn set_active_fiber(fiber: Option<Arc<Fiber>>) -> Option<Arc<Fiber>> {
+    let id = fiber.as_ref().map_or(0, |fiber| fiber.id().0);
+    let previous = ACTIVE_FIBER.with(|slot| slot.replace(fiber));
+    ACTIVE_FIBER_ID.with(|slot| slot.set(id));
+    previous
 }
 
 /// Green thread descriptor. D2.01.
@@ -2114,9 +2129,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     pool.workers[carrier_index]
         .current_fiber
         .store(thread.id().0, Ordering::Release);
-    ACTIVE_FIBER.with(|slot| {
-        *slot.borrow_mut() = Some(Arc::clone(&thread));
-    });
+    set_active_fiber(Some(Arc::clone(&thread)));
 
     // This scope stays on the carrier stack. A suspended fiber's registered
     // root chain remains live independently of whichever carrier resumes it.
@@ -2127,7 +2140,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
         // suspended stack still describes the live roots; do not clear it or
         // process the suspension reason a second time.
         drop(mounted_roots);
-        ACTIVE_FIBER.with(|slot| *slot.borrow_mut() = None);
+        set_active_fiber(None);
         pool.workers[carrier_index]
             .current_fiber
             .store(0, Ordering::Release);
@@ -2218,9 +2231,7 @@ fn run_worker_task(pool: &Arc<WorkerPool>, carrier_index: usize, task: WorkerTas
     }
 
     drop(mounted_roots);
-    ACTIVE_FIBER.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
+    set_active_fiber(None);
     pool.workers[carrier_index]
         .current_fiber
         .store(0, Ordering::Release);
@@ -3108,7 +3119,11 @@ pub(crate) fn current_yield_requested() -> bool {
 }
 
 pub fn current_fiber_id() -> Option<FiberId> {
-    current_fiber().map(Fiber::id)
+    ACTIVE_FIBER_ID
+        .try_with(|slot| slot.get())
+        .ok()
+        .filter(|&id| id != 0)
+        .map(FiberId)
 }
 
 pub fn all_fiber_ids() -> Vec<FiberId> {
@@ -3811,12 +3826,12 @@ mod native_context_address_tests {
             struct RestoreMounted(Option<Arc<Fiber>>);
             impl Drop for RestoreMounted {
                 fn drop(&mut self) {
-                    ACTIVE_FIBER.with(|slot| *slot.borrow_mut() = self.0.take());
+                    set_active_fiber(self.0.take());
                 }
             }
             // Test only the selector/identity contract. Actual scheduler
             // migration remains covered by the native recursive fiber fixture.
-            let restore = RestoreMounted(ACTIVE_FIBER.with(|slot| slot.replace(Some(Arc::clone(&fiber)))));
+            let restore = RestoreMounted(set_active_fiber(Some(Arc::clone(&fiber))));
             assert_eq!(current_execution_context_for_native(), Some(pointer));
             fiber.execution().set_carrier_id(17);
             assert_eq!(current_execution_context_for_native(), Some(pointer));

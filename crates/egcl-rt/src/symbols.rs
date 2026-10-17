@@ -367,6 +367,19 @@ impl ResolvedSymbolName {
         }
         find_index(&self.name)
     }
+
+    /// [`Self::index`] for a long-lived snapshot: a stale hit re-resolves and
+    /// keeps the new answer, so only the first use after a rename or image
+    /// restore pays for the registry lookup. A miss still looks again every
+    /// time, as `index` does.
+    pub fn refreshed_index(&mut self) -> Option<u32> {
+        let generation = NAME_GENERATION.load(Ordering::Acquire);
+        if self.index.is_none() || generation != self.generation {
+            self.index = find_index(&self.name);
+            self.generation = generation;
+        }
+        self.index
+    }
 }
 
 /// All interned symbols as `(index, name)` pairs, in index order — one lock

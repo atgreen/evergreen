@@ -211,6 +211,16 @@
   invisible inside it
   ([#363](https://github.com/atgreen/evergreen/pull/363)).
 
+### Performance
+
+- Calls made from compiled (native) code into other compiled functions are
+  cheaper: a call no longer looks `FUNCALL`/`APPLY` up by name, rebuilds the
+  callee's per-call buffers, rescans its bytecode or registers a global root
+  for it, and finding the current execution's state is quicker. A recursive
+  native caller spends about 27% less per call (about 38% when it establishes a
+  `HANDLER-CASE`), and a cached `(asdf:load-system :babel)` is about 5% faster
+  ([#390](https://github.com/atgreen/evergreen/pull/390)).
+
 ## 0.0.9 - 2026-10-15
 
 ### ANSI conformance

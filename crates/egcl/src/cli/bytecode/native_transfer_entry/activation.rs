@@ -43,29 +43,10 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
 }
 
 impl ActivationState {
-    pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
-        let special_capacity = code.body.code.iter()
-            .filter(|op| matches!(op, Instr::BindSpecial(_))).count();
-        let mut specials = Vec::new();
-        specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
-        let guard_resume = if code.has_deopt {
-            #[cfg(test)]
-            if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
-                return Err(EgclError::Oom);
-            }
-            let mut state = OuterResumeState {
-                debug_call: None,
-                handlers: Vec::new(),
-                cleanup_conts: Vec::new(),
-                dyn_binds: Vec::new(),
-            };
-            state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
-            state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
-            state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
-            Some(state)
-        } else {
-            None
-        };
+    /// The per-call reservations in the live Env and control-value map. A
+    /// pooled activation still makes them on every entry: they track the
+    /// current dynamic state, not the code.
+    fn reserve_env(code: &TransferCode, env: &mut Env) -> Result<(), EgclError> {
         // Reserve the control-value map while the caller can still report an
         // ordinary storage condition. Once generated code is running, payload
         // retirement and restoration must not discover a rehash allocation in
@@ -75,13 +56,7 @@ impl ActivationState {
             .cleanup_depths
             .len()
             .saturating_add(code.body.handler_cases.len())
-            .saturating_add(
-                code.body
-                    .code
-                    .iter()
-                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
-                    .count(),
-            )
+            .saturating_add(code.catch_pushes)
             .saturating_mul(4)
             .saturating_add(4);
         reserve_control_values(reserve).map_err(|_| EgclError::Oom)?;
@@ -103,14 +78,75 @@ impl ActivationState {
             }))
             .map_err(|_| EgclError::Oom)?;
         env.catch_stack
-            .try_reserve(
-                code.body
-                    .code
-                    .iter()
-                    .filter(|instruction| matches!(instruction, Instr::PushCatch { .. }))
-                    .count(),
-            )
+            .try_reserve(code.catch_pushes)
             .map_err(|_| EgclError::Oom)?;
+        Ok(())
+    }
+
+    /// `prepare`, reusing a finished activation's buffers when the code has
+    /// one pooled (see `recycle`). Recursion simply finds the pool empty.
+    pub(super) fn prepare_reusing(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+        let pooled = code.state_pool.borrow_mut().pop();
+        let Some(mut state) = pooled else {
+            return Self::prepare(code, env);
+        };
+        Self::reserve_env(code, env)?;
+        state.catch_base = env.catch_stack.len();
+        Ok(state)
+    }
+
+    /// Return a finished activation's buffers to its code for the next call,
+    /// or drop them. Only a quiescent state qualifies -- no registrations,
+    /// saved specials, prepared transfer, OSR hand-off or restart templates --
+    /// and its snapshots are cleared first, so nothing in the pool holds a
+    /// Lisp value that the collector would need to trace.
+    pub(super) fn recycle(mut self, code: &TransferCode) {
+        let guard_idle = self.guard_resume.as_ref().is_none_or(|guard| {
+            guard.debug_call.is_none()
+                && guard.handlers.is_empty()
+                && guard.cleanup_conts.is_empty()
+                && guard.dyn_binds.is_empty()
+        });
+        if !(self.is_quiescent()
+            && guard_idle
+            && self.ready_osr.is_none()
+            && self.restart_templates.0.is_empty())
+        {
+            return;
+        }
+        for snapshot in &mut self.snapshots {
+            snapshot.clear();
+        }
+        self.cluster_frames.clear();
+        let mut pool = code.state_pool.borrow_mut();
+        if pool.len() < 4 {
+            pool.push(self);
+        }
+    }
+
+    pub(super) fn prepare(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
+        let special_capacity = code.special_binds;
+        let mut specials = Vec::new();
+        specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
+        let guard_resume = if code.has_deopt {
+            #[cfg(test)]
+            if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
+                return Err(EgclError::Oom);
+            }
+            let mut state = OuterResumeState {
+                debug_call: None,
+                handlers: Vec::new(),
+                cleanup_conts: Vec::new(),
+                dyn_binds: Vec::new(),
+            };
+            state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
+            state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
+            state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
+            Some(state)
+        } else {
+            None
+        };
+        Self::reserve_env(code, env)?;
         let snapshots = code
             .sites
             .sites()
@@ -118,13 +154,7 @@ impl ActivationState {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| invalid_capture())?;
         let cleanups = Vec::<SavedCleanup>::with_capacity(code.cleanup_depths.len());
-        let catches = Vec::<SavedCatch>::with_capacity(
-            code.body
-                .code
-                .iter()
-                .filter(|i| matches!(i, Instr::PushCatch { .. }))
-                .count(),
-        );
+        let catches = Vec::<SavedCatch>::with_capacity(code.catch_pushes);
         let handlers = Vec::<SavedHandler>::with_capacity(code.body.handler_cases.len());
         let handler_binds = Vec::<SavedHandlerBind>::with_capacity(code.body.handler_binds.len());
         let restart_cases = Vec::<SavedRestartCase>::with_capacity(code.body.restart_cases.len());

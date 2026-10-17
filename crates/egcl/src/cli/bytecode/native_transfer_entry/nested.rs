@@ -248,7 +248,7 @@ unsafe fn prepare_child(
     };
     validate_declared_args(&code.body, args)?;
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-    let state = ActivationState::prepare(&code, env)?;
+    let state = ActivationState::prepare_reusing(&code, env)?;
     let children = unsafe { (*parent).children };
     unsafe { (*children).active.try_reserve(1) }.map_err(|_| EgclError::Oom)?;
     let mut child = Box::new(ChildActivation {
@@ -333,7 +333,10 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn finish_nested(record: *mut Map
     unsafe {
         (*record).owner = std::ptr::null_mut();
     }
-    drop(retired);
+    // Hand the finished activation's buffers back to its code for the next
+    // call (or drop them; see ActivationState::recycle).
+    let ChildActivation { code, state, .. } = *retired;
+    state.recycle(&code);
     // The Rust retirement boundary does not promise to preserve native result
     // registers or flags. Reconstruct them from the still-materialized tuple
     // after every potentially mutating retirement operation has finished.
