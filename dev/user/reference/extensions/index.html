@@ -1135,6 +1135,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#digests-and-cipher-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Digests and cipher blocks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Digests and cipher blocks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sha256" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:sha256
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#crc32" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:crc32
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#crypto-block-primitives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Block primitives
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#atomic-updates" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2096,6 +2146,56 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#digests-and-cipher-blocks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Digests and cipher blocks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Digests and cipher blocks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sha256" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:sha256
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#crc32" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:crc32
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#crypto-block-primitives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Block primitives
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#atomic-updates" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2212,6 +2312,46 @@ does not treat zero as a terminator, so pass the position of the first zero as
 <code>:default</code> means UTF-8. ASCII encoding rejects non-ASCII characters. Both
 decoders replace malformed input with U+FFFD, rather than signalling as SBCL's
 default decoder does. Other external formats are not supported.</p>
+<h2 id="digests-and-cipher-blocks">Digests and cipher blocks<a class="headerlink" href="#digests-and-cipher-blocks" title="Permanent link">&para;</a></h2>
+<p>These functions run in the runtime rather than in Lisp. Every octet argument
+holds integers in 0–255. An element outside that range signals <code>type-error</code>
+instead of being truncated. <code>sha256</code> and <code>crc32</code> accept any sequence. The
+block primitives take simple vectors, which is what <code>make-array</code> returns for
+an <code>(unsigned-byte 8)</code> or <code>(unsigned-byte 32)</code> element type.</p>
+<h3 id="sha256"><code>egcl-ext:sha256</code><a class="headerlink" href="#sha256" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:sha256 octets)</code> → 32-octet vector</p>
+<p>Returns the SHA-256 digest of the sequence <code>octets</code> as a fresh 32-element
+vector.</p>
+<h3 id="crc32"><code>egcl-ext:crc32</code><a class="headerlink" href="#crc32" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:crc32 octets)</code> → integer</p>
+<p>Returns the CRC-32 of <code>octets</code>, using the polynomial of ZIP, gzip and PNG.</p>
+<h3 id="crypto-block-primitives">Block primitives<a class="headerlink" href="#crypto-block-primitives" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-aes-encrypt-block round-keys n-rounds in in-start out out-start)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-aes-decrypt-block round-keys n-rounds in in-start out out-start)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-ghash-mul accumulator hash-key)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-sha256-block registers octets start)</code> → <code>nil</code></p>
+<p><strong>Function</strong> <code>(egcl-ext:crypto-sha256-words registers words)</code> → <code>nil</code></p>
+<p>These are the inner functions of AES, GCM and SHA-256. EGCL's port of
+Ironclad calls them in place of its portable Lisp versions, the way Ironclad
+uses assembly routines on SBCL. Each one updates its destination in place,
+using Ironclad's data layout. Applications should normally call Ironclad
+rather than these functions.</p>
+<ul>
+<li>The AES functions transform the 16 octets of <code>in</code> from <code>in-start</code> and store
+  the result in <code>out</code> from <code>out-start</code>. <code>round-keys</code> is a vector of 60
+  <code>(unsigned-byte 32)</code> words, holding the expanded key in FIPS-197 word order,
+  and <code>n-rounds</code> is 10, 12 or 14. For decryption, the round keys are in
+  reverse round order, with InvMixColumns applied to every round but the first
+  and last.</li>
+<li><code>crypto-ghash-mul</code> replaces the 16-octet <code>accumulator</code> with its product
+  with <code>hash-key</code> in GCM's GF(2^128). Both are big-endian, as in SP 800-38D.</li>
+<li><code>crypto-sha256-block</code> compresses the 64 octets of <code>octets</code> from <code>start</code> into
+  <code>registers</code>, a vector of eight <code>(unsigned-byte 32)</code> words.
+  <code>crypto-sha256-words</code> compresses a message block held as the first sixteen
+  big-endian words of <code>words</code>.</li>
+</ul>
+<p>A destination or source that is too short signals <code>type-error</code>, and a wrong
+argument count signals <code>program-error</code>.</p>
 <h2 id="atomic-updates">Atomic updates<a class="headerlink" href="#atomic-updates" title="Permanent link">&para;</a></h2>
 <p><strong>Macro</strong> <code>(egcl-ext:cas place old new)</code> → previous value</p>
 <p><strong>Macro</strong> <code>(egcl-ext:atomic-incf place &amp;optional (delta 1))</code> → previous value</p>
