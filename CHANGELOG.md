@@ -44,6 +44,10 @@
 
 ### Fixed
 
+- Several threads may read one hash table at once, as in SBCL; only writes
+  need exclusive access. Concurrent lookups in a table keyed by conses or
+  other objects hashed by address used to crash once a garbage collection
+  moved its keys ([#400](https://github.com/atgreen/evergreen/pull/400)).
 - Threads running interpreted code no longer crash while another thread
   collects garbage. A `:synchronized t` hash table now takes its lock on every
   operation as documented; it never did, and the interpreter's shared

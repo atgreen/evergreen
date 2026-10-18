@@ -190,3 +190,29 @@ fn equal_table_keeps_a_mutated_general_vector_key() {
         "(:FOUND T)"
     );
 }
+
+/// Threads may read one unsynchronized table at once, as in SBCL. After a
+/// collection moves its cons keys, each reader that touched the table used to
+/// rebuild its buckets in place, freeing the ones the other reader was probing:
+/// two compiled readers crashed on every run while a third thread collected.
+#[test]
+fn concurrent_readers_survive_a_moving_gc() {
+    let out = eval(CONCURRENT_READERS);
+    assert_eq!(out, "(42 42)");
+}
+
+const CONCURRENT_READERS: &str = "(progn \
+   (defparameter *reader-keys* (loop for i below 300 collect (list i))) \
+   (defparameter *reader-table* (make-hash-table :test 'eq)) \
+   (loop for key in *reader-keys* for i from 0 \
+         do (setf (gethash key *reader-table*) i)) \
+   (defun read-every-key () \
+     (loop repeat 20 do \
+       (loop for key in *reader-keys* for i from 0 \
+             unless (eql (gethash key *reader-table*) i) \
+               do (error \"lost key ~a\" i))) \
+     42) \
+   (let ((one (egcl-thread:make-thread 'read-every-key)) \
+         (two (egcl-thread:make-thread 'read-every-key))) \
+     (loop repeat 200 do (egcl-ext:gc)) \
+     (list (egcl-thread:join-thread one) (egcl-thread:join-thread two))))";

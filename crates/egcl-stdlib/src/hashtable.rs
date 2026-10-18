@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::sync::Once;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use egcl_rt::error::EgclError;
 use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 use egcl_rt::object::{CompiledFunctionData, ConsCell, ObjectHeader, type_id};
@@ -43,8 +43,8 @@ fn register_live_table(ptr: usize) {
 
 /// GC external root scanner: yield every live hash table's entry key and value
 /// slots so the collector marks + relocates them. Runs while the collector holds
-/// the heap lock, so it only reads the table registry and the (stable, leaked)
-/// entry Vecs — it never allocates on the GC heap.
+/// the heap lock, so it only reads the table registry and each table's current
+/// [`Buckets`] — it never allocates on the GC heap.
 fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     let guard = LIVE_TABLES.lock().unwrap();
     let Some(tables) = guard.as_ref() else {
@@ -52,7 +52,8 @@ fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     };
     for &addr in tables {
         // SAFETY: entries in LIVE_TABLES are leaked HashTableInner allocations
-        // that live for the process; their entry Vec is stable during a GC.
+        // that live for the process; the world is stopped, so nothing else
+        // touches their buckets.
         unsafe {
             let inner = addr as *mut HashTableInner;
             let weakness = (*inner).weakness;
@@ -62,7 +63,7 @@ fn scan_hash_table_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
             // drops dead entries (R3.13).
             let key_is_weak = matches!(weakness, Some(Weakness::Key | Weakness::KeyAndValue));
             let value_is_weak = matches!(weakness, Some(Weakness::Value | Weakness::KeyAndValue));
-            for slot in (*inner).entries.iter_mut() {
+            for slot in buckets_mut(&mut (*inner).buckets).entries.iter_mut() {
                 if let Some(entry) = slot.as_mut() {
                     if !key_is_weak {
                         visit(&mut entry.key as *mut EgclVal);
@@ -88,10 +89,12 @@ pub fn shake_root_scanner() -> egcl_rt::gc::RootScanner {
 ///
 /// `resolve` relocates the slot it is given and answers whether that object is
 /// still live. Runs under the collector's heap lock, so it touches only the table
-/// registry and the (leaked, stable) entry vectors and performs no EGCL
-/// allocation. Removing entries changes bucket occupancy, so a table that lost
-/// any entry is rehashed in place — the same pure reordering
-/// `maybe_rehash_for_gc` performs.
+/// registry and the tables' buckets and performs no EGCL allocation. Removing
+/// entries changes bucket occupancy, so a table that lost any entry gets freshly
+/// placed buckets, as `placed_buckets` would build.
+///
+/// Every collection runs this with the world stopped, so it is also where the
+/// buckets retired since the previous collection are freed.
 fn process_weak_table_entries(resolve: &dyn Fn(*mut EgclVal) -> bool) {
     let guard = LIVE_TABLES.lock().unwrap();
     let Some(tables) = guard.as_ref() else {
@@ -105,7 +108,7 @@ fn process_weak_table_entries(resolve: &dyn Fn(*mut EgclVal) -> bool) {
                 continue;
             };
             let mut removed = 0usize;
-            for slot in (*inner).entries.iter_mut() {
+            for slot in buckets_mut(&mut (*inner).buckets).entries.iter_mut() {
                 let Some(entry) = slot.as_mut() else {
                     continue;
                 };
@@ -137,11 +140,16 @@ fn process_weak_table_entries(resolve: &dyn Fn(*mut EgclVal) -> bool) {
             }
             if removed > 0 {
                 (*inner).count -= removed;
-                rehash_in_place(&mut *inner);
-                (*inner).gc_gen = egcl_rt::gc::gc_move_epoch();
+                let rebuilt = build_buckets((*inner).buckets(), (*inner).capacity(), (*inner).test);
+                (*inner).publish(rebuilt);
+                (*inner)
+                    .placement
+                    .store(placed_at(egcl_rt::gc::gc_move_epoch()), Ordering::Release);
             }
         }
     }
+    drop(guard);
+    free_retired_buckets();
 }
 
 /// Hash table test function.
@@ -200,9 +208,9 @@ struct RHEntry {
 struct HashTableInner {
     header: ObjectHeader,
     test: HashTest,
-    entries: Vec<Option<RHEntry>>,
+    /// The current [`Buckets`]: replaced, never edited, while readers may share it.
+    buckets: AtomicPtr<Buckets>,
     count: usize,
-    capacity: usize,
     rehash_size: f64,
     rehash_threshold: f64,
     synchronized: bool,
@@ -216,25 +224,20 @@ struct HashTableInner {
     /// (fixnum/char/string/symbol/cons-of-stable keys) stay `false` and are
     /// never rehashed for GC (bliss-jtc.22 / bliss-cpje).
     address_sensitive: bool,
-    /// The `gc_move_epoch()` at which this table's bucket placement was last
-    /// valid. When it differs from the current generation and the table is
-    /// `address_sensitive`, the next access rehashes in place first.
-    gc_gen: u64,
-    /// A clear bit proves absence without reading an entry. Eight bit positions
-    /// per bucket keep false positives uncommon at normal load. Deletion leaves
-    /// bits set; clearing or rebuilding removes those harmless false positives.
-    miss_filter: Vec<u64>,
+    /// `placed_at(epoch)` for the `gc_move_epoch()` at which the buckets'
+    /// positions last matched their keys' hashes, with [`REHASHING`] set while a
+    /// reader rebuilds them. When the epoch is stale and the table is
+    /// `address_sensitive`, the next access rebuilds first (`placed_buckets`).
+    placement: AtomicU64,
     /// Taken by every operation on a `:synchronized t` table (R5.33).
     lock: TableLock,
 }
 
 /// The per-table lock of a synchronized hash table (R5.33).
 ///
-/// Even a lookup writes the table: after a GC relocates an address-hashed key,
-/// the next access rebuilds the bucket vector in place (`maybe_rehash_for_gc`),
-/// so two threads probing one shared table at once could both replace and free
-/// it. That is how concurrent tree-walker threads corrupted the heap through the
-/// shared macro-expansion cache.
+/// Concurrent readers are safe on any table (see [`Buckets`]), but a writer
+/// updates the buckets in place, so a table that threads both read and write --
+/// such as the tree-walker's shared macro-expansion cache -- needs this lock.
 ///
 /// Reentrant, because EQUALP hashes and compares hash-table keys by reading
 /// them while the outer table is held. A holder never allocates or reaches a
@@ -308,6 +311,104 @@ fn lock_table(ptr: *mut HashTableInner) -> TableGuard {
     }
     lock.depth.fetch_add(1, Ordering::Relaxed);
     TableGuard(lock)
+}
+
+/// One generation of a table's slots, with the miss filter that summarizes them.
+///
+/// Like SBCL's, an unsynchronized table may be read by several threads at once
+/// (only a write needs exclusive access), even though a read can have to rebuild
+/// the table: after a collection relocates an address-hashed key, the key sits in
+/// the bucket for its old address. The first reader to notice claims the rebuild
+/// (`placed_buckets`), places the entries into fresh `Buckets` and publishes
+/// them. It never edits the buckets it replaces, which other readers may still
+/// be probing; it retires them, and the next collection frees them. A probe
+/// allocates nothing and so reaches no safepoint, which means none can still be
+/// running when that collection stops the world. Only a writer, which has the
+/// table to itself, updates buckets in place.
+struct Buckets {
+    entries: Vec<Option<RHEntry>>,
+    /// A clear bit proves absence without reading an entry. Eight bit positions
+    /// per bucket keep false positives uncommon at normal load. Deletion leaves
+    /// bits set; clearing or rebuilding removes those harmless false positives.
+    miss_filter: Vec<u64>,
+    /// The next entry of [`RETIRED_BUCKETS`], once these are retired.
+    next_retired: *mut Buckets,
+}
+
+impl Buckets {
+    fn empty(capacity: usize) -> Box<Self> {
+        Box::new(Buckets {
+            entries: vec![None; capacity],
+            miss_filter: empty_miss_filter(capacity),
+            next_retired: std::ptr::null_mut(),
+        })
+    }
+
+    fn capacity(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// A table's buckets, for a writer, which has the table to itself. Borrowing
+/// only the field leaves the table's other fields free to update.
+fn buckets_mut(buckets: &mut AtomicPtr<Buckets>) -> &mut Buckets {
+    // Safety: a table always holds published buckets, which stay allocated
+    // while they are current.
+    unsafe { &mut **buckets.get_mut() }
+}
+
+impl HashTableInner {
+    /// The current buckets, which other readers may be probing too.
+    fn buckets(&self) -> &Buckets {
+        // Safety: buckets stay allocated until the collection after they are
+        // replaced, and no table operation can span a collection.
+        unsafe { &*self.buckets.load(Ordering::Acquire) }
+    }
+
+    fn capacity(&self) -> usize {
+        self.buckets().capacity()
+    }
+
+    /// Make `new` current and retire the buckets it replaces.
+    fn publish(&self, new: Box<Buckets>) {
+        retire_buckets(self.buckets.swap(Box::into_raw(new), Ordering::AcqRel));
+    }
+}
+
+/// Buckets replaced since the last collection. Any thread may push; only a
+/// collection, with the world stopped, drains them.
+static RETIRED_BUCKETS: AtomicPtr<Buckets> = AtomicPtr::new(std::ptr::null_mut());
+
+fn retire_buckets(old: *mut Buckets) {
+    let mut head = RETIRED_BUCKETS.load(Ordering::Relaxed);
+    loop {
+        // Safety: `old` is no longer published, so only this thread links it.
+        unsafe { (*old).next_retired = head };
+        match RETIRED_BUCKETS.compare_exchange_weak(head, old, Ordering::Release, Ordering::Relaxed)
+        {
+            Ok(_) => return,
+            Err(current) => head = current,
+        }
+    }
+}
+
+/// Free every retired [`Buckets`]. Only while the world is stopped.
+fn free_retired_buckets() {
+    let mut next = RETIRED_BUCKETS.swap(std::ptr::null_mut(), Ordering::Acquire);
+    while !next.is_null() {
+        // Safety: retired buckets are unreachable from every table, and no
+        // reader can still hold them once the world has stopped.
+        let retired = unsafe { Box::from_raw(next) };
+        next = retired.next_retired;
+    }
+}
+
+/// Set in [`HashTableInner::placement`] while a reader rebuilds the buckets.
+const REHASHING: u64 = 1;
+
+/// The placement of buckets positioned by their keys' hashes as of `epoch`.
+fn placed_at(epoch: u64) -> u64 {
+    epoch << 1
 }
 
 // Small tables already fit in cache; avoid the extra filter lookup there.
@@ -830,8 +931,9 @@ fn hash_for_test(object: EgclVal, test: HashTest) -> u64 {
 // relocates such objects and rewrites the pointer stored in the table's entry,
 // but never recomputes the entry's bucket, so a later probe (which hashes the
 // NEW address) looks in the wrong bucket and misses a live key. `hash_key`
-// reports which keys those are, and a table holding one is rehashed in place
-// the first time it is touched in a new GC generation. Symbols and their name
+// reports which keys those are, and a table holding one gets freshly placed
+// buckets the first time it is touched in a new GC generation (see [`Buckets`]
+// for how concurrent readers share that rebuild). Symbols and their name
 // strings are pinned and immortal, so symbol/string keys are stable and never
 // trigger a rehash.
 
@@ -849,57 +951,95 @@ fn is_movable_pointer(object: EgclVal) -> bool {
     false
 }
 
-/// Rebuild the table's bucket placement at the current capacity from the live
-/// entries' *current* key hashes. Pure reordering of existing `EgclVal`s — no
-/// EGCL allocation — so it is GC-safe (no collection can fire during it).
-fn rehash_in_place(inner: &mut HashTableInner) {
-    let cap = inner.capacity;
-    let mut new_entries: Vec<Option<RHEntry>> = vec![None; cap];
-    let mut miss_filter = empty_miss_filter(cap);
-    for e in inner.entries.iter().flatten() {
-        let hash = hash_for_test(e.key, inner.test);
-        record_key_hash(&mut miss_filter, hash);
-        let mut idx = probe_index(hash, cap);
+/// Place `old`'s entries into fresh buckets of `capacity`, by their keys'
+/// *current* hashes. Pure reordering of existing `EgclVal`s — no EGCL
+/// allocation — so it is GC-safe (no collection can fire during it).
+fn build_buckets(old: &Buckets, capacity: usize, test: HashTest) -> Box<Buckets> {
+    let mut new = Buckets::empty(capacity);
+    for e in old.entries.iter().flatten() {
+        let hash = hash_for_test(e.key, test);
+        record_key_hash(&mut new.miss_filter, hash);
+        let mut idx = probe_index(hash, capacity);
         let mut incoming = RHEntry {
             key: e.key,
             value: e.value,
             probe_dist: 0,
         };
         loop {
-            match &new_entries[idx] {
+            match &new.entries[idx] {
                 None => {
-                    new_entries[idx] = Some(incoming);
+                    new.entries[idx] = Some(incoming);
                     break;
                 }
                 Some(occupant) => {
+                    // Robin Hood: swap if incoming has traveled farther
                     if incoming.probe_dist > occupant.probe_dist {
                         let displaced = *occupant;
-                        new_entries[idx] = Some(incoming);
+                        new.entries[idx] = Some(incoming);
                         incoming = displaced;
                     }
                 }
             }
             incoming.probe_dist += 1;
-            idx = (idx + 1) & (cap - 1);
+            idx = (idx + 1) & (capacity - 1);
         }
     }
-    inner.entries = new_entries;
-    inner.miss_filter = miss_filter;
+    new
 }
 
-/// If this table hashes any key by a movable address and the GC has run since it
-/// was last valid, rehash it in place so bucket positions match current key
-/// hashes. Must be called at the start of every access that probes by hash
-/// (bliss-jtc.22 / bliss-cpje).
-fn maybe_rehash_for_gc(inner: &mut HashTableInner) {
+/// What a probe should search.
+enum Lookup<'a> {
+    /// Buckets positioned by their keys' current hashes: probe by hash.
+    Placed(&'a Buckets),
+    /// Another reader is rebuilding the placement. These buckets hold every
+    /// entry but in stale positions, so search them linearly.
+    Unplaced(&'a Buckets),
+}
+
+/// The buckets to probe. If this table hashes any key by a movable address and
+/// the GC has run since its placement was valid, the first caller rebuilds the
+/// buckets by the current hashes (bliss-jtc.22 / bliss-cpje); concurrent
+/// readers meanwhile search the old ones linearly, much as SBCL's do. Must be
+/// called by every access that probes by hash.
+fn placed_buckets(inner: &HashTableInner) -> Lookup<'_> {
     if !inner.address_sensitive {
-        return;
+        return Lookup::Placed(inner.buckets());
     }
-    let epoch = egcl_rt::gc::gc_move_epoch();
-    if inner.gc_gen != epoch {
-        rehash_in_place(inner);
-        inner.gc_gen = epoch;
+    let current = placed_at(egcl_rt::gc::gc_move_epoch());
+    loop {
+        let state = inner.placement.load(Ordering::Acquire);
+        if state == current {
+            return Lookup::Placed(inner.buckets());
+        }
+        if state & REHASHING != 0 {
+            return Lookup::Unplaced(inner.buckets());
+        }
+        if inner
+            .placement
+            .compare_exchange(
+                state,
+                state | REHASHING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let old = inner.buckets();
+            inner.publish(build_buckets(old, old.capacity(), inner.test));
+            inner.placement.store(current, Ordering::Release);
+            return Lookup::Placed(inner.buckets());
+        }
     }
+}
+
+/// Find `key` without relying on slot positions.
+fn search_unplaced(buckets: &Buckets, key: EgclVal, test: HashTest) -> Option<EgclVal> {
+    buckets
+        .entries
+        .iter()
+        .flatten()
+        .find(|entry| keys_equal(entry.key, key, test))
+        .map(|entry| entry.value)
 }
 
 // ── Hash table operations ──────────────────────────────────────────
@@ -922,21 +1062,18 @@ pub fn make_hash_table(options: &MakeHashTableOptions) -> Result<EgclVal, EgclEr
     }
 
     let capacity = next_power_of_two(options.size.max(16));
-    let entries = vec![None; capacity];
 
     let inner = Box::new(HashTableInner {
         header: ObjectHeader::new(type_id::HASH_TABLE, 0),
         test: options.test,
-        entries,
+        buckets: AtomicPtr::new(Box::into_raw(Buckets::empty(capacity))),
         count: 0,
-        capacity,
         rehash_size: options.rehash_size,
         rehash_threshold: options.rehash_threshold,
         synchronized: options.synchronized,
         weakness: options.weakness,
         address_sensitive: false,
-        gc_gen: egcl_rt::gc::gc_move_epoch(),
-        miss_filter: empty_miss_filter(capacity),
+        placement: AtomicU64::new(placed_at(egcl_rt::gc::gc_move_epoch())),
         lock: TableLock::new(),
     });
 
@@ -1063,6 +1200,7 @@ pub fn serialize_live_tables() -> Vec<u8> {
             out.push(weakness_to_u8((*inner).weakness));
             out.push((*inner).synchronized as u8);
             let live: Vec<(EgclVal, EgclVal)> = (*inner)
+                .buckets()
                 .entries
                 .iter()
                 .filter_map(|e| e.as_ref().map(|e| (e.key, e.value)))
@@ -1211,19 +1349,26 @@ pub fn gethash(
     let ptr = get_table_inner(table)?;
     let _lock = lock_table(ptr);
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
-    // We create exactly one &mut reference from the raw pointer per call.
-    let inner = unsafe { &mut *ptr };
-    maybe_rehash_for_gc(inner);
-    let cap = inner.capacity;
+    // Other threads may be reading it too, so take only a shared reference.
+    let inner = unsafe { &*ptr };
     let test = inner.test;
+    let buckets = match placed_buckets(inner) {
+        Lookup::Placed(buckets) => buckets,
+        Lookup::Unplaced(buckets) => {
+            return Ok(
+                search_unplaced(buckets, key, test).map_or((default, false), |value| (value, true))
+            );
+        }
+    };
+    let cap = buckets.capacity();
     let key_hash = hash_for_test(key, test);
-    if cap >= MISS_FILTER_MIN_CAPACITY && !hash_may_be_present(&inner.miss_filter, key_hash) {
+    if cap >= MISS_FILTER_MIN_CAPACITY && !hash_may_be_present(&buckets.miss_filter, key_hash) {
         return Ok((default, false));
     }
     let mut idx = probe_index(key_hash, cap);
 
     for dist in 0..cap {
-        match &inner.entries[idx] {
+        match &buckets.entries[idx] {
             Some(entry) => {
                 // Robin Hood: if the occupant's probe distance is less than
                 // our current search distance, the key can't be present.
@@ -1246,43 +1391,10 @@ pub fn gethash(
 /// Resize the table when load factor exceeds threshold.
 fn resize_table(inner: &mut HashTableInner) {
     // Issue #1 fix: use float multiplication to preserve fractional rehash_size
-    let new_capacity = (inner.capacity as f64 * inner.rehash_size) as usize;
-    let new_capacity = next_power_of_two(new_capacity.max(inner.capacity + 1));
-    let mut new_entries: Vec<Option<RHEntry>> = vec![None; new_capacity];
-    let mut miss_filter = empty_miss_filter(new_capacity);
-
-    for e in inner.entries.iter().flatten() {
-        let hash = hash_for_test(e.key, inner.test);
-        record_key_hash(&mut miss_filter, hash);
-        let mut idx = probe_index(hash, new_capacity);
-        let mut incoming = RHEntry {
-            key: e.key,
-            value: e.value,
-            probe_dist: 0,
-        };
-        loop {
-            match &new_entries[idx] {
-                None => {
-                    new_entries[idx] = Some(incoming);
-                    break;
-                }
-                Some(occupant) => {
-                    // Robin Hood: swap if incoming has traveled farther
-                    if incoming.probe_dist > occupant.probe_dist {
-                        let displaced = *occupant;
-                        new_entries[idx] = Some(incoming);
-                        incoming = displaced;
-                    }
-                }
-            }
-            incoming.probe_dist += 1;
-            idx = (idx + 1) & (new_capacity - 1);
-        }
-    }
-
-    inner.entries = new_entries;
-    inner.capacity = new_capacity;
-    inner.miss_filter = miss_filter;
+    let capacity = inner.capacity();
+    let new_capacity = (capacity as f64 * inner.rehash_size) as usize;
+    let new_capacity = next_power_of_two(new_capacity.max(capacity + 1));
+    inner.publish(build_buckets(inner.buckets(), new_capacity, inner.test));
 }
 
 /// Set a value in a hash table (CL `(SETF GETHASH)`).
@@ -1292,28 +1404,30 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
-    maybe_rehash_for_gc(inner);
+    // A writer has the table to itself, so this places the buckets.
+    placed_buckets(inner);
     // A key hashed by a movable object's address makes this table need
     // rehashing after every GC that relocates it (bliss-jtc.22 / bliss-cpje).
     let test = inner.test;
     let (key_hash, address_sensitive) = hash_key(key, test);
     if address_sensitive && !inner.address_sensitive {
         inner.address_sensitive = true;
-        inner.gc_gen = egcl_rt::gc::gc_move_epoch();
+        *inner.placement.get_mut() = placed_at(egcl_rt::gc::gc_move_epoch());
     }
 
     // Check if key already exists and update in place
     {
-        let cap = inner.capacity;
+        let buckets = buckets_mut(&mut inner.buckets);
+        let cap = buckets.capacity();
         let mut idx = probe_index(key_hash, cap);
         for dist in 0..cap {
-            match &inner.entries[idx] {
+            match &buckets.entries[idx] {
                 Some(entry) => {
                     if entry.probe_dist < dist {
                         break; // Robin Hood: key can't be present beyond this point
                     }
                     if keys_equal(entry.key, key, test) {
-                        inner.entries[idx] = Some(RHEntry {
+                        buckets.entries[idx] = Some(RHEntry {
                             key,
                             value,
                             probe_dist: entry.probe_dist,
@@ -1328,14 +1442,15 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
     }
 
     // Check load factor and resize if needed
-    let threshold = (inner.capacity as f64 * inner.rehash_threshold) as usize;
+    let threshold = (inner.capacity() as f64 * inner.rehash_threshold) as usize;
     if inner.count + 1 > threshold {
         resize_table(inner);
     }
 
-    record_key_hash(&mut inner.miss_filter, key_hash);
+    let buckets = buckets_mut(&mut inner.buckets);
+    record_key_hash(&mut buckets.miss_filter, key_hash);
     // Insert into (possibly resized) table using Robin Hood insertion
-    let cap = inner.capacity;
+    let cap = buckets.capacity();
     let mut idx = probe_index(key_hash, cap);
     let mut incoming = RHEntry {
         key,
@@ -1343,9 +1458,9 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
         probe_dist: 0,
     };
     loop {
-        match &inner.entries[idx] {
+        match &buckets.entries[idx] {
             None => {
-                inner.entries[idx] = Some(incoming);
+                buckets.entries[idx] = Some(incoming);
                 inner.count += 1;
                 return Ok(());
             }
@@ -1353,7 +1468,7 @@ pub fn set_gethash(key: EgclVal, table: EgclVal, value: EgclVal) -> Result<(), E
                 // Robin Hood: if incoming has traveled farther, swap
                 if incoming.probe_dist > occupant.probe_dist {
                     let displaced = *occupant;
-                    inner.entries[idx] = Some(incoming);
+                    buckets.entries[idx] = Some(incoming);
                     incoming = displaced;
                 }
             }
@@ -1370,14 +1485,15 @@ pub fn remhash(key: EgclVal, table: EgclVal) -> Result<bool, EgclError> {
     // Safety: ptr is valid, non-null, and points to a leaked Box<HashTableInner>.
     // We create exactly one &mut reference from the raw pointer per call.
     let inner = unsafe { &mut *ptr };
-    maybe_rehash_for_gc(inner);
-    let cap = inner.capacity;
+    placed_buckets(inner);
     let test = inner.test;
+    let buckets = buckets_mut(&mut inner.buckets);
+    let cap = buckets.capacity();
     let key_hash = hash_for_test(key, test);
     let mut idx = probe_index(key_hash, cap);
 
     for dist in 0..cap {
-        match &inner.entries[idx] {
+        match &buckets.entries[idx] {
             Some(entry) => {
                 if entry.probe_dist < dist {
                     return Ok(false); // Robin Hood: key not present
@@ -1385,24 +1501,24 @@ pub fn remhash(key: EgclVal, table: EgclVal) -> Result<bool, EgclError> {
                 if keys_equal(entry.key, key, test) {
                     // Remove the entry and backward-shift to maintain
                     // Robin Hood invariant
-                    inner.entries[idx] = None;
+                    buckets.entries[idx] = None;
                     inner.count -= 1;
 
                     // Backward-shift: move subsequent entries back to fill
                     // the gap, decrementing their probe distances.
                     let mut j = (idx + 1) & (cap - 1);
                     loop {
-                        match inner.entries[j] {
+                        match buckets.entries[j] {
                             None => break,
                             Some(next) => {
                                 if next.probe_dist == 0 {
                                     break; // entry is at its natural slot
                                 }
-                                inner.entries[idx] = Some(RHEntry {
+                                buckets.entries[idx] = Some(RHEntry {
                                     probe_dist: next.probe_dist - 1,
                                     ..next
                                 });
-                                inner.entries[j] = None;
+                                buckets.entries[j] = None;
                                 idx = j;
                             }
                         }
@@ -1472,10 +1588,11 @@ pub fn maphash(function: EgclVal, table: EgclVal) -> Result<(), EgclError> {
 pub fn hash_table_entries(table: EgclVal) -> Result<Vec<(EgclVal, EgclVal)>, EgclError> {
     let ptr = get_table_inner(table)?;
     let _lock = lock_table(ptr);
-    // Safety: single &mut from raw pointer, valid for the function's duration.
-    let inner = unsafe { &mut *ptr };
+    // Safety: a shared reference; other threads may be reading the table too.
+    let inner = unsafe { &*ptr };
 
     Ok(inner
+        .buckets()
         .entries
         .iter()
         .filter_map(|slot| slot.map(|e| (e.key, e.value)))
@@ -1488,11 +1605,12 @@ pub fn clrhash(table: EgclVal) -> Result<(), EgclError> {
     let _lock = lock_table(ptr);
     // Safety: single &mut from raw pointer, valid for the function's duration.
     let inner = unsafe { &mut *ptr };
-    for entry in inner.entries.iter_mut() {
+    let buckets = buckets_mut(&mut inner.buckets);
+    for entry in buckets.entries.iter_mut() {
         *entry = None;
     }
+    buckets.miss_filter.fill(0);
     inner.count = 0;
-    inner.miss_filter.fill(0);
     Ok(())
 }
 
@@ -1520,7 +1638,7 @@ pub fn hash_table_weakness(table: EgclVal) -> Result<Option<Weakness>, EgclError
 pub fn hash_table_size(table: EgclVal) -> Result<usize, EgclError> {
     let ptr = get_table_inner(table)?;
     let _lock = lock_table(ptr);
-    Ok(unsafe { (*ptr).capacity })
+    Ok(unsafe { (*ptr).capacity() })
 }
 
 /// Get the rehash size.
@@ -1698,6 +1816,56 @@ mod tests {
         KEY_COMPARISONS.with(|count| count.set(0));
         assert_eq!(gethash(other, table, NIL).unwrap(), (NIL, false));
         assert!(KEY_COMPARISONS.with(Cell::get) >= 1);
+    }
+
+    /// Readers of an unsynchronized table may all meet a stale placement at
+    /// once, as after a collection that moved a key. One rebuilds it and the
+    /// rest search the buckets it replaces, which stay allocated, so every key
+    /// is still found. Each reader used to rebuild in place, freeing the
+    /// buckets the others were probing.
+    #[test]
+    fn concurrent_readers_share_a_placement_rebuild() {
+        const READERS: usize = 4;
+        const KEYS: i64 = 512;
+        let table = make_hash_table(&MakeHashTableOptions::default()).unwrap();
+        for key in 0..KEYS {
+            set_gethash(EgclVal::from_fixnum(key), table, EgclVal::from_fixnum(-key)).unwrap();
+        }
+        let inner = get_table_inner(table).unwrap();
+        // Fixnum keys never move, so no other test's collection can disturb
+        // them; claiming address sensitivity makes every stale placement
+        // rebuild exactly as moved keys would.
+        unsafe { (*inner).address_sensitive = true };
+        let table = table.0;
+        for _ in 0..200 {
+            let stale = placed_at(egcl_rt::gc::gc_move_epoch().wrapping_sub(1));
+            unsafe { (*inner).placement.store(stale, Ordering::SeqCst) };
+            let start = std::sync::Arc::new(std::sync::Barrier::new(READERS));
+            let readers: Vec<_> = (0..READERS)
+                .map(|_| {
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        let table = EgclVal::from_raw(table);
+                        start.wait();
+                        for key in 0..KEYS {
+                            assert_eq!(
+                                gethash(EgclVal::from_fixnum(key), table, NIL).unwrap(),
+                                (EgclVal::from_fixnum(-key), true)
+                            );
+                        }
+                        hash_table_entries(table).unwrap().len()
+                    })
+                })
+                .collect();
+            for reader in readers {
+                assert_eq!(reader.join().unwrap(), KEYS as usize);
+            }
+            // Placed again (by whichever reader won), with no rebuild left
+            // claimed. A collection elsewhere may have moved the epoch on.
+            let placement = unsafe { (*inner).placement.load(Ordering::SeqCst) };
+            assert_eq!(placement & REHASHING, 0);
+            assert_ne!(placement, stale);
+        }
     }
 
     #[test]
