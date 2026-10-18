@@ -4950,6 +4950,10 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (:export #:class-slots #:class-direct-slots #:class-precedence-list
            #:class-direct-superclasses #:class-direct-subclasses
            #:class-finalized-p #:finalize-inheritance
+           ;; The metaclass of a class named as a superclass before it is
+           ;; defined (spec R9.39). A CLASS; not a STANDARD-CLASS, since nothing
+           ;; has said yet what its instances look like.
+           #:forward-referenced-class
            #:generic-function-methods
            #:intern-eql-specializer #:validate-superclass
            #:slot-definition-name #:slot-definition-initargs

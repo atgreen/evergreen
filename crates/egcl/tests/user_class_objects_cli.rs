@@ -389,6 +389,79 @@ fn a_forward_referenced_class_cannot_be_instantiated_or_finalized() {
     ]);
 }
 
+/// A class named as a superclass before it is defined is an instance of
+/// `FORWARD-REFERENCED-CLASS`, as AMOP specifies and spec R9.39 requires
+/// (bliss-swhq0).
+///
+/// It was an ordinary STANDARD-CLASS instance carrying an internal flag, so
+/// `CLASS-OF` answered STANDARD-CLASS where SBCL answers
+/// `#<FORWARD-REFERENCED-CLASS UNDEF>`, and `(typep placeholder 'standard-class)`
+/// was T where SBCL says NIL.
+///
+/// The trap this had to avoid, and which the comments in `cli.rs` now record:
+/// "built in" is DERIVED as "neither structure nor standard", so making a
+/// placeholder not-standard puts it in the built-in bucket — and DEFCLASS
+/// refuses a system class as a direct superclass, which would refuse every
+/// forward-referenced superclass and break `lib/boot.lisp`. The SUB rows below
+/// are what pin that.
+#[test]
+fn a_forward_reference_is_an_instance_of_forward_referenced_class() {
+    let stdout = run(r#"
+      (defclass fr-sub3 (fr-pending) ())
+      (defvar *ph* (find-class 'fr-pending))
+      (format t "CLASS-OF ~a~%" (class-name (class-of *ph*)))
+      (format t "PRINTS ~s~%" *ph*)
+      (format t "TYPEP-FRC ~a~%" (typep *ph* 'egcl-mop:forward-referenced-class))
+      ;; Not a standard class: nothing has said what its instances look like.
+      (format t "TYPEP-STD ~a~%" (typep *ph* 'standard-class))
+      (format t "TYPEP-CLASS ~a~%" (typep *ph* 'class))
+      ;; The name belongs to EGCL-MOP, not to the closed COMMON-LISP package.
+      (format t "HOME-PACKAGE ~a~%"
+               (package-name (symbol-package 'egcl-mop:forward-referenced-class)))
+      ;; It is not finalized, nor is the subclass that named it, and it cannot
+      ;; be instantiated (bliss-jv7tj).
+      (format t "FINALIZED ~a~%" (egcl-mop:class-finalized-p *ph*))
+      (format t "SUB-FINALIZED ~a~%" (egcl-mop:class-finalized-p (find-class 'fr-sub3)))
+      (format t "REFUSED ~a~%"
+               (not (null (nth-value 1 (ignore-errors (make-instance 'fr-pending))))))
+      ;; THE TRAP: DEFCLASS must still accept it as a direct superclass.
+      (defclass fr-sub4 (fr-pending) ())
+      (format t "ACCEPTED-AS-SUPER ~a~%" (not (null (find-class 'fr-sub4))))
+
+      ;; The definition arrives: same object, now an ordinary standard class.
+      (eval '(defclass fr-pending () ((a :initform 7))))
+      (format t "EQ-AFTER ~a~%" (eq *ph* (find-class 'fr-pending)))
+      (format t "CLASS-OF-AFTER ~a~%" (class-name (class-of (find-class 'fr-pending))))
+      (format t "TYPEP-FRC-AFTER ~a~%"
+               (typep (find-class 'fr-pending) 'egcl-mop:forward-referenced-class))
+      (format t "TYPEP-STD-AFTER ~a~%" (typep (find-class 'fr-pending) 'standard-class))
+      (format t "FINALIZED-AFTER ~a~%" (egcl-mop:class-finalized-p (find-class 'fr-pending)))
+      (format t "INSTANCE ~a~%" (slot-value (make-instance 'fr-pending) 'a))
+      (format t "SUB-INHERITS ~a~%" (typep (make-instance 'fr-sub3) 'fr-pending))
+      (format t "FRC-OK~%")
+    "#);
+    expect(&stdout, &[
+        "CLASS-OF FORWARD-REFERENCED-CLASS",
+        "PRINTS #<FORWARD-REFERENCED-CLASS FR-PENDING>",
+        "TYPEP-FRC T",
+        "TYPEP-STD NIL",
+        "TYPEP-CLASS T",
+        "HOME-PACKAGE EGCL-MOP",
+        "FINALIZED NIL",
+        "SUB-FINALIZED NIL",
+        "REFUSED T",
+        "ACCEPTED-AS-SUPER T",
+        "EQ-AFTER T",
+        "CLASS-OF-AFTER STANDARD-CLASS",
+        "TYPEP-FRC-AFTER NIL",
+        "TYPEP-STD-AFTER T",
+        "FINALIZED-AFTER T",
+        "INSTANCE 7",
+        "SUB-INHERITS T",
+        "FRC-OK",
+    ]);
+}
+
 /// The condition hierarchy must survive, and a built-in or condition class
 /// must still refuse redefinition.
 ///
