@@ -2234,6 +2234,14 @@
 ;; A dimension list of rank ≥ 2 builds a real multidimensional array (row-major
 ;; storage); rank-0/1 build a string (character element-type) or simple/complex
 ;; vector as before. :adjustable / :fill-pointer apply to the rank-1 vector case.
+;; A vector's :INITIAL-CONTENTS must have exactly as many elements as the
+;; vector (CLHS MAKE-ARRAY); a shorter one used to be padded and a longer one
+;; to fail on an index. SBCL's wording.
+(defun %check-initial-contents-length (contents size)
+  (unless (= (length contents) size)
+    (error "There are ~D elements in the :INITIAL-CONTENTS, but the vector length is ~D."
+           (length contents) size)))
+
 (defun make-array (dimensions &rest keys)
   ;; Each dimension must be a non-negative integer (a list of them for rank ≥ 2,
   ;; or a bare integer for a vector). An empty list falls through to the
@@ -2262,7 +2270,8 @@
          ;; :element-type of NIL holds no elements, so a length-0 one is
          ;; SXHASH-similar to "" (ansi sxhash.8). Classify it as a string so
          ;; MAKE-ARRAY builds string storage, not a general NIL-filled vector.
-         (stringp (member et '(character base-char standard-char nil)))
+         ;; EXTENDED-CHAR upgrades to CHARACTER, so it too builds a string.
+         (stringp (member et '(character base-char standard-char extended-char nil)))
          (bitp (eq et 'bit))
          (doublep (member et-kind '(double-float long-float)))
          (fp-cell (member :fill-pointer keys))
@@ -2315,6 +2324,7 @@
       ;; adjustable) vector. The fill pointer is the given value, SIZE for
       ;; :fill-pointer t, or SIZE when only :adjustable is supplied.
       ((or fp adjustable)
+       (when ic-cell (%check-initial-contents-length (car (cdr ic-cell)) size))
        (let* ((fpn (cond ((eq fp t) size)
                          ((integerp fp) fp)
                          (t size)))
@@ -2340,6 +2350,7 @@
              (dotimes (i size) (setf (aref v i) (elt contents i)))))
          v))
       (ic-cell
+       (%check-initial-contents-length (car (cdr ic-cell)) size)
        ;; COERCE legitimately returns its ARGUMENT when it is already of the
        ;; target type (SBCL does the same), so coercing a string to 'string --
        ;; or a vector to 'vector -- would alias the :initial-contents. MAKE-ARRAY
