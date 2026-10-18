@@ -53,6 +53,15 @@ pub(super) fn call(
 #[egcl_shake_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
+        "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+        | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+        | "EGCL-EXT:CRYPTO-GHASH-MUL"
+        | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+        | "EGCL-EXT:CRYPTO-SHA256-WORDS" => Some(|operator, args, _env| {
+            let bare = operator.rsplit(':').next().unwrap_or(operator);
+            egcl_stdlib::crypto::call(bare, args).expect("listed crypto primitive")
+        }),
         "EGCL::%PPRINT-CIRCLE" => Some(|_operator, args, _env| {
             if args.len() != 2 || !args[0].is_symbol() {
                 return Err(EgclError::ProgramError(
@@ -312,7 +321,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 j += 2;
             }
             let mut fill = ' ';
+            let mut fill_val = NIL;
             let mut fill_set = false;
+            // :element-type BASE-CHAR (or STANDARD-CHAR) asks for the 8-bit
+            // SIMPLE-BASE-STRING; anything else, CHARACTER included, is the
+            // 32-bit string that holds any code point (spec §1.6.3). The
+            // keyword was accepted and ignored, so MAKE-ARRAY's :element-type
+            // 'base-char built a string TYPEP refused as a BASE-STRING (ansi
+            // sequences LENGTH.STRING.6).
+            let mut base = false;
+            let mut et_set = false;
             let mut i = 0;
             while i < kv.len() {
                 let key = kv[i];
@@ -334,10 +352,21 @@ fn resolve(name: &str) -> Option<Handler> {
                                 });
                             }
                             fill = val.as_char();
+                            fill_val = val;
                             fill_set = true;
                         }
                     }
-                    "ELEMENT-TYPE" | "ALLOW-OTHER-KEYS" => {}
+                    "ELEMENT-TYPE" => {
+                        if !et_set {
+                            et_set = true;
+                            base = val.is_symbol()
+                                && matches!(
+                                    sym_bare_name_rc(val).as_ref(),
+                                    "BASE-CHAR" | "STANDARD-CHAR"
+                                );
+                        }
+                    }
+                    "ALLOW-OTHER-KEYS" => {}
                     other => {
                         if !allow_other {
                             return Err(EgclError::ProgramError(format!(
@@ -348,8 +377,20 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 i += 2;
             }
+            // A base string never promotes: a wide :initial-element is the
+            // TYPE-ERROR the store would signal, raised before any store.
+            if base && (fill as u32) >= 256 {
+                return Err(EgclError::TypeError {
+                    datum: fill_val,
+                    expected: "base-char".into(),
+                });
+            }
             let content: String = std::iter::repeat_n(fill, size.as_fixnum() as usize).collect();
-            Ok(egcl_stdlib::make_lisp_string_fresh(&content))
+            Ok(if base {
+                egcl_stdlib::make_lisp_base_string_fresh(&content)
+            } else {
+                egcl_stdlib::make_lisp_string_fresh(&content)
+            })
         }),
 
         "MAKE-BROADCAST-STREAM" => Some(|_operator, args, _env| {
@@ -803,6 +844,45 @@ fn resolve(name: &str) -> Option<Handler> {
             };
             reader::set_readtable_case_mode(rt, code);
             Ok(mode_kw)
+        }),
+
+        "EGCL::%READTABLE-BASE-CHAR-PREFERENCE" => Some(|_operator, args, _env| {
+            // (egcl::%readtable-base-char-preference rt)
+            //   => :symbols | :strings | :both | nil
+            let rt = args.first().copied().unwrap_or(NIL);
+            Ok(
+                match reader::readtable_base_char_preference(rt)
+                    .unwrap_or(reader::BASE_CHAR_PREFERENCE_SYMBOLS)
+                {
+                    reader::BASE_CHAR_PREFERENCE_STRINGS => resolve_sym(":STRINGS").unwrap_or(NIL),
+                    reader::BASE_CHAR_PREFERENCE_BOTH => resolve_sym(":BOTH").unwrap_or(NIL),
+                    reader::BASE_CHAR_PREFERENCE_NONE => NIL,
+                    _ => resolve_sym(":SYMBOLS").unwrap_or(NIL),
+                },
+            )
+        }),
+
+        "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => Some(|_operator, args, _env| {
+            // (egcl::%set-readtable-base-char-preference preference rt) => preference
+            let preference = args.first().copied().unwrap_or(NIL);
+            let rt = args.get(1).copied().unwrap_or(NIL);
+            let code = if preference == NIL {
+                reader::BASE_CHAR_PREFERENCE_NONE
+            } else {
+                match sym_bare_name_rc(preference).as_ref() {
+                    "SYMBOLS" => reader::BASE_CHAR_PREFERENCE_SYMBOLS,
+                    "STRINGS" => reader::BASE_CHAR_PREFERENCE_STRINGS,
+                    "BOTH" => reader::BASE_CHAR_PREFERENCE_BOTH,
+                    _ => {
+                        return Err(EgclError::TypeError {
+                            datum: preference,
+                            expected: "(MEMBER :SYMBOLS :STRINGS :BOTH NIL)".into(),
+                        });
+                    }
+                }
+            };
+            reader::set_readtable_base_char_preference(rt, code);
+            Ok(preference)
         }),
 
         "EGCL::%SYM-BY-INDEX" => Some(|_operator, args, _env| {

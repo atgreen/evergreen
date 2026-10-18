@@ -3339,12 +3339,17 @@ fn typep_heap_numerics_and_complex_introspection() {
         ("(type-of #c(1 2))", "COMPLEX"),
         ("(prin1-to-string #c(1 2))", "\"#C(1 2)\""),
         // Character subtypes: STANDARD-CHAR (newline + printable ASCII),
-        // BASE-CHAR (all chars here), EXTENDED-CHAR (none). (bliss-vdtz)
+        // BASE-CHAR (code points below 256, the 8-bit string element) and
+        // EXTENDED-CHAR (the rest). (bliss-vdtz; BASE-CHAR was every character
+        // and EXTENDED-CHAR empty until the base-string fix made TYPEP agree
+        // with the storage.)
         ("(typep #\\a 'standard-char)", "T"),
         ("(typep #\\Newline 'standard-char)", "T"),
         ("(typep #\\Tab 'standard-char)", "NIL"),
         ("(typep #\\a 'base-char)", "T"),
         ("(typep #\\a 'extended-char)", "NIL"),
+        ("(typep (code-char 955) 'base-char)", "NIL"),
+        ("(typep (code-char 955) 'extended-char)", "T"),
         ("(typep 5 'standard-char)", "NIL"),
         // Standard float constants: PI (single-precision approximation) and the
         // single-float magnitude extremes. (bliss-ncor)
@@ -4326,6 +4331,19 @@ fn character_prin1_names_nongraphic_chars() {
     }
 }
 
+/// `"abc"` read under a readtable whose base-char preference is `:BOTH`, which
+/// stores an all-BASE-CHAR literal as an 8-bit base string (R4.94), tested
+/// against a base-string type.
+const BASE_READ_ABC_IS_BASE_STRING: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") 'base-string))"#;
+const BASE_READ_ABC_IS_SIMPLE_BASE_STRING: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") 'simple-base-string))"#;
+const BASE_READ_ABC_IS_BASE_STRING_3: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") '(base-string 3)))"#;
+
 /// TYPEP compound-type combinators: (NOT type) — was unhandled and always
 /// returned NIL, breaking (and integer (not (eql 0))) etc. — and (string N) /
 /// (simple-string N) length-qualified string types.
@@ -4349,14 +4367,18 @@ fn typep_not_and_string_length_compounds() {
         ("(typep 5 '(string 3))", "NIL"),
         // bliss-ajb3: BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base
         // strings (all BASE-CHARs), not the 32-bit character strings STRING also
-        // covers. An all-ASCII literal is a base string; one with a wide char is
-        // not, though it is still a STRING.
-        ("(typep \"abc\" 'base-string)", "T"),
-        ("(typep \"abc\" 'simple-base-string)", "T"),
+        // covers. As with SBCL's standard readtable, a literal is a CHARACTER
+        // string even when it is all ASCII (R4.94); a readtable preferring base
+        // strings for literals is what reads one as a base string.
+        ("(typep \"abc\" 'base-string)", "NIL"),
+        ("(typep \"abc\" 'simple-base-string)", "NIL"),
+        ("(typep \"abc\" 'simple-string)", "T"),
+        (BASE_READ_ABC_IS_BASE_STRING, "T"),
+        (BASE_READ_ABC_IS_SIMPLE_BASE_STRING, "T"),
+        (BASE_READ_ABC_IS_BASE_STRING_3, "T"),
         ("(typep \"hλ\" 'base-string)", "NIL"),
         ("(typep \"hλ\" 'simple-base-string)", "NIL"),
         ("(typep \"hλ\" 'string)", "T"),
-        ("(typep \"abc\" '(base-string 3))", "T"),
         ("(typep \"hλ\" '(base-string 2))", "NIL"),
         // A mutable (constructed) string is a 32-bit CHARACTER string, so it is a
         // STRING but not a BASE-STRING.

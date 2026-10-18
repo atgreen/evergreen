@@ -268,6 +268,24 @@ resolve a designator through `*package*`'s local nicknames first. The
 nickname is not a global one: `PACKAGE-NICKNAMES` does not list it, and no
 other package sees it.
 
+### String literals and the base-char preference
+
+As with SBCL's standard readtable, the reader makes every string literal a
+32-bit `(SIMPLE-ARRAY CHARACTER (*))`, even when all its characters are
+`BASE-CHAR`s. So `(copy-seq "abc")` can hold any character, and a literal is
+the same kind of string whether its file is loaded as source or compiled.
+
+A readtable can instead read literals of `BASE-CHAR`s compactly, as 8-bit
+`SIMPLE-BASE-STRING`s, through SBCL's preference, exported from `EGCL-EXT`:
+
+| Function | Contract |
+| --- | --- |
+| `(readtable-base-char-preference readtable)` | `:SYMBOLS` (the standard readtable's), `:STRINGS`, `:BOTH` or `NIL` |
+| `(setf (readtable-base-char-preference readtable) preference)` | Under `:STRINGS` or `:BOTH`, a literal made only of `BASE-CHAR`s is read as a `SIMPLE-BASE-STRING`; under `:SYMBOLS` or `NIL` every literal is a `CHARACTER` string. Any other value is a `TYPE-ERROR` |
+
+`COPY-READTABLE` carries the preference to the copy. Symbol names are always
+stored compactly, whatever the preference.
+
 ### Conduit packages
 
 ```lisp

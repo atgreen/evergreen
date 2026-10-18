@@ -4299,6 +4299,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             compiled_methods.insert(id, EgclVal::from_raw(remap(callable)));
         }
     }
+    for &callable in compiled_methods.values() {
+        set_compiled_method_cell(callable, true);
+    }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
     let mut expanders = HashMap::new();
     if data.get(off..off + 4) == Some(b"SEXP") {
@@ -6564,6 +6567,19 @@ fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclV
 }
 
 fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    // Bring an instance of a redefined class up to date FIRST, and take the
+    // address the migration answers. Every slot entry point below migrates on
+    // its own, and migrating ALLOCATES -- which can evacuate a nursery-resident
+    // instance and leave this function's own `instance` word pointing at a
+    // recycled body, because the collector cannot see it (bliss-ch80h, the
+    // cli.rs half). Measured: `EGCL_GC_STRESS_AT` on the allocation inside the
+    // migration turned `(setf (slot-value i 's) 7)` on a redefined class into
+    // "internal error: not an instance", deterministically.
+    //
+    // Cheap: a current instance costs a forwarding chase and a wrapper-stamp
+    // read, no lock and no allocation, which this path already paid inside the
+    // lookup below.
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     // FAST PATH. An `:allocation :class` slot is stored in the owning class's
     // cell and is NOT in the instance's inline layout — that is the whole reason
     // the class-slot lookup below exists. So a slot that IS in this instance's
@@ -6617,6 +6633,10 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
 /// `slot`, neither in the instance layout nor among class-allocated slots: the
 /// case CLHS hands to SLOT-MISSING.
 fn slot_is_missing(env: &Env, instance: EgclVal, slot: EgclVal) -> bool {
+    // As in `read_slot_value`: `slot_present_p` migrates an obsolete instance,
+    // which allocates, and the `class_of` below read this same word afterwards.
+    // That is the frame the sweep caught (bliss-ch80h).
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     if !egcl_stdlib::is_instance(instance) || egcl_stdlib::slot_present_p(instance, slot) {
         return false;
     }
@@ -6638,9 +6658,13 @@ fn invoke_slot_missing(
     new_value: Option<EgclVal>,
 ) -> Result<EgclVal, EgclError> {
     let _call_depth = CallDepthGuard::enter()?;
-    let class = egcl_stdlib::class_of(instance);
+    // `resolve_sym` interns, which allocates: root the instance across it
+    // rather than building the argument vector out of a word the collector may
+    // have moved (bliss-ch80h).
+    egcl_rt::rooted!(instance = instance);
+    let class = egcl_stdlib::class_of(*instance);
     let operation = resolve_sym(operation).unwrap_or(NIL);
-    let mut values = vec![class, instance, slot, operation];
+    let mut values = vec![class, *instance, slot, operation];
     values.extend(new_value);
     let args = RootedVals::new(values);
     let result = invoke_generic_function("SLOT-MISSING", &args, env);
@@ -6655,6 +6679,10 @@ fn slot_boundp_protocol(
     slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    // As in `slot_value_or_signal`: a program may ask SLOT-BOUNDP before it
+    // ever reads, and an added slot is bound once its initform has run
+    // (bliss-oi5a6). Measured without this: NIL where SBCL answers T.
+    let instance = run_redefinition_update(instance, env)?;
     if slot_is_missing(env, instance, slot) {
         let answer = invoke_slot_missing(env, instance, slot, "SLOT-BOUNDP", None)?;
         return Ok(if answer.is_nil() { NIL } else { T });
@@ -6669,7 +6697,19 @@ fn slot_makunbound_protocol(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
-    if slot_is_missing(env, *instance, slot) {
+    // Before unbinding, not after: the update protocol has to have run, or a
+    // later read would notice the slot unbound and apply the initform the
+    // program just removed (bliss-oi5a6).
+    //
+    // The migrated address stays INTERNAL. SLOT-MAKUNBOUND returns the
+    // instance, and the migration's replacement is not EQ to the reference the
+    // caller passed in -- nor to any other reference the program is holding,
+    // which all name the forwarded original. Storing it into `instance` here
+    // made `(eq (slot-makunbound i 'a) i)` answer NIL, measured, where main
+    // answers T. The accessors chase forwarding, so the original stays a
+    // perfectly good handle for everything below.
+    let current = run_redefinition_update(*instance, env)?;
+    if slot_is_missing(env, current, slot) {
         invoke_slot_missing(env, *instance, slot, "SLOT-MAKUNBOUND", None)?;
         return Ok(*instance);
     }
@@ -6685,6 +6725,44 @@ fn slot_makunbound_protocol(
     Ok(*instance)
 }
 
+/// Bring `instance` up to date if its class was redefined, running
+/// `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` (CLHS 7.2.2) when the layout actually
+/// changed. Answers the instance, which the migration may have moved.
+///
+/// The default method, in `lib/boot.lisp`, is
+/// `(apply #'shared-initialize instance added-slots initargs)` — and
+/// SHARED-INITIALIZE fills only slots that are UNBOUND, so running this lazily
+/// on the first read cannot clobber a value the program has already stored in
+/// an added slot. That is what makes the read path a sufficient trigger.
+///
+/// A class whose redefinition changed nothing about the layout costs one
+/// wrapper-stamp test, which is what the accessors already paid.
+fn run_redefinition_update(instance: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
+    let (instance, update) = egcl_stdlib::clos::migrate_if_obsolete(instance);
+    let Some(update) = update else {
+        return Ok(instance);
+    };
+    if update.added.is_empty() && update.discarded.is_empty() {
+        // A redefinition that kept the layout: nothing for the protocol to do,
+        // and no reason to make a generic-function call per instance.
+        return Ok(instance);
+    }
+    // Everything below allocates (three lists, then the method's own body), and
+    // the instance is a movable heap object, so root the instance and the slot
+    // names the migration just handed back before the first allocation.
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(added = update.added);
+    egcl_rt::rooted!(discarded = update.discarded);
+    egcl_rt::rooted!(plist = update.plist);
+    egcl_rt::rooted!(added_list = vec_to_list(&added));
+    egcl_rt::rooted!(discarded_list = vec_to_list(&discarded));
+    egcl_rt::rooted!(plist_list = vec_to_list(&plist));
+    let args = RootedVals::new(vec![*instance, *added_list, *discarded_list, *plist_list]);
+    invoke_generic_function("UPDATE-INSTANCE-FOR-REDEFINED-CLASS", &args, env)?;
+    env.clear_mv();
+    Ok(*instance)
+}
+
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
@@ -6692,6 +6770,19 @@ fn slot_value_or_signal(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
     egcl_rt::rooted!(slot = slot);
+    // FIRST, before anything reads a slot: bring an instance of a redefined
+    // class up to date through the CLHS protocol, not just through the layout
+    // copy. A slot the redefinition ADDED was left UNBOUND, where CLHS 4.3.6
+    // wants its initform applied -- measured: `(defclass c () ())`, an
+    // instance, then `(defclass c () ((s :initform 42)))` left S unbound where
+    // SBCL answers 42 (bliss-oi5a6).
+    //
+    // Here rather than deeper because this is the entry point that has the
+    // evaluator: applying an initform means EVALUATING it, and the protocol is
+    // a generic function users may specialize. It must also come before
+    // `slot_is_missing` below, which migrates the instance itself and would
+    // discard the record of what the redefinition changed.
+    *instance = run_redefinition_update(*instance, env)?;
     // An object of a built-in class has no slots at all; SLOT-MISSING reports
     // it (ansi slot-value.error.5). Conditions and structures, whose classes
     // are name symbols, keep their own slot access below.
@@ -6738,6 +6829,11 @@ fn write_slot_value(
     value: EgclVal,
     env: &Env,
 ) -> Result<(), EgclError> {
+    // `set_slot_value` at the end migrates, and a caller that reached here
+    // without going through `store_slot_value` would hold a stale word after it
+    // (bliss-ch80h). Idempotent, so the common double call costs two stamp
+    // reads.
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
@@ -7559,6 +7655,9 @@ fn store_slot_value(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(value = value);
+    // Before `slot_is_missing`, which migrates: `write_slot_value` below uses
+    // this word afterwards (bliss-ch80h).
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     if slot_is_missing(env, instance, slot) {
         // (setf slot-value) on a missing slot reaches SLOT-MISSING with the new
         // value, and still returns that value (ansi slot-missing.2/6).
@@ -11537,18 +11636,32 @@ fn is_base_string_value(v: EgclVal) -> bool {
     if egcl_stdlib::is_pathname(v) {
         return false;
     }
-    // A registry-backed sentinel carries its content as a Rust String; decode it
-    // and test whether every character is a BASE-CHAR.
-    if let Some(s) = egcl_stdlib::registered_string(v) {
-        return egcl_rt::object::is_all_base_char(&s);
+    // The registry holds both storage-less sentinels and real strings the
+    // evaluator noted while evaluating them, so its content says nothing about
+    // the width: only a real heap string stored 8-bit is a base string. Deciding
+    // by content called every evaluated ASCII CHARACTER-string literal a
+    // BASE-STRING (R4.94).
+    if egcl_stdlib::registered_string(v).is_some() {
+        return egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize) && v.is_base_string();
     }
-    // An adjustable / fill-pointer CHARACTER vector has element-type CHARACTER
-    // (32-bit), so it is a CHARACTER string, not a base string.
+    // A complex (adjustable, fill-pointer or displaced) string is a base
+    // string when the storage it reads and writes is: a string displaced onto
+    // an 8-bit base string refuses a wide character, so calling it CHARACTER
+    // let (setf subseq) copy wide characters into it and die (ansi strings
+    // RANDOM-STRING-COMPARISON-TESTS). An adjustable string's own store is
+    // 32-bit today, so it stays a CHARACTER string.
     if egcl_stdlib::is_complex_vector(v) {
-        return false;
+        return egcl_stdlib::cvec_is_string(v) && egcl_stdlib::string_storage_is_base(v);
     }
     // A real heap string: only the 8-bit SIMPLE_BASE_STRING type_id qualifies.
     v.is_base_string()
+}
+
+/// True if `v` is a BASE-CHAR: a character whose code point is below 256, the
+/// range an 8-bit `SIMPLE_BASE_STRING` stores (spec §1.6.3). EXTENDED-CHAR is
+/// the rest of CHARACTER.
+fn is_base_char_value(v: EgclVal) -> bool {
+    v.is_character() && (v.as_char() as u32) < 256
 }
 
 /// True if `v` is a registry-backed sentinel (a string/namestring hash wearing
@@ -15593,11 +15706,11 @@ fn numeric_subtypep(t1: EgclVal, t2: EgclVal) -> Option<(bool, bool)> {
 // the array/vector/string family to `(simple?, element, dims)` and decides
 // containment. It is allocation-free (no GC), like the numeric algebra above.
 //
-// egcl upgrades every element type to one of exactly three: T, CHARACTER
-// (character/base-char/…) and BIT — matching `upgraded-array-element-type`. So
-// string ≡ base-string ≡ (array character (*)) here; the ansi
-// `:nil-vectors-are-strings` tests that need base-char arrays distinct from
-// character arrays are inherently unsatisfiable under this upgrade policy.
+// egcl upgrades every element type to one of T, CHARACTER (32-bit strings),
+// BASE-CHAR (8-bit strings; standard-char upgrades to it), BIT and
+// DOUBLE-FLOAT — matching `upgraded-array-element-type`. STRING is the union
+// of the character, base-char and nil arms (bliss-7kmw), not a specialized
+// type of its own.
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EltU {
@@ -16344,11 +16457,11 @@ fn integer_range_within_bignum(t1: EgclVal) -> Option<(bool, bool)> {
 }
 
 fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
-    // egcl has no extended characters: EXTENDED-CHAR is the empty type, a
-    // subtype of everything (ansi subtypep.extended-char.1, types.9).
-    if t1.is_symbol() && !t1.is_nil() && sym_bare_name_rc(t1).as_ref() == "EXTENDED-CHAR" {
-        return (true, true);
-    }
+    // BASE-CHAR (code points below 256) is a proper subtype of CHARACTER and
+    // EXTENDED-CHAR is the rest of it; the symbol hierarchy table carries both,
+    // so neither needs a special case here. (EXTENDED-CHAR used to be the empty
+    // type, a subtype of everything, while TYPEP called every character a
+    // BASE-CHAR -- see the TYPEP arms.)
     if t2.is_symbol() && !t2.is_nil() && sym_bare_name_rc(t2).as_ref() == "BIGNUM" {
         if let Some(answer) = canonical_integer_type(t1)
             .or_else(|| t1.is_cons().then_some(t1))
@@ -16372,16 +16485,6 @@ fn subtypep_relation(t1: EgclVal, t2: EgclVal) -> (bool, bool) {
         egcl_rt::rooted!(canonical = canonical);
         egcl_rt::rooted!(t1 = t1);
         return subtypep_relation(*t1, *canonical);
-    }
-    // egcl has no extended characters, so BASE-CHAR and CHARACTER are the same
-    // type in both directions (TYPEP already says so; ansi arrays
-    // upgraded-array-element-type.2 checks the two SUBTYPEP answers agree).
-    if t1.is_symbol()
-        && t2.is_symbol()
-        && matches!(sym_bare_name_rc(t1).as_ref(), "CHARACTER" | "BASE-CHAR")
-        && matches!(sym_bare_name_rc(t2).as_ref(), "CHARACTER" | "BASE-CHAR")
-    {
-        return (true, true);
     }
     if t1.is_cons() && t2.is_cons() {
         let (head1, args1) = cp(t1);
@@ -16808,7 +16911,11 @@ fn typep_matches(
             // BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base strings —
             // every character a BASE-CHAR — not the 32-bit character strings a
             // STRING can also be (bliss-ajb3).
-            "BASE-STRING" | "SIMPLE-BASE-STRING" => is_base_string_value(object),
+            "BASE-STRING" => is_base_string_value(object),
+            // A displaced, adjustable or fill-pointer base string is not SIMPLE.
+            "SIMPLE-BASE-STRING" => {
+                is_base_string_value(object) && !egcl_stdlib::is_complex_vector(object)
+            }
             // Numeric lattice over the real heap numeric types (bignum, ratio,
             // double-float, complex), via the runtime predicates — the earlier
             // checks only recognised fixnum/single-float, so (typep (expt 2 100)
@@ -16873,17 +16980,24 @@ fn typep_matches(
             }
             "CHARACTER" => object.is_character(),
             // STANDARD-CHAR: the 96 standard characters — #\Newline plus the
-            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P). EGCL
-            // has no extended characters, so BASE-CHAR ≡ CHARACTER (its required
-            // superset of STANDARD-CHAR) and EXTENDED-CHAR is empty (bliss-vdtz).
+            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P).
             "STANDARD-CHAR" => {
                 object.is_character() && {
                     let code = object.as_char() as u32;
                     code == 10 || (32..127).contains(&code)
                 }
             }
-            "BASE-CHAR" => object.is_character(),
-            "EXTENDED-CHAR" => false,
+            // BASE-CHAR is the element type of an 8-bit SIMPLE-BASE-STRING: the
+            // code points below 256 (spec §1.6.3, R1.14). EXTENDED-CHAR is the
+            // rest of CHARACTER. TYPEP used to call EVERY character a BASE-CHAR
+            // (bliss-vdtz, "egcl has no extended characters") while BASE-STRING
+            // matched only 8-bit storage (bliss-ajb3), so a string of #\λ was a
+            // vector whose every element was a BASE-CHAR and yet not a
+            // BASE-STRING, and (make-array n :element-type 'base-char) built a
+            // 32-bit string TYPEP refused as a BASE-STRING (ansi sequences
+            // MAP.SPECIALIZED-STRING.3, LENGTH.STRING.6).
+            "BASE-CHAR" => is_base_char_value(object),
+            "EXTENDED-CHAR" => object.is_character() && !is_base_char_value(object),
             "BOOLEAN" => object.is_nil() || object == T,
             "FUNCTION" | "COMPILED-FUNCTION" => is_function_value(object),
             "GENERIC-FUNCTION" | "STANDARD-GENERIC-FUNCTION" => is_generic_function_value(object),
@@ -17289,6 +17403,9 @@ fn typep_matches(
         // the given length (bliss-ajb3).
         "BASE-STRING" | "SIMPLE-BASE-STRING" => {
             if !is_base_string_value(object) {
+                return Ok(false);
+            }
+            if op.as_ref() == "SIMPLE-BASE-STRING" && egcl_stdlib::is_complex_vector(object) {
                 return Ok(false);
             }
             Ok(vector_length_matches(&list_to_vec(args), object))
@@ -18654,6 +18771,11 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "CONS" | "RPLACA" | "RPLACD" | "SET-CAR" | "SET-CDR" => Some((2, 2)),
         "FINALIZE" => Some((2, 4)),
         "CANCEL-FINALIZATION" => Some((1, 1)),
+        _ if bare.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(bare).is_some() =>
+        {
+            egcl_stdlib::crypto::primitive_arity(bare).map(|n| (n, n))
+        }
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         "HASH-TABLE-WEAKNESS" => Some((1, 1)),
@@ -19722,6 +19844,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%READTABLE-BASE-CHAR-PREFERENCE" | "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "EGCL::%PRUNE-CLOSURES" => {
                 // (egcl::%prune-closures) → (before after): drop dead
                 // closure-registry entries (bliss-uamd). Also runs
@@ -20746,6 +20871,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let class = resolve_class_metaobject(env, class_input)?;
                 let supers = egcl_stdlib::clos::class_direct_superclasses(class);
                 return Ok(vec_to_list(&supers));
+            }
+            // The forward-reference half of the finalization protocol (R9.39).
+            // Answers the first class at or above the argument that is only a
+            // forward reference, so boot.lisp's CLASS-FINALIZED-P and
+            // FINALIZE-INHERITANCE can tell the truth about a class whose
+            // superclass is still undefined, rather than T and a no-op for
+            // every class (bliss-jv7tj).
+            "EGCL-INTERNAL::%FORWARD-REFERENCED-SUPERCLASS"
+            | "EGCL-INTERNAL:%FORWARD-REFERENCED-SUPERCLASS"
+            | "%FORWARD-REFERENCED-SUPERCLASS" => {
+                let (af, _) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                return Ok(egcl_stdlib::clos::forward_referenced_superclass(class));
             }
             "EGCL-INTERNAL::%CLASS-DIRECT-SUBCLASSES"
             | "EGCL-INTERNAL:%CLASS-DIRECT-SUBCLASSES"
@@ -23066,10 +23205,13 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "ARRAY-ELEMENT-TYPE" => {
                 let (af, _) = cp(cdr);
                 let v = eval_form(af, env)?;
-                // Strings hold CHARACTER; bit-vectors (simple OR a
+                // An 8-bit base string holds BASE-CHAR and a 32-bit string
+                // CHARACTER (spec §1.6.3); bit-vectors (simple OR a
                 // fill-pointer/adjustable/displaced complex bit vector, egcl-
                 // 65nx) hold BIT; packed vectors hold DOUBLE-FLOAT.
-                let ty = if is_string_value(v) {
+                let ty = if is_base_string_value(v) {
+                    "BASE-CHAR"
+                } else if is_string_value(v) {
                     "CHARACTER"
                 } else if is_bit_vector_value(v) {
                     "BIT"
@@ -25770,6 +25912,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // which made signing a 6.8 MB APK take ~22 minutes against SBCL's
             // 1.2 s (bliss-omaps); Ironclad itself uses implementation-specific
             // routines wherever a host has them, and this is EGCL's.
+            // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
+            "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:SHA256" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() != 1 {
@@ -27154,12 +27302,27 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                     return Ok(resolve_sym("READTABLE").unwrap_or(NIL));
                 } else if is_string_value(v) && egcl_stdlib::is_complex_vector(v) {
                     // An adjustable or fill-pointered string is not a
-                    // SIMPLE-STRING (ansi coerce.1).
+                    // SIMPLE-STRING (ansi coerce.1). Its element type is the
+                    // storage's: BASE-CHAR when displaced onto a base string.
                     let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    let elt = if is_base_string_value(v) { "BASE-CHAR" } else { "CHARACTER" };
                     return Ok(vec_to_list(&[
                         resolve_sym("VECTOR").unwrap_or(NIL),
-                        resolve_sym("CHARACTER").unwrap_or(NIL),
+                        resolve_sym(elt).unwrap_or(NIL),
                         EgclVal::from_fixnum(size as i64),
+                    ]));
+                } else if is_string_value(v) && !is_base_string_value(v) {
+                    // A 32-bit CHARACTER string is (SIMPLE-ARRAY CHARACTER (n));
+                    // only the 8-bit storage is a SIMPLE-BASE-STRING, which is
+                    // what TYPEP answers for it (bliss-ajb3). TYPE-OF called
+                    // every string SIMPLE-BASE-STRING, so (typep x (type-of x))
+                    // was NIL for a MAKE-STRING result.
+                    let size = egcl_stdlib::array_total_size(v).unwrap_or(0);
+                    egcl_rt::rooted!(dims = vec_to_list(&[EgclVal::from_fixnum(size as i64)]));
+                    return Ok(vec_to_list(&[
+                        resolve_sym("SIMPLE-ARRAY").unwrap_or(NIL),
+                        resolve_sym("CHARACTER").unwrap_or(NIL),
+                        *dims,
                     ]));
                 }
                 // A general vector's TYPE-OF is (SIMPLE-VECTOR n), or
@@ -31237,20 +31400,34 @@ fn coerce_to_bit_vector_value(value: EgclVal, mut type_val: EgclVal) -> Result<E
 /// COERCE's string result, shared by the bare-symbol arm (`'string`) and the
 /// compound-specifier pre-check (`'(vector character)`) so the two cannot
 /// diverge (bliss-wzfm).
-fn coerce_to_string_value(value: EgclVal) -> Result<EgclVal, EgclError> {
-    if egcl_stdlib::registered_string(value).is_some() {
+/// `base` asks for an 8-bit BASE-STRING: every element must then be a
+/// BASE-CHAR and the result is a SIMPLE-BASE-STRING, where COERCE built the
+/// 32-bit CHARACTER string for every string type -- so `(coerce '(#\a)
+/// 'base-string)` answered a string TYPEP refused as a BASE-STRING.
+fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclError> {
+    if !base && egcl_stdlib::registered_string(value).is_some() {
         return Ok(value);
     }
     let mut s = String::new();
     for e in seq_elements(value)? {
         if e.is_character() {
+            if base && !is_base_char_value(e) {
+                return Err(EgclError::TypeError {
+                    datum: e,
+                    expected: "base-char".into(),
+                });
+            }
             s.push(e.as_char());
         }
     }
     // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
     // :element-type character :initial-contents) must be MUTABLE — an
     // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
-    Ok(egcl_stdlib::make_lisp_string_fresh(&s))
+    Ok(if base {
+        egcl_stdlib::make_lisp_base_string_fresh(&s)
+    } else {
+        egcl_stdlib::make_lisp_string_fresh(&s)
+    })
 }
 
 /// Resolve DEFTYPE and function designators once, for both call paths.
@@ -31366,7 +31543,7 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
                 });
             }
         }
-        return coerce_to_string_value(value);
+        return coerce_to_string_value(value, egcl_stdlib::result_type_is_base_string(type_val));
     }
     // Same gap, one type over: `(vector bit)` / `(simple-array bit (*))` name a
     // bit vector through their ELEMENT TYPE, and the head-symbol dispatch below
@@ -31443,9 +31620,8 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
                 })
             }
         }
-        "STRING" | "SIMPLE-STRING" | "BASE-STRING" | "SIMPLE-BASE-STRING" => {
-            coerce_to_string_value(value)
-        }
+        "STRING" | "SIMPLE-STRING" => coerce_to_string_value(value, false),
+        "BASE-STRING" | "SIMPLE-BASE-STRING" => coerce_to_string_value(value, true),
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
             if value.is_character() {
                 return Ok(value);
@@ -38254,6 +38430,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     } else {
         None
     };
+    let mut replaced = None;
     {
         let mut methods_map = env.methods.borrow_mut();
         let list = methods_map.entry(name.clone()).or_default();
@@ -38263,9 +38440,8 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         if let Some(pos) = list.iter().position(|m| {
             m.qualifier == qualifier && specializers_equal(&m.specializers, &specializers)
         }) {
-            let old_id = list[pos].method_id;
+            replaced = Some(list[pos].method_id.0);
             list.remove(pos);
-            METHOD_COMPILED.borrow_mut().remove(&old_id.0);
         }
         list.push(MethodDef {
             method_id,
@@ -38277,6 +38453,11 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             body,
         });
     }
+    // Retire the replaced method's compiled body outside the methods borrow:
+    // clearing its symbol cell also invalidates call tables.
+    if let Some(old_id) = replaced {
+        forget_compiled_method(old_id);
+    }
     // A new/redefined method changes applicability and ordering (bliss-x5y.20).
     invalidate_gf_dispatch_cache();
 
@@ -38287,7 +38468,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // CALL-NEXT-METHOD/NEXT-METHOD-P (which need env.method_context, unknown to
     // the bytecode compiler). Everything else keeps tree-walking. A redefinition
     // drops any stale compiled body first.
-    METHOD_COMPILED.borrow_mut().remove(&method_id.0);
+    forget_compiled_method(method_id.0);
     if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() && !nested_in_binding {
         let compile_ll = method_lambda_list_for_compile(*lambda_list);
         if let Some(callable) = bytecode::compile_and_reify_lambda("METHOD", compile_ll, body, env)
@@ -38327,6 +38508,34 @@ fn specializers_equal(a: &[MethodSpecializer], b: &[MethodSpecializer]) -> bool 
 /// declared. (This is why `&key` methods were excluded from compilation
 /// outright in bliss-x5y.20; they are 59.6% of tree-walked method invocations
 /// on an ASDF/babel load.)
+/// Install (or, with `installed` false, clear) a compiled method callable in
+/// its own uninterned symbol's function cell, where the tiering bookkeeping
+/// looks for its counters (see `compile_and_reify_lambda`). An image restores
+/// METHOD_COMPILED without those cells, and a replaced method's cell must not
+/// keep its retired callable alive. Allocates nothing.
+fn set_compiled_method_cell(callable: EgclVal, installed: bool) {
+    if !egcl_rt::function::is_interpreted_function(callable) {
+        return;
+    }
+    let name = egcl_rt::function::name(callable);
+    let Some(sym) = name.symbol_index() else {
+        return;
+    };
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return;
+    }
+    let value = if installed { callable } else { egcl_rt::value::UNBOUND };
+    egcl_rt::symbols::set_symbol_function(sym, value);
+}
+
+/// Drop method `id`'s compiled body, if it has one.
+fn forget_compiled_method(id: u64) {
+    let retired = METHOD_COMPILED.borrow_mut().remove(&id);
+    if let Some(callable) = retired {
+        set_compiled_method_cell(callable, false);
+    }
+}
+
 fn method_lambda_list_for_compile(lambda_list: EgclVal) -> EgclVal {
     // Resolve the symbol FIRST. Interning can allocate, and every step below
     // this point holds `EgclVal`s copied out of the lambda list in a Rust
@@ -38727,6 +38936,12 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 
 /// Builtins `apply_builtin_fast` handles on evaluated arguments.
 const DIRECT_FAST: &[&str] = &[
+    // Ironclad's EGCL block primitives: leaf kernels on octet vectors.
+    "CRYPTO-AES-ENCRYPT-BLOCK",
+    "CRYPTO-AES-DECRYPT-BLOCK",
+    "CRYPTO-GHASH-MUL",
+    "CRYPTO-SHA256-BLOCK",
+    "CRYPTO-SHA256-WORDS",
     "AREF",
     "SVREF",
     "ROW-MAJOR-AREF",
@@ -39638,6 +39853,16 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::FINALIZE"
             | "EGCL-EXT:CANCEL-FINALIZATION"
             | "EGCL-EXT::CANCEL-FINALIZATION"
+            | "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT::CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT::CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS"
+            | "EGCL-EXT::CRYPTO-SHA256-WORDS"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
             | "EGCL-EXT:DECLARATION-SPECIFIER"
@@ -39882,6 +40107,12 @@ fn apply_builtin_fast(
         "LIST" | "GETF" => {
             env.clear_mv();
             evaluated_builtins::call(name, args, env)
+        }
+        _ if name.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(name).is_some() =>
+        {
+            env.clear_mv();
+            egcl_stdlib::crypto::call(name, args)
         }
         "APPEND" => {
             env.clear_mv();

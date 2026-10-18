@@ -48,6 +48,12 @@
 
 ### Fixed
 
+- String literals are `CHARACTER` strings, as in SBCL, so a copy of one can
+  hold any character: `(setf (char (copy-seq "abc") 0) #\λ)` works, and a
+  literal is the same kind of string whether its file was compiled or not.
+  `EGCL-EXT:READTABLE-BASE-CHAR-PREFERENCE` (`:SYMBOLS`, `:STRINGS`, `:BOTH`
+  or `NIL`, as in SBCL) can make a readtable read compact 8-bit literals
+  instead ([#411](https://github.com/atgreen/evergreen/pull/411)).
 - Several threads may read one hash table at once, as in SBCL; only writes
   need exclusive access. Concurrent lookups in a table keyed by conses or
   other objects hashed by address used to crash once a garbage collection
@@ -65,6 +71,21 @@
   metaclass's slots (issue
   [#384](https://github.com/atgreen/evergreen/issues/384),
   [#399](https://github.com/atgreen/evergreen/pull/399)).
+- A slot added by redefining a class takes its `:INITFORM` on instances that
+  already exist, as CLHS 4.3.6 requires: `(defclass c () ())`, an instance,
+  then `(defclass c () ((s :initform 42)))` left `S` unbound where it now
+  answers 42. `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` is called for the update,
+  so a method specialized on it participates and receives the added slots, the
+  discarded slots and their values
+  ([#412](https://github.com/atgreen/evergreen/pull/412)).
+- A class that is only a forward reference -- named as a superclass and not yet
+  defined -- can no longer be instantiated, as in SBCL: `MAKE-INSTANCE`,
+  `ALLOCATE-INSTANCE` and `CHANGE-CLASS` each used to return an object with no
+  slots, built against a layout the eventual `DEFCLASS` then contradicts.
+  `EGCL-MOP:CLASS-FINALIZED-P` also stops claiming T for such a class, or for a
+  class that inherits from one, and `EGCL-MOP:FINALIZE-INHERITANCE` signals for
+  them instead of silently doing nothing
+  ([#406](https://github.com/atgreen/evergreen/pull/406)).
 - A class named as a superclass **before** it is defined, and then defined with
   a `:METACLASS` that has slots, is an instance of that metaclass like any
   other. `CLASS-OF` answered the metaclass while `TYPEP`, `SLOT-EXISTS-P`,
@@ -106,6 +127,21 @@
   of a file that is still source-only see its source as
   `*COMPILE-FILE-PATHNAME*`
   ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- `BASE-CHAR` is the element type of an 8-bit base string, consistently.
+  `TYPEP` called every character a `BASE-CHAR` while `BASE-STRING` matched
+  only 8-bit storage, `MAKE-STRING` ignored `:element-type`, and `MAP`,
+  `COERCE` and `MAKE-SEQUENCE` built 32-bit strings for `BASE-STRING`, so
+  `(make-array 5 :element-type 'base-char)` and `(map 'base-string ...)`
+  answered strings `TYPEP` refused as base strings, and `TYPE-OF` called
+  every string `SIMPLE-BASE-STRING`. `BASE-CHAR` is now the code points
+  below 256 and `EXTENDED-CHAR` the rest, `UPGRADED-ARRAY-ELEMENT-TYPE` and
+  `ARRAY-ELEMENT-TYPE` answer `BASE-CHAR` for 8-bit strings (a string
+  displaced onto one included), the constructors honor the requested width
+  (a wide character is a `TYPE-ERROR`), `COPY-SEQ`, `SUBSEQ`, `REVERSE` and the `REMOVE`,
+  `SUBSTITUTE` and `REMOVE-DUPLICATES` families keep a string's width, and
+  `TYPE-OF` answers `(SIMPLE-ARRAY CHARACTER (n))` for a 32-bit string (ansi
+  sequences `MAP.SPECIALIZED-STRING.3`, `LENGTH.STRING.6`; the sequences
+  chapter now passes completely and joins the gate).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal
@@ -275,6 +311,19 @@
 
 ### Performance
 
+- A method body that loops now reaches optimized native code (T2) like the
+  same body in a `DEFUN`. It used to stop at baseline native code (T1) until
+  its 4096th call: a 1000-iteration loop took about 4 ms per call as a method
+  and 30 us as a function, and now takes about 50 us as a method. Methods
+  restored from a saved image are covered too
+  ([#413](https://github.com/atgreen/evergreen/pull/413)).
+- AES, GCM's GHASH multiply and SHA-256 compression run in the runtime, as
+  `EGCL-EXT:CRYPTO-*` block primitives that EGCL's Ironclad fork calls in place
+  of its portable Lisp. With the fork, encrypting 64 KB with AES-GCM takes
+  seconds instead of 193 s, hashing it with SHA-256 takes under 0.3 s instead
+  of 18 s, and a repeated HTTPS request through pure-tls is about 10x faster.
+  `EGCL-EXT:SHA256` and `EGCL-EXT:CRC32` are now documented
+  ([#410](https://github.com/atgreen/evergreen/pull/410)).
 - Calls made from compiled (native) code into other compiled functions are
   cheaper: a call no longer looks `FUNCALL`/`APPLY` up by name, rebuilds the
   callee's per-call buffers, rescans its bytecode or registers a global root

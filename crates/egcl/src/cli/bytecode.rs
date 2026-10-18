@@ -13583,12 +13583,15 @@ pub(super) fn compile_and_reify_lambda(
         .borrow_mut()
         .insert(sym_idx, Arc::clone(&bf));
     registry_put(sym_idx, Arc::clone(&bf));
-    Some(egcl_rt::function::alloc_interpreted(
-        lambda_list,
-        body,
-        NIL,
-        sym,
-    ))
+    let function = egcl_rt::function::alloc_interpreted(lambda_list, body, NIL, sym);
+    // Install the callable in its own uninterned symbol's function cell. The
+    // tiering bookkeeping finds a function's counters through that cell -- the
+    // heat counters native code bumps among them -- and without it a method
+    // body was promoted to T1 but never on to T2 by loop heat: it stayed at T1
+    // until its 4096th call, roughly 80x slower than the same body in a DEFUN.
+    // Nothing can name an uninterned symbol, so this is invisible to Lisp code.
+    egcl_rt::symbols::set_symbol_function(sym_idx, function);
+    Some(function)
 }
 
 fn bbu_direct_symbol_for_package(

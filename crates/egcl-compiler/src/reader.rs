@@ -243,6 +243,23 @@ pub fn current_readtable_case_mode() -> u8 {
     }
 }
 
+/// [`ReadtableData::base_char_preference`] codes, in SBCL's terms.
+pub const BASE_CHAR_PREFERENCE_SYMBOLS: u8 = 0;
+pub const BASE_CHAR_PREFERENCE_STRINGS: u8 = 1;
+pub const BASE_CHAR_PREFERENCE_BOTH: u8 = 2;
+pub const BASE_CHAR_PREFERENCE_NONE: u8 = 3;
+
+/// Whether the current readtable reads an all-BASE-CHAR string literal as an
+/// 8-bit base string (a preference of `:strings` or `:both`). Consulted per
+/// literal rather than gated by a process-wide flag, so a preference saved in
+/// an image still applies after it is restored.
+fn literals_prefer_base_strings() -> bool {
+    matches!(
+        readtable_base_char_preference(current_readtable_value()),
+        Some(BASE_CHAR_PREFERENCE_STRINGS | BASE_CHAR_PREFERENCE_BOTH)
+    )
+}
+
 /// Apply `readtable-case` folding to one UNESCAPED constituent character under
 /// modes that map char→char (`:upcase`, `:downcase`, `:preserve`). `:invert`
 /// (mode 3) is whole-token and handled by the caller, so it is left unchanged
@@ -712,12 +729,19 @@ fn alloc_cons(car: EgclVal, cdr: EgclVal) -> EgclVal {
 }
 
 fn alloc_string(s: &str) -> EgclVal {
-    // Compact simple string (SBCL model). A reader literal is
-    // immutable (mutating an interned literal is undefined and rejected), so it
-    // is stored at the NARROWEST width — an 8-bit SIMPLE_BASE_STRING when every
-    // code point < 256, else a 32-bit SIMPLE_CHARACTER_STRING (bliss-em3p).
+    // A string literal is a 32-bit CHARACTER string, as with SBCL's standard
+    // readtable, so a copy of one can hold any character. A readtable whose
+    // base-char preference covers strings stores an all-BASE-CHAR literal as an
+    // 8-bit SIMPLE_BASE_STRING instead (R4.94).
     let char_len = s.chars().count();
-    let (tid, total_size) = egcl_rt::object::narrowest_string_alloc(s);
+    let (tid, total_size) = if literals_prefer_base_strings() {
+        egcl_rt::object::narrowest_string_alloc(s)
+    } else {
+        (
+            type_id::SIMPLE_CHARACTER_STRING,
+            egcl_rt::object::character_string_alloc_size(s),
+        )
+    };
     let ptr = gc_alloc(total_size, tid);
     unsafe {
         *(ptr.add(8) as *mut u64) = char_len as u64;
@@ -1016,7 +1040,8 @@ fn alloc_readtable() -> EgclVal {
     let ptr = unsafe { body.sub(hdr) } as *mut ReadtableData;
     unsafe {
         (*ptr).case_mode = 0; // :upcase
-        (*ptr)._pad = [0; 7];
+        (*ptr).base_char_preference = 0; // :symbols
+        (*ptr)._pad = [0; 6];
         (*ptr).char_table = NIL;
         (*ptr).extended_table = NIL;
         (*ptr).macro_table = NIL;
@@ -4483,6 +4508,11 @@ pub fn copy_readtable(from: EgclVal, to: Option<EgclVal>) -> Result<EgclVal, Egc
     if let Some(mode) = readtable_case_mode(from) {
         set_readtable_case_mode(dest, mode);
     }
+    // Likewise the base-char preference; the standard readtable's is :symbols.
+    set_readtable_base_char_preference(
+        dest,
+        readtable_base_char_preference(from).unwrap_or(BASE_CHAR_PREFERENCE_SYMBOLS),
+    );
     Ok(dest)
 }
 
@@ -4519,6 +4549,37 @@ pub fn set_readtable_case_mode(rt: EgclVal, mode: u8) -> bool {
         if mode != 0 {
             ANY_NONUPCASE_CASE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        true
+    }
+}
+
+/// The base-char preference code of a specific readtable object, or `None` if
+/// `rt` is not one (the `:standard-readtable` placeholder, whose is `:symbols`).
+pub fn readtable_base_char_preference(rt: EgclVal) -> Option<u8> {
+    if rt.tag() != TAG_HEAP_OBJECT {
+        return None;
+    }
+    unsafe {
+        let ptr = rt.as_ptr();
+        if (*(ptr as *const ObjectHeader)).type_id() != type_id::READTABLE {
+            return None;
+        }
+        Some((*(ptr as *const ReadtableData)).base_char_preference)
+    }
+}
+
+/// Set the base-char preference code of a specific readtable object. No-op for
+/// a non-readtable value. Returns whether the write happened.
+pub fn set_readtable_base_char_preference(rt: EgclVal, preference: u8) -> bool {
+    if rt.tag() != TAG_HEAP_OBJECT {
+        return false;
+    }
+    unsafe {
+        let ptr = rt.as_ptr();
+        if (*(ptr as *const ObjectHeader)).type_id() != type_id::READTABLE {
+            return false;
+        }
+        (*(ptr as *mut ReadtableData)).base_char_preference = preference;
         true
     }
 }

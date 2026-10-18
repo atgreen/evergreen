@@ -22,6 +22,7 @@ a self-hosted CL reader MAY replace it in Phase 3 (§0, 4.5).
 | R4.07 | Support circular structure via `#n=` / `#n#` with correct back-patching. | MUST |
 | R4.08 | Track source positions (file, line, column, byte offset) for every object read, attaching them as object metadata for use by the compiler (§4.2) and debugger (§6). | MUST |
 | R4.09 | Signal CL-style `READER-ERROR` conditions (subtype of `STREAM-ERROR`) with position information on malformed input. | MUST |
+| R4.94 | Read a string literal as a `(SIMPLE-ARRAY CHARACTER (*))`, as SBCL's standard readtable does, unless the current readtable's base-char preference (`EGCL-EXT:READTABLE-BASE-CHAR-PREFERENCE`) is `:STRINGS` or `:BOTH`, which reads a literal made only of `BASE-CHAR`s as a `SIMPLE-BASE-STRING`. The standard readtable's preference is `:SYMBOLS`, and `COPY-READTABLE` carries it. A literal is the same kind of string whether its file is loaded as source or compiled. | MUST |
 
 ---
 
@@ -375,7 +376,7 @@ Returning `None` means "no value produced" (e.g., comments).
 | `)` | `read_right_paren` | Signal READER-ERROR if not inside a list read (stray `)`). Otherwise handled by `read_left_paren`'s loop. |
 | `'` | `read_quote` | Read next object X, return `(QUOTE X)`. |
 | `;` | `read_semicolon` | Skip to end of line, return no values. |
-| `"` | `read_double_quote` | Accumulate chars until unescaped `"`. Handle `\` escapes: `\\` → `\`, `\"` → `"`. Return a string object. |
+| `"` | `read_double_quote` | Accumulate chars until unescaped `"`. Handle `\` escapes: `\\` → `\`, `\"` → `"`. Return a `CHARACTER` string, or a `SIMPLE-BASE-STRING` under a base-char preference covering strings (R4.94). |
 | `` ` `` | `read_backquote` | Read next form X, return backquote expansion template (see §4.1.5.1 below). |
 | `,` | `read_comma` | Must appear inside backquote. Read next form. If next char is `@`, read form and wrap in `SYS:BQ-SPLICE`. If next char is `.`, read form and wrap in `SYS:BQ-NSPLICE` (destructive splice). Else wrap in `SYS:BQ-UNQUOTE`. Signal READER-ERROR if outside backquote. |
 
@@ -540,6 +541,7 @@ During bootstrap these are Rust functions; after self-hosting, CL wrappers deleg
 | `SET-DISPATCH-MACRO-CHARACTER` | `disp sub fn &optional rt` | `disp` MUST be dispatch macro char. `sub` MUST NOT be a digit. Stores `fn` in dispatch table. |
 | `GET-DISPATCH-MACRO-CHARACTER` | `disp sub &optional rt` | Returns dispatch function for `sub` under `disp`, or NIL. |
 | `READTABLE-CASE` | `rt` | Returns case mode. `(SETF READTABLE-CASE)` accepts `:UPCASE`, `:DOWNCASE`, `:PRESERVE`, `:INVERT`. |
+| `EGCL-EXT:READTABLE-BASE-CHAR-PREFERENCE` | `rt` | Returns `:SYMBOLS` (standard), `:STRINGS`, `:BOTH` or `NIL`. The `SETF` form accepts those values and signals `TYPE-ERROR` for any other. See R4.94. |
 
 ---
 

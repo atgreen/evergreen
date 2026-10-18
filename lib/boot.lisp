@@ -867,13 +867,17 @@
     (values (float q (%float-quotient-proto number divisor)) r)))
 
 ;; UPGRADED-ARRAY-ELEMENT-TYPE (CLHS 15.1.1): the element type the implementation
-;; actually stores. BIT, CHARACTER and DOUBLE-FLOAT have specialized storage;
-;; other element types upgrade to T.
+;; actually stores. BIT, BASE-CHAR (8-bit strings), CHARACTER (32-bit strings)
+;; and DOUBLE-FLOAT have specialized storage; other element types upgrade to T.
+;; BASE-CHAR used to upgrade to CHARACTER while MAKE-ARRAY and TYPEP kept the two
+;; widths apart (spec §1.6.3), so (upgraded-array-element-type 'base-char)
+;; disagreed with (array-element-type (make-array 1 :element-type 'base-char)).
 (defun upgraded-array-element-type (type &optional environment)
   (declare (ignore environment))
   (cond ((member (if (consp type) (car type) type) '(double-float long-float)) 'double-float)
         ((eq type 'bit) 'bit)
-        ((member type '(character base-char standard-char)) 'character)
+        ((member type '(base-char standard-char)) 'base-char)
+        ((member type '(character extended-char)) 'character)
         (t t)))
 
 ;; UPGRADED-COMPLEX-PART-TYPE (CLHS 12.2.6): the part type used for a complex of
@@ -1317,6 +1321,24 @@
                        :expected-type '(member :upcase :downcase :preserve :invert)))
   (egcl::%set-readtable-case mode readtable)
   mode)
+
+;;; SBCL's base-char preference. Under :STRINGS or :BOTH the reader stores a
+;;; string literal of BASE-CHARs as an 8-bit SIMPLE-BASE-STRING; otherwise, as
+;;; with the standard readtable's :SYMBOLS, every literal is a CHARACTER string.
+;;; Symbol names are always stored compactly, whatever the readtable says.
+(defun egcl-ext::readtable-base-char-preference (readtable)
+  "How READTABLE stores names and string literals made only of BASE-CHARs:
+:SYMBOLS (the standard readtable's), :STRINGS, :BOTH or NIL, as in SBCL."
+  (check-type readtable readtable)
+  (egcl::%readtable-base-char-preference readtable))
+(defun (setf egcl-ext::readtable-base-char-preference) (preference readtable)
+  (check-type readtable readtable)
+  (unless (member preference '(:symbols :strings :both nil))
+    (error 'type-error :datum preference
+                       :expected-type '(member :symbols :strings :both nil)))
+  (egcl::%set-readtable-base-char-preference preference readtable)
+  preference)
+(export '(egcl-ext::readtable-base-char-preference) :egcl-ext)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
 (defvar *default-pathname-defaults* (truename "."))
@@ -2330,10 +2352,26 @@
        ;; are a bit vector or string (ansi make-array.2d): COERCE to VECTOR
        ;; would hand those back as they are.
        (cond (bitp (%bit-vector-from-bits (coerce (car (cdr ic-cell)) 'list)))
+             ;; A BASE-CHAR request copies into a fresh 8-bit string element by
+             ;; element, so a wide character is the TYPE-ERROR the storage
+             ;; signals rather than a silent promotion.
+             ((and stringp (member et '(base-char standard-char)))
+              (let ((v (make-string size :element-type 'base-char))
+                    (i 0))
+                (dolist (e (coerce (car (cdr ic-cell)) 'list))
+                  (setf (aref v i) e)
+                  (setq i (+ i 1)))
+                v))
              (stringp (copy-seq (coerce (car (cdr ic-cell)) 'string)))
              (t (copy-seq (coerce (car (cdr ic-cell)) 'simple-vector)))))
+      ;; BASE-CHAR (and STANDARD-CHAR) ask for the 8-bit SIMPLE-BASE-STRING;
+      ;; CHARACTER and NIL get the 32-bit string (spec §1.6.3). MAKE-STRING
+      ;; carries the width.
       (stringp
-       (if iel-cell (make-string size :initial-element (car (cdr iel-cell))) (make-string size)))
+       (let ((width (if (member et '(base-char standard-char)) 'base-char 'character)))
+         (if iel-cell
+             (make-string size :initial-element (car (cdr iel-cell)) :element-type width)
+             (make-string size :element-type width))))
       ;; A BIT array is a real SIMPLE-BIT-VECTOR (egcl builds these immutably,
       ;; so the whole content is supplied at construction). Default fill 0.
       (bitp
@@ -2542,7 +2580,14 @@
       ((member head '(list cons null))
        (make-list size :initial-element iel))
       (stringp
-       (if iel-cell (make-string size :initial-element iel) (make-string size)))
+       ;; BASE-STRING, or a vector of BASE-CHAR, is the 8-bit string.
+       (let ((width (if (or (member head '(base-string simple-base-string))
+                            (member elt '(base-char standard-char)))
+                        'base-char
+                        'character)))
+         (if iel-cell
+             (make-string size :initial-element iel :element-type width)
+             (make-string size :element-type width))))
       (bitp
        (make-array size :element-type 'bit :initial-element (if iel-cell iel 0)))
       ((and (member head '(vector array simple-array))
@@ -2593,7 +2638,14 @@
 ;; vector #(0 1 1 1 ...) instead of #*0101011111 (ansi SUBSTITUTE-BIT-VECTOR.24/25
 ;; and the NSUBSTITUTE pairs, which are built on this).
 (defun %coerce-like (list orig)
-  (cond ((stringp orig) (coerce list 'string))
+  (cond ((stringp orig)
+         ;; Same element type as ORIG, width included: an 8-bit base string
+         ;; comes back as one (ansi REMOVE-STRING.4, DELETE-IF-STRING.1,
+         ;; REMOVE-DUPLICATES.STRING.1 compare ARRAY-ELEMENT-TYPE of the
+         ;; result with the input's).
+         (coerce list (if (eq (array-element-type orig) 'base-char)
+                          'simple-base-string
+                          'string)))
         ((bit-vector-p orig) (coerce list 'bit-vector))
         ((listp orig) list)
         (t (coerce list 'vector))))
@@ -4965,13 +5017,22 @@ takes."
   (egcl-internal::%generic-function-methods generic-function))
 
 (defun egcl-mop:class-finalized-p (class)
-  "T: classes finalize eagerly here, so a class that exists is finalized.
-Portable code that finalizes before reading the precedence list runs unchanged."
-  (declare (ignore class))
-  t)
+  "Whether CLASS is finalized. Classes finalize eagerly here, so a defined class
+is always finalized and portable code that finalizes before reading the
+precedence list runs unchanged. A class is NOT finalized while it, or any class
+it inherits from, is only a forward reference -- named as a superclass and never
+defined -- because nothing has said yet what slots it has."
+  (null (egcl-internal::%forward-referenced-superclass class)))
 
 (defun egcl-mop:finalize-inheritance (class)
-  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits."
+  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits --
+except that a class cannot be finalized while it, or a class it inherits from,
+is still only a forward reference, which is an error (spec R9.39)."
+  (let ((pending (egcl-internal::%forward-referenced-superclass class)))
+    (when pending
+      (error "FINALIZE-INHERITANCE: ~s cannot be finalized while ~s is only a ~
+              forward reference: it is named as a superclass but never defined."
+             class pending)))
   class)
 
 (defun egcl-mop:intern-eql-specializer (object)

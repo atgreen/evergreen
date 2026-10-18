@@ -166,20 +166,110 @@ unsafe fn forward_instance(old: EgclVal, new: EgclVal) {
     unsafe { egcl_rt::gc::forward_object_to(old, new) };
 }
 
+/// What a class redefinition changed about an instance's layout, in the shape
+/// `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` takes it (CLHS 7.2.2).
+///
+/// Returned to the caller rather than acted on here: applying an added slot's
+/// `:initform` means EVALUATING it, and the evaluator lives above this crate.
+/// A side table keyed by the instance would be the alternative, and a HashMap
+/// keyed by a movable nursery object needs a rehashing GC scanner — this needs
+/// neither.
+pub struct RedefinitionUpdate {
+    /// Slot names the new layout has and the old one did not. These are the
+    /// slots whose initforms CLHS says to apply.
+    pub added: Vec<EgclVal>,
+    /// Slot names the old layout had and the new one does not.
+    pub discarded: Vec<EgclVal>,
+    /// Name/value pairs, flat, for each discarded slot that was BOUND: the
+    /// property list the protocol hands to a user method.
+    pub plist: Vec<EgclVal>,
+}
+
+/// Bring `instance` up to date if its class has been redefined, and answer the
+/// address it now lives at.
+///
+/// For a caller OUTSIDE this crate that holds an instance across a slot
+/// operation. Every slot entry point migrates on its own, and migrating
+/// allocates — which can evacuate a nursery-resident instance and leave the
+/// caller's own word pointing at a recycled body, exactly as it did inside
+/// this crate before bliss-ch80h. Doing it once, up front, means nothing the
+/// caller does afterwards can migrate, so there is no window to root across.
+///
+/// Cheap for a current instance: a forwarding chase and a wrapper-stamp read,
+/// no lock and no allocation.
+///
+/// Discards what the redefinition CHANGED. A caller that can run the update
+/// protocol — one with the evaluator in hand — wants `migrate_if_obsolete`
+/// instead, and must call it before this (bliss-oi5a6).
+pub fn ensure_instance_current(instance: EgclVal) -> EgclVal {
+    migrate_if_obsolete(instance).0
+}
+
+/// Migrate `instance` if its class has been redefined, and report what the
+/// redefinition changed so the caller can run the CLHS update protocol.
+///
+/// The caller must do this BEFORE anything else touches the instance: every
+/// slot accessor migrates on its own (`update_if_obsolete`), and one that got
+/// there first would discard the record of what changed, leaving the added
+/// slots UNBOUND for good (bliss-oi5a6).
+pub fn migrate_if_obsolete(instance: EgclVal) -> (EgclVal, Option<RedefinitionUpdate>) {
+    if !is_instance(instance) {
+        return (instance, None);
+    }
+    unsafe { migrate_obsolete(instance) }
+}
+
 /// Lazily migrate an instance whose wrapper is obsolete (its class was
 /// redefined) to the class's current layout, exactly once (R5.83/R5.84).
 /// Surviving slots are copied by name; slots removed by the redefinition are
 /// dropped; slots added are left UNBOUND. The old object is forwarded to the
 /// new one, so subsequent accesses see the current layout and this runs once.
 ///
+/// RETURNS THE LIVE INSTANCE, and every caller must use it instead of the value
+/// it passed in (bliss-ch80h). `allocate_instance` below can fire a relocating
+/// minor GC, and a nursery-resident obsolete instance is then EVACUATED: this
+/// function roots its own copy across that, but a caller's is an independent,
+/// unrooted word that the collector cannot see, so it is left pointing at a
+/// body that has been recycled -- and poisoned, under `EGCL_GC_POISON`.
+///
+/// That was not hypothetical. With the probe below the fault is deterministic,
+/// a SIGSEGV on every run:
+///
+/// ```text
+/// (defclass c () ((a :initform 11)))
+/// (defvar *i* (make-instance 'c))
+/// (defclass c () ((a :initform 11) (b :initform 22)))   ; obsoletes *i*
+/// (slot-value *i* 'a)
+///
+/// EGCL_GC_STRESS_AT=100115 EGCL_GC_POISON=1 egcl --no-init --load probe.lisp
+/// ```
+///
+/// `EGCL_GC_STRESS_AT` is what makes it reachable: it forces ONE collection, at
+/// the migration's own allocation, while the instance is still nursery-fresh.
+/// `EGCL_GC_STRESS=1` cannot show it -- its earlier collections promote the
+/// instance out of the nursery first, so by migration time nothing moves. That
+/// is the "a clean stress run can mean nothing moved" trap in CLAUDE.md,
+/// measured here rather than reasoned about.
+///
 /// # Safety
 /// `inst` must be a live STANDARD_OBJECT heap value.
-unsafe fn update_if_obsolete(inst: EgclVal) {
+#[must_use = "the instance may have moved during the migration; use the returned value"]
+unsafe fn update_if_obsolete(inst: EgclVal) -> EgclVal {
+    // Drops the layout change: a slot accessor cannot run the update protocol,
+    // which evaluates initforms. `migrate_if_obsolete` is the entry point for a
+    // caller that can (bliss-oi5a6).
+    unsafe { migrate_obsolete(inst).0 }
+}
+
+/// [`update_if_obsolete`], also reporting what the redefinition changed.
+#[must_use = "the instance may have moved during the migration; use the returned value"]
+unsafe fn migrate_obsolete(inst: EgclVal) -> (EgclVal, Option<RedefinitionUpdate>) {
     unsafe {
         let live = resolve_forwarding(inst);
         let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
         if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_OBSOLETE {
-            return;
+            // Nothing allocated, so nothing moved: `live` is still current.
+            return (live, None);
         }
         let class = (*w).class;
         // Snapshot surviving (bound) slots from the old frozen layout.
@@ -205,7 +295,9 @@ unsafe fn update_if_obsolete(inst: EgclVal) {
         egcl_rt::rooted_ref!(_snap_root = &mut snap);
         let new_inst = match allocate_instance(class) {
             Ok(i) => i,
-            Err(_) => return,
+            // The allocation may still have collected before failing, so answer
+            // the ROOTED copy rather than the caller's.
+            Err(_) => return (live, None),
         };
         let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
         if !nw.is_null() {
@@ -216,7 +308,45 @@ unsafe fn update_if_obsolete(inst: EgclVal) {
                 }
             }
         }
+        // What the redefinition changed, read off the two frozen layouts: a
+        // name the new layout has and the old did not is ADDED (its initform is
+        // what the protocol applies), the reverse is DISCARDED, and a discarded
+        // slot that was bound contributes its name and value to the property
+        // list. Compared by identity, the same way the copy loop above matches
+        // names through `nl.index`.
+        //
+        // Nothing below allocates, so these values stay valid until they are
+        // returned -- but the CALLER evaluates initforms with them, and must
+        // root them first.
+        let update = {
+            let old_names = &(*w).layout.order;
+            let empty: Vec<EgclVal> = Vec::new();
+            let new_names = if nw.is_null() { &empty } else { &(*nw).layout.order };
+            let added: Vec<EgclVal> = new_names
+                .iter()
+                .copied()
+                .filter(|name| !old_names.contains(name))
+                .collect();
+            let discarded: Vec<EgclVal> = old_names
+                .iter()
+                .copied()
+                .filter(|name| !new_names.contains(name))
+                .collect();
+            let mut plist: Vec<EgclVal> = Vec::new();
+            for (name, value) in &snap {
+                if discarded.contains(name) {
+                    plist.push(*name);
+                    plist.push(*value);
+                }
+            }
+            RedefinitionUpdate {
+                added,
+                discarded,
+                plist,
+            }
+        };
         forward_instance(live, new_inst);
+        (new_inst, Some(update))
     }
 }
 
@@ -2341,12 +2471,33 @@ pub fn mark_forward_referenced(class: EgclVal) {
 }
 
 /// Whether `class` is only a forward-reference placeholder, never defined.
-fn is_forward_referenced(class: EgclVal) -> bool {
+pub fn is_forward_referenced(class: EgclVal) -> bool {
     with_state(|st| {
         st.class_meta
             .get(&class)
             .is_some_and(|m| m.forward_referenced)
     })
+}
+
+/// The first class at or above `class` that is only a forward reference, or NIL.
+///
+/// A class is finalized only once every class it inherits from is, so a class
+/// whose superclass is still a forward reference is not finalized either. That
+/// is what `CLASS-FINALIZED-P` must answer and what `FINALIZE-INHERITANCE` must
+/// refuse (R9.39). An inconsistent hierarchy -- one whose precedence list does
+/// not linearize -- answers NIL here and is reported by the caller that asks
+/// for the precedence list.
+pub fn forward_referenced_superclass(class: EgclVal) -> EgclVal {
+    if is_forward_referenced(class) {
+        return class;
+    }
+    match compute_class_precedence_list(class) {
+        Ok(cpl) => cpl
+            .into_iter()
+            .find(|&super_class| is_forward_referenced(super_class))
+            .unwrap_or(NIL),
+        Err(_) => NIL,
+    }
 }
 
 /// Hand back a replacement metaobject for a forward-referenced `class` whose
@@ -2364,8 +2515,8 @@ fn is_forward_referenced(class: EgclVal) -> bool {
 /// The way out is the one SBCL takes — `CHANGE-CLASS` of the
 /// `FORWARD-REFERENCED-CLASS` — adapted to a representation whose instances
 /// carry their slots inline: allocate the metaobject the definition actually
-/// calls for and move the placeholder's registrations onto it, instances
-/// included (`migrate_class_value`). Only a forward reference is ever replaced.
+/// calls for and move the placeholder's registrations onto it
+/// (`migrate_class_value`). Only a forward reference is ever replaced.
 /// A class that has been DEFINED keeps its object: a program can hold it, and
 /// CLHS requires a redefinition to leave existing instances naming the same
 /// class. A placeholder is the one class nothing can be holding on purpose —
@@ -2419,28 +2570,16 @@ pub fn replace_forward_referenced_class(
 /// registry knows, so `TYPEP` against the superclass would fail for its
 /// instances and the layout refresh would skip it.
 ///
-/// Its INSTANCES move too. `(make-instance 'undefined-class)` is accepted here
-/// where SBCL refuses it — measured, not assumed — so a placeholder can have
-/// instances, and they reach their class through the wrapper this metadata
-/// names rather than through any of the tables below.
+/// It does NOT have to find the placeholder's instances, because a forward
+/// reference cannot have any: `allocate_instance` refuses it (bliss-jv7tj), and
+/// that is the single place an instance of a class is born. The handover this
+/// function used to do -- rewriting the old wrapper's class word and obsoleting
+/// it -- became unreachable with that refusal and is gone; if some future path
+/// does create such an instance, the refusal is the one place to look.
 fn migrate_class_value(old: EgclVal, new: EgclVal) {
     with_state_mut(|st| {
         if let Some(mut meta) = st.class_meta.remove(&old) {
             meta.forward_referenced = false;
-            // Hand the placeholder's instances to the replacement: their
-            // wrapper's `class` word is what CLASS-OF reads, and obsoleting it
-            // makes each one migrate to the new layout on next access, exactly
-            // as a redefinition does (R5.83/R5.84, `update_if_obsolete`).
-            // Rewriting a leaked wrapper's class is sound for the same reason
-            // the field can hold a raw copy at all: a class is pinned and
-            // immortal, so neither value moves.
-            if let Some(wrapper) = meta.wrapper {
-                let wrapper = wrapper as *const ClassWrapper as *mut ClassWrapper;
-                unsafe {
-                    (*wrapper).class = new;
-                    (*wrapper).state.store(WRAPPER_OBSOLETE, Ordering::Release);
-                }
-            }
             // `meta.wrapper` is the wrapper for instances OF the class, which
             // the imminent `define_class` finalizes afresh; the replacement's
             // own wrapper -- the metaclass's -- came with its allocation.
@@ -2723,6 +2862,28 @@ fn c3_linearize_inner(
 /// bound value `0`). The object is leaked, matching the other tree-walker heap
 /// objects. See spec §5.3.4 / issue bliss-xyo.
 pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
+    // A class that exists only because another class named it as a superclass
+    // is not finalized: nobody has said what slots it has, so an instance of it
+    // would be a standard object with a layout the definition is going to
+    // contradict. CLHS and AMOP both make this an error, and SBCL signals it
+    // ("cannot allocate an instance of a forward referenced class"); EGCL used
+    // to hand back a slotless instance (bliss-jv7tj).
+    //
+    // Refused HERE rather than in each of MAKE-INSTANCE, ALLOCATE-INSTANCE and
+    // CHANGE-CLASS, because this is the one place an instance of a class is
+    // born -- and because the same guarantee is what lets
+    // `replace_forward_referenced_class` hand the placeholder's registrations
+    // to the replacement without also having to hunt for its instances.
+    if is_forward_referenced(class) {
+        return Err(EgclError::ProgramError(format!(
+            "cannot allocate an instance of {}: it is a forward-referenced class, \
+             named as a superclass but never defined",
+            class_name(class)
+                .symbol_index()
+                .and_then(egcl_rt::symbols::symbol_name)
+                .unwrap_or_else(|| "a forward-referenced class".to_string())
+        )));
+    }
     // Fetch the wrapper + slot count as Copy values, finalising the layout if
     // the class has none yet, then allocate outside the state borrow.
     let (wrapper, slot_count) = with_state_mut(|st| {
@@ -3024,7 +3185,7 @@ pub fn slot_value(instance: EgclVal, slot_name: EgclVal) -> Result<EgclVal, Egcl
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => {
                 let v = *slot_cell(instance, idx);
@@ -3060,7 +3221,7 @@ pub fn slot_value_if_present(
         return None;
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let idx = instance_slot_index(instance, slot_name)?;
         let v = *slot_cell(instance, idx);
         Some(if v == UNBOUND {
@@ -3081,7 +3242,7 @@ pub fn set_slot_value(
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => {
                 *slot_cell(instance, idx) = new_value;
@@ -3109,7 +3270,7 @@ pub fn compare_exchange_slot_value(
         });
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
@@ -3137,7 +3298,7 @@ pub fn atomic_update_slot_value(
         });
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
@@ -3155,7 +3316,7 @@ pub fn slot_boundp(instance: EgclVal, slot_name: EgclVal) -> Result<bool, EgclEr
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => Ok(*slot_cell(instance, idx) != UNBOUND),
             None => Ok(false),
@@ -3176,7 +3337,7 @@ pub fn slot_present_p(instance: EgclVal, slot_name: EgclVal) -> bool {
         return false;
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         instance_slot_index(instance, slot_name).is_some()
     }
 }
@@ -3187,7 +3348,7 @@ pub fn slot_makunbound(instance: EgclVal, slot_name: EgclVal) -> Result<(), Egcl
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         if let Some(idx) = instance_slot_index(instance, slot_name) {
             *slot_cell(instance, idx) = UNBOUND;
         }
@@ -3674,6 +3835,20 @@ pub fn get_short_form_method(key: EgclVal) -> Option<(MethodCombinationType, Vec
 pub fn change_class(instance: EgclVal, new_class: EgclVal) -> Result<(), EgclError> {
     if !is_instance(instance) {
         return Err(EgclError::Internal("not an instance".into()));
+    }
+    // CHANGE-CLASS into a forward reference is the same error as making one
+    // (see `allocate_instance`), and it does not reach that check: a change to
+    // a class with no MORE slots than the instance already has re-points the
+    // wrapper in place and never allocates (bliss-jv7tj).
+    if is_forward_referenced(new_class) {
+        return Err(EgclError::ProgramError(format!(
+            "cannot change an instance to {}: it is a forward-referenced class, \
+             named as a superclass but never defined",
+            class_name(new_class)
+                .symbol_index()
+                .and_then(egcl_rt::symbols::symbol_name)
+                .unwrap_or_else(|| "a forward-referenced class".to_string())
+        )));
     }
 
     // Step 1: snapshot the old instance's bound slots by name, and its inline

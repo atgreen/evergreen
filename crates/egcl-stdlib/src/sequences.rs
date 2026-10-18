@@ -468,6 +468,20 @@ fn vector_set_elt(v: EgclVal, idx: usize, val: EgclVal) {
     }
 }
 
+/// The element slots of a SIMPLE-VECTOR: a pointer to element 0 and the
+/// length, or `None` for anything else. For kernels that read or write a whole
+/// vector of fixnums in one pass (`crypto`). The pointer is valid only until
+/// the next allocation, which can move the vector; a store of a heap value
+/// through it also skips the write barrier, so store those with `set_aref`.
+pub(crate) fn simple_vector_slots(v: EgclVal) -> Option<(*mut EgclVal, usize)> {
+    if !is_vector(v) {
+        return None;
+    }
+    let ptr = unsafe { v.as_ptr() };
+    let off = vector_payload_offset(ptr);
+    Some((unsafe { ptr.add(off + 8) } as *mut EgclVal, vector_length(v)))
+}
+
 /// Atomically compare and exchange one SIMPLE-VECTOR element.
 pub fn compare_exchange_svref(
     vector: EgclVal,
@@ -700,6 +714,26 @@ pub fn cvec_has_fill_pointer(v: EgclVal) -> bool {
         tag.is_fixnum() && tag.as_fixnum() == 1
     }
 }
+/// Does this string's storage hold BASE-CHARs, i.e. is it 8-bit? A simple
+/// string answers by its type id; a displaced string by the array it reads and
+/// writes through to (chains resolve); an adjustable or fill-pointer string by
+/// its own store, which is 32-bit today. ARRAY-ELEMENT-TYPE and TYPEP follow
+/// this rather than the element type the array was asked for, because the
+/// storage is what accepts or refuses a character: a string displaced onto a
+/// base string said CHARACTER and then refused a wide character, so `(setf
+/// subseq)` copied wide characters into it and died (ansi strings
+/// RANDOM-STRING-COMPARISON-TESTS).
+pub fn string_storage_is_base(v: EgclVal) -> bool {
+    if is_complex_vector(v) {
+        if let Some((base, _, _)) = cvec_displacement(v) {
+            return string_storage_is_base(base);
+        }
+        let store = cvec_storage(v);
+        return store.is_heap_object() && store.is_base_string();
+    }
+    v.is_heap_object() && v.is_base_string()
+}
+
 /// Displacement of a complex array (bliss-7o4y): `Some((base, offset, total))`
 /// when `v` was built displaced to `base` (`:displaced-to`), where `offset` is
 /// the row-major offset into `base` and `total` the displaced array's own
@@ -1926,7 +1960,7 @@ pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
             .iter()
             .map(|&c| c.as_char())
             .collect();
-        return Ok(crate::streams::make_lisp_string_fresh(&s));
+        return Ok(crate::streams::make_lisp_string_fresh_like(sequence, &s));
     }
     // A general (non-character) fill-pointer / adjustable vector — char-typed ones
     // are handled by the is_char_seq branch above (bliss-w5t).
@@ -2002,8 +2036,9 @@ pub fn subseq(
         // and mutations aliased; `(eq (copy-seq "x") (copy-seq "x"))` was T. Use the
         // fresh constructor so copies have distinct identity and their own storage —
         // this also un-breaks the default-EQL set ops over COPY-SEQ'd strings that
-        // ansi-test's CONS chapter exercises (bliss-9kxg).
-        return Ok(crate::streams::make_lisp_string_fresh(&sub));
+        // ansi-test's CONS chapter exercises (bliss-9kxg). Same width as the
+        // input: a base string's subsequence is a base string (COPY-SEQ.20).
+        return Ok(crate::streams::make_lisp_string_fresh_like(sequence, &sub));
     }
     let len = length(sequence)?;
     let actual_end = end.unwrap_or(len);
@@ -2075,9 +2110,10 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
     if is_list(sequence) {
         Ok(build_list(&elems))
     } else if is_char_seq(sequence) {
-        // REVERSE of a string is a string (ANSI): same element type as input.
+        // REVERSE of a string is a string (ANSI): same element type as input,
+        // width included (REVERSE-STRING.5).
         let s: String = elems.iter().map(|&c| c.as_char()).collect();
-        Ok(crate::streams::make_lisp_string_fresh(&s))
+        Ok(crate::streams::make_lisp_string_fresh_like(sequence, &s))
     } else if is_bit_seq(sequence) {
         // REVERSE of a bit-vector is a bit-vector (bliss-8z5f).
         Ok(build_bit_vector_from_vals(&elems))
@@ -2223,6 +2259,49 @@ pub fn result_type_is_string(result_type: EgclVal) -> bool {
                 return matches!(
                     egcl_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref(),
                     Some("CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR")
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Does this sequence result-type specifier designate an 8-bit BASE-STRING —
+/// `BASE-STRING`, `SIMPLE-BASE-STRING`, their sized forms, or a vector type
+/// whose element type is `BASE-CHAR`/`STANDARD-CHAR`? A subset of
+/// `result_type_is_string`: the builder must then check every element is a
+/// BASE-CHAR and allocate the 8-bit representation, because TYPEP tells a
+/// BASE-STRING by its storage width (bliss-ajb3); `(map 'base-string ...)`
+/// built a 32-bit string it then refused as one (ansi MAP.SPECIALIZED-STRING.3).
+pub fn result_type_is_base_string(result_type: EgclVal) -> bool {
+    fn name_is_base_string(idx: u32) -> bool {
+        matches!(
+            egcl_compiler::reader::symbol_name(idx).as_deref(),
+            Some("BASE-STRING" | "SIMPLE-BASE-STRING")
+        )
+    }
+    if result_type.tag() == egcl_rt::value::TAG_SYMBOL {
+        return name_is_base_string(result_type.as_symbol_index());
+    }
+    if result_type.is_cons() {
+        let cell = unsafe { &*(result_type.as_ptr() as *const ConsCell) };
+        let car = cell.car;
+        if car.tag() != egcl_rt::value::TAG_SYMBOL {
+            return false;
+        }
+        if name_is_base_string(car.as_symbol_index()) {
+            return true;
+        }
+        let head_takes_element_type = matches!(
+            egcl_compiler::reader::symbol_name(car.as_symbol_index()).as_deref(),
+            Some("VECTOR" | "ARRAY" | "SIMPLE-ARRAY" | "SIMPLE-VECTOR")
+        );
+        if head_takes_element_type && cell.cdr.is_cons() {
+            let elt = unsafe { (*(cell.cdr.as_ptr() as *const ConsCell)).car };
+            if elt.tag() == egcl_rt::value::TAG_SYMBOL {
+                return matches!(
+                    egcl_compiler::reader::symbol_name(elt.as_symbol_index()).as_deref(),
+                    Some("BASE-CHAR" | "STANDARD-CHAR")
                 );
             }
         }
@@ -2445,6 +2524,7 @@ pub fn build_result_sequence(
         return build_packed_f64(elems);
     }
     if result_type_is_string(result_type) {
+        let base = result_type_is_base_string(result_type);
         let mut out = String::with_capacity(elems.len());
         for &elem in elems {
             if !elem.is_character() {
@@ -2453,7 +2533,17 @@ pub fn build_result_sequence(
                     expected: "character".to_string(),
                 });
             }
+            // A BASE-STRING holds code points below 256 and never promotes.
+            if base && (elem.as_char() as u32) >= 256 {
+                return Err(EgclError::TypeError {
+                    datum: elem,
+                    expected: "base-char".to_string(),
+                });
+            }
             out.push(elem.as_char());
+        }
+        if base {
+            return Ok(crate::streams::make_lisp_base_string_fresh(&out));
         }
         // FRESH, not interned. make_lisp_string interns by content, so two
         // CONCATENATE (or MAP) calls producing the same characters answered the
