@@ -456,6 +456,7 @@ fn duplicate_join_returns(f: &Function) -> Option<Function> {
     copy
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn emit_framed_ordinary_function_with_self_call_facts(
     f: &Function, entry: OrdinaryLispEntryOptions,
     targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
