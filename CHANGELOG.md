@@ -142,6 +142,12 @@
   of a file that is still source-only see its source as
   `*COMPILE-FILE-PATHNAME*`
   ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- A saved image keeps every compiled function. One whose code referred to a
+  constant the compiled-unit format could not hold, such as a package, a hash
+  table, a host-built closure or a `HANDLER-BIND` handler, was left out with a
+  warning and ran interpreted after a restart; an image of ocicl lost several
+  hundred. Compiled files now hold package and hash-table constants too
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
 - `BASE-CHAR` is the element type of an 8-bit base string, consistently.
   `TYPEP` called every character a `BASE-CHAR` while `BASE-STRING` matched
   only 8-bit storage, `MAKE-STRING` ignored `:element-type`, and `MAP`,
@@ -327,6 +333,11 @@
 
 ### Performance
 
+- A function with `&optional` parameters binds them by position, filling in
+  defaults in a short prologue, instead of through the general lambda-list
+  binder on every call. Calls to such functions in pure-tls's certificate
+  parsing and in `SEARCH` took about a third less time
+  ([#392](https://github.com/atgreen/evergreen/pull/392)).
 - Generic-function calls do less repeated work. A `DEFCLASS` accessor reads
   or writes its slot directly once dispatch selects it (user methods on the
   accessor still take over), slot writes skip the class-slot search for
