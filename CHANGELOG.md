@@ -50,6 +50,10 @@
 
 ### Fixed
 
+- A compiled method shows up as `(METHOD <generic-function>)`, with its
+  qualifier, in `EGCL_SPROF` profiles, the tiering log and backtraces, instead
+  of an anonymous `METHOD` shared by every method
+  ([#421](https://github.com/atgreen/evergreen/pull/421)).
 - `BASE-CHAR`, `STANDARD-CHAR` and `EXTENDED-CHAR` are proper subtypes of
   `CHARACTER` at more doors: `(coerce #\λ 'base-char)` and `(coerce #\a
   'extended-char)` signal `TYPE-ERROR` instead of returning the character,
