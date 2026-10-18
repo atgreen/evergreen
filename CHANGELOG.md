@@ -118,7 +118,8 @@
   `SUBSTITUTE` and `REMOVE-DUPLICATES` families keep a string's width, and
   `TYPE-OF` answers `(SIMPLE-ARRAY CHARACTER (n))` for a 32-bit string (ansi
   sequences `MAP.SPECIALIZED-STRING.3`, `LENGTH.STRING.6`; the sequences
-  chapter now passes completely and joins the gate).
+  chapter now passes completely and joins the gate)
+  ([#403](https://github.com/atgreen/evergreen/pull/403)).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal

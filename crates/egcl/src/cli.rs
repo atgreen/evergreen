@@ -11664,6 +11664,15 @@ fn is_base_char_value(v: EgclVal) -> bool {
     v.is_character() && (v.as_char() as u32) < 256
 }
 
+/// STANDARD-CHAR: the 96 standard characters, #\Newline plus the printable
+/// ASCII range (matches boot.lisp STANDARD-CHAR-P).
+fn is_standard_char_value(v: EgclVal) -> bool {
+    v.is_character() && {
+        let code = v.as_char() as u32;
+        code == 10 || (32..127).contains(&code)
+    }
+}
+
 /// True if `v` is a registry-backed sentinel (a string/namestring hash wearing
 /// TAG_HEAP_OBJECT) — a value that is NOT a real heap pointer and must never be
 /// dereferenced via a raw `ObjectHeader` load.
@@ -16966,14 +16975,7 @@ fn typep_matches(
                 egcl_rt::types::floatp(object) && !object.is_single_float()
             }
             "CHARACTER" => object.is_character(),
-            // STANDARD-CHAR: the 96 standard characters — #\Newline plus the
-            // printable ASCII range (matches boot.lisp STANDARD-CHAR-P).
-            "STANDARD-CHAR" => {
-                object.is_character() && {
-                    let code = object.as_char() as u32;
-                    code == 10 || (32..127).contains(&code)
-                }
-            }
+            "STANDARD-CHAR" => is_standard_char_value(object),
             // BASE-CHAR is the element type of an 8-bit SIMPLE-BASE-STRING: the
             // code points below 256 (spec §1.6.3, R1.14). EXTENDED-CHAR is the
             // rest of CHARACTER. TYPEP used to call EVERY character a BASE-CHAR
@@ -18297,8 +18299,12 @@ fn value_satisfies_declared_type(type_form: EgclVal, value: EgclVal) -> Result<b
         "BOOLEAN" => value.is_nil() || value == T,
         "SYMBOL" => value.is_symbol(),
         "KEYWORD" => value.is_symbol() && sym_name(value).starts_with("KEYWORD:"),
-        "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" => value.is_character(),
-        "STRING" | "SIMPLE-STRING" | "SIMPLE-BASE-STRING" => is_string_value(value),
+        // BASE-CHAR, STANDARD-CHAR and SIMPLE-BASE-STRING are proper subtypes
+        // of CHARACTER and STRING, so they are left to TYPEP: answering them
+        // here as "any character" or "any string" let (the base-char #\λ)
+        // through.
+        "CHARACTER" => value.is_character(),
+        "STRING" | "SIMPLE-STRING" => is_string_value(value),
         "INTEGER" | "FIXNUM" => value.is_fixnum(),
         "FLOAT" | "SINGLE-FLOAT" | "REAL" => value.is_single_float() || value.is_fixnum(),
         "RATIO" => ratio_parts_val(value).is_some(),
@@ -31347,15 +31353,16 @@ fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclErr
     }
     let mut s = String::new();
     for e in seq_elements(value)? {
-        if e.is_character() {
-            if base && !is_base_char_value(e) {
-                return Err(EgclError::TypeError {
-                    datum: e,
-                    expected: "base-char".into(),
-                });
-            }
-            s.push(e.as_char());
+        // Every element must fit the string: one that is not a character (or
+        // not a BASE-CHAR, for a base string) is a TYPE-ERROR, as in SBCL,
+        // rather than being dropped -- (coerce '(1 #\a) 'string) was "a".
+        if !e.is_character() || (base && !is_base_char_value(e)) {
+            return Err(EgclError::TypeError {
+                datum: e,
+                expected: if base { "base-char" } else { "character" }.into(),
+            });
         }
+        s.push(e.as_char());
     }
     // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
     // :element-type character :initial-contents) must be MUTABLE — an
@@ -31427,6 +31434,43 @@ fn subseq_values(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         .map(index)
         .transpose()?;
     egcl_stdlib::subseq(args[0], start, end)
+}
+
+/// A character designator as a character (CLHS COERCE to CHARACTER): a
+/// character, a one-element string, or a symbol whose name is one character.
+fn coerce_to_character(value: EgclVal) -> Result<EgclVal, EgclError> {
+    if value.is_character() {
+        return Ok(value);
+    }
+    // A character designator is a character, a one-element string, or a
+    // symbol whose name is a single character — NOT an arbitrary object.
+    // Stringifying anything (e.g. the integer 65 -> "65" -> #\6) is a
+    // silent wrong result; a non-designator must type-error (bliss-vv1b).
+    let s_opt: Option<String> = if is_string_value(value) {
+        Some(val_as_str(value))
+    } else if value.is_symbol() {
+        // CLHS: a symbol character designator uses its SYMBOL-NAME
+        // exactly. `symbol_bare_name` is the wrong accessor here on two
+        // counts -- it UPPER-CASES, so `(character (make-symbol "a"))`
+        // answered #\A instead of #\a, and it splits off a package
+        // prefix at a colon, so an uninterned symbol NAMED ":" was
+        // reduced to the empty string and type-errored instead of
+        // yielding #\: (ansi CHARACTER.1). `symbol_name_of` preserves
+        // case and returns an uninterned symbol's whole name, colons
+        // and all (bliss-lgml).
+        Some(symbol_name_of(value))
+    } else {
+        None
+    };
+    match s_opt {
+        Some(ref s) if s.chars().count() == 1 => {
+            Ok(EgclVal::from_char(s.chars().next().unwrap()))
+        }
+        _ => Err(EgclError::TypeError {
+            datum: value,
+            expected: "character".into(),
+        }),
+    }
 }
 
 fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, EgclError> {
@@ -31560,37 +31604,23 @@ fn coerce_value(mut value: EgclVal, mut type_val: EgclVal) -> Result<EgclVal, Eg
         "STRING" | "SIMPLE-STRING" => coerce_to_string_value(value, false),
         "BASE-STRING" | "SIMPLE-BASE-STRING" => coerce_to_string_value(value, true),
         "CHARACTER" | "BASE-CHAR" | "STANDARD-CHAR" | "EXTENDED-CHAR" => {
-            if value.is_character() {
-                return Ok(value);
-            }
-            // A character designator is a character, a one-element string, or a
-            // symbol whose name is a single character — NOT an arbitrary object.
-            // Stringifying anything (e.g. the integer 65 -> "65" -> #\6) is a
-            // silent wrong result; a non-designator must type-error (bliss-vv1b).
-            let s_opt: Option<String> = if is_string_value(value) {
-                Some(val_as_str(value))
-            } else if value.is_symbol() {
-                // CLHS: a symbol character designator uses its SYMBOL-NAME
-                // exactly. `symbol_bare_name` is the wrong accessor here on two
-                // counts -- it UPPER-CASES, so `(character (make-symbol "a"))`
-                // answered #\A instead of #\a, and it splits off a package
-                // prefix at a colon, so an uninterned symbol NAMED ":" was
-                // reduced to the empty string and type-errored instead of
-                // yielding #\: (ansi CHARACTER.1). `symbol_name_of` preserves
-                // case and returns an uninterned symbol's whole name, colons
-                // and all (bliss-lgml).
-                Some(symbol_name_of(value))
-            } else {
-                None
+            // COERCE never changes a character's code, so a character of
+            // another subtype cannot be converted: (coerce #\λ 'base-char) is a
+            // TYPE-ERROR, as in SBCL, rather than #\λ.
+            let ch = coerce_to_character(value)?;
+            let fits = match tname.as_str() {
+                "BASE-CHAR" => is_base_char_value(ch),
+                "STANDARD-CHAR" => is_standard_char_value(ch),
+                "EXTENDED-CHAR" => !is_base_char_value(ch),
+                _ => true,
             };
-            match s_opt {
-                Some(ref s) if s.chars().count() == 1 => {
-                    Ok(EgclVal::from_char(s.chars().next().unwrap()))
-                }
-                _ => Err(EgclError::TypeError {
+            if fits {
+                Ok(ch)
+            } else {
+                Err(EgclError::TypeError {
                     datum: value,
-                    expected: "character".into(),
-                }),
+                    expected: tname.clone(),
+                })
             }
         }
         "SINGLE-FLOAT" | "SHORT-FLOAT" => Ok(EgclVal::from_single_float(num_val(value)? as f32)),
