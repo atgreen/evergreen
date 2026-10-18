@@ -7086,6 +7086,11 @@ fn compile_local_function(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    let optional_required = optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
+        params_form = params;
+        fbody = body;
+        required
+    });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
     lo.self_symbol = Some(self_symbol);
@@ -7114,6 +7119,9 @@ fn compile_local_function(
     } else {
         declared_parameter_types(fbody, &param_names)?
     };
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut lo.self_call_sites,
+    );
     Some(BytecodeFunction {
         self_call_sites: lo.self_call_sites,
         code: lo.code,
@@ -7129,7 +7137,7 @@ fn compile_local_function(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: sym_name(EgclVal::from_symbol_index(self_symbol)),
         params_form: if variadic { params_form } else { NIL },
         min_args,
@@ -7161,6 +7169,11 @@ fn compile_capturing_local(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    let optional_required = optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
+        params_form = params;
+        fbody = body;
+        required
+    });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
     lo.declared_special = inherited_specials.clone();
@@ -7200,8 +7213,12 @@ fn compile_capturing_local(
         return None;
     }
     lo.emit(Instr::Return);
+    let mut self_call_sites = Vec::new();
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut self_call_sites,
+    );
     Some(BytecodeFunction {
-        self_call_sites: Vec::new(),
+        self_call_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -7215,7 +7232,7 @@ fn compile_capturing_local(
         has_env: true,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: "<flet-closure>".to_string(),
         params_form: if variadic { params_form } else { NIL },
         min_args,
@@ -8086,6 +8103,192 @@ fn parse_key_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
     None
 }
 
+/// The value an omitted `&optional` argument arrives as in an optional-range
+/// function (see [`optional_entry_prologue`]): binding fills the missing
+/// trailing parameters with it, and the function's own prologue replaces it
+/// with the default. An internal symbol, so it is an ordinary immediate to every tier
+/// and poolable in a fasl.
+pub(super) fn unsupplied_marker() -> EgclVal {
+    static INDEX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // Interned under its registry key, as the package system's own intern
+    // does, so it exists while boot.lisp is still compiling (before the
+    // package registry is up) and is the symbol a later `EGCL::` read finds.
+    EgclVal::from_symbol_index(*INDEX.get_or_init(|| {
+        let index = egcl_rt::symbols::intern("EGCL::%UNSUPPLIED-ARGUMENT");
+        egcl_rt::symbols::set_symbol_package(index, egcl_rt::packages::find_or_create("EGCL"));
+        index
+    }))
+}
+
+/// Whether `body` is an optional-range function: fixed positional slots, of
+/// which the trailing `arity - min_args` are `&optional` parameters a call may
+/// omit.
+pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
+    !body.variadic && body.min_args < body.arity
+}
+
+/// SBCL-style `&optional` entry: rewrite a lambda list of required parameters
+/// and `&optional` ones (nothing else) into fixed positional parameters plus a
+/// prologue that computes the defaults, so the function binds its arguments
+/// positionally instead of through the run-time lambda-list binder, which
+/// re-parsed the lambda list and tree-walked the defaults on every call.
+///
+/// Such a function stays at T0 for now: the native ordinary entry checks an
+/// exact argument count, and the generic activation entry costs more per call
+/// than the interpreter saves for the small hot functions this applies to.
+/// Native promotion needs that entry to pad the omitted arguments itself.
+///
+/// `(lambda (a &optional (b (f a) b-p) c) . body)` becomes
+///
+/// ```lisp
+/// (lambda (a #:arg-1 #:arg-2)
+///   (let* ((b-p (not (eq #:arg-1 'egcl::%unsupplied-argument)))
+///          (b (if b-p #:arg-1 (f a)))
+///          (c (if (eq #:arg-2 'egcl::%unsupplied-argument) nil #:arg-2)))
+///     . body))
+/// ```
+///
+/// LET* gives each default exactly the scope CLHS 3.4.1 requires: the earlier
+/// parameters, not its own or later ones, so `(&optional (x x))` reads the
+/// enclosing `x`. Leading declarations move into the LET*, where they apply to
+/// the bindings they name; a docstring is dropped. Returns
+/// `(params, body, required_count)`, or `None` when the lambda list has another
+/// keyword or a destructuring parameter, or the body declares anything SPECIAL
+/// (a bound SPECIAL declaration for a required parameter cannot move inside the
+/// LET*), leaving such functions to the general binder.
+fn optional_entry_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal, u16)> {
+    egcl_rt::rooted!(params = list_to_vec(params_form));
+    let optional_at = params
+        .iter()
+        .position(|p| p.is_symbol() && super::sym_name_rc(*p).as_ref() == "&OPTIONAL")?;
+    let required = &params[..optional_at];
+    if required.iter().any(|p| !p.is_symbol() || super::sym_name_rc(*p).starts_with('&')) {
+        return None;
+    }
+    let required_count = u16::try_from(required.len()).ok()?;
+    // Each optional spec as (var, init-or-NIL, supplied-p-or-NIL).
+    egcl_rt::rooted!(specs = Vec::<EgclVal>::new());
+    for index in optional_at + 1..params.len() {
+        let spec = params[index];
+        if spec.is_symbol() {
+            if super::sym_name_rc(spec).starts_with('&') {
+                return None;
+            }
+            specs.extend([spec, NIL, NIL]);
+        } else if spec.is_cons() {
+            let items = list_to_vec(spec);
+            if items.is_empty() || items.len() > 3 || !items[0].is_symbol() {
+                return None;
+            }
+            if items.len() == 3 && (!items[2].is_symbol() || items[2].is_nil()) {
+                return None;
+            }
+            specs.extend([
+                items[0],
+                items.get(1).copied().unwrap_or(NIL),
+                items.get(2).copied().unwrap_or(NIL),
+            ]);
+        } else {
+            return None;
+        }
+    }
+    if specs.is_empty() {
+        return None;
+    }
+    // Split off the docstring and leading declarations.
+    egcl_rt::rooted!(forms = list_to_vec(body));
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE"
+        {
+            if declares_special(form) {
+                return None;
+            }
+            declarations.push(form);
+        } else {
+            break;
+        }
+        start += 1;
+    }
+    let marker = unsupplied_marker();
+    let quote = resolve_sym("QUOTE")?;
+    let eq = resolve_sym("EQ")?;
+    let not = resolve_sym("NOT")?;
+    let if_op = resolve_sym("IF")?;
+    egcl_rt::rooted!(quoted_marker = form_list(&[quote, marker]));
+    egcl_rt::rooted!(new_params = required.to_vec());
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for position in 0..specs.len() / 3 {
+        // Read each triple from the rooted `specs` afresh: the allocations
+        // below can move its objects.
+        egcl_rt::rooted!(spec = specs[position * 3..position * 3 + 3].to_vec());
+        egcl_rt::rooted!(argument = egcl_rt::symbols::make_uninterned(&format!(
+            "%EGCL-OPTIONAL-ARGUMENT-{position}"
+        )));
+        new_params.push(*argument);
+        egcl_rt::rooted!(unsupplied = form_list(&[eq, *argument, *quoted_marker]));
+        if spec[2].is_nil() {
+            egcl_rt::rooted!(value = form_list(&[if_op, *unsupplied, spec[1], *argument]));
+            let binding = form_list(&[spec[0], *value]);
+            bindings.push(binding);
+        } else {
+            egcl_rt::rooted!(supplied = form_list(&[not, *unsupplied]));
+            let binding = form_list(&[spec[2], *supplied]);
+            bindings.push(binding);
+            egcl_rt::rooted!(value = form_list(&[if_op, spec[2], *argument, spec[1]]));
+            let binding = form_list(&[spec[0], *value]);
+            bindings.push(binding);
+        }
+    }
+    egcl_rt::rooted!(let_form = vec![resolve_sym("LET*")?, form_list(&bindings)]);
+    let_form.extend(declarations.iter().copied());
+    let_form.extend(forms[start..].iter().copied());
+    let wrapped = form_list(&let_form);
+    egcl_rt::rooted!(wrapped = wrapped);
+    let new_body = arena_cons(*wrapped, NIL);
+    egcl_rt::rooted!(new_body = new_body);
+    let params_list = form_list(&new_params);
+    Some((params_list, *new_body, required_count))
+}
+
+/// `(arity, min_args)` for a compiled lambda list, given the required count an
+/// optional entry prologue left (if any): the positional slots, and how many of
+/// them a call must supply. For an optional-range function, drop the self-call
+/// sites that omit arguments, since only a full-arity call may enter directly.
+fn positional_arity(
+    variadic: bool,
+    min_args: u16,
+    max_args: Option<u16>,
+    optional_required: Option<u16>,
+    code: &[Instr],
+    self_call_sites: &mut Vec<u32>,
+) -> (u16, u16) {
+    let arity = if variadic { min_args } else { max_args.unwrap_or(min_args) };
+    let min_args = optional_required.unwrap_or(min_args);
+    if min_args < arity {
+        self_call_sites.retain(|&pc| {
+            matches!(code.get(pc as usize), Some(Instr::CallNamed { nargs, .. }) if *nargs == arity)
+        });
+    }
+    (arity, min_args)
+}
+
+/// Whether a DECLARE form contains a SPECIAL declaration.
+fn declares_special(declare: EgclVal) -> bool {
+    list_to_vec(cp(declare).1).into_iter().any(|spec| {
+        spec.is_cons()
+            && cp(spec).0.is_symbol()
+            && super::sym_name_rc(cp(spec).0).as_ref() == "SPECIAL"
+    })
+}
+
 /// Parse an ordinary lambda list into `(all-variable-names-in-order, min_args,
 /// max_args, variadic)` (x5y.7). Every variable — required, &optional (+ its
 /// supplied-p), &rest, &key (+ supplied-p), &aux — gets a name so the compiler
@@ -8695,6 +8898,19 @@ fn compile_function_forcing_boxed(
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
+    // Required + &optional only: compile the defaults into an entry prologue and
+    // bind positionally (optional_entry_prologue). The arguments' count may then
+    // fall short of the arity, by the omitted optionals.
+    let mut optional_required = None;
+    if !macro_lambda_list {
+        if let Some((params, prologue_body, required)) =
+            optional_entry_prologue(*params_form, *body)
+        {
+            *params_form = params;
+            *body = prologue_body;
+            optional_required = Some(required);
+        }
+    }
     // Parse the lambda list. Fixed and variadic (&optional/&rest/&key/&aux) are
     // both supported (x5y.7); destructuring / unknown keywords still bail.
     let parsed = if macro_lambda_list {
@@ -8878,6 +9094,9 @@ fn compile_function_forcing_boxed(
     }
     lo.emit(Instr::Return);
 
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut lo.self_call_sites,
+    );
     let mut function = BytecodeFunction {
         self_call_sites: lo.self_call_sites,
         code: lo.code,
@@ -8893,7 +9112,7 @@ fn compile_function_forcing_boxed(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: name.to_string(),
         // Ordinary fixed-arity functions can install a synthetic lambda list
         // from arity, but source-free macros always re-run the macro binder at
@@ -12692,7 +12911,13 @@ fn decode_bbu_function(
         has_env,
         n_locals: encoded.n_locals,
         max_stack: encoded.max_stack,
-        arity: encoded.arity_min,
+        // Positional slots: an optional-range function's include its &optional
+        // parameters, which a call may omit (arity_min is the required count).
+        arity: if !variadic && encoded.arity_max != u16::MAX {
+            encoded.arity_max
+        } else {
+            encoded.arity_min
+        },
         name,
         params_form,
         min_args: encoded.arity_min,
@@ -14387,7 +14612,13 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     }
     for function in &encoded_functions {
         if let Some(metadata) = &function.metadata {
-            if !metadata.variadic && function.arity_min != function.arity_max {
+            // From 0x0203 a positional function may be optional-range: it
+            // requires arity_min arguments of its arity_max slots.
+            if !metadata.variadic
+                && (function.arity_min > function.arity_max
+                    || function.arity_max == u16::MAX
+                    || (bytecode_version < 0x0203 && function.arity_min != function.arity_max))
+            {
                 return Err(bbu_error("fixed function has a non-fixed arity range"));
             }
             if metadata.variadic && function.lambda_list_ref == BBU_NO_INDEX {
@@ -15232,8 +15463,11 @@ fn bind_params(
     args: &[EgclVal],
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
 ) {
+    // An optional-range function's omitted trailing arguments bind the
+    // unsupplied marker; its entry prologue computes their defaults.
+    let unsupplied = optional_range(func).then(unsupplied_marker);
     for (i, (name, loc)) in func.param_layout.iter().enumerate() {
-        if let Some(a) = args.get(i) {
+        if let Some(a) = args.get(i).or(unsupplied.as_ref()) {
             match loc {
                 VarLoc::Slot(s) => unsafe { slot_set(frame, *s, *a) },
                 VarLoc::Boxed => bind_boxed_param(
