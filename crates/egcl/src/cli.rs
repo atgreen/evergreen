@@ -18615,6 +18615,11 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "CONS" | "RPLACA" | "RPLACD" | "SET-CAR" | "SET-CDR" => Some((2, 2)),
         "FINALIZE" => Some((2, 4)),
         "CANCEL-FINALIZATION" => Some((1, 1)),
+        _ if bare.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(bare).is_some() =>
+        {
+            egcl_stdlib::crypto::primitive_arity(bare).map(|n| (n, n))
+        }
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         "HASH-TABLE-WEAKNESS" => Some((1, 1)),
@@ -25731,6 +25736,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // which made signing a 6.8 MB APK take ~22 minutes against SBCL's
             // 1.2 s (bliss-omaps); Ironclad itself uses implementation-specific
             // routines wherever a host has them, and this is EGCL's.
+            // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
+            "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:SHA256" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() != 1 {
@@ -38664,6 +38675,12 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 
 /// Builtins `apply_builtin_fast` handles on evaluated arguments.
 const DIRECT_FAST: &[&str] = &[
+    // Ironclad's EGCL block primitives: leaf kernels on octet vectors.
+    "CRYPTO-AES-ENCRYPT-BLOCK",
+    "CRYPTO-AES-DECRYPT-BLOCK",
+    "CRYPTO-GHASH-MUL",
+    "CRYPTO-SHA256-BLOCK",
+    "CRYPTO-SHA256-WORDS",
     "AREF",
     "SVREF",
     "ROW-MAJOR-AREF",
@@ -39575,6 +39592,16 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::FINALIZE"
             | "EGCL-EXT:CANCEL-FINALIZATION"
             | "EGCL-EXT::CANCEL-FINALIZATION"
+            | "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT::CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT::CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS"
+            | "EGCL-EXT::CRYPTO-SHA256-WORDS"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
             | "EGCL-EXT:DECLARATION-SPECIFIER"
@@ -39819,6 +39846,12 @@ fn apply_builtin_fast(
         "LIST" | "GETF" => {
             env.clear_mv();
             evaluated_builtins::call(name, args, env)
+        }
+        _ if name.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(name).is_some() =>
+        {
+            env.clear_mv();
+            egcl_stdlib::crypto::call(name, args)
         }
         "APPEND" => {
             env.clear_mv();

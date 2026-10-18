@@ -468,6 +468,20 @@ fn vector_set_elt(v: EgclVal, idx: usize, val: EgclVal) {
     }
 }
 
+/// The element slots of a SIMPLE-VECTOR: a pointer to element 0 and the
+/// length, or `None` for anything else. For kernels that read or write a whole
+/// vector of fixnums in one pass (`crypto`). The pointer is valid only until
+/// the next allocation, which can move the vector; a store of a heap value
+/// through it also skips the write barrier, so store those with `set_aref`.
+pub(crate) fn simple_vector_slots(v: EgclVal) -> Option<(*mut EgclVal, usize)> {
+    if !is_vector(v) {
+        return None;
+    }
+    let ptr = unsafe { v.as_ptr() };
+    let off = vector_payload_offset(ptr);
+    Some((unsafe { ptr.add(off + 8) } as *mut EgclVal, vector_length(v)))
+}
+
 /// Atomically compare and exchange one SIMPLE-VECTOR element.
 pub fn compare_exchange_svref(
     vector: EgclVal,
