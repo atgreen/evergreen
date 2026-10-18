@@ -36608,20 +36608,14 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         NIL
     };
     let (class, class_is_fresh) = match egcl_stdlib::find_class(name_form) {
-        // A placeholder minted for a forward reference was allocated before
-        // any `:metaclass` could be known, so it has no cell for the
-        // metaclass's slots and cannot grow one. DEFCLASS replaces it with a
-        // metaobject sized for this definition and moves the placeholder's
-        // registrations across -- the forward-referenced half of GitHub #384,
-        // and SBCL's CHANGE-CLASS of a FORWARD-REFERENCED-CLASS. The
-        // replacement is fresh, so the metaclass's initforms run on it below.
-        Some(existing) => match egcl_stdlib::clos::replace_forward_referenced_class(
-            existing,
-            metaclass_for_layout,
-        )? {
-            Some(replacement) => (replacement, true),
-            None => (existing, false),
-        },
+        // A placeholder minted for a forward reference is KEPT, even when this
+        // definition names a metaclass with slots: its storage grows to the
+        // metaclass's layout (bliss-fmhj5). DEFCLASS used to have to replace
+        // the whole metaobject here, which cost a program that had captured
+        // `(find-class 'x)` before the definition its EQ identity
+        // (bliss-qbz4o). `set_class_metaclass` below reports whether the layout
+        // changed, which is what decides the initforms.
+        Some(existing) => (existing, false),
         None => (
             egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
             true,
@@ -36646,7 +36640,7 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         && let Some(class) = egcl_stdlib::find_class(name_form)
         && let Some(metaclass) = egcl_stdlib::find_class(metaclass_name)
     {
-        egcl_stdlib::clos::set_class_metaclass(class, metaclass);
+        let layout_changed = egcl_stdlib::clos::set_class_metaclass(class, metaclass);
         // The class metaobject is an instance of its metaclass, so the
         // metaclass's slot :initforms apply to it -- that is what makes
         // `(meta-x (find-class 'foo))` answer the initform rather than
@@ -36659,7 +36653,11 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         //
         // After `set_class_metaclass`, which is what points the object's
         // wrapper at the metaclass and so decides which slot cells exist.
-        if class_is_fresh {
+        // Also when the class only NOW acquired the metaclass's slots: a
+        // forward-reference placeholder, or a class whose metaclass was defined
+        // after it, has cells that did not exist a moment ago and they are
+        // UNBOUND (bliss-fmhj5, bliss-qbz4o).
+        if class_is_fresh || layout_changed {
             let metaclass_name = class_name_for_instance_class(metaclass);
             apply_class_initforms(class, &metaclass_name, env, None, &[])?;
         }
