@@ -54,6 +54,11 @@
   qualifier, in `EGCL_SPROF` profiles, the tiering log and backtraces, instead
   of an anonymous `METHOD` shared by every method
   ([#421](https://github.com/atgreen/evergreen/pull/421)).
+- A fill-pointer or adjustable string made with `:element-type 'base-char`
+  is a `BASE-STRING`: `ARRAY-ELEMENT-TYPE` answers `BASE-CHAR`, it is stored
+  8-bit, and `VECTOR-PUSH`, `VECTOR-PUSH-EXTEND` and `ADJUST-ARRAY` signal
+  `TYPE-ERROR` for a wider character instead of storing it, as in SBCL
+  ([#418](https://github.com/atgreen/evergreen/pull/418)).
 - `BASE-CHAR`, `STANDARD-CHAR` and `EXTENDED-CHAR` are proper subtypes of
   `CHARACTER` at more doors: `(coerce #\λ 'base-char)` and `(coerce #\a
   'extended-char)` signal `TYPE-ERROR` instead of returning the character,

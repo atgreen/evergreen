@@ -2334,7 +2334,9 @@
               ;; tags the complex vector as a bit vector (bliss-65nx).
               (v (%make-complex-vector size fpn (and adjustable t) iel
                                        (and stringp (not bitp) t) (and fp t)
-                                       (and bitp t) (and doublep t))))
+                                       (and bitp t) (and doublep t)
+                                       ;; BASE-CHAR asks for 8-bit storage.
+                                       (and (member et '(base-char standard-char)) t))))
          (when ic-cell
            (let ((i 0))
              (dolist (e (coerce (car (cdr ic-cell)) 'list))

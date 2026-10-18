@@ -538,7 +538,8 @@ pub fn atomic_update_svref(
 // Like simple-vectors, these are leaked (off-GC) heap objects (egcl allocates
 // vectors with `Vec::forget`, so nothing here interacts with the collector).
 // Body layout after the 8-byte header:
-//   word 0 (+8):  storage — a SIMPLE_VECTOR of capacity `array-total-size`
+//   word 0 (+8):  storage — a SIMPLE_VECTOR of capacity `array-total-size`, or
+//                 for a string of BASE-CHARs an 8-bit SIMPLE_BASE_STRING
 //   word 1 (+16): fill-pointer, a fixnum (the active LENGTH)
 //   word 2 (+24): adjustable flag (T / NIL)
 //   word 3 (+32): element-type tag, a fixnum (1 = CHARACTER, 0 = general T)
@@ -717,7 +718,8 @@ pub fn cvec_has_fill_pointer(v: EgclVal) -> bool {
 /// Does this string's storage hold BASE-CHARs, i.e. is it 8-bit? A simple
 /// string answers by its type id; a displaced string by the array it reads and
 /// writes through to (chains resolve); an adjustable or fill-pointer string by
-/// its own store, which is 32-bit today. ARRAY-ELEMENT-TYPE and TYPEP follow
+/// its own store, which is 8-bit when it was made for BASE-CHARs
+/// ([`build_base_char_complex_vector`]). ARRAY-ELEMENT-TYPE and TYPEP follow
 /// this rather than the element type the array was asked for, because the
 /// storage is what accepts or refuses a character: a string displaced onto a
 /// base string said CHARACTER and then refused a wide character, so `(setf
@@ -941,6 +943,65 @@ pub fn build_complex_vector(
     //         (underivable from the base); a non-displaced array stores NIL in
     //         words 5-6.
     build_complex_array_body(*storage, fp, adj, elt, hasfp, NIL, NIL)
+}
+
+/// Build a (fill-pointer / adjustable) string of BASE-CHARs over 8-bit
+/// storage: a fresh SIMPLE-BASE-STRING of `capacity` characters, each `fill`.
+/// Its element type is then BASE-CHAR (see [`string_storage_is_base`]), and the
+/// storage refuses a wider character exactly as a simple base string does.
+pub fn build_base_char_complex_vector(
+    capacity: usize,
+    fill_pointer: usize,
+    adjustable: bool,
+    fill: char,
+    has_fill_pointer: bool,
+) -> Result<EgclVal, EgclError> {
+    if (fill as u32) >= 256 {
+        return Err(EgclError::TypeError {
+            datum: EgclVal::from_char(fill),
+            expected: "BASE-CHAR".into(),
+        });
+    }
+    let text: String = std::iter::repeat_n(fill, capacity).collect();
+    egcl_rt::rooted!(storage = crate::streams::make_lisp_base_string_fresh(&text));
+    Ok(build_complex_array_body(
+        *storage,
+        EgclVal::from_fixnum(fill_pointer.min(capacity) as i64),
+        if adjustable { T } else { NIL },
+        EgclVal::from_fixnum(element_type_code(true, false)),
+        EgclVal::from_fixnum(i64::from(has_fill_pointer)),
+        NIL,
+        NIL,
+    ))
+}
+
+/// Whether a complex vector is a string over 8-bit (BASE-CHAR) storage, whose
+/// replacement storage must stay 8-bit when it grows or is adjusted.
+fn cvec_holds_base_chars(v: EgclVal) -> bool {
+    cvec_is_string(v) && string_storage_is_base(v)
+}
+
+/// Fresh direct storage holding `elements`: an 8-bit SIMPLE-BASE-STRING for a
+/// vector over base-char storage, else a SIMPLE-VECTOR. An unset (NIL) slot of
+/// a base string becomes #\Nul; any other non-BASE-CHAR is a TYPE-ERROR.
+fn rebuilt_storage(base_chars: bool, elements: &[EgclVal]) -> Result<EgclVal, EgclError> {
+    if !base_chars {
+        return Ok(build_vector(elements));
+    }
+    let mut text = String::with_capacity(elements.len());
+    for &e in elements {
+        if e.is_nil() {
+            text.push('\0');
+        } else if e.is_character() && (e.as_char() as u32) < 256 {
+            text.push(e.as_char());
+        } else {
+            return Err(EgclError::TypeError {
+                datum: e,
+                expected: "BASE-CHAR".into(),
+            });
+        }
+    }
+    Ok(crate::streams::make_lisp_base_string_fresh(&text))
 }
 
 /// Build a rank-one DOUBLE-FLOAT array with packed backing storage.
@@ -1198,6 +1259,14 @@ pub fn vector_push_extend(
         cvec_set_fill_pointer_raw(*v, fp + 1);
         return Ok(EgclVal::from_fixnum(fp as i64));
     }
+    let base_chars = cvec_holds_base_chars(v);
+    // Refuse a character the 8-bit storage cannot hold before growing it.
+    if base_chars && !(value.is_character() && (value.as_char() as u32) < 256) {
+        return Err(EgclError::TypeError {
+            datum: value,
+            expected: "BASE-CHAR".into(),
+        });
+    }
     if fp >= cap {
         if !cvec_adjustable(v) {
             return Err(EgclError::TypeError {
@@ -1225,12 +1294,12 @@ pub fn vector_push_extend(
         // `cvec_set_storage(*v, build_vector(&store))` would reload `*v` as the
         // left argument *before* build_vector runs, handing the setter the very
         // pre-move address the rooting exists to avoid.
-        let storage = build_vector(&store);
+        let storage = rebuilt_storage(base_chars, &store)?;
         cvec_set_storage(*v, storage);
         // The array now owns fresh direct storage — a formerly displaced
         // array stops being displaced (its elements were copied above).
         cvec_clear_displacement(*v);
-        vector_set_elt(storage, fp, *value);
+        set_elt(storage, fp, *value)?;
         cvec_set_fill_pointer_raw(*v, fp + 1);
         return Ok(EgclVal::from_fixnum(fp as i64));
     }
@@ -1264,6 +1333,7 @@ pub fn adjust_complex_vector(
         return resize_double_float_complex_vector(v, new_size, fp, fill);
     }
     if new_size > cap {
+        let base_chars = cvec_holds_base_chars(v);
         let mut store: Vec<EgclVal> = Vec::with_capacity(new_size);
         for i in 0..cap {
             store.push(cvec_elt(v, i)?);
@@ -1278,7 +1348,7 @@ pub fn adjust_complex_vector(
         egcl_rt::rooted!(v = v);
         // Allocate FIRST, then re-read `*v` — see the note in
         // `vector_push_extend` on argument-evaluation order.
-        let storage = build_vector(&store);
+        let storage = rebuilt_storage(base_chars, &store)?;
         cvec_set_storage(*v, storage);
         // Fresh direct storage: a formerly displaced array stops being
         // displaced (ADJUST-ARRAY without :displaced-to, CLHS).
