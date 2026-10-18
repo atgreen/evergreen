@@ -4,6 +4,11 @@
 
 ### Added
 
+- An illustrated [guide to function calling conventions](docs/design/function-calling-conventions.html)
+  for readers new to EGCL, covering all sixteen calls between T2, T1, T0,
+  and the tree walker, with register, stack, and runtime metadata diagrams
+  ([#395](https://github.com/atgreen/evergreen/pull/395)).
+
 - `EGCL-MOP`, the metaobject-protocol package `docs/egcl-lisp-api.md`
   specified but the bootstrap never installed. It provides
   `CLASS-DIRECT-SUPERCLASSES`, `CLASS-DIRECT-SUBCLASSES`,
