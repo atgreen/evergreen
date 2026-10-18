@@ -4299,6 +4299,9 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             compiled_methods.insert(id, EgclVal::from_raw(remap(callable)));
         }
     }
+    for &callable in compiled_methods.values() {
+        set_compiled_method_cell(callable, true);
+    }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
     let mut expanders = HashMap::new();
     if data.get(off..off + 4) == Some(b"SEXP") {
@@ -38364,6 +38367,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     } else {
         None
     };
+    let mut replaced = None;
     {
         let mut methods_map = env.methods.borrow_mut();
         let list = methods_map.entry(name.clone()).or_default();
@@ -38373,9 +38377,8 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         if let Some(pos) = list.iter().position(|m| {
             m.qualifier == qualifier && specializers_equal(&m.specializers, &specializers)
         }) {
-            let old_id = list[pos].method_id;
+            replaced = Some(list[pos].method_id.0);
             list.remove(pos);
-            METHOD_COMPILED.borrow_mut().remove(&old_id.0);
         }
         list.push(MethodDef {
             method_id,
@@ -38387,6 +38390,11 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             body,
         });
     }
+    // Retire the replaced method's compiled body outside the methods borrow:
+    // clearing its symbol cell also invalidates call tables.
+    if let Some(old_id) = replaced {
+        forget_compiled_method(old_id);
+    }
     // A new/redefined method changes applicability and ordering (bliss-x5y.20).
     invalidate_gf_dispatch_cache();
 
@@ -38397,7 +38405,7 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     // CALL-NEXT-METHOD/NEXT-METHOD-P (which need env.method_context, unknown to
     // the bytecode compiler). Everything else keeps tree-walking. A redefinition
     // drops any stale compiled body first.
-    METHOD_COMPILED.borrow_mut().remove(&method_id.0);
+    forget_compiled_method(method_id.0);
     if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() && !nested_in_binding {
         let compile_ll = method_lambda_list_for_compile(*lambda_list);
         if let Some(callable) = bytecode::compile_and_reify_lambda("METHOD", compile_ll, body, env)
@@ -38437,6 +38445,34 @@ fn specializers_equal(a: &[MethodSpecializer], b: &[MethodSpecializer]) -> bool 
 /// declared. (This is why `&key` methods were excluded from compilation
 /// outright in bliss-x5y.20; they are 59.6% of tree-walked method invocations
 /// on an ASDF/babel load.)
+/// Install (or, with `installed` false, clear) a compiled method callable in
+/// its own uninterned symbol's function cell, where the tiering bookkeeping
+/// looks for its counters (see `compile_and_reify_lambda`). An image restores
+/// METHOD_COMPILED without those cells, and a replaced method's cell must not
+/// keep its retired callable alive. Allocates nothing.
+fn set_compiled_method_cell(callable: EgclVal, installed: bool) {
+    if !egcl_rt::function::is_interpreted_function(callable) {
+        return;
+    }
+    let name = egcl_rt::function::name(callable);
+    let Some(sym) = name.symbol_index() else {
+        return;
+    };
+    if !egcl_rt::symbols::is_uninterned(sym) {
+        return;
+    }
+    let value = if installed { callable } else { egcl_rt::value::UNBOUND };
+    egcl_rt::symbols::set_symbol_function(sym, value);
+}
+
+/// Drop method `id`'s compiled body, if it has one.
+fn forget_compiled_method(id: u64) {
+    let retired = METHOD_COMPILED.borrow_mut().remove(&id);
+    if let Some(callable) = retired {
+        set_compiled_method_cell(callable, false);
+    }
+}
+
 fn method_lambda_list_for_compile(lambda_list: EgclVal) -> EgclVal {
     // Resolve the symbol FIRST. Interning can allocate, and every step below
     // this point holds `EgclVal`s copied out of the lambda list in a Rust
