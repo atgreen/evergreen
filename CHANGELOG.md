@@ -41,6 +41,12 @@
   ([#352](https://github.com/atgreen/evergreen/pull/352),
   [#366](https://github.com/atgreen/evergreen/pull/366);
   issue [#350](https://github.com/atgreen/evergreen/issues/350)).
+- The manual now documents every `EGCL-EXT` function, including `SETENV`,
+  `UNSETENV`, `GET-PRECISE-TIME`, `REAL-TIME-NANOSECONDS`, the package-local
+  nickname functions, `HASH-TABLE-WEAKNESS`, the funcallable-instance functions,
+  declaration introspection and the embedded-file functions. Each one has an
+  anchored entry and a symbol-index row
+  ([#409](https://github.com/atgreen/evergreen/pull/409)).
 
 ### Fixed
 
