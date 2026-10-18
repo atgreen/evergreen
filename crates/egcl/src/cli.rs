@@ -10584,6 +10584,22 @@ fn print_val_inner(val: EgclVal, out: &mut String) {
             .unwrap_or_else(|| "INSTANCE".to_string());
         out.push_str("#<");
         out.push_str(&name);
+        // A class metaobject names ITSELF as well as its metaclass, the way
+        // SBCL, CCL and ECL print one: #<STANDARD-CLASS FOO>. Without it every
+        // standard class in the image prints as the identical text
+        // #<STANDARD-CLASS>.
+        //
+        // This mirrors `instance_class_tag` in egcl-stdlib's format.rs because
+        // there are TWO printers and fixing one does not reach the other: ~S,
+        // ~A, prin1-to-string and princ-to-string go through that one, while
+        // WRITE, PRIN1, PRINC, PRINT and write-to-string come here. Measured
+        // after fixing only format.rs -- half the entry points still printed
+        // the bare tag (bliss-w53r3).
+        let own_class_name = egcl_stdlib::class_name(*val);
+        if !own_class_name.is_nil() {
+            out.push(' ');
+            out.push_str(&sym_bare_name_rc(own_class_name));
+        }
         // Restart objects are first-class designators, and their printed
         // representation should retain the name that makes them useful at the
         // debugger/repl (bliss-0i56). The NAME slot is part of the private
