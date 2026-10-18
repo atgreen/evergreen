@@ -6676,6 +6676,10 @@ fn slot_boundp_protocol(
     slot: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    // As in `slot_value_or_signal`: a program may ask SLOT-BOUNDP before it
+    // ever reads, and an added slot is bound once its initform has run
+    // (bliss-oi5a6). Measured without this: NIL where SBCL answers T.
+    let instance = run_redefinition_update(instance, env)?;
     if slot_is_missing(env, instance, slot) {
         let answer = invoke_slot_missing(env, instance, slot, "SLOT-BOUNDP", None)?;
         return Ok(if answer.is_nil() { NIL } else { T });
@@ -6690,7 +6694,19 @@ fn slot_makunbound_protocol(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
-    if slot_is_missing(env, *instance, slot) {
+    // Before unbinding, not after: the update protocol has to have run, or a
+    // later read would notice the slot unbound and apply the initform the
+    // program just removed (bliss-oi5a6).
+    //
+    // The migrated address stays INTERNAL. SLOT-MAKUNBOUND returns the
+    // instance, and the migration's replacement is not EQ to the reference the
+    // caller passed in -- nor to any other reference the program is holding,
+    // which all name the forwarded original. Storing it into `instance` here
+    // made `(eq (slot-makunbound i 'a) i)` answer NIL, measured, where main
+    // answers T. The accessors chase forwarding, so the original stays a
+    // perfectly good handle for everything below.
+    let current = run_redefinition_update(*instance, env)?;
+    if slot_is_missing(env, current, slot) {
         invoke_slot_missing(env, *instance, slot, "SLOT-MAKUNBOUND", None)?;
         return Ok(*instance);
     }
@@ -6706,6 +6722,44 @@ fn slot_makunbound_protocol(
     Ok(*instance)
 }
 
+/// Bring `instance` up to date if its class was redefined, running
+/// `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` (CLHS 7.2.2) when the layout actually
+/// changed. Answers the instance, which the migration may have moved.
+///
+/// The default method, in `lib/boot.lisp`, is
+/// `(apply #'shared-initialize instance added-slots initargs)` — and
+/// SHARED-INITIALIZE fills only slots that are UNBOUND, so running this lazily
+/// on the first read cannot clobber a value the program has already stored in
+/// an added slot. That is what makes the read path a sufficient trigger.
+///
+/// A class whose redefinition changed nothing about the layout costs one
+/// wrapper-stamp test, which is what the accessors already paid.
+fn run_redefinition_update(instance: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
+    let (instance, update) = egcl_stdlib::clos::migrate_if_obsolete(instance);
+    let Some(update) = update else {
+        return Ok(instance);
+    };
+    if update.added.is_empty() && update.discarded.is_empty() {
+        // A redefinition that kept the layout: nothing for the protocol to do,
+        // and no reason to make a generic-function call per instance.
+        return Ok(instance);
+    }
+    // Everything below allocates (three lists, then the method's own body), and
+    // the instance is a movable heap object, so root the instance and the slot
+    // names the migration just handed back before the first allocation.
+    egcl_rt::rooted!(instance = instance);
+    egcl_rt::rooted!(added = update.added);
+    egcl_rt::rooted!(discarded = update.discarded);
+    egcl_rt::rooted!(plist = update.plist);
+    egcl_rt::rooted!(added_list = vec_to_list(&added));
+    egcl_rt::rooted!(discarded_list = vec_to_list(&discarded));
+    egcl_rt::rooted!(plist_list = vec_to_list(&plist));
+    let args = RootedVals::new(vec![*instance, *added_list, *discarded_list, *plist_list]);
+    invoke_generic_function("UPDATE-INSTANCE-FOR-REDEFINED-CLASS", &args, env)?;
+    env.clear_mv();
+    Ok(*instance)
+}
+
 fn slot_value_or_signal(
     instance: EgclVal,
     slot: EgclVal,
@@ -6713,6 +6767,19 @@ fn slot_value_or_signal(
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(instance = instance);
     egcl_rt::rooted!(slot = slot);
+    // FIRST, before anything reads a slot: bring an instance of a redefined
+    // class up to date through the CLHS protocol, not just through the layout
+    // copy. A slot the redefinition ADDED was left UNBOUND, where CLHS 4.3.6
+    // wants its initform applied -- measured: `(defclass c () ())`, an
+    // instance, then `(defclass c () ((s :initform 42)))` left S unbound where
+    // SBCL answers 42 (bliss-oi5a6).
+    //
+    // Here rather than deeper because this is the entry point that has the
+    // evaluator: applying an initform means EVALUATING it, and the protocol is
+    // a generic function users may specialize. It must also come before
+    // `slot_is_missing` below, which migrates the instance itself and would
+    // discard the record of what the redefinition changed.
+    *instance = run_redefinition_update(*instance, env)?;
     // An object of a built-in class has no slots at all; SLOT-MISSING reports
     // it (ansi slot-value.error.5). Conditions and structures, whose classes
     // are name symbols, keep their own slot access below.

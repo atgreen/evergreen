@@ -166,24 +166,57 @@ unsafe fn forward_instance(old: EgclVal, new: EgclVal) {
     unsafe { egcl_rt::gc::forward_object_to(old, new) };
 }
 
+/// What a class redefinition changed about an instance's layout, in the shape
+/// `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` takes it (CLHS 7.2.2).
+///
+/// Returned to the caller rather than acted on here: applying an added slot's
+/// `:initform` means EVALUATING it, and the evaluator lives above this crate.
+/// A side table keyed by the instance would be the alternative, and a HashMap
+/// keyed by a movable nursery object needs a rehashing GC scanner — this needs
+/// neither.
+pub struct RedefinitionUpdate {
+    /// Slot names the new layout has and the old one did not. These are the
+    /// slots whose initforms CLHS says to apply.
+    pub added: Vec<EgclVal>,
+    /// Slot names the old layout had and the new one does not.
+    pub discarded: Vec<EgclVal>,
+    /// Name/value pairs, flat, for each discarded slot that was BOUND: the
+    /// property list the protocol hands to a user method.
+    pub plist: Vec<EgclVal>,
+}
+
 /// Bring `instance` up to date if its class has been redefined, and answer the
 /// address it now lives at.
 ///
-/// The public form of [`update_if_obsolete`], for a caller OUTSIDE this crate
-/// that holds an instance across a slot operation. Every slot entry point
-/// migrates on its own, and migrating allocates — which can evacuate a
-/// nursery-resident instance and leave the caller's own word pointing at a
-/// recycled body, exactly as it did inside this crate before bliss-ch80h.
-/// Doing it once, up front, means nothing the caller does afterwards can
-/// migrate, so there is no window to root across.
+/// For a caller OUTSIDE this crate that holds an instance across a slot
+/// operation. Every slot entry point migrates on its own, and migrating
+/// allocates — which can evacuate a nursery-resident instance and leave the
+/// caller's own word pointing at a recycled body, exactly as it did inside
+/// this crate before bliss-ch80h. Doing it once, up front, means nothing the
+/// caller does afterwards can migrate, so there is no window to root across.
 ///
 /// Cheap for a current instance: a forwarding chase and a wrapper-stamp read,
 /// no lock and no allocation.
+///
+/// Discards what the redefinition CHANGED. A caller that can run the update
+/// protocol — one with the evaluator in hand — wants `migrate_if_obsolete`
+/// instead, and must call it before this (bliss-oi5a6).
 pub fn ensure_instance_current(instance: EgclVal) -> EgclVal {
+    migrate_if_obsolete(instance).0
+}
+
+/// Migrate `instance` if its class has been redefined, and report what the
+/// redefinition changed so the caller can run the CLHS update protocol.
+///
+/// The caller must do this BEFORE anything else touches the instance: every
+/// slot accessor migrates on its own (`update_if_obsolete`), and one that got
+/// there first would discard the record of what changed, leaving the added
+/// slots UNBOUND for good (bliss-oi5a6).
+pub fn migrate_if_obsolete(instance: EgclVal) -> (EgclVal, Option<RedefinitionUpdate>) {
     if !is_instance(instance) {
-        return instance;
+        return (instance, None);
     }
-    unsafe { update_if_obsolete(instance) }
+    unsafe { migrate_obsolete(instance) }
 }
 
 /// Lazily migrate an instance whose wrapper is obsolete (its class was
@@ -222,12 +255,21 @@ pub fn ensure_instance_current(instance: EgclVal) -> EgclVal {
 /// `inst` must be a live STANDARD_OBJECT heap value.
 #[must_use = "the instance may have moved during the migration; use the returned value"]
 unsafe fn update_if_obsolete(inst: EgclVal) -> EgclVal {
+    // Drops the layout change: a slot accessor cannot run the update protocol,
+    // which evaluates initforms. `migrate_if_obsolete` is the entry point for a
+    // caller that can (bliss-oi5a6).
+    unsafe { migrate_obsolete(inst).0 }
+}
+
+/// [`update_if_obsolete`], also reporting what the redefinition changed.
+#[must_use = "the instance may have moved during the migration; use the returned value"]
+unsafe fn migrate_obsolete(inst: EgclVal) -> (EgclVal, Option<RedefinitionUpdate>) {
     unsafe {
         let live = resolve_forwarding(inst);
         let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
         if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_OBSOLETE {
             // Nothing allocated, so nothing moved: `live` is still current.
-            return live;
+            return (live, None);
         }
         let class = (*w).class;
         // Snapshot surviving (bound) slots from the old frozen layout.
@@ -255,7 +297,7 @@ unsafe fn update_if_obsolete(inst: EgclVal) -> EgclVal {
             Ok(i) => i,
             // The allocation may still have collected before failing, so answer
             // the ROOTED copy rather than the caller's.
-            Err(_) => return live,
+            Err(_) => return (live, None),
         };
         let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
         if !nw.is_null() {
@@ -266,8 +308,45 @@ unsafe fn update_if_obsolete(inst: EgclVal) -> EgclVal {
                 }
             }
         }
+        // What the redefinition changed, read off the two frozen layouts: a
+        // name the new layout has and the old did not is ADDED (its initform is
+        // what the protocol applies), the reverse is DISCARDED, and a discarded
+        // slot that was bound contributes its name and value to the property
+        // list. Compared by identity, the same way the copy loop above matches
+        // names through `nl.index`.
+        //
+        // Nothing below allocates, so these values stay valid until they are
+        // returned -- but the CALLER evaluates initforms with them, and must
+        // root them first.
+        let update = {
+            let old_names = &(*w).layout.order;
+            let empty: Vec<EgclVal> = Vec::new();
+            let new_names = if nw.is_null() { &empty } else { &(*nw).layout.order };
+            let added: Vec<EgclVal> = new_names
+                .iter()
+                .copied()
+                .filter(|name| !old_names.contains(name))
+                .collect();
+            let discarded: Vec<EgclVal> = old_names
+                .iter()
+                .copied()
+                .filter(|name| !new_names.contains(name))
+                .collect();
+            let mut plist: Vec<EgclVal> = Vec::new();
+            for (name, value) in &snap {
+                if discarded.contains(name) {
+                    plist.push(*name);
+                    plist.push(*value);
+                }
+            }
+            RedefinitionUpdate {
+                added,
+                discarded,
+                plist,
+            }
+        };
         forward_instance(live, new_inst);
-        new_inst
+        (new_inst, Some(update))
     }
 }
 
