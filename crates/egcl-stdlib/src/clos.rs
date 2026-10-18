@@ -1800,7 +1800,7 @@ pub fn set_structure_class(class: EgclVal) {
     // A DEFSTRUCT class is an instance of STRUCTURE-CLASS, so CLASS-OF must
     // answer that and not the STANDARD-CLASS its metaobject was born with.
     if structure_class != NIL {
-        repoint_class_metaclass(class, structure_class);
+        let _ = repoint_class_metaclass(class, structure_class);
     }
 }
 
@@ -2096,7 +2096,17 @@ pub fn class_of(object: EgclVal) -> EgclVal {
     // Inspect heap state before taking the root-side-table lock (GC takes
     // these locks in the opposite direction while scanning definitions).
     if egcl_rt::gc::heap_object_type_id(object) == Some(type_id::STANDARD_OBJECT) {
-        return unsafe { (*instance_wrapper(object)).class };
+        // Chase forwarding on the wrapper's class word, the same way every
+        // other accessor chases it. The word is a plain copy living outside
+        // the GC heap, and reading it raw used to be justified by "a class is
+        // immortal and never moves". That stopped being true when
+        // `repoint_class_metaclass` gained the ability to REPLACE a class
+        // metaobject too small for its declared metaclass: an instance
+        // allocated against a wrapper minted before that replacement still
+        // holds the old class value, and no scanner can reach the copy to
+        // rewrite it. `resolve_forwarded` returns non-heap and out-of-range
+        // values untouched, so the common path is a header-bit test.
+        return egcl_rt::gc::resolve_forwarded(unsafe { (*instance_wrapper(object)).class });
     }
 
     // Arrays, streams, packages and pathnames belong to their standard
@@ -2243,18 +2253,102 @@ pub fn new_class_metaobject(metaclass: EgclVal) -> Result<EgclVal, EgclError> {
     allocate_instance_pinned_gc(metaclass)
 }
 
+/// Rewrite every reference to class value `old` in the CLOS registries to
+/// `new`, for a class metaobject that had to be reallocated (see
+/// `repoint_class_metaclass`).
+///
+/// Forwarding alone is not enough for this state, for two different reasons:
+///
+///   * `class_meta` and `structure_classes` are keyed BY the class value. A
+///     stale key is not merely slow -- `visit_clos_roots` marks those keys
+///     through a copy and asserts the copy came back unchanged, because a
+///     `HashMap` key cannot be rewritten in place without a rehash. A
+///     forwarded key resolves to the replacement during marking and trips that
+///     assertion. Rehashing HERE, outside the collector, keeps the keys
+///     unforwarded so the assertion goes on testing what it was written to
+///     test: that a pinned class metaobject never relocates.
+///   * A class's own `wrapper` holds a plain `class: EgclVal` copy, outside the
+///     GC heap where no scanner reaches it, and `class_of` reads that word
+///     RAW -- without chasing forwarding. Every instance of the class shares
+///     that wrapper, so leaving it stale makes `(class-of (make-instance
+///     'late))` answer a dead address.
+///
+/// Must not allocate: it runs under the CLOS definitions lock, which sits above
+/// the GC heap lock in the ordering.
+fn migrate_class_value(st: &mut ClosState, old: EgclVal, new: EgclVal) {
+    let swap = |v: &mut EgclVal| {
+        if *v == old {
+            *v = new;
+        }
+    };
+    for value in st.class_registry.values_mut() {
+        swap(value);
+    }
+    for value in st.class_by_name.values_mut() {
+        swap(value);
+    }
+    // Rehash: take the entry out under the old key and reinsert it under the
+    // new one. `remove` then `insert` rather than a rebuild of the whole map,
+    // so every other class keeps its identity and its metadata untouched.
+    if let Some(meta) = st.class_meta.remove(&old) {
+        st.class_meta.insert(new, meta);
+    }
+    if st.structure_classes.remove(&old) {
+        st.structure_classes.insert(new);
+    }
+    for meta in st.class_meta.values_mut() {
+        // A subclass defined BEFORE this class names it as a direct super --
+        // that is exactly how the placeholder came to exist -- so this is the
+        // reference that actually matters here, not a rare one.
+        for value in &mut meta.direct_supers {
+            swap(value);
+        }
+        for value in &mut meta.direct_subs {
+            swap(value);
+        }
+        swap(&mut meta.metaclass);
+        // The wrapper's own `class` word: see the doc comment above. The
+        // wrapper is a leaked, process-lifetime allocation handed out as
+        // `&'static`; writing through it is the same cast `finalize_class_layout`
+        // and `set_instance_wrapper` already use on these.
+        if let Some(wrapper) = meta.wrapper {
+            let w = wrapper as *const ClassWrapper as *mut ClassWrapper;
+            unsafe { swap(&mut (*w).class) };
+        }
+    }
+    // A method can be specialized on a class that is still a forward reference
+    // -- `(defmethod f ((x late)))` ahead of LATE's own DEFCLASS resolves to
+    // the placeholder -- and dispatch compares specializers by identity.
+    for method in st.method_meta.values_mut() {
+        for value in &mut method.specializers {
+            swap(value);
+        }
+    }
+    // Deliberately not migrated: the built-in class fields and
+    // `fixnum_registrations`. Those name bootstrap classes, which are
+    // allocated as instances of their final metaclass and so never reach the
+    // reallocating branch. `cpl_cache` needs nothing: `with_state_mut` clears
+    // it on every mutable access, this one included.
+}
+
 /// Re-point `class`'s own wrapper so `CLASS-OF` answers `metaclass`.
 ///
 /// A class metaobject's wrapper names the class it is an INSTANCE of, which is
 /// its metaclass — the same word `class_of` reads for any other instance. This
 /// is how a `(:metaclass M)` class comes to answer M without a special case
 /// anywhere (GitHub #384).
-fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+///
+/// Returns whether the class metaobject was REPLACED (a new object, forwarded
+/// to from the old one) rather than repointed in place. A replacement has
+/// freshly allocated, unbound slot cells, so its caller must run the
+/// metaclass's slot initforms on it even though the class is not "new".
+#[must_use]
+fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) -> bool {
     if egcl_rt::gc::heap_object_type_id(class) != Some(type_id::STANDARD_OBJECT) {
-        return;
+        return false;
     }
     if metaclass == NIL {
-        return;
+        return false;
     }
     // How many slot cells this object actually HAS. A class metaobject is
     // allocated as an instance of its metaclass, so the capacity is fixed at
@@ -2269,7 +2363,7 @@ fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
                 // Already an instance of this metaclass -- it was allocated
                 // that way. Nothing to do, and replacing the wrapper here
                 // would discard the layout it was sized for.
-                return;
+                return false;
             }
             (*current).slot_count
         }
@@ -2287,16 +2381,56 @@ fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
             .unwrap_or(std::ptr::null_mut())
     });
     if target.is_null() {
-        return;
+        return false;
     }
     if unsafe { (*target).slot_count } > capacity {
-        // The metaclass gained slots after this class was allocated -- or the
-        // metaclass was not yet defined when it was, which DEFCLASS already
-        // treats as "accepted, with CLASS-OF answering STANDARD-CLASS". Leave
-        // the object alone rather than hand it a layout it cannot hold.
-        return;
+        // The metaclass needs more slot cells than this object was allocated
+        // with. A class metaobject's capacity is fixed at allocation, so the
+        // wrapper cannot simply be repointed -- the slots would be read and
+        // written past the allocation.
+        //
+        // This is the forward-referenced case, and it is not rare: a class
+        // named as a superclass before it is defined gets a placeholder
+        // allocated before its metaclass is known, so the placeholder is a
+        // zero-slot instance of STANDARD-CLASS. Gendl hits it on every
+        // DEFINE-OBJECT, because VANILLA-MIXIN is appended to every
+        // superclass list and is itself defined late (GitHub #384).
+        //
+        // Refusing silently left CLASS-OF answering the metaclass while the
+        // OBJECT was still a STANDARD-CLASS instance, so TYPEP, SLOT-EXISTS-P,
+        // the accessors and dispatch all disagreed with it. Migrate instead,
+        // the way CHANGE-CLASS growth does: allocate a replacement that IS an
+        // instance of the metaclass and forward the old object to it. SBCL
+        // reaches the same place by CHANGE-CLASSing the
+        // FORWARD-REFERENCED-CLASS.
+        //
+        // Forwarding covers every reference the collector can reach or an
+        // accessor can chase -- a compiled function's constant pool, a
+        // dispatch cache, an already-allocated instance. It is NOT sufficient
+        // on its own: the CLOS registries are keyed BY the class value, and
+        // the class's own wrapper holds a copy of it that `class_of` reads
+        // without chasing. `migrate_class_value` rewrites those; EGCL_GC_STRESS
+        // over this path is what proves the pair is complete, and the
+        // key-marking assertion in `visit_clos_roots` is what caught the
+        // missing half.
+        // Never forward twice: `forward_instance` requires a live object, and
+        // a value that already forwards is the resolved one's stale address.
+        // Checked before allocating so a repeat cannot leak a replacement.
+        if egcl_rt::gc::resolve_forwarded(class) != class {
+            return false;
+        }
+        let Ok(replacement) = allocate_instance_pinned_gc(metaclass) else {
+            return false;
+        };
+        // Rehash the registries onto the replacement BEFORE forwarding, so the
+        // tables are never observed holding a forwarded key. `replacement` is
+        // pinned and immortal, so it needs no root across this.
+        with_state_mut(|st| migrate_class_value(st, class, replacement));
+        unsafe { forward_instance(class, replacement) };
+        return true;
     }
     unsafe { set_instance_wrapper(class, target) };
+    false
 }
 
 /// The metaclass DEFCLASS named for `class`, or NIL for the default.
@@ -2315,7 +2449,10 @@ pub fn class_metaclass(class: EgclVal) -> EgclVal {
 /// interpreter (it is a class NAME in the source, which may not be defined
 /// until after this class is) and because every existing caller of
 /// `define_class` means the default.
-pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+/// Returns whether the class metaobject was replaced to fit the metaclass's
+/// layout; see `repoint_class_metaclass`. The caller owns running initforms.
+#[must_use]
+pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) -> bool {
     with_state_mut(|st| {
         if let Some(meta) = st.class_meta.get_mut(&class) {
             meta.metaclass = metaclass;
@@ -2324,7 +2461,7 @@ pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
     // Outside the lock: leaking a wrapper is a Rust allocation, but keeping the
     // two in one critical section would invite a GC allocation under the CLOS
     // lock later. The recorded metaclass above stays the source of truth.
-    repoint_class_metaclass(class, metaclass);
+    repoint_class_metaclass(class, metaclass)
 }
 
 /// Get the direct superclasses of a class.
