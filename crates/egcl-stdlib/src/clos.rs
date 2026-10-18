@@ -76,6 +76,15 @@ struct ClassMeta {
     /// Gendl's kernel does exactly that, and the option used to be parsed and
     /// dropped (GitHub #371).
     metaclass: EgclVal,
+    /// True while this class exists only because another class named it as a
+    /// superclass before it was defined (`resolve_superclass_metaobject`).
+    /// Cleared by the first real definition, which is every `define_class`
+    /// call. A placeholder has no instances and no definition of its own, so
+    /// it is the one class metaobject that may be REPLACED rather than
+    /// redefined — see `replace_forward_referenced_class`, which is how a
+    /// `(:metaclass M)` class that was forward-referenced still gets an object
+    /// sized for M's slots (GitHub #384).
+    forward_referenced: bool,
 }
 
 // ── Standard-object instances (heap objects) ───────────────────────
@@ -888,8 +897,11 @@ pub fn serialize_clos_state() -> Vec<u8> {
     let mut out = with_state(|st| {
         let mut out = Vec::new();
         out.extend_from_slice(b"CLST");
-        // 3 added ClassMeta.metaclass; 4 added ClassMeta.shared_slots; 5 adds
-        // ClosState::standard_class and ::structure_class.
+        // 3 added ClassMeta.metaclass; 4 added ClassMeta.shared_slots; 5 added
+        // ClosState::standard_class and ::structure_class; 6 adds
+        // ClassMeta.forward_referenced, so a class another class named as a
+        // superclass before it was defined is still replaceable after a
+        // restore (GitHub #384).
         //
         // No reader compatibility with 3 is kept, and none is possible to
         // need: an image also carries a hash of the runtime's source and is
@@ -897,7 +909,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
         // core written by any other build never reaches this version check.
         // Measured — a core from the previous commit's binary is rejected at
         // the header, not here.
-        cs_put_u32(&mut out, 5);
+        cs_put_u32(&mut out, 6);
         cs_put_u32(&mut out, st.class_registry.len() as u32);
         for (k, v) in &st.class_registry {
             cs_put_val(&mut out, *k);
@@ -917,6 +929,7 @@ pub fn serialize_clos_state() -> Vec<u8> {
             cs_put_vals(&mut out, &meta.slots);
             cs_put_val(&mut out, meta.metaclass);
             cs_put_vals(&mut out, &meta.shared_slots);
+            out.push(meta.forward_referenced as u8);
         }
         cs_put_u32(&mut out, st.generic_functions.len() as u32);
         for (gf, data) in &st.generic_functions {
@@ -1040,7 +1053,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
     }
     let mut off = 4usize;
     let version = cs_get_u32(data, &mut off).ok_or_else(bad)?;
-    if version != 5 {
+    if version != 6 {
         return Err(EgclError::InvalidImage(format!(
             "CLOS state section: unsupported version {version}"
         )));
@@ -1067,6 +1080,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         let slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
         let metaclass = cs_get_val(data, &mut off, remap).ok_or_else(bad)?;
         let shared_slots = cs_get_vals(data, &mut off, remap).ok_or_else(bad)?;
+        let forward_referenced = cs_get_u8(data, &mut off).ok_or_else(bad)? != 0;
         st.class_meta.insert(
             class,
             ClassMeta {
@@ -1077,6 +1091,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
                 slots,
                 wrapper: None,
                 metaclass,
+                forward_referenced,
             },
         );
     }
@@ -1581,6 +1596,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                 slots: vec![],
                 wrapper: None,
                 metaclass: NIL,
+                forward_referenced: false,
             },
         );
 
@@ -1596,6 +1612,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                 slots: vec![],
                 wrapper: None,
                 metaclass: NIL,
+                forward_referenced: false,
             },
         );
 
@@ -1637,6 +1654,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                     slots: vec![],
                     wrapper: None,
                     metaclass: NIL,
+                    forward_referenced: false,
                 },
             );
         }
@@ -1698,6 +1716,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
                     slots: vec![],
                     wrapper: None,
                     metaclass: NIL,
+                    forward_referenced: false,
                 },
             );
         }
@@ -1845,6 +1864,7 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
                     slots: vec![],
                     wrapper: None,
                     metaclass: NIL,
+                    forward_referenced: false,
                 },
             );
         } else {
@@ -1970,6 +1990,7 @@ pub fn define_class_with_shared_slots(
                 slots: slots.to_vec(),
                 wrapper: None,
                 metaclass: NIL,
+                forward_referenced: false,
             },
         );
 
@@ -2274,18 +2295,7 @@ fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
             (*current).slot_count
         }
     };
-    // The metaclass's own wrapper, finalized if it has none yet, so the class
-    // object shares the layout its metaclass's instances use.
-    let target = with_state_mut(|st| {
-        if st.class_meta.get(&metaclass).and_then(|m| m.wrapper).is_none() {
-            finalize_class_layout(st, metaclass);
-        }
-        st.class_meta
-            .get(&metaclass)
-            .and_then(|m| m.wrapper)
-            .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
-            .unwrap_or(std::ptr::null_mut())
-    });
+    let target = metaclass_instance_wrapper(metaclass);
     if target.is_null() {
         return;
     }
@@ -2294,9 +2304,184 @@ fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
         // metaclass was not yet defined when it was, which DEFCLASS already
         // treats as "accepted, with CLASS-OF answering STANDARD-CLASS". Leave
         // the object alone rather than hand it a layout it cannot hold.
+        //
+        // A class that is still only a forward reference does not come here:
+        // DEFCLASS replaces its placeholder outright
+        // (`replace_forward_referenced_class`), so the object it points at was
+        // allocated for this very layout.
         return;
     }
     unsafe { set_instance_wrapper(class, target) };
+}
+
+/// The wrapper `metaclass`'s own instances use — which is the wrapper a class
+/// metaobject with that metaclass must carry, since it IS one of them.
+/// Finalized on demand: a metaclass need never have been instantiated.
+fn metaclass_instance_wrapper(metaclass: EgclVal) -> *mut ClassWrapper {
+    with_state_mut(|st| {
+        if st.class_meta.get(&metaclass).and_then(|m| m.wrapper).is_none() {
+            finalize_class_layout(st, metaclass);
+        }
+        st.class_meta
+            .get(&metaclass)
+            .and_then(|m| m.wrapper)
+            .map(|w| w as *const ClassWrapper as *mut ClassWrapper)
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Mark `class` as existing only as a forward reference: some other class named
+/// it as a superclass before it was defined. See `ClassMeta.forward_referenced`.
+pub fn mark_forward_referenced(class: EgclVal) {
+    with_state_mut(|st| {
+        if let Some(meta) = st.class_meta.get_mut(&class) {
+            meta.forward_referenced = true;
+        }
+    });
+}
+
+/// Whether `class` is only a forward-reference placeholder, never defined.
+fn is_forward_referenced(class: EgclVal) -> bool {
+    with_state(|st| {
+        st.class_meta
+            .get(&class)
+            .is_some_and(|m| m.forward_referenced)
+    })
+}
+
+/// Hand back a replacement metaobject for a forward-referenced `class` whose
+/// definition names a `metaclass` it has no room for, or `None` when the object
+/// it already has will do.
+///
+/// A class metaobject IS an instance of its metaclass, so its slot cells are
+/// allocated with it and the count cannot grow. A forward reference is
+/// allocated before any `(:metaclass M)` is known — nothing has named M at that
+/// point — so a placeholder for a class whose metaclass has slots is always one
+/// cell short, and `repoint_class_metaclass` then has to refuse: `CLASS-OF`
+/// answered M while `TYPEP`, `SLOT-VALUE` and method dispatch all still saw a
+/// plain `STANDARD-CLASS` (GitHub #384, the Gendl `VANILLA-MIXIN` case).
+///
+/// The way out is the one SBCL takes — `CHANGE-CLASS` of the
+/// `FORWARD-REFERENCED-CLASS` — adapted to a representation whose instances
+/// carry their slots inline: allocate the metaobject the definition actually
+/// calls for and move the placeholder's registrations onto it, instances
+/// included (`migrate_class_value`). Only a forward reference is ever replaced.
+/// A class that has been DEFINED keeps its object: a program can hold it, and
+/// CLHS requires a redefinition to leave existing instances naming the same
+/// class. A placeholder is the one class nothing can be holding on purpose —
+/// it exists because some other class named it, and its name answered no class
+/// until it was minted.
+///
+/// The caller must treat the replacement as a fresh metaobject: its slots are
+/// UNBOUND, so the metaclass's `:initform`s still have to run on it.
+///
+/// Must be called with no CLOS lock held: it allocates.
+pub fn replace_forward_referenced_class(
+    class: EgclVal,
+    metaclass: EgclVal,
+) -> Result<Option<EgclVal>, EgclError> {
+    if metaclass == NIL || !is_forward_referenced(class) {
+        return Ok(None);
+    }
+    if egcl_rt::gc::heap_object_type_id(class) != Some(type_id::STANDARD_OBJECT) {
+        return Ok(None);
+    }
+    let target = metaclass_instance_wrapper(metaclass);
+    if target.is_null() {
+        return Ok(None);
+    }
+    let (needed, capacity) = unsafe {
+        let current = instance_wrapper(class);
+        if current.is_null() || (*current).class == metaclass {
+            // No wrapper to compare, or already an instance of this metaclass.
+            return Ok(None);
+        }
+        ((*target).slot_count, (*current).slot_count)
+    };
+    if needed <= capacity {
+        // The placeholder can carry this metaclass's layout as it stands;
+        // `repoint_class_metaclass` will point it there and identity is kept.
+        return Ok(None);
+    }
+    let replacement = new_class_metaobject(metaclass)?;
+    migrate_class_value(class, replacement);
+    Ok(Some(replacement))
+}
+
+/// Move every recorded reference to `old` onto `new`, and `old`'s own metadata
+/// with it. Only ever used to replace a forward-reference placeholder
+/// (`replace_forward_referenced_class`); `old` is an orphan afterwards.
+///
+/// The placeholder's recorded subclasses are the point of the exercise: a class
+/// that named it as a superclass is already defined, and `define_class` adds a
+/// class to its superclasses' subclass lists only when IT is defined. Losing
+/// them here would leave the subclass's precedence list naming a class no
+/// registry knows, so `TYPEP` against the superclass would fail for its
+/// instances and the layout refresh would skip it.
+///
+/// Its INSTANCES move too. `(make-instance 'undefined-class)` is accepted here
+/// where SBCL refuses it — measured, not assumed — so a placeholder can have
+/// instances, and they reach their class through the wrapper this metadata
+/// names rather than through any of the tables below.
+fn migrate_class_value(old: EgclVal, new: EgclVal) {
+    with_state_mut(|st| {
+        if let Some(mut meta) = st.class_meta.remove(&old) {
+            meta.forward_referenced = false;
+            // Hand the placeholder's instances to the replacement: their
+            // wrapper's `class` word is what CLASS-OF reads, and obsoleting it
+            // makes each one migrate to the new layout on next access, exactly
+            // as a redefinition does (R5.83/R5.84, `update_if_obsolete`).
+            // Rewriting a leaked wrapper's class is sound for the same reason
+            // the field can hold a raw copy at all: a class is pinned and
+            // immortal, so neither value moves.
+            if let Some(wrapper) = meta.wrapper {
+                let wrapper = wrapper as *const ClassWrapper as *mut ClassWrapper;
+                unsafe {
+                    (*wrapper).class = new;
+                    (*wrapper).state.store(WRAPPER_OBSOLETE, Ordering::Release);
+                }
+            }
+            // `meta.wrapper` is the wrapper for instances OF the class, which
+            // the imminent `define_class` finalizes afresh; the replacement's
+            // own wrapper -- the metaclass's -- came with its allocation.
+            meta.wrapper = None;
+            st.class_meta.insert(new, meta);
+        }
+        for value in st.class_registry.values_mut() {
+            if *value == old {
+                *value = new;
+            }
+        }
+        for value in st.class_by_name.values_mut() {
+            if *value == old {
+                *value = new;
+            }
+        }
+        for meta in st.class_meta.values_mut() {
+            for value in meta
+                .direct_supers
+                .iter_mut()
+                .chain(meta.direct_subs.iter_mut())
+            {
+                if *value == old {
+                    *value = new;
+                }
+            }
+            if meta.metaclass == old {
+                meta.metaclass = new;
+            }
+        }
+        for meta in st.method_meta.values_mut() {
+            for specializer in &mut meta.specializers {
+                if *specializer == old {
+                    *specializer = new;
+                }
+            }
+        }
+        if st.structure_classes.remove(&old) {
+            st.structure_classes.insert(new);
+        }
+    });
 }
 
 /// The metaclass DEFCLASS named for `class`, or NIL for the default.

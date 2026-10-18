@@ -6149,6 +6149,11 @@ fn resolve_superclass_metaobject(env: &Env, super_name: EgclVal) -> Result<EgclV
     }
     let class = egcl_stdlib::clos::new_class_metaobject(NIL)?;
     egcl_stdlib::define_class(super_name, class, &[], &[])?;
+    // Flagged as a placeholder, which is what lets the eventual DEFCLASS
+    // REPLACE it. It has to: a class metaobject's slot cells are allocated with
+    // it, and a `(:metaclass M)` whose M has slots needs more of them than
+    // exist here -- M is not even named yet (GitHub #384).
+    egcl_stdlib::clos::mark_forward_referenced(class);
     Ok(class)
 }
 
@@ -36427,7 +36432,20 @@ fn eval_defclass(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         NIL
     };
     let (class, class_is_fresh) = match egcl_stdlib::find_class(name_form) {
-        Some(existing) => (existing, false),
+        // A placeholder minted for a forward reference was allocated before
+        // any `:metaclass` could be known, so it has no cell for the
+        // metaclass's slots and cannot grow one. DEFCLASS replaces it with a
+        // metaobject sized for this definition and moves the placeholder's
+        // registrations across -- the forward-referenced half of GitHub #384,
+        // and SBCL's CHANGE-CLASS of a FORWARD-REFERENCED-CLASS. The
+        // replacement is fresh, so the metaclass's initforms run on it below.
+        Some(existing) => match egcl_stdlib::clos::replace_forward_referenced_class(
+            existing,
+            metaclass_for_layout,
+        )? {
+            Some(replacement) => (replacement, true),
+            None => (existing, false),
+        },
         None => (
             egcl_stdlib::clos::new_class_metaobject(metaclass_for_layout)?,
             true,

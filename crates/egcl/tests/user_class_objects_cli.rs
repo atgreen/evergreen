@@ -182,6 +182,128 @@ fn a_class_with_a_user_metaclass_is_an_instance_of_it() {
     ]);
 }
 
+/// A class NAMED AS A SUPERCLASS BEFORE IT IS DEFINED and then defined with a
+/// `(:metaclass M)` is an instance of M too (GitHub #384, second half).
+///
+/// This is the case the first fix could not reach. A class metaobject carries
+/// its metaclass's slots inline, allocated with it, so the placeholder minted
+/// for a forward reference — before anything has named M — is always a cell
+/// short, and pointing it at M's layout would write past the allocation.
+/// `CLASS-OF` answered M while TYPEP, SLOT-VALUE and dispatch all still saw a
+/// plain STANDARD-CLASS. DEFCLASS now replaces the placeholder with a
+/// metaobject sized for the definition, as SBCL CHANGE-CLASSes a
+/// FORWARD-REFERENCED-CLASS.
+///
+/// Gendl's kernel is the reporter: every DEFINE-OBJECT appends VANILLA-MIXIN,
+/// which is forward-referenced until its own file loads and is then defined
+/// `(:metaclass gdl-class)` — the one class of the seven that failed to
+/// dispatch CLEAR-CACHES.
+///
+/// Both tiers, and the two shapes that must NOT be replaced: a metaclass with
+/// no slots fits the placeholder as it stands, and a forward reference with no
+/// `:metaclass` at all is untouched. The subclass that caused the forward
+/// reference is the thing replacement can break — its recorded superclass is
+/// the placeholder — so its inheritance is checked on both.
+#[test]
+fn a_forward_referenced_class_with_a_user_metaclass_is_an_instance_of_it() {
+    let stdout = run(r#"
+      (defclass fmeta (standard-class) ((x :initform 1 :accessor fmeta-x)))
+      (defmethod egcl-mop:validate-superclass ((c fmeta) (s standard-class)) t)
+      (defgeneric fcc (c))
+      (defmethod fcc ((c fmeta)) :meta)
+      (defmethod fcc ((c standard-class)) :std)
+
+      ;; LATE is only a forward reference here, and gets its metaclass after.
+      (defclass late-sub (late) () (:metaclass fmeta))
+      (defclass late () () (:metaclass fmeta))
+
+      (format t "CLASS-OF-IS-META ~a~%" (eq (class-of (find-class 'late)) (find-class 'fmeta)))
+      (format t "TYPEP-META ~a~%" (typep (find-class 'late) 'fmeta))
+      (format t "TYPE-OF ~a~%" (type-of (find-class 'late)))
+      (format t "SLOT-EXISTS ~a~%" (slot-exists-p (find-class 'late) 'x))
+      (format t "INITFORM ~a~%" (fmeta-x (find-class 'late)))
+      (format t "DISPATCH-PREFERS-META ~a~%" (fcc (find-class 'late)))
+      (setf (fmeta-x (find-class 'late)) 7)
+      (format t "ACCESSOR-ROUNDTRIP ~a~%" (fmeta-x (find-class 'late)))
+      ;; Replacing the placeholder must not orphan the subclass that named it:
+      ;; its recorded superclass, its precedence list and its instances all
+      ;; have to name the class the registry now answers.
+      (format t "SUPER-IS-REGISTERED ~a~%"
+               (eq (car (egcl-mop:class-direct-superclasses (find-class 'late-sub)))
+                   (find-class 'late)))
+      (format t "SUB-IS-RECORDED ~a~%"
+               (eq (car (egcl-mop:class-direct-subclasses (find-class 'late)))
+                   (find-class 'late-sub)))
+      (format t "SUB-INHERITS ~a~%" (typep (make-instance 'late-sub) 'late))
+      (format t "CLASS-NAME ~a~%" (class-name (find-class 'late)))
+
+      ;; The same questions from inside a compiled function (memory
+      ;; `acceptance-eval-wrapper-hides-compiled-path`: a check in the
+      ;; tree-walker does not cover cli/bytecode.rs).
+      (defun compiled-probe ()
+        (list (typep (find-class 'late) 'fmeta)
+              (slot-exists-p (find-class 'late) 'x)
+              (slot-value (find-class 'late) 'x)
+              (fcc (find-class 'late))))
+      (format t "COMPILED ~a~%" (compiled-probe))
+
+      ;; An INSTANCE of the placeholder follows it. `(make-instance
+      ;; 'undefined-class)` is accepted here where SBCL refuses it, so a
+      ;; placeholder can have instances; they reach their class through their
+      ;; wrapper, not through any registry, and replacement has to hand that
+      ;; wrapper over. (The slot the definition adds is UNBOUND on an instance
+      ;; that predates it -- what every redefinition does here.)
+      (defclass inst-sub (inst-late) ())
+      (defvar *i* (make-instance 'inst-late))
+      (defclass inst-late () ((s)) (:metaclass fmeta))
+      (format t "INSTANCE-CLASS-OF ~a~%" (eq (class-of *i*) (find-class 'inst-late)))
+      (format t "INSTANCE-TYPEP ~a~%" (typep *i* 'inst-late))
+      (setf (slot-value *i* 's) 9)
+      (format t "INSTANCE-SLOT ~a~%" (slot-value *i* 's))
+
+      ;; A metaclass with no slots: the placeholder already fits its layout, so
+      ;; the object is reused rather than replaced.
+      (defclass bare-meta (standard-class) ())
+      (defmethod egcl-mop:validate-superclass ((c bare-meta) (s standard-class)) t)
+      (defclass bare-sub (bare-late) ())
+      (defclass bare-late () () (:metaclass bare-meta))
+      (format t "BARE-TYPEP ~a~%" (typep (find-class 'bare-late) 'bare-meta))
+      (format t "BARE-SUB-INHERITS ~a~%" (typep (make-instance 'bare-sub) 'bare-late))
+
+      ;; No :metaclass at all: nothing is replaced, and the inherited slot the
+      ;; late definition introduced still reaches the subclass's instances.
+      (defclass plain-sub (plain-late) ())
+      (defclass plain-late () ((s :initform 7)))
+      (format t "PLAIN-SUPER-EQ ~a~%"
+               (eq (car (egcl-mop:class-direct-superclasses (find-class 'plain-sub)))
+                   (find-class 'plain-late)))
+      (format t "PLAIN-INHERITED-SLOT ~a~%" (slot-value (make-instance 'plain-sub) 's))
+      (format t "FORWARD-METACLASS-OK~%")
+    "#);
+    expect(&stdout, &[
+        "CLASS-OF-IS-META T",
+        "TYPEP-META T",
+        "TYPE-OF FMETA",
+        "SLOT-EXISTS T",
+        "INITFORM 1",
+        "DISPATCH-PREFERS-META META",
+        "ACCESSOR-ROUNDTRIP 7",
+        "SUPER-IS-REGISTERED T",
+        "SUB-IS-RECORDED T",
+        "SUB-INHERITS T",
+        "CLASS-NAME LATE",
+        "COMPILED (T T 7 META)",
+        "INSTANCE-CLASS-OF T",
+        "INSTANCE-TYPEP T",
+        "INSTANCE-SLOT 9",
+        "BARE-TYPEP T",
+        "BARE-SUB-INHERITS T",
+        "PLAIN-SUPER-EQ T",
+        "PLAIN-INHERITED-SLOT 7",
+        "FORWARD-METACLASS-OK",
+    ]);
+}
+
 /// The condition hierarchy must survive, and a built-in or condition class
 /// must still refuse redefinition.
 ///
