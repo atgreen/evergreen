@@ -85,11 +85,55 @@ impl ActivationState {
 
     /// `prepare`, reusing a finished activation's buffers when the code has
     /// one pooled (see `recycle`). Recursion simply finds the pool empty.
+    /// The one-shot guard-recovery reservation for an activation that can
+    /// deoptimize: buffers sized for its handlers, cleanup continuations and
+    /// dynamic bindings, allocated BEFORE any protected form runs so the deopt
+    /// path itself has nothing fallible left to do.
+    ///
+    /// Factored out because a POOLED activation needs one too. `prepare_reusing`
+    /// used to hand back a recycled state untouched, and `recycle` counted a
+    /// consumed reservation (`None`) as idle, so a state whose guard had already
+    /// been taken went into the pool and came back out without one -- and the
+    /// next deopt on it failed with "invalid native transfer capture". The fix
+    /// belongs here, not in the deopt path: the reservation stays strictly
+    /// single-shot per activation (activation.rs's own invariant, asserted by
+    /// deopt.rs's "a second handoff must not duplicate outer state"), and each
+    /// reuse is simply a fresh activation that gets a fresh reservation
+    /// (bliss-w96f8).
+    fn reserve_guard_resume(
+        code: &TransferCode,
+        special_capacity: usize,
+    ) -> Result<Option<OuterResumeState>, EgclError> {
+        if !code.has_deopt {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
+            return Err(EgclError::Oom);
+        }
+        let mut state = OuterResumeState {
+            debug_call: None,
+            handlers: Vec::new(),
+            cleanup_conts: Vec::new(),
+            dyn_binds: Vec::new(),
+        };
+        state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
+        state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
+        state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
+        Ok(Some(state))
+    }
+
     pub(super) fn prepare_reusing(code: &TransferCode, env: &mut Env) -> Result<Self, EgclError> {
         let pooled = code.state_pool.borrow_mut().pop();
         let Some(mut state) = pooled else {
             return Self::prepare(code, env);
         };
+        // A pooled activation may have had its guard reservation consumed by a
+        // deopt before it was recycled. Restore it here, where failing is still
+        // safe, rather than discovering it missing inside the deopt path.
+        if state.guard_resume.is_none() {
+            state.guard_resume = Self::reserve_guard_resume(code, code.special_binds)?;
+        }
         Self::reserve_env(code, env)?;
         state.catch_base = env.catch_stack.len();
         Ok(state)
@@ -128,24 +172,7 @@ impl ActivationState {
         let special_capacity = code.special_binds;
         let mut specials = Vec::new();
         specials.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
-        let guard_resume = if code.has_deopt {
-            #[cfg(test)]
-            if FAIL_GUARD_RESERVATION.with(|fail| fail.replace(false)) {
-                return Err(EgclError::Oom);
-            }
-            let mut state = OuterResumeState {
-                debug_call: None,
-                handlers: Vec::new(),
-                cleanup_conts: Vec::new(),
-                dyn_binds: Vec::new(),
-            };
-            state.handlers.try_reserve(code.guard_handler_capacity).map_err(|_| EgclError::Oom)?;
-            state.cleanup_conts.try_reserve(code.cleanup_depths.len()).map_err(|_| EgclError::Oom)?;
-            state.dyn_binds.try_reserve(special_capacity).map_err(|_| EgclError::Oom)?;
-            Some(state)
-        } else {
-            None
-        };
+        let guard_resume = Self::reserve_guard_resume(code, special_capacity)?;
         Self::reserve_env(code, env)?;
         let snapshots = code
             .sites
