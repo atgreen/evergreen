@@ -44,6 +44,16 @@
 
 ### Fixed
 
+- A class named as a superclass before it is defined now becomes a real
+  instance of the `:METACLASS` its own `DEFCLASS` names. The placeholder built
+  for the forward reference had no room for the metaclass's slots, so
+  `CLASS-OF` answered the metaclass while the class itself was still a
+  `STANDARD-CLASS`: `TYPEP`, `TYPE-OF`, `SLOT-EXISTS-P`, the metaclass's slot
+  accessors and any generic specialized on it all disagreed with it. Gendl
+  reaches this on every `DEFINE-OBJECT`, because `VANILLA-MIXIN` is appended to
+  every superclass list and is itself defined late
+  ([#405](https://github.com/atgreen/evergreen/pull/405); issue
+  [#384](https://github.com/atgreen/evergreen/issues/384)).
 - Several threads may read one hash table at once, as in SBCL; only writes
   need exclusive access. Concurrent lookups in a table keyed by conses or
   other objects hashed by address used to crash once a garbage collection
