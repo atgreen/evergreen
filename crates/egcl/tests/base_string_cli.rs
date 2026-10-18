@@ -164,9 +164,10 @@ fn base_char_is_the_element_type_of_an_8_bit_base_string_consistently() {
         "MS-DEFAULT (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3)))",
         "MAP-STRING (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3)))",
         "TYPE-OF-ROUNDTRIP T",
-        // Element type follows the storage the string reads and writes.
+        // Element type follows the storage the string reads and writes. An
+        // adjustable string made for BASE-CHARs has 8-bit storage too.
         "DISPLACED-BASE (BASE-CHAR T NIL :TYPE-ERROR BASE-CHAR BASE-CHAR)",
-        "ADJUSTABLE-BASE (CHARACTER NIL :STORED)",
+        "ADJUSTABLE-BASE (BASE-CHAR T :TYPE-ERROR)",
         // The copying sequence functions keep the width both ways.
         "COPIES-KEEP-WIDTH (BASE-CHAR CHARACTER BASE-CHAR BASE-CHAR BASE-CHAR BASE-CHAR BASE-CHAR BASE-CHAR CHARACTER CHARACTER)",
         // ansi LENGTH.STRING.6's shape, and the 8-bit result is mutable.

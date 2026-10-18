@@ -54,6 +54,17 @@
 
 ### Fixed
 
+- A form whose value is only tested no longer leaks its other values into the
+  result. `(if (values x 99) x (list x))` returned X and 99 in compiled code,
+  and a compiled `UNLESS` could even return the test's value instead of `NIL`;
+  `IF`, `WHEN`, `UNLESS`, `COND` and non-final `AND`/`OR` forms now pass on
+  only the primary value, as in SBCL
+  ([#419](https://github.com/atgreen/evergreen/pull/419)).
+- A fill-pointer or adjustable string made with `:element-type 'base-char`
+  is a `BASE-STRING`: `ARRAY-ELEMENT-TYPE` answers `BASE-CHAR`, it is stored
+  8-bit, and `VECTOR-PUSH`, `VECTOR-PUSH-EXTEND` and `ADJUST-ARRAY` signal
+  `TYPE-ERROR` for a wider character instead of storing it, as in SBCL
+  ([#418](https://github.com/atgreen/evergreen/pull/418)).
 - `BASE-CHAR`, `STANDARD-CHAR` and `EXTENDED-CHAR` are proper subtypes of
   `CHARACTER` at more doors: `(coerce #\λ 'base-char)` and `(coerce #\a
   'extended-char)` signal `TYPE-ERROR` instead of returning the character,
@@ -338,6 +349,11 @@
   binder on every call. Calls to such functions in pure-tls's certificate
   parsing and in `SEARCH` took about a third less time
   ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- A compiled function whose `IF` returns a call's result in one arm, such as a
+  recursive `(if (< n 2) (leaf n) (+ (f (- n 1)) (f (- n 2))))`, now uses the
+  direct native calling convention instead of going through Rust for every
+  call: about 5 ns per call instead of about 700 ns
+  ([#420](https://github.com/atgreen/evergreen/pull/420)).
 - Generic-function calls do less repeated work. A `DEFCLASS` accessor reads
   or writes its slot directly once dispatch selects it (user methods on the
   accessor still take over), slot writes skip the class-slot search for

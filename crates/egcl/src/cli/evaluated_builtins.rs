@@ -2319,6 +2319,23 @@ fn resolve(name: &str) -> Option<Handler> {
                     size, fp, adjustable, iel.as_double_float(), has_fill_pointer,
                 );
             }
+            // 9th arg (optional): non-NIL ⇒ element-type BASE-CHAR, a string
+            // over 8-bit storage that refuses wider characters.
+            if args.get(8).is_some_and(|v| !v.is_nil()) {
+                let fill = if iel.is_character() {
+                    iel.as_char()
+                } else if iel.is_nil() {
+                    '\0'
+                } else {
+                    return Err(EgclError::TypeError {
+                        datum: iel,
+                        expected: "BASE-CHAR".into(),
+                    });
+                };
+                return egcl_stdlib::sequences::build_base_char_complex_vector(
+                    size, fp, adjustable, fill, has_fill_pointer,
+                );
+            }
             let elems = vec![iel; size];
             Ok(egcl_stdlib::build_complex_vector(
                 &elems,

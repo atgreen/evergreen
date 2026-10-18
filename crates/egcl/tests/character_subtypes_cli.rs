@@ -118,3 +118,34 @@ fn initial_contents_must_match_the_vector_length() {
         "(:ERROR :ERROR :ERROR :ERROR :ERROR 3 3)"
     );
 }
+
+/// A fill-pointer or adjustable string made for BASE-CHARs is a BASE-STRING
+/// over 8-bit storage, as in SBCL: it refuses a wider character, and keeps
+/// its width when VECTOR-PUSH-EXTEND or ADJUST-ARRAY replaces the storage.
+#[test]
+fn a_growable_base_char_string_is_a_base_string() {
+    assert_eq!(
+        eval(
+            "(flet ((try (thunk) (handler-case (funcall thunk) (type-error () :type-error)))) \
+               (let ((v (make-array 0 :element-type 'base-char :adjustable t :fill-pointer 0))) \
+                 (dotimes (i 20) (vector-push-extend #\\a v)) \
+                 (list (array-element-type v) (typep v 'base-string) (length v) \
+                       (try (lambda () (vector-push-extend (code-char 955) v))) \
+                       (array-element-type (copy-seq v)) \
+                       (progn (adjust-array v 40 :fill-pointer 20) (array-element-type v)) \
+                       (try (lambda () (adjust-array v 80 :initial-element (code-char 955)))) \
+                       (try (lambda () (make-array 2 :element-type 'base-char :fill-pointer t \
+                                                     :initial-element (code-char 955)))))))"
+        ),
+        "(BASE-CHAR T 20 :TYPE-ERROR BASE-CHAR BASE-CHAR :TYPE-ERROR :TYPE-ERROR)"
+    );
+    // A CHARACTER one still holds any character.
+    assert_eq!(
+        eval(
+            "(let ((v (make-array 2 :element-type 'character :fill-pointer 0))) \
+               (vector-push (code-char 955) v) \
+               (list (array-element-type v) (typep v 'base-string) v))"
+        ),
+        "(CHARACTER NIL \"λ\")"
+    );
+}

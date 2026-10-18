@@ -6223,7 +6223,12 @@ fn resolve_superclass_metaobject(env: &Env, super_name: EgclVal) -> Result<EgclV
     if builtin_condition_definition(&sym_name(super_name)).is_some() {
         return Ok(resolved);
     }
-    let class = egcl_stdlib::clos::new_class_metaobject(NIL)?;
+    // An instance of FORWARD-REFERENCED-CLASS, as AMOP specifies and SBCL
+    // prints (#<FORWARD-REFERENCED-CLASS UNDEF>). Its storage grows to the real
+    // metaclass's layout when the definition arrives, so the object -- and the
+    // identity of any reference already taken to it -- survives (bliss-fmhj5).
+    let class =
+        egcl_stdlib::clos::new_class_metaobject(egcl_stdlib::clos::forward_referenced_class())?;
     egcl_stdlib::define_class(super_name, class, &[], &[])?;
     // Flagged as a placeholder, which is what lets the eventual DEFCLASS
     // REPLACE it. It has to: a class metaobject's slot cells are allocated with
@@ -11787,8 +11792,8 @@ fn is_base_string_value(v: EgclVal) -> bool {
     // string when the storage it reads and writes is: a string displaced onto
     // an 8-bit base string refuses a wide character, so calling it CHARACTER
     // let (setf subseq) copy wide characters into it and die (ansi strings
-    // RANDOM-STRING-COMPARISON-TESTS). An adjustable string's own store is
-    // 32-bit today, so it stays a CHARACTER string.
+    // RANDOM-STRING-COMPARISON-TESTS). An adjustable or fill-pointer string
+    // has 8-bit storage exactly when it was made with element type BASE-CHAR.
     if egcl_stdlib::is_complex_vector(v) {
         return egcl_stdlib::cvec_is_string(v) && egcl_stdlib::string_storage_is_base(v);
     }
@@ -15395,7 +15400,14 @@ fn class_of_value(object: EgclVal) -> EgclVal {
         if metaclass != NIL {
             return metaclass;
         }
-        if egcl_stdlib::is_structure_class(class) {
+        if egcl_stdlib::clos::is_forward_referenced(class) {
+            // Named as a superclass and not yet defined: an instance of
+            // FORWARD-REFERENCED-CLASS, which is what SBCL answers and prints.
+            // Before this it fell through to the BUILT-IN-CLASS arm below,
+            // since "built in" is derived as "neither structure nor standard"
+            // (R9.39).
+            "FORWARD-REFERENCED-CLASS"
+        } else if egcl_stdlib::is_structure_class(class) {
             "STRUCTURE-CLASS"
         } else if is_standard_class_metaobject(class) {
             "STANDARD-CLASS"
@@ -15448,6 +15460,18 @@ fn is_standard_class_metaobject(class: EgclVal) -> bool {
     if egcl_stdlib::is_structure_class(class) {
         return false;
     }
+    // A class that is only a forward reference is an instance of
+    // FORWARD-REFERENCED-CLASS, not of STANDARD-CLASS: nothing has said yet
+    // what its instances look like (R9.39, and SBCL answers NIL here).
+    //
+    // Its own precedence list says STANDARD-OBJECT -- that is the default it
+    // was minted with -- so the test below would otherwise call it standard.
+    // The two questions differ for exactly this one kind of class: "would its
+    // instances be standard objects" is not "is IT an instance of
+    // STANDARD-CLASS".
+    if egcl_stdlib::clos::is_forward_referenced(class) {
+        return false;
+    }
     // Condition classes are standard classes here, not built-in ones (ansi
     // defclass.error.24 would otherwise redefine PROGRAM-ERROR).
     if is_condition_class(class) {
@@ -15483,7 +15507,14 @@ fn is_standard_class_metaobject(class: EgclVal) -> bool {
 /// specializer-distance table asked `!class.is_symbol()`, which agreed only by
 /// accident of the current representation.
 fn is_built_in_class_metaobject(class: EgclVal) -> bool {
-    !egcl_stdlib::is_structure_class(class) && !is_standard_class_metaobject(class)
+    // "Built in" is DERIVED here: neither structure nor standard. A forward
+    // reference is neither, so it would fall into this third bucket by default
+    // -- and DEFCLASS refuses a system class as a direct superclass, which
+    // would make it refuse EVERY forward-referenced superclass and break
+    // lib/boot.lisp. Excluded explicitly (R9.39).
+    !egcl_stdlib::is_structure_class(class)
+        && !is_standard_class_metaobject(class)
+        && !egcl_stdlib::clos::is_forward_referenced(class)
 }
 
 fn class_metaobject_of(object: EgclVal) -> Option<EgclVal> {

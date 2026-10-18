@@ -705,6 +705,13 @@ impl Function {
         b
     }
 
+    /// Drop `block` from the layout. Its arena entry remains, so handles stay
+    /// valid; the caller must already have removed every edge into it.
+    pub fn remove_from_layout(&mut self, block: Block) {
+        debug_assert!(block != self.entry, "the entry block stays in the layout");
+        self.block_order.retain(|&b| b != block);
+    }
+
     /// Add a typed parameter to `block`, returning its `Value`.
     pub fn add_block_param(
         &mut self,
