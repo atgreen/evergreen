@@ -1735,9 +1735,28 @@ fn format_struct(v: EgclVal, class: EgclVal) -> String {
 }
 
 /// `#<CLASS-NAME>` tag for an instance with no printable report.
+///
+/// A class metaobject names ITSELF as well as its metaclass —
+/// `#<STANDARD-CLASS FOO>` — the way SBCL, CCL and ECL print one. Without
+/// that, every standard class in the image printed as the identical text
+/// `#<STANDARD-CLASS>`, which is useless in a backtrace or a slot dump and was
+/// invisible before classes became objects: a class used to print as its own
+/// name symbol (bliss-w53r3, bliss-rj5o).
+///
+/// `class_name` of a non-class answers NIL — the lookup is keyed by the class
+/// value and an ordinary instance is not one — so this costs one registry
+/// lookup on a path that already does two.
 fn instance_class_tag(v: EgclVal) -> String {
     let class = crate::clos::class_of(v);
     let name = crate::clos::class_name(class);
+    let own_name = crate::clos::class_name(v);
+    if !own_name.is_nil() {
+        return format!(
+            "#<{} {}>",
+            egclval_to_print_string(name, false),
+            egclval_to_print_string(own_name, false)
+        );
+    }
     format!("#<{}>", egclval_to_print_string(name, false))
 }
 

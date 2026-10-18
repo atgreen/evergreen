@@ -48,6 +48,10 @@
 
 ### Fixed
 
+- Several threads may read one hash table at once, as in SBCL; only writes
+  need exclusive access. Concurrent lookups in a table keyed by conses or
+  other objects hashed by address used to crash once a garbage collection
+  moved its keys ([#400](https://github.com/atgreen/evergreen/pull/400)).
 - Threads running interpreted code no longer crash while another thread
   collects garbage. A `:synchronized t` hash table now takes its lock on every
   operation as documented; it never did, and the interpreter's shared
@@ -61,6 +65,14 @@
   metaclass's slots (issue
   [#384](https://github.com/atgreen/evergreen/issues/384),
   [#399](https://github.com/atgreen/evergreen/pull/399)).
+- A class named as a superclass **before** it is defined, and then defined with
+  a `:METACLASS` that has slots, is an instance of that metaclass like any
+  other. `CLASS-OF` answered the metaclass while `TYPEP`, `SLOT-EXISTS-P`,
+  `SLOT-VALUE`, the metaclass's slot accessors and method dispatch all still
+  saw a plain `STANDARD-CLASS`. A kernel that appends a late-defined mixin to
+  every class -- Gendl's does -- hit this on exactly the classes that mattered
+  ([#404](https://github.com/atgreen/evergreen/pull/404);
+  issue [#384](https://github.com/atgreen/evergreen/issues/384)).
 - An inherited slot is reachable when the superclass is defined after the
   subclass: `(defclass sub (super) ...)` followed by `(defclass super ()
   ((a)))` left `A` unusable on an instance of `SUB`. Redefining a class now
