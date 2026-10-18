@@ -61,6 +61,13 @@
   metaclass's slots (issue
   [#384](https://github.com/atgreen/evergreen/issues/384),
   [#399](https://github.com/atgreen/evergreen/pull/399)).
+- A slot added by redefining a class takes its `:INITFORM` on instances that
+  already exist, as CLHS 4.3.6 requires: `(defclass c () ())`, an instance,
+  then `(defclass c () ((s :initform 42)))` left `S` unbound where it now
+  answers 42. `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` is called for the update,
+  so a method specialized on it participates and receives the added slots, the
+  discarded slots and their values
+  ([#412](https://github.com/atgreen/evergreen/pull/412)).
 - A class that is only a forward reference -- named as a superclass and not yet
   defined -- can no longer be instantiated, as in SBCL: `MAKE-INSTANCE`,
   `ALLOCATE-INSTANCE` and `CHANGE-CLASS` each used to return an object with no
