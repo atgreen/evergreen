@@ -11566,10 +11566,13 @@ fn is_base_string_value(v: EgclVal) -> bool {
     if egcl_stdlib::is_pathname(v) {
         return false;
     }
-    // A registry-backed sentinel carries its content as a Rust String; decode it
-    // and test whether every character is a BASE-CHAR.
-    if let Some(s) = egcl_stdlib::registered_string(v) {
-        return egcl_rt::object::is_all_base_char(&s);
+    // The registry holds both storage-less sentinels and real strings the
+    // evaluator noted while evaluating them, so its content says nothing about
+    // the width: only a real heap string stored 8-bit is a base string. Deciding
+    // by content called every evaluated ASCII CHARACTER-string literal a
+    // BASE-STRING (R4.94).
+    if egcl_stdlib::registered_string(v).is_some() {
+        return egcl_rt::gc::is_in_heap(unsafe { v.as_ptr() } as usize) && v.is_base_string();
     }
     // An adjustable / fill-pointer CHARACTER vector has element-type CHARACTER
     // (32-bit), so it is a CHARACTER string, not a base string.
@@ -19717,6 +19720,9 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::%COPY-READTABLE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%SET-READTABLE-CASE" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%READTABLE-BASE-CHAR-PREFERENCE" | "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => {
+                return eval_builtin_arguments(&name, cdr, env);
+            }
             "EGCL::%PRUNE-CLOSURES" => {
                 // (egcl::%prune-closures) → (before after): drop dead
                 // closure-registry entries (bliss-uamd). Also runs

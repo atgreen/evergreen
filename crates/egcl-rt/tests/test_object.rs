@@ -536,6 +536,7 @@ fn pathname_data_layout() {
 fn readtable_data_layout() {
     assert_eq!(memoffset(|r: &ReadtableData| &r.header), 0);
     assert_eq!(memoffset(|r: &ReadtableData| &r.case_mode), 8);
+    assert_eq!(memoffset(|r: &ReadtableData| &r.base_char_preference), 9);
     assert_eq!(memoffset(|r: &ReadtableData| &r.char_table), 16);
     assert_eq!(memoffset(|r: &ReadtableData| &r.extended_table), 24);
     assert_eq!(memoffset(|r: &ReadtableData| &r.macro_table), 32);

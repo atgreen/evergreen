@@ -1317,6 +1317,24 @@
                        :expected-type '(member :upcase :downcase :preserve :invert)))
   (egcl::%set-readtable-case mode readtable)
   mode)
+
+;;; SBCL's base-char preference. Under :STRINGS or :BOTH the reader stores a
+;;; string literal of BASE-CHARs as an 8-bit SIMPLE-BASE-STRING; otherwise, as
+;;; with the standard readtable's :SYMBOLS, every literal is a CHARACTER string.
+;;; Symbol names are always stored compactly, whatever the readtable says.
+(defun egcl-ext::readtable-base-char-preference (readtable)
+  "How READTABLE stores names and string literals made only of BASE-CHARs:
+:SYMBOLS (the standard readtable's), :STRINGS, :BOTH or NIL, as in SBCL."
+  (check-type readtable readtable)
+  (egcl::%readtable-base-char-preference readtable))
+(defun (setf egcl-ext::readtable-base-char-preference) (preference readtable)
+  (check-type readtable readtable)
+  (unless (member preference '(:symbols :strings :both nil))
+    (error 'type-error :datum preference
+                       :expected-type '(member :symbols :strings :both nil)))
+  (egcl::%set-readtable-base-char-preference preference readtable)
+  preference)
+(export '(egcl-ext::readtable-base-char-preference) :egcl-ext)
 ;; The default pathname merged against by MERGE-PATHNAMES and friends; ANSI
 ;; requires it to be bound to a pathname. Initialize to the startup directory.
 (defvar *default-pathname-defaults* (truename "."))
