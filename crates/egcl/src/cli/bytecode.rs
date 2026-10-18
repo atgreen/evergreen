@@ -2915,6 +2915,19 @@ impl<'e> Lowerer<'e> {
         }
     }
 
+    /// Lower a form whose primary value is only tested: an IF/WHEN/UNLESS or
+    /// COND test, or a non-final AND/OR form. Its other values are discarded,
+    /// so clear them here; otherwise a branch that then yields a single value
+    /// (a variable, a constant, NIL) returned the test's secondary values too:
+    /// `(if (values x 99) x (list x))` gave X and 99.
+    fn lower_test(&mut self, form: EgclVal) -> LowerResult<()> {
+        self.lower_expr(form)?;
+        if self.may_produce_multiple_values(form) {
+            self.emit(Instr::ClearMv);
+        }
+        Ok(())
+    }
+
     fn lower_if(&mut self, rest: EgclVal) -> LowerResult<()> {
         // Root across the allocating lower_expr recursion (moving GC; bliss-wlf).
         egcl_rt::rooted!(parts = list_to_vec(rest));
@@ -2922,7 +2935,7 @@ impl<'e> Lowerer<'e> {
             return Err(Bail);
         }
         // test
-        self.lower_expr(parts[0])?;
+        self.lower_test(parts[0])?;
         self.emit(Instr::BrIfFalse(0)); // patched
         let br_if_false_at = self.code.len() - 1;
         self.pop_n(1);
@@ -2959,7 +2972,7 @@ impl<'e> Lowerer<'e> {
         let (test, mut body) = cp(rest);
         egcl_rt::rooted_ref!(_body_root = &mut body);
         let base = self.cur_stack;
-        self.lower_expr(test)?;
+        self.lower_test(test)?;
         if negate {
             // UNLESS: run the body when the test is NIL. Branch on the test:
             // BrIfFalse jumps to the body; the true path yields NIL.
@@ -3013,11 +3026,13 @@ impl<'e> Lowerer<'e> {
         let n = args.len();
         let mut false_jumps = Vec::new();
         for i in 0..n {
-            self.lower_expr(args[i])?;
             if i + 1 < n {
+                self.lower_test(args[i])?;
                 self.emit(Instr::BrIfFalse(0)); // pops; jump to the NIL result
                 false_jumps.push(self.code.len() - 1);
                 self.pop_n(1);
+            } else {
+                self.lower_expr(args[i])?;
             }
         }
         // Last value is on the stack (the result of a successful AND).
@@ -3052,7 +3067,11 @@ impl<'e> Lowerer<'e> {
         let n = args.len();
         let mut end_jumps = Vec::new();
         for i in 0..n {
-            self.lower_expr(args[i])?;
+            if i + 1 < n {
+                self.lower_test(args[i])?;
+            } else {
+                self.lower_expr(args[i])?;
+            }
             if i + 1 < n {
                 self.emit(Instr::Dup);
                 self.push_n(1);
@@ -3187,7 +3206,7 @@ impl<'e> Lowerer<'e> {
             let (test, mut body) = cp(clause);
             egcl_rt::rooted_ref!(_body_root = &mut body);
             self.cur_stack = base;
-            self.lower_expr(test)?; // test value on stack
+            self.lower_test(test)?; // test value on stack
             if body.is_nil() {
                 // (cond (test)) — the test's value is the result if non-NIL.
                 self.emit(Instr::Dup);
