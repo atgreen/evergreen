@@ -2341,12 +2341,33 @@ pub fn mark_forward_referenced(class: EgclVal) {
 }
 
 /// Whether `class` is only a forward-reference placeholder, never defined.
-fn is_forward_referenced(class: EgclVal) -> bool {
+pub fn is_forward_referenced(class: EgclVal) -> bool {
     with_state(|st| {
         st.class_meta
             .get(&class)
             .is_some_and(|m| m.forward_referenced)
     })
+}
+
+/// The first class at or above `class` that is only a forward reference, or NIL.
+///
+/// A class is finalized only once every class it inherits from is, so a class
+/// whose superclass is still a forward reference is not finalized either. That
+/// is what `CLASS-FINALIZED-P` must answer and what `FINALIZE-INHERITANCE` must
+/// refuse (R9.39). An inconsistent hierarchy -- one whose precedence list does
+/// not linearize -- answers NIL here and is reported by the caller that asks
+/// for the precedence list.
+pub fn forward_referenced_superclass(class: EgclVal) -> EgclVal {
+    if is_forward_referenced(class) {
+        return class;
+    }
+    match compute_class_precedence_list(class) {
+        Ok(cpl) => cpl
+            .into_iter()
+            .find(|&super_class| is_forward_referenced(super_class))
+            .unwrap_or(NIL),
+        Err(_) => NIL,
+    }
 }
 
 /// Hand back a replacement metaobject for a forward-referenced `class` whose
@@ -2364,8 +2385,8 @@ fn is_forward_referenced(class: EgclVal) -> bool {
 /// The way out is the one SBCL takes — `CHANGE-CLASS` of the
 /// `FORWARD-REFERENCED-CLASS` — adapted to a representation whose instances
 /// carry their slots inline: allocate the metaobject the definition actually
-/// calls for and move the placeholder's registrations onto it, instances
-/// included (`migrate_class_value`). Only a forward reference is ever replaced.
+/// calls for and move the placeholder's registrations onto it
+/// (`migrate_class_value`). Only a forward reference is ever replaced.
 /// A class that has been DEFINED keeps its object: a program can hold it, and
 /// CLHS requires a redefinition to leave existing instances naming the same
 /// class. A placeholder is the one class nothing can be holding on purpose —
@@ -2419,28 +2440,16 @@ pub fn replace_forward_referenced_class(
 /// registry knows, so `TYPEP` against the superclass would fail for its
 /// instances and the layout refresh would skip it.
 ///
-/// Its INSTANCES move too. `(make-instance 'undefined-class)` is accepted here
-/// where SBCL refuses it — measured, not assumed — so a placeholder can have
-/// instances, and they reach their class through the wrapper this metadata
-/// names rather than through any of the tables below.
+/// It does NOT have to find the placeholder's instances, because a forward
+/// reference cannot have any: `allocate_instance` refuses it (bliss-jv7tj), and
+/// that is the single place an instance of a class is born. The handover this
+/// function used to do -- rewriting the old wrapper's class word and obsoleting
+/// it -- became unreachable with that refusal and is gone; if some future path
+/// does create such an instance, the refusal is the one place to look.
 fn migrate_class_value(old: EgclVal, new: EgclVal) {
     with_state_mut(|st| {
         if let Some(mut meta) = st.class_meta.remove(&old) {
             meta.forward_referenced = false;
-            // Hand the placeholder's instances to the replacement: their
-            // wrapper's `class` word is what CLASS-OF reads, and obsoleting it
-            // makes each one migrate to the new layout on next access, exactly
-            // as a redefinition does (R5.83/R5.84, `update_if_obsolete`).
-            // Rewriting a leaked wrapper's class is sound for the same reason
-            // the field can hold a raw copy at all: a class is pinned and
-            // immortal, so neither value moves.
-            if let Some(wrapper) = meta.wrapper {
-                let wrapper = wrapper as *const ClassWrapper as *mut ClassWrapper;
-                unsafe {
-                    (*wrapper).class = new;
-                    (*wrapper).state.store(WRAPPER_OBSOLETE, Ordering::Release);
-                }
-            }
             // `meta.wrapper` is the wrapper for instances OF the class, which
             // the imminent `define_class` finalizes afresh; the replacement's
             // own wrapper -- the metaclass's -- came with its allocation.
@@ -2723,6 +2732,28 @@ fn c3_linearize_inner(
 /// bound value `0`). The object is leaked, matching the other tree-walker heap
 /// objects. See spec §5.3.4 / issue bliss-xyo.
 pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
+    // A class that exists only because another class named it as a superclass
+    // is not finalized: nobody has said what slots it has, so an instance of it
+    // would be a standard object with a layout the definition is going to
+    // contradict. CLHS and AMOP both make this an error, and SBCL signals it
+    // ("cannot allocate an instance of a forward referenced class"); EGCL used
+    // to hand back a slotless instance (bliss-jv7tj).
+    //
+    // Refused HERE rather than in each of MAKE-INSTANCE, ALLOCATE-INSTANCE and
+    // CHANGE-CLASS, because this is the one place an instance of a class is
+    // born -- and because the same guarantee is what lets
+    // `replace_forward_referenced_class` hand the placeholder's registrations
+    // to the replacement without also having to hunt for its instances.
+    if is_forward_referenced(class) {
+        return Err(EgclError::ProgramError(format!(
+            "cannot allocate an instance of {}: it is a forward-referenced class, \
+             named as a superclass but never defined",
+            class_name(class)
+                .symbol_index()
+                .and_then(egcl_rt::symbols::symbol_name)
+                .unwrap_or_else(|| "a forward-referenced class".to_string())
+        )));
+    }
     // Fetch the wrapper + slot count as Copy values, finalising the layout if
     // the class has none yet, then allocate outside the state borrow.
     let (wrapper, slot_count) = with_state_mut(|st| {
@@ -3674,6 +3705,20 @@ pub fn get_short_form_method(key: EgclVal) -> Option<(MethodCombinationType, Vec
 pub fn change_class(instance: EgclVal, new_class: EgclVal) -> Result<(), EgclError> {
     if !is_instance(instance) {
         return Err(EgclError::Internal("not an instance".into()));
+    }
+    // CHANGE-CLASS into a forward reference is the same error as making one
+    // (see `allocate_instance`), and it does not reach that check: a change to
+    // a class with no MORE slots than the instance already has re-points the
+    // wrapper in place and never allocates (bliss-jv7tj).
+    if is_forward_referenced(new_class) {
+        return Err(EgclError::ProgramError(format!(
+            "cannot change an instance to {}: it is a forward-referenced class, \
+             named as a superclass but never defined",
+            class_name(new_class)
+                .symbol_index()
+                .and_then(egcl_rt::symbols::symbol_name)
+                .unwrap_or_else(|| "a forward-referenced class".to_string())
+        )));
     }
 
     // Step 1: snapshot the old instance's bound slots by name, and its inline

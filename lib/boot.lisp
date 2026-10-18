@@ -4965,13 +4965,22 @@ takes."
   (egcl-internal::%generic-function-methods generic-function))
 
 (defun egcl-mop:class-finalized-p (class)
-  "T: classes finalize eagerly here, so a class that exists is finalized.
-Portable code that finalizes before reading the precedence list runs unchanged."
-  (declare (ignore class))
-  t)
+  "Whether CLASS is finalized. Classes finalize eagerly here, so a defined class
+is always finalized and portable code that finalizes before reading the
+precedence list runs unchanged. A class is NOT finalized while it, or any class
+it inherits from, is only a forward reference -- named as a superclass and never
+defined -- because nothing has said yet what slots it has."
+  (null (egcl-internal::%forward-referenced-superclass class)))
 
 (defun egcl-mop:finalize-inheritance (class)
-  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits."
+  "Return CLASS. Classes finalize eagerly, so this is the no-op AMOP permits --
+except that a class cannot be finalized while it, or a class it inherits from,
+is still only a forward reference, which is an error (spec R9.39)."
+  (let ((pending (egcl-internal::%forward-referenced-superclass class)))
+    (when pending
+      (error "FINALIZE-INHERITANCE: ~s cannot be finalized while ~s is only a ~
+              forward reference: it is named as a superclass but never defined."
+             class pending)))
   class)
 
 (defun egcl-mop:intern-eql-specializer (object)

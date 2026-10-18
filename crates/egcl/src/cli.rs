@@ -20708,6 +20708,20 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let supers = egcl_stdlib::clos::class_direct_superclasses(class);
                 return Ok(vec_to_list(&supers));
             }
+            // The forward-reference half of the finalization protocol (R9.39).
+            // Answers the first class at or above the argument that is only a
+            // forward reference, so boot.lisp's CLASS-FINALIZED-P and
+            // FINALIZE-INHERITANCE can tell the truth about a class whose
+            // superclass is still undefined, rather than T and a no-op for
+            // every class (bliss-jv7tj).
+            "EGCL-INTERNAL::%FORWARD-REFERENCED-SUPERCLASS"
+            | "EGCL-INTERNAL:%FORWARD-REFERENCED-SUPERCLASS"
+            | "%FORWARD-REFERENCED-SUPERCLASS" => {
+                let (af, _) = cp(cdr);
+                let class_input = eval_form(af, env)?;
+                let class = resolve_class_metaobject(env, class_input)?;
+                return Ok(egcl_stdlib::clos::forward_referenced_superclass(class));
+            }
             "EGCL-INTERNAL::%CLASS-DIRECT-SUBCLASSES"
             | "EGCL-INTERNAL:%CLASS-DIRECT-SUBCLASSES"
             | "%CLASS-DIRECT-SUBCLASSES" => {

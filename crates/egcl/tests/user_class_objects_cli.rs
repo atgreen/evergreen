@@ -247,19 +247,15 @@ fn a_forward_referenced_class_with_a_user_metaclass_is_an_instance_of_it() {
               (fcc (find-class 'late))))
       (format t "COMPILED ~a~%" (compiled-probe))
 
-      ;; An INSTANCE of the placeholder follows it. `(make-instance
-      ;; 'undefined-class)` is accepted here where SBCL refuses it, so a
-      ;; placeholder can have instances; they reach their class through their
-      ;; wrapper, not through any registry, and replacement has to hand that
-      ;; wrapper over. (The slot the definition adds is UNBOUND on an instance
-      ;; that predates it -- what every redefinition does here.)
+      ;; Replacement never has to find the placeholder's instances, because a
+      ;; forward reference cannot have any -- instantiating one is refused
+      ;; (bliss-jv7tj, pinned by its own test below).
       (defclass inst-sub (inst-late) ())
-      (defvar *i* (make-instance 'inst-late))
-      (defclass inst-late () ((s)) (:metaclass fmeta))
-      (format t "INSTANCE-CLASS-OF ~a~%" (eq (class-of *i*) (find-class 'inst-late)))
-      (format t "INSTANCE-TYPEP ~a~%" (typep *i* 'inst-late))
-      (setf (slot-value *i* 's) 9)
-      (format t "INSTANCE-SLOT ~a~%" (slot-value *i* 's))
+      (format t "INSTANCE-REFUSED ~a~%"
+               (not (null (nth-value 1 (ignore-errors (make-instance 'inst-late))))))
+      (defclass inst-late () ((s :initform 3)) (:metaclass fmeta))
+      (format t "INSTANCE-AFTER-DEFINITION ~a~%"
+               (slot-value (make-instance 'inst-sub) 's))
 
       ;; A metaclass with no slots: the placeholder already fits its layout, so
       ;; the object is reused rather than replaced.
@@ -293,14 +289,103 @@ fn a_forward_referenced_class_with_a_user_metaclass_is_an_instance_of_it() {
         "SUB-INHERITS T",
         "CLASS-NAME LATE",
         "COMPILED (T T 7 META)",
-        "INSTANCE-CLASS-OF T",
-        "INSTANCE-TYPEP T",
-        "INSTANCE-SLOT 9",
+        "INSTANCE-REFUSED T",
+        "INSTANCE-AFTER-DEFINITION 3",
         "BARE-TYPEP T",
         "BARE-SUB-INHERITS T",
         "PLAIN-SUPER-EQ T",
         "PLAIN-INHERITED-SLOT 7",
         "FORWARD-METACLASS-OK",
+    ]);
+}
+
+/// A class that is only a forward reference cannot be instantiated, and does not
+/// claim to be finalized (bliss-jv7tj; spec R9.39).
+///
+/// `MAKE-INSTANCE`, `ALLOCATE-INSTANCE` and `CHANGE-CLASS` each used to hand
+/// back a standard object whose class had no slots yet, because nothing had
+/// said what its slots were -- a layout the eventual DEFCLASS then contradicts.
+/// SBCL signals ("cannot allocate an instance of a forward referenced class"),
+/// and the refusal is also what lets `replace_forward_referenced_class` move a
+/// placeholder's registrations without hunting for its instances.
+///
+/// `CLASS-FINALIZED-P` answered T for everything and `FINALIZE-INHERITANCE` was
+/// a no-op, which AMOP permits for a class that finalizes eagerly -- but not for
+/// one whose superclass is still undefined, since its precedence list and
+/// layout cannot be settled. A class is unfinalized while ANY class it inherits
+/// from is a forward reference, which is why `SUB` reports NIL too.
+#[test]
+fn a_forward_referenced_class_cannot_be_instantiated_or_finalized() {
+    let stdout = run(r#"
+      (defclass fr-sub2 (fr-undef) ())
+      (defun erred (thunk) (not (null (nth-value 1 (ignore-errors (funcall thunk))))))
+
+      ;; Direct forms.
+      (format t "MAKE-INSTANCE ~a~%" (erred (lambda () (make-instance 'fr-undef))))
+      (format t "ALLOCATE-INSTANCE ~a~%"
+               (erred (lambda () (allocate-instance (find-class 'fr-undef)))))
+      ;; Through FUNCALL, which takes a different arm of the evaluator.
+      (format t "ALLOCATE-VIA-FUNCALL ~a~%"
+               (erred (lambda () (funcall #'allocate-instance (find-class 'fr-undef)))))
+      ;; CHANGE-CLASS reaches neither: a class with no more slots than the
+      ;; instance has re-points the wrapper in place and never allocates.
+      (format t "CHANGE-CLASS ~a~%"
+               (erred (lambda () (change-class (make-instance 'fr-sub2) 'fr-undef))))
+      ;; A defined class is unaffected.
+      (format t "DEFINED-CLASS-OK ~a~%" (typep (make-instance 'fr-sub2) 'fr-sub2))
+
+      ;; Finalization tells the truth, for the forward reference AND for the
+      ;; subclass that inherits from it.
+      (format t "FINALIZED-UNDEF ~a~%" (egcl-mop:class-finalized-p (find-class 'fr-undef)))
+      (format t "FINALIZED-SUB ~a~%" (egcl-mop:class-finalized-p (find-class 'fr-sub2)))
+      (format t "FINALIZED-STANDARD-OBJECT ~a~%"
+               (egcl-mop:class-finalized-p (find-class 'standard-object)))
+      (format t "FINALIZE-SIGNALS ~a~%"
+               (erred (lambda () (egcl-mop:finalize-inheritance (find-class 'fr-sub2)))))
+
+      ;; The same questions from compiled code (memory
+      ;; `acceptance-eval-wrapper-hides-compiled-path`).
+      (defun compiled-refusals ()
+        (list (erred (lambda () (make-instance 'fr-undef)))
+              (erred (lambda () (allocate-instance (find-class 'fr-undef))))
+              (egcl-mop:class-finalized-p (find-class 'fr-undef))
+              (erred (lambda () (egcl-mop:finalize-inheritance (find-class 'fr-sub2))))))
+      (format t "COMPILED ~a~%" (compiled-refusals))
+
+      ;; Every one of them becomes legal the moment the class is defined.
+      (defclass fr-undef () ((a :initform 1)))
+      (format t "AFTER-MAKE-INSTANCE ~a~%" (slot-value (make-instance 'fr-undef) 'a))
+      (format t "AFTER-ALLOCATE ~a~%"
+               (typep (allocate-instance (find-class 'fr-undef)) 'fr-undef))
+      (format t "AFTER-CHANGE-CLASS ~a~%"
+               (typep (change-class (make-instance 'fr-sub2) 'fr-undef) 'fr-undef))
+      (format t "AFTER-FINALIZED ~a~%"
+               (list (egcl-mop:class-finalized-p (find-class 'fr-undef))
+                     (egcl-mop:class-finalized-p (find-class 'fr-sub2))))
+      (format t "AFTER-FINALIZE ~a~%"
+               (eq (egcl-mop:finalize-inheritance (find-class 'fr-sub2))
+                   (find-class 'fr-sub2)))
+      (format t "AFTER-INHERITED-SLOT ~a~%" (slot-value (make-instance 'fr-sub2) 'a))
+      (format t "FORWARD-REFUSAL-OK~%")
+    "#);
+    expect(&stdout, &[
+        "MAKE-INSTANCE T",
+        "ALLOCATE-INSTANCE T",
+        "ALLOCATE-VIA-FUNCALL T",
+        "CHANGE-CLASS T",
+        "DEFINED-CLASS-OK T",
+        "FINALIZED-UNDEF NIL",
+        "FINALIZED-SUB NIL",
+        "FINALIZED-STANDARD-OBJECT T",
+        "FINALIZE-SIGNALS T",
+        "COMPILED (T T NIL T)",
+        "AFTER-MAKE-INSTANCE 1",
+        "AFTER-ALLOCATE T",
+        "AFTER-CHANGE-CLASS T",
+        "AFTER-FINALIZED (T T)",
+        "AFTER-FINALIZE T",
+        "AFTER-INHERITED-SLOT 1",
+        "FORWARD-REFUSAL-OK",
     ]);
 }
 
