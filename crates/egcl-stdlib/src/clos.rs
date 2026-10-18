@@ -152,28 +152,11 @@ unsafe fn resolve_forwarding(inst: EgclVal) -> EgclVal {
     egcl_rt::gc::resolve_forwarded(inst)
 }
 
-/// Mark `old` as forwarded to `new` (used by `change-class` growth).
-///
-/// # Safety
-/// Both must be live STANDARD_OBJECT heap values; `old` must not already be
-/// forwarded.
-#[inline]
-unsafe fn forward_instance(old: EgclVal, new: EgclVal) {
-    // The collector's forwarding layout — NOT a tagged EgclVal in the payload
-    // word. relocate_slot reads that word as an untagged body address; the old
-    // CLOS-private tagged scheme made it compute a wild pointer whenever a GC
-    // relocation pass encountered a slot still holding the stub (bliss-334).
-    unsafe { egcl_rt::gc::forward_object_to(old, new) };
-}
-
 /// What a class redefinition changed about an instance's layout, in the shape
 /// `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` takes it (CLHS 7.2.2).
 ///
 /// Returned to the caller rather than acted on here: applying an added slot's
 /// `:initform` means EVALUATING it, and the evaluator lives above this crate.
-/// A side table keyed by the instance would be the alternative, and a HashMap
-/// keyed by a movable nursery object needs a rehashing GC scanner — this needs
-/// neither.
 pub struct RedefinitionUpdate {
     /// Slot names the new layout has and the old one did not. These are the
     /// slots whose initforms CLHS says to apply.
@@ -188,19 +171,10 @@ pub struct RedefinitionUpdate {
 /// Bring `instance` up to date if its class has been redefined, and answer the
 /// address it now lives at.
 ///
-/// For a caller OUTSIDE this crate that holds an instance across a slot
-/// operation. Every slot entry point migrates on its own, and migrating
-/// allocates — which can evacuate a nursery-resident instance and leave the
-/// caller's own word pointing at a recycled body, exactly as it did inside
-/// this crate before bliss-ch80h. Doing it once, up front, means nothing the
-/// caller does afterwards can migrate, so there is no window to root across.
-///
-/// Cheap for a current instance: a forwarding chase and a wrapper-stamp read,
-/// no lock and no allocation.
-///
-/// Discards what the redefinition CHANGED. A caller that can run the update
-/// protocol — one with the evaluator in hand — wants `migrate_if_obsolete`
-/// instead, and must call it before this (bliss-oi5a6).
+/// Since bliss-fmhj5 the address is always the one passed in — a CLOS update
+/// replaces the instance's STORAGE, never its shell — so this is kept for the
+/// callers that were written against the old reallocating behaviour rather
+/// than because it can still change.
 pub fn ensure_instance_current(instance: EgclVal) -> EgclVal {
     migrate_if_obsolete(instance).0
 }
@@ -272,39 +246,55 @@ unsafe fn migrate_obsolete(inst: EgclVal) -> (EgclVal, Option<RedefinitionUpdate
             return (live, None);
         }
         let class = (*w).class;
-        // Snapshot surviving (bound) slots from the old frozen layout.
+        // Snapshot surviving (bound) slots from the old frozen layout, reading
+        // the storage the shell currently points at.
         let mut snap: Vec<(EgclVal, EgclVal)> = Vec::new();
         {
             let ol = (*w).layout;
+            let old_storage = instance_storage(live);
             for (i, &name) in ol.order.iter().enumerate() {
-                let v = *((live.as_ptr().add(16) as *const EgclVal).add(i));
+                let v = *(old_storage.as_ptr().add(16) as *const EgclVal).add(i);
                 if v != UNBOUND {
                     snap.push((name, v));
                 }
             }
         }
-        // Allocate a fresh instance in the class's current layout and copy
-        // surviving slots by name, then forward the old object to it.
+        // The class's CURRENT wrapper, which is the layout the instance is
+        // being brought up to.
+        let nw = metaclass_instance_wrapper(class);
+        if nw.is_null() {
+            return (live, None);
+        }
+        // Fresh STORAGE for that layout, and then the swap: wrapper and
+        // storage into the SAME shell. The instance keeps its address, so
+        // nothing downstream can be holding a stale one — which is what makes
+        // the whole reallocate-and-forward mechanism, and the three GC defects
+        // it produced (bliss-ch80h, bliss-kbo3y, bliss-k4gev), go away
+        // (bliss-fmhj5). SBCL's %obsolete-instance-trap is these same two
+        // stores.
         //
-        // GC safety (bliss-334): allocate_instance can fire a relocating minor
-        // GC, so both the OLD instance and the snapshotted slot values must be
-        // rooted across it — an unrooted `live` would forward a stale address,
-        // and unrooted snap values would be copied stale into the new layout.
+        // Pinned storage for a pinned shell: a class metaobject is an instance
+        // of its metaclass and migrates through here when the metaclass is
+        // redefined, and its shell is pinned because ClosState keys HashMaps by
+        // its address.
+        let pinned = with_state(|st| st.class_meta.contains_key(&live));
         let mut live = live;
         egcl_rt::rooted_ref!(_live_root = &mut live);
         egcl_rt::rooted_ref!(_snap_root = &mut snap);
-        let new_inst = match allocate_instance(class) {
-            Ok(i) => i,
+        let mut storage = match alloc_slot_storage((*nw).slot_count as usize, pinned) {
+            Some(s) => s,
             // The allocation may still have collected before failing, so answer
             // the ROOTED copy rather than the caller's.
-            Err(_) => return (live, None),
+            None => return (live, None),
         };
-        let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
-        if !nw.is_null() {
+        egcl_rt::rooted_ref!(_storage_root = &mut storage);
+        set_instance_storage(live, storage);
+        set_instance_wrapper(live, nw);
+        {
             let nl = (*nw).layout;
             for (name, val) in &snap {
                 if let Some(&idx) = nl.index.get(name) {
-                    *((new_inst.as_ptr().add(16) as *mut EgclVal).add(idx)) = *val;
+                    *slot_cell(live, idx) = *val;
                 }
             }
         }
@@ -345,8 +335,8 @@ unsafe fn migrate_obsolete(inst: EgclVal) -> (EgclVal, Option<RedefinitionUpdate
                 plist,
             }
         };
-        forward_instance(live, new_inst);
-        (new_inst, Some(update))
+        // No forwarding: the shell never moved.
+        (live, Some(update))
     }
 }
 
@@ -408,20 +398,107 @@ fn leak_empty_wrapper(class: EgclVal) -> *mut ClassWrapper {
 /// The wrapper word is left NULL and must be filled in by the caller before
 /// anything reads it — `class_of` dereferences it with no null check.
 fn alloc_class_metaobject() -> Option<EgclVal> {
-    // 16 bytes: the 8-byte header the allocator writes, plus the wrapper word.
-    let body = egcl_rt::gc::alloc_pinned_typed(8, type_id::STANDARD_OBJECT)?;
-    unsafe { Some(EgclVal::from_heap_ptr(body.sub(8))) }
+    // 24 bytes: the 8-byte header the allocator writes, the wrapper word, and
+    // the slot-storage word every shell now carries (bliss-fmhj5). The storage
+    // starts NIL rather than a zero-length vector: these are the built-in class
+    // metaobjects, whose own metaclass cannot gain slots (redefining a built-in
+    // class is refused), so nothing indexes them -- and the body MUST still be
+    // wide enough, or a migration that did install storage would write past the
+    // allocation. NIL is a valid tagged value for the STANDARD_OBJECT tracer,
+    // which visits word 1.
+    let body = egcl_rt::gc::alloc_pinned_typed(SLOT_STORAGE_OFFSET, type_id::STANDARD_OBJECT)?;
+    unsafe {
+        let inst = EgclVal::from_heap_ptr(body.sub(8));
+        *(body.add(8) as *mut EgclVal) = NIL;
+        Some(inst)
+    }
 }
 
-/// Pointer to slot cell `idx` (offset 16 + 8*idx), chasing forwarding.
+/// Offset of the slot-storage word in an instance shell: past the 8-byte
+/// header and the raw wrapper pointer.
+const SLOT_STORAGE_OFFSET: usize = 16;
+
+/// The instance's slot-storage vector (word 1 of the shell), chasing
+/// forwarding.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value.
+#[inline]
+unsafe fn instance_storage(inst: EgclVal) -> EgclVal {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        *(live.as_ptr().add(SLOT_STORAGE_OFFSET) as *const EgclVal)
+    }
+}
+
+/// Install a slot-storage vector in the shell (word 1), chasing forwarding.
+///
+/// This is the whole point of the indirection: a class redefinition or
+/// CHANGE-CLASS replaces the STORAGE and the wrapper, never the shell, so the
+/// instance keeps its address and its identity (bliss-fmhj5). SBCL does the
+/// same two stores — `(setf (%instance-layout thing) layout)` plus
+/// `(%instance-set thing instance-data-start slot-vector)`.
+///
+/// # Safety
+/// `inst` must be a live STANDARD_OBJECT heap value and `storage` a
+/// SIMPLE_VECTOR with a cell per slot of the wrapper's layout.
+#[inline]
+unsafe fn set_instance_storage(inst: EgclVal, storage: EgclVal) {
+    unsafe {
+        let live = resolve_forwarding(inst);
+        *(live.as_ptr().add(SLOT_STORAGE_OFFSET) as *mut EgclVal) = storage;
+    }
+}
+
+/// A fresh slot-storage vector of `slot_count` UNBOUND cells.
+///
+/// A SIMPLE_VECTOR, deliberately: the collector already traces one elementwise
+/// (`length | elements…`), and the shell reaches it through a tagged word the
+/// STANDARD_OBJECT tracer already visits — so this representation needs no new
+/// tracing code at all.
+///
+/// `pinned` follows the shell. A class metaobject's shell is pinned because
+/// `ClosState` keys HashMaps by its address; pinning its storage too keeps the
+/// pair immortal together rather than relying on a pinned object's reference
+/// to a movable one being rewritten.
+fn alloc_slot_storage(slot_count: usize, pinned: bool) -> Option<EgclVal> {
+    let body_size = 8 + slot_count * 8;
+    let body = if pinned {
+        egcl_rt::gc::alloc_pinned_typed(body_size, type_id::SIMPLE_VECTOR)?
+    } else {
+        egcl_rt::gc::alloc_typed(body_size, type_id::SIMPLE_VECTOR)?
+    };
+    unsafe {
+        *(body as *mut u64) = slot_count as u64;
+        for i in 0..slot_count {
+            *(body.add(8 + i * 8) as *mut EgclVal) = UNBOUND;
+        }
+        Some(EgclVal::from_heap_ptr(
+            body.sub(egcl_rt::gc::body_header_offset(body_size)),
+        ))
+    }
+}
+
+/// Pointer to slot cell `idx`, chasing forwarding.
 ///
 /// # Safety
 /// `inst` must be a live STANDARD_OBJECT with at least `idx+1` slots.
 #[inline]
 unsafe fn slot_cell(inst: EgclVal, idx: usize) -> *mut EgclVal {
     unsafe {
-        let live = resolve_forwarding(inst);
-        (live.as_ptr().add(16) as *mut EgclVal).add(idx)
+        let storage = instance_storage(inst);
+        // Slot storage is always a SMALL object, so its payload begins at the
+        // fixed 8-byte header offset and the length word sits there: elements
+        // start 16 bytes in. A layout cannot be large enough to need the
+        // 16-byte prefix, because the instance size field caps it at 0xFFFE
+        // words (`allocate_instance` asserts that). Hard-coding the offset is
+        // what keeps this to TWO dependent loads, the same shape as SBCL's
+        // standard-instance-access.
+        debug_assert!(
+            !(*(storage.as_ptr() as *const egcl_rt::object::ObjectHeader)).is_large_object(),
+            "slot storage unexpectedly a large object"
+        );
+        (storage.as_ptr().add(16) as *mut EgclVal).add(idx)
     }
 }
 
@@ -1949,7 +2026,7 @@ pub fn set_structure_class(class: EgclVal) {
     // A DEFSTRUCT class is an instance of STRUCTURE-CLASS, so CLASS-OF must
     // answer that and not the STANDARD-CLASS its metaobject was born with.
     if structure_class != NIL {
-        repoint_class_metaclass(class, structure_class);
+        let _ = repoint_class_metaclass(class, structure_class);
     }
 }
 
@@ -2400,48 +2477,73 @@ pub fn new_class_metaobject(metaclass: EgclVal) -> Result<EgclVal, EgclError> {
 /// its metaclass — the same word `class_of` reads for any other instance. This
 /// is how a `(:metaclass M)` class comes to answer M without a special case
 /// anywhere (GitHub #384).
-fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+/// Re-point `class`'s own wrapper so `CLASS-OF` answers `metaclass`, growing
+/// its slot storage to the metaclass's layout. Answers whether the layout
+/// actually changed, which tells DEFCLASS whether the metaclass's `:initform`s
+/// still have to run over the new cells.
+///
+/// A class metaobject's wrapper names the class it is an INSTANCE of, which is
+/// its metaclass — the same word `class_of` reads for any other instance. This
+/// is how a `(:metaclass M)` class comes to answer M without a special case
+/// anywhere (GitHub #384).
+///
+/// This used to REFUSE when the metaclass's layout had more slots than the
+/// object was allocated with, because inline slots cannot grow; DEFCLASS then
+/// replaced the whole metaobject to work around it, which cost a
+/// forward-referenced class its EQ identity (bliss-qbz4o). With indirect
+/// storage there is nothing to refuse: install fresh storage, carry over any
+/// slots the old layout shared by name, and keep the object (bliss-fmhj5).
+fn repoint_class_metaclass(class: EgclVal, metaclass: EgclVal) -> bool {
     if egcl_rt::gc::heap_object_type_id(class) != Some(type_id::STANDARD_OBJECT) {
-        return;
+        return false;
     }
     if metaclass == NIL {
-        return;
+        return false;
     }
-    // How many slot cells this object actually HAS. A class metaobject is
-    // allocated as an instance of its metaclass, so the capacity is fixed at
-    // allocation and cannot grow: pointing it at a layout with more slots than
-    // that would read and write past the allocation.
-    let capacity = unsafe {
-        let current = instance_wrapper(class);
-        if current.is_null() {
-            0
-        } else {
-            if (*current).class == metaclass {
-                // Already an instance of this metaclass -- it was allocated
-                // that way. Nothing to do, and replacing the wrapper here
-                // would discard the layout it was sized for.
-                return;
-            }
-            (*current).slot_count
-        }
-    };
+    let old_wrapper = unsafe { instance_wrapper(class) };
+    if !old_wrapper.is_null() && unsafe { (*old_wrapper).class } == metaclass {
+        // Already an instance of this metaclass, with storage sized for it.
+        return false;
+    }
     let target = metaclass_instance_wrapper(metaclass);
     if target.is_null() {
-        return;
+        return false;
     }
-    if unsafe { (*target).slot_count } > capacity {
-        // The metaclass gained slots after this class was allocated -- or the
-        // metaclass was not yet defined when it was, which DEFCLASS already
-        // treats as "accepted, with CLASS-OF answering STANDARD-CLASS". Leave
-        // the object alone rather than hand it a layout it cannot hold.
-        //
-        // A class that is still only a forward reference does not come here:
-        // DEFCLASS replaces its placeholder outright
-        // (`replace_forward_referenced_class`), so the object it points at was
-        // allocated for this very layout.
-        return;
+    // Carry over whatever the old layout and the new one share, by name, so a
+    // metaclass that GAINS a slot does not reset the state a metaclass protocol
+    // was keeping in the others (bliss-k4gev).
+    let mut carried: Vec<(EgclVal, EgclVal)> = Vec::new();
+    if !old_wrapper.is_null() {
+        unsafe {
+            let old_layout = (*old_wrapper).layout;
+            for (i, &name) in old_layout.order.iter().enumerate() {
+                let value = *slot_cell(class, i);
+                if value != UNBOUND {
+                    carried.push((name, value));
+                }
+            }
+        }
     }
-    unsafe { set_instance_wrapper(class, target) };
+    let mut class = class;
+    egcl_rt::rooted_ref!(_class_root = &mut class);
+    egcl_rt::rooted_ref!(_carried_root = &mut carried);
+    // A class metaobject's shell is pinned, so its storage is too.
+    let Some(mut storage) = alloc_slot_storage(unsafe { (*target).slot_count } as usize, true)
+    else {
+        return false;
+    };
+    egcl_rt::rooted_ref!(_storage_root = &mut storage);
+    unsafe {
+        set_instance_storage(class, storage);
+        set_instance_wrapper(class, target);
+        let layout = (*target).layout;
+        for (name, value) in &carried {
+            if let Some(&idx) = layout.index.get(name) {
+                *slot_cell(class, idx) = *value;
+            }
+        }
+    }
+    true
 }
 
 /// The wrapper `metaclass`'s own instances use — which is the wrapper a class
@@ -2500,129 +2602,6 @@ pub fn forward_referenced_superclass(class: EgclVal) -> EgclVal {
     }
 }
 
-/// Hand back a replacement metaobject for a forward-referenced `class` whose
-/// definition names a `metaclass` it has no room for, or `None` when the object
-/// it already has will do.
-///
-/// A class metaobject IS an instance of its metaclass, so its slot cells are
-/// allocated with it and the count cannot grow. A forward reference is
-/// allocated before any `(:metaclass M)` is known — nothing has named M at that
-/// point — so a placeholder for a class whose metaclass has slots is always one
-/// cell short, and `repoint_class_metaclass` then has to refuse: `CLASS-OF`
-/// answered M while `TYPEP`, `SLOT-VALUE` and method dispatch all still saw a
-/// plain `STANDARD-CLASS` (GitHub #384, the Gendl `VANILLA-MIXIN` case).
-///
-/// The way out is the one SBCL takes — `CHANGE-CLASS` of the
-/// `FORWARD-REFERENCED-CLASS` — adapted to a representation whose instances
-/// carry their slots inline: allocate the metaobject the definition actually
-/// calls for and move the placeholder's registrations onto it
-/// (`migrate_class_value`). Only a forward reference is ever replaced.
-/// A class that has been DEFINED keeps its object: a program can hold it, and
-/// CLHS requires a redefinition to leave existing instances naming the same
-/// class. A placeholder is the one class nothing can be holding on purpose —
-/// it exists because some other class named it, and its name answered no class
-/// until it was minted.
-///
-/// The caller must treat the replacement as a fresh metaobject: its slots are
-/// UNBOUND, so the metaclass's `:initform`s still have to run on it.
-///
-/// Must be called with no CLOS lock held: it allocates.
-pub fn replace_forward_referenced_class(
-    class: EgclVal,
-    metaclass: EgclVal,
-) -> Result<Option<EgclVal>, EgclError> {
-    if metaclass == NIL || !is_forward_referenced(class) {
-        return Ok(None);
-    }
-    if egcl_rt::gc::heap_object_type_id(class) != Some(type_id::STANDARD_OBJECT) {
-        return Ok(None);
-    }
-    let target = metaclass_instance_wrapper(metaclass);
-    if target.is_null() {
-        return Ok(None);
-    }
-    let (needed, capacity) = unsafe {
-        let current = instance_wrapper(class);
-        if current.is_null() || (*current).class == metaclass {
-            // No wrapper to compare, or already an instance of this metaclass.
-            return Ok(None);
-        }
-        ((*target).slot_count, (*current).slot_count)
-    };
-    if needed <= capacity {
-        // The placeholder can carry this metaclass's layout as it stands;
-        // `repoint_class_metaclass` will point it there and identity is kept.
-        return Ok(None);
-    }
-    let replacement = new_class_metaobject(metaclass)?;
-    migrate_class_value(class, replacement);
-    Ok(Some(replacement))
-}
-
-/// Move every recorded reference to `old` onto `new`, and `old`'s own metadata
-/// with it. Only ever used to replace a forward-reference placeholder
-/// (`replace_forward_referenced_class`); `old` is an orphan afterwards.
-///
-/// The placeholder's recorded subclasses are the point of the exercise: a class
-/// that named it as a superclass is already defined, and `define_class` adds a
-/// class to its superclasses' subclass lists only when IT is defined. Losing
-/// them here would leave the subclass's precedence list naming a class no
-/// registry knows, so `TYPEP` against the superclass would fail for its
-/// instances and the layout refresh would skip it.
-///
-/// It does NOT have to find the placeholder's instances, because a forward
-/// reference cannot have any: `allocate_instance` refuses it (bliss-jv7tj), and
-/// that is the single place an instance of a class is born. The handover this
-/// function used to do -- rewriting the old wrapper's class word and obsoleting
-/// it -- became unreachable with that refusal and is gone; if some future path
-/// does create such an instance, the refusal is the one place to look.
-fn migrate_class_value(old: EgclVal, new: EgclVal) {
-    with_state_mut(|st| {
-        if let Some(mut meta) = st.class_meta.remove(&old) {
-            meta.forward_referenced = false;
-            // `meta.wrapper` is the wrapper for instances OF the class, which
-            // the imminent `define_class` finalizes afresh; the replacement's
-            // own wrapper -- the metaclass's -- came with its allocation.
-            meta.wrapper = None;
-            st.class_meta.insert(new, meta);
-        }
-        for value in st.class_registry.values_mut() {
-            if *value == old {
-                *value = new;
-            }
-        }
-        for value in st.class_by_name.values_mut() {
-            if *value == old {
-                *value = new;
-            }
-        }
-        for meta in st.class_meta.values_mut() {
-            for value in meta
-                .direct_supers
-                .iter_mut()
-                .chain(meta.direct_subs.iter_mut())
-            {
-                if *value == old {
-                    *value = new;
-                }
-            }
-            if meta.metaclass == old {
-                meta.metaclass = new;
-            }
-        }
-        for meta in st.method_meta.values_mut() {
-            for specializer in &mut meta.specializers {
-                if *specializer == old {
-                    *specializer = new;
-                }
-            }
-        }
-        if st.structure_classes.remove(&old) {
-            st.structure_classes.insert(new);
-        }
-    });
-}
-
 /// The metaclass DEFCLASS named for `class`, or NIL for the default.
 pub fn class_metaclass(class: EgclVal) -> EgclVal {
     with_state(|st| {
@@ -2639,7 +2618,7 @@ pub fn class_metaclass(class: EgclVal) -> EgclVal {
 /// interpreter (it is a class NAME in the source, which may not be defined
 /// until after this class is) and because every existing caller of
 /// `define_class` means the default.
-pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
+pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) -> bool {
     with_state_mut(|st| {
         if let Some(meta) = st.class_meta.get_mut(&class) {
             meta.metaclass = metaclass;
@@ -2648,7 +2627,10 @@ pub fn set_class_metaclass(class: EgclVal, metaclass: EgclVal) {
     // Outside the lock: leaking a wrapper is a Rust allocation, but keeping the
     // two in one critical section would invite a GC allocation under the CLOS
     // lock later. The recorded metaclass above stays the source of truth.
-    repoint_class_metaclass(class, metaclass);
+    //
+    // Answers whether the class's slot layout changed, so DEFCLASS knows to run
+    // the metaclass's initforms over cells that did not exist before.
+    repoint_class_metaclass(class, metaclass)
 }
 
 /// Get the direct superclasses of a class.
@@ -2914,10 +2896,11 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
             "cannot allocate an instance of a class with no slot layout".into(),
         ));
     }
-    let size = 16 + 8 * slot_count;
+    // The cap that licenses `slot_cell`'s hard-coded small-object payload
+    // offset: storage this size can never need the 16-byte large-object prefix.
     debug_assert!(
-        size / 8 <= 0xFFFE,
-        "instance too large for header size field"
+        (16 + 8 * slot_count) / 8 <= 0xFFFE,
+        "slot storage too large for the header size field"
     );
     // Ordinary instances are ORDINARY HEAP OBJECTS (bliss-334): nursery-born,
     // movable, and collectible, like any cons. They used to be std::alloc'd
@@ -2926,15 +2909,22 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
     // root scanner. The GC already knows the STANDARD_OBJECT layout (word 0 is
     // the raw wrapper pointer, the rest are traced slot values), so instances
     // need no side-table at all.
-    let body = egcl_rt::gc::alloc_typed(size - 8, type_id::STANDARD_OBJECT)
+    // Storage first, ROOTED across the shell's allocation: two allocations, and
+    // the first value has to survive the second (bliss-334's invariant 1).
+    let mut storage = alloc_slot_storage(slot_count, false)
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for instance slots".into()))?;
+    egcl_rt::rooted_ref!(_storage_root = &mut storage);
+    // The shell is a FIXED 16-byte body whatever the slot count: the raw
+    // wrapper pointer and the tagged storage reference.
+    let body = egcl_rt::gc::alloc_typed(SLOT_STORAGE_OFFSET, type_id::STANDARD_OBJECT)
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for instance".into()))?;
     unsafe {
         let ptr = body.sub(8);
         let inst = EgclVal::from_heap_ptr(ptr);
+        // Both words before anything can collect again: the tracer reads word 1
+        // as a tagged value, so it must not see the allocator's leftovers.
+        set_instance_storage(inst, storage);
         set_instance_wrapper(inst, wrapper);
-        for i in 0..slot_count {
-            *slot_cell(inst, i) = UNBOUND;
-        }
         Ok(inst)
     }
 }
@@ -2974,10 +2964,11 @@ pub fn allocate_instance_pinned_gc(class: EgclVal) -> Result<EgclVal, EgclError>
             "cannot allocate an instance of a class with no slot layout".into(),
         ));
     }
-    let size = 16 + 8 * slot_count;
+    // The cap that licenses `slot_cell`'s hard-coded small-object payload
+    // offset: storage this size can never need the 16-byte large-object prefix.
     debug_assert!(
-        size / 8 <= 0xFFFE,
-        "instance too large for header size field"
+        (16 + 8 * slot_count) / 8 <= 0xFFFE,
+        "slot storage too large for the header size field"
     );
     // The GC allocator writes an 8-byte STANDARD_OBJECT header and returns the
     // body pointer; the instance value points at the header (body − 8).
@@ -2991,15 +2982,20 @@ pub fn allocate_instance_pinned_gc(class: EgclVal) -> Result<EgclVal, EgclError>
     // poisoned 316 x 1MB regions). Until instances become movable and
     // collectible (bliss-334) they are immortal either way; packed host
     // regions bound the cost to the instances' own bytes.
-    let body = egcl_rt::gc::alloc_pinned_typed(size - 8, type_id::STANDARD_OBJECT)
+    // Storage pinned alongside the shell, and rooted across its allocation:
+    // this pair is immortal together, rather than a pinned shell holding a
+    // reference into movable space (bliss-fmhj5).
+    let mut storage = alloc_slot_storage(slot_count, true).ok_or_else(|| {
+        EgclError::Internal("GC heap unavailable for pooled instance slots".into())
+    })?;
+    egcl_rt::rooted_ref!(_storage_root = &mut storage);
+    let body = egcl_rt::gc::alloc_pinned_typed(SLOT_STORAGE_OFFSET, type_id::STANDARD_OBJECT)
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for pooled instance".into()))?;
     unsafe {
         let ptr = body.sub(8);
         let inst = EgclVal::from_heap_ptr(ptr);
+        set_instance_storage(inst, storage);
         set_instance_wrapper(inst, wrapper);
-        for i in 0..slot_count {
-            *slot_cell(inst, i) = UNBOUND;
-        }
         Ok(inst)
     }
 }
@@ -3253,6 +3249,35 @@ pub fn set_slot_value(
                 egcl_rt::symbols::symbol_name(slot_name.as_symbol_index()).unwrap_or_default()
             ))),
         }
+    }
+}
+
+/// Store into `slot_name` if it is in the instance's own layout, the writer's
+/// counterpart of [`slot_value_if_present`]. `None` when INSTANCE is not an
+/// instance, the slot is not an instance slot (a class-allocated or missing
+/// slot), or the instance is obsolete, leaving the caller's general path to
+/// handle it.
+///
+/// Never allocates. Migrating an obsolete instance would, and NEW_VALUE is held
+/// here only in a local the collector cannot see, so that case is declined
+/// rather than migrated.
+pub fn set_slot_value_if_present(
+    instance: EgclVal,
+    slot_name: EgclVal,
+    new_value: EgclVal,
+) -> Option<()> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        let live = resolve_forwarding(instance);
+        let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
+        if !w.is_null() && (*w).state.load(Ordering::Acquire) == WRAPPER_OBSOLETE {
+            return None;
+        }
+        let idx = instance_slot_index(live, slot_name)?;
+        *slot_cell(live, idx) = new_value;
+        Some(())
     }
 }
 
@@ -3853,7 +3878,7 @@ pub fn change_class(instance: EgclVal, new_class: EgclVal) -> Result<(), EgclErr
 
     // Step 1: snapshot the old instance's bound slots by name, and its inline
     // capacity (the number of cells the allocation was sized for).
-    let (old_capacity, snapshot): (usize, Vec<(EgclVal, EgclVal)>) = unsafe {
+    let (_old_capacity, snapshot): (usize, Vec<(EgclVal, EgclVal)>) = unsafe {
         let ow = instance_wrapper(instance);
         let cap = if ow.is_null() {
             0
@@ -3903,43 +3928,34 @@ pub fn change_class(instance: EgclVal, new_class: EgclVal) -> Result<(), EgclErr
         ));
     }
 
-    if new_count <= old_capacity {
-        // Step 3a (fits): swap the wrapper in place, clear the new layout's
-        // cells to UNBOUND, then copy shared slots by name (R5.82). Added slots
-        // stay UNBOUND.
+    {
+        // ONE path, whatever the slot counts: allocate storage for the new
+        // layout and install it with the new wrapper in the SAME shell, then
+        // copy shared slots by name (R5.82); added slots stay UNBOUND. The
+        // instance keeps its address, which is what CLHS 7.2 asks for and what
+        // the old growth branch below needed a forwarding stub to fake
+        // (bliss-fmhj5).
+        //
+        // GC safety: the storage allocation can relocate the instance and the
+        // snapshotted values, so both are rooted across it.
+        let mut instance = instance;
+        let mut snapshot = snapshot;
+        egcl_rt::rooted_ref!(_inst_root = &mut instance);
+        egcl_rt::rooted_ref!(_snap_root = &mut snapshot);
+        let pinned = with_state(|st| st.class_meta.contains_key(&instance));
+        let mut storage = alloc_slot_storage(new_count, pinned).ok_or_else(|| {
+            EgclError::Internal("GC heap unavailable for changed-class slots".into())
+        })?;
+        egcl_rt::rooted_ref!(_storage_root = &mut storage);
         unsafe {
+            set_instance_storage(instance, storage);
             set_instance_wrapper(instance, new_wrapper);
-            for i in 0..new_count {
-                *slot_cell(instance, i) = UNBOUND;
-            }
             let nl = (*new_wrapper).layout;
             for (name, val) in &snapshot {
                 if let Some(&idx) = nl.index.get(name) {
                     *slot_cell(instance, idx) = *val;
                 }
             }
-        }
-    } else {
-        // Step 3b (growth): the new layout needs more inline cells than the old
-        // allocation holds. Allocate a fresh larger instance, copy shared slots
-        // by name, then forward the old object to it so pointer identity is
-        // preserved (spec R5.69 forwarding word).
-        //
-        // GC safety (bliss-334): the allocation can relocate both the old
-        // instance and the snapshotted slot values; root them across it.
-        let mut instance = instance;
-        let mut snapshot = snapshot;
-        egcl_rt::rooted_ref!(_inst_root = &mut instance);
-        egcl_rt::rooted_ref!(_snap_root = &mut snapshot);
-        let new_inst = allocate_instance(new_class)?;
-        unsafe {
-            let nl = (*new_wrapper).layout;
-            for (name, val) in &snapshot {
-                if let Some(&idx) = nl.index.get(name) {
-                    *slot_cell(new_inst, idx) = *val;
-                }
-            }
-            forward_instance(resolve_forwarding(instance), new_inst);
         }
     }
     Ok(())

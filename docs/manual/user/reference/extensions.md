@@ -1,9 +1,10 @@
 # Operating-system interface
 
-These extensions expose process state and synchronous subprocess execution.
-They are in `EGCL-EXT`. Their signatures differ from some similarly named
-SBCL extensions; use this dictionary rather than substituting package names
-in an SBCL call.
+These extensions expose process state, synchronous subprocess execution,
+clocks, text encoding, package-local nicknames, funcallable instances,
+digests and cipher blocks, and atomic operations. They are in `EGCL-EXT`. Their signatures differ from some
+similarly named SBCL extensions; use this dictionary rather than substituting
+package names in an SBCL call.
 
 ## Environment
 
@@ -19,6 +20,36 @@ sandbox capability check on this operation.
 ```lisp
 (or (egcl-ext:getenv "HOME") "no home directory")
 ```
+
+### `egcl-ext:setenv` { #setenv }
+
+**Function** `(egcl-ext:setenv name value &optional (overwrite t))` → `value`
+
+Sets the process environment variable named by the string `name` to the
+string `value`. With `overwrite` false, an existing variable is left unchanged.
+The function returns `value` in either case, so it does not report whether
+the variable was changed. This is the shape of POSIX `setenv`.
+
+The change is made to the real process environment, so child processes started
+afterwards and foreign code see it. EGCL's own environment reads and writes are
+serialized with each other; foreign code that calls the C library's `getenv`
+concurrently with a change is not synchronized with it.
+
+A `program-error` is signalled when `name` is empty or contains `=` or a NUL
+character, or when `value` contains a NUL character.
+
+```lisp
+(egcl-ext:setenv "APP_MODE" "test")
+(egcl-ext:getenv "APP_MODE")  ; => "test"
+```
+
+### `egcl-ext:unsetenv` { #unsetenv }
+
+**Function** `(egcl-ext:unsetenv name)` → `nil`
+
+Removes the process environment variable named by the string `name`. Removing
+a variable that is not set is not an error. Invalid names signal
+`program-error`, as for [`setenv`](#setenv).
 
 ## Current directory
 
@@ -106,7 +137,35 @@ See [Starting and stopping](../../starting.md) for invocation order and
 init-file behavior, and [Compilation](../../compiler.md) for the compiler
 observation functions previously grouped with these operating-system calls.
 
+## Time
+
+### `egcl-ext:get-precise-time` { #get-precise-time }
+
+**Function** `(egcl-ext:get-precise-time)` → seconds, nanoseconds
+
+Returns the current wall-clock time as a universal time in whole seconds and
+the nanoseconds within that second. Both values come from one clock reading, so
+they cannot straddle a second boundary as two separate calls could. This clock
+follows changes to the system time. Passing any argument signals
+`program-error`.
+
+```lisp
+(multiple-value-bind (seconds nanoseconds) (egcl-ext:get-precise-time)
+  (+ seconds (/ nanoseconds 1000000000)))
+```
+
+### `egcl-ext:real-time-nanoseconds` { #real-time-nanoseconds }
+
+**Function** `(egcl-ext:real-time-nanoseconds)` → integer
+
+Returns a monotonic time in nanoseconds since an origin fixed for the process,
+the same origin as `get-internal-real-time`. Use differences between two
+readings to measure elapsed time; the value is not related to calendar time.
+It is unaffected by changes to the system clock.
+
 ## String and octet conversion
+
+### Text conversion { #octet-conversion }
 
 **Function** `(egcl-ext:string-to-octets string &key (external-format :utf-8) (start 0) end null-terminate)` → byte vector
 
@@ -122,6 +181,76 @@ Supported format names are `:utf-8`, `:utf8`, `:ascii`, and `:us-ascii`;
 `:default` means UTF-8. ASCII encoding rejects non-ASCII characters. Both
 decoders replace malformed input with U+FFFD, rather than signalling as SBCL's
 default decoder does. Other external formats are not supported.
+
+## Package-local nicknames { #local-nicknames }
+
+A package-local nickname makes a name designate another package only while a
+given package is current. The reader, `find-package`, `intern`, and
+`find-symbol` consult the current package's local nicknames before global
+package names. `defpackage` accepts a `:local-nicknames` option with entries of
+the form `(nickname package)`, and `*features*` contains
+`:package-local-nicknames`. The functions below are the programmatic interface;
+they follow CDR 10, as SBCL's do.
+
+### `egcl-ext:add-package-local-nickname` { #add-package-local-nickname }
+
+**Function** `(egcl-ext:add-package-local-nickname local-nickname actual-package &optional (package *package*))` → package
+
+Makes the string designator `local-nickname` designate `actual-package` when
+`package` is current, and returns `package`. Adding the same nickname for the
+same package again is not an error. A `package-error` is signalled when the
+nickname already designates a different package in `package`, when either
+package designator names no package, or when the nickname is `CL`,
+`COMMON-LISP`, or `KEYWORD`.
+
+```lisp
+(defpackage :my-app (:use :cl))
+(egcl-ext:add-package-local-nickname "THR" :egcl-thread :my-app)
+```
+
+### `egcl-ext:remove-package-local-nickname` { #remove-package-local-nickname }
+
+**Function** `(egcl-ext:remove-package-local-nickname local-nickname &optional (package *package*))` → `t` or `nil`
+
+Removes `local-nickname` from `package`. Returns `t` if it was a local
+nickname there and `nil` otherwise.
+
+### `egcl-ext:package-local-nicknames` { #package-local-nicknames }
+
+**Function** `(egcl-ext:package-local-nicknames &optional (package *package*))` → alist
+
+Returns the local nicknames of `package` as a fresh alist of
+`("NICKNAME" . package)` entries sorted by nickname.
+
+### `egcl-ext:package-locally-nicknamed-by-list` { #package-locally-nicknamed-by-list }
+
+**Function** `(egcl-ext:package-locally-nicknamed-by-list package)` → list of packages
+
+Returns the packages that have a local nickname for `package`.
+
+## Funcallable instances
+
+A class whose `:metaclass` is named `funcallable-standard-class` creates
+funcallable instances. The metaclass is recognized by its symbol name in any
+package, so `c2mop:funcallable-standard-class` and the bare name are
+equivalent. Such an instance is a function as soon as it exists, whether or not
+a function has been installed. These two functions are the AMOP interface used
+by portability layers such as closer-mop.
+
+### `egcl-ext:set-funcallable-instance-function` { #set-funcallable-instance-function }
+
+**Function** `(egcl-ext:set-funcallable-instance-function instance function)` → function
+
+Installs `function` as the function called when `instance` is called, and
+returns `function`. A `type-error` is signalled when `instance` is not a
+funcallable instance.
+
+### `egcl-ext:funcallable-instance-function` { #funcallable-instance-function }
+
+**Function** `(egcl-ext:funcallable-instance-function instance)` → function or `nil`
+
+Returns the function installed in `instance`. Returns `nil` when no function
+has been installed or when `instance` is not a funcallable instance.
 
 ## Digests and cipher blocks
 
@@ -180,6 +309,8 @@ argument count signals `program-error`.
 
 ## Atomic updates
 
+### Atomic place updates { #atomic-place-updates }
+
 **Macro** `(egcl-ext:cas place old new)` → previous value
 
 **Macro** `(egcl-ext:atomic-incf place &optional (delta 1))` → previous value
@@ -237,6 +368,8 @@ protocol; do not mix these operations with unsynchronized `SETF`, `INCF`, or
 
 ## Memory ordering
 
+### Memory barriers { #memory-barriers }
+
 **Function** `(egcl-ext:memory-barrier &optional (kind :full))` → `nil`
 
 **Function** `(egcl-ext:load-barrier)` → `nil`
@@ -261,3 +394,40 @@ for `:write`, and `mfence` for `:full`. `load-barrier`, `store-barrier`, and
 the checked runtime helper; other architectures retain the runtime path.
 The interface promises memory ordering, not a particular instruction sequence
 or call latency. Compiled files preserve the intrinsic without source fallback.
+
+## Stream timeouts
+
+### `egcl-ext:io-timeout` { #io-timeout }
+
+**Condition type**; a subtype of `stream-error` and `simple-condition`
+
+Signalled when a stream operation reaches an I/O deadline, such as a socket
+read timeout. `stream-error-stream` returns the stream when it is known.
+
+## Internal functions { #internal-functions }
+
+These functions are implementation details used by EGCL's bootstrap and its
+bundled ASDF. Their names begin with `%`, and they may change or disappear
+without notice. They are listed so that a reader who meets
+them in a backtrace or in `lib/` knows what they do; do not call them from
+applications.
+
+**Function** `(egcl-ext::%build-fingerprint)` → string
+
+Returns an eight-digit hexadecimal tag derived from the size and modification
+time of the running executable, or a fixed tag when the executable cannot be
+examined. Bundled ASDF adds it to its Lisp version string so that each EGCL
+build uses a separate compiled-file cache.
+
+**Function** `(egcl-ext::%machine-type)` → string
+
+Returns the build's target architecture as an uppercase string such as
+`"X86-64"` or `"ARM64"`, or `"UNKNOWN"`. `machine-type` and `machine-version`
+return this value.
+
+**Function** `(egcl-ext::%save-core pathname &key executable)`
+
+Writes a core image, or an executable with `:executable` true, and terminates
+the process. It is a lower-level entry point with fewer options than
+[`save-lisp-and-die`](images.md#save-lisp-and-die), which applications should
+use instead. Other keyword arguments are evaluated and ignored.

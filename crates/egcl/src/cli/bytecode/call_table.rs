@@ -286,7 +286,11 @@ fn select_target(symbol: u32, nargs: usize) -> Option<Target> {
             promote,
         });
     }
-    if let Some(slot) = super::super::direct_builtin_slot(symbol, nargs) {
+    // Memoized per symbol: a cell whose callee has no cached target -- a generic
+    // function, whose symbol has no function object -- resolves again on every
+    // call, and the unmemoized lookup allocates the symbol's name and scans the
+    // builtin table each time.
+    if let Some(slot) = super::super::direct_builtin_slot_memoized(symbol, nargs) {
         return Some(Target::Builtin { slot, nargs });
     }
     egcl_rt::function::is_interpreted_function(function).then_some(Target::Function(function))

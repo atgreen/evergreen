@@ -45,9 +45,24 @@
   `uiop:chdir`, `uiop:delete-empty-directory` and `uiop:delete-directory-tree`,
   which signalled "Not (currently) implemented on EGCL"
   ([#392](https://github.com/atgreen/evergreen/pull/392)).
+- The manual now documents every `EGCL-EXT` function, including `SETENV`,
+  `UNSETENV`, `GET-PRECISE-TIME`, `REAL-TIME-NANOSECONDS`, the package-local
+  nickname functions, `HASH-TABLE-WEAKNESS`, the funcallable-instance functions,
+  declaration introspection and the embedded-file functions. Each one has an
+  anchored entry and a symbol-index row
+  ([#409](https://github.com/atgreen/evergreen/pull/409)).
 
 ### Fixed
 
+- `BASE-CHAR`, `STANDARD-CHAR` and `EXTENDED-CHAR` are proper subtypes of
+  `CHARACTER` at more doors: `(coerce #\λ 'base-char)` and `(coerce #\a
+  'extended-char)` signal `TYPE-ERROR` instead of returning the character,
+  the interpreter's `(the base-char #\λ)` signals one, and an
+  `EXTENDED-CHAR` array is a `CHARACTER` string. `COERCE` to a string
+  signals `TYPE-ERROR` for an element that is not a character instead of
+  dropping it, and `MAKE-ARRAY` rejects `:initial-contents` whose length is
+  not the vector's instead of padding it
+  ([#416](https://github.com/atgreen/evergreen/pull/416)).
 - String literals are `CHARACTER` strings, as in SBCL, so a copy of one can
   hold any character: `(setf (char (copy-seq "abc") 0) #\λ)` works, and a
   literal is the same kind of string whether its file was compiled or not.
@@ -141,7 +156,8 @@
   `SUBSTITUTE` and `REMOVE-DUPLICATES` families keep a string's width, and
   `TYPE-OF` answers `(SIMPLE-ARRAY CHARACTER (n))` for a 32-bit string (ansi
   sequences `MAP.SPECIALIZED-STRING.3`, `LENGTH.STRING.6`; the sequences
-  chapter now passes completely and joins the gate).
+  chapter now passes completely and joins the gate)
+  ([#403](https://github.com/atgreen/evergreen/pull/403)).
 - Hash tables find every key their test calls equal. An `EQUALP` table missed
   `1d0` for `1`, `0.5` for `1/2`, an adjustable or fill-pointer vector or string
   for a simple one, a string for a vector of its characters, and equal
@@ -311,6 +327,14 @@
 
 ### Performance
 
+- Generic-function calls do less repeated work. A `DEFCLASS` accessor reads
+  or writes its slot directly once dispatch selects it (user methods on the
+  accessor still take over), slot writes skip the class-slot search for
+  ordinary slots, and per-generic and per-class facts are cached. From
+  compiled callers an accessor read takes about 3 us instead of 11, a write 8
+  instead of 23, and `READ-BYTE` on a Gray stream 40 instead of about 110; a
+  repeated HTTPS request through drakma and pure-tls is about twice as fast
+  ([#415](https://github.com/atgreen/evergreen/pull/415)).
 - A method body that loops now reaches optimized native code (T2) like the
   same body in a `DEFUN`. It used to stop at baseline native code (T1) until
   its 4096th call: a 1000-iteration loop took about 4 ms per call as a method
