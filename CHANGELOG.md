@@ -260,6 +260,13 @@
 
 ### Performance
 
+- AES, GCM's GHASH multiply and SHA-256 compression run in the runtime, as
+  `EGCL-EXT:CRYPTO-*` block primitives that EGCL's Ironclad fork calls in place
+  of its portable Lisp. With the fork, encrypting 64 KB with AES-GCM takes
+  seconds instead of 193 s, hashing it with SHA-256 takes under 0.3 s instead
+  of 18 s, and a repeated HTTPS request through pure-tls is about 10x faster.
+  `EGCL-EXT:SHA256` and `EGCL-EXT:CRC32` are now documented
+  ([#410](https://github.com/atgreen/evergreen/pull/410)).
 - Calls made from compiled (native) code into other compiled functions are
   cheaper: a call no longer looks `FUNCALL`/`APPLY` up by name, rebuilds the
   callee's per-call buffers, rescans its bytecode or registers a global root
