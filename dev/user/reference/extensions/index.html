@@ -1073,6 +1073,45 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#chdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:chdir
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#directories" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Directories
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Directories">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#delete-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:delete-directory
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2335,6 +2374,45 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#chdir" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:chdir
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#directories" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Directories
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Directories">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#delete-directory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:delete-directory
+      
+    </span>
+  </a>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -2785,6 +2863,17 @@ a variable that is not set is not an error. Invalid names signal
 <p>Returns the process working directory as a string with a trailing slash, or
 <code>nil</code> if the host query fails. This is process state; it is not the same thing
 as a dynamically bound Lisp <code>*default-pathname-defaults*</code>.</p>
+<h3 id="chdir"><code>egcl-ext:chdir</code><a class="headerlink" href="#chdir" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:chdir namestring)</code> → <code>t</code></p>
+<p>Changes the process working directory, as POSIX <code>chdir(2)</code>, and signals a
+<code>file-error</code> if it cannot. It does not change <code>*default-pathname-defaults*</code>.
+<code>uiop:chdir</code> uses it.</p>
+<h2 id="directories">Directories<a class="headerlink" href="#directories" title="Permanent link">&para;</a></h2>
+<h3 id="delete-directory"><code>egcl-ext:delete-directory</code><a class="headerlink" href="#delete-directory" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:delete-directory namestring)</code> → <code>t</code></p>
+<p>Removes an empty directory, as POSIX <code>rmdir(2)</code>, and signals a <code>file-error</code>
+if it cannot. <code>uiop:delete-empty-directory</code> uses it, and through it
+<code>uiop:delete-directory-tree</code>.</p>
 <h2 id="subprocesses">Subprocesses<a class="headerlink" href="#subprocesses" title="Permanent link">&para;</a></h2>
 <h3 id="run-program"><code>egcl-ext:run-program</code><a class="headerlink" href="#run-program" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:run-program command)</code> → exit-code, stdout, stderr</p>
