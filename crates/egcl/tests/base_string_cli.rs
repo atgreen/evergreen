@@ -156,9 +156,10 @@ fn base_char_is_the_element_type_of_an_8_bit_base_string_consistently() {
         &format!("COERCE-VBASE {BASE}"),
         &format!("MAKE-SEQ-BASE {BASE}"),
         &format!("MA-IC-BASE {BASE}"),
-        &format!("LITERAL {BASE}"),
         // CHARACTER, and the default, is the 32-bit string, and TYPE-OF says
-        // so instead of calling it SIMPLE-BASE-STRING.
+        // so instead of calling it SIMPLE-BASE-STRING. A literal is one too,
+        // as with SBCL's standard readtable (R4.94).
+        "LITERAL (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3)))",
         "MA-CHAR (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (5)))",
         "MS-DEFAULT (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3)))",
         "MAP-STRING (NIL NIL T CHARACTER (SIMPLE-ARRAY CHARACTER (3)))",
