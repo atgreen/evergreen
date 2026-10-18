@@ -1003,10 +1003,30 @@ fn check_pending_sigpipe_for_output() -> Result<(), EgclError> {
 /// route such streams through the Gray generic functions (spec §5.5.2,
 /// egcl-jtc.7b); built-in Rust-backed streams take the fast stdlib path.
 fn is_gray_stream(s: EgclVal) -> bool {
-    egcl_stdlib::is_instance(s)
-        && instance_class_hierarchy_names(s)
-            .map(|names| names.iter().any(|n| n == "FUNDAMENTAL-STREAM"))
-            .unwrap_or(false)
+    if !egcl_stdlib::is_instance(s) {
+        return false;
+    }
+    // Every stream operation on an instance asks this, and the answer is a
+    // function of the class, so memoize it per class. Building the precedence
+    // list's names as Strings on every READ-BYTE cost more than the read.
+    // Stamped with the dispatch generation, which every DEFCLASS bumps; keyed
+    // by class identity bits, as the effective-method cache is.
+    let class = egcl_stdlib::class_of(s);
+    let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
+    if let Some(gray) = GRAY_CLASS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&class.0)
+            .filter(|(stamp, _)| *stamp == generation)
+            .map(|&(_, gray)| gray)
+    }) {
+        return gray;
+    }
+    let gray = instance_class_hierarchy_names(s)
+        .map(|names| names.iter().any(|n| n == "FUNDAMENTAL-STREAM"))
+        .unwrap_or(false);
+    GRAY_CLASS_CACHE.with(|cache| cache.borrow_mut().insert(class.0, (generation, gray)));
+    gray
 }
 
 /// Read one character from an input stream, or `None` at end of input. Handles
@@ -2416,6 +2436,21 @@ static METHOD_COMPILED: LazyLock<DefinitionTable<HashMap<u64, EgclVal>>> = LazyL
     ))
 });
 
+/// The methods DEFCLASS generated for slot accessors, keyed by method identity:
+/// the slot's symbol index and whether the method is a writer. Read only when
+/// the effective-method cache records a dispatch decision, so a call that
+/// selects one of these methods can read or store the slot directly
+/// (`try_single_primary_fast`) instead of running the method body.
+static ACCESSOR_METHODS: LazyLock<DefinitionTable<HashMap<u64, (u32, bool)>>> =
+    LazyLock::new(|| {
+        DefinitionTable(OrderedMutex::new(
+            LockLevel::GcWorld,
+            25,
+            "slot accessor methods",
+            HashMap::new(),
+        ))
+    });
+
 impl<T> SharedCell<T> {
     fn new(value: T) -> Self {
         Self(Mutex::new(value))
@@ -2924,6 +2959,11 @@ thread_local! {
     /// per call — the `cacheable` check ran `generic_has_eql_specializer`, which
     /// iterates every method of the generic, on every dispatch.
     static GF_META_CACHE: RefCell<HashMap<u32, GfMeta, egcl_rt::fxhash::FxBuildHasher>> =
+        RefCell::new(HashMap::default());
+
+    /// `is_gray_stream`'s answer per class identity, stamped with the dispatch
+    /// generation.
+    static GRAY_CLASS_CACHE: RefCell<HashMap<u64, (u64, bool), egcl_rt::fxhash::FxBuildHasher>> =
         RefCell::new(HashMap::default());
 }
 /// Global SETF writers are shared by every execution and scanned once per GC.
@@ -3717,6 +3757,18 @@ fn host_serialize_registries() -> Vec<u8> {
             out.extend_from_slice(&callable.to_raw().to_le_bytes());
         }
     }
+    // Which methods are DEFCLASS slot accessors, for the dispatch fast path.
+    // Method ids and symbol indices are both stable across an image.
+    out.extend_from_slice(b"MACC");
+    {
+        let accessors = ACCESSOR_METHODS.borrow();
+        out.extend_from_slice(&(accessors.len() as u32).to_le_bytes());
+        for (&id, &(slot, writer)) in accessors.iter() {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&slot.to_le_bytes());
+            out.push(u8::from(writer));
+        }
+    }
     // SETF expanders are distinct from SETF writer functions. Preserve their
     // source and shared lexical frames; compiled expanders ride the BCOD unit.
     out.extend_from_slice(b"SEXP");
@@ -4303,6 +4355,27 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         set_compiled_method_cell(callable, true);
     }
     *METHOD_COMPILED.borrow_mut() = compiled_methods;
+    // Older images lack MACC; their accessors run their method bodies.
+    let mut accessor_methods = HashMap::new();
+    if data.get(off..off + 4) == Some(b"MACC") {
+        off += 4;
+        let bad = || EgclError::InvalidImage("host registry: truncated (accessor methods)".into());
+        let count_bytes = data.get(off..off + 4).ok_or_else(bad)?;
+        let count = u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+        off += 4;
+        if count > (data.len() - off) / 13 {
+            return Err(bad());
+        }
+        for _ in 0..count {
+            let id = hr_get_u64(data, &mut off).ok_or_else(bad)?;
+            let slot_bytes = data.get(off..off + 4).ok_or_else(bad)?;
+            let slot = u32::from_le_bytes(slot_bytes.try_into().unwrap());
+            let writer = *data.get(off + 4).ok_or_else(bad)? != 0;
+            off += 5;
+            accessor_methods.insert(id, (slot, writer));
+        }
+    }
+    *ACCESSOR_METHODS.borrow_mut() = accessor_methods;
     let mut expanders = HashMap::new();
     if data.get(off..off + 4) == Some(b"SEXP") {
         off += 4;
@@ -6834,6 +6907,13 @@ fn write_slot_value(
     // (bliss-ch80h). Idempotent, so the common double call costs two stamp
     // reads.
     let instance = egcl_stdlib::clos::ensure_instance_current(instance);
+    // FAST PATH, as in `read_slot_value`: a slot in the instance's own layout
+    // cannot be class-allocated, so the class-slot search below -- which
+    // rebuilds the class name as a String and walks the superclass graph
+    // comparing slot names -- has nothing to find.
+    if egcl_stdlib::set_slot_value_if_present(instance, slot, value).is_some() {
+        return Ok(());
+    }
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
@@ -7994,6 +8074,9 @@ struct GfEffective {
     before: Vec<EgclVal>,
     primary: Vec<EgclVal>,
     after: Vec<EgclVal>,
+    /// When the effective method is a single DEFCLASS-generated accessor:
+    /// its slot's symbol index and whether it writes. See ACCESSOR_METHODS.
+    accessor: Option<(u32, bool)>,
 }
 
 struct GfDispatchEntry {
@@ -8018,6 +8101,14 @@ struct GfMeta {
     /// The generic's argument precedence order (bliss-nj6id). Shared rather than
     /// cloned: dispatch only reads it, and most generics leave it empty.
     precedence: Rc<[usize]>,
+    /// `generic_is_slot_reader`, which scans every slot of every class. It ran
+    /// on every call with other than one argument -- every writer call.
+    slot_reader: bool,
+    /// Bit i set when some method specializes argument i (for i below
+    /// GF_KEY_MAX_ARGS). Applicability cannot depend on the others, so the
+    /// dispatch key leaves them out rather than computing their classes -- for
+    /// a writer, the class of the value being stored.
+    specialized: u8,
 }
 
 /// Allocation-free dispatch-cache key (bliss-fy37): the generic's interned
@@ -8225,20 +8316,39 @@ fn methods_by_ids(env: &Env, name: &str, ids: &[EgclVal]) -> Option<Vec<MethodDe
 /// (aux methods present, more than one primary, or an uncompiled body).
 fn try_single_primary_fast(
     env: &mut Env,
-    around_ids: &[EgclVal],
-    before_ids: &[EgclVal],
-    primary_ids: &[EgclVal],
-    after_ids: &[EgclVal],
+    effective: &GfEffective,
     args: &[EgclVal],
 ) -> Option<Result<EgclVal, EgclError>> {
-    if !(around_ids.is_empty()
-        && before_ids.is_empty()
-        && after_ids.is_empty()
-        && primary_ids.len() == 1)
+    if !(effective.around.is_empty()
+        && effective.before.is_empty()
+        && effective.after.is_empty()
+        && effective.primary.len() == 1)
     {
         return None;
     }
-    let id = primary_ids[0];
+    // A DEFCLASS accessor is the whole effective method: read or store the slot
+    // here rather than enter its body, whose SLOT-VALUE would cost another full
+    // call. This runs only after dispatch chose that method, so a user's
+    // :AROUND/:BEFORE/:AFTER method or replacement method still takes over
+    // (#202). An unbound, missing or class-allocated slot, or an obsolete
+    // instance, falls through to the body for the full protocol.
+    if let Some((slot, writer)) = effective.accessor {
+        let slot = EgclVal::from_symbol_index(slot);
+        if writer {
+            if args.len() == 2
+                && egcl_stdlib::set_slot_value_if_present(args[1], slot, args[0]).is_some()
+            {
+                env.clear_mv();
+                return Some(Ok(args[0]));
+            }
+        } else if args.len() == 1
+            && let Some(Ok(value)) = egcl_stdlib::slot_value_if_present(args[0], slot)
+        {
+            env.clear_mv();
+            return Some(Ok(value));
+        }
+    }
+    let id = effective.primary[0];
     let callable = METHOD_COMPILED.borrow().get(&id.0).copied()?;
     Some(apply_function(callable, args, env))
 }
@@ -8281,6 +8391,22 @@ fn generic_is_slot_reader(env: &Env, name: &str) -> bool {
     })
 }
 
+/// Which of the first GF_KEY_MAX_ARGS argument positions some method of `name`
+/// specializes, as a bit mask. Only the dispatch key consults it.
+fn generic_specialized_positions(env: &Env, name: &str) -> u8 {
+    let mut mask = 0u8;
+    if let Some(methods) = env.methods.borrow().get(name) {
+        for method in methods {
+            for (position, specializer) in method.specializers.iter().enumerate() {
+                if position < GF_KEY_MAX_ARGS && !matches!(specializer, MethodSpecializer::Any) {
+                    mask |= 1 << position;
+                }
+            }
+        }
+    }
+    mask
+}
+
 fn invoke_generic_function(
     name: &str,
     args: &[EgclVal],
@@ -8298,21 +8424,7 @@ fn invoke_generic_function_inner(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    // Reader calls share this path with FUNCALL/APPLY and compiled callers.
-    // Reject wrong arity before method applicability can turn a missing
-    // receiver into NO-APPLICABLE-METHOD instead of PROGRAM-ERROR.
-    if args.len() != 1 && generic_is_slot_reader(env, name) {
-        return Err(EgclError::ProgramError(format!(
-            "{name}: accessor requires exactly one argument, got {}", args.len()
-        )));
-    }
-    if let Some(receiver) = args.first() {
-        let receiver_class = egcl_stdlib::class_of(*receiver);
-        bytecode::record_generic_receiver_profile(name, receiver_class.0);
-    }
-
     let gf_idx = egcl_rt::symbols::find_index(name);
-    check_generic_call_arguments(env, gf_idx, name, args, None)?;
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     // Per-generic metadata memo (bliss-fy37 #3): (combination, cacheable) is a
     // pure function of the generic's definition + its method set, both of which
@@ -8321,7 +8433,8 @@ fn invoke_generic_function_inner(
     // AND generic_has_eql_specializer iterating EVERY method on every dispatch —
     // O(methods) per call, measurable on many-method generics (asdf). Memoize it,
     // gen-stamped, keyed by the generic's interned symbol index.
-    let (combination, cacheable, metaclass_sensitive, precedence) = match gf_idx {
+    let (combination, cacheable, metaclass_sensitive, precedence, slot_reader, specialized) =
+        match gf_idx {
         Some(idx) => {
             let hit = GF_META_CACHE.with(|c| {
                 c.borrow()
@@ -8333,6 +8446,8 @@ fn invoke_generic_function_inner(
                             m.cacheable,
                             m.metaclass_sensitive,
                             Rc::clone(&m.precedence),
+                            m.slot_reader,
+                            m.specialized,
                         )
                     })
             });
@@ -8350,6 +8465,8 @@ fn invoke_generic_function_inner(
                 let precedence: Rc<[usize]> =
                     egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx))
                         .into();
+                let slot_reader = generic_is_slot_reader(env, name);
+                let specialized = generic_specialized_positions(env, name);
                 GF_META_CACHE.with(|c| {
                     c.borrow_mut().insert(
                         idx,
@@ -8359,10 +8476,12 @@ fn invoke_generic_function_inner(
                             cacheable,
                             metaclass_sensitive,
                             precedence: Rc::clone(&precedence),
+                            slot_reader,
+                            specialized,
                         },
                     );
                 });
-                (combination, cacheable, metaclass_sensitive, precedence)
+                (combination, cacheable, metaclass_sensitive, precedence, slot_reader, specialized)
             })
         }
         None => {
@@ -8380,9 +8499,24 @@ fn invoke_generic_function_inner(
             // unused here — computed anyway rather than hardcoded, so that
             // building a key here later cannot silently inherit a wrong value.
             let metaclass_sensitive = generic_dispatches_on_a_metaclass(env, name);
-            (combination, cacheable, metaclass_sensitive, Rc::from(&[][..]))
+            let slot_reader = generic_is_slot_reader(env, name);
+            let specialized = generic_specialized_positions(env, name);
+            (combination, cacheable, metaclass_sensitive, Rc::from(&[][..]), slot_reader, specialized)
         }
     };
+    // Reader calls share this path with FUNCALL/APPLY and compiled callers.
+    // Reject wrong arity before method applicability can turn a missing
+    // receiver into NO-APPLICABLE-METHOD instead of PROGRAM-ERROR.
+    if args.len() != 1 && slot_reader {
+        return Err(EgclError::ProgramError(format!(
+            "{name}: accessor requires exactly one argument, got {}", args.len()
+        )));
+    }
+    if let Some(receiver) = args.first() {
+        let receiver_class = egcl_stdlib::class_of(*receiver);
+        bytecode::record_generic_receiver_profile(name, receiver_class.0);
+    }
+    check_generic_call_arguments(env, gf_idx, name, args, None)?;
     // Build the allocation-free dispatch key (bliss-fy37): interned GF symbol
     // index + up to GF_KEY_MAX_ARGS `class_of` identity bits. `None` (bypass the
     // cache) if not cacheable, if the GF name is somehow un-interned, or if there
@@ -8391,7 +8525,14 @@ fn invoke_generic_function_inner(
         gf_idx.map(|gf| {
             let mut classes = [0u64; GF_KEY_MAX_ARGS];
             let mut builtin = [0u32; GF_KEY_MAX_ARGS];
-            for ((slot, bits), a) in classes.iter_mut().zip(builtin.iter_mut()).zip(args.iter()) {
+            for (position, ((slot, bits), a)) in
+                classes.iter_mut().zip(builtin.iter_mut()).zip(args.iter()).enumerate()
+            {
+                // An argument no method specializes cannot change which
+                // methods apply; leave its entry zero.
+                if specialized & (1 << position) == 0 {
+                    continue;
+                }
                 // `dispatch_key_entry` costs a class-registry lookup per
                 // argument, so it is used only for the generics that need it:
                 // one whose methods specialize on a metaclass, where two class
@@ -8440,9 +8581,7 @@ fn invoke_generic_function_inner(
             )?;
             // Single-primary fast path (bliss-fy37 #2): the common case skips the
             // general standard-combination machinery entirely.
-            if let Some(fast) =
-                try_single_primary_fast(env, &m.around, &m.before, &m.primary, &m.after, args)
-            {
+            if let Some(fast) = try_single_primary_fast(env, &m, args) {
                 return fast;
             }
             if let Some(result) =
@@ -8479,10 +8618,7 @@ fn invoke_generic_function_inner(
         // A slot reader applied to a non-instance yields NIL rather than
         // no-applicable-method (bliss-lb6.14), matching the tree-walker's
         // operator-position path — so a compiled `(reader nil)` agrees.
-        if args.len() == 1
-            && !egcl_stdlib::is_instance(args[0])
-            && generic_is_slot_reader(env, name)
-        {
+        if args.len() == 1 && !egcl_stdlib::is_instance(args[0]) && slot_reader {
             return Ok(NIL);
         }
         if let Some(result) = builtin_generic_fallback(name, args, env) {
@@ -8515,11 +8651,21 @@ fn invoke_generic_function_inner(
             // lists move into one Rc; the cache entry holds a refcount clone, and
             // we run from the same Rc — no Vec cloning on the miss path either
             // (bliss-fy37). Only reached on a cacheable generic (see dispatch_key).
+            let accessor = if around_ids.is_empty()
+                && before_ids.is_empty()
+                && after_ids.is_empty()
+                && primary_ids.len() == 1
+            {
+                ACCESSOR_METHODS.borrow().get(&primary_ids[0].0).copied()
+            } else {
+                None
+            };
             let effective = Rc::new(GfEffective {
                 around: around_ids,
                 before: before_ids,
                 primary: primary_ids,
                 after: after_ids,
+                accessor,
             });
             if let Some(key) = dispatch_key {
                 GF_DISPATCH_CACHE.with(|c| {
@@ -8534,14 +8680,7 @@ fn invoke_generic_function_inner(
             }
             // Single-primary fast path (bliss-fy37 #2), now that the decision is
             // cached for subsequent calls.
-            if let Some(fast) = try_single_primary_fast(
-                env,
-                &effective.around,
-                &effective.before,
-                &effective.primary,
-                &effective.after,
-                args,
-            ) {
+            if let Some(fast) = try_single_primary_fast(env, &effective, args) {
                 return fast;
             }
             match run_standard_from_ids(
@@ -38495,6 +38634,7 @@ fn set_compiled_method_cell(callable: EgclVal, installed: bool) {
 
 /// Drop method `id`'s compiled body, if it has one.
 fn forget_compiled_method(id: u64) {
+    ACCESSOR_METHODS.borrow_mut().remove(&id);
     let retired = METHOD_COMPILED.borrow_mut().remove(&id);
     if let Some(callable) = retired {
         set_compiled_method_cell(callable, false);
@@ -38565,6 +38705,7 @@ fn install_slot_accessor_method(
     egcl_rt::rooted!(class_form = class_form);
     egcl_rt::rooted!(slot_sym = slot_sym);
     let obj = reader::make_uninterned_symbol("O");
+    let mut typed_writer = false;
     egcl_rt::rooted!(obj_spec = vec_to_list(&[obj, *class_form])); // (o CLASS)
     egcl_rt::rooted!(quoted_slot = vec_to_list(&[quote_sym(), *slot_sym])); // 'SLOT
     egcl_rt::rooted!(
@@ -38579,6 +38720,7 @@ fn install_slot_accessor_method(
         let type_property = resolve_sym(STRUCT_SLOT_TYPES_PROPERTY).unwrap_or(NIL);
         egcl_rt::rooted!(checked = val);
         if plist_lookup(symbol_plist_of(*class_form), type_property).is_some() {
+            typed_writer = true;
             let check = resolve_sym("EGCL::%CHECKED-STRUCTURE-SLOT-VALUE").unwrap_or(NIL);
             *checked = vec_to_list(&[check, val, obj, *quoted_slot]);
         }
@@ -38595,7 +38737,10 @@ fn install_slot_accessor_method(
     egcl_rt::rooted!(body_tail = vec_to_list(&[body]));
     egcl_rt::rooted!(inner = arena_cons(*lambda_list_r, *body_tail));
     egcl_rt::rooted!(defmethod_cdr = arena_cons(*method_name_r, *inner));
-    eval_defmethod(*defmethod_cdr, env)?;
+    let method_id = eval_defmethod(*defmethod_cdr, env)?;
+    if !typed_writer && let Some(slot) = slot_sym.symbol_index() {
+        ACCESSOR_METHODS.borrow_mut().insert(method_id.0, (slot, is_writer));
+    }
     Ok(())
 }
 

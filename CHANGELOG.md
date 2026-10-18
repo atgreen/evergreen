@@ -298,6 +298,14 @@
 
 ### Performance
 
+- Generic-function calls do less repeated work. A `DEFCLASS` accessor reads
+  or writes its slot directly once dispatch selects it (user methods on the
+  accessor still take over), slot writes skip the class-slot search for
+  ordinary slots, and per-generic and per-class facts are cached. From
+  compiled callers an accessor read takes about 3 us instead of 11, a write 8
+  instead of 23, and `READ-BYTE` on a Gray stream 40 instead of about 110; a
+  repeated HTTPS request through drakma and pure-tls is about twice as fast
+  ([#415](https://github.com/atgreen/evergreen/pull/415)).
 - A method body that loops now reaches optimized native code (T2) like the
   same body in a `DEFUN`. It used to stop at baseline native code (T1) until
   its 4096th call: a 1000-iteration loop took about 4 ms per call as a method
