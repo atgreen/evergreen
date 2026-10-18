@@ -769,6 +769,45 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(mode_kw)
         }),
 
+        "EGCL::%READTABLE-BASE-CHAR-PREFERENCE" => Some(|_operator, args, _env| {
+            // (egcl::%readtable-base-char-preference rt)
+            //   => :symbols | :strings | :both | nil
+            let rt = args.first().copied().unwrap_or(NIL);
+            Ok(
+                match reader::readtable_base_char_preference(rt)
+                    .unwrap_or(reader::BASE_CHAR_PREFERENCE_SYMBOLS)
+                {
+                    reader::BASE_CHAR_PREFERENCE_STRINGS => resolve_sym(":STRINGS").unwrap_or(NIL),
+                    reader::BASE_CHAR_PREFERENCE_BOTH => resolve_sym(":BOTH").unwrap_or(NIL),
+                    reader::BASE_CHAR_PREFERENCE_NONE => NIL,
+                    _ => resolve_sym(":SYMBOLS").unwrap_or(NIL),
+                },
+            )
+        }),
+
+        "EGCL::%SET-READTABLE-BASE-CHAR-PREFERENCE" => Some(|_operator, args, _env| {
+            // (egcl::%set-readtable-base-char-preference preference rt) => preference
+            let preference = args.first().copied().unwrap_or(NIL);
+            let rt = args.get(1).copied().unwrap_or(NIL);
+            let code = if preference == NIL {
+                reader::BASE_CHAR_PREFERENCE_NONE
+            } else {
+                match sym_bare_name_rc(preference).as_ref() {
+                    "SYMBOLS" => reader::BASE_CHAR_PREFERENCE_SYMBOLS,
+                    "STRINGS" => reader::BASE_CHAR_PREFERENCE_STRINGS,
+                    "BOTH" => reader::BASE_CHAR_PREFERENCE_BOTH,
+                    _ => {
+                        return Err(EgclError::TypeError {
+                            datum: preference,
+                            expected: "(MEMBER :SYMBOLS :STRINGS :BOTH NIL)".into(),
+                        });
+                    }
+                }
+            };
+            reader::set_readtable_base_char_preference(rt, code);
+            Ok(preference)
+        }),
+
         "EGCL::%SYM-BY-INDEX" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 

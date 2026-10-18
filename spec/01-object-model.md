@@ -638,8 +638,9 @@ use the same structure with `host` being a logical-host string.
 ```text
 Offset  Size     Field
   0       8      ObjectHeader { type_id=0x15 }
-  8       8      case_mode: u8  — 0=:upcase 1=:downcase 2=:preserve 3=:invert
-  9       7      padding
+  8       1      case_mode: u8  — 0=:upcase 1=:downcase 2=:preserve 3=:invert
+  9       1      base_char_preference: u8 — 0=:symbols 1=:strings 2=:both 3=NIL (R4.94)
+ 10       6      padding
  16       8      char_table: EgclVal — simple-vector of 128 entries (syntax types for ASCII)
  24       8      extended_table: EgclVal — hash-table for non-ASCII chars
  32       8      macro_table: EgclVal — hash-table char→function for reader macros

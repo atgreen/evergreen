@@ -651,7 +651,12 @@ pub struct PathnameData {
 pub struct ReadtableData {
     pub header: ObjectHeader,
     pub case_mode: u8,
-    pub _pad: [u8; 7],
+    /// SBCL's `readtable-base-char-preference`: 0 = `:symbols` (the standard
+    /// readtable's), 1 = `:strings`, 2 = `:both`, 3 = `NIL`. Under `:strings` or
+    /// `:both` the reader stores an all-BASE-CHAR string literal as an 8-bit
+    /// base string; otherwise every literal is a 32-bit CHARACTER string.
+    pub base_char_preference: u8,
+    pub _pad: [u8; 6],
     pub char_table: EgclVal,
     pub extended_table: EgclVal,
     pub macro_table: EgclVal,

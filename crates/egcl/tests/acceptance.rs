@@ -4326,6 +4326,19 @@ fn character_prin1_names_nongraphic_chars() {
     }
 }
 
+/// `"abc"` read under a readtable whose base-char preference is `:BOTH`, which
+/// stores an all-BASE-CHAR literal as an 8-bit base string (R4.94), tested
+/// against a base-string type.
+const BASE_READ_ABC_IS_BASE_STRING: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") 'base-string))"#;
+const BASE_READ_ABC_IS_SIMPLE_BASE_STRING: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") 'simple-base-string))"#;
+const BASE_READ_ABC_IS_BASE_STRING_3: &str = r#"(let ((*readtable* (copy-readtable nil)))
+  (setf (egcl-ext:readtable-base-char-preference *readtable*) :both)
+  (typep (read-from-string "\"abc\"") '(base-string 3)))"#;
+
 /// TYPEP compound-type combinators: (NOT type) — was unhandled and always
 /// returned NIL, breaking (and integer (not (eql 0))) etc. — and (string N) /
 /// (simple-string N) length-qualified string types.
@@ -4349,14 +4362,18 @@ fn typep_not_and_string_length_compounds() {
         ("(typep 5 '(string 3))", "NIL"),
         // bliss-ajb3: BASE-STRING / SIMPLE-BASE-STRING match ONLY 8-bit base
         // strings (all BASE-CHARs), not the 32-bit character strings STRING also
-        // covers. An all-ASCII literal is a base string; one with a wide char is
-        // not, though it is still a STRING.
-        ("(typep \"abc\" 'base-string)", "T"),
-        ("(typep \"abc\" 'simple-base-string)", "T"),
+        // covers. As with SBCL's standard readtable, a literal is a CHARACTER
+        // string even when it is all ASCII (R4.94); a readtable preferring base
+        // strings for literals is what reads one as a base string.
+        ("(typep \"abc\" 'base-string)", "NIL"),
+        ("(typep \"abc\" 'simple-base-string)", "NIL"),
+        ("(typep \"abc\" 'simple-string)", "T"),
+        (BASE_READ_ABC_IS_BASE_STRING, "T"),
+        (BASE_READ_ABC_IS_SIMPLE_BASE_STRING, "T"),
+        (BASE_READ_ABC_IS_BASE_STRING_3, "T"),
         ("(typep \"hλ\" 'base-string)", "NIL"),
         ("(typep \"hλ\" 'simple-base-string)", "NIL"),
         ("(typep \"hλ\" 'string)", "T"),
-        ("(typep \"abc\" '(base-string 3))", "T"),
         ("(typep \"hλ\" '(base-string 2))", "NIL"),
         // A mutable (constructed) string is a 32-bit CHARACTER string, so it is a
         // STRING but not a BASE-STRING.
