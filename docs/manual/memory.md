@@ -55,6 +55,25 @@ contract from the accepted spelling.
 
 Cancels the deferred finalizers registered for the object.
 
+## Weak hash tables
+
+`make-hash-table` accepts a `:weakness` argument naming which part of an entry
+the table holds weakly: `:key`, `:value`, or `:key-and-value`. `nil` makes an
+ordinary table. Any other value, including Trivial-Garbage's `:key-or-value`,
+signals `program-error` rather than silently creating a strong table.
+
+### `egcl-ext:hash-table-weakness` { #hash-table-weakness }
+
+**Function** `(egcl-ext:hash-table-weakness hash-table)` → `:key`, `:value`, `:key-and-value`, or `nil`
+
+Returns the weakness the table was created with, or `nil` for an ordinary
+table. A non-hash-table argument signals `type-error`. Trivial-Garbage's
+`hash-table-weakness` uses this function.
+
+```lisp
+(egcl-ext:hash-table-weakness (make-hash-table :weakness :key))  ; => :KEY
+```
+
 ## Measurement and debugging
 
 `room` describes Lisp heap usage; engine profiling provides collection counts

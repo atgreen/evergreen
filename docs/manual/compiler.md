@@ -111,6 +111,68 @@ fails. Deoptimization must preserve both completed side effects and the next
 Lisp operation to execute. Raising compilation thresholds changes when work is
 compiled, not the intended semantics of the source.
 
+### Declaration introspection { #declaration-introspection }
+
+These functions let a macro read declarations in force. They are the
+implementation layer beneath `egcl-cltl2:declaration-information`; portability
+libraries normally use that instead.
+
+Lexical environments retain only some declaration specifiers: `optimize`,
+`inline`, `notinline`, and specifiers whose name has been proclaimed with
+`(proclaim '(declaration name))`. Other specifiers are not visible to these
+functions. An environment object is valid only during the macro expansion that
+received it.
+
+### `egcl-ext:declaration-specifier` { #declaration-specifier }
+
+**Function** `(egcl-ext:declaration-specifier name environment)` → declaration specifier or `nil`
+
+Returns the innermost complete declaration specifier, such as
+`(my-declaration x 3)`, whose name is the symbol `name` in the lexical
+`environment`. Returns `nil` when there is none or when `environment` is `nil`.
+A non-symbol `name` signals `type-error`; an object that is not a live macro
+expansion environment signals `program-error`.
+
+```lisp
+(proclaim '(declaration units))
+(defmacro units-in-force (&environment env)
+  `',(egcl-ext:declaration-specifier 'units env))
+(locally (declare (units meters))
+  (units-in-force))
+;; => (UNITS METERS)
+```
+
+### `egcl-ext:declaration-specifiers` { #declaration-specifiers }
+
+**Function** `(egcl-ext:declaration-specifiers name environment)` → list
+
+Returns every retained specifier named `name` in `environment`, outermost
+first. This is the cumulative counterpart of `declaration-specifier`, for
+declarations such as `optimize` whose qualities combine across nested
+declarations. Arguments and errors are as for `declaration-specifier`.
+
+### `egcl-ext:proclaimed-declarations` { #proclaimed-declarations }
+
+**Function** `(egcl-ext:proclaimed-declarations)` → list of symbols
+
+Returns the names proclaimed as declarations, in no particular order.
+
+### `egcl-ext:proclaimed-optimize` { #proclaimed-optimize }
+
+**Function** `(egcl-ext:proclaimed-optimize)` → list
+
+Returns the globally proclaimed optimization qualities as a fresh list of
+`(quality value)` entries, in the order the qualities were first proclaimed.
+A later proclamation of a quality replaces its value. A quality proclaimed
+without a value is recorded as `3`. Only qualities that have been proclaimed
+appear; the list does not include defaults for the others.
+
+```lisp
+(proclaim '(optimize (speed 2) safety))
+(egcl-ext:proclaimed-optimize)
+;; => ((SPEED 2) (SAFETY 3)) when nothing else has been proclaimed
+```
+
 ## Observing compilation
 
 ### `egcl-ext:function-tier` { #function-tier }
@@ -151,6 +213,28 @@ These are observations; use them for diagnostics, not application decisions.
 A function's installed tier does not identify the tier of an active OSR loop.
 For that purpose inspect OSR activity and execution behavior, rather than
 concluding from a T0 label that no native code ran.
+
+### Generic-function receiver profile { #generic-receiver-profile }
+
+**Functions**
+
+```lisp
+(egcl-ext:generic-receiver-profile-count name)
+(egcl-ext:generic-receiver-profile-distinct-count name)
+```
+
+Report the receiver profile the tiering engine keeps for the generic function
+named by the symbol `name`. Generic dispatch with at least one argument
+records the class of the first argument. `generic-receiver-profile-count` returns the
+number of recorded dispatches. `generic-receiver-profile-distinct-count`
+returns the number of distinct receiver classes currently held in the profile;
+the profile holds at most four, so the value saturates at 4 for a megamorphic
+generic function. Both return `0` for a generic function with no recorded
+dispatches, including one that does not exist.
+
+The profile belongs to the current thread or fiber. Setting
+`EGCL_PROFILING_DISABLED=1` before starting the process disables recording, and
+both functions then return `0`. Like the other counters, these are diagnostics.
 
 ### `egcl-ext:bail-report` { #bail-report }
 

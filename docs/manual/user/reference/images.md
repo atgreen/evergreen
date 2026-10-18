@@ -14,20 +14,20 @@ field by hand cannot repair the saved code or missing lexical scopes. Current
 images retain shared local-function scopes, captured declarations, and saved
 function objects independently of later global redefinitions.
 
-## `save-image`
+## Saving images
 
-```lisp
-(egcl-ext:save-image pathname)
-```
+### `egcl-ext:save-image` { #save-image }
+
+**Function** `(egcl-ext:save-image pathname)` → `t`
 
 Writes a core image of the live Lisp world, returns `T`, and keeps the current
 process running. Restore the core with `egcl --image FILE`.
 
-## `save-lisp-and-die`
+### `egcl-ext:save-lisp-and-die` { #save-lisp-and-die }
 
-```lisp
-(save-lisp-and-die pathname &key executable toplevel application)
-```
+**Function** `(egcl-ext:save-lisp-and-die pathname &key executable toplevel application)` → does not return
+
+**Function** `(egcl-ext:save-image-and-die pathname &key executable toplevel application)` → does not return
 
 Writes a core image of the live Lisp world and terminates the saving process.
 `save-image-and-die` is an accepted alias.
@@ -71,7 +71,9 @@ The current implementation accepts some additional SBCL-style keywords,
 including `:compression` and `:save-runtime-options`, without implementing
 their effects. Do not rely on them to change the output format or startup.
 
-## `egcl-ext:*init-hooks*`
+### `egcl-ext:*init-hooks*` { #init-hooks }
+
+**Variable** list of function designators, initially `nil`
 
 A list of functions or function names called without arguments when a saved
 image starts. Register process-specific reinitialization before saving:
@@ -94,6 +96,49 @@ Bundled UIOP registers a dispatcher for its image restore hooks here. This
 refreshes ASDF's user cache and UIOP's temporary directory, streams, and command
 line for the current user instead of retaining the image builder's values.
 Images built before this integration must be rebuilt to include the registration.
+
+## Embedded files { #embedded-file-storage }
+
+An image can carry copies of files read on the build host, so that a program
+copied or cross-built to another machine finds files such as time-zone data
+where it expects them. `open` for input, `probe-file`, `truename`,
+`file-length`, `file-write-date`, `directory`, and `load` find embedded files.
+An embedded file shadows a real file at the same path. Embedded files are
+read-only: opening one for output, renaming it, or deleting it signals
+`file-error`. Only the Lisp image sees them; the operating system, foreign code,
+and child processes do not. Saved images, cores, and shaken executables carry
+them. See [Carry files in the image](../how-to/save-executable.md#carry-files-in-the-image) for
+a task-oriented example and the ASDF integration.
+
+### `egcl-ext:embed-file` { #embed-file }
+
+**Function** `(egcl-ext:embed-file path &optional (source path))` → namestring
+
+Reads the file `source` now and stores its bytes in the image under `path`.
+Both arguments are pathname designators. `path` is made absolute against the
+process's working directory and any trailing slash is removed; the function
+returns that normalized namestring. The source file's modification time
+becomes the embedded file's `file-write-date`, or the current time when the
+host does not report one. Embedding the same path again replaces its contents.
+A `file-error` is signalled when `source` cannot be read.
+
+```lisp
+(egcl-ext:embed-file "/usr/share/zoneinfo/UTC")
+(egcl-ext:embed-file "/etc/my-app/config.sexp" "deploy/config.sexp")
+```
+
+### `egcl-ext:embedded-file-p` { #embedded-file-p }
+
+**Function** `(egcl-ext:embedded-file-p path)` → `t` or `nil`
+
+Returns `t` if the image carries a file at `path`, normalized as by
+`embed-file`, and `nil` otherwise.
+
+### `egcl-ext:embedded-files` { #embedded-files }
+
+**Function** `(egcl-ext:embedded-files)` → list of strings
+
+Returns a fresh, sorted list of the namestrings of all embedded files.
 
 ## `uiop:dump-image`
 
