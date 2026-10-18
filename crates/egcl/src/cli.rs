@@ -11787,8 +11787,8 @@ fn is_base_string_value(v: EgclVal) -> bool {
     // string when the storage it reads and writes is: a string displaced onto
     // an 8-bit base string refuses a wide character, so calling it CHARACTER
     // let (setf subseq) copy wide characters into it and die (ansi strings
-    // RANDOM-STRING-COMPARISON-TESTS). An adjustable string's own store is
-    // 32-bit today, so it stays a CHARACTER string.
+    // RANDOM-STRING-COMPARISON-TESTS). An adjustable or fill-pointer string
+    // has 8-bit storage exactly when it was made with element type BASE-CHAR.
     if egcl_stdlib::is_complex_vector(v) {
         return egcl_stdlib::cvec_is_string(v) && egcl_stdlib::string_storage_is_base(v);
     }
