@@ -10021,10 +10021,22 @@ impl Env {
     }
 
     fn assign_var_symbol(&mut self, symbol: EgclVal, val: EgclVal) -> Result<(), EgclError> {
+        // A special variable is written where `lookup_var_symbol` reads it: the
+        // value cell, which holds the current dynamic binding. A parameter whose
+        // name is special is bound in the frame first and then made dynamic by
+        // `enter_body_special_decls`, which leaves the frame binding behind; so
+        // trying the frame first wrote that stale copy, and a callee reading the
+        // variable never saw the assignment. cl-who's TREE-TO-COMMANDS binds
+        // ((:indent *indent*) *indent*), turns T into 0 with SETQ, and its
+        // callees then did arithmetic on T.
+        let idx = symbol.as_symbol_index();
+        if is_special_var(symbol) || self.locally_specials.contains(&idx) {
+            return egcl_rt::symbols::set_symbol_value_checked(idx, val);
+        }
         if self.set_frame_var_symbol(symbol, val) {
             return Ok(());
         }
-        egcl_rt::symbols::set_symbol_value_checked(symbol.as_symbol_index(), val)
+        egcl_rt::symbols::set_symbol_value_checked(idx, val)
     }
 
     fn lookup_symbol_macro(&self, symbol: EgclVal) -> Option<EgclVal> {
