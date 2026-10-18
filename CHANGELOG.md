@@ -44,6 +44,12 @@
 
 ### Fixed
 
+- String literals are `CHARACTER` strings, as in SBCL, so a copy of one can
+  hold any character: `(setf (char (copy-seq "abc") 0) #\λ)` works, and a
+  literal is the same kind of string whether its file was compiled or not.
+  `EGCL-EXT:READTABLE-BASE-CHAR-PREFERENCE` (`:SYMBOLS`, `:STRINGS`, `:BOTH`
+  or `NIL`, as in SBCL) can make a readtable read compact 8-bit literals
+  instead ([#411](https://github.com/atgreen/evergreen/pull/411)).
 - Several threads may read one hash table at once, as in SBCL; only writes
   need exclusive access. Concurrent lookups in a table keyed by conses or
   other objects hashed by address used to crash once a garbage collection
