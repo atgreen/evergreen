@@ -7274,8 +7274,19 @@ fn method_specificity_vector(
                     // Not a name the table knows: fall back to the class graph, so
                     // a method on a class a non-instance value still belongs to
                     // (STRUCTURE-OBJECT, a condition class, …) keeps working.
+                    //
+                    // The table also answers None for a name it knows but that
+                    // does not apply, so this runs for those too, and it must ask
+                    // the class CLASS-OF answers. `egcl_stdlib::class_of` reads the
+                    // representation: an interpreter closure is physically the cons
+                    // `(EGCL::CLOSURE . id)`, so it answered CONS, whose precedence
+                    // list holds LIST -- and a LIST method applied to every
+                    // interpreted lambda and outranked the FUNCTION method the
+                    // table had already found. cl-ppcre's BUILD-REPLACEMENT-TEMPLATE
+                    // then returned a replacement function unwrapped, and every
+                    // REGEX-REPLACE with a function replacement failed.
                     let specializer_sym = resolve_sym(name).unwrap_or(NIL);
-                    let arg_class = egcl_stdlib::class_of(*arg);
+                    let arg_class = class_of_value(*arg);
                     resolve_class_metaobject(env, specializer_sym)
                         .ok()
                         .and_then(|specializer_class| {
