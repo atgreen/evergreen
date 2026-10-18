@@ -45,6 +45,10 @@ fn a_hot_loop_in_a_method_body_reaches_t2() {
             .filter(method_line)
             .any(|line| line.contains("optimized worker result installed")),
         "the method body must reach T2 by loop heat: {}",
-        stderr.lines().filter(method_line).collect::<Vec<_>>().join("\n")
+        stderr
+            .lines()
+            .filter(method_line)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
