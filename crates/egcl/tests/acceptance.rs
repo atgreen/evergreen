@@ -3339,12 +3339,17 @@ fn typep_heap_numerics_and_complex_introspection() {
         ("(type-of #c(1 2))", "COMPLEX"),
         ("(prin1-to-string #c(1 2))", "\"#C(1 2)\""),
         // Character subtypes: STANDARD-CHAR (newline + printable ASCII),
-        // BASE-CHAR (all chars here), EXTENDED-CHAR (none). (bliss-vdtz)
+        // BASE-CHAR (code points below 256, the 8-bit string element) and
+        // EXTENDED-CHAR (the rest). (bliss-vdtz; BASE-CHAR was every character
+        // and EXTENDED-CHAR empty until the base-string fix made TYPEP agree
+        // with the storage.)
         ("(typep #\\a 'standard-char)", "T"),
         ("(typep #\\Newline 'standard-char)", "T"),
         ("(typep #\\Tab 'standard-char)", "NIL"),
         ("(typep #\\a 'base-char)", "T"),
         ("(typep #\\a 'extended-char)", "NIL"),
+        ("(typep (code-char 955) 'base-char)", "NIL"),
+        ("(typep (code-char 955) 'extended-char)", "T"),
         ("(typep 5 'standard-char)", "NIL"),
         // Standard float constants: PI (single-precision approximation) and the
         // single-float magnitude extremes. (bliss-ncor)

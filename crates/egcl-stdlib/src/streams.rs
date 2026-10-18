@@ -2305,6 +2305,46 @@ pub fn make_lisp_string_fresh(s: &str) -> EgclVal {
     egcl_rt::gc::alloc_character_string(s)
 }
 
+/// A fresh 8-bit `SIMPLE-BASE-STRING` — what `(make-string n :element-type
+/// 'base-char)`, `(map 'base-string ...)` and `(coerce x 'base-string)` must
+/// build, since TYPEP recognises a BASE-STRING by its storage width
+/// (bliss-ajb3) and a base string never promotes (spec §1.6.3). The caller has
+/// checked that every character is a BASE-CHAR (code point below 256). Same GC
+/// contract as [`make_lisp_string_fresh`]: it moves, so root it.
+pub fn make_lisp_base_string_fresh(s: &str) -> EgclVal {
+    debug_assert!(
+        egcl_rt::object::is_all_base_char(s),
+        "a base string holds code points below 256"
+    );
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    egcl_rt::gc::alloc_base_string_bytes(&bytes)
+}
+
+/// A fresh string of the same width as `like`: an 8-bit base string when
+/// `like` is one, else the 32-bit CHARACTER string. COPY-SEQ, SUBSEQ and
+/// REVERSE keep a string's element type (ansi COPY-SEQ.20, REVERSE-STRING.5
+/// and the REMOVE family's string cases compare ARRAY-ELEMENT-TYPE of the
+/// result with the input's), which the width-blind fresh constructor lost once
+/// ARRAY-ELEMENT-TYPE started telling the two widths apart. The characters of
+/// `s` normally come from `like` and so fit; the base-char check covers a
+/// caller that widened one.
+pub fn make_lisp_string_fresh_like(like: EgclVal, s: &str) -> EgclVal {
+    // `string_storage_is_base` looks through a displaced or adjustable string
+    // to the storage that holds its characters, the same way
+    // ARRAY-ELEMENT-TYPE does, so a copy of a string displaced onto a base
+    // string is a base string too (ansi COPY-SEQ.20 and REVERSE-STRING.5 run
+    // over displaced strings as well as simple ones).
+    if !crate::pathnames::is_registered_string(like)
+        && like.is_heap_object()
+        && crate::sequences::string_storage_is_base(like)
+        && egcl_rt::object::is_all_base_char(s)
+    {
+        make_lisp_base_string_fresh(s)
+    } else {
+        make_lisp_string_fresh(s)
+    }
+}
+
 // ── Core-image serialization of interned strings (bliss-x0f2 off-heap M3) ──
 //
 // `make_lisp_string` allocates OFF the GC heap, so an interned string never

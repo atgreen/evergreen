@@ -309,7 +309,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 j += 2;
             }
             let mut fill = ' ';
+            let mut fill_val = NIL;
             let mut fill_set = false;
+            // :element-type BASE-CHAR (or STANDARD-CHAR) asks for the 8-bit
+            // SIMPLE-BASE-STRING; anything else, CHARACTER included, is the
+            // 32-bit string that holds any code point (spec §1.6.3). The
+            // keyword was accepted and ignored, so MAKE-ARRAY's :element-type
+            // 'base-char built a string TYPEP refused as a BASE-STRING (ansi
+            // sequences LENGTH.STRING.6).
+            let mut base = false;
+            let mut et_set = false;
             let mut i = 0;
             while i < kv.len() {
                 let key = kv[i];
@@ -331,10 +340,21 @@ fn resolve(name: &str) -> Option<Handler> {
                                 });
                             }
                             fill = val.as_char();
+                            fill_val = val;
                             fill_set = true;
                         }
                     }
-                    "ELEMENT-TYPE" | "ALLOW-OTHER-KEYS" => {}
+                    "ELEMENT-TYPE" => {
+                        if !et_set {
+                            et_set = true;
+                            base = val.is_symbol()
+                                && matches!(
+                                    sym_bare_name_rc(val).as_ref(),
+                                    "BASE-CHAR" | "STANDARD-CHAR"
+                                );
+                        }
+                    }
+                    "ALLOW-OTHER-KEYS" => {}
                     other => {
                         if !allow_other {
                             return Err(EgclError::ProgramError(format!(
@@ -345,8 +365,20 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 i += 2;
             }
+            // A base string never promotes: a wide :initial-element is the
+            // TYPE-ERROR the store would signal, raised before any store.
+            if base && (fill as u32) >= 256 {
+                return Err(EgclError::TypeError {
+                    datum: fill_val,
+                    expected: "base-char".into(),
+                });
+            }
             let content: String = std::iter::repeat_n(fill, size.as_fixnum() as usize).collect();
-            Ok(egcl_stdlib::make_lisp_string_fresh(&content))
+            Ok(if base {
+                egcl_stdlib::make_lisp_base_string_fresh(&content)
+            } else {
+                egcl_stdlib::make_lisp_string_fresh(&content)
+            })
         }),
 
         "MAKE-BROADCAST-STREAM" => Some(|_operator, args, _env| {
