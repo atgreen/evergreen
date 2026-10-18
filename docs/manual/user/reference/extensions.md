@@ -1,8 +1,8 @@
 # Operating-system interface
 
 These extensions expose process state, synchronous subprocess execution,
-clocks, text encoding, package-local nicknames, funcallable instances, and
-atomic operations. They are in `EGCL-EXT`. Their signatures differ from some
+clocks, text encoding, package-local nicknames, funcallable instances,
+digests and cipher blocks, and atomic operations. They are in `EGCL-EXT`. Their signatures differ from some
 similarly named SBCL extensions; use this dictionary rather than substituting
 package names in an SBCL call.
 
@@ -233,6 +233,61 @@ funcallable instance.
 
 Returns the function installed in `instance`. Returns `nil` when no function
 has been installed or when `instance` is not a funcallable instance.
+
+## Digests and cipher blocks
+
+These functions run in the runtime rather than in Lisp. Every octet argument
+holds integers in 0–255. An element outside that range signals `type-error`
+instead of being truncated. `sha256` and `crc32` accept any sequence. The
+block primitives take simple vectors, which is what `make-array` returns for
+an `(unsigned-byte 8)` or `(unsigned-byte 32)` element type.
+
+### `egcl-ext:sha256` { #sha256 }
+
+**Function** `(egcl-ext:sha256 octets)` → 32-octet vector
+
+Returns the SHA-256 digest of the sequence `octets` as a fresh 32-element
+vector.
+
+### `egcl-ext:crc32` { #crc32 }
+
+**Function** `(egcl-ext:crc32 octets)` → integer
+
+Returns the CRC-32 of `octets`, using the polynomial of ZIP, gzip and PNG.
+
+### Block primitives { #crypto-block-primitives }
+
+**Function** `(egcl-ext:crypto-aes-encrypt-block round-keys n-rounds in in-start out out-start)` → `nil`
+
+**Function** `(egcl-ext:crypto-aes-decrypt-block round-keys n-rounds in in-start out out-start)` → `nil`
+
+**Function** `(egcl-ext:crypto-ghash-mul accumulator hash-key)` → `nil`
+
+**Function** `(egcl-ext:crypto-sha256-block registers octets start)` → `nil`
+
+**Function** `(egcl-ext:crypto-sha256-words registers words)` → `nil`
+
+These are the inner functions of AES, GCM and SHA-256. EGCL's port of
+Ironclad calls them in place of its portable Lisp versions, the way Ironclad
+uses assembly routines on SBCL. Each one updates its destination in place,
+using Ironclad's data layout. Applications should normally call Ironclad
+rather than these functions.
+
+- The AES functions transform the 16 octets of `in` from `in-start` and store
+  the result in `out` from `out-start`. `round-keys` is a vector of 60
+  `(unsigned-byte 32)` words, holding the expanded key in FIPS-197 word order,
+  and `n-rounds` is 10, 12 or 14. For decryption, the round keys are in
+  reverse round order, with InvMixColumns applied to every round but the first
+  and last.
+- `crypto-ghash-mul` replaces the 16-octet `accumulator` with its product
+  with `hash-key` in GCM's GF(2^128). Both are big-endian, as in SP 800-38D.
+- `crypto-sha256-block` compresses the 64 octets of `octets` from `start` into
+  `registers`, a vector of eight `(unsigned-byte 32)` words.
+  `crypto-sha256-words` compresses a message block held as the first sixteen
+  big-endian words of `words`.
+
+A destination or source that is too short signals `type-error`, and a wrong
+argument count signals `program-error`.
 
 ## Atomic updates
 

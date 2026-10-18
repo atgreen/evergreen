@@ -6564,6 +6564,19 @@ fn effective_default_initargs(env: &Env, class_name: &str) -> Vec<(String, EgclV
 }
 
 fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVal, EgclError> {
+    // Bring an instance of a redefined class up to date FIRST, and take the
+    // address the migration answers. Every slot entry point below migrates on
+    // its own, and migrating ALLOCATES -- which can evacuate a nursery-resident
+    // instance and leave this function's own `instance` word pointing at a
+    // recycled body, because the collector cannot see it (bliss-ch80h, the
+    // cli.rs half). Measured: `EGCL_GC_STRESS_AT` on the allocation inside the
+    // migration turned `(setf (slot-value i 's) 7)` on a redefined class into
+    // "internal error: not an instance", deterministically.
+    //
+    // Cheap: a current instance costs a forwarding chase and a wrapper-stamp
+    // read, no lock and no allocation, which this path already paid inside the
+    // lookup below.
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     // FAST PATH. An `:allocation :class` slot is stored in the owning class's
     // cell and is NOT in the instance's inline layout — that is the whole reason
     // the class-slot lookup below exists. So a slot that IS in this instance's
@@ -6617,6 +6630,10 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
 /// `slot`, neither in the instance layout nor among class-allocated slots: the
 /// case CLHS hands to SLOT-MISSING.
 fn slot_is_missing(env: &Env, instance: EgclVal, slot: EgclVal) -> bool {
+    // As in `read_slot_value`: `slot_present_p` migrates an obsolete instance,
+    // which allocates, and the `class_of` below read this same word afterwards.
+    // That is the frame the sweep caught (bliss-ch80h).
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     if !egcl_stdlib::is_instance(instance) || egcl_stdlib::slot_present_p(instance, slot) {
         return false;
     }
@@ -6638,9 +6655,13 @@ fn invoke_slot_missing(
     new_value: Option<EgclVal>,
 ) -> Result<EgclVal, EgclError> {
     let _call_depth = CallDepthGuard::enter()?;
-    let class = egcl_stdlib::class_of(instance);
+    // `resolve_sym` interns, which allocates: root the instance across it
+    // rather than building the argument vector out of a word the collector may
+    // have moved (bliss-ch80h).
+    egcl_rt::rooted!(instance = instance);
+    let class = egcl_stdlib::class_of(*instance);
     let operation = resolve_sym(operation).unwrap_or(NIL);
-    let mut values = vec![class, instance, slot, operation];
+    let mut values = vec![class, *instance, slot, operation];
     values.extend(new_value);
     let args = RootedVals::new(values);
     let result = invoke_generic_function("SLOT-MISSING", &args, env);
@@ -6738,6 +6759,11 @@ fn write_slot_value(
     value: EgclVal,
     env: &Env,
 ) -> Result<(), EgclError> {
+    // `set_slot_value` at the end migrates, and a caller that reached here
+    // without going through `store_slot_value` would hold a stale word after it
+    // (bliss-ch80h). Idempotent, so the common double call costs two stamp
+    // reads.
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     let class_name = class_name_for_instance_class(egcl_stdlib::class_of(instance));
     let slot_name = sym_bare_name_rc(slot);
     if let Some(owner) = class_slot_owner(env, &class_name, &slot_name) {
@@ -7559,6 +7585,9 @@ fn store_slot_value(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted!(value = value);
+    // Before `slot_is_missing`, which migrates: `write_slot_value` below uses
+    // this word afterwards (bliss-ch80h).
+    let instance = egcl_stdlib::clos::ensure_instance_current(instance);
     if slot_is_missing(env, instance, slot) {
         // (setf slot-value) on a missing slot reaches SLOT-MISSING with the new
         // value, and still returns that value (ansi slot-missing.2/6).
@@ -18615,6 +18644,11 @@ fn fixed_arity_builtin(bare: &str) -> Option<(usize, usize)> {
         "CONS" | "RPLACA" | "RPLACD" | "SET-CAR" | "SET-CDR" => Some((2, 2)),
         "FINALIZE" => Some((2, 4)),
         "CANCEL-FINALIZATION" => Some((1, 1)),
+        _ if bare.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(bare).is_some() =>
+        {
+            egcl_stdlib::crypto::primitive_arity(bare).map(|n| (n, n))
+        }
         "DECLARATION-SPECIFIER" | "DECLARATION-SPECIFIERS" => Some((2, 2)),
         "PROCLAIMED-DECLARATIONS" | "PROCLAIMED-OPTIMIZE" => Some((0, 0)),
         "HASH-TABLE-WEAKNESS" => Some((1, 1)),
@@ -25745,6 +25779,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             // which made signing a 6.8 MB APK take ~22 minutes against SBCL's
             // 1.2 s (bliss-omaps); Ironclad itself uses implementation-specific
             // routines wherever a host has them, and this is EGCL's.
+            // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
+            "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL-EXT:SHA256" => {
                 let args = eval_args(cdr, env)?;
                 if args.len() != 1 {
@@ -38678,6 +38718,12 @@ const DIRECT_STRUCTURAL: &[&str] = &[
 
 /// Builtins `apply_builtin_fast` handles on evaluated arguments.
 const DIRECT_FAST: &[&str] = &[
+    // Ironclad's EGCL block primitives: leaf kernels on octet vectors.
+    "CRYPTO-AES-ENCRYPT-BLOCK",
+    "CRYPTO-AES-DECRYPT-BLOCK",
+    "CRYPTO-GHASH-MUL",
+    "CRYPTO-SHA256-BLOCK",
+    "CRYPTO-SHA256-WORDS",
     "AREF",
     "SVREF",
     "ROW-MAJOR-AREF",
@@ -39589,6 +39635,16 @@ fn is_builtin_function(name: &str) -> bool {
             | "EGCL-EXT::FINALIZE"
             | "EGCL-EXT:CANCEL-FINALIZATION"
             | "EGCL-EXT::CANCEL-FINALIZATION"
+            | "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-ENCRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT::CRYPTO-AES-DECRYPT-BLOCK"
+            | "EGCL-EXT:CRYPTO-GHASH-MUL"
+            | "EGCL-EXT::CRYPTO-GHASH-MUL"
+            | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT::CRYPTO-SHA256-BLOCK"
+            | "EGCL-EXT:CRYPTO-SHA256-WORDS"
+            | "EGCL-EXT::CRYPTO-SHA256-WORDS"
             | "EGCL-EXT:GC"
             | "EGCL-EXT::GC"
             | "EGCL-EXT:DECLARATION-SPECIFIER"
@@ -39833,6 +39889,12 @@ fn apply_builtin_fast(
         "LIST" | "GETF" => {
             env.clear_mv();
             evaluated_builtins::call(name, args, env)
+        }
+        _ if name.starts_with("CRYPTO-")
+            && egcl_stdlib::crypto::primitive_arity(name).is_some() =>
+        {
+            env.clear_mv();
+            egcl_stdlib::crypto::call(name, args)
         }
         "APPEND" => {
             env.clear_mv();

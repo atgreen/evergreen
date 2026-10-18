@@ -40,6 +40,12 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-thread:condition-notify` | [Dictionary entry](concurrency.md#condition-notify) |
 | `egcl-thread:condition-variable-p` | [Dictionary entry](concurrency.md#condition-wait) |
 | `egcl-thread:condition-wait` | [Dictionary entry](concurrency.md#condition-wait) |
+| `egcl-ext:crc32` | [Dictionary entry](user/reference/extensions.md#crc32) |
+| `egcl-ext:crypto-aes-decrypt-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-aes-encrypt-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-ghash-mul` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-sha256-block` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
+| `egcl-ext:crypto-sha256-words` | [Dictionary entry](user/reference/extensions.md#crypto-block-primitives) |
 | `egcl-thread:current-thread` | [Dictionary entry](concurrency.md#thread-observations) |
 | `egcl-ext:declaration-specifier` | [Dictionary entry](compiler.md#declaration-specifier) |
 | `egcl-ext:declaration-specifiers` | [Dictionary entry](compiler.md#declaration-specifiers) |
@@ -150,6 +156,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ext:save-lisp-and-die` | [Dictionary entry](user/reference/images.md#save-lisp-and-die) |
 | `egcl-ext:set-funcallable-instance-function` | [Dictionary entry](user/reference/extensions.md#set-funcallable-instance-function) |
 | `egcl-ext:setenv` | [Dictionary entry](user/reference/extensions.md#setenv) |
+| `egcl-ext:sha256` | [Dictionary entry](user/reference/extensions.md#sha256) |
 | `egcl-ext:sprof-fold` | [Dictionary entry](profiling.md#sprof) |
 | `egcl-ext:sprof-start` | [Dictionary entry](profiling.md#sprof) |
 | `egcl-ext:sprof-stop` | [Dictionary entry](profiling.md#sprof) |

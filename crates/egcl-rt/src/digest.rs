@@ -23,6 +23,13 @@ const INIT: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
+/// Compress one 64-byte block into a SHA-256 state, for callers that keep
+/// their own state and buffering (Ironclad's digest objects, through
+/// `egcl_stdlib::crypto`).
+pub fn sha256_compress(h: &mut [u32; 8], chunk: &[u8; 64]) {
+    block(h, chunk);
+}
+
 /// Compress one 64-byte block into the state.
 #[inline]
 fn block(h: &mut [u32; 8], chunk: &[u8; 64]) {

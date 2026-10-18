@@ -41,6 +41,15 @@ pub(super) fn call(
 #[egcl_shake_macros::builtin_dispatch(name)]
 fn resolve(name: &str) -> Option<Handler> {
     match name {
+        // Ironclad's EGCL block primitives (egcl_stdlib::crypto).
+        "EGCL-EXT:CRYPTO-AES-ENCRYPT-BLOCK"
+        | "EGCL-EXT:CRYPTO-AES-DECRYPT-BLOCK"
+        | "EGCL-EXT:CRYPTO-GHASH-MUL"
+        | "EGCL-EXT:CRYPTO-SHA256-BLOCK"
+        | "EGCL-EXT:CRYPTO-SHA256-WORDS" => Some(|operator, args, _env| {
+            let bare = operator.rsplit(':').next().unwrap_or(operator);
+            egcl_stdlib::crypto::call(bare, args).expect("listed crypto primitive")
+        }),
         "EGCL::%PPRINT-CIRCLE" => Some(|_operator, args, _env| {
             if args.len() != 2 || !args[0].is_symbol() {
                 return Err(EgclError::ProgramError(

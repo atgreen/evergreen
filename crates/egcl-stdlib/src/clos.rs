@@ -166,6 +166,26 @@ unsafe fn forward_instance(old: EgclVal, new: EgclVal) {
     unsafe { egcl_rt::gc::forward_object_to(old, new) };
 }
 
+/// Bring `instance` up to date if its class has been redefined, and answer the
+/// address it now lives at.
+///
+/// The public form of [`update_if_obsolete`], for a caller OUTSIDE this crate
+/// that holds an instance across a slot operation. Every slot entry point
+/// migrates on its own, and migrating allocates — which can evacuate a
+/// nursery-resident instance and leave the caller's own word pointing at a
+/// recycled body, exactly as it did inside this crate before bliss-ch80h.
+/// Doing it once, up front, means nothing the caller does afterwards can
+/// migrate, so there is no window to root across.
+///
+/// Cheap for a current instance: a forwarding chase and a wrapper-stamp read,
+/// no lock and no allocation.
+pub fn ensure_instance_current(instance: EgclVal) -> EgclVal {
+    if !is_instance(instance) {
+        return instance;
+    }
+    unsafe { update_if_obsolete(instance) }
+}
+
 /// Lazily migrate an instance whose wrapper is obsolete (its class was
 /// redefined) to the class's current layout, exactly once (R5.83/R5.84).
 /// Surviving slots are copied by name; slots removed by the redefinition are
