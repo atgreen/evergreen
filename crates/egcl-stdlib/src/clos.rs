@@ -79,11 +79,14 @@ struct ClassMeta {
     /// True while this class exists only because another class named it as a
     /// superclass before it was defined (`resolve_superclass_metaobject`).
     /// Cleared by the first real definition, which is every `define_class`
-    /// call. A placeholder has no instances and no definition of its own, so
-    /// it is the one class metaobject that may be REPLACED rather than
-    /// redefined — see `replace_forward_referenced_class`, which is how a
-    /// `(:metaclass M)` class that was forward-referenced still gets an object
-    /// sized for M's slots (GitHub #384).
+    /// call.
+    ///
+    /// Such a class is an instance of `FORWARD-REFERENCED-CLASS` and is not yet
+    /// a standard class: it cannot be instantiated (`allocate_instance`), it is
+    /// not finalized, and neither is anything that inherits from it (R9.39).
+    /// Its slot storage grows to its real metaclass's layout when the
+    /// definition arrives, so unlike before bliss-fmhj5 the object itself is
+    /// kept and its identity survives (GitHub #384, bliss-qbz4o).
     forward_referenced: bool,
 }
 
@@ -649,6 +652,11 @@ struct ClosState {
     /// image, while these go through the same remap as any other class value.
     standard_class: EgclVal,
     structure_class: EgclVal,
+    /// FORWARD-REFERENCED-CLASS: the metaclass of a placeholder minted for a
+    /// class named as a superclass before it is defined (AMOP; spec R9.39).
+    /// Kept as a value for the same reason as the two above — a raw wrapper
+    /// pointer cannot survive a saved image.
+    forward_referenced_class: EgclVal,
     cons_class: EgclVal,
     float_class: EgclVal,
     function_class: EgclVal,
@@ -680,6 +688,7 @@ impl ClosState {
             standard_object_class: NIL,
             standard_class: NIL,
             structure_class: NIL,
+            forward_referenced_class: NIL,
             cons_class: NIL,
             float_class: NIL,
             function_class: NIL,
@@ -851,6 +860,7 @@ fn visit_clos_roots(visit: &mut dyn FnMut(*mut EgclVal), root_definitions: bool)
         visit(&mut state.standard_object_class);
         visit(&mut state.standard_class);
         visit(&mut state.structure_class);
+        visit(&mut state.forward_referenced_class);
         visit(&mut state.cons_class);
         visit(&mut state.float_class);
         visit(&mut state.function_class);
@@ -1678,6 +1688,8 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
     let bclass_cls = alloc_class_metaobject()
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let frc_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a class".into()))?;
     let stclass_cls = alloc_class_metaobject()
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
     let gf_cls = alloc_class_metaobject()
@@ -1717,6 +1729,11 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         sclass_cls,
         bclass_cls,
         stclass_cls,
+        // FORWARD-REFERENCED-CLASS is an AMOP metaobject class like its three
+        // siblings above, so it is itself an instance of STANDARD-CLASS. Giving
+        // it no wrapper left its own word NULL and `class_of` dereferenced it
+        // (R9.39).
+        frc_cls,
         gf_cls,
         sgf_cls,
         method_cls,
@@ -1777,6 +1794,11 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let sclass_nm = nm("STANDARD-CLASS");
     let bclass_nm = nm("BUILT-IN-CLASS");
     let stclass_nm = nm("STRUCTURE-CLASS");
+    // Interned into EGCL-MOP, which OWNS this name: it is AMOP, not ANSI, so
+    // adding it to COMMON-LISP would be interning into a closed package (the
+    // mistake #383 fixed for CLASS-PRECEDENCE-LIST). boot.lisp exports it from
+    // there (spec R9.39).
+    let frc_nm = nm("EGCL-MOP:FORWARD-REFERENCED-CLASS");
     let gf_nm = nm("GENERIC-FUNCTION");
     let sgf_nm = nm("STANDARD-GENERIC-FUNCTION");
     let method_nm = nm("METHOD");
@@ -1905,6 +1927,9 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             (sclass_nm, sclass_cls, vec![class_cls]),
             (bclass_nm, bclass_cls, vec![class_cls]),
             (stclass_nm, stclass_cls, vec![class_cls]),
+            // A forward-referenced class is a CLASS that is not yet any of the
+            // three above: nothing has said what its instances look like.
+            (frc_nm, frc_cls, vec![class_cls]),
             (gf_nm, gf_cls, vec![fun_cls, std_obj]),
             (sgf_nm, sgf_cls, vec![gf_cls]),
             (method_nm, method_cls, vec![std_obj]),
@@ -1932,6 +1957,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         st.standard_object_class = std_obj;
         st.standard_class = sclass_cls;
         st.structure_class = stclass_cls;
+        st.forward_referenced_class = frc_cls;
         st.fixnum_class = fix_cls;
         st.character_class = chr_cls;
         st.symbol_class = sym_cls;
@@ -2138,7 +2164,7 @@ pub fn define_class_with_shared_slots(
     shared_slots: &[EgclVal],
 ) -> Result<(), EgclError> {
     let key = class_name_key(name);
-    with_state_mut(|st| {
+    let (was_forward_referenced, standard_class) = with_state_mut(|st| -> Result<(bool, EgclVal), EgclError> {
         // Track handle-id registration order (for diamond-hierarchy inference)
         if class.is_meta_handle() {
             let fv = class.as_meta_handle_id();
@@ -2176,6 +2202,17 @@ pub fn define_class_with_shared_slots(
             .and_then(|m| m.wrapper)
             .map(|wrapper| wrapper as *const ClassWrapper as *mut ClassWrapper)
             .unwrap_or(std::ptr::null_mut());
+
+        // Whether this class is a forward reference being DEFINED. Its own
+        // wrapper still says FORWARD-REFERENCED-CLASS, and defining it makes
+        // that false: the wrapper has to be repointed, or `class_of` keeps
+        // answering the placeholder metaclass while the metadata says otherwise
+        // (R9.39). Repointed by the caller below, outside this lock, because
+        // repointing allocates storage.
+        let was_forward_referenced = st
+            .class_meta
+            .get(&class)
+            .is_some_and(|m| m.forward_referenced);
 
         // Subclasses already recorded for this class survive a redefinition.
         // The insert below used to reset them to empty, which silently cut a
@@ -2261,8 +2298,16 @@ pub fn define_class_with_shared_slots(
             }
         }
 
-        Ok(())
-    })
+        Ok((was_forward_referenced, st.standard_class))
+    })?;
+    // Outside the lock, because repointing allocates slot storage: a class that
+    // was a forward reference until a moment ago is now an ordinary standard
+    // class, and its wrapper must say so. DEFSTRUCT and a `:metaclass` option
+    // repoint again afterwards, which is the existing order (R9.39).
+    if was_forward_referenced && standard_class != NIL {
+        let _ = repoint_class_metaclass(class, standard_class);
+    }
+    Ok(())
 }
 
 /// Compute a class's effective :instance-allocated slot layout (walking the
@@ -2562,6 +2607,13 @@ fn metaclass_instance_wrapper(metaclass: EgclVal) -> *mut ClassWrapper {
     })
 }
 
+/// `FORWARD-REFERENCED-CLASS`, the metaclass of a placeholder minted for a
+/// class named as a superclass before it is defined (AMOP; spec R9.39). NIL
+/// before the bootstrap registers it.
+pub fn forward_referenced_class() -> EgclVal {
+    with_state(|st| st.forward_referenced_class)
+}
+
 /// Mark `class` as existing only as a forward reference: some other class named
 /// it as a superclass before it was defined. See `ClassMeta.forward_referenced`.
 pub fn mark_forward_referenced(class: EgclVal) {
@@ -2853,9 +2905,7 @@ pub fn allocate_instance(class: EgclVal) -> Result<EgclVal, EgclError> {
     //
     // Refused HERE rather than in each of MAKE-INSTANCE, ALLOCATE-INSTANCE and
     // CHANGE-CLASS, because this is the one place an instance of a class is
-    // born -- and because the same guarantee is what lets
-    // `replace_forward_referenced_class` hand the placeholder's registrations
-    // to the replacement without also having to hunt for its instances.
+    // born.
     if is_forward_referenced(class) {
         return Err(EgclError::ProgramError(format!(
             "cannot allocate an instance of {}: it is a forward-referenced class, \
