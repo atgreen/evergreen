@@ -1245,35 +1245,102 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#saving-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saving images
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Saving images">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
   <a href="#save-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        save-image
+        egcl-ext:save-image
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
+        
+          <li class="md-nav__item">
   <a href="#save-lisp-and-die" class="md-nav__link">
     <span class="md-ellipsis">
       
-        save-lisp-and-die
+        egcl-ext:save-lisp-and-die
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
-  <a href="#egcl-extinit-hooks" class="md-nav__link">
+        
+          <li class="md-nav__item">
+  <a href="#init-hooks" class="md-nav__link">
     <span class="md-ellipsis">
       
         egcl-ext:*init-hooks*
       
     </span>
   </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedded-file-storage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedded files
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedded files">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#embed-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embed-file
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#embedded-file-p" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embedded-file-p
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#embedded-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embedded-files
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1863,35 +1930,102 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#saving-images" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saving images
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Saving images">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
   <a href="#save-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        save-image
+        egcl-ext:save-image
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
+        
+          <li class="md-nav__item">
   <a href="#save-lisp-and-die" class="md-nav__link">
     <span class="md-ellipsis">
       
-        save-lisp-and-die
+        egcl-ext:save-lisp-and-die
       
     </span>
   </a>
   
 </li>
-      
-        <li class="md-nav__item">
-  <a href="#egcl-extinit-hooks" class="md-nav__link">
+        
+          <li class="md-nav__item">
+  <a href="#init-hooks" class="md-nav__link">
     <span class="md-ellipsis">
       
         egcl-ext:*init-hooks*
       
     </span>
   </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#embedded-file-storage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Embedded files
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Embedded files">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#embed-file" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embed-file
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#embedded-file-p" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embedded-file-p
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#embedded-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:embedded-files
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1955,14 +2089,14 @@ load the rebuilt program, and save a new core or executable. Updating a version
 field by hand cannot repair the saved code or missing lexical scopes. Current
 images retain shared local-function scopes, captured declarations, and saved
 function objects independently of later global redefinitions.</p>
-<h2 id="save-image"><code>save-image</code><a class="headerlink" href="#save-image" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="nv">egcl-ext:save-image</span><span class="w"> </span><span class="nb">pathname</span><span class="p">)</span>
-</code></pre></div>
+<h2 id="saving-images">Saving images<a class="headerlink" href="#saving-images" title="Permanent link">&para;</a></h2>
+<h3 id="save-image"><code>egcl-ext:save-image</code><a class="headerlink" href="#save-image" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:save-image pathname)</code> → <code>t</code></p>
 <p>Writes a core image of the live Lisp world, returns <code>T</code>, and keeps the current
 process running. Restore the core with <code>egcl --image FILE</code>.</p>
-<h2 id="save-lisp-and-die"><code>save-lisp-and-die</code><a class="headerlink" href="#save-lisp-and-die" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">(</span><span class="nv">save-lisp-and-die</span><span class="w"> </span><span class="nb">pathname</span><span class="w"> </span><span class="k">&amp;key</span><span class="w"> </span><span class="nv">executable</span><span class="w"> </span><span class="nv">toplevel</span><span class="w"> </span><span class="nv">application</span><span class="p">)</span>
-</code></pre></div>
+<h3 id="save-lisp-and-die"><code>egcl-ext:save-lisp-and-die</code><a class="headerlink" href="#save-lisp-and-die" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:save-lisp-and-die pathname &amp;key executable toplevel application)</code> → does not return</p>
+<p><strong>Function</strong> <code>(egcl-ext:save-image-and-die pathname &amp;key executable toplevel application)</code> → does not return</p>
 <p>Writes a core image of the live Lisp world and terminates the saving process.
 <code>save-image-and-die</code> is an accepted alias.</p>
 <div class="admonition note">
@@ -1974,8 +2108,8 @@ script evaluated in <code>CL-USER</code>, where the bare name is what you want.<
 (:use :cl))</code> inherits <code>COMMON-LISP</code> and nothing else, so a bare
 <code>save-lisp-and-die</code> there names a fresh, undefined symbol in <code>MY-APP</code>.
 Qualify it, or use the package:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nv">egcl-ext:save-lisp-and-die</span><span class="w"> </span><span class="s">"app.core"</span><span class="p">)</span><span class="w">            </span><span class="c1">; from any package</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nb">defpackage</span><span class="w"> </span><span class="ss">:my-app</span><span class="w"> </span><span class="p">(</span><span class="ss">:use</span><span class="w"> </span><span class="ss">:cl</span><span class="w"> </span><span class="ss">:egcl-ext</span><span class="p">))</span><span class="w">          </span><span class="c1">; or inherit it</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="p">(</span><span class="nv">egcl-ext:save-lisp-and-die</span><span class="w"> </span><span class="s">"app.core"</span><span class="p">)</span><span class="w">            </span><span class="c1">; from any package</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="p">(</span><span class="nb">defpackage</span><span class="w"> </span><span class="ss">:my-app</span><span class="w"> </span><span class="p">(</span><span class="ss">:use</span><span class="w"> </span><span class="ss">:cl</span><span class="w"> </span><span class="ss">:egcl-ext</span><span class="p">))</span><span class="w">          </span><span class="c1">; or inherit it</span>
 </code></pre></div>
 <p>This is ordinary Common Lisp package behaviour (CLHS 11.1.2), not an EGCL
 quirk: a program is entitled to define its own <code>SAVE-IMAGE</code>, and one does —
@@ -2016,13 +2150,14 @@ unless this option is enabled. Rebuild existing applications to enable it.</p>
 <p>The current implementation accepts some additional SBCL-style keywords,
 including <code>:compression</code> and <code>:save-runtime-options</code>, without implementing
 their effects. Do not rely on them to change the output format or startup.</p>
-<h2 id="egcl-extinit-hooks"><code>egcl-ext:*init-hooks*</code><a class="headerlink" href="#egcl-extinit-hooks" title="Permanent link">&para;</a></h2>
+<h3 id="init-hooks"><code>egcl-ext:*init-hooks*</code><a class="headerlink" href="#init-hooks" title="Permanent link">&para;</a></h3>
+<p><strong>Variable</strong> list of function designators, initially <code>nil</code></p>
 <p>A list of functions or function names called without arguments when a saved
 image starts. Register process-specific reinitialization before saving:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">reconnect-services</span><span class="w"> </span><span class="p">()</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="c1">;; Reopen resources that cannot survive an image save.</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="o">...</span><span class="p">)</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="p">(</span><span class="nb">pushnew</span><span class="w"> </span><span class="ss">'reconnect-services</span><span class="w"> </span><span class="nv">egcl-ext:*init-hooks*</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">reconnect-services</span><span class="w"> </span><span class="p">()</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="c1">;; Reopen resources that cannot survive an image save.</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="o">...</span><span class="p">)</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="p">(</span><span class="nb">pushnew</span><span class="w"> </span><span class="ss">'reconnect-services</span><span class="w"> </span><span class="nv">egcl-ext:*init-hooks*</span><span class="p">)</span>
 </code></pre></div>
 <p>Hooks run in list order, once per startup, after restoring the image and setting
 up the current process's streams and arguments. They finish before the user
@@ -2034,15 +2169,45 @@ a hook affect future saves/restores; an unhandled hook error aborts startup.</p>
 refreshes ASDF's user cache and UIOP's temporary directory, streams, and command
 line for the current user instead of retaining the image builder's values.
 Images built before this integration must be rebuilt to include the registration.</p>
+<h2 id="embedded-file-storage">Embedded files<a class="headerlink" href="#embedded-file-storage" title="Permanent link">&para;</a></h2>
+<p>An image can carry copies of files read on the build host, so that a program
+copied or cross-built to another machine finds files such as time-zone data
+where it expects them. <code>open</code> for input, <code>probe-file</code>, <code>truename</code>,
+<code>file-length</code>, <code>file-write-date</code>, <code>directory</code>, and <code>load</code> find embedded files.
+An embedded file shadows a real file at the same path. Embedded files are
+read-only: opening one for output, renaming it, or deleting it signals
+<code>file-error</code>. Only the Lisp image sees them; the operating system, foreign code,
+and child processes do not. Saved images, cores, and shaken executables carry
+them. See <a href="../../how-to/save-executable/#carry-files-in-the-image">Carry files in the image</a> for
+a task-oriented example and the ASDF integration.</p>
+<h3 id="embed-file"><code>egcl-ext:embed-file</code><a class="headerlink" href="#embed-file" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:embed-file path &amp;optional (source path))</code> → namestring</p>
+<p>Reads the file <code>source</code> now and stores its bytes in the image under <code>path</code>.
+Both arguments are pathname designators. <code>path</code> is made absolute against the
+process's working directory and any trailing slash is removed; the function
+returns that normalized namestring. The source file's modification time
+becomes the embedded file's <code>file-write-date</code>, or the current time when the
+host does not report one. Embedding the same path again replaces its contents.
+A <code>file-error</code> is signalled when <code>source</code> cannot be read.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nv">egcl-ext:embed-file</span><span class="w"> </span><span class="s">"/usr/share/zoneinfo/UTC"</span><span class="p">)</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nv">egcl-ext:embed-file</span><span class="w"> </span><span class="s">"/etc/my-app/config.sexp"</span><span class="w"> </span><span class="s">"deploy/config.sexp"</span><span class="p">)</span>
+</code></pre></div>
+<h3 id="embedded-file-p"><code>egcl-ext:embedded-file-p</code><a class="headerlink" href="#embedded-file-p" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:embedded-file-p path)</code> → <code>t</code> or <code>nil</code></p>
+<p>Returns <code>t</code> if the image carries a file at <code>path</code>, normalized as by
+<code>embed-file</code>, and <code>nil</code> otherwise.</p>
+<h3 id="embedded-files"><code>egcl-ext:embedded-files</code><a class="headerlink" href="#embedded-files" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:embedded-files)</code> → list of strings</p>
+<p>Returns a fresh, sorted list of the namestrings of all embedded files.</p>
 <h2 id="uiopdump-image"><code>uiop:dump-image</code><a class="headerlink" href="#uiopdump-image" title="Permanent link">&para;</a></h2>
 <p>Bundled UIOP supports EGCL core files and standalone executables:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">(</span><span class="nb">require</span><span class="w"> </span><span class="ss">:asdf</span><span class="p">)</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"Arguments: ~S~%"</span><span class="w"> </span><span class="nv">uiop:*command-line-arguments*</span><span class="p">)</span>
-<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span><span class="no">t</span><span class="p">)</span>
-<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="p">(</span><span class="nb">setf</span><span class="w"> </span><span class="nv">uiop:*image-entry-point*</span><span class="w"> </span><span class="ss">'main</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">      </span><span class="nv">uiop:*lisp-interaction*</span><span class="w"> </span><span class="no">nil</span><span class="p">)</span>
-<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="p">(</span><span class="nv">uiop:dump-image</span><span class="w"> </span><span class="s">"my-app"</span><span class="w"> </span><span class="ss">:executable</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nb">require</span><span class="w"> </span><span class="ss">:asdf</span><span class="p">)</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="p">(</span><span class="nb">defun</span><span class="w"> </span><span class="nv">main</span><span class="w"> </span><span class="p">()</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="p">(</span><span class="nb">format</span><span class="w"> </span><span class="no">t</span><span class="w"> </span><span class="s">"Arguments: ~S~%"</span><span class="w"> </span><span class="nv">uiop:*command-line-arguments*</span><span class="p">)</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="no">t</span><span class="p">)</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="p">(</span><span class="nb">setf</span><span class="w"> </span><span class="nv">uiop:*image-entry-point*</span><span class="w"> </span><span class="ss">'main</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">      </span><span class="nv">uiop:*lisp-interaction*</span><span class="w"> </span><span class="no">nil</span><span class="p">)</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="p">(</span><span class="nv">uiop:dump-image</span><span class="w"> </span><span class="s">"my-app"</span><span class="w"> </span><span class="ss">:executable</span><span class="w"> </span><span class="no">t</span><span class="p">)</span>
 </code></pre></div>
 <p>Run the result with <code>./my-app -- argument1 argument2</code>. EGCL retains its runtime
 command-line parser, so use <code>--</code> to separate application arguments.</p>

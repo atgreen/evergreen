@@ -2051,7 +2051,9 @@ one at the same path, so behaviour does not depend on the host; and they are
 read-only, so opening one for output, renaming or deleting it signals
 <code>file-error</code>. Only the Lisp image sees them: the operating system, foreign code
 called through the FFI and child processes do not. Saved images, shaken
-executables and cores carry them; contents cost one byte per octet.</p>
+executables and cores carry them; contents cost one byte per octet.
+The <a href="../../reference/images/#embedded-file-storage">embedded-file dictionary</a> gives
+the exact contracts.</p>
 <p>An application can list the files it needs in its own <code>.asd</code> with the
 <code>egcl-embed-asdf</code> extension, as <code>(:embedded-file ...)</code> and <code>(:embedded-tree
 ... :only ...)</code> components that embed when the system loads; see

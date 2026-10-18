@@ -877,6 +877,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#weak-hash-tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weak hash tables
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Weak hash tables">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#hash-table-weakness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:hash-table-weakness
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#measurement-and-debugging" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1973,6 +2001,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#weak-hash-tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weak hash tables
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Weak hash tables">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#hash-table-weakness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:hash-table-weakness
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#measurement-and-debugging" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2045,6 +2101,18 @@ contract from the accepted spelling.</p>
 <h3 id="cancel-finalization"><code>egcl-ext:cancel-finalization</code><a class="headerlink" href="#cancel-finalization" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:cancel-finalization object)</code> → <code>nil</code></p>
 <p>Cancels the deferred finalizers registered for the object.</p>
+<h2 id="weak-hash-tables">Weak hash tables<a class="headerlink" href="#weak-hash-tables" title="Permanent link">&para;</a></h2>
+<p><code>make-hash-table</code> accepts a <code>:weakness</code> argument naming which part of an entry
+the table holds weakly: <code>:key</code>, <code>:value</code>, or <code>:key-and-value</code>. <code>nil</code> makes an
+ordinary table. Any other value, including Trivial-Garbage's <code>:key-or-value</code>,
+signals <code>program-error</code> rather than silently creating a strong table.</p>
+<h3 id="hash-table-weakness"><code>egcl-ext:hash-table-weakness</code><a class="headerlink" href="#hash-table-weakness" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:hash-table-weakness hash-table)</code> → <code>:key</code>, <code>:value</code>, <code>:key-and-value</code>, or <code>nil</code></p>
+<p>Returns the weakness the table was created with, or <code>nil</code> for an ordinary
+table. A non-hash-table argument signals <code>type-error</code>. Trivial-Garbage's
+<code>hash-table-weakness</code> uses this function.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">(</span><span class="nv">egcl-ext:hash-table-weakness</span><span class="w"> </span><span class="p">(</span><span class="nb">make-hash-table</span><span class="w"> </span><span class="ss">:weakness</span><span class="w"> </span><span class="ss">:key</span><span class="p">))</span><span class="w">  </span><span class="c1">; =&gt; :KEY</span>
+</code></pre></div>
 <h2 id="measurement-and-debugging">Measurement and debugging<a class="headerlink" href="#measurement-and-debugging" title="Permanent link">&para;</a></h2>
 <p><code>room</code> describes Lisp heap usage; engine profiling provides collection counts
 and pause totals. Host allocations require different instrumentation. See

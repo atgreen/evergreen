@@ -769,6 +769,67 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Declarations and optimization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#declaration-introspection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Declaration introspection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#declaration-specifier" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:declaration-specifier
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#declaration-specifiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:declaration-specifiers
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#proclaimed-declarations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:proclaimed-declarations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#proclaimed-optimize" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:proclaimed-optimize
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -799,6 +860,17 @@
     <span class="md-ellipsis">
       
         Invocation and loop counters
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#generic-receiver-profile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Generic-function receiver profile
       
     </span>
   </a>
@@ -2044,6 +2116,67 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Declarations and optimization">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#declaration-introspection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Declaration introspection
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#declaration-specifier" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:declaration-specifier
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#declaration-specifiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:declaration-specifiers
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#proclaimed-declarations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:proclaimed-declarations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#proclaimed-optimize" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:proclaimed-optimize
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2074,6 +2207,17 @@
     <span class="md-ellipsis">
       
         Invocation and loop counters
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#generic-receiver-profile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Generic-function receiver profile
       
     </span>
   </a>
@@ -2216,6 +2360,49 @@ This does not add slot-type enforcement to <code>defclass</code>.</p>
 fails. Deoptimization must preserve both completed side effects and the next
 Lisp operation to execute. Raising compilation thresholds changes when work is
 compiled, not the intended semantics of the source.</p>
+<h3 id="declaration-introspection">Declaration introspection<a class="headerlink" href="#declaration-introspection" title="Permanent link">&para;</a></h3>
+<p>These functions let a macro read declarations in force. They are the
+implementation layer beneath <code>egcl-cltl2:declaration-information</code>; portability
+libraries normally use that instead.</p>
+<p>Lexical environments retain only some declaration specifiers: <code>optimize</code>,
+<code>inline</code>, <code>notinline</code>, and specifiers whose name has been proclaimed with
+<code>(proclaim '(declaration name))</code>. Other specifiers are not visible to these
+functions. An environment object is valid only during the macro expansion that
+received it.</p>
+<h3 id="declaration-specifier"><code>egcl-ext:declaration-specifier</code><a class="headerlink" href="#declaration-specifier" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:declaration-specifier name environment)</code> → declaration specifier or <code>nil</code></p>
+<p>Returns the innermost complete declaration specifier, such as
+<code>(my-declaration x 3)</code>, whose name is the symbol <code>name</code> in the lexical
+<code>environment</code>. Returns <code>nil</code> when there is none or when <code>environment</code> is <code>nil</code>.
+A non-symbol <code>name</code> signals <code>type-error</code>; an object that is not a live macro
+expansion environment signals <code>program-error</code>.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nb">proclaim</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="nv">declaration</span><span class="w"> </span><span class="nv">units</span><span class="p">))</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nb">defmacro</span><span class="w"> </span><span class="nv">units-in-force</span><span class="w"> </span><span class="p">(</span><span class="k">&amp;environment</span><span class="w"> </span><span class="nv">env</span><span class="p">)</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="o">`</span><span class="ss">',</span><span class="p">(</span><span class="nv">egcl-ext:declaration-specifier</span><span class="w"> </span><span class="ss">'units</span><span class="w"> </span><span class="nv">env</span><span class="p">))</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">(</span><span class="k">locally</span><span class="w"> </span><span class="p">(</span><span class="k">declare</span><span class="w"> </span><span class="p">(</span><span class="nv">units</span><span class="w"> </span><span class="nv">meters</span><span class="p">))</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="p">(</span><span class="nv">units-in-force</span><span class="p">))</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="c1">;; =&gt; (UNITS METERS)</span>
+</code></pre></div>
+<h3 id="declaration-specifiers"><code>egcl-ext:declaration-specifiers</code><a class="headerlink" href="#declaration-specifiers" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:declaration-specifiers name environment)</code> → list</p>
+<p>Returns every retained specifier named <code>name</code> in <code>environment</code>, outermost
+first. This is the cumulative counterpart of <code>declaration-specifier</code>, for
+declarations such as <code>optimize</code> whose qualities combine across nested
+declarations. Arguments and errors are as for <code>declaration-specifier</code>.</p>
+<h3 id="proclaimed-declarations"><code>egcl-ext:proclaimed-declarations</code><a class="headerlink" href="#proclaimed-declarations" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:proclaimed-declarations)</code> → list of symbols</p>
+<p>Returns the names proclaimed as declarations, in no particular order.</p>
+<h3 id="proclaimed-optimize"><code>egcl-ext:proclaimed-optimize</code><a class="headerlink" href="#proclaimed-optimize" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:proclaimed-optimize)</code> → list</p>
+<p>Returns the globally proclaimed optimization qualities as a fresh list of
+<code>(quality value)</code> entries, in the order the qualities were first proclaimed.
+A later proclamation of a quality replaces its value. A quality proclaimed
+without a value is recorded as <code>3</code>. Only qualities that have been proclaimed
+appear; the list does not include defaults for the others.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">(</span><span class="nb">proclaim</span><span class="w"> </span><span class="o">'</span><span class="p">(</span><span class="k">optimize</span><span class="w"> </span><span class="p">(</span><span class="nv">speed</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="nv">safety</span><span class="p">))</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="p">(</span><span class="nv">egcl-ext:proclaimed-optimize</span><span class="p">)</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="c1">;; =&gt; ((SPEED 2) (SAFETY 3)) when nothing else has been proclaimed</span>
+</code></pre></div>
 <h2 id="observing-compilation">Observing compilation<a class="headerlink" href="#observing-compilation" title="Permanent link">&para;</a></h2>
 <h3 id="function-tier"><code>egcl-ext:function-tier</code><a class="headerlink" href="#function-tier" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:function-tier function)</code> → integer or <code>nil</code></p>
@@ -2224,10 +2411,10 @@ or <code>nil</code> if the designator is not recognized as a tiered function. Po
 completed background compilation before reading the tier.</p>
 <h3 id="counters">Invocation and loop counters<a class="headerlink" href="#counters" title="Permanent link">&para;</a></h3>
 <p><strong>Functions</strong></p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">(</span><span class="nv">egcl-ext:function-invoke-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="p">(</span><span class="nv">egcl-ext:function-back-edge-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="p">(</span><span class="nv">egcl-ext:function-osr-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="p">(</span><span class="nv">egcl-ext:deopt-count</span><span class="p">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">(</span><span class="nv">egcl-ext:function-invoke-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="p">(</span><span class="nv">egcl-ext:function-back-edge-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="p">(</span><span class="nv">egcl-ext:function-osr-count</span><span class="w"> </span><span class="k">function</span><span class="p">)</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="p">(</span><span class="nv">egcl-ext:deopt-count</span><span class="p">)</span>
 </code></pre></div>
 <p><code>function-invoke-count</code> reports tiering heat, not a complete lifetime
 invocation total. New dispatches stop counting while T2 code for the current
@@ -2246,6 +2433,22 @@ These are observations; use them for diagnostics, not application decisions.</p>
 <p>A function's installed tier does not identify the tier of an active OSR loop.
 For that purpose inspect OSR activity and execution behavior, rather than
 concluding from a T0 label that no native code ran.</p>
+<h3 id="generic-receiver-profile">Generic-function receiver profile<a class="headerlink" href="#generic-receiver-profile" title="Permanent link">&para;</a></h3>
+<p><strong>Functions</strong></p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">(</span><span class="nv">egcl-ext:generic-receiver-profile-count</span><span class="w"> </span><span class="nv">name</span><span class="p">)</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="p">(</span><span class="nv">egcl-ext:generic-receiver-profile-distinct-count</span><span class="w"> </span><span class="nv">name</span><span class="p">)</span>
+</code></pre></div>
+<p>Report the receiver profile the tiering engine keeps for the generic function
+named by the symbol <code>name</code>. Generic dispatch with at least one argument
+records the class of the first argument. <code>generic-receiver-profile-count</code> returns the
+number of recorded dispatches. <code>generic-receiver-profile-distinct-count</code>
+returns the number of distinct receiver classes currently held in the profile;
+the profile holds at most four, so the value saturates at 4 for a megamorphic
+generic function. Both return <code>0</code> for a generic function with no recorded
+dispatches, including one that does not exist.</p>
+<p>The profile belongs to the current thread or fiber. Setting
+<code>EGCL_PROFILING_DISABLED=1</code> before starting the process disables recording, and
+both functions then return <code>0</code>. Like the other counters, these are diagnostics.</p>
 <h3 id="bail-report"><code>egcl-ext:bail-report</code><a class="headerlink" href="#bail-report" title="Permanent link">&para;</a></h3>
 <p><strong>Function</strong> <code>(egcl-ext:bail-report)</code> → number of distinct reasons</p>
 <p>Prints collected bytecode-lowering decline reasons and counts. Enable collection
