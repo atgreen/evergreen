@@ -172,14 +172,42 @@ unsafe fn forward_instance(old: EgclVal, new: EgclVal) {
 /// dropped; slots added are left UNBOUND. The old object is forwarded to the
 /// new one, so subsequent accesses see the current layout and this runs once.
 ///
+/// RETURNS THE LIVE INSTANCE, and every caller must use it instead of the value
+/// it passed in (bliss-ch80h). `allocate_instance` below can fire a relocating
+/// minor GC, and a nursery-resident obsolete instance is then EVACUATED: this
+/// function roots its own copy across that, but a caller's is an independent,
+/// unrooted word that the collector cannot see, so it is left pointing at a
+/// body that has been recycled -- and poisoned, under `EGCL_GC_POISON`.
+///
+/// That was not hypothetical. With the probe below the fault is deterministic,
+/// a SIGSEGV on every run:
+///
+/// ```text
+/// (defclass c () ((a :initform 11)))
+/// (defvar *i* (make-instance 'c))
+/// (defclass c () ((a :initform 11) (b :initform 22)))   ; obsoletes *i*
+/// (slot-value *i* 'a)
+///
+/// EGCL_GC_STRESS_AT=100115 EGCL_GC_POISON=1 egcl --no-init --load probe.lisp
+/// ```
+///
+/// `EGCL_GC_STRESS_AT` is what makes it reachable: it forces ONE collection, at
+/// the migration's own allocation, while the instance is still nursery-fresh.
+/// `EGCL_GC_STRESS=1` cannot show it -- its earlier collections promote the
+/// instance out of the nursery first, so by migration time nothing moves. That
+/// is the "a clean stress run can mean nothing moved" trap in CLAUDE.md,
+/// measured here rather than reasoned about.
+///
 /// # Safety
 /// `inst` must be a live STANDARD_OBJECT heap value.
-unsafe fn update_if_obsolete(inst: EgclVal) {
+#[must_use = "the instance may have moved during the migration; use the returned value"]
+unsafe fn update_if_obsolete(inst: EgclVal) -> EgclVal {
     unsafe {
         let live = resolve_forwarding(inst);
         let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
         if w.is_null() || (*w).state.load(Ordering::Acquire) != WRAPPER_OBSOLETE {
-            return;
+            // Nothing allocated, so nothing moved: `live` is still current.
+            return live;
         }
         let class = (*w).class;
         // Snapshot surviving (bound) slots from the old frozen layout.
@@ -205,7 +233,9 @@ unsafe fn update_if_obsolete(inst: EgclVal) {
         egcl_rt::rooted_ref!(_snap_root = &mut snap);
         let new_inst = match allocate_instance(class) {
             Ok(i) => i,
-            Err(_) => return,
+            // The allocation may still have collected before failing, so answer
+            // the ROOTED copy rather than the caller's.
+            Err(_) => return live,
         };
         let nw = *(new_inst.as_ptr().add(8) as *const *mut ClassWrapper);
         if !nw.is_null() {
@@ -217,6 +247,7 @@ unsafe fn update_if_obsolete(inst: EgclVal) {
             }
         }
         forward_instance(live, new_inst);
+        new_inst
     }
 }
 
@@ -3055,7 +3086,7 @@ pub fn slot_value(instance: EgclVal, slot_name: EgclVal) -> Result<EgclVal, Egcl
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => {
                 let v = *slot_cell(instance, idx);
@@ -3091,7 +3122,7 @@ pub fn slot_value_if_present(
         return None;
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let idx = instance_slot_index(instance, slot_name)?;
         let v = *slot_cell(instance, idx);
         Some(if v == UNBOUND {
@@ -3112,7 +3143,7 @@ pub fn set_slot_value(
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => {
                 *slot_cell(instance, idx) = new_value;
@@ -3140,7 +3171,7 @@ pub fn compare_exchange_slot_value(
         });
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
@@ -3168,7 +3199,7 @@ pub fn atomic_update_slot_value(
         });
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         let Some(index) = instance_slot_index(instance, slot_name) else {
             return Err(EgclError::Internal(format!(
                 "slot not present in class layout: {}",
@@ -3186,7 +3217,7 @@ pub fn slot_boundp(instance: EgclVal, slot_name: EgclVal) -> Result<bool, EgclEr
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         match instance_slot_index(instance, slot_name) {
             Some(idx) => Ok(*slot_cell(instance, idx) != UNBOUND),
             None => Ok(false),
@@ -3207,7 +3238,7 @@ pub fn slot_present_p(instance: EgclVal, slot_name: EgclVal) -> bool {
         return false;
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         instance_slot_index(instance, slot_name).is_some()
     }
 }
@@ -3218,7 +3249,7 @@ pub fn slot_makunbound(instance: EgclVal, slot_name: EgclVal) -> Result<(), Egcl
         return Err(EgclError::Internal("not an instance".into()));
     }
     unsafe {
-        update_if_obsolete(instance);
+        let instance = update_if_obsolete(instance);
         if let Some(idx) = instance_slot_index(instance, slot_name) {
             *slot_cell(instance, idx) = UNBOUND;
         }
