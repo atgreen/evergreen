@@ -61,6 +61,14 @@
   metaclass's slots (issue
   [#384](https://github.com/atgreen/evergreen/issues/384),
   [#399](https://github.com/atgreen/evergreen/pull/399)).
+- A class that is only a forward reference -- named as a superclass and not yet
+  defined -- can no longer be instantiated, as in SBCL: `MAKE-INSTANCE`,
+  `ALLOCATE-INSTANCE` and `CHANGE-CLASS` each used to return an object with no
+  slots, built against a layout the eventual `DEFCLASS` then contradicts.
+  `EGCL-MOP:CLASS-FINALIZED-P` also stops claiming T for such a class, or for a
+  class that inherits from one, and `EGCL-MOP:FINALIZE-INHERITANCE` signals for
+  them instead of silently doing nothing
+  ([#406](https://github.com/atgreen/evergreen/pull/406)).
 - A class named as a superclass **before** it is defined, and then defined with
   a `:METACLASS` that has slots, is an instance of that metaclass like any
   other. `CLASS-OF` answered the metaclass while `TYPEP`, `SLOT-EXISTS-P`,
