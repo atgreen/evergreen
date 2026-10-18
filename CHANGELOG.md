@@ -54,6 +54,10 @@
 
 ### Fixed
 
+- A compiled method shows up as `(METHOD <generic-function>)`, with its
+  qualifier, in `EGCL_SPROF` profiles, the tiering log and backtraces, instead
+  of an anonymous `METHOD` shared by every method
+  ([#421](https://github.com/atgreen/evergreen/pull/421)).
 - A form whose value is only tested no longer leaks its other values into the
   result. `(if (values x 99) x (list x))` returned X and 99 in compiled code,
   and a compiled `UNLESS` could even return the test's value instead of `NIL`;

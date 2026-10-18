@@ -37,14 +37,17 @@ fn a_hot_loop_in_a_method_body_reaches_t2() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stdout}\n{stderr}");
     assert!(stdout.contains("METHOD-HEAT-OK"), "{stdout}");
+    // The callable is named after its generic function: (METHOD ...HEAT-SUM).
+    let method_line = |line: &&str| line.contains("[T2] (METHOD ") && line.contains("HEAT-SUM");
     assert!(
         stderr
             .lines()
-            .any(|line| line.contains("[T2] METHOD: optimized worker result installed")),
+            .filter(method_line)
+            .any(|line| line.contains("optimized worker result installed")),
         "the method body must reach T2 by loop heat: {}",
         stderr
             .lines()
-            .filter(|line| line.contains("[T2] METHOD"))
+            .filter(method_line)
             .collect::<Vec<_>>()
             .join("\n")
     );

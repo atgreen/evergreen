@@ -38669,7 +38669,17 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
     forget_compiled_method(method_id.0);
     if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() && !nested_in_binding {
         let compile_ll = method_lambda_list_for_compile(*lambda_list);
-        if let Some(callable) = bytecode::compile_and_reify_lambda("METHOD", compile_ll, body, env)
+        // Name the callable after its generic function, so profiles, the
+        // tiering log and backtraces say which method ran instead of a bare
+        // METHOD for every one of them.
+        let qualifier_text = match qualifier {
+            egcl_stdlib::MethodQualifier::Around => " :AROUND",
+            egcl_stdlib::MethodQualifier::Before => " :BEFORE",
+            egcl_stdlib::MethodQualifier::After => " :AFTER",
+            _ => "",
+        };
+        let label = format!("(METHOD {name}{qualifier_text})");
+        if let Some(callable) = bytecode::compile_and_reify_lambda(&label, compile_ll, body, env)
         {
             METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
         }
