@@ -249,3 +249,52 @@ at_both_tiers!(
     discarded_mv_t1,
     discarded_mv_t2
 );
+
+/// A call in one arm of an IF reaches its return through the join, so it used
+/// to take the mapped ABI: only a call followed directly by its return could
+/// forward the callee's values. The join's return is copied into each arm.
+fn branch_tail_calls_forward_multiple_values(tier: &str) {
+    check_native(
+        r#"
+        (defun abi-tail-pair (x) (values x (* x 2)))
+        (defun abi-tail-branch (n)
+          (if (< n 2) (abi-tail-pair n) (+ (abi-tail-branch (- n 1)) 1)))
+        (dotimes (i 40)
+          (assert (equal (multiple-value-list (abi-tail-branch 1)) '(1 2)))
+          (assert (equal (multiple-value-list (abi-tail-branch 4)) '(4))))
+        (defun abi-tail-pair (x) (values x :redefined))
+        (assert (equal (multiple-value-list (abi-tail-branch 0)) '(0 :redefined)))
+        (assert (equal (multiple-value-list (abi-tail-branch 3)) '(3)))
+        "#,
+        &["abi-tail-branch"],
+        tier,
+    );
+}
+at_both_tiers!(
+    branch_tail_calls_forward_multiple_values,
+    branch_tail_values_t1,
+    branch_tail_values_t2
+);
+
+/// A guard that fails on the arm whose return was copied still resumes in the
+/// interpreter with the right continuation.
+fn branch_tail_call_guard_failure_resumes(tier: &str) {
+    check_native(
+        r#"
+        (defun abi-guard-pair (x) (values x (* x 2)))
+        (defun abi-guard-branch (n)
+          (if (< n 2) (abi-guard-pair n) (+ (abi-guard-branch (- n 1)) 1)))
+        (dotimes (i 40) (assert (= (abi-guard-branch 5) 5)))
+        (assert (= (abi-guard-branch 2.5) 2.5))
+        (assert (equal (multiple-value-list (abi-guard-branch 1.5)) '(1.5 3.0)))
+        (dotimes (i 40) (assert (= (abi-guard-branch 6) 6)))
+        "#,
+        &[],
+        tier,
+    );
+}
+at_both_tiers!(
+    branch_tail_call_guard_failure_resumes,
+    branch_tail_guard_t1,
+    branch_tail_guard_t2
+);

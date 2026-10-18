@@ -187,6 +187,8 @@ pub enum EmitError {
     FloatUnsupported,
     /// Branch resolution failed (out-of-range / unbound label).
     BadBranch,
+    /// An emitter's admission check refused the function, for this reason.
+    Declined(&'static str),
 }
 
 /// x86-64 encodings of the callee-saved GPRs SysV requires a function to

@@ -393,28 +393,98 @@ pub fn emit_framed_ordinary_function_with_self_calls(
 /// Emit using invariants established at every ingress by the artifact owner.
 /// Facts apply only to source-proven self calls, never ordinary named calls.
 #[allow(clippy::too_many_arguments)]
+/// Copy a join's bare `return p` into each edge that reaches it, so a branch
+/// that ends by calling returns the call's result directly.
+///
+/// The ordinary ABI forwards a callee's result descriptor only from a call
+/// immediately followed by its return, and a return of a merged value needs
+/// every path to have proved a single value. A tail call inside an IF reaches
+/// its return through the join's block parameter, so it satisfied neither, and
+/// the whole function took the mapped ABI: `(if (< n 2) (leaf n) (+ ...))`.
+/// A `jump B(a)` becomes `return a`; a conditional edge into the join gets a
+/// new block holding `return a`, as when an arm is just a variable:
+/// `(if (listp x) x (list x))`. Every other instruction and frame state is
+/// kept, so call sites and their targets are unchanged. Returns `None` when no
+/// join qualifies.
+fn duplicate_join_returns(f: &Function) -> Option<Function> {
+    let mut joins = Vec::new();
+    for &block in f.block_order() {
+        let data = f.block(block);
+        if block == f.entry() || data.insts.len() != 1 { continue; }
+        let ret = f.inst(data.insts[0]);
+        let [returned] = ret.args[..] else { continue };
+        if ret.opcode != Opcode::Return { continue; }
+        if let Some(param) = data.params.iter().position(|&p| p == returned) {
+            joins.push((block, param, data.insts[0]));
+        }
+    }
+    let mut copy: Option<Function> = None;
+    for (join, param, ret) in joins {
+        let source = copy.as_ref().unwrap_or(f);
+        // Every (terminator, edge index) that enters the join.
+        let edges: Vec<(Inst, usize)> = source.preds(join).into_iter().filter_map(|pred| {
+            source.terminator(pred)
+        }).flat_map(|term| {
+            source.inst(term).targets.iter().enumerate()
+                .filter(|(_, edge)| edge.block == join)
+                .map(move |(index, _)| (term, index))
+                .collect::<Vec<_>>()
+        }).collect();
+        if edges.is_empty() { continue; }
+        let g = copy.get_or_insert_with(|| f.clone());
+        for (term, index) in edges {
+            let value = g.inst(term).targets[index].args[param];
+            if g.inst(term).opcode == Opcode::Jump {
+                let source_pos = g.inst(ret).source_pos;
+                let data = g.inst_mut(term);
+                data.opcode = Opcode::Return;
+                data.args = vec![value];
+                data.targets.clear();
+                data.source_pos = source_pos;
+            } else {
+                let block = g.make_block();
+                let mut data = g.inst(ret).clone();
+                data.args = vec![value];
+                g.set_terminator(block, data);
+                let edge = &mut g.inst_mut(term).targets[index];
+                edge.block = block;
+                edge.args.clear();
+            }
+        }
+        if g.preds(join).is_empty() { g.remove_from_layout(join); }
+    }
+    copy
+}
+
 pub fn emit_framed_ordinary_function_with_self_call_facts(
     f: &Function, entry: OrdinaryLispEntryOptions,
     targets: &[(Inst, OrdinaryCallTarget)], flags: OrdinaryCallFlags,
     cold: u64, guard: OrdinaryGuardOptions, poll_veneer: u64, self_calls: &[Inst],
     self_facts: OrdinarySelfCallFacts,
 ) -> Result<FramedCode, EmitError> {
-    let bad = || EmitError::UnsupportedOp(0xFA);
-    if f.is_variadic() || !f.osr_entries.is_empty() || !f.handler_cases.is_empty()
-        || entry.arity > u16::MAX as usize || entry.arity_error_veneer == 0
+    let declined = EmitError::Declined;
+    let duplicated = duplicate_join_returns(f);
+    let f = duplicated.as_ref().unwrap_or(f);
+    if f.is_variadic() { return Err(declined("variadic")); }
+    if !f.osr_entries.is_empty() { return Err(declined("OSR entries")); }
+    if !f.handler_cases.is_empty() { return Err(declined("handler cases")); }
+    if entry.arity > u16::MAX as usize || entry.arity_error_veneer == 0
         || f.block(f.entry()).params.len() != entry.arity
-        || [cold, guard.veneer, guard.multiple_values, flags.gc_requested,
-            flags.sigusr1_pending, flags.posted_signal, flags.native_errors,
-            flags.signal_epoch].contains(&0)
-        || crate::t2::verify::verify(f).is_err()
-        || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
-        || f.frame_states.iter().any(|(_, state)| {
-            // Retained self expansion shares one body's scope-free recovery
-            // protocol. Cross-function logical frames need separate admission.
-            state.scopes.first().is_none_or(|outer|
-                state.scopes.iter().any(|scope| scope.function != outer.function))
-        })
-    { return Err(bad()); }
+    { return Err(declined("entry arity")); }
+    if [cold, guard.veneer, guard.multiple_values, flags.gc_requested,
+        flags.sigusr1_pending, flags.posted_signal, flags.native_errors,
+        flags.signal_epoch].contains(&0)
+    { return Err(declined("missing veneer or flag address")); }
+    if crate::t2::verify::verify(f).is_err() { return Err(declined("IR verification")); }
+    if (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged) {
+        return Err(declined("untagged value"));
+    }
+    if f.frame_states.iter().any(|(_, state)| {
+        // Retained self expansion shares one body's scope-free recovery
+        // protocol. Cross-function logical frames need separate admission.
+        state.scopes.first().is_none_or(|outer|
+            state.scopes.iter().any(|scope| scope.function != outer.function))
+    }) { return Err(declined("frame state spans inlined functions")); }
     let single = crate::t2::opt_clear_mv::single_value_state(f, true);
     let mut returns = Vec::new();
     let mut call_count = 0;
@@ -426,12 +496,13 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 Opcode::Call => {
                     call_count += 1;
                     let mut matches = targets.iter().filter(|(site, _)| *site == inst);
-                    let (_, target) = matches.next().ok_or_else(bad)?;
+                    let (_, target) = matches.next()
+                        .ok_or(declined("call site without a call cell"))?;
                     if matches.next().is_some() || target.descriptor_slot == 0
                         || target.revision_address == 0 || data.args.len() > u16::MAX as usize
                         || data.results.len() > 1 || !data.flags.call || !data.flags.safepoint
                         || !matches!(data.aux, AuxData::CallTarget(symbol) if symbol == target.symbol)
-                    { return Err(bad()); }
+                    { return Err(declined("call site shape")); }
                     if position + 2 == insts.len() {
                         let ret = f.inst(insts[position + 1]);
                         if ret.opcode == Opcode::Return && ret.args == data.results {
@@ -442,11 +513,13 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 Opcode::Return => {
                     if data.args.len() != 1 || (!single.contains(&inst)
                         && (position == 0 || !returns.contains(&insts[position - 1])))
-                    { return Err(bad()); }
+                    { return Err(declined("return of possibly multiple values")); }
                 }
                 Opcode::Guard | Opcode::FixnumAdd | Opcode::FixnumSub | Opcode::FixnumMul
                 | Opcode::FixnumNeg | Opcode::FixnumShl | Opcode::FixnumShr => {
-                    if data.frame_state.is_none() { return Err(bad()); }
+                    if data.frame_state.is_none() {
+                        return Err(declined("guarded operation without a frame state"));
+                    }
                 }
                 Opcode::ConstFixnum | Opcode::ConstNil | Opcode::ConstT
                 | Opcode::ConstSymbol | Opcode::ConstChar | Opcode::ClearMv
@@ -460,7 +533,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
             }
         }
     }
-    if targets.len() != call_count { return Err(bad()); }
+    if targets.len() != call_count { return Err(declined("call cells do not match calls")); }
     if self_calls.iter().any(|site| !targets.iter().any(|(inst, target)| {
         if inst != site { return false; }
         let data = f.inst(*inst);
@@ -468,7 +541,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
             let scopes = &f.frame_states.get(state).scopes;
             !scopes.is_empty() && scopes.iter().all(|scope| scope.function == target.symbol)
         })
-    })) { return Err(bad()); }
+    })) { return Err(declined("self call shape")); }
 
     // Calls contain the complete lifecycle poll. A cycle without a call would
     // otherwise suppress signals, collection and fiber yielding indefinitely.
@@ -480,7 +553,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
         let ready = pending.iter().copied().find(|&block|
             !pending.iter().any(|&predecessor| f.terminator(predecessor).is_some_and(|inst|
                 f.inst(inst).targets.iter().any(|target| target.block == block))));
-        let Some(block) = ready else { return Err(bad()); };
+        let Some(block) = ready else { return Err(declined("call-free loop without a poll")); };
         pending.remove(&block);
     }
     // A call-free guarded function still needs native homes and guard control.
@@ -856,5 +929,102 @@ impl OrdinaryCallEmission<'_> {
         retire(a, 64);
         a.bind(done);
         Ok(direct.into_iter().chain(std::iter::once(slow)).collect())
+    }
+}
+
+#[cfg(test)]
+mod join_return_tests {
+    use super::*;
+    use crate::t2::ir::{BlockCall, IRType, InstFlags};
+
+    const TAGGED: (IRType, ValueRepresentation) = (IRType::TOP, ValueRepresentation::Tagged);
+
+    fn inst(opcode: Opcode, args: Vec<Value>, targets: Vec<BlockCall>) -> InstData {
+        InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags {
+                call: opcode == Opcode::Call,
+                ..InstFlags::default()
+            },
+            targets,
+            frame_state: None,
+            source_pos: 0,
+        }
+    }
+
+    fn edge(block: crate::t2::ir::Block, args: Vec<Value>) -> BlockCall {
+        BlockCall { block, args }
+    }
+
+    /// `(and (stringp s) (plusp (length s)) (char s 0))`: a nested branch whose
+    /// arms reach a join returning its parameter, one arm by calling.
+    #[test]
+    fn a_join_return_is_copied_into_every_arm() {
+        let mut f = Function::new("first-char");
+        let entry = f.entry();
+        let s = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (inner, call_arm, nil_arm, join, outer_nil) =
+            (f.make_block(), f.make_block(), f.make_block(), f.make_block(), f.make_block());
+        let (_, nil) = f.push_inst(entry, inst(Opcode::ConstNil, vec![], vec![]), &[TAGGED]);
+        let (_, test) = f.push_inst(entry, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
+        f.set_terminator(entry, inst(Opcode::Brif, vec![test[0]],
+            vec![edge(inner, vec![]), edge(outer_nil, vec![])]));
+        let (_, inner_test) = f.push_inst(inner, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
+        f.set_terminator(inner, inst(Opcode::Brif, vec![inner_test[0]],
+            vec![edge(call_arm, vec![]), edge(nil_arm, vec![])]));
+        let (call, result) = f.push_inst(call_arm, inst(Opcode::Call, vec![s], vec![]), &[TAGGED]);
+        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![result[0]])]));
+        f.set_terminator(nil_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![nil[0]])]));
+        let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
+        f.set_terminator(outer_nil, inst(Opcode::Return, vec![nil[0]], vec![]));
+
+        let g = duplicate_join_returns(&f).expect("the join qualifies");
+        assert!(!g.block_order().contains(&join), "the emptied join leaves the layout");
+        let tail = |block| g.inst(g.terminator(block).unwrap()).clone();
+        assert_eq!(tail(call_arm).opcode, Opcode::Return);
+        assert_eq!(tail(call_arm).args, result);
+        assert_eq!(*g.block(call_arm).insts.first().unwrap(), call, "the call is kept");
+        assert_eq!(tail(nil_arm).opcode, Opcode::Return);
+        assert_eq!(tail(nil_arm).args, nil);
+        assert!(crate::t2::verify::verify(&g).is_ok());
+    }
+
+    /// An arm that is just a variable leaves the branch entering the join
+    /// directly; that edge gets its own returning block.
+    #[test]
+    fn a_conditional_edge_into_a_join_gets_its_own_return() {
+        let mut f = Function::new("ensure-list");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (call_arm, join) = (f.make_block(), f.make_block());
+        let (_, test) = f.push_inst(entry, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
+        f.set_terminator(entry, inst(Opcode::Brif, vec![test[0]],
+            vec![edge(join, vec![x]), edge(call_arm, vec![])]));
+        let (_, list) = f.push_inst(call_arm, inst(Opcode::Call, vec![x], vec![]), &[TAGGED]);
+        f.set_terminator(call_arm, inst(Opcode::Jump, vec![], vec![edge(join, vec![list[0]])]));
+        let merged = f.add_block_param(join, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(join, inst(Opcode::Return, vec![merged], vec![]));
+
+        let g = duplicate_join_returns(&f).expect("the join qualifies");
+        let branch = g.inst(g.terminator(entry).unwrap());
+        let taken = branch.targets[0].block;
+        assert!(branch.targets[0].args.is_empty());
+        assert_ne!(taken, join);
+        assert_eq!(g.inst(g.terminator(taken).unwrap()).args, vec![x]);
+        assert!(!g.block_order().contains(&join));
+        assert!(crate::t2::verify::verify(&g).is_ok());
+    }
+
+    #[test]
+    fn a_function_without_a_bare_join_return_is_left_alone() {
+        let mut f = Function::new("leaf");
+        let entry = f.entry();
+        let x = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        f.set_terminator(entry, inst(Opcode::Return, vec![x], vec![]));
+        assert!(duplicate_join_returns(&f).is_none());
     }
 }

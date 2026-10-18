@@ -315,6 +315,11 @@
 
 ### Performance
 
+- A compiled function whose `IF` returns a call's result in one arm, such as a
+  recursive `(if (< n 2) (leaf n) (+ (f (- n 1)) (f (- n 2))))`, now uses the
+  direct native calling convention instead of going through Rust for every
+  call: about 5 ns per call instead of about 700 ns
+  ([#420](https://github.com/atgreen/evergreen/pull/420)).
 - Generic-function calls do less repeated work. A `DEFCLASS` accessor reads
   or writes its slot directly once dispatch selects it (user methods on the
   accessor still take over), slot writes skip the class-slot search for
