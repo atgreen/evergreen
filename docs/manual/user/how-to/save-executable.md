@@ -58,6 +58,8 @@ read-only, so opening one for output, renaming or deleting it signals
 `file-error`. Only the Lisp image sees them: the operating system, foreign code
 called through the FFI and child processes do not. Saved images, shaken
 executables and cores carry them; contents cost one byte per octet.
+The [embedded-file dictionary](../reference/images.md#embedded-file-storage) gives
+the exact contracts.
 
 An application can list the files it needs in its own `.asd` with the
 `egcl-embed-asdf` extension, as `(:embedded-file ...)` and `(:embedded-tree
