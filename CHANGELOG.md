@@ -260,6 +260,12 @@
 
 ### Performance
 
+- A method body that loops now reaches optimized native code (T2) like the
+  same body in a `DEFUN`. It used to stop at baseline native code (T1) until
+  its 4096th call: a 1000-iteration loop took about 4 ms per call as a method
+  and 30 us as a function, and now takes about 50 us as a method. Methods
+  restored from a saved image are covered too
+  ([#413](https://github.com/atgreen/evergreen/pull/413)).
 - AES, GCM's GHASH multiply and SHA-256 compression run in the runtime, as
   `EGCL-EXT:CRYPTO-*` block primitives that EGCL's Ironclad fork calls in place
   of its portable Lisp. With the fork, encrypting 64 KB with AES-GCM takes
