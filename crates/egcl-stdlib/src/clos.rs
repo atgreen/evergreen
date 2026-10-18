@@ -3256,6 +3256,35 @@ pub fn set_slot_value(
     }
 }
 
+/// Store into `slot_name` if it is in the instance's own layout, the writer's
+/// counterpart of [`slot_value_if_present`]. `None` when INSTANCE is not an
+/// instance, the slot is not an instance slot (a class-allocated or missing
+/// slot), or the instance is obsolete, leaving the caller's general path to
+/// handle it.
+///
+/// Never allocates. Migrating an obsolete instance would, and NEW_VALUE is held
+/// here only in a local the collector cannot see, so that case is declined
+/// rather than migrated.
+pub fn set_slot_value_if_present(
+    instance: EgclVal,
+    slot_name: EgclVal,
+    new_value: EgclVal,
+) -> Option<()> {
+    if !is_instance(instance) {
+        return None;
+    }
+    unsafe {
+        let live = resolve_forwarding(instance);
+        let w = *(live.as_ptr().add(8) as *const *mut ClassWrapper);
+        if !w.is_null() && (*w).state.load(Ordering::Acquire) == WRAPPER_OBSOLETE {
+            return None;
+        }
+        let idx = instance_slot_index(live, slot_name)?;
+        *slot_cell(live, idx) = new_value;
+        Some(())
+    }
+}
+
 /// Atomically compare and exchange an inline instance slot.
 pub fn compare_exchange_slot_value(
     instance: EgclVal,
