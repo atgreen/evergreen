@@ -13348,8 +13348,15 @@ fn seed_compile_time_definitions(form: EgclVal, env: &mut Env) {
                 // re-evaluating, then reported "already bound non-constant
                 // variable" when the fasl loaded. That is what stopped iolib
                 // loading (bliss-vhr6e).
+                // The walk visits every subform, so this can be data shaped
+                // like a definition — ocicl's linter has the CASE clause
+                // `((defconstant) …)`, whose "name" is NIL. Neither NIL nor T
+                // can be a DEFCONSTANT name, and seeding them panicked.
+                if !cdr.is_cons() {
+                    return;
+                }
                 let (symbol, rest) = cp(cdr);
-                if symbol.is_symbol() {
+                if symbol.is_symbol() && symbol != NIL && symbol != T {
                     if rest.is_cons() {
                         // An init form that cannot be evaluated yet seeds
                         // nothing. A seeded NIL would become
@@ -13391,10 +13398,16 @@ fn seed_compile_time_binding(env: &mut Env, symbol: EgclVal, value: EgclVal) {
     let name = sym_name(symbol);
     env.set_var(&name, value);
     // Mirror to the bare name for package-qualified symbols, but never for
-    // keywords (see lookup_var_symbol).
+    // keywords (see lookup_var_symbol). The mirror is a frame binding only:
+    // `set_var` would intern a homeless symbol of that bare name, or assign the
+    // global value of one that exists, and the reader then hands such a valued
+    // homeless symbol to every package reading the name without a symbol of its
+    // own — ironclad's compile-time `+BUFFER-SIZE+` became drakma's and then
+    // salza2's, whose DEFPARAMETER of it failed as a constant redefinition.
     let bare = symbol_bare_name(&name);
-    if bare != name && !name.starts_with("KEYWORD:") {
-        env.set_var(&bare, value);
+    if bare != name && !name.starts_with("KEYWORD:") && !Env::set_frame_var(&env.frame, &bare, value)
+    {
+        env.frame.borrow_mut().vars.insert(bare, value);
     }
 }
 
@@ -17709,6 +17722,13 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
     // on error), which also keeps `current_package` — the reader's bare-symbol
     // resolution context (bliss-lb6.12) and the REPL prompt — consistent.
     let saved_package = env.current_package.clone();
+    // *READTABLE* is bound the same way, so a file's IN-READTABLE (or SETF of
+    // *READTABLE*) does not leak into the code that loaded it. It lives in the
+    // symbol's value cell; the guard restores it on success or error.
+    let mut readtable_binding = egcl_rt::symbols::find_index("*READTABLE*").map(|index| {
+        DynBind::establish(EgclVal::from_symbol_index(index), cli_current_readtable())
+    });
+    egcl_rt::rooted_ref!(_readtable_binding_root = &mut readtable_binding);
     // ANSI LOAD also dynamically binds *LOAD-PATHNAME*/*LOAD-TRUENAME* to the
     // file being loaded.  The binding must live in the symbols' value cells:
     // functions called by the loaded file run in their captured lexical
@@ -17831,6 +17851,25 @@ fn load_bfasl_into_env(bytes: &[u8], env: &mut Env) -> Result<EgclVal, EgclError
             )
         })?;
     let src = String::from_utf8_lossy(forms).into_owned();
+    // A source-only artifact re-reads text that COMPILE-FILE would have read, so
+    // its read-time `#.` forms see the source file as *COMPILE-FILE-PATHNAME*
+    // and *COMPILE-FILE-TRUENAME*, as they would have during compilation. The
+    // common `(or *compile-file-pathname* *load-pathname*)` idiom otherwise
+    // resolved paths against the fasl cache (ocicl's runtime/ files).
+    let mut source_bindings: Vec<DynBind> = Vec::new();
+    egcl_rt::rooted_ref!(_source_bindings_root = &mut source_bindings);
+    if let Some(source) = unit
+        .section(egcl_rt::bfasl::section::SOURCE_MAP)
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .and_then(|path| load_pathname_value(&path))
+    {
+        egcl_rt::rooted!(source = source);
+        for name in ["*COMPILE-FILE-PATHNAME*", "*COMPILE-FILE-TRUENAME*"] {
+            if let Some(symbol) = resolve_sym(name) {
+                source_bindings.push(DynBind::establish(symbol, *source));
+            }
+        }
+    }
     with_eval_context(env, EvalContext::Load, |env| read_eval_all_env(&src, env))
 }
 
@@ -26160,6 +26199,30 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         arena_str(&s)
                     })
                     .unwrap_or(NIL));
+            }
+            "EGCL-EXT:CHDIR" => {
+                // (egcl-ext:chdir namestring) — change the process working
+                // directory, as POSIX chdir(2), for ASDF's chdir (#+egcl). Like
+                // GETCWD this is process state: it does not touch
+                // *DEFAULT-PATHNAME-DEFAULTS*, as sb-posix:chdir does not.
+                let (dir_form, _) = cp(cdr);
+                let dir = val_as_str(eval_form(dir_form, env)?);
+                std::env::set_current_dir(&dir).map_err(|e| {
+                    EgclError::FileError(format!("cannot change directory to {dir}: {e}"))
+                })?;
+                return Ok(T);
+            }
+            "EGCL-EXT:DELETE-DIRECTORY" => {
+                // (egcl-ext:delete-directory namestring) — remove an EMPTY
+                // directory, as POSIX rmdir(2), for ASDF's
+                // delete-empty-directory (#+egcl); delete-directory-tree
+                // empties the tree first.
+                let (dir_form, _) = cp(cdr);
+                let dir = val_as_str(eval_form(dir_form, env)?);
+                std::fs::remove_dir(&dir).map_err(|e| {
+                    EgclError::FileError(format!("cannot delete directory {dir}: {e}"))
+                })?;
+                return Ok(T);
             }
             "EGCL-EXT:RUN-PROGRAM" => {
                 // (egcl-ext:run-program command) — run a subprocess synchronously,

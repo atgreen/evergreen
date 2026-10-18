@@ -971,7 +971,10 @@ pub(super) fn registry_sizes() -> (usize, usize, usize) {
 /// serializable. Pool encoding is Rust-only (no EGCL allocation) — GC-safe
 /// post-STW-GC.
 pub(super) fn serialize_registry_unit() -> Vec<u8> {
-    let mut pool = BbuConstPool::default();
+    let mut pool = BbuConstPool {
+        saved_heap_refs: true,
+        ..BbuConstPool::default()
+    };
     egcl_rt::rooted_ref!(_pool_root = &mut pool);
     let source_file_ref = pool.string("<core-registry>");
     let mut functions: Vec<BbuFunction> = Vec::new();
@@ -1084,10 +1087,15 @@ pub(super) fn serialize_registry_unit() -> Vec<u8> {
             }
         }
     }
-    if (sk_pool + sk_tree) > 0 && dbg {
+    // A function left out here is a restored stub that answers NIL, so say so
+    // whenever it happens, not only under the debug variable.
+    if (sk_pool + sk_tree) > 0 {
         eprintln!(
-            ";; core save: bytecode-registry skips — unpoolable-name {sk_pool}, unserializable-tree {sk_tree}, kept {}",
-            load_actions.len()
+            ";; warning: core save left out {} compiled function(s) it could not serialize \
+             (unpoolable name {sk_pool}, unserializable body {sk_tree}); they will not work \
+             in the restored image{}",
+            sk_pool + sk_tree,
+            if dbg { "" } else { " — set EGCL_HOSTREG_DBG=1 to list them" }
         );
     }
     if load_actions.is_empty() {
@@ -7097,6 +7105,11 @@ fn compile_local_function(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    let optional_required = optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
+        params_form = params;
+        fbody = body;
+        required
+    });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
     lo.self_symbol = Some(self_symbol);
@@ -7125,6 +7138,9 @@ fn compile_local_function(
     } else {
         declared_parameter_types(fbody, &param_names)?
     };
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut lo.self_call_sites,
+    );
     Some(BytecodeFunction {
         self_call_sites: lo.self_call_sites,
         code: lo.code,
@@ -7140,7 +7156,7 @@ fn compile_local_function(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: sym_name(EgclVal::from_symbol_index(self_symbol)),
         params_form: if variadic { params_form } else { NIL },
         min_args,
@@ -7172,6 +7188,11 @@ fn compile_capturing_local(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    let optional_required = optional_entry_prologue(params_form, fbody).map(|(params, body, required)| {
+        params_form = params;
+        fbody = body;
+        required
+    });
     let (param_names, min_args, max_args, variadic) = parse_lambda_list(params_form)?;
     let mut lo = Lowerer::new(env);
     lo.declared_special = inherited_specials.clone();
@@ -7211,8 +7232,12 @@ fn compile_capturing_local(
         return None;
     }
     lo.emit(Instr::Return);
+    let mut self_call_sites = Vec::new();
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut self_call_sites,
+    );
     Some(BytecodeFunction {
-        self_call_sites: Vec::new(),
+        self_call_sites,
         code: lo.code,
         constants: lo.constants,
         load_time_values: lo.load_time_values,
@@ -7226,7 +7251,7 @@ fn compile_capturing_local(
         has_env: true,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: "<flet-closure>".to_string(),
         params_form: if variadic { params_form } else { NIL },
         min_args,
@@ -8097,6 +8122,192 @@ fn parse_key_spec(elem: EgclVal) -> Option<(String, Option<String>)> {
     None
 }
 
+/// The value an omitted `&optional` argument arrives as in an optional-range
+/// function (see [`optional_entry_prologue`]): binding fills the missing
+/// trailing parameters with it, and the function's own prologue replaces it
+/// with the default. An internal symbol, so it is an ordinary immediate to every tier
+/// and poolable in a fasl.
+pub(super) fn unsupplied_marker() -> EgclVal {
+    static INDEX: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // Interned under its registry key, as the package system's own intern
+    // does, so it exists while boot.lisp is still compiling (before the
+    // package registry is up) and is the symbol a later `EGCL::` read finds.
+    EgclVal::from_symbol_index(*INDEX.get_or_init(|| {
+        let index = egcl_rt::symbols::intern("EGCL::%UNSUPPLIED-ARGUMENT");
+        egcl_rt::symbols::set_symbol_package(index, egcl_rt::packages::find_or_create("EGCL"));
+        index
+    }))
+}
+
+/// Whether `body` is an optional-range function: fixed positional slots, of
+/// which the trailing `arity - min_args` are `&optional` parameters a call may
+/// omit.
+pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
+    !body.variadic && body.min_args < body.arity
+}
+
+/// SBCL-style `&optional` entry: rewrite a lambda list of required parameters
+/// and `&optional` ones (nothing else) into fixed positional parameters plus a
+/// prologue that computes the defaults, so the function binds its arguments
+/// positionally instead of through the run-time lambda-list binder, which
+/// re-parsed the lambda list and tree-walked the defaults on every call.
+///
+/// Such a function stays at T0 for now: the native ordinary entry checks an
+/// exact argument count, and the generic activation entry costs more per call
+/// than the interpreter saves for the small hot functions this applies to.
+/// Native promotion needs that entry to pad the omitted arguments itself.
+///
+/// `(lambda (a &optional (b (f a) b-p) c) . body)` becomes
+///
+/// ```lisp
+/// (lambda (a #:arg-1 #:arg-2)
+///   (let* ((b-p (not (eq #:arg-1 'egcl::%unsupplied-argument)))
+///          (b (if b-p #:arg-1 (f a)))
+///          (c (if (eq #:arg-2 'egcl::%unsupplied-argument) nil #:arg-2)))
+///     . body))
+/// ```
+///
+/// LET* gives each default exactly the scope CLHS 3.4.1 requires: the earlier
+/// parameters, not its own or later ones, so `(&optional (x x))` reads the
+/// enclosing `x`. Leading declarations move into the LET*, where they apply to
+/// the bindings they name; a docstring is dropped. Returns
+/// `(params, body, required_count)`, or `None` when the lambda list has another
+/// keyword or a destructuring parameter, or the body declares anything SPECIAL
+/// (a bound SPECIAL declaration for a required parameter cannot move inside the
+/// LET*), leaving such functions to the general binder.
+fn optional_entry_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal, u16)> {
+    egcl_rt::rooted!(params = list_to_vec(params_form));
+    let optional_at = params
+        .iter()
+        .position(|p| p.is_symbol() && super::sym_name_rc(*p).as_ref() == "&OPTIONAL")?;
+    let required = &params[..optional_at];
+    if required.iter().any(|p| !p.is_symbol() || super::sym_name_rc(*p).starts_with('&')) {
+        return None;
+    }
+    let required_count = u16::try_from(required.len()).ok()?;
+    // Each optional spec as (var, init-or-NIL, supplied-p-or-NIL).
+    egcl_rt::rooted!(specs = Vec::<EgclVal>::new());
+    for index in optional_at + 1..params.len() {
+        let spec = params[index];
+        if spec.is_symbol() {
+            if super::sym_name_rc(spec).starts_with('&') {
+                return None;
+            }
+            specs.extend([spec, NIL, NIL]);
+        } else if spec.is_cons() {
+            let items = list_to_vec(spec);
+            if items.is_empty() || items.len() > 3 || !items[0].is_symbol() {
+                return None;
+            }
+            if items.len() == 3 && (!items[2].is_symbol() || items[2].is_nil()) {
+                return None;
+            }
+            specs.extend([
+                items[0],
+                items.get(1).copied().unwrap_or(NIL),
+                items.get(2).copied().unwrap_or(NIL),
+            ]);
+        } else {
+            return None;
+        }
+    }
+    if specs.is_empty() {
+        return None;
+    }
+    // Split off the docstring and leading declarations.
+    egcl_rt::rooted!(forms = list_to_vec(body));
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE"
+        {
+            if declares_special(form) {
+                return None;
+            }
+            declarations.push(form);
+        } else {
+            break;
+        }
+        start += 1;
+    }
+    let marker = unsupplied_marker();
+    let quote = resolve_sym("QUOTE")?;
+    let eq = resolve_sym("EQ")?;
+    let not = resolve_sym("NOT")?;
+    let if_op = resolve_sym("IF")?;
+    egcl_rt::rooted!(quoted_marker = form_list(&[quote, marker]));
+    egcl_rt::rooted!(new_params = required.to_vec());
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for position in 0..specs.len() / 3 {
+        // Read each triple from the rooted `specs` afresh: the allocations
+        // below can move its objects.
+        egcl_rt::rooted!(spec = specs[position * 3..position * 3 + 3].to_vec());
+        egcl_rt::rooted!(argument = egcl_rt::symbols::make_uninterned(&format!(
+            "%EGCL-OPTIONAL-ARGUMENT-{position}"
+        )));
+        new_params.push(*argument);
+        egcl_rt::rooted!(unsupplied = form_list(&[eq, *argument, *quoted_marker]));
+        if spec[2].is_nil() {
+            egcl_rt::rooted!(value = form_list(&[if_op, *unsupplied, spec[1], *argument]));
+            let binding = form_list(&[spec[0], *value]);
+            bindings.push(binding);
+        } else {
+            egcl_rt::rooted!(supplied = form_list(&[not, *unsupplied]));
+            let binding = form_list(&[spec[2], *supplied]);
+            bindings.push(binding);
+            egcl_rt::rooted!(value = form_list(&[if_op, spec[2], *argument, spec[1]]));
+            let binding = form_list(&[spec[0], *value]);
+            bindings.push(binding);
+        }
+    }
+    egcl_rt::rooted!(let_form = vec![resolve_sym("LET*")?, form_list(&bindings)]);
+    let_form.extend(declarations.iter().copied());
+    let_form.extend(forms[start..].iter().copied());
+    let wrapped = form_list(&let_form);
+    egcl_rt::rooted!(wrapped = wrapped);
+    let new_body = arena_cons(*wrapped, NIL);
+    egcl_rt::rooted!(new_body = new_body);
+    let params_list = form_list(&new_params);
+    Some((params_list, *new_body, required_count))
+}
+
+/// `(arity, min_args)` for a compiled lambda list, given the required count an
+/// optional entry prologue left (if any): the positional slots, and how many of
+/// them a call must supply. For an optional-range function, drop the self-call
+/// sites that omit arguments, since only a full-arity call may enter directly.
+fn positional_arity(
+    variadic: bool,
+    min_args: u16,
+    max_args: Option<u16>,
+    optional_required: Option<u16>,
+    code: &[Instr],
+    self_call_sites: &mut Vec<u32>,
+) -> (u16, u16) {
+    let arity = if variadic { min_args } else { max_args.unwrap_or(min_args) };
+    let min_args = optional_required.unwrap_or(min_args);
+    if min_args < arity {
+        self_call_sites.retain(|&pc| {
+            matches!(code.get(pc as usize), Some(Instr::CallNamed { nargs, .. }) if *nargs == arity)
+        });
+    }
+    (arity, min_args)
+}
+
+/// Whether a DECLARE form contains a SPECIAL declaration.
+fn declares_special(declare: EgclVal) -> bool {
+    list_to_vec(cp(declare).1).into_iter().any(|spec| {
+        spec.is_cons()
+            && cp(spec).0.is_symbol()
+            && super::sym_name_rc(cp(spec).0).as_ref() == "SPECIAL"
+    })
+}
+
 /// Parse an ordinary lambda list into `(all-variable-names-in-order, min_args,
 /// max_args, variadic)` (x5y.7). Every variable — required, &optional (+ its
 /// supplied-p), &rest, &key (+ supplied-p), &aux — gets a name so the compiler
@@ -8706,6 +8917,19 @@ fn compile_function_forcing_boxed(
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
+    // Required + &optional only: compile the defaults into an entry prologue and
+    // bind positionally (optional_entry_prologue). The arguments' count may then
+    // fall short of the arity, by the omitted optionals.
+    let mut optional_required = None;
+    if !macro_lambda_list {
+        if let Some((params, prologue_body, required)) =
+            optional_entry_prologue(*params_form, *body)
+        {
+            *params_form = params;
+            *body = prologue_body;
+            optional_required = Some(required);
+        }
+    }
     // Parse the lambda list. Fixed and variadic (&optional/&rest/&key/&aux) are
     // both supported (x5y.7); destructuring / unknown keywords still bail.
     let parsed = if macro_lambda_list {
@@ -8889,6 +9113,9 @@ fn compile_function_forcing_boxed(
     }
     lo.emit(Instr::Return);
 
+    let (arity, min_args) = positional_arity(
+        variadic, min_args, max_args, optional_required, &lo.code, &mut lo.self_call_sites,
+    );
     let mut function = BytecodeFunction {
         self_call_sites: lo.self_call_sites,
         code: lo.code,
@@ -8904,7 +9131,7 @@ fn compile_function_forcing_boxed(
         has_env: lo.has_env,
         n_locals: lo.n_locals,
         max_stack: lo.max_stack.max(1),
-        arity: min_args,
+        arity,
         name: name.to_string(),
         // Ordinary fixed-arity functions can install a synthetic lambda list
         // from arity, but source-free macros always re-run the macro binder at
@@ -9178,7 +9405,10 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0201: function metadata gains a tag-3 literal fixnum range, followed by
 // its two i64 endpoints. Older readers must reject the changed record layout.
 // 0x0202: primary-preserving primitive result assertions (opcode 0x45).
-const BBU_BYTECODE_VERSION: u16 = 0x0202;
+// 0x0203: package-object constants (tag 20), resolved by name on load; saved
+// heap-reference constants (tag 21), valid only in a core image's registry
+// unit; hash-table constants (tag 22): test plus key/value refs.
+const BBU_BYTECODE_VERSION: u16 = 0x0203;
 const BBU_VERIFIER_VERSION: u16 = 0x0100;
 const BBU_NO_INDEX: u32 = u32::MAX;
 /// Unit-flags bit: every load form is represented in `load_actions`, so the
@@ -9195,6 +9425,9 @@ const BBU_AUX_RESTART_TABLES: u16 = 7;
 const BBU_AUX_HANDLER_CASES: u16 = 9;
 // Optional: older units conservatively retain dynamic named calls.
 const BBU_AUX_SELF_CALL_SITES: u16 = 10;
+// Per function, each HANDLER-BIND's condition type names (0x0203). Absent from
+// older units, whose functions could not contain PUSH_HANDLER_BIND.
+const BBU_AUX_HANDLER_BINDS: u16 = 11;
 
 fn put_u8(out: &mut Vec<u8>, v: u8) {
     out.push(v);
@@ -9233,11 +9466,20 @@ struct BbuConstPool {
     // Keep movable keys in a rooted vector, never in a persistent pointer map.
     graph_values: Vec<EgclVal>,
     graph_refs: Vec<u32>,
+    /// A core image's registry unit: a heap constant the pool cannot encode is
+    /// written as a saved heap reference (tag 21) instead of failing. The heap
+    /// snapshot carries the object itself, and the restore remaps the
+    /// reference, so the function keeps its exact constant.
+    saved_heap_refs: bool,
+    /// Hash tables whose entries are being encoded, so one that contains itself
+    /// is refused instead of recursing forever.
+    open_tables: Vec<EgclVal>,
 }
 
 impl egcl_rt::gc::TraceHostRoots for BbuConstPool {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.graph_values, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.open_tables, visit);
     }
 }
 
@@ -9532,6 +9774,52 @@ impl BbuConstPool {
         references[0]
     }
 
+    /// Tag 22: a hash table's test, then its key/value pairs as constant refs.
+    /// Each entry is encoded before the table, so its refs point backwards.
+    fn hash_table(&mut self, mut table: EgclVal) -> Option<u32> {
+        egcl_rt::rooted_ref!(_table_root = &mut table);
+        if egcl_stdlib::hash_table_weakness(table).ok()?.is_some()
+            || self.open_tables.contains(&table)
+        {
+            return None;
+        }
+        let test = match egcl_stdlib::hash_table_test(table).ok()? {
+            egcl_stdlib::HashTest::Eq => 0u8,
+            egcl_stdlib::HashTest::Eql => 1,
+            egcl_stdlib::HashTest::Equal => 2,
+            egcl_stdlib::HashTest::Equalp => 3,
+        };
+        // Encoding an entry can allocate, so keep the entries rooted as a flat
+        // key, value, key, value… vector.
+        egcl_rt::rooted!(
+            entries = egcl_stdlib::hash_table_entries(table)
+                .ok()?
+                .into_iter()
+                .flat_map(|(key, value)| [key, value])
+                .collect::<Vec<EgclVal>>()
+        );
+        self.open_tables.push(table);
+        let mut refs = Vec::with_capacity(entries.len());
+        for index in 0..entries.len() {
+            match self.value(entries[index]) {
+                Some(reference) => refs.push(reference),
+                None => {
+                    self.open_tables.pop();
+                    return None;
+                }
+            }
+        }
+        self.open_tables.pop();
+        let mut bytes = Vec::new();
+        put_u8(&mut bytes, 22);
+        put_u8(&mut bytes, test);
+        put_u32(&mut bytes, u32::try_from(refs.len() / 2).ok()?);
+        for reference in refs {
+            put_u32(&mut bytes, reference);
+        }
+        Some(self.intern_encoded(bytes))
+    }
+
     fn value_leaf(&mut self, mut v: EgclVal) -> Option<u32> {
         egcl_rt::rooted_ref!(_v_root = &mut v);
         if v.is_nil() {
@@ -9584,6 +9872,13 @@ impl BbuConstPool {
         if v.is_string() {
             return Some(self.string(&val_as_str(v)));
         }
+        // A string with a fill pointer or adjustable storage, such as the ones
+        // cl-interpol's `#?"…"` reader builds. Externalizing a vector preserves
+        // its active elements (CLHS 3.2.4.2.2), so it loads as a simple string.
+        // Without this, one such literal made the whole file source-only.
+        if let Some(contents) = egcl_stdlib::cvec_char_contents(v) {
+            return Some(self.string(&contents));
+        }
         if v.is_symbol() {
             let idx = v.as_symbol_index();
             if let Some(r) = self.symbol_by_index(idx) {
@@ -9630,6 +9925,35 @@ impl BbuConstPool {
             put_u32(&mut bytes, name_ref);
             return Some(self.intern_encoded(bytes));
         }
+        // A package object, as `(load-time-value (find-package …))` or `#.` yields:
+        // by name, resolved again on load (CLHS 3.2.4.2.2 makes packages similar
+        // by name).
+        if let Some(name) = egcl_stdlib::package_name(v) {
+            let name_ref = self.string(&name);
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 20);
+            put_u32(&mut bytes, name_ref);
+            return Some(self.intern_encoded(bytes));
+        }
+        // A hash table, such as a `#.(make-hash-table)` literal or a load-time
+        // cache: its test and its entries, which is what similarity requires of
+        // a hash table (CLHS 3.2.4.2.2). A weak table, or one containing itself,
+        // is left to the caller's fallback. A core image keeps the table itself
+        // (below): it may be shared mutable state, which a copy would split.
+        if egcl_stdlib::hash_table_p(v) && !self.saved_heap_refs {
+            return self.hash_table(v);
+        }
+        // Only for a core image, whose heap snapshot holds the object: a package
+        // from `(load-time-value (find-package …))`, a hash table, an instance.
+        // Without this the function was left out of the image, and its restored
+        // stub silently ran a NIL body — ironclad's MASSAGE-SYMBOL answered NIL
+        // for every digest name in a saved executable.
+        if self.saved_heap_refs && v.is_heap_object() {
+            let mut bytes = Vec::new();
+            put_u8(&mut bytes, 21);
+            put_u64(&mut bytes, v.0);
+            return Some(self.intern_encoded(bytes));
+        }
         None
     }
 }
@@ -9652,6 +9976,8 @@ struct BbuFunction {
     // Per `handler-case` form: its clauses as (type-name string ref, clause body
     // byte offset, var slot or NO_INDEX).
     handler_cases: Vec<Vec<(u32, u32, u32)>>,
+    // Per `handler-bind` form: its condition type names as string refs.
+    handler_binds: Vec<Vec<u32>>,
 }
 
 fn bbu_instr_len(i: &Instr) -> Option<usize> {
@@ -9736,11 +10062,13 @@ fn serialize_bbu_function(
     // `serialize_bbu_function_tree`, which serializes children before the owner.
     nested_global: &[u32],
 ) -> Option<BbuFunction> {
-    // Handler-bind tables do not yet have a BBU encoding. Handler-case clauses
-    // are serialized below.
-    if !bf.handler_binds.is_empty() {
-        return None;
-    }
+    // Each handler-bind's type names; the handler functions themselves are
+    // operands on the stack, so the table is all PUSH_HANDLER_BIND needs.
+    let handler_binds: Vec<Vec<u32>> = bf
+        .handler_binds
+        .iter()
+        .map(|info| info.types.iter().map(|name| pool.string(name)).collect())
+        .collect();
     let mut literal_refs = Vec::with_capacity(bf.constants.len());
     for &c in &bf.constants {
         match pool.value(c) {
@@ -9761,9 +10089,17 @@ fn serialize_bbu_function(
 
     let mut offsets = Vec::with_capacity(bf.code.len());
     let mut pc = 0u32;
+    // A core image may keep closures built from a source form (EvalHost,
+    // MakeClosureEnv): it already carries such source-based functions, and
+    // leaving the function out would leave a stub that answers NIL.
+    let image = pool.saved_heap_refs;
     for instr in &bf.code {
         offsets.push(pc);
-        let len = match bbu_instr_len(instr) {
+        let len = match instr {
+            Instr::EvalHost(_) | Instr::MakeClosureEnv(_) if image => Some(5),
+            _ => bbu_instr_len(instr),
+        };
+        let len = match len {
             Some(len) => len,
             None => {
                 if std::env::var_os("EGCL_BFASL_FORM").is_some() {
@@ -9998,6 +10334,10 @@ fn serialize_bbu_function(
                 // heap frame is captured), so no slot payload follows.
                 put_u16(&mut code, u16::from(*capture_env));
             }
+            Instr::EvalHost(idx) | Instr::MakeClosureEnv(idx) if image => {
+                put_u8(&mut code, if matches!(instr, Instr::EvalHost(_)) { 0x46 } else { 0x47 });
+                put_u32(&mut code, *idx as u32);
+            }
             Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => {
                 if std::env::var_os("EGCL_BFASL_FORM").is_some() {
                     eprintln!("[bfasl] serialize: non-portable instr {instr:?}");
@@ -10059,6 +10399,7 @@ fn serialize_bbu_function(
             }
             tables
         },
+        handler_binds,
     })
 }
 
@@ -10269,6 +10610,21 @@ fn serialize_bbu_restart_tables(functions: &[BbuFunction]) -> Vec<u8> {
             for &(name_ref, function_ref) in table {
                 put_u32(&mut out, name_ref);
                 put_u32(&mut out, function_ref);
+            }
+        }
+    }
+    out
+}
+
+fn serialize_bbu_handler_binds(functions: &[BbuFunction]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, functions.len() as u32);
+    for function in functions {
+        put_u32(&mut out, function.handler_binds.len() as u32);
+        for types in &function.handler_binds {
+            put_u32(&mut out, types.len() as u32);
+            for &type_ref in types {
+                put_u32(&mut out, type_ref);
             }
         }
     }
@@ -10768,7 +11124,7 @@ pub fn build_bbu_from_forms(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 4);
+    put_u32(&mut out, 5);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(source.as_bytes()));
 
@@ -10805,6 +11161,11 @@ pub fn build_bbu_from_forms(
     put_u16(&mut out, 0);
     put_u32(&mut out, self_calls.len() as u32);
     out.extend_from_slice(&self_calls);
+    let handler_binds = serialize_bbu_handler_binds(&functions);
+    put_u16(&mut out, BBU_AUX_HANDLER_BINDS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, handler_binds.len() as u32);
+    out.extend_from_slice(&handler_binds);
     Ok(Some(out))
 }
 
@@ -10826,7 +11187,7 @@ fn assemble_bbu(
     put_u32(&mut out, pool.entries.len() as u32);
     put_u32(&mut out, functions.len() as u32);
     put_u32(&mut out, load_actions.len() as u32);
-    put_u32(&mut out, 4);
+    put_u32(&mut out, 5);
     put_u32(&mut out, source_file_ref);
     put_u64(&mut out, fnv1a64(content_tag));
     for entry in &pool.entries {
@@ -10862,6 +11223,11 @@ fn assemble_bbu(
     put_u16(&mut out, 0);
     put_u32(&mut out, self_calls.len() as u32);
     out.extend_from_slice(&self_calls);
+    let handler_binds = serialize_bbu_handler_binds(functions);
+    put_u16(&mut out, BBU_AUX_HANDLER_BINDS);
+    put_u16(&mut out, 0);
+    put_u32(&mut out, handler_binds.len() as u32);
+    out.extend_from_slice(&handler_binds);
     out
 }
 
@@ -11481,6 +11847,20 @@ enum BbuConstant {
     Pathname {
         name_ref: u32,
     },
+    /// A package object, by name: load resolves it with the package registry,
+    /// so the constant is the same object FIND-PACKAGE returns there.
+    PackageObject {
+        name_ref: u32,
+    },
+    /// A core image's heap object, by its saved tagged value; accepted only
+    /// while restoring that image, which remaps it to the object's new address.
+    SavedHeapRef(u64),
+    /// A hash table: its test (0 EQ, 1 EQL, 2 EQUAL, 3 EQUALP) and its entries
+    /// as alternating key and value refs, all to earlier constants.
+    HashTable {
+        test: u8,
+        entry_refs: Vec<u32>,
+    },
     /// A general multidimensional array: dimensions plus row-major element refs.
     MdArray {
         dimensions: Vec<u64>,
@@ -11685,6 +12065,24 @@ fn parse_bbu_constant(
         18 => BbuConstant::Pathname {
             name_ref: cursor.u32()?,
         },
+        20 if bytecode_version >= 0x0203 => BbuConstant::PackageObject {
+            name_ref: cursor.u32()?,
+        },
+        21 if bytecode_version >= 0x0203 => BbuConstant::SavedHeapRef(cursor.u64()?),
+        22 if bytecode_version >= 0x0203 => {
+            let test = cursor.u8()?;
+            if test > 3 {
+                return Err(bbu_error("invalid hash table test"));
+            }
+            let count = cursor.u32()? as usize;
+            // Bounds-check against the file before allocating the ref buffer.
+            let bytes = cursor.take(count.checked_mul(8).ok_or_else(|| bbu_error("hash table too large"))?)?;
+            let entry_refs = bytes
+                .chunks_exact(4)
+                .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            BbuConstant::HashTable { test, entry_refs }
+        }
         19 if bytecode_version >= 0x010d => {
             let rank = cursor.u32()? as usize;
             if rank > 1024 {
@@ -11884,11 +12282,63 @@ fn parse_bbu_handler_cases(
     Ok(functions)
 }
 
+fn parse_bbu_handler_binds(
+    bytes: &[u8],
+    function_count: usize,
+) -> Result<Vec<Vec<Vec<u32>>>, EgclError> {
+    let mut cursor = BbuCursor::new(bytes);
+    if cursor.u32()? as usize != function_count {
+        return Err(bbu_error(
+            "handler-bind function count does not match function table",
+        ));
+    }
+    let mut functions = Vec::with_capacity(function_count);
+    for _ in 0..function_count {
+        let table_count = cursor.u32()? as usize;
+        let mut tables = Vec::with_capacity(table_count.min(bytes.len()));
+        for _ in 0..table_count {
+            let type_count = cursor.u32()? as usize;
+            let mut types = Vec::with_capacity(type_count.min(bytes.len()));
+            for _ in 0..type_count {
+                types.push(cursor.u32()?);
+            }
+            tables.push(types);
+        }
+        functions.push(tables);
+    }
+    if !cursor.done() {
+        return Err(bbu_error("trailing handler-bind metadata"));
+    }
+    Ok(functions)
+}
+
 fn materialize_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, EgclError> {
     let mut values = allocate_bbu_constants(constants)?;
     egcl_rt::rooted_ref!(_values_root = &mut values);
     fill_bbu_constant_edges(constants, &values)?;
+    fill_bbu_hash_tables(constants, &values)?;
     Ok(values)
+}
+
+// Last, once every cons and vector is complete: EQUAL and EQUALP tables hash a
+// key's contents. Entries refer only to earlier constants (the encoder writes
+// them first), so a table used as another table's key is already filled. An
+// insertion can allocate; `values` is rooted by the caller and each entry is
+// read from it afresh.
+fn fill_bbu_hash_tables(constants: &[BbuConstant], values: &[EgclVal]) -> Result<(), EgclError> {
+    for (index, constant) in constants.iter().enumerate() {
+        let BbuConstant::HashTable { entry_refs, .. } = constant else {
+            continue;
+        };
+        for pair in entry_refs.chunks_exact(2) {
+            let (key, value) = (pair[0] as usize, pair[1] as usize);
+            if key >= index || value >= index {
+                return Err(bbu_error("hash table entry refers forward"));
+            }
+            egcl_stdlib::set_gethash(values[key], values[index], values[value])?;
+        }
+    }
+    Ok(())
 }
 
 // Allocate every aggregate before installing its edges. A constant graph can
@@ -12028,6 +12478,28 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                 egcl_rt::rooted_ref!(_ns_root = &mut ns);
                 egcl_stdlib::pathnames::parse_namestring(ns, None, None)?.0
             }
+            BbuConstant::SavedHeapRef(raw) => {
+                EgclVal::from_raw(egcl_rt::gc::remap_saved_pointer(*raw))
+            }
+            // A package not defined yet is created empty, as a symbol constant's
+            // home package is, so its later DEFPACKAGE reconciles into this
+            // same object.
+            BbuConstant::PackageObject { name_ref } => {
+                super::package_object(bbu_string(constants, *name_ref)?)
+            }
+            // Empty here; fill_bbu_hash_tables inserts the entries once every
+            // key is complete, since EQUAL and EQUALP hash a key's contents.
+            BbuConstant::HashTable { test, .. } => {
+                egcl_stdlib::make_hash_table(&egcl_stdlib::MakeHashTableOptions {
+                    test: match test {
+                        0 => egcl_stdlib::HashTest::Eq,
+                        1 => egcl_stdlib::HashTest::Eql,
+                        2 => egcl_stdlib::HashTest::Equal,
+                        _ => egcl_stdlib::HashTest::Equalp,
+                    },
+                    ..Default::default()
+                })?
+            }
             BbuConstant::Cons(_, _) => arena_cons(NIL, NIL),
             BbuConstant::Vector(refs) => egcl_stdlib::build_simple_vector(&vec![NIL; refs.len()]),
             BbuConstant::MdArray {
@@ -12102,6 +12574,7 @@ fn decode_bbu_function(
     encoded: &EncodedBbuFunction,
     constants: &[EgclVal],
     handler_case_table: &[Vec<(u32, u32, u32)>],
+    handler_bind_table: &[Vec<u32>],
     bytecode_version: u16,
 ) -> Result<BytecodeFunction, EgclError> {
     let mut cursor = BbuCursor::new(&encoded.code);
@@ -12265,11 +12738,31 @@ fn decode_bbu_function(
                 MemoryFenceKind::from_u8(cursor.u8()?)
                     .ok_or_else(|| bbu_error("invalid memory-fence kind"))?,
             ),
+            // Core-image only; the loader rejects them in a fasl.
+            0x46 | 0x47 if bytecode_version >= 0x0203 => {
+                let literal = cursor.u32()?;
+                if literal > u16::MAX as u32 || literal as usize >= encoded.literal_refs.len() {
+                    return Err(bbu_error("closure-form operand out of bounds"));
+                }
+                if opcode == 0x46 {
+                    Instr::EvalHost(literal as u16)
+                } else {
+                    Instr::MakeClosureEnv(literal as u16)
+                }
+            }
             0x28 => Instr::PushHandlerCase {
                 hc: cursor.u32()?,
                 sp_restore: cursor.u16()?,
             },
             0x29 => Instr::PopHandlerCase,
+            0x2a if bytecode_version >= 0x0203 => {
+                let hb = cursor.u32()?;
+                if hb as usize >= handler_bind_table.len() {
+                    return Err(bbu_error("handler-bind index out of bounds"));
+                }
+                Instr::PushHandlerBind { hb }
+            }
+            0x2b if bytecode_version >= 0x0203 => Instr::PopHandlerBind,
             0x2c => Instr::PushRestartCase {
                 rc: cursor.u32()?,
                 resume_bcp: cursor.u32()?,
@@ -12362,6 +12855,16 @@ fn decode_bbu_function(
         }
         handler_cases.push(HandlerCaseInfo { clauses: infos });
     }
+    let handler_binds = handler_bind_table
+        .iter()
+        .map(|types| {
+            types
+                .iter()
+                .map(|&type_ref| bbu_string_from_values(constants, type_ref))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|types| HandlerBindInfo { types })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let literal_values = encoded
         .literal_refs
@@ -12416,7 +12919,7 @@ fn decode_bbu_function(
         constants: literal_values,
         load_time_values: Vec::new(),
         handler_cases,
-        handler_binds: Vec::new(),
+        handler_binds,
         names,
         restart_cases: Vec::new(),
         // Filled during reconstruction once `MakeClosure` global references are
@@ -12427,7 +12930,13 @@ fn decode_bbu_function(
         has_env,
         n_locals: encoded.n_locals,
         max_stack: encoded.max_stack,
-        arity: encoded.arity_min,
+        // Positional slots: an optional-range function's include its &optional
+        // parameters, which a call may omit (arity_min is the required count).
+        arity: if !variadic && encoded.arity_max != u16::MAX {
+            encoded.arity_max
+        } else {
+            encoded.arity_min
+        },
         name,
         params_form,
         min_args: encoded.arity_min,
@@ -13938,6 +14447,15 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     for _ in 0..constant_count {
         encoded_constants.push(parse_bbu_constant(&mut cursor, bytecode_version)?);
     }
+    // A saved heap reference names an object in the image being restored; in a
+    // fasl it would be an arbitrary address.
+    if !restoring
+        && encoded_constants
+            .iter()
+            .any(|constant| matches!(constant, BbuConstant::SavedHeapRef(_)))
+    {
+        return Err(bbu_error("saved heap reference outside a core image"));
+    }
     if source_file_ref != BBU_NO_INDEX {
         bbu_string(&encoded_constants, source_file_ref)?;
     }
@@ -13986,6 +14504,14 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
             BbuConstant::MdArray { element_refs, .. } => {
                 for &reference in element_refs {
                     bbu_index(reference, encoded_constants.len(), "array element")?;
+                }
+            }
+            BbuConstant::PackageObject { name_ref } => {
+                bbu_string(&encoded_constants, *name_ref)?;
+            }
+            BbuConstant::HashTable { entry_refs, .. } => {
+                for &reference in entry_refs {
+                    bbu_index(reference, encoded_constants.len(), "hash table entry")?;
                 }
             }
             _ => {}
@@ -14048,6 +14574,7 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut function_metadata = None;
     let mut restart_tables = None;
     let mut handler_case_tables = None;
+    let mut handler_bind_tables = None;
     let mut self_call_tables = None;
     for _ in 0..aux_count {
         let kind = cursor.u16()?;
@@ -14075,10 +14602,17 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
                 return Err(bbu_error("duplicate handler-case metadata"));
             }
             handler_case_tables = Some(parse_bbu_handler_cases(bytes, function_count)?);
+        } else if kind == BBU_AUX_HANDLER_BINDS {
+            if handler_bind_tables.is_some() {
+                return Err(bbu_error("duplicate handler-bind metadata"));
+            }
+            handler_bind_tables = Some(parse_bbu_handler_binds(bytes, function_count)?);
         }
     }
     let handler_case_tables =
         handler_case_tables.unwrap_or_else(|| vec![Vec::new(); function_count]);
+    let handler_bind_tables =
+        handler_bind_tables.unwrap_or_else(|| vec![Vec::new(); function_count]);
     if !cursor.done() {
         return Err(bbu_error("trailing bytes"));
     }
@@ -14100,7 +14634,13 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     }
     for function in &encoded_functions {
         if let Some(metadata) = &function.metadata {
-            if !metadata.variadic && function.arity_min != function.arity_max {
+            // From 0x0203 a positional function may be optional-range: it
+            // requires arity_min arguments of its arity_max slots.
+            if !metadata.variadic
+                && (function.arity_min > function.arity_max
+                    || function.arity_max == u16::MAX
+                    || (bytecode_version < 0x0203 && function.arity_min != function.arity_max))
+            {
                 return Err(bbu_error("fixed function has a non-fixed arity range"));
             }
             if metadata.variadic && function.lambda_list_ref == BBU_NO_INDEX {
@@ -14322,8 +14862,22 @@ fn load_bbu_definitions(bytes: &[u8], env: &mut Env, restoring: bool) -> Result<
     let mut decoded_functions: Vec<BytecodeFunction> = Vec::with_capacity(encoded_functions.len());
     for (index, encoded) in encoded_functions.iter().enumerate() {
         let mut function = decode_bbu_function(
-            encoded, &constants, &handler_case_tables[index], bytecode_version,
+            encoded,
+            &constants,
+            &handler_case_tables[index],
+            &handler_bind_tables[index],
+            bytecode_version,
         )?;
+        // These build a closure by evaluating a source form; a fasl must stay
+        // source-free, so only a core image's registry unit may carry them.
+        if !restoring
+            && function
+                .code
+                .iter()
+                .any(|instr| matches!(instr, Instr::EvalHost(_) | Instr::MakeClosureEnv(_)))
+        {
+            return Err(bbu_error("host-evaluated closure outside a core image"));
+        }
         function.restart_cases = restart_tables[index]
             .iter()
             .map(|table| {
@@ -14931,8 +15485,11 @@ fn bind_params(
     args: &[EgclVal],
     env_frame: Option<&Arc<SharedCell<EnvFrame>>>,
 ) {
+    // An optional-range function's omitted trailing arguments bind the
+    // unsupplied marker; its entry prologue computes their defaults.
+    let unsupplied = optional_range(func).then(unsupplied_marker);
     for (i, (name, loc)) in func.param_layout.iter().enumerate() {
-        if let Some(a) = args.get(i) {
+        if let Some(a) = args.get(i).or(unsupplied.as_ref()) {
             match loc {
                 VarLoc::Slot(s) => unsafe { slot_set(frame, *s, *a) },
                 VarLoc::Boxed => bind_boxed_param(

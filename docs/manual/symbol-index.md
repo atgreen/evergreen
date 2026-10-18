@@ -32,6 +32,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ffi:callback-pointer` | [Dictionary entry](foreign.md#callbacks) |
 | `egcl-ext:cancel-finalization` | [Dictionary entry](memory.md#cancel-finalization) |
 | `egcl-ext:cas` | [Dictionary entry](user/reference/extensions.md#atomic-place-updates) |
+| `egcl-ext:chdir` | [Dictionary entry](user/reference/extensions.md#chdir) |
 | `egcl-ffi:close-foreign-library` | [Dictionary entry](foreign.md#libraries) |
 | `compile` | [Dictionary entry](compiler.md#compile) |
 | `compile-file` | [Dictionary entry](compiler.md#compile-file) |
@@ -51,6 +52,7 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ext:declaration-specifiers` | [Dictionary entry](compiler.md#declaration-specifiers) |
 | `java:define-call` | [Dictionary entry](java.md#bindings) |
 | `java:define-class` | [Dictionary entry](java.md#classes) |
+| `egcl-ext:delete-directory` | [Dictionary entry](user/reference/extensions.md#delete-directory) |
 | `egcl-ext:deopt-count` | [Dictionary entry](compiler.md#counters) |
 | `java:describe-class` | [Dictionary entry](java.md#bindings) |
 | `egcl-ext:embed-file` | [Dictionary entry](user/reference/images.md#embed-file) |

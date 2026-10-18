@@ -316,12 +316,13 @@ mod tests {
             variadic: false,
             restart_tables: Vec::new(),
             handler_cases: Vec::new(),
+            handler_binds: Vec::new(),
         };
         let mut record = Vec::new();
         serialize_bbu_function_record(&mut record, &encoded);
         let mut legacy = parse_bbu_function(&mut BbuCursor::new(&record)).unwrap();
         assert!(
-            decode_bbu_function(&legacy, &[name, other], &[], 0x0200)
+            decode_bbu_function(&legacy, &[name, other], &[], &[], 0x0200)
                 .unwrap()
                 .self_call_sites
                 .is_empty()
@@ -329,15 +330,15 @@ mod tests {
         let table = serialize_bbu_self_call_sites(&[encoded]);
         legacy.self_call_sites = parse_bbu_self_call_sites(&table, 1).unwrap().remove(0);
         assert_eq!(
-            decode_bbu_function(&legacy, &[name, other], &[], 0x0200)
+            decode_bbu_function(&legacy, &[name, other], &[], &[], 0x0200)
                 .unwrap()
                 .self_call_sites,
             vec![1]
         );
         legacy.name_ref = 1;
-        assert!(decode_bbu_function(&legacy, &[name, other], &[], 0x0200).is_err());
+        assert!(decode_bbu_function(&legacy, &[name, other], &[], &[], 0x0200).is_err());
         legacy.name_ref = 0;
         legacy.self_call_sites = vec![0];
-        assert!(decode_bbu_function(&legacy, &[name, other], &[], 0x0200).is_err());
+        assert!(decode_bbu_function(&legacy, &[name, other], &[], &[], 0x0200).is_err());
     }
 }
