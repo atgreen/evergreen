@@ -481,48 +481,36 @@ pub fn big_abs(n: &BigInt) -> BigInt {
 /// (FLOOR toward −∞, CEILING toward +∞, TRUNCATE toward 0, ROUND to nearest,
 /// ties to even).
 pub fn bigrat_round_to_int(r: &BigRat, mode: RoundMode) -> BigInt {
-    // big_divmod truncates toward zero; `rem` carries the numerator's sign.
-    let (q, rem) = big_divmod(&r.num, &r.den);
+    // The denominator is positive, so this rounds num/den as integers do.
+    big_round_div(&r.num, &r.den, mode).0
+}
+/// FLOOR/CEILING/TRUNCATE/ROUND of integers `a`/`b`: (quotient, remainder =
+/// a − quotient·b) from one truncating division. `b` must be nonzero.
+pub fn big_round_div(a: &BigInt, b: &BigInt, mode: RoundMode) -> (BigInt, BigInt) {
+    // big_divmod truncates toward zero; `rem` carries the dividend's sign.
+    let (q, rem) = big_divmod(a, b);
     if rem.is_zero() {
-        return q;
+        return (q, rem);
     }
-    let neg = r.num.sign < 0;
-    let away = |q: &BigInt| {
-        if neg {
-            big_sub(q, &BigInt::one())
-        } else {
-            big_add(q, &BigInt::one())
-        }
+    let neg = a.sign != b.sign;
+    let away = match mode {
+        RoundMode::Truncate => false,
+        RoundMode::Floor => neg,
+        RoundMode::Ceiling => !neg,
+        // Compare 2·|rem| with |b|: <half keeps q, >half rounds away, and a
+        // tie rounds to the even neighbour.
+        RoundMode::Round => match mag_cmp(&mag_shl_bits(&rem.mag, 1), &b.mag) {
+            Ordering::Less => false,
+            Ordering::Greater => true,
+            Ordering::Equal => q.mag.first().copied().unwrap_or(0) & 1 != 0,
+        },
     };
-    match mode {
-        RoundMode::Truncate => q,
-        RoundMode::Floor => {
-            if neg {
-                away(&q)
-            } else {
-                q
-            }
-        }
-        RoundMode::Ceiling => {
-            if neg {
-                q
-            } else {
-                away(&q)
-            }
-        }
-        RoundMode::Round => {
-            // Compare 2·|rem| with den: <half keeps q, >half rounds away, and a
-            // tie rounds to the even neighbour.
-            let two_rem = big_mul(&BigInt::from_i64(2), &big_abs(&rem));
-            match big_cmp(&two_rem, &r.den) {
-                Ordering::Less => q,
-                Ordering::Greater => away(&q),
-                Ordering::Equal => {
-                    let even = q.mag.first().copied().unwrap_or(0) & 1 == 0;
-                    if even { q } else { away(&q) }
-                }
-            }
-        }
+    if !away {
+        (q, rem)
+    } else if neg {
+        (big_sub(&q, &BigInt::one()), big_add(&rem, b))
+    } else {
+        (big_add(&q, &BigInt::one()), big_sub(&rem, b))
     }
 }
 /// CL `MOD` on floats: the remainder of FLOOR, which takes the sign of the
@@ -546,20 +534,17 @@ pub fn fixnum_from_i128(n: i128) -> Option<EgclVal> {
 }
 /// Fixnum/fixnum fast path for FLOOR/CEILING/TRUNCATE/ROUND (and so MOD/REM).
 ///
-/// The general `exact_int_div` path builds a reduced `BigRat` per operand — a
-/// heap-allocated limb vector each, plus a gcd loop in `BigRat::new` — then does
-/// a rational divide, round, multiply and subtract. That made `(mod i 16)` on
-/// two fixnums ~18x more expensive than `(aref v 3)`, and put ~15% of a hot
-/// loop's time in malloc/free (bliss-mwpb). Small integers are the common case,
-/// so divide them natively; nothing here allocates.
+/// Other integers take `big_round_div`, which copies each operand into a
+/// heap-allocated `BigInt`. The general path once built a reduced `BigRat` per
+/// operand and did a rational divide, round, multiply and subtract, which made
+/// `(mod i 16)` on two fixnums ~18x more expensive than `(aref v 3)` and put
+/// ~15% of a hot loop's time in malloc/free (bliss-mwpb). Small integers are
+/// the common case, so divide them natively; nothing here allocates.
 ///
-/// The semantics are transcribed from `bigrat_round_to_int` and MUST stay
-/// identical to it: `BigRat::new` normalizes the denominator positive, so its
-/// `neg` is the sign of the exact QUOTIENT (not of `a`); the ROUND tie compares
-/// `2*|rem|` against the denominator and breaks toward the even neighbour; and
-/// the returned remainder is `a - q*b`. Reducing by the gcd scales `|rem|` and
-/// the denominator by the same factor, so comparing against the unreduced `|b|`
-/// gives the same ordering.
+/// The semantics are transcribed from `big_round_div` and MUST stay identical
+/// to it: `neg` is the sign of the exact quotient, the ROUND tie compares
+/// `2*|rem|` against `|b|` and breaks toward the even neighbour, and the
+/// returned remainder is `a - q*b`.
 ///
 /// Arithmetic is in `i128` so no intermediate can overflow a fixnum operand
 /// pair; `None` defers to the general path if a result leaves fixnum range.
@@ -626,6 +611,18 @@ pub fn exact_int_div(
         if let Some(pair) = fixnum_int_div(a.as_fixnum(), bi, mode) {
             return Some(Ok(pair));
         }
+    }
+    // Integer operands need one division. The BigRat path below first reduces
+    // a/b to lowest terms, a gcd costing hundreds of divisions on RSA-sized
+    // operands.
+    if let (Some(ia), Some(ib)) = (bigint_from_val(a), bigint_from_val(b)) {
+        if ib.is_zero() {
+            return Some(Err(EgclError::ArithmeticError("division by zero".into())));
+        }
+        let (q, rem) = big_round_div(&ia, &ib, mode);
+        crate::rooted!(q_val = q.to_val());
+        let rem_val = rem.to_val();
+        return Some(Ok((*q_val, rem_val)));
     }
     let ra = as_bigrat(a)?;
     let rb = as_bigrat(b)?;
@@ -1004,6 +1001,66 @@ mod divmod_tests {
             let (q, r) = mag_divmod(&product, &d);
             assert!(r.is_empty(), "exact division left {r:?}");
             assert_eq!(q, a);
+        }
+    }
+
+    /// The properties that pin down each mode's quotient: a == q·b + r, and r
+    /// lies in the range that mode leaves (sign of `a`, of `b`, against `b`,
+    /// or within half of |b| with ties on an even q).
+    fn check_round(a: &BigInt, b: &BigInt, mode: RoundMode) {
+        let (q, r) = big_round_div(a, b, mode);
+        assert!(big_add(&big_mul(&q, b), &r) == *a);
+        assert_eq!(mag_cmp(&r.mag, &b.mag), Ordering::Less);
+        if r.is_zero() {
+            return;
+        }
+        match mode {
+            RoundMode::Truncate => assert_eq!(r.sign, a.sign),
+            RoundMode::Floor => assert_eq!(r.sign, b.sign),
+            RoundMode::Ceiling => assert_eq!(r.sign, -b.sign),
+            RoundMode::Round => match mag_cmp(&mag_shl_bits(&r.mag, 1), &b.mag) {
+                Ordering::Less => {}
+                Ordering::Equal => assert_eq!(q.mag.first().copied().unwrap_or(0) & 1, 0),
+                Ordering::Greater => panic!("ROUND left more than half of |b|"),
+            },
+        }
+    }
+
+    #[test]
+    fn integer_rounding_division_in_every_mode_and_sign() {
+        let modes = [
+            RoundMode::Floor,
+            RoundMode::Ceiling,
+            RoundMode::Truncate,
+            RoundMode::Round,
+        ];
+        let mut rng = Rng(0xD1B54A32D192ED03);
+        for _ in 0..200 {
+            for (alimbs, blimbs) in [(1, 1), (4, 2), (64, 32), (3, 5)] {
+                let (am, bm) = (rng.mag(alimbs), rng.mag(blimbs));
+                if bm.is_empty() {
+                    continue;
+                }
+                for (sa, sb) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                    let a = BigInt::from_mag(sa, am.clone());
+                    let b = BigInt::from_mag(sb, bm.clone());
+                    for mode in modes {
+                        check_round(&a, &b, mode);
+                    }
+                }
+            }
+        }
+        // Ties go to the even quotient, from either side and in either sign.
+        let i = BigInt::from_i64;
+        for (a, b, q) in [
+            (7, 2, 4),
+            (5, 2, 2),
+            (-5, 2, -2),
+            (-7, 2, -4),
+            (5, -2, -2),
+            (-5, -2, 2),
+        ] {
+            assert!(big_round_div(&i(a), &i(b), RoundMode::Round).0 == i(q));
         }
     }
 }
