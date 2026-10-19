@@ -15,6 +15,11 @@
   shares, and the loader could read its next form in another package, then
   report "undefined function" for a function the file had just defined
   ([#433](https://github.com/atgreen/evergreen/pull/433)).
+- A `MAKE-PACKAGE` name clash or a `DELETE-PACKAGE` of a missing package
+  signals a `SIMPLE-PACKAGE-ERROR` whose report says what failed, such as
+  "a package named FOO already exists". Both are still correctable with
+  `CONTINUE`; until now they signalled a bare `PACKAGE-ERROR` with no message
+  ([#436](https://github.com/atgreen/evergreen/pull/436)).
 
 ## 0.0.10 - 2026-10-19
 
