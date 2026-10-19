@@ -54,6 +54,11 @@
 
 ### Fixed
 
+- `FILE-POSITION` works on a Gray stream. It signalled a bare `STREAM-ERROR`,
+  so cl-tar could not extract any archive and ocicl could not install a
+  package. The Gray protocol gains `STREAM-FILE-POSITION`, as in SBCL, which
+  `FILE-POSITION` calls and `EGCL-GRAY-STREAMS` exports
+  ([#428](https://github.com/atgreen/evergreen/pull/428)).
 - A compiled method shows up as `(METHOD <generic-function>)`, with its
   qualifier, in `EGCL_SPROF` profiles, the tiering log and backtraces, instead
   of an anonymous `METHOD` shared by every method
