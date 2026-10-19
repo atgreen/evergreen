@@ -248,6 +248,8 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
         }
         package_names.insert(canonical);
     }
+    // Interning the marker allocates, which the snapshot below must not do.
+    let unsupplied = bytecode::unsupplied_marker();
     egcl_rt::gc::with_heap_snapshot(|| {
         generics::discard_compiled_method_sources();
         let mut candidates = BTreeMap::new();
@@ -273,7 +275,18 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     .map(|&id| EgclVal::from_raw(id)),
             )
             .collect();
-        let indices = candidates.keys().copied().collect();
+        let mut indices: HashSet<u32> = candidates.keys().copied().collect();
+        // A compiled method's callable sits in its own uninterned symbol's
+        // function cell, for tiering (#413). It is reached through its generic
+        // function, so that cell must not root every method in the image.
+        indices.extend(
+            METHOD_COMPILED
+                .borrow()
+                .values()
+                .filter(|&&callable| egcl_rt::function::is_interpreted_function(callable))
+                .filter_map(|&callable| egcl_rt::function::name(callable).symbol_index())
+                .filter(|&index| symbols::is_uninterned(index)),
+        );
         let mut exposed_roots = symbols::shake_roots(&indices);
         let mut roots = Vec::new();
         // SAFETY: this entire analysis runs under with_heap_snapshot and makes
@@ -543,7 +556,12 @@ fn analyze(spec: &Spec, entry: u32, keeps: &[u32], env: &mut Env) -> Result<Plan
                     // Bound functions are checked through their actual object
                     // and code, including aliases. Unbound runtime names can
                     // designate native builtins through FUNCALL or saved data.
-                    if callable_data && !functions.contains_key(&index) {
+                    // The omitted-&optional marker is a constant in an
+                    // optional-range prologue, never a function to call.
+                    if callable_data
+                        && !functions.contains_key(&index)
+                        && value != unsupplied
+                    {
                         let name = symbols::symbol_name(index).unwrap_or_default();
                         let runtime_symbol = is_builtin_function(&name)
                             || name.starts_with("EGCL")

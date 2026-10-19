@@ -441,7 +441,7 @@ fn shake_retains_hidden_source_binders_and_methods() {
     let source = f.path("hidden.lisp");
     let fasl = f.path("hidden.bfasl");
     let spec = f.path("hidden.shake");
-    fs::write(&source, "(defpackage :hidden-walker (:use :cl)) (in-package :hidden-walker) (defun optional-main (&optional (x 7)) x) (defun method-main () (method-result))").unwrap();
+    fs::write(&source, "(defpackage :hidden-walker (:use :cl)) (in-package :hidden-walker) (defun optional-main (&optional (x 7)) x) (defun key-main (&key (x 7)) x) (defun method-main () (method-result))").unwrap();
     ok(run(
         BIN,
         &[
@@ -450,12 +450,16 @@ fn shake_retains_hidden_source_binders_and_methods() {
             &format!("(compile-file {source:?} :output-file {fasl:?})"),
         ],
     ));
+    // `&optional` alone binds positionally since #392, through a prologue and
+    // not the run-time lambda-list binder, so it needs no walker. `&key` still
+    // takes the binder.
     for (entry, setup, dependency) in [
-        ("OPTIONAL-MAIN", "", "variadic lambda-list binder"),
+        ("OPTIONAL-MAIN", "", None),
+        ("KEY-MAIN", "", Some("variadic lambda-list binder")),
         (
             "METHOD-MAIN",
             "(let ((x 7)) (defmethod hidden-walker::method-result () x))",
-            "source generic method",
+            Some("source generic method"),
         ),
     ] {
         let core = f.path(&format!("{entry}.core"));
@@ -480,8 +484,13 @@ fn shake_retains_hidden_source_binders_and_methods() {
                 "--dry-run",
             ],
         ));
-        assert!(report.contains("capabilities=tree-walker\n"), "{report}");
-        assert!(report.contains(dependency), "{report}");
+        match dependency {
+            Some(dependency) => {
+                assert!(report.contains("capabilities=tree-walker\n"), "{report}");
+                assert!(report.contains(dependency), "{report}");
+            }
+            None => assert!(report.contains("capabilities=\n"), "{report}"),
+        }
     }
 }
 

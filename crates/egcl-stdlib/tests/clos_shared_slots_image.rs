@@ -117,8 +117,8 @@ fn a_wrong_version_or_a_truncated_block_is_refused() {
     assert_eq!(&bytes[..4], b"CLST");
     assert_eq!(
         u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-        5,
-        "4 added shared_slots; 5 adds ClosState's standard_class and structure_class"
+        6,
+        "5 added ClosState's standard_class and structure_class; 6 adds forward_referenced"
     );
 
     let mut wrong = bytes.clone();

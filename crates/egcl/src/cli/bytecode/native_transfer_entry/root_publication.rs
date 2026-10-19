@@ -1375,6 +1375,9 @@ mod tests {
     fn native_only_caller_value_moves_across_a_mapped_child() {
         let _lock = crate::cli::heap_test_lock()
             .lock().unwrap_or_else(|e| e.into_inner());
+        // Since #420 the caller reaches this child on the ordinary ABI; this
+        // fixture covers the mapped adapter, so it must take it (bliss-lzdkm).
+        let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         let loop_forms = "((let ((n 0))

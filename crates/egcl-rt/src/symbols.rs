@@ -1060,13 +1060,12 @@ pub fn shake_roots(candidates: &std::collections::HashSet<u32>) -> Vec<EgclVal> 
                     roots.push(EgclVal(data.function.load(Ordering::Acquire)));
                 }
             }
-            for &obj in reg.uninterned.values() {
+            for (index, &obj) in &reg.uninterned {
                 let data = unsafe { &*symbol_data(obj) };
-                roots.extend([
-                    EgclVal(data.value.load(Ordering::Acquire)),
-                    data.plist,
-                    EgclVal(data.function.load(Ordering::Acquire)),
-                ]);
+                roots.extend([EgclVal(data.value.load(Ordering::Acquire)), data.plist]);
+                if !candidates.contains(index) {
+                    roots.push(EgclVal(data.function.load(Ordering::Acquire)));
+                }
             }
         }
         roots

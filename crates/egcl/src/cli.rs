@@ -6723,9 +6723,9 @@ fn read_slot_value(instance: EgclVal, slot: EgclVal, env: &Env) -> Result<EgclVa
     // String and then walks the precedence list comparing strings, per call, for
     // every slot read in the system — SLOT-VALUE reaches here too, not just
     // accessors. ONE layout lookup answers both halves: `slot_value_if_present`
-    // returns None when the slot is not an instance slot, and calls
-    // `update_if_obsolete` itself, so it describes the instance's CURRENT shape
-    // rather than a stale layout (bliss-51m0l).
+    // returns None when the slot is not an instance slot (bliss-51m0l). It also
+    // declines an obsolete instance, which `ensure_instance_current` above has
+    // already ruled out.
     //
     // A non-instance answers false and falls through, preserving the NIL that
     // ASDF's readers rely on at the end of this function (bliss-lb6.14).
@@ -44280,12 +44280,16 @@ mod host_registry_hook_tests {
         let params = *params;
         let body = *body;
         let name = "HOST-HOOK-TEST-MAC";
+        // Defined as if inside (LET ((HELD 42)) ...), so the round trip has a
+        // captured binding to keep.
+        let captured = Arc::new(SharedCell::new(EnvFrame::default()));
+        captured.borrow_mut().vars.insert("HELD".into(), EgclVal::from_fixnum(42));
         global_macro_insert(
             name.into(),
             MacroDef {
                 params_form: params,
                 body,
-                captured_frame: Arc::new(SharedCell::new(EnvFrame::default())),
+                captured_frame: captured,
                 bytecode: None,
                 function: None,
             },
@@ -44326,13 +44330,19 @@ mod host_registry_hook_tests {
         let (rp, rb) = global_macro_source(name).expect("macro restored via drain");
         assert_eq!(rp.to_raw(), params.to_raw(), "macro params_form preserved");
         assert_eq!(rb.to_raw(), body.to_raw(), "macro body preserved");
-        // Its captured frame is the fresh root frame (top-level rebind).
+        // Its captured frame is the one it closed over, restored with its
+        // binding, not the fresh root frame (bliss-6kts9, GitHub #426).
         {
             let borrow = GLOBAL_MACROS.lock().unwrap();
             let def = borrow.get(name).unwrap();
             assert!(
-                Arc::ptr_eq(&def.captured_frame, &fresh_frame),
-                "restored macro rebinds captured_frame to the fresh root frame"
+                !Arc::ptr_eq(&def.captured_frame, &fresh_frame),
+                "restored macro keeps its own captured frame"
+            );
+            assert_eq!(
+                def.captured_frame.borrow().vars.get("HELD").copied(),
+                Some(EgclVal::from_fixnum(42)),
+                "restored macro frame keeps its binding"
             );
             assert!(
                 def.bytecode.is_none(),

@@ -151,6 +151,8 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // bindings. Loading those bodies cannot recover the original named calls.
 // Version 9 retains the shared local-function scopes of source closures.
 // Older images discarded that lexical namespace and cannot reconstruct it.
+// Version 10 saves each macro's captured frame with its definition. Older
+// images dropped it, so a macro defined inside a LET lost its bindings.
 const FORMAT_VERSION: u32 = 10;
 
 /// Image file header (128 bytes). D7.01.
