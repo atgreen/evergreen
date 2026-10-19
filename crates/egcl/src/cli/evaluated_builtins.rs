@@ -1456,6 +1456,16 @@ fn resolve(name: &str) -> Option<Handler> {
                 num_val(args[0])?
             };
             if secs > 0.0 {
+                // A sleeping thread must not hold up a collection. It never
+                // reaches a poll point while asleep, and the collector's SIGUSR1
+                // nudge only interrupts nanosleep, which std::thread::sleep then
+                // resumes, so a stop-the-world handshake waited on it, gave up,
+                // and the allocation that wanted the collection failed
+                // ("memory allocation of 16 bytes failed" from a cons). Sleep
+                // as a native blocking region, as condition waits, joins and
+                // socket I/O already do.
+                // SAFETY: nothing below touches the Lisp heap or invokes Lisp.
+                let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
                 std::thread::sleep(std::time::Duration::from_secs_f64(secs));
             }
             Ok(NIL)
