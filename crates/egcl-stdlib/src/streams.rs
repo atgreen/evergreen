@@ -4230,6 +4230,15 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+/// A failed socket operation, keeping the OS error number alongside the text
+/// so Lisp can classify it (EADDRINUSE, ECONNREFUSED, ...) without parsing it.
+fn socket_error(context: impl std::fmt::Display, error: std::io::Error) -> EgclError {
+    EgclError::SocketError {
+        errno: error.raw_os_error(),
+        message: format!("{context}: {error}"),
+    }
+}
+
 struct SocketListener {
     socket: TcpListener,
     closed: AtomicBool,
@@ -4250,7 +4259,7 @@ impl SocketListener {
         // Each parked operation needs its own poller registration. Duplicates
         // share the listening socket and its shutdown, but have distinct fds.
         let waiter = self.socket.try_clone()
-            .map_err(|e| EgclError::FileError(format!("socket listener wait: {e}")))?;
+            .map_err(|e| socket_error("socket listener wait", e))?;
         let ready = egcl_rt::sync::wait_fd(
             waiter.as_raw_fd(), egcl_rt::sync::IoInterest::Read, timeout,
         )?;
@@ -4323,11 +4332,11 @@ pub fn socket_listen_with_options(
         Err(last_error)
     };
     let listener = bind()
-        .map_err(|e| EgclError::FileError(format!("socket-listen {host}:{port}: {e}")))?;
+        .map_err(|e| socket_error(format_args!("socket-listen {host}:{port}"), e))?;
     #[cfg(unix)]
     listener
         .set_nonblocking(true)
-        .map_err(|e| EgclError::FileError(format!("socket-listen: {e}")))?;
+        .map_err(|e| socket_error("socket-listen", e))?;
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     socket_listeners().lock().unwrap().insert(
@@ -4373,7 +4382,7 @@ pub fn socket_connect(
     let connected = if let Some(timeout) = timeout {
         let addresses = (host, port)
             .to_socket_addrs()
-            .map_err(|e| EgclError::FileError(format!("socket-connect {host}:{port}: {e}")))?;
+            .map_err(|e| socket_error(format_args!("socket-connect {host}:{port}"), e))?;
         let start = std::time::Instant::now();
         let mut result = Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
@@ -4397,7 +4406,7 @@ pub fn socket_connect(
     } else {
         TcpStream::connect((host, port))
     }
-    .map_err(|e| EgclError::FileError(format!("socket-connect {host}:{port}: {e}")))?;
+    .map_err(|e| socket_error(format_args!("socket-connect {host}:{port}"), e))?;
     socket_stream(connected)
 }
 
@@ -4417,7 +4426,7 @@ pub fn socket_accept(id: u64) -> Result<EgclVal, EgclError> {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 listener.wait(None)?;
             }
-            Err(e) => return Err(EgclError::FileError(format!("socket-accept: {e}"))),
+            Err(e) => return Err(socket_error("socket-accept", e)),
         }
     };
     socket_stream(stream)

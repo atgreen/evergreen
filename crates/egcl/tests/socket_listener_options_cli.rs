@@ -158,3 +158,31 @@ fn socket_names_report_both_ends_of_a_connection() {
     "#,
     );
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn socket_failures_carry_their_os_errno() {
+    // usocket could only report a bind failure as UNKNOWN-ERROR with errno 0,
+    // because the errno survived only inside the message text (GitHub #427).
+    // The condition must stay a FILE-ERROR with its message, so handlers that
+    // already caught socket failures keep catching them.
+    check(
+        r#"
+      (let* ((listener (egcl::%socket-listen "127.0.0.1" 0 5 t))
+             (port (egcl::%socket-local-port listener)))
+        (let ((c (handler-case (progn (egcl::%socket-listen "127.0.0.1" port 5 t) nil)
+                   (egcl-ext:socket-os-error (c) c))))
+          (assert c)
+          (assert (typep c 'file-error))
+          (assert (typep c 'simple-condition))
+          (assert (eql 98 (egcl-ext:socket-os-error-errno c)))     ; EADDRINUSE
+          (assert (search "socket-listen" (princ-to-string c))))
+        (egcl::%socket-close listener)
+        (let ((c (handler-case (progn (close (egcl::%socket-connect "127.0.0.1" port)) nil)
+                   (egcl-ext:socket-os-error (c) c))))
+          (assert c)
+          (assert (eql 111 (egcl-ext:socket-os-error-errno c))))) ; ECONNREFUSED
+      (format t "SOCKET-ERRNO-OK~%")
+    "#,
+    );
+}
