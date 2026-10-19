@@ -42176,18 +42176,21 @@ fn signal_correctable_package_error(
     env: &mut Env,
 ) -> Result<bool, EgclError> {
     let package_kw = resolve_sym("PACKAGE").unwrap_or(NIL);
+    let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+    let arguments_kw = resolve_sym("FORMAT-ARGUMENTS").unwrap_or(NIL);
     egcl_rt::rooted!(package = package);
-    // Deliberately PACKAGE-ERROR, not the SIMPLE-PACKAGE-ERROR used for
-    // uncaught package failures. Signalling a SIMPLE-PACKAGE-ERROR through this
-    // hand-rolled restart path silently disables the CONTINUE restart this
-    // function exists to provide: INVOKE-RESTART then fails to map the restart
-    // object back to its entry ("Restart #<INSTANCE> not found"). The cause is
-    // not yet understood — it is NOT simply a two-parent class, since
-    // SIMPLE-TYPE-ERROR behaves identically here and works — so the narrowing
-    // lives in bliss-hpqo. Switch once that is fixed; the cost meanwhile is
-    // that these reports cannot carry a message.
+    // A SIMPLE-PACKAGE-ERROR, so the report says what failed. The message goes
+    // in as a FORMAT argument rather than the control string, since a package
+    // name may contain a tilde.
+    egcl_rt::rooted!(control = arena_str("~A"));
+    egcl_rt::rooted!(text = arena_str(message));
+    egcl_rt::rooted!(arguments = vec_to_list(&[*text]));
     egcl_rt::rooted!(
-        condition = build_condition_instance(env, "PACKAGE-ERROR", &[package_kw, *package])?
+        condition = build_condition_instance(
+            env,
+            "SIMPLE-PACKAGE-ERROR",
+            &[package_kw, *package, control_kw, *control, arguments_kw, *arguments],
+        )?
     );
 
     let base_len = env.restarts.len();

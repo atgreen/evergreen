@@ -5929,6 +5929,26 @@ fn package_errors_are_correctable() {
             "(handler-case (delete-package \"PE-NO-SUCH-RR\") (error () :signalled))",
             ":SIGNALLED",
         ),
+        // The correctable condition carries its message as a SIMPLE-CONDITION
+        // while CONTINUE still works (bliss-hpqo kept it a bare PACKAGE-ERROR).
+        (
+            "(progn (make-package \"PE-E\" :use '(\"CL\")) \
+               (handler-bind ((error (lambda (c) \
+                                       (when (and (typep c 'simple-condition) \
+                                                  (search \"already exists\" \
+                                                          (princ-to-string c))) \
+                                         (continue c))))) \
+                 (package-name (make-package \"PE-E\"))))",
+            "\"PE-E\"",
+        ),
+        (
+            "(handler-bind ((error (lambda (c) \
+                                     (when (search \"no package named PE-NO~SUCH\" \
+                                                   (princ-to-string c)) \
+                                       (continue))))) \
+               (delete-package \"PE-NO~SUCH\"))",
+            "NIL",
+        ),
     ];
     for (expr, expected) in cases {
         let program = format!("(progn {helper} (cl:format t \"~S\" {expr}))");
