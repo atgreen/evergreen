@@ -3276,6 +3276,10 @@ thread_local! {
     /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
     static PENDING_HOST_SETF: RefCell<Vec<SetfRec>> =
         const { RefCell::new(Vec::new()) };
+    /// Symbol indices of the saved world's proclaimed specials, re-proclaimed
+    /// by the post-`Env::new` drain.
+    static PENDING_PROCLAIMED_SPECIALS: RefCell<Vec<u32>> =
+        const { RefCell::new(Vec::new()) };
     /// References to the saving Env's global definition tables, stashed by
     /// `save_core_and_die` for the serialize hook (whose signature has no Env).
     /// The save-time full_gc root scan keeps the contained EgclVals current;
@@ -3794,6 +3798,24 @@ fn host_serialize_registries() -> Vec<u8> {
             out.extend_from_slice(&id.to_le_bytes());
             out.extend_from_slice(&slot.to_le_bytes());
             out.push(u8::from(writer));
+        }
+    }
+    // The proclaimed specials (DEFVAR, DEFPARAMETER, DECLAIM SPECIAL). A
+    // restored world otherwise knows only the earmuff convention and the
+    // symbols that have a value, so a valueless `(defvar flag?)` was lexical
+    // after a restore while `(defvar *flag*)` and `(defvar flag? 1)` survived.
+    // Symbol indices are stable across an image; a symbol's spelling is not
+    // (see `symbol_home_package_name`), so the indices are what is written.
+    out.extend_from_slice(b"SPCL");
+    {
+        let names = PROCLAIMED_SPECIAL.borrow();
+        let indices: Vec<u32> = names
+            .iter()
+            .filter_map(|name| egcl_rt::symbols::find_index(name))
+            .collect();
+        out.extend_from_slice(&(indices.len() as u32).to_le_bytes());
+        for index in indices {
+            out.extend_from_slice(&index.to_le_bytes());
         }
     }
     // SETF expanders are distinct from SETF writer functions. Preserve their
@@ -4415,6 +4437,22 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
         }
     }
     *ACCESSOR_METHODS.borrow_mut() = accessor_methods;
+    // Older images lack SPCL; their valueless, un-earmuffed specials are lost.
+    // Only indices are stashed here: the names are read off the symbol tables
+    // in the drain, once they are live.
+    if data.get(off..off + 4) == Some(b"SPCL") {
+        off += 4;
+        let bad = || EgclError::InvalidImage("host registry: truncated (proclaimed specials)".into());
+        let count = hr_get_u32(data, &mut off).ok_or_else(bad)? as usize;
+        if count > (data.len() - off) / 4 {
+            return Err(bad());
+        }
+        let mut indices = Vec::with_capacity(count);
+        for _ in 0..count {
+            indices.push(hr_get_u32(data, &mut off).ok_or_else(bad)?);
+        }
+        PENDING_PROCLAIMED_SPECIALS.with(|p| *p.borrow_mut() = indices);
+    }
     let mut expanders = HashMap::new();
     if data.get(off..off + 4) == Some(b"SEXP") {
         off += 4;
@@ -4487,6 +4525,13 @@ fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
                 ),
             );
         });
+    }
+    // The saved world's proclaimed specials, by symbol index: `proclaim_special`
+    // spells each as the restored symbol tables spell it, which is what the
+    // LET and reference sites look up.
+    let specials = PENDING_PROCLAIMED_SPECIALS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    for index in specials {
+        proclaim_special(EgclVal::from_symbol_index(index));
     }
 }
 
