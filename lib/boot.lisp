@@ -4153,6 +4153,10 @@
 (defgeneric stream-clear-input (stream))
 (defgeneric stream-read-byte (stream))
 (defgeneric stream-read-sequence (stream sequence start end))
+;; FILE-POSITION on a Gray stream, as SBCL's SB-GRAY:STREAM-FILE-POSITION:
+;; with no POSITION-SPEC return the position or NIL; with one (an integer,
+;; :START or :END) move there and return true on success.
+(defgeneric stream-file-position (stream &optional position-spec))
 
 (defgeneric stream-write-char (stream character))
 (defgeneric stream-line-column (stream))
@@ -4231,6 +4235,12 @@
           (t (stream-unread-char stream c) t))))
 
 (defmethod stream-clear-input ((stream fundamental-input-stream)) nil)
+
+;; A Gray stream that does not track its position reports it as unknown and
+;; cannot be repositioned, which FILE-POSITION expresses as NIL.
+(defmethod stream-file-position ((stream fundamental-stream) &optional position-spec)
+  (declare (ignore position-spec))
+  nil)
 
 (defmethod stream-read-sequence ((stream fundamental-input-stream) sequence start end)
   (let ((read-element (if (subtypep (stream-element-type stream) 'character)
@@ -4317,7 +4327,7 @@
                   stream-write-string stream-terpri stream-fresh-line
                   stream-finish-output stream-force-output stream-clear-output
                   stream-advance-to-column stream-read-byte stream-write-byte
-                  stream-read-sequence stream-write-sequence)))
+                  stream-read-sequence stream-write-sequence stream-file-position)))
   ;; Bootstrap symbols were historically available by their unqualified names.
   ;; Keep them present in CL-USER as well as in the public protocol package.
   (import protocol :cl-user)
