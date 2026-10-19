@@ -9,6 +9,12 @@
   so a server whose main thread parks in `(loop (sleep 60))` could abort a
   worker with "memory allocation of 16 bytes failed"
   ([#434](https://github.com/atgreen/evergreen/pull/434)).
+- `LOAD` and `COMPILE-FILE` bind `*PACKAGE*` for the extent of the file, so
+  a file that sets `*PACKAGE*` and then starts a thread stays in its own
+  package. The file's package used to live in the global value every thread
+  shares, and the loader could read its next form in another package, then
+  report "undefined function" for a function the file had just defined
+  ([#433](https://github.com/atgreen/evergreen/pull/433)).
 
 ## 0.0.10 - 2026-10-19
 
