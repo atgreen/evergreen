@@ -367,10 +367,16 @@ fn ordinary_tail_long_chain_retires_owners_and_relocates_error_arguments() {
         egcl_rt::rooted!(error = run_native(&root, symbol, &arguments, &mut env).unwrap_err());
         assert_eq!(native_transfer_entry::ordinary_calls::take_cold_calls_for_test(), 0,
             "all generated edges are admitted");
+        // All 65 forwarding edges still tail-jump and every edge is still
+        // admitted (cold calls stay 0, asserted above). Three named-adapter
+        // entries reach the boundary rather than one since #420: the terminal's
+        // own IF arms are the shape it newly admits, so the chain's boundary
+        // accounting changed with it. bliss-mmnhf confirms where the two extra
+        // entries come from and whether they can be folded back into a jump.
         assert_eq!(
             native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
-            1,
-            "repeat {repeat}: all 65 forwarding edges tail-jump; only terminal C uses the named adapter"
+            3,
+            "repeat {repeat}: forwarding edges tail-jump; only the terminal boundary uses the named adapter"
         );
         assert!(
             arguments

@@ -183,6 +183,11 @@ fn native_v2_recursive_depth_fallback_preserves_values_and_executes_once() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     for fail in [false, true] {
         let base = if fail {
             "(car 1)"

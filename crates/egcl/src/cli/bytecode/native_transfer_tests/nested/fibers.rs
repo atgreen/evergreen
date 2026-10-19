@@ -586,6 +586,14 @@ fn run_child_modes(refuse: bool, modes: std::ops::Range<usize>) {
         let num_workers = *num_workers;
         for mode in modes.clone() {
             MODE.store(mode, Ordering::Relaxed);
+            // Modes >= 6 are the recursive fixtures: they want four physical
+            // native child frames and the c2i recursive entries that count
+            // them. #420 admits the same body onto the ordinary ABI, where
+            // self-calls go direct, so ask for the mapped variant explicitly
+            // (bliss-lzdkm). Modes < 6 are unaffected and keep the production
+            // admission.
+            let _mapped = (mode >= 6)
+                .then(crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new);
             #[cfg(feature = "native-transfer-test-hooks")]
             {
                 *REFUSE_TARGET.lock().unwrap() = None;

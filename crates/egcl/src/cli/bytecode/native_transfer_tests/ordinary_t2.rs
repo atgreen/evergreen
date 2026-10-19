@@ -929,6 +929,11 @@ fn ordinary_t2_recursive_calls_move_roots_and_recover_deepest_guard_once() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     for fail in [false, true] {
         let name = if fail {
             "ORDINARY-T2-RECURSIVE-ERROR"
@@ -1743,6 +1748,11 @@ fn ordinary_t2_recursive_frames_do_not_grow_the_managed_stack() {
         .unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     let name = "ORDINARY-T2-NATIVE-FRAME-DEPTH";
     let form = "(if (= n 0) (ordinary-t2-native-frame-leaf)
         (+ (ordinary-t2-native-frame-depth (- n 1)) 1))";
@@ -1913,6 +1923,11 @@ fn ordinary_t2_native_recursion_falls_back_at_depth_cap_and_restores_anchor() {
         .lock().unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     let name = "ORDINARY-T2-NATIVE-CAP";
     let form = "(if (= n 0) (ordinary-t2-native-cap-leaf)
         (+ (ordinary-t2-native-cap (- n 1)) 1))";

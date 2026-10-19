@@ -140,6 +140,48 @@ fn format_listing(code: &TransferCode, header: &str) -> String {
 static SEGMENT_RUNS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// #420 admitted recursive shapes that branch between a call and arithmetic onto
+// the ordinary ABI. The mapped managed-activation path they used to take still
+// exists, and still serves every shape the ordinary emitter refuses, so its
+// protocol fixtures need a way to reach it deliberately rather than losing
+// their coverage to the wider admission (bliss-lzdkm).
+//
+// Compilation can run off-thread under `with_gc_stable_mutator`, so this is a
+// process-global flag rather than a thread-local. Hold it only through
+// `MappedOnlyForTest`, and only in tests that already serialize on
+// `heap_test_lock()`.
+#[cfg(test)]
+static MAPPED_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) struct MappedOnlyForTest;
+
+#[cfg(test)]
+impl MappedOnlyForTest {
+    pub(in crate::cli::bytecode) fn new() -> Self {
+        MAPPED_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for MappedOnlyForTest {
+    fn drop(&mut self) {
+        MAPPED_ONLY.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn ordinary_admission_suppressed() -> bool {
+    MAPPED_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn ordinary_admission_suppressed() -> bool {
+    false
+}
+
 #[cfg(test)]
 static RECURSIVE_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
@@ -859,7 +901,8 @@ impl TransferCode {
         } else { None };
         let mut ordinary_arity = None;
         let mut ordinary_cold = None;
-        let ordinary = ordinary_ir.filter(|_| fixed_tagged_parameters(&body)
+        let ordinary = ordinary_ir.filter(|_| !ordinary_admission_suppressed()
+            && fixed_tagged_parameters(&body)
             && scope_free_native_body(&body, false))
             .and_then(|ir| {
                 use egcl_compiler::t2::emit::{OrdinaryLispEntryOptions, OrdinaryCallTarget, OrdinaryCallFlags};
