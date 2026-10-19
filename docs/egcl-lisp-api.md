@@ -69,6 +69,14 @@ after a timeout and can be read again or closed by the caller.
 This is distinct from `EGCL-EXT:TIMEOUT-CONDITION`, which represents a sandbox
 CPU deadline. It does not impose a total deadline on a multi-operation protocol.
 
+### Socket errors
+
+`EGCL-EXT:SOCKET-OS-ERROR` is a subtype of `SIMPLE-FILE-ERROR`. A native
+socket bind, listen, connect, accept or listener wait signals it on failure.
+`EGCL-EXT:SOCKET-OS-ERROR-ERRNO` returns the operating system's error number,
+or `NIL` when there is none, so a caller can tell `EADDRINUSE` from
+`ECONNREFUSED` without parsing the message.
+
 ### Environment and working directory
 
 #### `egcl-ext:getenv`

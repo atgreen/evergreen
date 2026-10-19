@@ -404,6 +404,28 @@ or call latency. Compiled files preserve the intrinsic without source fallback.
 Signalled when a stream operation reaches an I/O deadline, such as a socket
 read timeout. `stream-error-stream` returns the stream when it is known.
 
+## Socket errors
+
+### `egcl-ext:socket-os-error` { #socket-os-error }
+
+**Condition type**; a subtype of `simple-file-error`
+
+Signalled when a native socket operation fails: binding or listening,
+connecting, accepting, or waiting on a listener. Because it is a `file-error`,
+handlers written for socket failures before it existed still catch it. The
+simple-condition accessors provide the diagnostic text, which includes the
+operation and the address.
+
+### `egcl-ext:socket-os-error-errno` { #socket-os-error-errno }
+
+**Function** `(egcl-ext:socket-os-error-errno condition)` → integer or `nil`
+
+Returns the operating system's error number for the failure, such as 98
+(`EADDRINUSE`) or 111 (`ECONNREFUSED`) on Linux, or `nil` when the failure had
+none, as for a host name that did not resolve. usocket's EGCL backend uses it
+to signal `usocket:address-in-use-error` and the other errno-specific
+conditions.
+
 ## Internal functions { #internal-functions }
 
 These functions are implementation details used by EGCL's bootstrap and its
