@@ -1486,6 +1486,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#socket-errors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Socket errors
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Socket errors">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#socket-os-error" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:socket-os-error
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#socket-os-error-errno" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:socket-os-error-errno
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#internal-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2787,6 +2826,45 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#socket-errors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Socket errors
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Socket errors">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#socket-os-error" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:socket-os-error
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#socket-os-error-errno" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        egcl-ext:socket-os-error-errno
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#internal-functions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -3134,6 +3212,21 @@ or call latency. Compiled files preserve the intrinsic without source fallback.<
 <p><strong>Condition type</strong>; a subtype of <code>stream-error</code> and <code>simple-condition</code></p>
 <p>Signalled when a stream operation reaches an I/O deadline, such as a socket
 read timeout. <code>stream-error-stream</code> returns the stream when it is known.</p>
+<h2 id="socket-errors">Socket errors<a class="headerlink" href="#socket-errors" title="Permanent link">&para;</a></h2>
+<h3 id="socket-os-error"><code>egcl-ext:socket-os-error</code><a class="headerlink" href="#socket-os-error" title="Permanent link">&para;</a></h3>
+<p><strong>Condition type</strong>; a subtype of <code>simple-file-error</code></p>
+<p>Signalled when a native socket operation fails: binding or listening,
+connecting, accepting, or waiting on a listener. Because it is a <code>file-error</code>,
+handlers written for socket failures before it existed still catch it. The
+simple-condition accessors provide the diagnostic text, which includes the
+operation and the address.</p>
+<h3 id="socket-os-error-errno"><code>egcl-ext:socket-os-error-errno</code><a class="headerlink" href="#socket-os-error-errno" title="Permanent link">&para;</a></h3>
+<p><strong>Function</strong> <code>(egcl-ext:socket-os-error-errno condition)</code> → integer or <code>nil</code></p>
+<p>Returns the operating system's error number for the failure, such as 98
+(<code>EADDRINUSE</code>) or 111 (<code>ECONNREFUSED</code>) on Linux, or <code>nil</code> when the failure had
+none, as for a host name that did not resolve. usocket's EGCL backend uses it
+to signal <code>usocket:address-in-use-error</code> and the other errno-specific
+conditions.</p>
 <h2 id="internal-functions">Internal functions<a class="headerlink" href="#internal-functions" title="Permanent link">&para;</a></h2>
 <p>These functions are implementation details used by EGCL's bootstrap and its
 bundled ASDF. Their names begin with <code>%</code>, and they may change or disappear
