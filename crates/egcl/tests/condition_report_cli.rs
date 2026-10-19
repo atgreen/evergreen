@@ -74,12 +74,18 @@ fn reports(forms: &[&str], marker: &str, stress: bool) {
             "--no-init",
         ])
         .env_remove("EGCL_GC_STRESS")
-        .env_remove("EGCL_GC_POISON");
+        .env_remove("EGCL_GC_POISON")
+        .env_remove("EGCL_GC_STRESS_AFTER_INIT");
     for form in forms {
         command.args(["--eval", form]);
     }
+    // Stress only the forms under test: a collection on every bootstrap
+    // allocation costs minutes before they run, and overran the timeout.
     if stress {
-        command.env("EGCL_GC_STRESS", "1").env("EGCL_GC_POISON", "1");
+        command
+            .env("EGCL_GC_STRESS", "1")
+            .env("EGCL_GC_POISON", "1")
+            .env("EGCL_GC_STRESS_AFTER_INIT", "1");
     }
     let output = command.output().expect("run bounded EGCL");
     let text = format!(
