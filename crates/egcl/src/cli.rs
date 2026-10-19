@@ -26455,12 +26455,22 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 }
                 let stream = eval_form(args[0], env)?;
                 if args.len() < 2 {
+                    if is_gray_stream(stream) {
+                        return invoke_generic_function("STREAM-FILE-POSITION", &[stream], env);
+                    }
                     return egcl_stdlib::file_position(stream);
                 }
                 // Root the stream across evaluating the position spec — that eval
                 // can allocate and fire a relocating minor GC (GC-safety).
                 egcl_rt::rooted!(stream = stream);
                 let spec = eval_form(args[1], env)?;
+                // A Gray stream positions itself (STREAM-FILE-POSITION). The
+                // native path knows only built-in streams and signalled a bare
+                // STREAM-ERROR, which broke tar archives read through Gray
+                // streams (cl-tar seeks its entry streams this way).
+                if is_gray_stream(*stream) {
+                    return invoke_generic_function("STREAM-FILE-POSITION", &[*stream, spec], env);
+                }
                 if spec.is_symbol() {
                     match sym_bare_name_rc(spec).as_ref() {
                         "END" => return egcl_stdlib::set_file_position_to_end(*stream),
