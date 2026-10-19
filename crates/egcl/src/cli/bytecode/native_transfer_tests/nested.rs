@@ -151,6 +151,11 @@ fn native_v2_distinct_mutual_calls_bound_depth_and_retire_crossed_frames() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     let a = "((distinct-mutual-tick) (if (= n 0) (distinct-mutual-base x fail) (distinct-mutual-b (- n 1) x fail)))";
     let b = "((distinct-mutual-tick) (if (= n 0) (distinct-mutual-base x fail) (distinct-mutual-a (- n 1) x fail)))";
     super::super::super::read_eval_all_env(&format!(
@@ -295,6 +300,11 @@ fn native_v2_distinct_callee_returns_to_recursive_parent_activation() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: physical
+    // native child frames and the c2i recursive entries that count them. #420
+    // admits the same body onto the ordinary ABI, where self-calls go direct,
+    // so ask for the mapped variant explicitly (bliss-lzdkm).
+    let _mapped = crate::cli::bytecode::native_transfer_entry::MappedOnlyForTest::new();
     let form = "((if (= n 0) (distinct-recursive-leaf x fail) (distinct-recursive-parent (- n 1) x fail)))";
     let leaf =
         "((distinct-recursive-collect) (if fail (distinct-recursive-error) (values x (list x))))";

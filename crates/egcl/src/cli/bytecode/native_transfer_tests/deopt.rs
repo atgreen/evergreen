@@ -96,6 +96,11 @@ fn native_v2_optimized_deopt_moves_caller_roots_and_retires_errors() {
         .unwrap_or_else(|e| e.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
+    // This fixture exercises the mapped managed-activation path: a deopt in the
+    // deepest of nine activations, with the callers' roots moving underneath it.
+    // #420 admits this shape onto the ordinary ABI, where self-calls go direct
+    // and the overflow never deopts, so ask for the mapped variant explicitly.
+    let _mapped = native_transfer_entry::MappedOnlyForTest::new();
     for fail in [false, true] {
         let finish = if fail { "(car 1)" } else { "x" };
         let form = "(progn (segment-moving-tick v)
