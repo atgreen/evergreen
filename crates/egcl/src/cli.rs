@@ -3267,9 +3267,12 @@ type MethodRec = (u64, u64, u64, u8, u32, Vec<SpecRec>);
 type SetfRec = (String, Vec<String>, u64, u64);
 
 thread_local! {
-    /// Remapped (name, params_form_raw, body_raw) records awaiting rebind to the
-    /// fresh root frame after an image load. Drained by the CLI post-`Env::new`.
-    static PENDING_HOST_MACROS: RefCell<Vec<(String, u64, u64)>> = const { RefCell::new(Vec::new()) };
+    /// Remapped (name, params_form_raw, body_raw, captured-frame id) records
+    /// awaiting rebind after an image load. Drained by the CLI post-`Env::new`.
+    /// The frame id indexes the CLSR frame table, or is `u32::MAX` for a macro
+    /// that captured nothing but the root env shell (bliss-6kts9).
+    static PENDING_HOST_MACROS: RefCell<Vec<(String, u64, u64, u32)>> =
+        const { RefCell::new(Vec::new()) };
     /// Remapped ((SETF place) key, params, params_form_raw, body_raw) records.
     static PENDING_HOST_SETF: RefCell<Vec<SetfRec>> =
         const { RefCell::new(Vec::new()) };
@@ -3357,19 +3360,105 @@ fn hr_get_u64(data: &[u8], off: &mut usize) -> Option<u64> {
 fn host_serialize_registries() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(b"HREG");
+    // Assign the CLSR frame ids HERE rather than inside the CLSR block below,
+    // because the macro and method records are written first and each needs the
+    // id of the frame it captured. Root sources: tree-walker closures, the
+    // bytecode CLOSURE_ENV, the captured frame of every saved method (bliss-mxjr)
+    // and — new in bliss-6kts9 — of every saved macro. A definition inside a LET
+    // used to lose its lexicals across an image because its frame was reachable
+    // from none of the others, so it was never serialized at all.
+    //
+    // For macros the old code did not even reach for an id: it assumed a
+    // top-level macro's captured frame is always the root env shell and rebound
+    // it to the fresh root on restore. `(let ((y (list 1 2))) (defmacro with-y ()
+    // `',y))` breaks that assumption, and every expansion in a restored image
+    // signalled "the variable Y is unbound" while a DEFUN or DEFMETHOD in the
+    // same LET kept its binding (GitHub #426).
+    //
+    // Frames are SHARED: two methods closing over one LET must come back sharing
+    // a single frame, not holding copies. Keying by `Arc::as_ptr` and walking
+    // parents once is what preserves that, and it is the same walk the CLSR block
+    // used before this was hoisted.
+    let setf_expanders = SAVE_SETF_EXPANDERS.with(|s| {
+        s.borrow().as_ref().map(|table| table.borrow().clone()).unwrap_or_default()
+    });
+    // Drop the lock before the table walk below, which locks GLOBAL_MACROS again.
+    let macro_frames: Vec<Arc<SharedCell<EnvFrame>>> = GLOBAL_MACROS
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|d| d.bytecode.is_none())
+        .map(|d| Arc::clone(&d.captured_frame))
+        .collect();
+    let function_scopes = reified_metadata::FunctionScopes::collect();
+    let (frame_ids, clsr_frames) = {
+        let reg = closure_registry();
+        let reg = reg.borrow();
+        let bc_env = bytecode::closure_env_entries();
+        let method_frames: Vec<Arc<SharedCell<EnvFrame>>> = SAVE_METHODS.with(|m| {
+            m.borrow().as_ref().map_or_else(Vec::new, |map| {
+                map.borrow()
+                    .values()
+                    .flat_map(|defs| defs.iter())
+                    .filter_map(|d| d.captured_frame.as_ref().map(Arc::clone))
+                    .collect()
+            })
+        });
+        let mut frame_ids: HashMap<usize, u32> = HashMap::new();
+        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
+        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
+            .values()
+            .map(|c| Arc::clone(&c.captured_frame))
+            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
+            .chain(method_frames)
+            .chain(macro_frames)
+            .chain(function_scopes.frames())
+            .chain(setf_expanders.values().filter_map(|expander| match expander {
+                SetfExpander::Expander(def) => Some(Arc::clone(&def.captured_frame)),
+                SetfExpander::LongUpdate { captured_frame, .. } => Some(Arc::clone(captured_frame)),
+                SetfExpander::ShortUpdate(_) => None,
+            }))
+            .collect();
+        for root in roots {
+            let mut cur = Some(root);
+            while let Some(f) = cur {
+                let key = Arc::as_ptr(&f) as usize;
+                if frame_ids.contains_key(&key) {
+                    break;
+                }
+                frame_ids.insert(key, frames.len() as u32);
+                let parent = f.borrow().parent.clone();
+                frames.push(f);
+                cur = parent;
+            }
+        }
+        (frame_ids, frames)
+    };
+    let frame_id_of = |f: Option<&Arc<SharedCell<EnvFrame>>>| -> u32 {
+        f.and_then(|f| frame_ids.get(&(Arc::as_ptr(f) as usize)).copied())
+            .unwrap_or(u32::MAX)
+    };
     // Macros.
-    let macros: Vec<(String, u64, u64)> = GLOBAL_MACROS
+    let macros: Vec<(String, u64, u64, u32)> = GLOBAL_MACROS
         .lock()
         .unwrap()
         .iter()
         .filter(|(_, d)| d.bytecode.is_none())
-        .map(|(n, d)| (n.clone(), d.params_form.to_raw(), d.body.to_raw()))
+        .map(|(n, d)| {
+            (
+                n.clone(),
+                d.params_form.to_raw(),
+                d.body.to_raw(),
+                frame_id_of(Some(&d.captured_frame)),
+            )
+        })
         .collect();
     out.extend_from_slice(&(macros.len() as u32).to_le_bytes());
-    for (name, params_raw, body_raw) in &macros {
+    for (name, params_raw, body_raw, frame_id) in &macros {
         hr_put_str(&mut out, name);
         out.extend_from_slice(&params_raw.to_le_bytes());
         out.extend_from_slice(&body_raw.to_le_bytes());
+        out.extend_from_slice(&frame_id.to_le_bytes());
     }
     // Setf-functions.
     let setfs: Vec<(String, Vec<String>, u64, u64)> = with_global_setf_fns(|m| {
@@ -3425,68 +3514,6 @@ fn host_serialize_registries() -> Vec<u8> {
         out.extend_from_slice(&gf_raw.to_le_bytes());
         out.push(*comb);
     }
-    // Assign the CLSR frame ids HERE rather than inside the CLSR block below,
-    // because the method records are written first and each needs the id of the
-    // frame it captured. Three root sources: tree-walker closures, the bytecode
-    // CLOSURE_ENV, and — new in bliss-mxjr — the captured frame of every saved
-    // method. A method defined inside a LET used to lose its lexicals across an
-    // image because its frame was reachable from none of the other two, so it was
-    // never serialized at all.
-    //
-    // Frames are SHARED: two methods closing over one LET must come back sharing
-    // a single frame, not holding copies. Keying by `Arc::as_ptr` and walking
-    // parents once is what preserves that, and it is the same walk the CLSR block
-    // used before this was hoisted.
-    let setf_expanders = SAVE_SETF_EXPANDERS.with(|s| {
-        s.borrow().as_ref().map(|table| table.borrow().clone()).unwrap_or_default()
-    });
-    let function_scopes = reified_metadata::FunctionScopes::collect();
-    let (frame_ids, clsr_frames) = {
-        let reg = closure_registry();
-        let reg = reg.borrow();
-        let bc_env = bytecode::closure_env_entries();
-        let method_frames: Vec<Arc<SharedCell<EnvFrame>>> = SAVE_METHODS.with(|m| {
-            m.borrow().as_ref().map_or_else(Vec::new, |map| {
-                map.borrow()
-                    .values()
-                    .flat_map(|defs| defs.iter())
-                    .filter_map(|d| d.captured_frame.as_ref().map(Arc::clone))
-                    .collect()
-            })
-        });
-        let mut frame_ids: HashMap<usize, u32> = HashMap::new();
-        let mut frames: Vec<Arc<SharedCell<EnvFrame>>> = Vec::new();
-        let roots: Vec<Arc<SharedCell<EnvFrame>>> = reg
-            .values()
-            .map(|c| Arc::clone(&c.captured_frame))
-            .chain(bc_env.iter().map(|(_, f)| Arc::clone(f)))
-            .chain(method_frames)
-            .chain(function_scopes.frames())
-            .chain(setf_expanders.values().filter_map(|expander| match expander {
-                SetfExpander::Expander(def) => Some(Arc::clone(&def.captured_frame)),
-                SetfExpander::LongUpdate { captured_frame, .. } => Some(Arc::clone(captured_frame)),
-                SetfExpander::ShortUpdate(_) => None,
-            }))
-            .collect();
-        for root in roots {
-            let mut cur = Some(root);
-            while let Some(f) = cur {
-                let key = Arc::as_ptr(&f) as usize;
-                if frame_ids.contains_key(&key) {
-                    break;
-                }
-                frame_ids.insert(key, frames.len() as u32);
-                let parent = f.borrow().parent.clone();
-                frames.push(f);
-                cur = parent;
-            }
-        }
-        (frame_ids, frames)
-    };
-    let frame_id_of = |f: Option<&Arc<SharedCell<EnvFrame>>>| -> u32 {
-        f.and_then(|f| frame_ids.get(&(Arc::as_ptr(f) as usize)).copied())
-            .unwrap_or(u32::MAX)
-    };
     let methods: Vec<(String, Vec<MethodRec>)> = SAVE_METHODS.with(|m| {
         m.borrow().as_ref().map_or_else(Vec::new, |map| {
             map.borrow()
@@ -3900,7 +3927,19 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
             .ok_or_else(|| EgclError::InvalidImage("host registry: bad macro params".into()))?;
         let body = hr_get_u64(data, &mut off)
             .ok_or_else(|| EgclError::InvalidImage("host registry: bad macro body".into()))?;
-        macros.push((name, remap(params), remap(body)));
+        // Captured-frame id, resolved against the CLSR frame table when these
+        // records are drained after Env::new (bliss-6kts9).
+        let frame_id = {
+            if data.len() < off + 4 {
+                return Err(EgclError::InvalidImage(
+                    "host registry: bad macro frame id".into(),
+                ));
+            }
+            let v = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+            off += 4;
+            v
+        };
+        macros.push((name, remap(params), remap(body), frame_id));
     }
     PENDING_HOST_MACROS.with(|p| *p.borrow_mut() = macros);
     // Setf count (u32).
@@ -4418,13 +4457,19 @@ fn host_restore_registries(data: &[u8]) -> Result<(), EgclError> {
 /// `from_raw`, `Rc::clone`, and map inserts).
 fn drain_pending_host_registries(root_frame: &Arc<SharedCell<EnvFrame>>) {
     let macros = PENDING_HOST_MACROS.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    for (name, params_raw, body_raw) in macros {
+    for (name, params_raw, body_raw, frame_id) in macros {
+        // A macro defined inside a LET captured that frame, not the root shell.
+        // Restore the frame it actually closed over; fall back to the fresh root
+        // for a top-level macro, which captured nothing (bliss-6kts9).
+        let captured_frame = PENDING_CLSR_FRAMES
+            .with(|frames| frames.borrow().get(frame_id as usize).map(Arc::clone))
+            .unwrap_or_else(|| Arc::clone(root_frame));
         global_macro_insert(
             name,
             MacroDef {
                 params_form: EgclVal::from_raw(params_raw),
                 body: EgclVal::from_raw(body_raw),
-                captured_frame: Arc::clone(root_frame),
+                captured_frame,
                 bytecode: None,
                 function: None,
             },
