@@ -155,6 +155,32 @@ fn idle_hook_and_error_drain() {
 }
 
 #[test]
+fn cl_sleep_in_a_fiber_frees_its_carrier() {
+    // CL:SLEEP used to block the carrier thread itself, so on one carrier no
+    // other fiber ran until the sleeper woke (bliss-bv4iy). B waits for A to
+    // be asleep and then records itself; A looks for that record on waking.
+    run(r##"
+      (let* ((events nil)
+             (lock (egcl-thread:make-mutex))
+             (a (egcl-fiber:make-fiber
+                  (lambda ()
+                    (egcl-thread:with-mutex (lock) (push :a-sleeping events))
+                    (assert (null (sleep 0.2)))
+                    (egcl-thread:with-mutex (lock)
+                      (if (member :b events) :saw-b :no-b)))))
+             (b (egcl-fiber:make-fiber
+                  (lambda ()
+                    (loop until (egcl-thread:with-mutex (lock) (member :a-sleeping events))
+                          do (egcl-fiber:fiber-yield))
+                    (egcl-thread:with-mutex (lock) (push :b events))
+                    :b))))
+        (assert (equal '(:saw-b :b)
+                       (egcl-fiber:run-fibers (list a b) :carrier-count 1))))
+      (format t "FIBER-API-OK~%")
+    "##);
+}
+
+#[test]
 fn saved_fiber_backtraces() {
     run(r##"
       (let* ((fiber (egcl-fiber:make-fiber (lambda () 9) :name "trace-me"))

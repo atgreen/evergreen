@@ -20,6 +20,11 @@
   "a package named FOO already exists". Both are still correctable with
   `CONTINUE`; until now they signalled a bare `PACKAGE-ERROR` with no message
   ([#436](https://github.com/atgreen/evergreen/pull/436)).
+- `SLEEP` inside a fiber suspends only that fiber, so other fibers on the
+  same carrier keep running. It used to block the carrier thread until it
+  woke. In a pinned fiber it follows `EGCL-FIBER:*PINNED-BLOCKING-ACTION*`,
+  like the other blocking operations
+  ([#437](https://github.com/atgreen/evergreen/pull/437)).
 
 ## 0.0.10 - 2026-10-19
 

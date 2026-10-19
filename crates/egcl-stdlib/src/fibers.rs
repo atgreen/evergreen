@@ -244,14 +244,7 @@ pub fn call(args: &[EgclVal]) -> Result<EgclVal, EgclError> {
         ("SLEEP", [seconds]) => {
             let duration = timeout(*seconds)?
                 .ok_or_else(|| EgclError::ProgramError("sleep needs a duration".into()))?;
-            let mode = egcl_rt::sync::blocking_mode("FIBER-SLEEP")?;
-            if mode == egcl_rt::sync::BlockingMode::Native {
-                // SAFETY: only an owned Duration is accessed while blocked.
-                let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
-                std::thread::sleep(duration);
-            } else {
-                egcl_rt::sync::fiber_sleep_cancellable(duration)?;
-            }
+            egcl_rt::sync::fiber_sleep_cancellable(duration)?;
             Ok(NIL)
         }
         ("WAIT", [number, limit]) => Ok(if wait(FiberId(id(*number)?), timeout(*limit)?)? {

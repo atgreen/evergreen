@@ -26,6 +26,7 @@ static SAFETY_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
 static POLL_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
 static T0_ALLOC_LOOP_EXIT: AtomicBool = AtomicBool::new(false);
 static T0_ALLOC_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
+static NATIVE_SLEEP_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "c-ffi")]
 static NATIVE_FFI_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "c-ffi")]
@@ -155,6 +156,13 @@ fn native_ffi_entry() -> EgclVal {
         .expect("usleep FFI call must succeed");
     }
     NATIVE_FFI_FINISHED.store(true, Ordering::Release);
+    T
+}
+
+fn native_sleep_entry() -> EgclVal {
+    NATIVE_SLEEP_STARTED.store(true, Ordering::Release);
+    // Not in a fiber, so this is the native-mode sleep.
+    egcl_rt::sync::fiber_sleep(Duration::from_secs(2)).expect("native sleep");
     T
 }
 
@@ -478,6 +486,33 @@ fn failed_safepoint_handshake_is_reported_and_cleans_up() {
 
     RELEASE_SLOW_THREAD.store(true, Ordering::Release);
     assert_eq!(join_thread(id).expect("join must succeed after cleanup"), T);
+}
+
+#[test]
+fn safepoint_wait_does_not_block_on_a_thread_in_native_fiber_sleep() {
+    serialize_global_runtime!();
+    // bliss-bv4iy: outside a fiber, fiber_sleep blocks the native thread. It
+    // reaches no poll point while asleep and std::thread::sleep resumes after
+    // the SIGUSR1 nudge, so unless it sleeps as a native blocking region the
+    // handshake waits on it until it wakes or gives up.
+    install_signal_handlers().expect("signal handlers must install before SIGUSR1 nudging");
+    NATIVE_SLEEP_STARTED.store(false, Ordering::Release);
+
+    let id = make_thread(unsafe { fn_entry(native_sleep_entry) }).expect("thread creation");
+    while !NATIVE_SLEEP_STARTED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let started = Instant::now();
+    wait_for_all_threads().expect("a sleeping thread must not fail the handshake");
+    let elapsed = started.elapsed();
+    resume_all_threads().expect("resume must succeed");
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the handshake waited {elapsed:?} on a sleeping thread"
+    );
+    assert_eq!(join_thread(id).expect("sleeping thread must finish"), T);
 }
 
 #[test]

@@ -128,6 +128,11 @@ fn sleep_fiber(duration: Duration, cancellable: bool) -> Result<(), EgclError> {
     }
     match blocking_mode("FIBER-SLEEP")? {
         BlockingMode::Native => {
+            // A sleeping thread reaches no poll point, and std::thread::sleep
+            // resumes after the collector's SIGUSR1 nudge, so sleep as a native
+            // blocking region or a stop-the-world handshake waits on us.
+            // SAFETY: only an owned Duration is accessed while blocked.
+            let _blocked = unsafe { crate::safepoint::NativeBlockingScope::enter() };
             std::thread::sleep(duration);
             Ok(())
         }
