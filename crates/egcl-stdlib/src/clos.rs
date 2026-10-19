@@ -3259,6 +3259,11 @@ pub fn slot_value(instance: EgclVal, slot_name: EgclVal) -> Result<EgclVal, Egcl
 /// Exists so a caller can make that distinction with ONE layout lookup. Asking
 /// [`slot_present_p`] and then [`slot_value`] answers it with two — two
 /// `update_if_obsolete` calls and two hash lookups for one question (bliss-51m0l).
+///
+/// Also `None` for an obsolete instance. Migrating it here would drop the
+/// record of what the redefinition changed, and the caller's general path
+/// could then no longer run UPDATE-INSTANCE-FOR-REDEFINED-CLASS: an accessor
+/// that touched the instance first left the added slots UNBOUND for good.
 pub fn slot_value_if_present(
     instance: EgclVal,
     slot_name: EgclVal,
@@ -3267,7 +3272,11 @@ pub fn slot_value_if_present(
         return None;
     }
     unsafe {
-        let instance = update_if_obsolete(instance);
+        let instance = resolve_forwarding(instance);
+        let w = *(instance.as_ptr().add(8) as *const *mut ClassWrapper);
+        if !w.is_null() && (*w).state.load(Ordering::Acquire) == WRAPPER_OBSOLETE {
+            return None;
+        }
         let idx = instance_slot_index(instance, slot_name)?;
         let v = *slot_cell(instance, idx);
         Some(if v == UNBOUND {

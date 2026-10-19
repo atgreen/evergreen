@@ -792,6 +792,9 @@ pub(super) fn shake_walker_dependencies() -> HashMap<u32, Option<&'static str>> 
 /// unreachable private code and captures before the compacting image save.
 pub(super) fn remove_shake_closure(symbol: u32) {
     debug_assert!(egcl_rt::symbols::is_uninterned(symbol));
+    // A compiled method keeps its callable in this cell (#413); a pruned one
+    // must not carry it into the saved image.
+    egcl_rt::symbols::set_symbol_function(symbol, egcl_rt::value::UNBOUND);
     closure_bodies().borrow_mut().remove(&symbol);
     clear_lazy_state(symbol);
     clear_closure_env(symbol);
