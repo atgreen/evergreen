@@ -1448,7 +1448,13 @@ fn resolve(name: &str) -> Option<Handler> {
         "SLEEP" => Some(|_operator, args, _env| {
             let args = RootedVals::new(args.to_vec());
 
-            // (sleep seconds) → NIL. Blocks the (single) thread.
+            // (sleep seconds) → NIL. In a fiber that can yield, only the fiber
+            // sleeps: its carrier runs other fibers meanwhile, as EGCL-FIBER's
+            // own SLEEP does. Elsewhere the thread sleeps as a native blocking
+            // region, so it cannot hold up a collection -- a sleeping thread
+            // reaches no poll point, and std::thread::sleep resumes after the
+            // collector's SIGUSR1 nudge ("memory allocation of 16 bytes
+            // failed" from a cons whose collection never ran).
 
             let secs = if args.is_empty() {
                 0.0
@@ -1456,17 +1462,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 num_val(args[0])?
             };
             if secs > 0.0 {
-                // A sleeping thread must not hold up a collection. It never
-                // reaches a poll point while asleep, and the collector's SIGUSR1
-                // nudge only interrupts nanosleep, which std::thread::sleep then
-                // resumes, so a stop-the-world handshake waited on it, gave up,
-                // and the allocation that wanted the collection failed
-                // ("memory allocation of 16 bytes failed" from a cons). Sleep
-                // as a native blocking region, as condition waits, joins and
-                // socket I/O already do.
-                // SAFETY: nothing below touches the Lisp heap or invokes Lisp.
-                let _blocked = unsafe { egcl_rt::safepoint::NativeBlockingScope::enter() };
-                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                egcl_rt::sync::fiber_sleep_cancellable(std::time::Duration::from_secs_f64(secs))?;
             }
             Ok(NIL)
         }),
