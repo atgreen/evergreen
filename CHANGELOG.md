@@ -2,30 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- A thread waiting in `SLEEP` no longer holds up a garbage collection. A
-  collection needed by another thread used to wait on the sleeper and give up,
-  so a server whose main thread parks in `(loop (sleep 60))` could abort a
-  worker with "memory allocation of 16 bytes failed"
-  ([#434](https://github.com/atgreen/evergreen/pull/434)).
-- `LOAD` and `COMPILE-FILE` bind `*PACKAGE*` for the extent of the file, so
-  a file that sets `*PACKAGE*` and then starts a thread stays in its own
-  package. The file's package used to live in the global value every thread
-  shares, and the loader could read its next form in another package, then
-  report "undefined function" for a function the file had just defined
-  ([#433](https://github.com/atgreen/evergreen/pull/433)).
-- A `MAKE-PACKAGE` name clash or a `DELETE-PACKAGE` of a missing package
-  signals a `SIMPLE-PACKAGE-ERROR` whose report says what failed, such as
-  "a package named FOO already exists". Both are still correctable with
-  `CONTINUE`; until now they signalled a bare `PACKAGE-ERROR` with no message
-  ([#436](https://github.com/atgreen/evergreen/pull/436)).
-- `SLEEP` inside a fiber suspends only that fiber, so other fibers on the
-  same carrier keep running. It used to block the carrier thread until it
-  woke. In a pinned fiber it follows `EGCL-FIBER:*PINNED-BLOCKING-ACTION*`,
-  like the other blocking operations
-  ([#437](https://github.com/atgreen/evergreen/pull/437)).
-
 ## 0.0.10 - 2026-10-19
 
 ### Added
@@ -91,6 +67,27 @@
 
 ### Fixed
 
+- A thread waiting in `SLEEP` no longer holds up a garbage collection. A
+  collection needed by another thread used to wait on the sleeper and give up,
+  so a server whose main thread parks in `(loop (sleep 60))` could abort a
+  worker with "memory allocation of 16 bytes failed"
+  ([#434](https://github.com/atgreen/evergreen/pull/434)).
+- `LOAD` and `COMPILE-FILE` bind `*PACKAGE*` for the extent of the file, so
+  a file that sets `*PACKAGE*` and then starts a thread stays in its own
+  package. The file's package used to live in the global value every thread
+  shares, and the loader could read its next form in another package, then
+  report "undefined function" for a function the file had just defined
+  ([#433](https://github.com/atgreen/evergreen/pull/433)).
+- A `MAKE-PACKAGE` name clash or a `DELETE-PACKAGE` of a missing package
+  signals a `SIMPLE-PACKAGE-ERROR` whose report says what failed, such as
+  "a package named FOO already exists". Both are still correctable with
+  `CONTINUE`; until now they signalled a bare `PACKAGE-ERROR` with no message
+  ([#436](https://github.com/atgreen/evergreen/pull/436)).
+- `SLEEP` inside a fiber suspends only that fiber, so other fibers on the
+  same carrier keep running. It used to block the carrier thread until it
+  woke. In a pinned fiber it follows `EGCL-FIBER:*PINNED-BLOCKING-ACTION*`,
+  like the other blocking operations
+  ([#437](https://github.com/atgreen/evergreen/pull/437)).
 - A macro defined inside a `LET` keeps its captured binding across a saved
   image, as a `DEFUN` or `DEFMETHOD` in the same `LET` already did. Only a
   macro's name, lambda list and body reached the image, and every restored
