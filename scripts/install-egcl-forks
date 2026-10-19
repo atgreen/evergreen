@@ -61,6 +61,9 @@ atomics@egcl
 cl-fad
 usocket@egcl-support
 precise-time
+ironclad@egcl
+pure-tls@egcl
+chipz@egcl
 fset
 closer-mop@egcl
 cffi
