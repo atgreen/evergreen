@@ -159,6 +159,8 @@ alphabetized by unqualified name and display their package explicitly.
 | `egcl-ext:set-funcallable-instance-function` | [Dictionary entry](user/reference/extensions.md#set-funcallable-instance-function) |
 | `egcl-ext:setenv` | [Dictionary entry](user/reference/extensions.md#setenv) |
 | `egcl-ext:sha256` | [Dictionary entry](user/reference/extensions.md#sha256) |
+| `egcl-ext:socket-os-error` | [Dictionary entry](user/reference/extensions.md#socket-os-error) |
+| `egcl-ext:socket-os-error-errno` | [Dictionary entry](user/reference/extensions.md#socket-os-error-errno) |
 | `egcl-ext:sprof-fold` | [Dictionary entry](profiling.md#sprof) |
 | `egcl-ext:sprof-start` | [Dictionary entry](profiling.md#sprof) |
 | `egcl-ext:sprof-stop` | [Dictionary entry](profiling.md#sprof) |

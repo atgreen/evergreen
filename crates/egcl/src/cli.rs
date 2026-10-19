@@ -5301,6 +5301,17 @@ fn egcl_error_to_condition(
             egcl_rt::rooted!(control = arena_str(msg));
             build_condition_instance(env, "SIMPLE-FILE-ERROR", &[control_kw, *control])?
         }
+        EgclError::SocketError { errno, message } => {
+            let errno = errno.map_or(NIL, |errno| EgclVal::from_fixnum(errno as i64));
+            let errno_kw = resolve_sym("ERRNO").unwrap_or(NIL);
+            let control_kw = resolve_sym("FORMAT-CONTROL").unwrap_or(NIL);
+            egcl_rt::rooted!(control = arena_str(message));
+            build_condition_instance(
+                env,
+                "EGCL-EXT:SOCKET-OS-ERROR",
+                &[errno_kw, errno, control_kw, *control],
+            )?
+        }
         EgclError::Interrupt => build_condition_instance(env, "INTERRUPT-CONDITION", &[])?,
         EgclError::Timeout => build_condition_instance(env, "TIMEOUT-CONDITION", &[])?,
         EgclError::Oom => {
@@ -14836,6 +14847,15 @@ fn builtin_condition_definition(type_name: &str) -> Option<ConditionDefinition> 
         // SIMPLE-PACKAGE-ERROR above fixed for package failures, and SBCL
         // likewise signals a simple-file-error here.
         "SIMPLE-FILE-ERROR" => Some((vec!["FILE-ERROR".into(), "SIMPLE-CONDITION".into()], vec![])),
+        // A failed socket call. It stays a SIMPLE-FILE-ERROR, which is what socket
+        // failures signalled before, so existing FILE-ERROR handlers still catch
+        // it; ERRNO lets a socket library map EADDRINUSE and friends to its own
+        // conditions (GitHub #427). Not SOCKET-ERROR: CL-USER uses EGCL-EXT, and
+        // USOCKET exports a SOCKET-ERROR of its own.
+        "SOCKET-OS-ERROR" => Some((
+            vec!["SIMPLE-FILE-ERROR".into()],
+            vec![("ERRNO".into(), "ERRNO".into())],
+        )),
         // Same family, same defect: PROGRAM-ERROR and CONTROL-ERROR have no slot
         // for a message, so every one reported as its bare type name even though
         // the evaluator built a description (bliss-kk0i). SBCL signals the

@@ -1,7 +1,7 @@
 # Native TCP client and server through the pinned usocket fork
 
 This scenario installs `atgreen/usocket` at
-`39c189d2c51317fbdfa6d6023a3369fdb329e61e` using ocicl's Git source support.
+`1318d92e817a8912e86233444af63038f37bf621` using ocicl's Git source support.
 It uses an isolated source registry and FASL cache, with runtime downloads
 disabled. No installed libraries or user configuration are modified.
 
@@ -28,7 +28,13 @@ The script retains logs in its printed temporary directory and runs:
   actual read deadline expiry, mapped `USOCKET:TIMEOUT-ERROR` socket identity,
   and successful reads after a timeout.
 - Literal octet types and one-hop/two-hop DEFTYPE aliases, each with its own
-  full duplex connection; character and non-octet integer widths stay rejected.
+  full duplex connection; character connections and non-octet integer widths
+  stay rejected.
+- Listeners with the default `character` element type, which bind and report
+  their port; accepting a character connection from one is still rejected.
+- OS errors mapped by errno through `EGCL-EXT:SOCKET-OS-ERROR`: a second bind
+  of a live port is `ADDRESS-IN-USE-ERROR` and a refused connection is
+  `CONNECTION-REFUSED-ERROR`, not `UNKNOWN-ERROR` with errno 0.
 - EGCL server listen/accept/close and local-port queries, including cross-thread
   ownership, inherited and overridden octet aliases, and wildcard/auto-port defaults.
 - Linux address-reuse checks using active close and TIME_WAIT, including the
@@ -43,7 +49,7 @@ The wrapper applies `EGCL_MEM_MAX` (default 4G) and `EGCL_TIMEOUT` (default
 600 seconds) to each phase. All socket traffic is loopback, without credentials.
 
 This checks a binary TCP client/server subset, not TLS, a complete usocket port,
-Dexador, or `completions` streaming. Character sockets, UDP, Unix-domain sockets,
+Dexador, or `completions` streaming. Character connections, UDP, Unix-domain sockets,
 USOCKET readiness/address queries, connected-socket port queries, explicit client
 local binding, deadlines, and disabling TCP_NODELAY remain unsupported. DNS
 resolution precedes the connection timeout.

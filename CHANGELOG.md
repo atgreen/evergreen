@@ -16,6 +16,16 @@
   getting a copy, so a binding several of them see stays shared
   ([#431](https://github.com/atgreen/evergreen/pull/431);
   issue [#426](https://github.com/atgreen/evergreen/issues/426)).
+- A failed socket call carries its operating system error number, so
+  usocket reports a port in use as `ADDRESS-IN-USE-ERROR` and a refused
+  connection as `CONNECTION-REFUSED-ERROR`. Both used to arrive as
+  `UNKNOWN-ERROR` with errno 0, and a port probe that handled only
+  `ADDRESS-IN-USE-ERROR` retried the same busy port forever. Socket failures
+  signal the new `EGCL-EXT:SOCKET-OS-ERROR`, which is still a `FILE-ERROR`, and
+  `EGCL-EXT:SOCKET-OS-ERROR-ERRNO` reads the number. The usocket fork also
+  accepts listeners with the default `character` element type
+  ([#432](https://github.com/atgreen/evergreen/pull/432);
+  issue [#427](https://github.com/atgreen/evergreen/issues/427)).
 
 ## 0.0.10 - 2026-10-19
 

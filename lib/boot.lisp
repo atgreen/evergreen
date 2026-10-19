@@ -5214,6 +5214,13 @@ sorted by nickname."
 
 (export (intern "IO-TIMEOUT" :egcl-ext) :egcl-ext)
 
+(defun egcl-ext::socket-os-error-errno (condition)
+  "The OS error number of an EGCL-EXT:SOCKET-OS-ERROR, or NIL when the failure
+had none, as for a host name that did not resolve."
+  (slot-value condition 'egcl-ext::errno))
+(export (list (intern "SOCKET-OS-ERROR" :egcl-ext) 'egcl-ext::socket-os-error-errno)
+        :egcl-ext)
+
 (export (mapcar (lambda (name) (intern name :egcl-ext))
                 '("CAS" "ATOMIC-INCF" "ATOMIC-DECF"))
         :egcl-ext)

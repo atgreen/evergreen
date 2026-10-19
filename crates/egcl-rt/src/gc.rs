@@ -3459,6 +3459,7 @@ impl TraceHostRoots for EgclError {
             | EgclError::PackageError(_)
             | EgclError::StreamError(_)
             | EgclError::FileError(_)
+            | EgclError::SocketError { .. }
             | EgclError::SandboxViolation(_)
             | EgclError::ControlError(_) => {}
         }

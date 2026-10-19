@@ -73,6 +73,11 @@ pub enum EgclError {
     /// File error. Maps to CL `FILE-ERROR`.
     FileError(String),
 
+    /// A socket operation failed. Maps to `EGCL-EXT:SOCKET-OS-ERROR`, a
+    /// `SIMPLE-FILE-ERROR` that also carries the OS error number, so a socket
+    /// library can tell EADDRINUSE from ECONNREFUSED without parsing the text.
+    SocketError { errno: Option<i32>, message: String },
+
     /// Sandbox policy violation.
     SandboxViolation(String),
 
@@ -208,6 +213,7 @@ impl core::fmt::Display for EgclError {
             EgclError::StreamError(msg) => write!(f, "stream error: {}", msg),
             EgclError::IoTimeout { message, .. } => write!(f, "I/O timeout: {message}"),
             EgclError::FileError(msg) => write!(f, "file error: {}", msg),
+            EgclError::SocketError { message, .. } => write!(f, "socket error: {message}"),
             EgclError::SandboxViolation(msg) => write!(f, "sandbox violation: {}", msg),
             EgclError::ControlError(msg) => write!(f, "control error: {}", msg),
             #[cfg(feature = "python")]
