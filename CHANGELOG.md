@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Performance
+
+- `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
+  once instead of going through exact rational arithmetic, which reduced
+  `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
+  about 45x faster, an RSA-2048 signature check through Ironclad about 65x,
+  and a repeated HTTPS request through pure-tls drops from about 38 s to 11 s
+  ([#443](https://github.com/atgreen/evergreen/pull/443)).
+
 ## 0.0.10 - 2026-10-19
 
 ### Added
