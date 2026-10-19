@@ -2,11 +2,20 @@
 
 ## Unreleased
 
+## 0.0.10 - 2026-10-19
+
 ### Added
 
 - `install-egcl-forks` also installs the EGCL forks of Ironclad, pure-tls and
   chipz, which HTTPS through pure-tls and archive extraction with chipz need
   ([#429](https://github.com/atgreen/evergreen/pull/429)).
+- `EGCL-MOP:FORWARD-REFERENCED-CLASS`, the metaclass of a class named as a
+  superclass before it is defined. `CLASS-OF` answers it and such a class
+  prints as `#<FORWARD-REFERENCED-CLASS FOO>`, as on SBCL; it is a `CLASS` but
+  not a `STANDARD-CLASS`, since nothing has yet said what its instances look
+  like, and it becomes an ordinary class -- the same object, so references
+  already taken to it stay `EQ` -- when the definition arrives
+  ([#417](https://github.com/atgreen/evergreen/pull/417)).
 - `EGCL-MOP`, the metaobject-protocol package `docs/egcl-lisp-api.md`
   specified but the bootstrap never installed. It provides
   `CLASS-DIRECT-SUPERCLASSES`, `CLASS-DIRECT-SUBCLASSES`,
@@ -33,7 +42,8 @@
   `REMOVE-PACKAGE-LOCAL-NICKNAME`, `PACKAGE-LOCAL-NICKNAMES` and
   `PACKAGE-LOCALLY-NICKNAMED-BY-LIST` as the API document already listed
   them, `:PACKAGE-LOCAL-NICKNAMES` is on `*FEATURES*`, and UIOP's
-  `DEFINE-PACKAGE` finds the functions in `EGCL-EXT`.
+  `DEFINE-PACKAGE` finds the functions in `EGCL-EXT`
+  ([#372](https://github.com/atgreen/evergreen/pull/372)).
 - Socket endpoint queries: `(egcl::%socket-listener-local-name listener)`,
   `(egcl::%socket-local-name stream)` and `(egcl::%socket-peer-name stream)`
   report an endpoint as an octet vector and a port together, four elements for
@@ -57,6 +67,39 @@
 
 ### Fixed
 
+- A generic function dispatches an interpreted lambda or closure on the
+  `FUNCTION` class. `CLASS-OF`, `FUNCTIONP` and `TYPEP` all answered
+  `FUNCTION`, but dispatch disagreed with them in both tiers, so
+  `(brt (lambda (y) y))` chose a `LIST` method over a `FUNCTION` one and a
+  `LIST`-only generic accepted a lambda outright. A compiled lambda and
+  `#'car` were already correct
+  ([#423](https://github.com/atgreen/evergreen/pull/423)).
+- `SETQ` of a parameter whose name is special reaches the callees that read it.
+  Such a parameter is bound in the frame and then made dynamic, and the
+  assignment path tried the frame before the value cell, so it updated a stale
+  frame copy: after `(defun f (&key ((:indent *ind*) *ind*)) (setq *ind* 0)
+  (reader))`, `(f :indent t)` answered the old value instead of `0`
+  ([#425](https://github.com/atgreen/evergreen/pull/425)).
+- A class metaobject prints its own name: `#<STANDARD-CLASS UC>` and
+  `#<STRUCTURE-CLASS ST>`, as on SBCL, CCL and ECL. Once a class became an
+  object it printed through the generic instance path, so every standard class
+  in the image printed as the identical `#<STANDARD-CLASS>` -- useless in a
+  backtrace or a slot dump
+  ([#402](https://github.com/atgreen/evergreen/pull/402)).
+- A class restored from an image keeps the slot shadowing its
+  `:allocation :class` declaration implies. The names a class declares class
+  allocated were not written to the core, so a class finalized for the first
+  time *after* a restore -- which is what subclassing a restored class does --
+  rebuilt its layout without them, and an inherited instance slot of the same
+  name wrongly entered that layout. CLST format version 4 records the field
+  ([#393](https://github.com/atgreen/evergreen/pull/393)).
+- `INTERRUPT-THREAD` interrupts a running thread. It posted a value nothing
+  ever observed, read only after the entry function returned, so rather than
+  interrupting a thread it overrode the return value of one already finishing.
+  It now raises the pending signal taken at every tier's safepoints, and sends
+  a directed `SIGUSR1` so a thread parked in a syscall wakes; a wait with no
+  deadline no longer parks forever through the signal
+  ([#373](https://github.com/atgreen/evergreen/pull/373)).
 - `FILE-POSITION` works on a Gray stream. It signalled a bare `STREAM-ERROR`,
   so cl-tar could not extract any archive and ocicl could not install a
   package. The Gray protocol gains `STREAM-FILE-POSITION`, as in SBCL, which
@@ -77,6 +120,14 @@
   8-bit, and `VECTOR-PUSH`, `VECTOR-PUSH-EXTEND` and `ADJUST-ARRAY` signal
   `TYPE-ERROR` for a wider character instead of storing it, as in SBCL
   ([#418](https://github.com/atgreen/evergreen/pull/418)).
+- A class redefinition or `CHANGE-CLASS` no longer moves the instance it
+  updates, so an object keeps its identity: two references to it stay `EQ`, an
+  `EQ` hash table still finds it, and `SLOT-MAKUNBOUND` returns the object the
+  caller passed in. Instances hold their slots indirectly, as in SBCL, and an
+  update replaces that storage rather than the object. A metaclass that gains a
+  slot now gives its existing classes that slot without disturbing them, which
+  previously corrupted the class registry
+  ([#414](https://github.com/atgreen/evergreen/pull/414)).
 - `BASE-CHAR`, `STANDARD-CHAR` and `EXTENDED-CHAR` are proper subtypes of
   `CHARACTER` at more doors: `(coerce #\λ 'base-char)` and `(coerce #\a
   'extended-char)` signal `TYPE-ERROR` instead of returning the character,
@@ -115,7 +166,8 @@
   answers 42. `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` is called for the update,
   so a method specialized on it participates and receives the added slots, the
   discarded slots and their values
-  ([#412](https://github.com/atgreen/evergreen/pull/412)).
+  ([#412](https://github.com/atgreen/evergreen/pull/412),
+  [#408](https://github.com/atgreen/evergreen/pull/408)).
 - A class that is only a forward reference -- named as a superclass and not yet
   defined -- can no longer be instantiated, as in SBCL: `MAKE-INSTANCE`,
   `ALLOCATE-INSTANCE` and `CHANGE-CLASS` each used to return an object with no
@@ -266,12 +318,14 @@
   writing refuses a character outside the format's range, and
   `STREAM-EXTERNAL-FORMAT` answers the format a file stream was opened with
   instead of `:default`. A format the stream layer cannot decode (`:utf-16`,
-  `:utf-32`) is refused at `OPEN` rather than read as UTF-8.
+  `:utf-32`) is refused at `OPEN` rather than read as UTF-8
+  ([#374](https://github.com/atgreen/evergreen/pull/374)).
 - `LISTEN` on a freshly opened octet file stream answers T while bytes remain
   and NIL at the end of the file. With nothing buffered yet it asked the
   handle as if it were a socket, and a regular file always answered NIL, so a
   `(unsigned-byte 8)` file stream had to be read once before `LISTEN` saw
-  it. The file-stream case joins the socket test of
+  it ([#369](https://github.com/atgreen/evergreen/pull/369)). The file-stream
+  case joins the socket test of
   [#360](https://github.com/atgreen/evergreen/pull/360).
 - A thread waiting for input on a stream no longer locks every other thread out
   of it. Input parked while holding the stream's state mutex, so for as long as
