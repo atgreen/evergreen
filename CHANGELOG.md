@@ -2,31 +2,6 @@
 
 ## Unreleased
 
-### Fixed
-
-- A macro defined inside a `LET` keeps its captured binding across a saved
-  image, as a `DEFUN` or `DEFMETHOD` in the same `LET` already did. Only a
-  macro's name, lambda list and body reached the image, and every restored
-  expander was rebound to the fresh global environment, so an expansion that
-  mentioned a captured variable signalled `UNBOUND-VARIABLE`. anaphora defines
-  `SYMBOLIC` and `ANAPHORIC` inside `(with-unique-names ...)`, so in any saved
-  core every anaphoric macro failed with "the variable
-  `ANAPHORA::S-INDICATOR` is unbound". A macro now records which captured frame
-  it closed over, and restored definitions share one frame rather than each
-  getting a copy, so a binding several of them see stays shared
-  ([#431](https://github.com/atgreen/evergreen/pull/431);
-  issue [#426](https://github.com/atgreen/evergreen/issues/426)).
-- A failed socket call carries its operating system error number, so
-  usocket reports a port in use as `ADDRESS-IN-USE-ERROR` and a refused
-  connection as `CONNECTION-REFUSED-ERROR`. Both used to arrive as
-  `UNKNOWN-ERROR` with errno 0, and a port probe that handled only
-  `ADDRESS-IN-USE-ERROR` retried the same busy port forever. Socket failures
-  signal the new `EGCL-EXT:SOCKET-OS-ERROR`, which is still a `FILE-ERROR`, and
-  `EGCL-EXT:SOCKET-OS-ERROR-ERRNO` reads the number. The usocket fork also
-  accepts listeners with the default `character` element type
-  ([#432](https://github.com/atgreen/evergreen/pull/432);
-  issue [#427](https://github.com/atgreen/evergreen/issues/427)).
-
 ## 0.0.10 - 2026-10-19
 
 ### Added
@@ -92,6 +67,28 @@
 
 ### Fixed
 
+- A macro defined inside a `LET` keeps its captured binding across a saved
+  image, as a `DEFUN` or `DEFMETHOD` in the same `LET` already did. Only a
+  macro's name, lambda list and body reached the image, and every restored
+  expander was rebound to the fresh global environment, so an expansion that
+  mentioned a captured variable signalled `UNBOUND-VARIABLE`. anaphora defines
+  `SYMBOLIC` and `ANAPHORIC` inside `(with-unique-names ...)`, so in any saved
+  core every anaphoric macro failed with "the variable
+  `ANAPHORA::S-INDICATOR` is unbound". A macro now records which captured frame
+  it closed over, and restored definitions share one frame rather than each
+  getting a copy, so a binding several of them see stays shared
+  ([#431](https://github.com/atgreen/evergreen/pull/431);
+  issue [#426](https://github.com/atgreen/evergreen/issues/426)).
+- A failed socket call carries its operating system error number, so
+  usocket reports a port in use as `ADDRESS-IN-USE-ERROR` and a refused
+  connection as `CONNECTION-REFUSED-ERROR`. Both used to arrive as
+  `UNKNOWN-ERROR` with errno 0, and a port probe that handled only
+  `ADDRESS-IN-USE-ERROR` retried the same busy port forever. Socket failures
+  signal the new `EGCL-EXT:SOCKET-OS-ERROR`, which is still a `FILE-ERROR`, and
+  `EGCL-EXT:SOCKET-OS-ERROR-ERRNO` reads the number. The usocket fork also
+  accepts listeners with the default `character` element type
+  ([#432](https://github.com/atgreen/evergreen/pull/432);
+  issue [#427](https://github.com/atgreen/evergreen/issues/427)).
 - A generic function dispatches an interpreted lambda or closure on the
   `FUNCTION` class. `CLASS-OF`, `FUNCTIONP` and `TYPEP` all answered
   `FUNCTION`, but dispatch disagreed with them in both tiers, so
