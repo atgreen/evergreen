@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- A thread waiting in `SLEEP` no longer holds up a garbage collection. A
+  collection needed by another thread used to wait on the sleeper and give up,
+  so a server whose main thread parks in `(loop (sleep 60))` could abort a
+  worker with "memory allocation of 16 bytes failed"
+  ([#434](https://github.com/atgreen/evergreen/pull/434)).
+
 ## 0.0.10 - 2026-10-19
 
 ### Added
