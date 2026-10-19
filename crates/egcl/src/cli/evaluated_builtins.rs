@@ -4364,6 +4364,14 @@ fn resolve(name: &str) -> Option<Handler> {
                 // bare-symbol resolution context and what the prompt shows, and
                 // the two are kept in step deliberately (bliss-lb6.12).
                 let saved_package = env.current_package.clone();
+                // And a real dynamic binding of *PACKAGE*, as for a file LOAD
+                // (see `load_path_into_env`), so another thread's write to the
+                // global value cannot move this load's reader mid-stream.
+                let package_symbol = resolve_sym("*PACKAGE*")
+                    .ok_or_else(|| EgclError::Internal("LOAD: *PACKAGE* is unavailable".into()))?;
+                let dynamic_package = global_value_cell(package_symbol.as_symbol_index())
+                    .unwrap_or(egcl_rt::value::UNBOUND);
+                egcl_rt::rooted!(_package_binding = DynBind::establish(package_symbol, dynamic_package));
                 let result = read_eval_all_env(&contents, env);
                 if env.current_package != saved_package {
                     env.current_package = saved_package.clone();
@@ -4500,8 +4508,19 @@ fn resolve(name: &str) -> Option<Handler> {
             // IN-PACKAGE forms don't leak into the caller — after
             // `(compile-file "lib/asdf.lisp")` the REPL stays in CL-USER, not
             // ASDF/FOOTER. Snapshot the current package and restore it once
-            // compilation is done (mirrors LOAD in load_path_into_env).
+            // compilation is done (mirrors LOAD in load_path_into_env), and
+            // bind it dynamically for the extent so the file's package lives in
+            // this thread's binding, not in the global value other threads share.
             let saved_package = env.current_package.clone();
+            let compile_package_symbol = resolve_sym("*PACKAGE*").ok_or_else(|| {
+                EgclError::Internal("COMPILE-FILE: *PACKAGE* is unavailable".into())
+            })?;
+            let compile_dynamic_package = global_value_cell(compile_package_symbol.as_symbol_index())
+                .unwrap_or(egcl_rt::value::UNBOUND);
+            egcl_rt::rooted!(
+                _compile_package_binding =
+                    DynBind::establish(compile_package_symbol, compile_dynamic_package)
+            );
             let image = {
                 // Bind BEFORE reading: #.*COMPILE-FILE-PATHNAME* must
                 // capture the source, even when ASDF redirects the output.

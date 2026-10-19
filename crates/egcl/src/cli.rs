@@ -17844,6 +17844,19 @@ fn load_path_into_env(path: &str, env: &mut Env) -> Result<EgclVal, EgclError> {
             }
         }
     }
+    // *PACKAGE* is bound dynamically as well, as *READTABLE* is above: the
+    // snapshot-and-restore keeps the caller's package, but during the load the
+    // file's package lived in the GLOBAL value, which every thread shares. A
+    // file that SETQs *PACKAGE* (as GDL:INITIALIZE does) and then starts a
+    // thread lost its package -- the thread's startup, or any thread's SETQ of
+    // *PACKAGE*, wrote the global value, and the loading thread read its next
+    // form in that package ("undefined function" for a function the same file
+    // had just defined). The guard drops after the restore below.
+    let mut package_binding = resolve_sym("*PACKAGE*").map(|symbol| {
+        let current = global_value_cell(symbol.as_symbol_index()).unwrap_or(egcl_rt::value::UNBOUND);
+        DynBind::establish(symbol, current)
+    });
+    egcl_rt::rooted_ref!(_package_binding_root = &mut package_binding);
     let result = (|| {
         // Resolve the load path (e.g. prefer a compiled .bfasl sibling, like SBCL)
         // before reading (bfasl-bytecode-unit).
