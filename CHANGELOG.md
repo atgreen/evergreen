@@ -4,6 +4,9 @@
 
 ### Added
 
+- `install-egcl-forks` also installs the EGCL forks of Ironclad, pure-tls and
+  chipz, which HTTPS through pure-tls and archive extraction with chipz need
+  ([#429](https://github.com/atgreen/evergreen/pull/429)).
 - `EGCL-MOP`, the metaobject-protocol package `docs/egcl-lisp-api.md`
   specified but the bootstrap never installed. It provides
   `CLASS-DIRECT-SUPERCLASSES`, `CLASS-DIRECT-SUBCLASSES`,

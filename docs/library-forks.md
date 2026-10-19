@@ -32,6 +32,9 @@ exercises these forks:
 | cl-fad (environment lookup) | https://github.com/atgreen/cl-fad | `6e415a049a2936e614f52108274d7cc016e55694` |
 | precise-time | https://github.com/atgreen/precise-time | `045df7c4cddc84d775610cbecf47b462aaea29d6` |
 | closer-mop (slot inspection and callable instances) | https://github.com/atgreen/closer-mop | `e9f6d94ff7bb91768841339c87a89bf70b52b95f` |
+| ironclad (branch `egcl`: native AES, GHASH and SHA-256 block functions; needs EGCL with PR #410) | https://github.com/atgreen/ironclad | `57db5ee19708a72b9b7a405e5b620bb39f7439b2` |
+| pure-tls (branch `egcl`: environment lookup, cached trust stores, native text conversion) | https://github.com/atgreen/pure-tls | `480bbab6635d65cb74aa6c66f19f0d249beeb537` |
+| chipz (branch `egcl`: decompressing streams on EGCL's Gray streams) | https://github.com/atgreen/chipz | `a48e6e741a353a14ab4430eb1519e2f3d5b94aef` |
 | fset | https://github.com/atgreen/fset | `553d6a75f6520ef4435748f16b0f619e71988628` |
 | cffi (and cffi-grovel, cffi-toolchain, cffi-libffi, cffi-uffi-compat, uffi) | https://github.com/atgreen/cffi | `ee7e4ea5238efce6ce4be7d6f0f29699884ad791` |
 | iolib (and iolib.base, iolib.conf) | https://github.com/atgreen/iolib | `57bc68250f498d48a6d0a3d07ccd2b36b8a561ea` |
@@ -92,8 +95,8 @@ Omit the project directory to install into the current directory. Preview the
 commands with `--dry-run` (before the optional project directory). The script
 requires `git` and an `ocicl` version supporting Git sources on `PATH`, stops
 on the first failed install, and fetches each fork's default branch, except
-USOCKET (`egcl-support`), Atomics, closer-mop, SLIME, SLY and the Quicklisp client (`egcl`), where their ports
-live. No commit revisions
+USOCKET (`egcl-support`), Atomics, closer-mop, Ironclad, pure-tls, chipz, SLIME, SLY and the
+Quicklisp client (`egcl`), where their ports live. No commit revisions
 are specified. It creates `ocicl.csv` if needed so installation stays in the
 selected directory. ocicl records the resolved commits in that file;
 commit it in your project for reproducibility. The script downloads and
