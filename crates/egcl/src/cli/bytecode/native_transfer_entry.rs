@@ -739,10 +739,19 @@ impl TransferCode {
         let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) || result_recovery {
             let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
             let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
+            // A site with no profile yet gets the optimistic fixnum guess.
+            // Record it so a disproved guess recompiles rather than blacklists.
+            let cold_guesses = RefCell::new(Vec::new());
             let profile = |bcp| {
                 use egcl_compiler::t2::speculate::SpecType as CompilerType;
                 match type_profile_at(Arc::as_ptr(&body) as usize, bcp) {
-                    None => Some(CompilerType::Fixnum),
+                    None => {
+                        let mut cold = cold_guesses.borrow_mut();
+                        if !cold.contains(&bcp) {
+                            cold.push(bcp);
+                        }
+                        Some(CompilerType::Fixnum)
+                    }
                     Some(profile) => match profile.speculation() {
                         Some(SpecType::Fixnum) => Some(CompilerType::Fixnum),
                         _ => None,
@@ -765,6 +774,7 @@ impl TransferCode {
             egcl_compiler::t2::build::legalize_transfer_calls(&mut ir, &scopes).ok()?;
             let metadata = Arc::new(T2InstalledMetadata {
                 speculations,
+                cold_guesses: cold_guesses.into_inner(),
                 _roots: egcl_rt::CrossThreadRoot::new(T2InstalledBodies { bodies: vec![Arc::clone(&body)] }),
                 deopt_bodies: [(symbol, Arc::clone(&body))].into_iter().collect(),
             });

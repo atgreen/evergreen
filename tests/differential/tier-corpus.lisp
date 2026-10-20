@@ -347,6 +347,34 @@
              (wide-cmp 3) (wide-cmp 2000000000000) (wide-cmp-value 1000000000000)
              (masked-ash #xFFFFFFFFFF) (masked-ash 3)))
 
+;;; ── double floats behind cold fixnum guesses (bliss-fenm) ──────────────
+
+(defun s-double (a b)
+  (declare (double-float a b))
+  (+ (* a b) 1d0))
+
+(check :s-double
+       (let ((r 0d0))
+         (dotimes (i 200 r)
+           (setq r (s-double 1.5d0 (float i 1d0))))))
+
+(defun br-cold-double (flag x)
+  (if flag (+ x 1) (+ x 1d0)))
+
+(check :br-cold-double
+       (let ((acc nil))
+         (dotimes (i 50) (push (br-cold-double t i) acc))
+         (dotimes (i 50) (push (br-cold-double nil (float i 1d0)) acc))
+         (list (reduce #'+ acc) (first acc) (car (last acc)))))
+
+(defun double-loop (n)
+  (let ((s 0d0))
+    (dotimes (i n s)
+      (incf s (* 1.5d0 i)))))
+
+(check :double-loop-1000 (double-loop 1000))
+(check :double-loop-100000 (double-loop 100000))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)
