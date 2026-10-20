@@ -23,10 +23,11 @@
   whole enclosing function to the tree-walker. chipz's inflate state machine
   is one, and inflating a 2.7 KB gzip member drops from 50 s to 2.7 s
   ([#449](https://github.com/atgreen/evergreen/pull/449)).
-- `REPLACE` between simple vectors or simple strings, and `SEARCH` with the
-  default `EQL` test and no key on them, run natively instead of element by
-  element in Lisp. Parsing a 121-certificate CA bundle with pure-tls drops
-  from 20 s to about 14 s
+- `REPLACE` between simple vectors or simple strings, `SEARCH` with the
+  default `EQL` test and no key on them, and `FILL` of a simple vector or
+  simple string run natively instead of element by element in Lisp. Parsing
+  a 121-certificate CA bundle with pure-tls drops from 20 s to about 14 s,
+  and zeroing a 1 KB octet buffer with `FILL` from 4.4 ms to 28 us
   ([#450](https://github.com/atgreen/evergreen/pull/450)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
