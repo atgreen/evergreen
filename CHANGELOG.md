@@ -72,7 +72,7 @@
   branch first reached with double floats, no longer drops back to the
   interpreter for good. Its failed fixnum guesses now recompile it from the
   types seen since, so it stays native and can reach T2
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#459](https://github.com/atgreen/evergreen/pull/459)).
 
 ### Fixed
 
