@@ -16,7 +16,7 @@
   `compile` trace name the failing step -- for example the mapped emitter's
   error or a control scope a transfer site cannot recover -- instead of the
   generic "native emission declined"
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#469](https://github.com/atgreen/evergreen/pull/469)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in
@@ -55,7 +55,7 @@
   frontend stayed interpreted and never reached T2. Loading Babel now
   compiles 23 more ASDF methods to T1, and a method called past the T2
   threshold is optimized like a `DEFUN`
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#469](https://github.com/atgreen/evergreen/pull/469)).
 - A `(return-from NAME ...)` inside a `FLET` or `LABELS` function compiles to
   bytecode: the compiler now establishes the implicit block named after the
   local function, as the tree-walker does. Such a return used to send the
