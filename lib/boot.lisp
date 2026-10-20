@@ -3280,7 +3280,9 @@
 (defun fill (seq item &key (start 0) end)
   (%check-bounding-indices seq start end)
   (let ((stop (or end (length seq))) (i start))
-    (loop while (< i stop) do (setf (elt seq i) item) (incf i)))
+    ;; Simple vectors and simple strings are filled natively.
+    (unless (egcl::%vector-fill seq item start stop)
+      (loop while (< i stop) do (setf (elt seq i) item) (incf i))))
   seq)
 
 ;; When SEQ1 and SEQ2 are the same object with OVERLAPPING ranges, the result

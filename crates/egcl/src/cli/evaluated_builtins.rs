@@ -1035,10 +1035,25 @@ fn resolve(name: &str) -> Option<Handler> {
             env.clear_mv();
             egcl_stdlib::text_codec::call(args)
         }),
-        // Boot REPLACE's and SEARCH's native vector cases. Boot checks the
-        // bounds before calling; T from %VECTOR-SEARCH and NIL from
-        // %VECTOR-REPLACE mean "not a pair this covers", and boot falls back to
-        // its element-by-element code.
+        // Boot REPLACE's, SEARCH's and FILL's native vector cases. Boot checks
+        // the bounds before calling; T from %VECTOR-SEARCH and NIL from
+        // %VECTOR-REPLACE or %VECTOR-FILL mean "not a sequence this covers", and
+        // boot falls back to its element-by-element code.
+        "EGCL::%VECTOR-FILL" => Some(|_operator, args, env| {
+            env.clear_mv();
+            let [seq, item, start, end] = args else {
+                return Err(EgclError::ProgramError(
+                    "%VECTOR-FILL takes four arguments".into(),
+                ));
+            };
+            let handled = egcl_stdlib::sequences::fill_direct(
+                *seq,
+                *item,
+                index_arg(*start)?,
+                index_arg(*end)?,
+            )?;
+            Ok(if handled { T } else { NIL })
+        }),
         "EGCL::%VECTOR-REPLACE" => Some(|_operator, args, env| {
             env.clear_mv();
             let [dst, src, start1, start2, count] = args else {

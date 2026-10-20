@@ -2040,6 +2040,19 @@ pub fn replace_direct(
     Ok(true)
 }
 
+/// Boot FILL's native case: store ITEM in `seq[start..end]`, the caller
+/// having checked the bounds. Returns `false` without storing when `seq` is
+/// not a [`direct_vector`]. Nothing here allocates.
+pub fn fill_direct(seq: EgclVal, item: EgclVal, start: usize, end: usize) -> Result<bool, EgclError> {
+    if !direct_vector(seq) {
+        return Ok(false);
+    }
+    for index in start..end {
+        set_elt(seq, index, item)?;
+    }
+    Ok(true)
+}
+
 /// Boot SEARCH's native case: the EQL test and no key, the caller having
 /// checked the bounds. Returns SEARCH's value -- the index in `seq` where
 /// `pat[start1..end1]` first matches within `seq[start2..end2]` (the last

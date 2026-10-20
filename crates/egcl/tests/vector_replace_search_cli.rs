@@ -82,3 +82,31 @@ fn search_scans_simple_vectors_and_strings() {
         "{stdout}"
     );
 }
+
+/// FILL stores natively into simple vectors and simple strings; a list and a
+/// fill-pointer string keep the Lisp path, and a character into an octet
+/// vector is still an error.
+#[test]
+fn fill_stores_into_simple_vectors_and_strings() {
+    let stdout = eval(
+        r#"
+      (let ((octets (make-array 6 :element-type '(unsigned-byte 8) :initial-element 1))
+            (s (copy-seq "abcdef"))
+            (v (vector 1 2 3 4))
+            (fp (make-array 5 :element-type 'character :fill-pointer 3
+                              :initial-contents "vwxyz")))
+        (format t "RESULT:~S ~S ~S ~S ~S ~S~%"
+                (fill octets 0 :start 2 :end 5)
+                (fill s #\z :start 4)
+                (fill v :x)
+                (fill (list 1 2 3) 9 :end 2)
+                (fill fp #\- )
+                (handler-case (fill (copy-seq "abc") 7) (type-error () :type-error))))
+    "#,
+    );
+    assert!(
+        stdout.contains(r#"RESULT:#(1 1 0 0 0 1) "abcdzz" #(:X :X :X :X) (9 9 3) "---" :TYPE-ERROR"#),
+        "{stdout}"
+    );
+}
+
