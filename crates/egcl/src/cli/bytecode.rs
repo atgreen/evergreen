@@ -23669,6 +23669,9 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // never be published for the closure's `return-from`/`go` to find (bliss-4u5u,
     // the ASDF traverse-action plan truncation).
     if native_would_lose_captured_control(&bf) {
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "[T1] {}: declined: a closure it creates needs captured block/tag control; retain interpreter",
+            display_fn_name(&bf.name));
         return None;
     }
     // Prefer the published native ABI for the shapes whose exact frame and

@@ -1538,6 +1538,7 @@ impl TransferCode {
                                 | Instr::EvalHost(_)
                                 | Instr::LoadFunction(_)
                                 | Instr::ValuesToList
+                                | Instr::MakeClosure { capture_env: false, .. }
                                 | Instr::CleanupReturn
                                 | Instr::SetValues(_)
                                 | Instr::Throw
