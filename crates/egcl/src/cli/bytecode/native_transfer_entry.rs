@@ -1505,6 +1505,7 @@ impl TransferCode {
                             Instr::CallNamed { .. }
                                 | Instr::EvalHost(_)
                                 | Instr::LoadFunction(_)
+                                | Instr::ValuesToList
                                 | Instr::CleanupReturn
                                 | Instr::SetValues(_)
                                 | Instr::Throw
@@ -1739,7 +1740,8 @@ fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_
         && body.code.iter().all(|op| {
             // Nested tagged callees support MV; optimized/direct-recursive
             // admission retains its existing restriction.
-            (allow_values && matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. }))
+            (allow_values && matches!(op,
+                Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList))
             || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
             || (allow_local_scopes && matches!(op,
                 Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
@@ -2318,7 +2320,42 @@ unsafe fn call_or_throw_unpublished(
         TRANSFER_HANDLER_ENTER_REQUEST, TRANSFER_HANDLER_LEAVE_REQUEST,
         TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
         TRANSFER_HOST_EVAL_REQUEST, TRANSFER_FUNCTION_LOOKUP_REQUEST,
+        TRANSFER_VALUES_TO_LIST_REQUEST,
     };
+    if request_kind == TRANSFER_VALUES_TO_LIST_REQUEST {
+        // Same result as the T0 arm: the primary alone when no tuple is
+        // active. args[0] lives in the mapped outgoing area; copy it into a
+        // rooted Vec before vec_to_list allocates (bliss-6z1hh).
+        let mut value = NIL;
+        if !native_error_pending() {
+            let result = guard_c2i(|| {
+                assert_eq!(call.nargs, 1);
+                let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
+                let primary = unsafe { *call.args };
+                egcl_rt::rooted!(
+                    vals = if env.mv_active { env.mv.clone() } else { vec![primary] }
+                );
+                let list = vec_to_list(&vals);
+                env.clear_mv();
+                Ok(list)
+            });
+            match result {
+                Ok(result) => value = result,
+                Err(error) => NATIVE_ERROR.with(|slot| slot.set_first(error)),
+            }
+        }
+        unsafe {
+            out.write(NativeOutcome {
+                value,
+                exit: if native_error_pending() {
+                    NativeExit::Transfer
+                } else {
+                    NativeExit::Returned
+                },
+            });
+        }
+        return;
+    }
     if matches!(
         request_kind,
         TRANSFER_HOST_EVAL_REQUEST | TRANSFER_FUNCTION_LOOKUP_REQUEST

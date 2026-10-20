@@ -887,6 +887,7 @@ impl<'a> Builder<'a> {
                 }
                 Instr::CallNamed { .. }
                 | Instr::SetValues(_)
+                | Instr::ValuesToList
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -971,6 +972,7 @@ impl<'a> Builder<'a> {
                             | Instr::EvalHost(_)
                             | Instr::LoadFunction(_)
                             | Instr::SetValues(_)
+                            | Instr::ValuesToList
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1067,6 +1069,9 @@ impl<'a> Builder<'a> {
                 }
                 Instr::TakeValuesToLocals { .. } => {
                     push(i + 1, d - 1, &mut depth_at, &mut work);
+                }
+                Instr::ValuesToList => {
+                    push(i + 1, d, &mut depth_at, &mut work); // primary -> list
                 }
                 Instr::ClearMv => {
                     push(i + 1, d, &mut depth_at, &mut work); // no operand-stack effect
@@ -1185,6 +1190,7 @@ impl<'a> Builder<'a> {
                             | Instr::EvalHost(_)
                             | Instr::LoadFunction(_)
                             | Instr::SetValues(_)
+                            | Instr::ValuesToList
                             | Instr::CleanupReturn
                             | Instr::Throw
                     ))
@@ -1420,6 +1426,7 @@ impl<'a> Builder<'a> {
             match instr {
                 Instr::CallNamed { .. }
                 | Instr::SetValues(_)
+                | Instr::ValuesToList
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
@@ -1951,6 +1958,42 @@ impl<'a> Builder<'a> {
                                 safepoint: true,
                                 ..InstFlags::default()
                             },
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    if self.native_cleanups {
+                        self.finish_native_invoke(
+                            block,
+                            inst,
+                            stack,
+                            results[0],
+                            i as u32,
+                            Some(end),
+                        )?;
+                        return Ok(());
+                    }
+                    stack.push(results[0]);
+                }
+                Instr::ValuesToList => {
+                    // `(multiple-value-list form)`: the helper reads the
+                    // runtime tuple left by FORM, so it is a mapped helper
+                    // Invoke like LoadFunction. The cold state is before the
+                    // primary is consumed (bliss-6z1hh).
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let primary = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (ValuesToList)"))?;
+                    let (inst, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args: vec![primary],
+                            results: vec![],
+                            aux: AuxData::ValuesToList,
+                            flags: runtime_call_flags(),
                             targets: vec![],
                             frame_state: Some(fs),
                             source_pos: 0,
@@ -3644,6 +3687,48 @@ mod tests {
                     function.inst(inst).opcode == Opcode::Return
                 })
             }), "the caller must retain its return after the named call");
+        }
+    }
+
+    #[test]
+    fn values_to_list_is_a_mapped_helper_invoke() {
+        let input = bf(
+            "values-to-list",
+            vec![
+                Instr::ClearMv,
+                Instr::LoadLocal(0),
+                Instr::ValuesToList,
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        let plain = build_from_bytecode(&input).unwrap();
+        crate::t2::verify::verify(&plain).unwrap();
+        let collects = |function: &Function, opcode: Opcode| {
+            function.block_order().iter().any(|&block| {
+                function.block(block).insts.iter().any(|&inst| {
+                    let data = function.inst(inst);
+                    data.opcode == opcode
+                        && matches!(data.aux, AuxData::ValuesToList)
+                        && data.args.len() == 1
+                        && data.frame_state.is_some()
+                })
+            })
+        };
+        assert!(collects(&plain, Opcode::Call));
+        for result in [
+            build_from_bytecode_for_transfers(&input),
+            build_from_bytecode_for_native_cleanups(&input),
+        ] {
+            let function = result.unwrap();
+            crate::t2::verify::verify(&function).unwrap();
+            assert!(
+                collects(&function, Opcode::Invoke),
+                "the helper must own an exceptional edge"
+            );
         }
     }
 

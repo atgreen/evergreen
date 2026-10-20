@@ -643,3 +643,85 @@ fn protected_functions_publish_tagged_native_baselines() {
         "{stdout}"
     );
 }
+
+/// MULTIPLE-VALUE-LIST (`ValuesToList`) reaches mapped T2 at natural
+/// thresholds, returns the same lists as the interpreter, and leaves no stale
+/// secondary values for its caller (bliss-6z1hh).
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn values_to_list_reaches_mapped_t2() {
+    let program = r#"
+        (defvar *mvl-log* nil)
+        (defun s-values (a) (values a (1+ a) (* 2 a)))
+        (defun s-mvlist (a) (multiple-value-list (s-values a)))
+        (defun s-mvlist0 (a) (declare (ignore a)) (multiple-value-list (values)))
+        (defun s-mvlist1 (a) (multiple-value-list (1+ a)))
+        (defun s-mvlist-alloc (a) (multiple-value-list (values (list a) (vector a))))
+        ;; A nursery primary that the helper's own allocation relocates.
+        (defun s-mvlist-fresh (a) (multiple-value-list (list a)))
+        (defun s-mvlist-effect (a)
+          (multiple-value-list (progn (push :x *mvl-log*) (s-values a))))
+        (defun s-mvlist-outer (a) (multiple-value-bind (x y z) (s-mvlist a) (list x y z)))
+        (defun s-mvlist-check (a)
+          (setf *mvl-log* nil)
+          (assert (equal (s-mvlist a) (list a (1+ a) (* 2 a))))
+          (assert (null (s-mvlist0 a)))
+          (assert (equal (s-mvlist1 a) (list (1+ a))))
+          (assert (equalp (s-mvlist-alloc a) (list (list a) (vector a))))
+          (assert (equal (s-mvlist-fresh a) (list (list a))))
+          (assert (equal (s-mvlist-effect a) (list a (1+ a) (* 2 a))))
+          (assert (equal *mvl-log* '(:x)))
+          (assert (equal (s-mvlist-outer a) (list (list a (1+ a) (* 2 a)) nil nil)))
+          (assert (equal (multiple-value-list (s-mvlist a)) (list (list a (1+ a) (* 2 a))))))
+        (defvar *mvl-names*
+          '(s-mvlist s-mvlist0 s-mvlist1 s-mvlist-alloc s-mvlist-fresh s-mvlist-effect))
+        (let ((n 0))
+          (loop (s-mvlist-check (mod n 1000))
+                (incf n)
+                (when (or (> n 200000)
+                          (every (lambda (f) (= 2 (egcl-ext:function-tier f))) *mvl-names*))
+                  (return)))
+          (dotimes (i 200) (s-mvlist-check i)))
+        (assert (every (lambda (f) (= 2 (egcl-ext:function-tier f))) *mvl-names*))
+        (print (list (s-mvlist 3) (s-mvlist0 3) (s-mvlist1 3) (s-mvlist-alloc 3)
+                     (s-mvlist-effect 3) (s-mvlist-outer 3)))
+        (format t "~%MVLIST-T2-OK~%")
+    "#;
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .args(["--no-init", "--eval", program])
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .env("EGCL_T2_THRESHOLD", "20")
+        .env("EGCL_T2_LOG", "stderr")
+        .output()
+        .expect("run EGCL");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(stdout.contains("MVLIST-T2-OK"), "{stdout}");
+    assert!(
+        stdout.contains("((3 4 6) NIL (4) ((3) #(3)) (3 4 6) ((3 4 6) NIL NIL))"),
+        "{stdout}"
+    );
+    for name in [
+        "S-MVLIST",
+        "S-MVLIST0",
+        "S-MVLIST1",
+        "S-MVLIST-ALLOC",
+        "S-MVLIST-FRESH",
+        "S-MVLIST-EFFECT",
+    ] {
+        assert!(
+            stderr.contains(&format!(
+                "[T2] {name}: optimized worker result installed with mapped T2 ABI;"
+            )),
+            "{name} must install mapped T2 code: {stderr}"
+        );
+        assert!(
+            !stderr.contains(&format!("[T1] {name}: declined")),
+            "{stderr}"
+        );
+    }
+}

@@ -16253,7 +16253,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         vec![primary]
                     }
                 );
-                act.push_op(vec_to_list(&vals));
+                let list = vec_to_list(&vals);
+                // The list is now the form's only value: the consumed tuple
+                // must not leak out as secondaries (bliss-6z1hh).
+                env.clear_mv();
+                act.push_op(list);
             }
             Instr::EvalHost(idx) => {
                 let form = acts[top_idx].func.constants[idx as usize];
@@ -18184,13 +18188,6 @@ extern "C" fn c2i_t2_mv(primary: u64, dst: *mut EgclVal, n: u64) {
     }
 }
 
-/// `ValuesToList`: collect the current multiple-values into a fresh list. When
-/// `mv_active`, the values are `env.mv`; otherwise the single `primary` value.
-/// Mirrors the T0 `Instr::ValuesToList` arm exactly (bliss-rwiv) so the compiled
-/// tier produces the identical list. ALLOCATES (`vec_to_list` builds conses), so
-/// `primary`/`env.mv` are rooted before the allocation — the whole-function GC
-/// stack map covers the native operand slots, and `primary` (a caller-saved
-/// register argument, invisible to the scan) is rooted here in the helper frame.
 /// c2i helper for the `TypeP` opcode on the native (T1) path: a leaf type check
 /// with no allocation — far cheaper than a full CallNamed to
 /// TYPEP (no registry lookup / catch_unwind / apply_function name dispatch), and
@@ -18207,6 +18204,15 @@ extern "C" fn c2i_typep_class(v: u64, class: u64) -> u64 {
     }
 }
 
+/// `ValuesToList`: collect the current multiple-values into a fresh list. When
+/// `mv_active`, the values are `env.mv`; otherwise the single `primary` value.
+/// Mirrors the T0 `Instr::ValuesToList` arm exactly (bliss-rwiv) so the compiled
+/// tier produces the identical list. ALLOCATES (`vec_to_list` builds conses), so
+/// `primary`/`env.mv` are rooted before the allocation — the whole-function GC
+/// stack map covers the native operand slots, and `primary` (a caller-saved
+/// register argument, invisible to the scan) is rooted here in the helper frame.
+/// Clears the MV state afterwards: the list is the form's only value
+/// (bliss-6z1hh).
 extern "C" fn c2i_values_to_list(primary: u64) -> u64 {
     let env_ptr = NATIVE_ENV.with(|cell| cell.get());
     if env_ptr.is_null() {
@@ -18222,7 +18228,9 @@ extern "C" fn c2i_values_to_list(primary: u64) -> u64 {
             vec![EgclVal(primary)]
         }
     );
-    vec_to_list(&vals).0
+    let list = vec_to_list(&vals);
+    env.clear_mv();
+    list.0
 }
 
 extern "C" fn c2i_call(sym: u64, n: u64, a0: u64, a1: u64, a2: u64, profile_site: u64) -> u64 {

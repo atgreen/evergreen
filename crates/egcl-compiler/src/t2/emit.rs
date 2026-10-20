@@ -2081,6 +2081,7 @@ fn emit_invoke_call(
             0,
             false,
         ),
+        crate::t2::ir::AuxData::ValuesToList => (TRANSFER_VALUES_TO_LIST_REQUEST, 1, false),
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -3603,6 +3604,8 @@ pub const TRANSFER_SPECIAL_UNBIND_REQUEST: u64 = 12_u64 << 32;
 /// Low word identifies the execution-local symbol value cell.
 pub const TRANSFER_GLOBAL_LOAD_REQUEST: u64 = 13_u64 << 32;
 pub const TRANSFER_GLOBAL_STORE_REQUEST: u64 = 14_u64 << 32;
+/// Collect the primary (args[0]) and the runtime multiple values into a list.
+pub const TRANSFER_VALUES_TO_LIST_REQUEST: u64 = 15_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. The args slice resides in
@@ -4419,6 +4422,7 @@ fn emit_transfer_function_with_storage(
                         AuxData::CleanupContinuation { .. }
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
+                            | AuxData::ValuesToList
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -6059,6 +6063,7 @@ fn emit_framed_inner(
                             .map_or(transfer.veneer, |(_, entry)| *entry),
                         AuxData::HostEval(_)
                         | AuxData::FunctionLookup(_)
+                        | AuxData::ValuesToList
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }

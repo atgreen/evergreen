@@ -399,6 +399,10 @@ pub enum AuxData {
     HostEval(u16),
     /// Read a function designator through the native-transfer bridge.
     FunctionLookup(u32),
+    /// `MULTIPLE-VALUE-LIST` collection through the native-transfer bridge.
+    /// Consumes the primary, reads the runtime multiple-value tuple, returns
+    /// a fresh list and leaves the multiple-value state inactive.
+    ValuesToList,
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
     SpecialBinding { bcp: u32, enter: bool },
@@ -909,7 +913,7 @@ impl Function {
         if data.opcode != Opcode::Call
             || data.frame_state.is_none()
             || !matches!(data.aux, AuxData::CallTarget(_) | AuxData::GlobalValue { .. }
-                | AuxData::FunctionLookup(_))
+                | AuxData::FunctionLookup(_) | AuxData::ValuesToList)
             || !self.block_has_terminator(block)
         {
             return Err("exceptional conversion requires a mapped call in a finished block");

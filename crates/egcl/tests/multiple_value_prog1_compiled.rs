@@ -60,11 +60,9 @@ fn check(tier: &str) {
     assert!(output.status.success(), "{tier}: {stdout}\n{stderr}");
     assert!(stdout.contains("MV-PROG1-COMPILED-OK"), "{stdout}");
     if tier != "interp" {
-        // Linux mapped entries do not yet admit ValuesToList/ListToValues.
-        // Preserve the exact bytecode fallback while exercising all MV effects.
-        let installed = if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-            "T0"
-        } else if tier == "t2" {
+        // Linux mapped entries admit ValuesToList, so the requested tier runs
+        // every MV effect natively (bliss-6z1hh).
+        let installed = if tier == "t2" && !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
             "T1"
         } else {
             &tier.to_uppercase()

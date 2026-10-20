@@ -204,6 +204,10 @@
 (check :mv-through-catch
        (multiple-value-list (catch 'mv (throw 'mv (values 7 8 9)))))
 (check :mv-prog1 (multiple-value-list (multiple-value-prog1 (two-vals) (five-vals))))
+;; MULTIPLE-VALUE-LIST returns exactly one value: the collected tuple must not
+;; leak to the caller as stale secondaries (bliss-6z1hh).
+(defun mvl-wrap () (multiple-value-list (five-vals)))
+(check :mv-list-no-leak (multiple-value-bind (a b) (mvl-wrap) (list a b)))
 
 ;;; ── discarded-but-must-still-signal ────────────────────────────────────
 
