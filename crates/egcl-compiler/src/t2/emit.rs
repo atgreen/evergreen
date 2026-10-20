@@ -3491,6 +3491,7 @@ pub fn emit_framed_with_direct_natives(
                 self_sym: None,
                 direct_natives: Vec::new(),
                 code_id: 0,
+                environment: EnvironmentCalls::default(),
             },
         );
     }
@@ -3512,6 +3513,7 @@ pub fn emit_framed_with_direct_natives(
                 self_sym: None,
                 direct_natives: Vec::new(),
                 code_id: 0,
+                environment: EnvironmentCalls::default(),
             },
         );
     }
@@ -3549,6 +3551,7 @@ pub fn emit_framed_with_direct_natives(
                 self_sym,
                 direct_natives: direct_natives.to_vec(),
                 code_id,
+                environment,
             },
         );
     }
