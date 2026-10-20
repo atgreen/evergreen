@@ -891,8 +891,9 @@ impl<'a> Builder<'a> {
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
-                    if self.native_cleanups =>
-                {
+                | Instr::MakeClosure {
+                    capture_env: false, ..
+                } if self.native_cleanups => {
                     if i + 1 < code.len() {
                         set.insert(i + 1);
                     }
@@ -971,6 +972,10 @@ impl<'a> Builder<'a> {
                         Instr::CallNamed { .. }
                             | Instr::EvalHost(_)
                             | Instr::LoadFunction(_)
+                            | Instr::MakeClosure {
+                                capture_env: false,
+                                ..
+                            }
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
                             | Instr::CleanupReturn
@@ -998,7 +1003,10 @@ impl<'a> Builder<'a> {
                 }
             }
             match &code[i] {
-                Instr::EvalHost(_) if self.native_cleanups => {
+                Instr::EvalHost(_)
+                | Instr::MakeClosure {
+                    capture_env: false, ..
+                } if self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::BindSpecial(_) if self.native_cleanups => {
@@ -1189,6 +1197,10 @@ impl<'a> Builder<'a> {
                         Instr::CallNamed { .. }
                             | Instr::EvalHost(_)
                             | Instr::LoadFunction(_)
+                            | Instr::MakeClosure {
+                                capture_env: false,
+                                ..
+                            }
                             | Instr::SetValues(_)
                             | Instr::ValuesToList
                             | Instr::CleanupReturn
@@ -1430,8 +1442,9 @@ impl<'a> Builder<'a> {
                 | Instr::Throw
                 | Instr::EvalHost(_)
                 | Instr::LoadFunction(_)
-                    if self.native_cleanups =>
-                {
+                | Instr::MakeClosure {
+                    capture_env: false, ..
+                } if self.native_cleanups => {
                     let mut successors = Vec::new();
                     for target in self.exceptional_handlers((start + offset) as u32) {
                         successors.push(blk(target.body_bcp as usize)?);
@@ -1654,7 +1667,15 @@ impl<'a> Builder<'a> {
                 return Ok(());
             }
             if self.native_cleanups
-                && matches!(instruction, Instr::EvalHost(_) | Instr::LoadFunction(_))
+                && matches!(
+                    instruction,
+                    Instr::EvalHost(_)
+                        | Instr::LoadFunction(_)
+                        | Instr::MakeClosure {
+                            capture_env: false,
+                            ..
+                        }
+                )
             {
                 let aux = match instruction {
                     Instr::EvalHost(index) => {
@@ -1664,6 +1685,12 @@ impl<'a> Builder<'a> {
                         AuxData::HostEval(*index)
                     }
                     Instr::LoadFunction(symbol) => AuxData::FunctionLookup(*symbol),
+                    Instr::MakeClosure { func, .. } => {
+                        if self.bf.nested_functions.get(*func as usize).is_none() {
+                            return Err(BuildError::Unsupported("invalid nested function"));
+                        }
+                        AuxData::NestedClosure(*func)
+                    }
                     _ => unreachable!(),
                 };
                 let fs = self.build_frame_state(block, &stack, i as u32);

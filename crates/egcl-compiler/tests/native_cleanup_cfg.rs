@@ -831,3 +831,54 @@ fn native_invoke_speculation_preserves_cold_only_osr_header_and_imports() {
     assert!(reachable(&function, None).contains(&entry.block));
     assert!(function.dominators().dominates(preheader, entry.block));
 }
+
+#[test]
+fn noncapturing_closure_is_an_argument_free_transfer_invoke() {
+    let mut body = cleanup_body();
+    body.nested_functions = vec![std::sync::Arc::new(cleanup_body())];
+    body.code = vec![
+        Instr::MakeClosure {
+            func: 0,
+            capture_env: false,
+        },
+        Instr::Return,
+    ];
+    assert!(build::build_from_bytecode(&body).is_err());
+    let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
+    verify::verify(&ir).unwrap();
+    let closure = ir
+        .block_order()
+        .iter()
+        .flat_map(|&block| &ir.block(block).insts)
+        .copied()
+        .find(|&inst| matches!(ir.inst(inst).aux, AuxData::NestedClosure(0)))
+        .unwrap();
+    let data = ir.inst(closure);
+    assert_eq!(data.opcode, Opcode::Invoke);
+    assert!(data.args.is_empty());
+    assert_eq!(data.targets.len(), 2);
+    assert_ne!(data.targets[0].block, data.targets[1].block);
+    assert!(build::build_for_native_scope_optimization(&body, 0).is_ok());
+
+    let mut malformed = ir.clone();
+    let argument = ir.block(ir.block_order()[0]).params[0];
+    malformed.inst_mut(closure).args = vec![argument];
+    assert!(verify::verify(&malformed).is_err());
+
+    body.code[0] = Instr::MakeClosure {
+        func: 1,
+        capture_env: false,
+    };
+    assert!(
+        build::build_from_bytecode_for_native_cleanups(&body).is_err(),
+        "an out-of-range nested function must decline"
+    );
+    body.code[0] = Instr::MakeClosure {
+        func: 0,
+        capture_env: true,
+    };
+    assert!(
+        build::build_from_bytecode_for_native_cleanups(&body).is_err(),
+        "a capturing closure needs an activation EnvFrame"
+    );
+}

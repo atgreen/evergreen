@@ -13355,6 +13355,29 @@ fn bf_escapes_to_control(
         .any(|n| bf_escapes_to_control(n, blocks, tags))
 }
 
+/// True if `bf` (a nested closure body) or any closure nested in it can
+/// perform a non-local exit by name, i.e. one it must find in the lexical
+/// control captured when it was created. Opaque source-form closures
+/// and host-evaluated forms count as escaping: they are not analysed here,
+/// and declining is always safe (bliss-ku9w).
+fn bf_has_free_control_exit(bf: &BytecodeFunction) -> bool {
+    // The compiler emits ReturnFromNamed/GoNamed only for a block or tag that
+    // is NOT lexically visible inside `bf` at that point, so every one is a
+    // free exit. A same-named block established elsewhere in `bf` must not
+    // excuse it (an inner `(block b nil)` beside a `(return-from b)` to an
+    // outer B), and neither may an enclosing nested body's: a closure made
+    // outside that body's block still targets the outer one.
+    bf.code.iter().any(|instr| {
+        matches!(
+            instr,
+            Instr::ReturnFromNamed { .. }
+                | Instr::GoNamed { .. }
+                | Instr::MakeClosureEnv(_)
+                | Instr::EvalHost(_)
+        )
+    }) || bf.nested_functions.iter().any(|n| bf_has_free_control_exit(n))
+}
+
 /// True if compiling `bf` to native (T1/T2) would break a closure's non-local
 /// exit. Native lowers `PushBlock`/`PushTag` to no-ops (local returns become
 /// jumps), so a block/tag this function establishes is never published on
@@ -13379,6 +13402,18 @@ fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
                 own_tags.insert(bf.names[*name_idx as usize].clone());
             }
             _ => {}
+        }
+    }
+    // A native activation does not publish the lexical control it inherited
+    // on `env.block_stack`/`env.tag_stack` (its entry guard moves them aside),
+    // so a closure it creates would snapshot an empty scope. Keep the body at
+    // T0 when such a closure can exit by name to a block/tag outside itself:
+    // the interpreter gives it the creator's full captured control.
+    for instr in &bf.code {
+        if let Instr::MakeClosure { func, .. } = instr {
+            if bf_has_free_control_exit(&bf.nested_functions[*func as usize]) {
+                return true;
+            }
         }
     }
     if own_blocks.is_empty() && own_tags.is_empty() {
@@ -23634,6 +23669,9 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
     // never be published for the closure's `return-from`/`go` to find (bliss-4u5u,
     // the ASDF traverse-action plan truncation).
     if native_would_lose_captured_control(&bf) {
+        egcl_rt::blog!("compile", egcl_rt::log::TRACE,
+            "[T1] {}: declined: a closure it creates needs captured block/tag control; retain interpreter",
+            display_fn_name(&bf.name));
         return None;
     }
     // Prefer the published native ABI for the shapes whose exact frame and
@@ -23917,7 +23955,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
             | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
-            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
+            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+            | Instr::MakeClosure { capture_env: false, .. }))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))

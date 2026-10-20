@@ -163,6 +163,7 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList
+                            | AuxData::NestedClosure(_)
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -184,12 +185,14 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "THROW requires an Invoke with tag and primary",
                 ));
             }
-            if matches!(data.aux, AuxData::HostEval(_) | AuxData::FunctionLookup(_))
-                && (data.opcode != Opcode::Invoke || !data.args.is_empty())
+            if matches!(
+                data.aux,
+                AuxData::HostEval(_) | AuxData::FunctionLookup(_) | AuxData::NestedClosure(_)
+            ) && (data.opcode != Opcode::Invoke || !data.args.is_empty())
             {
                 errors.push(VerifyError::new(
                     "V11 invoke-shape",
-                    "host evaluation and function lookup require argument-free Invoke",
+                    "host evaluation, function lookup and closure creation require argument-free Invoke",
                 ));
             }
             if matches!(data.aux, AuxData::ValuesToList)

@@ -403,6 +403,9 @@ pub enum AuxData {
     /// Consumes the primary, reads the runtime multiple-value tuple, returns
     /// a fresh list and leaves the multiple-value state inactive.
     ValuesToList,
+    /// Materialize `nested_functions[idx]` of the retained root body as a
+    /// fresh non-capturing closure through the native-transfer bridge.
+    NestedClosure(u32),
     /// Binding operation identified by its exact retained bytecode PC. Exit
     /// decodes UnbindSpecial's count there; entry consumes one rooted value.
     SpecialBinding { bcp: u32, enter: bool },
