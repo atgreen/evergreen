@@ -116,24 +116,40 @@ fn find_and_count_match_the_interpreter() {
     );
 }
 
-/// The closure-environment decline is gone. Each function must still appear in
-/// the T2 log (so the probe reached the tiering decision) with some other
-/// outcome; today that is the &key decline that bliss-shih7.27 removes.
+/// The closure-environment decline is gone, and with the &key native entry
+/// (bliss-shih7.27) nothing else keeps these functions interpreted: after the
+/// corpus each must be installed natively (tier 1 or above), and none may log a
+/// closure-environment decline on the way.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn find_and_count_no_longer_decline_for_a_closure_environment() {
-    let (_, log) = run(None);
+    let out = Command::new(BIN)
+        .args([
+            "--no-init",
+            "--eval",
+            &format!("(progn {PROGRAM} (values))"),
+            "--eval",
+            "(dolist (f '(find find-if find-if-not count count-if count-if-not)) \
+               (format t \"TIER ~A ~A~%\" f (egcl-ext:function-tier f)))",
+        ])
+        .env("EGCL_T2_LOG", "stderr")
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .output()
+        .expect("run egcl");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}\n{log}");
     for name in NAMES {
         let prefix = format!("[T2] {name}:");
-        let ours: Vec<&str> = log.lines().filter(|l| l.starts_with(&prefix)).collect();
         assert!(
-            !ours.is_empty(),
-            "{name} never reached a tiering decision:\n{log}"
+            !log.lines().any(|l| l.starts_with(&prefix) && l.contains("closure environment")),
+            "{name} still builds a capturing closure:\n{log}"
         );
-        assert!(
-            !ours.iter().any(|l| l.contains("closure environment")),
-            "{name} still builds a capturing closure:\n{}",
-            ours.join("\n")
-        );
+        let tier = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("TIER {name} ")))
+            .and_then(|t| t.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("no tier reported for {name}:\n{stdout}"));
+        assert!(tier >= 1, "{name} stayed interpreted (tier {tier}):\n{log}");
     }
 }

@@ -409,6 +409,32 @@
 (check :optional-overflow (list (opt-overflow 1) (opt-overflow -1 -2)))
 (check :optional-too-many (opt-sp 1 2 3 4))
 
+;;; ── &rest / &key / &aux entry: lambda list bound at native entry ──────
+
+(defun key-sp (a &key (b (list a a) b-p) (c 3)) (list a b b-p c))
+(defun key-rest (x &rest r) (list* x (length r) r))
+(defun key-aux (a &aux (b (* a 2)) (c (cons a b))) (list a b c))
+(defun key-allow (&key a &allow-other-keys) a)
+(defun key-overflow (a &key (b most-positive-fixnum)) (+ a b))
+(defun key-count (n &key acc)
+  (if (zerop n) acc (key-count (1- n) :acc (cons n acc))))
+(defun key-throw (a &key (b (throw 'key-exit (list :thrown a)))) (list a b))
+
+(defun key-calls (i)
+  (list (key-sp i) (key-sp i :b nil) (key-sp i :c 4 :b 5 :b 6) (key-rest i)
+        (key-rest i 1 2 3) (key-aux i) (key-allow :z 1 :a i)
+        (key-overflow i) (key-count 4 :acc (list i))
+        (catch 'key-exit (key-throw i)) (key-throw i :b 0)))
+
+(check :key-hot
+       (let ((acc nil))
+         (dotimes (i 40 acc)
+           (setq acc (key-calls i)))))
+(check :key-overflow (list (key-overflow 1) (key-overflow -1 :b -2)))
+(check :key-odd (key-sp 1 :b))
+(check :key-unknown (key-sp 1 :z 2))
+(check :key-too-few (key-rest))
+
 ;;; ── #'f function designators (bliss-j3fv8) ────────────────────────────
 
 (defun fd-apply (l) (apply #'+ l))

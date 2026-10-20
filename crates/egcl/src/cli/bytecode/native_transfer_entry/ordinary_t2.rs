@@ -24,7 +24,7 @@ pub(in crate::cli::bytecode) fn prepare_ordinary_t2(
         ));
         None
     };
-    if !positional_tagged_parameters(&input.body) {
+    if !activation_bound_parameters(&input.body) {
         return decline("unsupported parameter shape");
     }
     if !local_control_native_body(&input.body, true, true, false) {

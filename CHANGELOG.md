@@ -46,8 +46,8 @@
   `COUNT` family no longer build a closure for each call. Counting over a
   100-element sequence is about 45x faster (`COUNT-IF` about 12x) and `FIND`
   about 2x faster. None of these functions is refused native compilation for
-  a closure environment any more; their keyword arguments still keep them
-  interpreted for now
+  a closure environment any more, and with keyword functions now compiling
+  natively they reach T1 and T2 when hot
   ([#465](https://github.com/atgreen/evergreen/pull/465)).
 - Methods hot by call count compile to native code on x86-64 Linux. A
   method's compiled body is named `(METHOD ...)`, which the T1 compiler tried
@@ -90,6 +90,14 @@
   argument; it now fills in omitted optional arguments itself, so these
   functions reach T1 and then T2 like fixed-arity ones
   ([#457](https://github.com/atgreen/evergreen/pull/457)).
+- Functions whose lambda list has `&rest`, `&key` or `&aux` parameters now
+  compile to native code on x86-64 Linux too, provided no closure captures
+  those parameters. The native entry binds the lambda list with the same
+  binder as the interpreter, so keyword checking, supplied-p variables and
+  defaults behave as before. Prelude functions such as `STRING-UPCASE`,
+  `POSITION-IF`, `REDUCE` and `PARSE-INTEGER` now reach T1 and then T2
+  instead of staying in the interpreter
+  ([#470](https://github.com/atgreen/evergreen/pull/470)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
@@ -126,6 +134,11 @@
 
 ### Fixed
 
+- A `THROW` from the default form of a `&key` or `&aux` parameter to a
+  `CATCH` in the interpreted caller reaches that catch. Once the caller had
+  been called a few times, the throw escaped as an internal error such as
+  `__THROW__:1758` instead
+  ([#470](https://github.com/atgreen/evergreen/pull/470)).
 - On x86-64, a fully optimized function that left-shifted a masked value, such
   as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
   the bignum result. It now checks the shift for overflow

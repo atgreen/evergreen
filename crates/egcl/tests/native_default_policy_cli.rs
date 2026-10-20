@@ -37,12 +37,13 @@ fn linux_default_installs_ordinary_register_calls() {
 
 #[test]
 fn linux_default_interprets_unsupported_parameters_and_preserves_transfers() {
-    // &key still needs the variadic binder, which the mapped entry lacks
-    // (bliss-shih7.27), so these stay interpreted.
+    // A &key parameter captured by a closure lives in a heap binding that the
+    // mapped entry cannot bind (bliss-shih7.27), so these stay interpreted.
     let output = run("(defun policy-key-leaf (x) (values (list x) 19))
-        (defun policy-key (x &key (y 1)) (policy-key-leaf (+ x y)))
+        (defun policy-key (x &key (y 1))
+          (funcall (lambda () (policy-key-leaf (+ x y)))))
         (defun policy-escape (x &key (y 1))
-          (unwind-protect (throw 'policy-exit (values (+ x y) 23))
+          (unwind-protect (throw 'policy-exit (values (funcall (lambda () (+ x y))) 23))
             (incf *policy-cleanups*)))
         (setq *policy-cleanups* 0)
         (dotimes (i 40)
@@ -53,6 +54,32 @@ fn linux_default_interprets_unsupported_parameters_and_preserves_transfers() {
           (egcl-ext:function-tier 'policy-key) *policy-cleanups*)
         (disassemble 'policy-key)");
     assert!(output.contains("POLICY-KEY=0 CLEANUPS=40"), "{output}");
+    assert!(!output.contains("Legacy checked ABI"), "{output}");
+}
+
+#[test]
+fn linux_default_compiles_keyword_parameters_and_preserves_transfers() {
+    // Non-capturing &key bodies bind their slots in the mapped activation
+    // entry (bliss-shih7.27): they promote and keep MV and THROW intact.
+    let output = run("(defun policy-key-leaf (x) (values (list x) 19))
+        (defun policy-key (x &key (y 1)) (policy-key-leaf (+ x y)))
+        (defun policy-escape (x &key (y 1))
+          (unwind-protect (throw 'policy-exit (values (+ x y) 23))
+            (incf *policy-cleanups*)))
+        (setq *policy-cleanups* 0)
+        (dotimes (i 40)
+          (assert (equal '((8) 19) (multiple-value-list (policy-key 7))))
+          (assert (equal '((9) 19) (multiple-value-list (policy-key 7 :y 2))))
+          (assert (equal '(8 23) (multiple-value-list
+            (catch 'policy-exit (policy-escape 7))))))
+        (format t \"POLICY-KEY=~D ESCAPE=~D CLEANUPS=~D~%\"
+          (egcl-ext:function-tier 'policy-key)
+          (egcl-ext:function-tier 'policy-escape) *policy-cleanups*)
+        (disassemble 'policy-key)");
+    assert!(
+        output.contains("POLICY-KEY=1 ESCAPE=1 CLEANUPS=40"),
+        "{output}"
+    );
     assert!(!output.contains("Legacy checked ABI"), "{output}");
 }
 
@@ -79,8 +106,9 @@ fn linux_default_compiles_optional_parameters_and_preserves_transfers() {
 
 #[test]
 fn linux_default_keeps_hot_unsupported_loop_in_interpreter() {
+    // The closure captures SUM, so the mapped entry cannot bind it.
     let output = run("(defun policy-loop (n &key (sum 0))
-          (dotimes (i n sum) (incf sum i)))
+          (dotimes (i n (funcall (lambda () sum))) (incf sum i)))
         (assert (= 780 (policy-loop 40)))
         (format t \"POLICY-LOOP=~D OSR=~D~%\"
           (egcl-ext:function-tier 'policy-loop)

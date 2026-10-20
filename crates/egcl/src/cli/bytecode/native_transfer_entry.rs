@@ -368,7 +368,7 @@ pub(super) fn install_t1(
     body: Arc<BytecodeFunction>,
     allow_speculation: bool,
 ) -> Option<Rc<NativeCode>> {
-    if !native_transfer::is_supported() || !positional_tagged_parameters(&body) {
+    if !native_transfer::is_supported() || !activation_bound_parameters(&body) {
         return None;
     }
     let code =
@@ -382,7 +382,6 @@ pub(super) fn install_t1(
 /// used to return `None` without saying why; the decline logs print it.
 #[derive(Debug)]
 pub(super) enum EmitDecline {
-    Variadic,
     CapturedEnvironment,
     ExecutingIdentity,
     /// The body's name does not read back as a symbol, so the optimizing
@@ -409,7 +408,6 @@ pub(super) enum EmitDecline {
 impl std::fmt::Display for EmitDecline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Variadic => f.write_str("&rest, &key or &aux lambda list"),
             Self::CapturedEnvironment => f.write_str("captured variables (closure environment)"),
             Self::ExecutingIdentity => f.write_str("a scope needs an executing identity"),
             Self::UnresolvedName => {
@@ -454,11 +452,12 @@ pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>
     if body.has_env {
         return "captured variables (closure environment)".into();
     }
-    if body.variadic {
-        return "&rest, &key or &aux lambda list".into();
-    }
-    if !positional_tagged_parameters(body) {
-        return "a parameter is special or boxed, not a plain slot".into();
+    if !activation_bound_parameters(body) {
+        return if body.variadic {
+            "a &rest, &key or &aux parameter is special or out of slot order".into()
+        } else {
+            "a parameter is special or boxed, not a plain slot".into()
+        };
     }
     if let Some(op) = body.code.iter().find(|op| {
         matches!(op, Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. })
@@ -769,6 +768,12 @@ impl TransferCode {
     }
 
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
+        // The uninstalled segment cache runs without the callable whose
+        // captured environment a variadic default may read; only installed
+        // entries bind variadic lambda lists.
+        if body.variadic {
+            return None;
+        }
         Self::compile_variant(Arc::clone(&body), true, true, None)
             .or_else(|| Self::compile_variant(body, false, true, None))
     }
@@ -834,9 +839,7 @@ impl TransferCode {
         allow_recursion: bool,
         symbol: Option<u32>,
     ) -> Result<Self, EmitDecline> {
-        if body.variadic {
-            return Err(EmitDecline::Variadic);
-        }
+        // A non-capturing variadic body binds its slots in `run_activation`.
         if body.has_env {
             return Err(EmitDecline::CapturedEnvironment);
         }
@@ -1418,10 +1421,9 @@ impl TransferCode {
         };
         egcl_rt::rooted!(args = args.to_vec());
         egcl_rt::rooted_ref!(_env = &mut *env);
-        // `bind_params` pads omitted `&optional` arguments below.
-        if osr_offset.is_none()
-            && !(usize::from(self.body.min_args)..=usize::from(self.body.arity)).contains(&args.len())
-        {
+        // `bind_params` pads omitted `&optional` arguments below, and
+        // `bind_variadic` parses a `&rest`/`&key` tail.
+        if osr_offset.is_none() && !super::arity_accepts(&self.body, args.len()) {
             return Err(EgclError::ProgramError(
                 "native transfer entry: wrong argument count".into(),
             ));
@@ -1469,7 +1471,20 @@ impl TransferCode {
                 )
             })? };
         frame_guard.0 = Some(frame);
-        if osr_offset.is_none() {
+        if osr_offset.is_none() && self.body.variadic {
+            // Defaults may run arbitrary Lisp, collect or exit non-locally.
+            // The frame's slots are still NIL, as at the entry poll below, and
+            // no native scope, block stack or entry state is installed yet;
+            // `frame_guard` pops the frame on an error, as the checked ABI does.
+            bind_variadic(
+                &self.body,
+                frame,
+                &args,
+                closure_captured_env(*function).as_ref(),
+                env,
+            )
+            .map_err(EgclError::capture_backtrace)?;
+        } else if osr_offset.is_none() {
             bind_params(&self.body, frame, &args, None);
         }
         let _dynamic_scope_guard = DynamicScopeGuard {
@@ -1894,6 +1909,24 @@ fn named_call_cells(body: &BytecodeFunction) -> Vec<(u32, Arc<egcl_rt::call_tabl
     cells
 }
 
+/// Parameters the managed activation entry can bind: positional ones, or a
+/// non-capturing `&rest`/`&key`/`&aux` lambda list whose `n`th parameter lives
+/// in slot `n`, which `bind_variadic` fills before entry (bliss-shih7.27). T2's
+/// entry seeds the same slot prefix. Only the managed entry admits the variadic
+/// shape; every exact-arity entry still requires `fixed_tagged_parameters`.
+pub(super) fn activation_bound_parameters(body: &BytecodeFunction) -> bool {
+    positional_tagged_parameters(body) || variadic_slot_parameters(body)
+}
+
+fn variadic_slot_parameters(body: &BytecodeFunction) -> bool {
+    body.variadic
+        && !body.has_env
+        && body.param_layout.len() <= usize::from(body.n_locals)
+        && body.param_layout.iter().enumerate().all(|(index, (_, location))| {
+            matches!(location, VarLoc::Slot(slot) if usize::from(*slot) == index)
+        })
+}
+
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     local_control_native_body(body, allow_values, false, false)
 }
@@ -1920,7 +1953,7 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
-    body.param_layout.len() == usize::from(body.arity)
+    (body.param_layout.len() == usize::from(body.arity) || variadic_slot_parameters(body))
         && body
             .param_layout
             .iter()
