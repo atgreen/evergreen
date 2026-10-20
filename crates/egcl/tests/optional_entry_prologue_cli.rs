@@ -123,3 +123,113 @@ fn optional_prologue_survives_gc_stress() {
         ],
     ));
 }
+
+/// Hot `&optional` functions, called with and without their optional
+/// arguments: a heap default, a default that overflows to a bignum, and
+/// recursion that omits an argument. Prints the results, then each tier.
+const T2_PROGRAM: &str = r#"
+(progn
+  (defun hot (a &optional (b 1)) (+ a b))
+  (defun two-defaults (a &optional (b (* a 10)) (c (+ a b))) (list a b c))
+  (defun hot-list (a &optional (b (list a a))) (list* a b))
+  (defun overflow (a &optional (b most-positive-fixnum)) (+ a b))
+  (defun sum-to (n &optional (acc 0)) (if (zerop n) acc (sum-to (1- n) (+ acc n))))
+  (defun all-calls (i)
+    (list (hot i) (hot i i) (two-defaults i) (two-defaults i 2)
+          (two-defaults i 2 3) (hot-list i) (hot-list i :x)
+          (overflow 0) (sum-to 20) (sum-to 5 i)))
+  ;; T2 compiles on a background thread: keep calling (bounded) until every
+  ;; function is published, then take the answers from the promoted code.
+  (loop for i from 0 below 5000
+        do (all-calls i)
+        until (every (lambda (f) (eql (egcl-ext:function-tier f) 2))
+                     '(hot two-defaults hot-list overflow sum-to)))
+  (print (all-calls 199))
+  (print (list (overflow 1) (overflow -1) (overflow 1 2) (sum-to 100)
+               (handler-case (progn (two-defaults) nil) (program-error () :few))
+               (handler-case (progn (funcall 'two-defaults 1 2 3 4) nil)
+                 (program-error () :many))))
+  (terpri)
+  (format t "TIERS ~{~a~^ ~}~%"
+          (mapcar #'egcl-ext:function-tier '(hot two-defaults hot-list overflow sum-to))))
+"#;
+
+const T2_THRESHOLDS: &[(&str, &str)] = &[
+    ("EGCL_T0_T1_THRESHOLD", "2"),
+    ("EGCL_T1_T2_INVOKE_THRESHOLD", "5"),
+    ("EGCL_T2_LOG", "stderr"),
+];
+
+/// Splits the program's output into its result lines and its tier line.
+fn results_and_tiers(output: &Output) -> (String, String) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (results, tiers) = stdout.split_once("TIERS ").expect("tier line");
+    let tiers = tiers.lines().next().unwrap_or_default();
+    (results.trim().to_string(), tiers.to_string())
+}
+
+/// The mapped Linux entry pads omitted `&optional` arguments, so these
+/// functions reach T2 instead of being declined at T1 (bliss-shih7.27), and
+/// compute what the tree-walker and the T2-disabled engine compute.
+#[test]
+fn optional_parameters_reach_t2_with_identical_results() {
+    let dir = scratch("optional-prologue-t2");
+    let tiered = egcl(&dir, &["--eval", T2_PROGRAM], T2_THRESHOLDS);
+    let (results, tiers) = results_and_tiers(&tiered);
+    assert!(
+        results.contains("1152921504606846976 1152921504606846974 3 5050 :FEW :MANY"),
+        "{results}"
+    );
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(
+            tiers,
+            "2 2 2 2 2",
+            "{}",
+            String::from_utf8_lossy(&tiered.stderr)
+        );
+        let log = String::from_utf8_lossy(&tiered.stderr);
+        for name in ["HOT", "TWO-DEFAULTS", "HOT-LIST", "OVERFLOW", "SUM-TO"] {
+            assert!(
+                log.contains(&format!("[T2] {name}: optimized worker result installed")),
+                "{name} was not installed at T2:\n{log}"
+            );
+        }
+    }
+    for envs in [
+        &[("EGCL_BACKEND", "tree-walker")][..],
+        &[("EGCL_DISABLE_T2", "1"), ("EGCL_T0_T1_THRESHOLD", "2")][..],
+    ] {
+        let (other, _) = results_and_tiers(&egcl(&dir, &["--eval", T2_PROGRAM], envs));
+        assert_eq!(results, other, "results differ under {envs:?}");
+    }
+}
+
+/// The promoted entry binds a heap default in a managed frame slot. Under a
+/// collection on every allocation it must still compute the same values.
+#[test]
+fn optional_t2_entry_survives_gc_stress() {
+    let dir = scratch("optional-prologue-t2-stress");
+    let (plain, _) = results_and_tiers(&egcl(&dir, &["--eval", T2_PROGRAM], T2_THRESHOLDS));
+    let mut envs = T2_THRESHOLDS.to_vec();
+    envs.extend([
+        ("EGCL_GC_STRESS", "1"),
+        ("EGCL_GC_POISON", "1"),
+        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+    ]);
+    let stressed = egcl(&dir, &["--eval", T2_PROGRAM], &envs);
+    let (results, tiers) = results_and_tiers(&stressed);
+    assert_eq!(plain, results);
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        assert_eq!(
+            tiers,
+            "2 2 2 2 2",
+            "{}",
+            String::from_utf8_lossy(&stressed.stderr)
+        );
+    }
+}

@@ -12,7 +12,8 @@
 
 use std::process::{Command, Output};
 
-// Mapped Linux admission still excludes captured and variadic entries. Checked
+// Mapped Linux admission still excludes captured entries and &rest/&key ones;
+// &optional-only entries are admitted (bliss-shih7.27). Checked
 // primitive declarations have an ordinary native entry and validate at ingress.
 const MAPPED_LINUX: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
@@ -1967,17 +1968,13 @@ fn variadic_lambda_lists_compile_and_promote() {
     let (out, ok) = run(prog, &[("EGCL_T1_THRESHOLD", "2")]);
     assert!(ok, "variadic run failed: {out}");
     let line = out.lines().next().unwrap_or("").to_string();
+    // The mapped Linux entry pads omitted &optional arguments (bliss-shih7.27).
     assert!(
-        line.starts_with(if MAPPED_LINUX { "0 " } else { "1 " }),
+        line.starts_with("1 "),
         "unexpected admission tier for &optional: {line:?}"
     );
     assert_eq!(
-        line,
-        if MAPPED_LINUX {
-            "0 (10 20 NIL) (5 1 99) (1 (2 3))"
-        } else {
-            "1 (10 20 NIL) (5 1 99) (1 (2 3))"
-        },
+        line, "1 (10 20 NIL) (5 1 99) (1 (2 3))",
         "variadic results (tier f, f, g, h): {line:?}"
     );
 
@@ -2423,7 +2420,7 @@ fn structural_t1_decline_is_attempted_only_once() {
     // This therefore declines at T1 and
     // stays in the interpreter — where it must still compute the right answer.
     let program = "\
-        (defun thrower (&optional n) (catch 'tag (if (> n 3) (throw 'tag (* n 2)) n))) \
+        (defun thrower (&rest ns) (let ((n (car ns))) (catch 'tag (if (> n 3) (throw 'tag (* n 2)) n)))) \
         (dotimes (i 300) (thrower i)) \
         (format t \"~a ~a~%\" (thrower 10) (egcl-ext:function-tier (quote thrower)))";
     let out = run_output(
@@ -2457,7 +2454,7 @@ fn structural_t1_decline_is_attempted_only_once() {
 #[test]
 fn redefining_a_declined_function_allows_promotion_again() {
     let program = "\
-        (defun redef-target (&optional n) (catch 'tag (throw 'tag n))) \
+        (defun redef-target (&rest ns) (catch 'tag (throw 'tag (car ns)))) \
         (dotimes (i 50) (redef-target i)) \
         (defun redef-target (n) (+ n 1)) \
         (dotimes (i 300) (redef-target i)) \

@@ -292,7 +292,7 @@ fn native_optional_entry_preserves_defaults_and_single_values() {
           (dotimes (i 30)
             (assert (= (native-optional-full 1 2 3) 6))
             (assert (equal (multiple-value-list (native-single-value i)) (list i))))
-          (assert (= OPTIONAL-TIER (egcl-ext:function-tier 'native-optionals)))
+          (assert (= 2 (egcl-ext:function-tier 'native-optionals)))
           (assert (= 2 (egcl-ext:function-tier 'native-optional-full)))
           (assert (= 2 (egcl-ext:function-tier 'native-identity)))
           (assert (= *native-defaults* 0))
@@ -303,12 +303,8 @@ fn native_optional_entry_preserves_defaults_and_single_values() {
           (assert (= *native-defaults* 2))
           (format t "NATIVE-OPTIONAL-ENTRY-OK~%")
         "#;
-    // Optional parameters currently use the interpreter adapter on Linux;
-    // the fixed-arity caller and identity callee must still be actual T2.
-    let optional_tier = if cfg!(all(target_arch = "x86_64", target_os = "linux")) { "0" } else { "2" };
-    let program = program.replace("OPTIONAL-TIER", optional_tier);
     let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
-        .args(["--no-init", "--eval", &program])
+        .args(["--no-init", "--eval", program])
         .env("EGCL_FORCE_TIER", "t2")
         .env("EGCL_LAZY_COMPILE", "0")
         .output().unwrap();

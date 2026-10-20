@@ -56,6 +56,12 @@
   `(< a 1000000000000)`, now reach the optimizing tier instead of stopping
   one tier below it
   ([#456](https://github.com/atgreen/evergreen/pull/456)).
+- Functions whose lambda list has `&optional` parameters, but no `&rest`,
+  `&key` or `&aux`, now compile to native code on x86-64 Linux. They used to
+  stay in the interpreter there, because the native entry required every
+  argument; it now fills in omitted optional arguments itself, so these
+  functions reach T1 and then T2 like fixed-arity ones
+  ([#457](https://github.com/atgreen/evergreen/pull/457)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
