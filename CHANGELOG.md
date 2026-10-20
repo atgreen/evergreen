@@ -26,7 +26,7 @@
   function blacklisted after repeated guard deopts logs one summary line
   naming where T0 resumed and the disproved speculation. Deopt lines
   now use the same plain function name as the rest of the log
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#480](https://github.com/atgreen/evergreen/pull/480)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in
