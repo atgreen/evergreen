@@ -1036,8 +1036,13 @@ impl Emitter<'_> {
                 // constants map holds TAGGED bits, so the shift count is
                 // recovered by untagging it.
                 let deopt = self.deopt_label(data)?;
-                let amount = *data.args.get(1).ok_or(unsupported!())?;
-                let tagged = *self.constants.get(&amount).ok_or(unsupported!())?;
+                // Report the OPCODE, not this line: a variable shift amount is
+                // a shape emit.rs refuses as the opcode too, and the T2 log's
+                // "refused Opcode #N in t2/ir.rs" is what makes the two
+                // backends' declines greppable the same way (bliss-ieajy.1).
+                let refused = || EmitError::UnsupportedOp(op_tag(data.opcode));
+                let amount = *data.args.get(1).ok_or_else(refused)?;
+                let tagged = *self.constants.get(&amount).ok_or_else(refused)?;
                 let n = (tagged as i64) >> 3;
                 self.guard_fixnum(W0, deopt);
                 // DIRECTION, mirroring emit.rs and easy to get backwards: on
