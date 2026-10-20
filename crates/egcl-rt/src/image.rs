@@ -203,16 +203,6 @@ pub enum SectionType {
     /// real body is a Box'd Rust struct off the GC heap. Restored INSIDE
     /// `restore_heap`, between its two passes, so references to them relocate.
     OffHeap = 9,
-    /// Embedded shared libraries (bliss-rhsy4): a manifest and page-aligned
-    /// library payloads, kept off the Lisp heap. Always `STORED`, so the
-    /// payloads can be copied straight from the file.
-    ForeignLibraries = 10,
-}
-
-/// Per-section flag bits.
-pub mod section_flags {
-    /// Written uncompressed even in a compressed image.
-    pub const STORED: u32 = 1 << 0;
 }
 
 /// Host-crate registry serialization hooks (bliss-x0f2 M2). The `egcl` crate
@@ -560,10 +550,7 @@ fn save_image_impl(
     } else {
         settings_raw
     };
-    // Embedded shared libraries are never compressed: they are copied from the
-    // file into a memfd without passing through a buffer.
-    let foreign_data: Vec<u8> = crate::ffi::embedded::serialize_section()?;
-    let section_count: u32 = 10;
+    let section_count: u32 = 9;
 
     // Page alignment constant (4 KiB) — §7.2.2 requires sections after
     // the directory to be page-aligned to allow mmap with MAP_FIXED (R7.02).
@@ -665,15 +652,6 @@ fn save_image_impl(
         uncompressed_size: settings_size as u64,
     };
 
-    current_offset = align_to_page(current_offset + settings_data.len());
-    let foreign_section = SectionEntry {
-        section_type: SectionType::ForeignLibraries as u32,
-        flags: section_flags::STORED,
-        file_offset: current_offset as u64,
-        size: foreign_data.len() as u64,
-        uncompressed_size: foreign_data.len() as u64,
-    };
-
     // Get the actual heap base address for relocation tracking (R7.03).
     let original_base = crate::gc::heap_base_address();
     let gc_generation = crate::gc::gc_generation();
@@ -722,7 +700,6 @@ fn save_image_impl(
             host_section,
             offheap_section,
             settings_section,
-            foreign_section,
         ];
         for section in &sections {
             let section_bytes = struct_to_bytes(section);
@@ -734,7 +711,7 @@ fn save_image_impl(
         // Write section data with page-alignment padding between sections.
         // Each section's file_offset was computed with page alignment, so
         // we pad to match those offsets.
-        let section_data_slices: [&[u8]; 10] = [
+        let section_data_slices: [&[u8]; 9] = [
             &heap_data,
             &symbol_data,
             &package_data,
@@ -744,7 +721,6 @@ fn save_image_impl(
             &host_data,
             &offheap_data,
             &settings_data,
-            &foreign_data,
         ];
         let mut write_pos = section_dir_offset + sections.len() * SECTION_ENTRY_SIZE;
         for (idx, data) in section_data_slices.iter().enumerate() {
@@ -933,7 +909,6 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
     let mut gc_meta_entry: Option<SectionEntry> = None;
     let mut host_entry: Option<SectionEntry> = None;
     let mut offheap_entry: Option<SectionEntry> = None;
-    let mut foreign_entry: Option<SectionEntry> = None;
 
     let mut seen_sections = std::collections::HashSet::new();
     let mut extents = Vec::new();
@@ -965,7 +940,6 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
             t if t == SectionType::GcMeta as u32 => gc_meta_entry = Some(entry),
             t if t == SectionType::HostRegistries as u32 => host_entry = Some(entry),
             t if t == SectionType::OffHeap as u32 => offheap_entry = Some(entry),
-            t if t == SectionType::ForeignLibraries as u32 => foreign_entry = Some(entry),
             _ => {
                 // Unknown section type — skip for forward compatibility.
             }
@@ -988,23 +962,6 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
             "image requires a runtime contract validator".into(),
         ));
     }
-
-    // Validate the embedded libraries before anything is restored, so a bad
-    // manifest rejects the image instead of leaving it half-installed. A STORED
-    // section is read in place; its payloads stay in the file.
-    let foreign_libraries = match foreign_entry {
-        Some(entry) if entry.flags & section_flags::STORED != 0 || !is_compressed => {
-            let start = entry.file_offset as usize;
-            let section = &file_data[start..start + entry.size as usize];
-            let backing = backing
-                .map(|(file, offset)| offset.checked_add(entry.file_offset).map(|offset| (file, offset)))
-                .map(|b| b.ok_or_else(|| EgclError::InvalidImage("foreign-library file offset overflow".into())))
-                .transpose()?;
-            crate::ffi::embedded::parse_section(section, backing)?
-        }
-        Some(entry) => crate::ffi::embedded::parse_section(&read_section_data(&entry)?, None)?,
-        None => crate::ffi::embedded::parse_section(&[], None)?,
-    };
 
     // Stash the off-heap-body section so restore_heap can re-materialize those
     // objects between its two passes (bliss-x0f2 M3), then clear it afterward.
@@ -1090,8 +1047,6 @@ fn load_image_contents(file_data: &[u8], backing: Option<(&std::fs::File, u64)>)
             }
         }
     }
-
-    crate::ffi::embedded::install_section(foreign_libraries);
 
     // Store the restored entry continuation, remapped through the heap's old→new
     // map (it is itself a saved pointer into the relocated heap).
