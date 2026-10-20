@@ -92,19 +92,14 @@
 
 ### Fixed
 
-- `MULTIPLE-VALUE-LIST` returns exactly one value once its function is
-  compiled. Compiled code used to leave the collected values behind as stale
-  secondary values, so `(multiple-value-bind (a b) (f))` around a function
-  ending in `MULTIPLE-VALUE-LIST` saw `b` as the second collected value instead
-  of `NIL` ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
-
-### Fixed
-
 - On x86-64, a fully optimized function that left-shifted a masked value, such
   as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
   the bignum result. It now checks the shift for overflow
   ([#456](https://github.com/atgreen/evergreen/pull/456)).
-
+- `MULTIPLE-VALUE-LIST` returns exactly one value once its function is
+  compiled. Compiled code used to leave the collected values behind as stale
+  secondary values, so `(multiple-value-bind (a b) (f))` around a function
+  ending in `MULTIPLE-VALUE-LIST` saw `b` as the second collected value instead
   of `NIL` ([#461](https://github.com/atgreen/evergreen/pull/461)).
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
