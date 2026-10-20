@@ -4226,8 +4226,22 @@ mod tests {
                     Instr::Return,
                 ],
             ),
+            // CAR then CDR of one value share a single NIL test, so the join
+            // carries one parameter per load.
+            (
+                "car-cdr",
+                vec![
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: car, nargs: 1 },
+                    Instr::StoreLocal(1),
+                    Instr::LoadLocal(0),
+                    Instr::CallNamed { sym: cdr, nargs: 1 },
+                    Instr::Return,
+                ],
+            ),
         ] {
-            let input = bf(name, code, vec![], 1, 1, 1);
+            let locals = if name == "car-cdr" { 2 } else { 1 };
+            let input = bf(name, code, vec![], locals, 1, 1);
             let function = build_from_bytecode(&input).unwrap();
             crate::t2::verify::verify(&function).unwrap();
             assert!(
@@ -4238,6 +4252,12 @@ mod tests {
                     .any(|&inst| function.inst(inst).opcode == Opcode::GenericEq)),
                 "{name}: the fixture must carry the NIL test it is checking"
             );
+            if name == "car-cdr" {
+                assert!(
+                    function.block_order().iter().any(|&block| function.block(block).params.len() >= 2),
+                    "car-cdr: the grouped loads must meet at a multi-parameter join"
+                );
+            }
             let runtime = emit_s390x::RuntimeCalls {
                 multiple_values: 1,
                 ..Default::default()
