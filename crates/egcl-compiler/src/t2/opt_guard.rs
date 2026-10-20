@@ -200,7 +200,10 @@ fn forwarding_keeps_declared_types(f: &mut Function, inst: Inst, v: Value, got: 
         return true;
     }
     let narrowed = have.meet(got.bits);
-    if narrowed.is_bottom() || !need.contains(narrowed) || !can_refine_declared(f, v, narrowed) {
+    if narrowed.is_bottom()
+        || !need.contains(narrowed)
+        || !can_refine_declared(f, v, &results, narrowed)
+    {
         return false;
     }
     f.refine_type(v, IRType::of(narrowed));
@@ -212,12 +215,15 @@ fn forwarding_keeps_declared_types(f: &mut Function, inst: Inst, v: Value, got: 
 /// definition. A block parameter additionally needs every incoming argument
 /// to be declared within `bits`; parameters of the entry block or an OSR
 /// header, and any value an OSR state imports, receive values from outside
-/// the IR and are left alone.
-fn can_refine_declared(f: &Function, v: Value, bits: TypeBits) -> bool {
+/// the IR and are left alone. `forwarded` are the guard results about to be
+/// replaced by `v`: a state naming one of them imports `v` once they are
+/// forwarded, so it counts as importing `v` already.
+fn can_refine_declared(f: &Function, v: Value, forwarded: &[Value], bits: TypeBits) -> bool {
     let imported = f.osr_entries.iter().any(|osr| {
         let state = f.frame_states.get(osr.frame_state);
-        let names =
-            |src: &ValueSource| matches!(src, ValueSource::Value { value, .. } if *value == v);
+        let names = |src: &ValueSource| {
+            matches!(src, ValueSource::Value { value, .. } if *value == v || forwarded.contains(value))
+        };
         state
             .scopes
             .iter()
