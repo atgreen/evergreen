@@ -137,7 +137,7 @@
   ASDF's `ABSOLUTE-PATHNAME-P` on a pathname without a directory -- were sent
   back to the interpreter for good after eight of them. They now keep their
   native code and stay eligible for further tier-up
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#472](https://github.com/atgreen/evergreen/pull/472)).
 
 ### Fixed
 
