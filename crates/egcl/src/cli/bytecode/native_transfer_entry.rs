@@ -1505,6 +1505,7 @@ impl TransferCode {
                             Instr::CallNamed { .. }
                                 | Instr::EvalHost(_)
                                 | Instr::LoadFunction(_)
+                                | Instr::ValuesToList
                                 | Instr::CleanupReturn
                                 | Instr::SetValues(_)
                                 | Instr::Throw
