@@ -55,7 +55,7 @@
   constant wider than 32 bits, such as `(* a 1000000000000)`, `(ash a 40)` or
   `(< a 1000000000000)`, now reach the optimizing tier instead of stopping
   one tier below it
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#456](https://github.com/atgreen/evergreen/pull/456)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
@@ -68,7 +68,7 @@
 - On x86-64, a fully optimized function that left-shifted a masked value, such
   as `(ash (logand a #xFFFFFFFFFF) 30)`, returned a wrapped fixnum instead of
   the bignum result. It now checks the shift for overflow
-  ([#TBD](https://github.com/atgreen/evergreen/pull/TBD)).
+  ([#456](https://github.com/atgreen/evergreen/pull/456)).
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
   of the same name. A generic function such as `(defgeneric my:length (x))`
