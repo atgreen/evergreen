@@ -102,7 +102,7 @@
   bytecode interpreter. In a cold `(asdf:load-system :babel)` this moves
   functions such as `UIOP:NORMALIZE-PATHNAME-DIRECTORY-COMPONENT` and
   `ASDF:MAKE-OPERATION` out of the interpreter
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#464](https://github.com/atgreen/evergreen/pull/464)).
 
 ### Fixed
 
@@ -118,7 +118,7 @@
 - A backquote form returns exactly one value in the bytecode interpreter.
   It used to pass on the values of its last evaluated operand, so
   `` (multiple-value-list `(,(values 1 2))) `` returned `(1 2)` instead of
-  `((1))` ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  `((1))` ([#464](https://github.com/atgreen/evergreen/pull/464)).
 - Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
   other functions the compiler calls directly, rather than the CL function
   of the same name. A generic function such as `(defgeneric my:length (x))`
