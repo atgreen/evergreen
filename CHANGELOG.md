@@ -130,7 +130,7 @@
   natively and can reach the optimizing tier. Previously any `LAMBDA` kept the
   whole function in the interpreter. Closures that capture variables still
   run interpreted
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#463](https://github.com/atgreen/evergreen/pull/463)).
 
 ## 0.0.10 - 2026-10-19
 
