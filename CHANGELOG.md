@@ -30,6 +30,25 @@
   and a repeated HTTPS request through pure-tls drops from about 38 s to 11 s
   ([#443](https://github.com/atgreen/evergreen/pull/443)).
 
+### Fixed
+
+- Compiled code calls another package's `LENGTH`, `FIRST`, `ELT` and the
+  other functions the compiler calls directly, rather than the CL function
+  of the same name. A generic function such as `(defgeneric my:length (x))`
+  was bypassed by callers compiled with `COMPILE-FILE`, which signalled
+  "The value 42 is not of type SEQUENCE"
+  ([#446](https://github.com/atgreen/evergreen/pull/446)).
+- A saved image keeps every special proclamation. A valueless `(defvar flag?)`
+  without earmuffs, the shape of Parenscript's compiler flag, became lexical
+  after a restore, so a `LET` of it no longer reached the functions reading it.
+  The image format is now version 11; images saved by 0.0.10 must be saved
+  again ([#447](https://github.com/atgreen/evergreen/pull/447)).
+- A thread made by `egcl-thread:make-thread` gets the main thread's stack size
+  (the soft `RLIMIT_STACK`, else 8 MiB), or `EGCL_STACK_SIZE` when that is set,
+  instead of Rust's 2 MiB. Threads overflowed with `STORAGE-CONDITION` at about
+  a quarter of the main thread's recursion depth; a larger `RUST_MIN_STACK` is
+  still honoured ([#448](https://github.com/atgreen/evergreen/pull/448)).
+
 ## 0.0.10 - 2026-10-19
 
 ### Added
