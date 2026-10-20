@@ -354,7 +354,10 @@ pub(super) fn install_baseline(symbol: u32, body: Arc<BytecodeFunction>) -> Opti
     if !native_transfer::is_supported() || !fixed_tagged_parameters(&body) {
         return None;
     }
-    install_baseline_code(symbol, TransferCode::compile_variant(body, false, false)?)
+    install_baseline_code(
+        symbol,
+        TransferCode::compile_variant(body, false, false, Some(symbol))?,
+    )
 }
 
 /// Ordinary T1 keeps speculative arithmetic and direct mapped recursion when
@@ -368,16 +371,79 @@ pub(super) fn install_t1(
     if !native_transfer::is_supported() || !positional_tagged_parameters(&body) {
         return None;
     }
-    let code = TransferCode::compile_variant(Arc::clone(&body), allow_speculation, true)
-        .or_else(|| TransferCode::compile_variant(body, false, true))?;
+    let code =
+        TransferCode::compile_variant(Arc::clone(&body), allow_speculation, true, Some(symbol))
+            .or_else(|| TransferCode::compile_variant(body, false, true, Some(symbol)))?;
     install_baseline_code(symbol, code)
 }
 
+/// The step at which the mapped emitter refused a body (bliss-6tf0e). Each
+/// variant is one place `compile_variant` or `emit_prepared_with_ordinary`
+/// used to return `None` without saying why; the decline logs print it.
+#[derive(Debug)]
+pub(super) enum EmitDecline {
+    Variadic,
+    CapturedEnvironment,
+    ExecutingIdentity,
+    /// The body's name does not read back as a symbol, so the optimizing
+    /// frontend has no identity for self calls and deopt frames.
+    UnresolvedName,
+    Build(egcl_compiler::t2::build::BuildError),
+    Scopes(egcl_compiler::control_scope::ScopeError),
+    Legalize(egcl_compiler::t2::build::BuildError),
+    ExecutableMemory,
+    FrameTooLarge,
+    /// Unboxed values need a T2 native-stack frame without OSR entries.
+    RawValues,
+    OsrCompanion(Box<EmitDecline>),
+    Emitter(egcl_compiler::t2::emit::EmitError),
+    /// A transfer site crosses a scope recovery cannot reconstruct.
+    TransferScope(ScopeKind, Ownership),
+    CleanupScope(u32),
+    FrameEntry,
+    DebugInfo,
+    StackMap,
+    NativeCallSites,
+}
+
+impl std::fmt::Display for EmitDecline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Variadic => f.write_str("&rest, &key or &aux lambda list"),
+            Self::CapturedEnvironment => f.write_str("captured variables (closure environment)"),
+            Self::ExecutingIdentity => f.write_str("a scope needs an executing identity"),
+            Self::UnresolvedName => {
+                f.write_str("the function's name is not a symbol the optimizer can identify")
+            }
+            Self::Build(error) => write!(f, "IR builder: {error:?}"),
+            Self::Scopes(error) => write!(f, "control-scope analysis: {error:?}"),
+            Self::Legalize(error) => write!(f, "transfer-call legalization: {error:?}"),
+            Self::ExecutableMemory => f.write_str("no executable memory for a veneer"),
+            Self::FrameTooLarge => f.write_str("frame slot count overflows"),
+            Self::RawValues => f.write_str("unboxed values outside a T2 native-stack frame"),
+            Self::OsrCompanion(decline) => write!(f, "OSR companion: {decline}"),
+            Self::Emitter(error) => {
+                write!(f, "mapped emitter: {error:?}{}", describe_emit_error(error))
+            }
+            Self::TransferScope(kind, ownership) => write!(
+                f,
+                "a transfer site crosses an unrecoverable {ownership:?} {kind:?} scope"
+            ),
+            Self::CleanupScope(bcp) => write!(f, "no scope map at the cleanup at bcp {bcp}"),
+            Self::FrameEntry => f.write_str("frame entry lies outside the emitted code"),
+            Self::DebugInfo => f.write_str("debug info could not be installed"),
+            Self::StackMap => f.write_str("stack map could not be installed"),
+            Self::NativeCallSites => f.write_str("emitter produced no native call-site table"),
+        }
+    }
+}
+
 /// Why `install_t1` declined `body`, for the decline log only (bliss-s5r0c).
-/// It repeats `install_t1`'s and `compile_variant`'s checks in order, then
-/// rebuilds the IR to name the first instruction the builder refuses. Call it
-/// only when the reason will be printed: the rebuild is not free.
-pub(super) fn mapped_t1_decline_reason(body: &BytecodeFunction) -> String {
+/// It repeats `install_t1`'s checks in order, rebuilds the IR to name the first
+/// instruction the builder refuses, and otherwise replays the final compile
+/// attempt to name the step that refused it (bliss-6tf0e). Call it only when
+/// the reason will be printed: the rebuild and replay are not free.
+pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>) -> String {
     let kind = |op: &Instr| {
         let full = format!("{op:?}");
         full.find(['(', ' ', '{']).map_or(full.clone(), |i| full[..i].to_string())
@@ -399,9 +465,12 @@ pub(super) fn mapped_t1_decline_reason(body: &BytecodeFunction) -> String {
     }) {
         return format!("{} needs an executing identity", kind(op));
     }
-    match egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(body) {
-        Err(error) => format!("IR builder: {error:?}"),
-        Ok(_) => "native emission declined".into(),
+    if let Err(error) = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(body) {
+        return format!("IR builder: {error:?}");
+    }
+    match TransferCode::try_compile_variant(Arc::clone(body), false, true, Some(symbol)) {
+        Err(decline) => decline.to_string(),
+        Ok(_) => "native emission declined, but compiled on replay".into(),
     }
 }
 
@@ -469,8 +538,15 @@ pub(super) fn refresh_installed(expected: &NativeCode) -> Option<Rc<NativeCode>>
     // Ordinary T2 versions retire to an honest non-speculating mapped baseline.
     // The next dispatch can queue optimized worker compilation again; this
     // local baseline frontend must not replace it under a T2 tier label.
-    let replacement = TransferCode::compile_variant(Arc::clone(&body), !expected.is_t2, !expected.is_t2)
-        .or_else(|| TransferCode::compile_variant(Arc::clone(&body), false, !expected.is_t2))?;
+    let replacement = TransferCode::compile_variant(
+        Arc::clone(&body),
+        !expected.is_t2,
+        !expected.is_t2,
+        Some(symbol),
+    )
+    .or_else(|| {
+        TransferCode::compile_variant(Arc::clone(&body), false, !expected.is_t2, Some(symbol))
+    })?;
     // Compilation can collect and reenter runtime services. Never let a stale
     // invocation replace code published for a newer version or callable.
     if !current() || egcl_rt::symbols::symbol_function(symbol) != Some(*function) {
@@ -693,13 +769,13 @@ impl TransferCode {
     }
 
     pub(super) fn compile(body: Arc<BytecodeFunction>) -> Option<Self> {
-        Self::compile_variant(Arc::clone(&body), true, true)
-            .or_else(|| Self::compile_variant(body, false, true))
+        Self::compile_variant(Arc::clone(&body), true, true, None)
+            .or_else(|| Self::compile_variant(body, false, true, None))
     }
 
     #[cfg(test)]
     pub(super) fn compile_nested_protected(body: Arc<BytecodeFunction>) -> Option<Self> {
-        Self::compile_variant(body, false, false)
+        Self::compile_variant(body, false, false, None)
     }
 
     // Protocol fixtures need a real managed-activation caller even when the
@@ -721,8 +797,8 @@ impl TransferCode {
         {
             return None;
         }
-        Self::compile_variant(Arc::clone(&body), true, false)
-            .or_else(|| Self::compile_variant(body, false, false))
+        Self::compile_variant(Arc::clone(&body), true, false, None)
+            .or_else(|| Self::compile_variant(body, false, false, None))
     }
 
     fn set_installed_symbol(&mut self, symbol: u32) {
@@ -740,13 +816,29 @@ impl TransferCode {
         self.recompile.get()
     }
 
+    /// `symbol` is the function cell `body` is installed in, when the caller
+    /// knows it; otherwise the body's name is read back as a symbol.
     fn compile_variant(
         body: Arc<BytecodeFunction>,
         optimize: bool,
         allow_recursion: bool,
+        symbol: Option<u32>,
     ) -> Option<Self> {
-        if body.variadic || body.has_env {
-            return None;
+        Self::try_compile_variant(body, optimize, allow_recursion, symbol).ok()
+    }
+
+    /// `compile_variant`, naming the step that refused `body` (bliss-6tf0e).
+    fn try_compile_variant(
+        body: Arc<BytecodeFunction>,
+        optimize: bool,
+        allow_recursion: bool,
+        symbol: Option<u32>,
+    ) -> Result<Self, EmitDecline> {
+        if body.variadic {
+            return Err(EmitDecline::Variadic);
+        }
+        if body.has_env {
+            return Err(EmitDecline::CapturedEnvironment);
         }
         // These scopes need executing identity, dynamic values or inherited
         // state. Do not invent fresh tokens during recovery for live closures.
@@ -756,7 +848,7 @@ impl TransferCode {
                 Instr::PushBlock { register: true, .. } | Instr::NamedTag { .. }
             )
         }) {
-            return None;
+            return Err(EmitDecline::ExecutingIdentity);
         }
         let roots = retain_native_body(&body);
         let optimize = optimize && scope_free_native_body(&body, false);
@@ -766,8 +858,14 @@ impl TransferCode {
         let result_recovery = scope_free_native_body(&body, true)
             && body.code.iter().any(|op| matches!(op, Instr::CheckResult(_)));
         let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false) || result_recovery {
-            let symbol = super::super::resolve_sym(&body.name)?.as_symbol_index();
-            let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol).ok()?;
+            // A method's callable lives in an uninterned symbol whose name,
+            // "(METHOD ...)", does not read back; the installed symbol is its
+            // identity for self calls and deopt frames (bliss-6tf0e).
+            let symbol = symbol
+                .or_else(|| super::super::resolve_sym(&body.name).map(EgclVal::as_symbol_index))
+                .ok_or(EmitDecline::UnresolvedName)?;
+            let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization(&body, symbol)
+                .map_err(EmitDecline::Build)?;
             // A site with no profile yet gets the optimistic fixnum guess.
             // Record it so a disproved guess recompiles rather than blacklists.
             let cold_guesses = RefCell::new(Vec::new());
@@ -798,9 +896,11 @@ impl TransferCode {
             passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
             passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
             passes.run(&mut ir);
-            let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+            let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body)
+                .map_err(EmitDecline::Scopes)?;
             let ordinary_ir = ir.clone();
-            egcl_compiler::t2::build::legalize_transfer_calls(&mut ir, &scopes).ok()?;
+            egcl_compiler::t2::build::legalize_transfer_calls(&mut ir, &scopes)
+                .map_err(EmitDecline::Legalize)?;
             let metadata = Arc::new(T2InstalledMetadata {
                 speculations,
                 cold_guesses: cold_guesses.into_inner(),
@@ -809,10 +909,12 @@ impl TransferCode {
             });
             (ir, Some(ordinary_ir), Some(metadata))
         } else {
-            (egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).ok()?, None, None)
+            let ir = egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body)
+                .map_err(EmitDecline::Build)?;
+            (ir, None, None)
         };
         let call_cells = named_call_cells(&body);
-        Self::emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
+        Self::try_emit_prepared_with_ordinary(body, roots, &ir, ordinary_ir.as_ref(), deopt_metadata, &call_cells, allow_recursion, CompilationTier::T1)
     }
 
     /// Emit the existing mapped ABI from prepared IR. The ordinary worker path
@@ -840,34 +942,63 @@ impl TransferCode {
         allow_recursion: bool,
         tier: CompilationTier,
     ) -> Option<Self> {
+        Self::try_emit_prepared_with_ordinary(
+            body,
+            roots,
+            ir,
+            ordinary_ir,
+            deopt_metadata,
+            call_cells,
+            allow_recursion,
+            tier,
+        )
+        .ok()
+    }
+
+    /// `emit_prepared_with_ordinary`, naming the step that refused the body
+    /// (bliss-6tf0e). The ordinary and native-frame entries are optional: their
+    /// refusals fall back to the mapped emitter, so only its refusal and the
+    /// mandatory steps around it are reasons.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_prepared_with_ordinary(
+        body: Arc<BytecodeFunction>,
+        roots: Arc<ActiveBytecodeRoot>,
+        ir: &egcl_compiler::t2::ir::Function,
+        ordinary_ir: Option<&egcl_compiler::t2::ir::Function>,
+        deopt_metadata: Option<Arc<T2InstalledMetadata>>,
+        call_cells: &[(u32, Arc<egcl_rt::call_table::CallCell>)],
+        allow_recursion: bool,
+        tier: CompilationTier,
+    ) -> Result<Self, EmitDecline> {
+        let exec = |buffer: Option<JitBuffer>| buffer.ok_or(EmitDecline::ExecutableMemory);
         // Every normal mapped entry clears the complete MV buffer before
         // admission (outer, nested, and recursive). OSR deliberately preserves
         // pending values; the analysis treats each OSR header as unknown.
         let mut prepared_ir = ir.clone();
         egcl_compiler::t2::opt_clear_mv::eliminate_redundant(&mut prepared_ir, true);
         let ir = &prepared_ir;
-        let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8))?;
+        let capture = exec(JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)))?;
         let deopt_capture = if deopt_metadata.is_some() {
-            Some(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8))?)
+            Some(exec(JitBuffer::new(&emit_capture_stub(prepare_completed_deopt, dispatch as *const u8)))?)
         } else { None };
         let mut deopt_veneer = match &deopt_capture {
-            Some(capture) => Some(JitBuffer::new(&emit_published_helper_veneer(resume_guard, capture.as_ptr()))?),
+            Some(capture) => Some(exec(JitBuffer::new(&emit_published_helper_veneer(resume_guard, capture.as_ptr())))?),
             None => None,
         };
-        let veneer = JitBuffer::new(&emit_published_helper_veneer(call_or_throw, capture.as_ptr()))?;
+        let veneer = exec(JitBuffer::new(&emit_published_helper_veneer(call_or_throw, capture.as_ptr())))?;
         let mut call_entries = Vec::new();
         for (sym, cell) in call_cells {
             if call_entries.iter().any(|(symbol, _, _)| symbol == sym) {
                 continue;
             }
-            let mapped = JitBuffer::new(
+            let mapped = exec(JitBuffer::new(
                 &egcl_compiler::t2::native_transfer::emit_published_call_veneer(
                     Arc::as_ptr(cell) as u64,
                     cell.entry_address(false) as u64,
                     cell.entry_address(true) as u64,
                     capture.as_ptr(),
                 ),
-            )?;
+            ))?;
             call_entries.push((*sym, Arc::clone(cell), mapped));
         }
         let named_veneers: Vec<_> = call_entries.iter()
@@ -880,10 +1011,10 @@ impl TransferCode {
             CompilationTier::T1 => poll_or_transfer,
             CompilationTier::T2 => poll_t2_or_transfer,
         };
-        let poll = JitBuffer::new(&emit_published_helper_veneer(poll_helper, capture.as_ptr()))?;
-        let base_slots = body.n_locals.checked_add(body.max_stack)?;
-        let completion = JitBuffer::new(&emit_published_helper_veneer(complete_cleanup, capture.as_ptr()))?;
-        let landing = JitBuffer::new(&emit_native_landing_stub())?;
+        let poll = exec(JitBuffer::new(&emit_published_helper_veneer(poll_helper, capture.as_ptr())))?;
+        let base_slots = body.n_locals.checked_add(body.max_stack).ok_or(EmitDecline::FrameTooLarge)?;
+        let completion = exec(JitBuffer::new(&emit_published_helper_veneer(complete_cleanup, capture.as_ptr())))?;
+        let landing = exec(JitBuffer::new(&emit_native_landing_stub()))?;
         // Direct recursion first shares only immutable code/site metadata.
         // Dynamic handler and cleanup records still require their own mapped
         // activation ownership before these bodies can use recursive entries.
@@ -900,7 +1031,7 @@ impl TransferCode {
                 matches!(op, Instr::CallNamed { sym, .. } if sym == symbol)
             }));
         let mut recursive_prepare = match recursive_symbol {
-            Some(_) => Some(JitBuffer::new(&emit_published_helper_veneer(prepare_recursive, capture.as_ptr()))?),
+            Some(_) => Some(exec(JitBuffer::new(&emit_published_helper_veneer(prepare_recursive, capture.as_ptr())))?),
             None => None,
         };
         let recursion = recursive_symbol.map(|symbol| RecursiveTransfer {
@@ -1060,7 +1191,7 @@ impl TransferCode {
             if !matches!(tier, CompilationTier::T2) || deopt_metadata.is_none()
                 || !ir.osr_entries.is_empty() || !packed_f64_native_body(&body, ir)
             {
-                return None;
+                return Err(EmitDecline::RawValues);
             }
             egcl_compiler::t2::emit::NativeCallStorage::NativeStack
         } else {
@@ -1070,12 +1201,14 @@ impl TransferCode {
         // distinct mapped owner (including its maps and recovery veneers) for
         // each existing OSR header. Passing no ordinary IR prevents recursion.
         let osr_companion = if ordinary.is_some() && !ir.osr_entries.is_empty() {
-            Some(Box::new(Self::emit_prepared(
-                Arc::clone(&body), Arc::clone(&roots), ir, deopt_metadata.clone(),
+            Some(Box::new(Self::try_emit_prepared_with_ordinary(
+                Arc::clone(&body), Arc::clone(&roots), ir, None, deopt_metadata.clone(),
                 call_cells, allow_recursion, tier,
-            )?))
+            ).map_err(|decline| EmitDecline::OsrCompanion(Box::new(decline)))?))
         } else { None };
-        let (emitted, sites) = ordinary.or(native_frames).or_else(|| egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
+        let (emitted, sites) = match ordinary.or(native_frames) {
+            Some(emitted) => emitted,
+            None => egcl_compiler::t2::emit::emit_framed_native_handlers_with_entries_storage_and_poll_fast_path(
             ir,
             veneer.as_ptr() as u64,
             base_slots,
@@ -1096,12 +1229,13 @@ impl TransferCode {
             "{}: mapped emitter: {error:?}{}",
             display_fn_name(&body.name), describe_emit_error(error)
         )))
-        .ok())?;
+        .map_err(EmitDecline::Emitter)?,
+        };
         // Reconstruct local, non-escaping BLOCK/TAGBODY records and pending
         // UNWIND-PROTECT cleanups from exact scope maps. Other records require the
         // forthcoming native scope state; rejecting them is part of admission.
         for site in sites.sites() {
-            if site.map().control_scopes.iter().any(|scope| {
+            if let Some(scope) = site.map().control_scopes.iter().find(|scope| {
                 scope.ownership != Ownership::Local
                     || !matches!(
                         scope.kind,
@@ -1118,10 +1252,11 @@ impl TransferCode {
                             | ScopeKind::SpecialBinding { .. }
                     )
             }) {
-                return None;
+                return Err(EmitDecline::TransferScope(scope.kind.clone(), scope.ownership));
             }
         }
-        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body).ok()?;
+        let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body)
+            .map_err(EmitDecline::Scopes)?;
         let guard_handler_capacity = (0..body.code.len()).filter_map(|bcp| {
             scopes.before(bcp as u32)
         }).map(|active| active.iter().filter(|scope| !matches!(scope.kind,
@@ -1131,7 +1266,8 @@ impl TransferCode {
         for instruction in &body.code {
             if let Instr::PushUnwind { cleanup_bcp, .. } = instruction {
                 let depth = scopes
-                    .before(*cleanup_bcp)?
+                    .before(*cleanup_bcp)
+                    .ok_or(EmitDecline::CleanupScope(*cleanup_bcp))?
                     .iter()
                     .filter(|scope| {
                         matches!(
@@ -1149,20 +1285,20 @@ impl TransferCode {
                 cleanup_depths.insert(*cleanup_bcp, depth);
             }
         }
-        let slots = base_slots.checked_add(emitted.shadow_root_slots)?;
+        let slots = base_slots.checked_add(emitted.shadow_root_slots).ok_or(EmitDecline::FrameTooLarge)?;
         if emitted.frame_entry.is_some_and(|offset| offset >= emitted.code.len()) {
-            return None;
+            return Err(EmitDecline::FrameEntry);
         }
-        let mut code = JitBuffer::new(&emitted.code)?;
+        let mut code = exec(JitBuffer::new(&emitted.code))?;
         // Native entries do not receive the managed slots pointer in RDI:
         // private entries receive control; ordinary entries receive argument 1.
         // Runtime stack capture uses their immutable native argument homes.
         let arguments = native_debug::arguments(&body, emitted.native_recursive_entry.is_some() || emitted.ordinary_entry.is_some());
         let debug_info = code
             .install_debug_info_with_arguments(&body.name, arguments.as_ref())
-            .ok()?;
-        let code_info = install_stack_map(slots, debug_info)?;
-        let osr_polls = emitted.native_calls.as_ref()?.iter().filter_map(|site| {
+            .map_err(|_| EmitDecline::DebugInfo)?;
+        let code_info = install_stack_map(slots, debug_info).ok_or(EmitDecline::StackMap)?;
+        let osr_polls = emitted.native_calls.as_ref().ok_or(EmitDecline::NativeCallSites)?.iter().filter_map(|site| {
             let egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(block) = site.origin else {
                 return None;
             };
@@ -1179,7 +1315,7 @@ impl TransferCode {
             .filter(|op| matches!(op, Instr::BindSpecial(_))).count();
         let catch_pushes = body.code.iter()
             .filter(|op| matches!(op, Instr::PushCatch { .. })).count();
-        Some(Self {
+        Ok(Self {
             installed_symbol: None,
             is_t2: matches!(tier, CompilationTier::T2),
             #[cfg(test)]
@@ -1196,7 +1332,7 @@ impl TransferCode {
             ordinary_stack_required: emitted.ordinary_stack_required,
             _ordinary_arity: ordinary_arity,
             _ordinary_cold: ordinary_cold,
-            _native_calls: Arc::new(emitted.native_calls?),
+            _native_calls: Arc::new(emitted.native_calls.ok_or(EmitDecline::NativeCallSites)?),
             has_deopt: emitted.has_deopt,
             bcp_offsets: emitted.bcp_offsets,
             osr_entries: emitted.osr_entries.into_iter().collect(),

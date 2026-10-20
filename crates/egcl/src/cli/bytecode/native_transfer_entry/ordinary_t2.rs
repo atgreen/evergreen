@@ -101,7 +101,7 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         deopt_bodies,
     });
     let roots = retain_native_body(body);
-    let Some(mut code) = TransferCode::emit_prepared_with_ordinary(
+    let mut code = match TransferCode::try_emit_prepared_with_ordinary(
         Arc::clone(body),
         roots,
         &prepared.ir,
@@ -110,12 +110,15 @@ pub(in crate::cli::bytecode) fn install_ordinary_t2(
         &prepared.call_cells,
         true,
         CompilationTier::T2,
-    ) else {
-        t2_log_write(format_args!(
-            "{}: mapped T2 emission declined; keep mapped T1 or interpreter",
-            display_fn_name(&body.name)
-        ));
-        return None;
+    ) {
+        Ok(code) => code,
+        Err(decline) => {
+            t2_log_write(format_args!(
+                "{}: mapped T2 emission declined ({decline}); keep mapped T1 or interpreter",
+                display_fn_name(&body.name)
+            ));
+            return None;
+        }
     };
     code.set_installed_symbol(symbol);
     let code = Rc::new(code);
