@@ -36,6 +36,14 @@
 
 ### Performance
 
+- `COUNT`, `COUNT-IF` and `COUNT-IF-NOT` compile to bytecode instead of being
+  tree-walked on every call, and `FIND`, `FIND-IF`, `FIND-IF-NOT` and the
+  `COUNT` family no longer build a closure for each call. Counting over a
+  100-element sequence is about 45x faster (`COUNT-IF` about 12x) and `FIND`
+  about 2x faster. None of these functions is refused native compilation for
+  a closure environment any more; their keyword arguments still keep them
+  interpreted for now
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `(return-from NAME ...)` inside a `FLET` or `LABELS` function compiles to
   bytecode: the compiler now establishes the implicit block named after the
   local function, as the tree-walker does. Such a return used to send the

@@ -4555,9 +4555,10 @@ fn format_of_inline_fresh_instance_is_gc_safe() {
 /// (a FLET body sees neither its siblings nor itself); the swapped-out funs hold
 /// the FLET FunDef body cons trees, so a minor GC during the body freed them and
 /// a LATER call read a poisoned body -> "null guard SIGSEGV". COUNT (boot.lisp)
-/// is exactly this shape — (flet ((matchp ...)) (loop ... count (matchp ...))) —
-/// and crashed under GC stress before the fix. Exercise COUNT and a bare FLET
-/// under stress; both must survive and stay correct.
+/// was exactly this shape — (flet ((matchp ...)) (loop ... count (matchp ...))) —
+/// and crashed under GC stress before the fix. COUNT now tests inline
+/// (bliss-15gms), so the bare FLET below is what keeps the shape covered.
+/// Exercise both under stress; both must survive and stay correct.
 #[test]
 fn flet_body_survives_gc_across_calls() {
     let prog = "\
