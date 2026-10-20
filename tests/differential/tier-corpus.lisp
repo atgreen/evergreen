@@ -426,6 +426,18 @@
          (setf (symbol-function 'fd-target) (lambda (x) (list :new x)))
          (list before (fd-caller 2))))
 
+;;; ── non-capturing closures created by compiled code (bliss-ku9w) ─────
+
+(defun nocap-lambda () (let ((f (lambda (x) (+ x 1)))) (funcall f 1)))
+(defun mapcar-lambda (l) (mapcar (lambda (x) (* x 2)) l))
+(defun make-tagger () (lambda (x) (list x :tagged)))
+
+(check :nocap-lambda (let ((acc 0)) (dotimes (i 30 acc) (incf acc (nocap-lambda)))))
+(check :mapcar-lambda (let ((acc nil)) (dotimes (i 30 acc) (setq acc (mapcar-lambda (list i 2 3))))))
+(check :fresh-closures
+       (let ((a (make-tagger)) (b (make-tagger)))
+         (list (eq a b) (funcall a 1) (funcall b 2))))
+
 ;;; ── epilogue: checksum + completion sentinel ───────────────────────────
 
 (note :checksum *hash*)

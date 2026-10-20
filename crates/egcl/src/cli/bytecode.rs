@@ -23917,7 +23917,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     let built = if cfg!(all(target_arch = "x86_64", target_os = "linux"))
         && bf.code.iter().any(|op| matches!(op, Instr::PushCatch { .. } | Instr::PushUnwind { .. }
             | Instr::PushHandlerCase { .. } | Instr::PushHandlerBind { .. } | Instr::PushRestartCase { .. }
-            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)))
+            | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
+            | Instr::MakeClosure { capture_env: false, .. }))
     {
         egcl_compiler::t2::build::build_for_native_scope_optimization(bf, sym)
     } else if cfg!(all(target_arch = "x86_64", target_os = "linux"))

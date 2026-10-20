@@ -125,6 +125,12 @@
   instead of Rust's 2 MiB. Threads overflowed with `STORAGE-CONDITION` at about
   a quarter of the main thread's recursion depth; a larger `RUST_MIN_STACK` is
   still honoured ([#448](https://github.com/atgreen/evergreen/pull/448)).
+- On x86-64 Linux, a function that creates a closure capturing no local
+  variables, such as `(mapcar (lambda (x) (* x 2)) list)`, is now compiled
+  natively and can reach the optimizing tier. Previously any `LAMBDA` kept the
+  whole function in the interpreter. Closures that capture variables still
+  run interpreted
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 
 ## 0.0.10 - 2026-10-19
 

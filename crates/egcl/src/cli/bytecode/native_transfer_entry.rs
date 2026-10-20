@@ -1760,7 +1760,8 @@ fn packed_f64_native_body(body: &BytecodeFunction, ir: &egcl_compiler::t2::ir::F
                 | Instr::PushHandlerBind { .. } | Instr::PopHandlerBind
                 | Instr::PushRestartCase { .. } | Instr::PopRestartCase
                 | Instr::BindSpecial(_) | Instr::UnbindSpecial(_)
-                | Instr::LoadFunction(_)))
+                | Instr::LoadFunction(_)
+                | Instr::MakeClosure { .. }))
 }
 
 fn local_control_native_body(body: &BytecodeFunction, allow_values: bool, allow_local_scopes: bool, allow_primary_transport: bool) -> bool {
@@ -1786,6 +1787,9 @@ fn local_control_op(op: &Instr, allow_values: bool, allow_local_scopes: bool, al
     (allow_values && matches!(op,
         Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList))
     || (allow_primary_transport && matches!(op, Instr::TakeValuesToLocals { nvars: 1, .. }))
+    // A non-capturing closure is a helper-v2 Invoke that indexes the
+    // activation's retained body; capturing closures need an EnvFrame.
+    || (allow_local_scopes && matches!(op, Instr::MakeClosure { capture_env: false, .. }))
     || (allow_local_scopes && matches!(op,
         Instr::PushTag { .. } | Instr::Go { .. } | Instr::PushCatch { .. } | Instr::Throw
             | Instr::PushUnwind { .. } | Instr::EnterCleanupNormal { .. } | Instr::CleanupReturn
@@ -2363,6 +2367,7 @@ unsafe fn call_or_throw_unpublished(
         TRANSFER_RESTART_CASE_ENTER_REQUEST, TRANSFER_RESTART_CASE_LEAVE_REQUEST,
         TRANSFER_HOST_EVAL_REQUEST, TRANSFER_FUNCTION_LOOKUP_REQUEST,
         TRANSFER_VALUES_TO_LIST_REQUEST,
+        TRANSFER_MAKE_CLOSURE_REQUEST,
     };
     if request_kind == TRANSFER_VALUES_TO_LIST_REQUEST {
         // Same result as the T0 arm: the primary alone when no tuple is
@@ -2400,7 +2405,7 @@ unsafe fn call_or_throw_unpublished(
     }
     if matches!(
         request_kind,
-        TRANSFER_HOST_EVAL_REQUEST | TRANSFER_FUNCTION_LOOKUP_REQUEST
+        TRANSFER_HOST_EVAL_REQUEST | TRANSFER_FUNCTION_LOOKUP_REQUEST | TRANSFER_MAKE_CLOSURE_REQUEST
     ) {
         let mut value = NIL;
         if !native_error_pending() {
@@ -2414,6 +2419,18 @@ unsafe fn call_or_throw_unpublished(
                         .get(call.symbol as u32 as usize)
                         .ok_or_else(invalid_capture)?;
                     eval_form(form, env)
+                } else if request_kind == TRANSFER_MAKE_CLOSURE_REQUEST {
+                    // Index the executing activation's retained body, never a
+                    // template pointer baked into code. Clone the Arc out before
+                    // allocating; the closure is not rooted, so nothing may
+                    // allocate between its creation and the outcome write.
+                    let body = unsafe { &*context.body };
+                    let nested = Arc::clone(body.nested_functions
+                        .get(call.symbol as u32 as usize)
+                        .ok_or_else(invalid_capture)?);
+                    let closure = super::make_bytecode_closure(&nested, None);
+                    super::register_closure_control(closure, env);
+                    Ok(closure)
                 } else {
                     let symbol = EgclVal::from_symbol_index(call.symbol as u32);
                     Ok(super::super::symbol_function_object(env, symbol).unwrap_or(symbol))

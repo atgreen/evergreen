@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 use std::{fs, process::Command};
 
-// MakeClosure and captured environment setup are not admitted by Linux mapped
-// entries yet; their portable bytecode implementation remains the exact fallback.
+// Capturing MakeClosure and captured environment setup are not admitted by
+// Linux mapped entries yet; their portable bytecode implementation remains the
+// exact fallback. Non-capturing closures use a mapped helper (bliss-ku9w).
 fn factory_tier() -> u8 {
     if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
         0
@@ -190,4 +191,74 @@ fn saved_fasl_function_retains_bytecode_after_function_cell_replacement() {
       (format t "SAVED-FASL-OK~%")
     "#, &[("EGCL_FORCE_TIER", "t2")]);
     assert!(out.contains("SAVED-FASL-OK"));
+}
+
+/// A function that only creates non-capturing closures reaches mapped T2 on
+/// Linux, and every tier returns the same results with fresh closure identity
+/// (bliss-ku9w). A capturing closure still keeps the interpreter fallback.
+#[test]
+fn noncapturing_lambda_outer_reaches_mapped_t2() {
+    let definitions = r#"
+      (defun s-nested-lambda (l) (mapcar (lambda (x) (* x 2)) l))
+      (defun s-nocap () (let ((f (lambda (x) (+ x 1)))) (funcall f 1)))
+      (defun s-make () (lambda (x) (list x :made)))
+      (defun s-closure (n) (let ((f (lambda (x) (+ x n)))) (funcall f 1)))
+    "#;
+    let probe = r#"
+      (dotimes (i 200)
+        (s-nested-lambda (list i 2 3)) (s-nocap) (s-make) (s-closure i))
+      (dotimes (warm 2000) (egcl-ext:function-tier 's-nested-lambda))
+      (format t "TIERS=~S~%"
+              (mapcar #'egcl-ext:function-tier '(s-nested-lambda s-nocap s-make s-closure)))
+      (format t "RESULTS=~S~%"
+              (list (s-nested-lambda (list 1 2 3)) (s-nocap) (funcall (s-make) 7)
+                    (eq (s-make) (s-make)) (s-closure 5)))
+    "#;
+    let results = "RESULTS=((2 4 6) 2 (7 :MADE) NIL 6)";
+    for tier in ["t0", "t1", "t2"] {
+        let out = run_case(
+            &format!("noncapturing-{tier}"),
+            definitions,
+            probe,
+            &[("EGCL_FORCE_TIER", tier)],
+        );
+        assert!(out.contains(results), "{tier}: {out}");
+    }
+    let dir = std::env::temp_dir().join(format!("egcl-native-noncapturing-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("factory.lisp");
+    fs::write(&source, definitions).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+        .env_remove("EGCL_FORCE_TIER")
+        .env("EGCL_T0_T1_THRESHOLD", "5")
+        .env("EGCL_T2_THRESHOLD", "20")
+        .env("EGCL_T2_THREADS", "1")
+        .env("EGCL_T2_LOG", "-")
+        .args([
+            "--no-init",
+            "--eval",
+            &format!("(load {source:?})\n{probe}"),
+        ])
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&dir);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains(results), "{stdout}");
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        for name in ["S-NESTED-LAMBDA", "S-NOCAP", "S-MAKE"] {
+            assert!(
+                stderr.contains(&format!(
+                    "{name}: optimized worker result installed with mapped T2 ABI"
+                )),
+                "{name} must install mapped T2: {stderr}"
+            );
+        }
+        assert!(stdout.contains("TIERS=(2 2 2 0)"), "{stdout}\n{stderr}");
+        assert!(
+            !stderr.contains("S-CLOSURE: optimized worker result installed"),
+            "{stderr}"
+        );
+    }
 }

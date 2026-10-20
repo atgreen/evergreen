@@ -2082,6 +2082,9 @@ fn emit_invoke_call(
             false,
         ),
         crate::t2::ir::AuxData::ValuesToList => (TRANSFER_VALUES_TO_LIST_REQUEST, 1, false),
+        crate::t2::ir::AuxData::NestedClosure(index) => {
+            (TRANSFER_MAKE_CLOSURE_REQUEST | u64::from(index), 0, false)
+        }
         crate::t2::ir::AuxData::CleanupContinuation {
             cleanup_bcp,
             resume_bcp,
@@ -3606,6 +3609,8 @@ pub const TRANSFER_GLOBAL_LOAD_REQUEST: u64 = 13_u64 << 32;
 pub const TRANSFER_GLOBAL_STORE_REQUEST: u64 = 14_u64 << 32;
 /// Collect the primary (args[0]) and the runtime multiple values into a list.
 pub const TRANSFER_VALUES_TO_LIST_REQUEST: u64 = 15_u64 << 32;
+/// Low word indexes the retained root body's `nested_functions`.
+pub const TRANSFER_MAKE_CLOSURE_REQUEST: u64 = 16_u64 << 32;
 
 /// Helper-v2 call request, live in the generated caller's temporary frame until
 /// normal return or completion of cold preparation. The args slice resides in
@@ -4423,6 +4428,7 @@ fn emit_transfer_function_with_storage(
                             | AuxData::HostEval(_)
                             | AuxData::FunctionLookup(_)
                             | AuxData::ValuesToList
+                            | AuxData::NestedClosure(_)
                             | AuxData::TransferThrow
                             | AuxData::CatchScope { .. }
                             | AuxData::HandlerScope { .. }
@@ -6064,6 +6070,7 @@ fn emit_framed_inner(
                         AuxData::HostEval(_)
                         | AuxData::FunctionLookup(_)
                         | AuxData::ValuesToList
+                        | AuxData::NestedClosure(_)
                         | AuxData::TransferThrow
                         | AuxData::CatchScope { .. }
                         | AuxData::HandlerScope { .. }
