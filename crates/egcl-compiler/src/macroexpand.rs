@@ -1517,6 +1517,10 @@ fn is_known_special_operator(val: EgclVal) -> bool {
                 | "DEFMACRO"
                 | "DEFMETHOD"
                 | "DEFUN"
+                // DEFGENERIC's name may be `(SETF NAME)`, and its lambda list and
+                // options are not expressions; only :METHOD bodies are code
+                // (GitHub #441).
+                | "DEFGENERIC"
                 // COND is lowered directly (not a macro): macroexpand must expand
                 // its clauses so symbol-macros inside them are handled (bliss-x5y.20).
                 | "COND"
@@ -1642,8 +1646,9 @@ fn expand_special_form(
         // macro whose expansion mentions a parameter re-expanded forever and hit
         // the circular-expansion guard (bliss-ump7).
         "DEFUN" | "DEFMETHOD" | "DEFMACRO" | "DEFINE-COMPILER-MACRO" => {
-            expand_definer_body(form, env)
+            expand_definer_body(form, env, 2)
         }
+        "DEFGENERIC" => expand_defgeneric(form, env),
         // For IF, PROGN, CATCH, THROW, UNWIND-PROTECT, MULTIPLE-VALUE-CALL,
         // MULTIPLE-VALUE-PROG1, PROGV — all subforms are
         // expression positions, so the generic walk is correct.
@@ -2246,15 +2251,22 @@ fn expand_lambda_expression(
 /// expansion is final; without the shadowing the walker re-expanded SELF inside
 /// it, looped, and fell back to a path that left the other slot macros
 /// unexpanded — "unbound variable: SLOT" (bliss-ump7).
-fn expand_definer_body(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+///
+/// `first_lambda_list_index` is where the lambda list search starts: 2 for
+/// `(op name …)`, 1 for a DEFGENERIC `(:method …)` option, which has no name.
+fn expand_definer_body(
+    mut form: EgclVal,
+    env: &Environment,
+    first_lambda_list_index: usize,
+) -> Result<EgclVal, EgclError> {
     egcl_rt::rooted_ref!(_form_root = &mut form);
     // (op name [qualifier…] lambda-list . body): the lambda list is the first
     // element after the name that is a list — DEFMETHOD qualifiers are symbols.
     egcl_rt::rooted!(items = cons_to_vec(form));
-    if items.len() < 3 {
+    if items.len() <= first_lambda_list_index {
         return Ok(form);
     }
-    let Some(lambda_list_index) = (2..items.len()).find(|&index| {
+    let Some(lambda_list_index) = (first_lambda_list_index..items.len()).find(|&index| {
         let item = items[index];
         item.is_nil() || item.is_cons()
     }) else {
@@ -2301,6 +2313,38 @@ fn expand_definer_body(mut form: EgclVal, env: &Environment) -> Result<EgclVal, 
             continue;
         }
         let out = macroexpand_all(items[index], &body_env)?;
+        changed |= out != items[index];
+        expanded.push(out);
+    }
+    if !changed {
+        return Ok(form);
+    }
+    Ok(vec_to_cons(&expanded))
+}
+
+/// Expand DEFGENERIC: `(defgeneric name lambda-list option*)`. The name (which
+/// may be `(setf name)`), the lambda list and every option other than :METHOD
+/// are data. Walking the form as a call treated `(setf name)` as a SETF form
+/// with an odd argument count and signalled PROGRAM-ERROR, so COMPILE-FILE
+/// could not pre-read a top-level MACROLET expanding to it (GitHub #441).
+/// A `(:method [qualifier…] lambda-list . body)` option's body is code, and is
+/// expanded like a DEFMETHOD body so local macros and symbol macros reach it.
+fn expand_defgeneric(mut form: EgclVal, env: &Environment) -> Result<EgclVal, EgclError> {
+    egcl_rt::rooted_ref!(_form_root = &mut form);
+    egcl_rt::rooted!(items = cons_to_vec(form));
+    let mut changed = false;
+    egcl_rt::rooted!(expanded = Vec::<EgclVal>::with_capacity(items.len()));
+    for index in 0..items.len() {
+        let item = items[index];
+        let is_method_option = index >= 3
+            && item.is_cons()
+            && get_symbol_name(unsafe { cons_car(item) })
+                .is_some_and(|name| name.rsplit(':').next() == Some("METHOD"));
+        if !is_method_option {
+            expanded.push(item);
+            continue;
+        }
+        let out = expand_definer_body(item, env, 1)?;
         changed |= out != items[index];
         expanded.push(out);
     }
