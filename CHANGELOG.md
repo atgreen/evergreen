@@ -151,7 +151,7 @@
   including after on-stack replacement into T2 and after deoptimization.
   Closure bodies that read bindings from the function that created them still
   run interpreted
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
+  ([#482](https://github.com/atgreen/evergreen/pull/482)).
 - `FLOOR`, `CEILING`, `TRUNCATE`, `ROUND`, `MOD` and `REM` on bignums divide
   once instead of going through exact rational arithmetic, which reduced
   `a/b` with a gcd first. A `MOD` of a 4096-bit number by a 2048-bit one is
