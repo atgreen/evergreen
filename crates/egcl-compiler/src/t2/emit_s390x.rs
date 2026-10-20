@@ -200,6 +200,12 @@ pub struct RuntimeCalls {
     /// when it was entered by a direct native call, and knows whether the
     /// activation owns the frame at fp; 0 means "the active code".
     pub code_id: u64,
+    /// Retained linkage slots for this function's named calls. A site with
+    /// one loads the callee's entry out of the cell instead of baking
+    /// `call_slice`, so the runtime can redirect it when the callee is
+    /// installed, replaced or invalidated -- no compile-time resolution
+    /// needed, which is what `direct_natives` requires (bliss-9va4r).
+    pub named_calls: Vec<super::emit::NamedCallTarget>,
     /// Captured-lexical access: the retained name metadata of the root body
     /// plus its load/store adapters. A zero `body` declines
     /// `EnvironmentValue`/`SetEnvironmentValue`, so a closure that reads a
@@ -441,6 +447,10 @@ impl Emitter<'_> {
         // Bound after the helper call when a direct native fast path precedes
         // it: both paths leave the result in r2 and share the post-call code.
         let mut direct_join: Option<Label> = None;
+        // A named call reads its target out of a linkage cell rather than
+        // baking one in, so the runtime can redirect it later. Holds the
+        // address of the cell's entry word, not the entry.
+        let mut entry_slot: Option<u64> = None;
         let helper = if let Some(data) = data {
             match data.opcode {
                 Opcode::Call => {
@@ -515,11 +525,38 @@ impl Emitter<'_> {
                             adapter
                         }
                         None => {
-                            self.asm.imm64(2, u64::from(symbol));
+                            // A cell's slice bridge takes exactly the
+                            // arguments `call_slice` does -- (target, nargs,
+                            // args, 0) in r2-r5 -- so only the first word and
+                            // the branch target differ. Not from a
+                            // register-entry body: that stages its arguments
+                            // in the native frame, where the collector cannot
+                            // see them, and the bridges read the slice as a
+                            // scanned activation (bliss-of8kz).
+                            let named = if in_frame {
+                                None
+                            } else {
+                                self.runtime
+                                    .named_calls
+                                    .iter()
+                                    .find(|target| target.symbol == symbol)
+                                    .map(|target| target.slice_entry)
+                                    .filter(|slot| *slot != 0)
+                            };
+                            match named {
+                                Some(slot) => {
+                                    self.asm.imm64(2, self.cell_for(symbol));
+                                    entry_slot = Some(slot);
+                                }
+                                None => self.asm.imm64(2, u64::from(symbol)),
+                            }
                             self.asm.imm64(3, data.args.len() as u64);
                             self.asm.address(4, args_reg, args_base);
                             self.asm.imm64(5, 0);
-                            if in_frame {
+                            if entry_slot.is_some() {
+                                // Unused: the tail branches through the cell.
+                                u64::MAX
+                            } else if in_frame {
                                 self.runtime.call_slice_rooted
                             } else {
                                 self.runtime.call_slice
@@ -596,7 +633,16 @@ impl Emitter<'_> {
             return Err(unsupported!());
         }
         let offset = self.asm.here();
-        self.asm.imm64(1, helper);
+        match entry_slot {
+            // The cell's word is read on every call: a plain load is enough,
+            // because a stale entry is still a valid bridge and the bridge
+            // re-checks the cell's revision before it dispatches.
+            Some(slot) => {
+                self.asm.imm64(1, slot);
+                self.asm.load(1, 1, 0);
+            }
+            None => self.asm.imm64(1, helper),
+        }
         self.asm.call_reg(1);
         if let Some(join) = direct_join {
             self.asm.bind(join);
@@ -682,6 +728,17 @@ impl Emitter<'_> {
     }
 
     /// The listed native callee for `symbol` at this arity, if any.
+    /// The cell a named call passes as its first argument. The bridges
+    /// recover their state from it, so it must be the cell itself, not the
+    /// address of the entry word inside it.
+    fn cell_for(&self, symbol: u32) -> u64 {
+        self.runtime
+            .named_calls
+            .iter()
+            .find(|target| target.symbol == symbol)
+            .map_or(0, |target| target.cell_address)
+    }
+
     fn direct_native_for(
         &self,
         symbol: u32,
@@ -2436,6 +2493,106 @@ mod tests {
             let mut slots = vec![0u64; 1 + compiled.shadow_root_slots as usize];
             slots[0] = 41;
             assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 42);
+        }
+    }
+
+    /// A named call reads its target out of the linkage cell on every call,
+    /// so the runtime can redirect it after the code is emitted -- which is
+    /// the whole point: `direct_natives` can only bind a callee the runtime
+    /// had already installed when the CALLER was compiled.
+    ///
+    /// The fixture points `call_slice` at a sentinel, so falling back to the
+    /// baked helper is visible in the result rather than silently slower.
+    #[test]
+    fn a_named_call_branches_through_the_cell_and_follows_a_later_redirect() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const SENTINEL: u64 = 0x5ced_0002;
+        const CELL: u64 = 0x5ced_0003;
+        static SLOT: AtomicUsize = AtomicUsize::new(0);
+
+        extern "C" fn baked(_: u64, _: u64, _: *const EgclVal, _: u64) -> u64 {
+            SENTINEL
+        }
+        // Both bridges speak the slice ABI: (cell, nargs, args, 0) in r2-r5.
+        extern "C" fn first(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
+            assert_eq!((cell, nargs), (CELL, 1));
+            // SAFETY: the emitter points r4 at the activation argument area.
+            unsafe { (*args).0 + 1 }
+        }
+        extern "C" fn second(cell: u64, nargs: u64, args: *const EgclVal, _: u64) -> u64 {
+            assert_eq!((cell, nargs), (CELL, 1));
+            // SAFETY: as above.
+            unsafe { (*args).0 + 2 }
+        }
+
+        let mut f = Function::new("z-named-cell");
+        let block = f.entry();
+        let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, result) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Call,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::CallTarget(71),
+                flags: InstFlags {
+                    call: true,
+                    safepoint: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![result[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+
+        let compiled = emit_framed_with_runtime(
+            &f,
+            0,
+            1,
+            RuntimeCalls {
+                call_slice: baked as *const () as u64,
+                named_calls: vec![crate::t2::emit::NamedCallTarget {
+                    symbol: 71,
+                    cell_address: CELL,
+                    register_entry: 0,
+                    slice_entry: std::ptr::from_ref(&SLOT) as u64,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(compiled.emitted_safepoints, 1);
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            // SAFETY: the buffer owns the generated activation entry, and the
+            // slots include every shadow word the emitter advertised.
+            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut slots = vec![0u64; 1 + compiled.shadow_root_slots as usize];
+            slots[0] = 10;
+            SLOT.store(first as *const () as usize, Ordering::Release);
+            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 11);
+            // The same emitted bytes must follow a redirect with no recompile.
+            slots[0] = 10;
+            SLOT.store(second as *const () as usize, Ordering::Release);
+            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 12);
         }
     }
 

@@ -21157,7 +21157,7 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
     let generation = REGISTRY_GENERATION.with(|g| g.borrow().get(&sym).copied().unwrap_or(0));
     let direct_natives = direct_native_targets(sym, generation, &root, &inline_bodies);
     let mut call_cells = Vec::new();
-    if cfg!(target_arch = "x86_64") {
+    if cfg!(any(target_arch = "x86_64", target_arch = "s390x")) {
         for body in std::iter::once(&*root).chain(inline_bodies.iter().map(|saved| &*saved.body)) {
             for instruction in &body.code {
                 // A backquote's AllocCons is built as a call to CONS (bliss-elwvl).

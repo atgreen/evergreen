@@ -3533,6 +3533,7 @@ pub fn emit_framed_with_direct_natives(
                 code_id: 0,
                 environment: EnvironmentCalls::default(),
                 portable: portable.clone(),
+                named_calls: Vec::new(),
             },
         );
     }
@@ -3556,6 +3557,7 @@ pub fn emit_framed_with_direct_natives(
                 code_id: 0,
                 environment: EnvironmentCalls::default(),
                 portable: portable.clone(),
+                named_calls: Vec::new(),
             },
         );
     }
@@ -3595,6 +3597,7 @@ pub fn emit_framed_with_direct_natives(
                 code_id,
                 environment,
                 portable: portable.clone(),
+                named_calls: named_calls.to_vec(),
             },
         );
     }
