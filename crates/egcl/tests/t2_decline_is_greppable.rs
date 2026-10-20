@@ -71,7 +71,8 @@ fn a_declined_function_explains_itself_under_one_name() {
 
     assert!(
         ours.iter().any(|line| line.contains("=> stay T1")
-            || line.contains("mapped T2 emission declined; keep mapped T1 or interpreter")),
+            || (line.contains("mapped T2 emission declined (")
+                && line.contains("); keep mapped T1 or interpreter"))),
         "the decline must explain the retained execution path:\n{log}"
     );
     // And it must say WHICH opcode, not only an opaque tag.

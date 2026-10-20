@@ -23705,7 +23705,7 @@ fn try_promote_to_t1_with_speculation(sym: u32, allow_speculation: bool) -> Opti
         let compile_trace = egcl_rt::log::enabled("compile", egcl_rt::log::TRACE);
         if compile_trace || t2_log_target().is_some() {
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            let reason = native_transfer_entry::mapped_t1_decline_reason(&bf);
+            let reason = native_transfer_entry::mapped_t1_decline_reason(sym, &bf);
             #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
             let reason = "mapped native entry unavailable";
             if compile_trace {

@@ -12,6 +12,11 @@
   logged only as "mapped native entry unavailable". A mapped T2 decline now
   names the refused instruction too
   ([#462](https://github.com/atgreen/evergreen/pull/462)).
+- When the native compiler itself refuses a function, `EGCL_T2_LOG` and the
+  `compile` trace name the failing step -- for example the mapped emitter's
+  error or a control scope a transfer site cannot recover -- instead of the
+  generic "native emission declined"
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - `EGCL-EXT:INFLATE` decompresses raw deflate, zlib and gzip data in the
   runtime, checking each format's trailer. EGCL's port of chipz uses it, so
   unpacking a package with `ocicl install` no longer runs chipz's inflate in
@@ -44,6 +49,13 @@
   a closure environment any more; their keyword arguments still keep them
   interpreted for now
   ([#465](https://github.com/atgreen/evergreen/pull/465)).
+- Methods hot by call count compile to native code on x86-64 Linux. A
+  method's compiled body is named `(METHOD ...)`, which the T1 compiler tried
+  to read back as a symbol; it failed, so any method needing the optimizing
+  frontend stayed interpreted and never reached T2. Loading Babel now
+  compiles 23 more ASDF methods to T1, and a method called past the T2
+  threshold is optimized like a `DEFUN`
+  ([#PR](https://github.com/atgreen/evergreen/pull/PR)).
 - A `(return-from NAME ...)` inside a `FLET` or `LABELS` function compiles to
   bytecode: the compiler now establishes the implicit block named after the
   local function, as the tree-walker does. Such a return used to send the
