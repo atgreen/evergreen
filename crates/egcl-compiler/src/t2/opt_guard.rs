@@ -36,7 +36,10 @@
 //!    `v` is not `⊥`, its tag bits are a subset of `τ`'s, and any range or
 //!    class refinement `τ` carries is already met (`refinements_covered`).
 //!    Results forward to `args[0]`, which dominates the guard and hence every
-//!    use of the result.
+//!    use of the result. Inference facts are not declared types, so when a
+//!    result feeds a block argument whose parameter is declared narrower than
+//!    `args[0]`, `args[0]`'s declared type is first narrowed to its inferred
+//!    fact (if every edge into it allows that), or the guard is kept.
 //! 2. **Dominating-duplicate removal.** Collect every guard with a `TypeTag`
 //!    or `StringLayout` proof. A guard is redundant when an equivalent guard
 //!    (same opcode, same operands, same kind) precedes it on every path:
@@ -153,11 +156,98 @@ fn remove_inference_proven(f: &mut Function) -> bool {
         }
     }
 
-    let n = to_remove.len();
+    // One at a time, so each forwarding check sees the declared types the
+    // earlier removals (and refinements) left behind.
+    let mut removed = false;
     for inst in to_remove {
-        remove_guard(f, inst);
+        let d = f.inst(inst);
+        let Some(&v) = d.args.first() else { continue };
+        if forwarding_keeps_declared_types(f, inst, v, &inf.ty(v)) {
+            remove_guard(f, inst);
+            removed = true;
+        }
     }
-    n > 0
+    removed
+}
+
+/// Can `inst`'s results be forwarded to its operand `v` without passing a
+/// block argument wider than its parameter's declared type (verify V4)?
+///
+/// Inference facts live in a side table, so a proven operand's *declared*
+/// type may still be wider than the guard result it replaces (bliss-fva34:
+/// LOOP's `(if first i (+ i 1))` merge parameter is declared TOP, while the
+/// header parameter its guarded result feeds was refined to FIXNUM by loop
+/// entry splitting). When an edge would widen, narrow `v`'s declared type to
+/// the inferred fact `got` if that is locally checkable; otherwise keep the
+/// guard. Forwarding into instruction operands never matters here.
+fn forwarding_keeps_declared_types(f: &mut Function, inst: Inst, v: Value, got: &IRType) -> bool {
+    let results = f.inst(inst).results.clone();
+    let mut need = TypeBits::TOP;
+    for &b in f.block_order() {
+        for &i in &f.block(b).insts {
+            for call in &f.inst(i).targets {
+                for (k, a) in call.args.iter().enumerate() {
+                    if results.contains(a) {
+                        let param = f.block(call.block).params[k];
+                        need = need.meet(f.value(param).ty.bits);
+                    }
+                }
+            }
+        }
+    }
+    let have = f.value(v).ty.bits;
+    if need.contains(have) {
+        return true;
+    }
+    let narrowed = have.meet(got.bits);
+    if narrowed.is_bottom() || !need.contains(narrowed) || !can_refine_declared(f, v, narrowed) {
+        return false;
+    }
+    f.refine_type(v, IRType::of(narrowed));
+    true
+}
+
+/// May `v`'s declared type be narrowed to `bits` without breaking an edge into
+/// it or an OSR import? An instruction result's declared type is local to its
+/// definition. A block parameter additionally needs every incoming argument
+/// to be declared within `bits`; parameters of the entry block or an OSR
+/// header, and any value an OSR state imports, receive values from outside
+/// the IR and are left alone.
+fn can_refine_declared(f: &Function, v: Value, bits: TypeBits) -> bool {
+    let imported = f.osr_entries.iter().any(|osr| {
+        let state = f.frame_states.get(osr.frame_state);
+        let names =
+            |src: &ValueSource| matches!(src, ValueSource::Value { value, .. } if *value == v);
+        state
+            .scopes
+            .iter()
+            .any(|s| s.locals.iter().chain(&s.stack).any(names))
+            || state.remat.iter().any(|r| r.inputs.iter().any(names))
+    });
+    if imported {
+        return false;
+    }
+    match f.value(v).def {
+        ValueDef::Result { .. } => true,
+        ValueDef::Param { block, num } => {
+            if block == f.entry() || f.osr_entries.iter().any(|o| o.block == block) {
+                return false;
+            }
+            f.block_order().iter().all(|&b| {
+                f.block(b).insts.iter().all(|&i| {
+                    f.inst(i)
+                        .targets
+                        .iter()
+                        .filter(|c| c.block == block)
+                        .all(|c| {
+                            c.args
+                                .get(num as usize)
+                                .is_some_and(|&a| bits.contains(f.value(a).ty.bits))
+                        })
+                })
+            })
+        }
+    }
 }
 
 /// Is `τ`'s range/class refinement already satisfied by the inferred fact? Type
@@ -1090,6 +1180,157 @@ mod tests {
             TypeBits::FIXNUM,
             "a checked import keeps the edge fact"
         );
+    }
+
+    /// LOOP's `(setq i (if first i (+ i 1)))` stepping (bliss-fva34):
+    ///
+    /// ```text
+    /// entry(a, first) -> ph -> header(phi) [OSR names phi]
+    /// header: brif first -> A | B
+    /// A: jump M(phi_in)          phi_in = phi, or a TOP-declared constant
+    /// B: g = Guard(phi); x = g + 1; jump M(x)
+    /// M(m): r = Guard(m); brif t -> header(r) | exit
+    /// ```
+    ///
+    /// Splitting refines `phi` to FIXNUM, after which inference proves
+    /// `Guard(m)`. Forwarding `r` to `m` puts `m` on the back edge into `phi`.
+    /// Returns (f, header, merge block (also the latch), merge guard).
+    fn loop_first_merge(declared_top_first_arg: bool) -> (Function, Block, Block, Inst) {
+        let mut f = Function::new("loop-first-merge");
+        let entry = f.entry();
+        let a = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let first = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, c1) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::FixnumImm(1),
+                ..base(Opcode::ConstFixnum)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        // Inference knows this is a fixnum; its declared type says nothing.
+        let (_, c7) = f.push_inst(
+            entry,
+            InstData {
+                aux: AuxData::FixnumImm(7),
+                ..base(Opcode::ConstFixnum)
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let (_, t) = f.push_inst(
+            entry,
+            base(Opcode::ConstT),
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        let ph = f.make_block();
+        let header = f.make_block();
+        let then_first = f.make_block();
+        let step = f.make_block();
+        let merge = f.make_block();
+        let exit = f.make_block();
+        let phi = f.add_block_param(header, IRType::TOP, ValueRepresentation::Tagged);
+        let m = f.add_block_param(merge, IRType::TOP, ValueRepresentation::Tagged);
+        let jump_with = |b: Block, args: Vec<Value>| InstData {
+            targets: vec![BlockCall { block: b, args }],
+            ..base(Opcode::Jump)
+        };
+        f.set_terminator(entry, jump(ph));
+        f.set_terminator(ph, jump_with(header, vec![a]));
+        let state = f.frame_states.add(FrameState {
+            scopes: vec![FrameScope {
+                function: 0,
+                bcp: 5,
+                locals: vec![ValueSource::Value {
+                    value: phi,
+                    repr: ValueRepresentation::Tagged,
+                }],
+                stack: vec![],
+            }],
+            remat: vec![],
+        });
+        f.osr_entries.push(crate::t2::ir::OsrEntry {
+            control_scopes: Vec::new(),
+            bcp: 5,
+            block: header,
+            frame_state: state,
+            checks: Vec::new(),
+        });
+        f.set_terminator(header, brif(first, then_first, vec![], step));
+        let first_arg = if declared_top_first_arg { c7[0] } else { phi };
+        f.set_terminator(then_first, jump_with(merge, vec![first_arg]));
+        let (_, g) = f.push_inst(
+            step,
+            InstData {
+                frame_state: Some(state),
+                ..guard(phi, fixnum())
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        let (_, x) = f.push_inst(
+            step,
+            InstData {
+                args: vec![g[0], c1[0]],
+                flags: InstFlags {
+                    guard: true,
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                frame_state: Some(state),
+                ..base(Opcode::FixnumAdd)
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(step, jump_with(merge, vec![x[0]]));
+        let (merge_guard, r) = f.push_inst(
+            merge,
+            InstData {
+                frame_state: Some(state),
+                ..guard(m, fixnum())
+            },
+            &[(fixnum(), ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(merge, brif(t[0], header, vec![r[0]], exit));
+        f.set_terminator(exit, ret());
+        crate::t2::verify::verify(&f).expect("valid loop before guard elimination");
+        (f, header, merge, merge_guard)
+    }
+
+    #[test]
+    fn proven_merge_guard_narrows_merge_param_for_back_edge() {
+        let (mut f, header, merge, merge_guard) = loop_first_merge(false);
+        run(&mut f);
+        if let Err(e) = crate::t2::verify::verify(&f) {
+            panic!("guard elimination must keep declared edge types: {e:?}");
+        }
+        let phi = f.block(header).params[0];
+        let m = f.block(merge).params[0];
+        assert_eq!(f.value(phi).ty.bits, TypeBits::FIXNUM, "split refines phi");
+        assert_eq!(f.value(m).ty.bits, TypeBits::FIXNUM, "merge param narrowed");
+        assert!(
+            !f.block(merge).insts.contains(&merge_guard),
+            "the proven merge guard is removed"
+        );
+        let back = f.inst(f.terminator(merge).unwrap()).targets[0].args[0];
+        assert_eq!(back, m, "back edge carries the merge param");
+        assert!(f.osr_entries[0].checks.contains(&(phi, fixnum())));
+    }
+
+    #[test]
+    fn proven_merge_guard_stays_when_an_edge_is_declared_wider() {
+        // The constant is inferred FIXNUM but declared TOP, so the merge param
+        // cannot be narrowed; removing its guard would widen the back edge.
+        let (mut f, header, merge, merge_guard) = loop_first_merge(true);
+        run(&mut f);
+        if let Err(e) = crate::t2::verify::verify(&f) {
+            panic!("guard elimination must keep declared edge types: {e:?}");
+        }
+        let m = f.block(merge).params[0];
+        assert_eq!(f.value(m).ty.bits, TypeBits::TOP);
+        assert!(
+            f.block(merge).insts.contains(&merge_guard),
+            "the guard that keeps the back edge FIXNUM survives"
+        );
+        assert_eq!(f.value(f.block(header).params[0]).ty.bits, TypeBits::FIXNUM);
     }
 
     #[test]
