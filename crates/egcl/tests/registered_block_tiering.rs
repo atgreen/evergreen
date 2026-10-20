@@ -17,8 +17,12 @@
 //! The corpus pairs those shapes with ones that do register: closures that
 //! RETURN-FROM or GO out through native frames holding UNWIND-PROTECT cleanups
 //! and special bindings, deep in the stack, via a funarg, through a handler and
-//! from a HANDLER-CASE clause, and a THROW across the same frames. Every tier
-//! must print what the interpreter prints. A RETURN-FROM to a block that has
+//! from a HANDLER-CASE clause, and a THROW across the same frames. It also
+//! invokes ASSERT's and CHECK-TYPE's restarts and a RESTART-CASE restart in
+//! functions that now run natively. A block that a HANDLER-CASE clause closure
+//! or a nested HANDLER-BIND handler returns from stays registered, and such a
+//! function still declines native code: native activations have no executing
+//! identity yet. Every tier must print what the interpreter prints. A RETURN-FROM to a block that has
 //! already exited is left out: every tier, the interpreter included, reports an
 //! internal error there instead of CONTROL-ERROR (bliss-hce1h).
 
@@ -105,6 +109,51 @@ const PROGRAM: &str = r#"
 (defun scale (x)
   (assert (numberp x))
   (block nil (when (> x 100) (return :big)) (+ x 1)))
+;; ASSERT's CONTINUE and CHECK-TYPE's STORE-VALUE restarts, invoked by a
+;; handler while the function holding them runs natively.
+(defun a1 (x)
+  (assert (integerp x) (x) "need int ~S" x)
+  (block nil (when (> x 5) (return :big)) (* x 2)))
+(defun drive-a1 (v)
+  (handler-bind ((error (lambda (c) (declare (ignore c)) (invoke-restart 'continue))))
+    (a1 v)))
+(defun ct (x) (check-type x integer) (block nil (when (minusp x) (return :neg)) (1+ x)))
+(defun drive-ct (v)
+  (handler-bind ((type-error (lambda (c) (declare (ignore c)) (invoke-restart 'store-value 41))))
+    (ct v)))
+;; A RESTART-CASE inside a block whose clause names neither the block nor a
+;; tag, invoked from a callee through UNWIND-PROTECT and a special binding.
+(defun inner-signal ()
+  (let ((*dyn* :inner)) (unwind-protect (invoke-restart 'use) (push (list :ic *dyn*) *log*))))
+(defun rc (x)
+  (let ((*dyn* :rc))
+    (block rc
+      (when (eq x :early) (return-from rc :early))
+      (list (restart-case (progn (inner-signal) :no) (use () (list :used *dyn*))) *dyn*))))
+;; A tagged loop whose HANDLER-CASE clause GOes to a tag as inline code.
+(defun tb (n)
+  (let ((i 0) (r nil))
+    (tagbody
+     top (when (>= i n) (go out))
+       (handler-case (if (oddp i) (error "o") (push i r))
+         (error () (push (- i) r) (go nxt)))
+     nxt (incf i) (go top)
+     out)
+    (nreverse r)))
+;; These keep their registrations: a closure made in a HANDLER-CASE clause, and
+;; a HANDLER-BIND handler nested in a HANDLER-CASE, each return from the block.
+(defun callit (k) (funcall k))
+(defun hc2 (f)
+  (block hb
+    (handler-case (error "x")
+      (error () (funcall f (lambda () (return-from hb :clause-closure)))))
+    :not-reached))
+(defun nested-hc (x)
+  (block outer
+    (handler-case
+        (handler-bind ((warning (lambda (c) (declare (ignore c)) (return-from outer :warned))))
+          (if x (warn "w") (error "e")))
+      (error () :errored))))
 ;; A hot loop after ASSERT, entered once.
 (defun sum-to (n)
   (assert (integerp n))
@@ -128,6 +177,12 @@ const PROGRAM: &str = r#"
 (case30 (from-clause))
 (case30 (thrown))
 (case30 (go-escape))
+(case30 (list (drive-a1 3) (drive-a1 9)))
+(case30 (list (drive-ct 3) (drive-ct -2)))
+(case30 (list (rc :early) (rc :go)))
+(case30 (tb 6))
+(case30 (hc2 #'callit))
+(case30 (list (nested-hc t) (nested-hc nil)))
 (let ((r nil))
   (dotimes (i 40) (setq r (scale i)))
   (let ((before (egcl-ext:deopt-count)))
@@ -136,12 +191,23 @@ const PROGRAM: &str = r#"
 (prin1 (list (sum-to 5000) (sum-to 10))) (terpri)
 (format t "TIERS ~S~%"
   (mapcar #'egcl-ext:function-tier
-          '(mas tru signal-loop scale sum-to h via-mapcar h2 h3 deep funarg in-handler from-clause go-escape)))
+          '(mas tru signal-loop scale a1 ct rc tb sum-to h via-mapcar h2 h3 deep funarg in-handler
+            from-clause go-escape hc2 nested-hc)))
 (format t "DONE~%")
 "#;
 
 /// Functions whose blocks or tags used to be registered for nothing, in TIERS order.
-const ELIDED: [&str; 5] = ["MAS", "TRU", "SIGNAL-LOOP", "SCALE", "SUM-TO"];
+const ELIDED: [&str; 9] = [
+    "MAS",
+    "TRU",
+    "SIGNAL-LOOP",
+    "SCALE",
+    "A1",
+    "CT",
+    "RC",
+    "TB",
+    "SUM-TO",
+];
 
 fn run(envs: &[(&str, &str)]) -> (String, String) {
     let out = Command::new(BIN)
@@ -209,6 +275,12 @@ fn non_local_exits_match_the_interpreter_at_every_tier() {
         "((:WENT-OUT :TOP) ((:CLEANUP 0 (:H 0)) (:CLEANUP 1 (:H 1))) :TOP)",
         "(40 2.5 :BIG :BIG 8)",
         "(12497500 45)",
+        "((6 :BIG) NIL :TOP)",
+        "((4 :NEG) NIL :TOP)",
+        "((:EARLY ((:USED :RC) :RC)) ((:IC :INNER)) :TOP)",
+        "((0 -1 2 -3 4 -5) NIL :TOP)",
+        "(:CLAUSE-CLOSURE NIL :TOP)",
+        "((:WARNED :ERRORED) NIL :TOP)",
     ] {
         assert!(
             oracle.contains(expected),
@@ -264,7 +336,7 @@ fn unregistered_blocks_and_tags_reach_t1_and_t2() {
     let (stdout, log) = run(&[("EGCL_T2_LOG", "stderr")]);
     let tiers = tiers(&stdout);
     // SUM-TO runs twice, below the invocation gate; the others are hot.
-    for (name, actual) in ELIDED.iter().zip(&tiers).take(4) {
+    for (name, actual) in ELIDED.iter().zip(&tiers).take(ELIDED.len() - 1) {
         assert_eq!(*actual, 2, "{name} did not reach T2:\n{log}");
         assert!(
             log.contains(&format!("[T2] {name}: optimized worker result installed")),
