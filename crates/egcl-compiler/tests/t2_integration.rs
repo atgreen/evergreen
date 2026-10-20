@@ -1089,7 +1089,7 @@ fn moving_gc_relocates_t2_roots_in_registers_and_native_spills() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
+fn car_cdr_metadata_emit_guarded_field_loads_with_a_nil_arm() {
     use std::sync::atomic::Ordering;
     use egcl_compiler::t2::emit::emit_framed;
     use egcl_compiler::t2::ir::{AuxData, Opcode, TypeBits};
@@ -1162,14 +1162,22 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
         assert_eq!(EgclVal(run(frame.as_mut_ptr())), expected);
         assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
 
+        // (CAR NIL) and (CDR NIL) are NIL on the native path (bliss-jmwqr);
+        // only a non-list operand reaches the deopt.
+        frame[0] = NIL.0;
+        CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
+        assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
+        assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+
         frame[0] = EgclVal::from_fixnum(7).0;
         CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
         let _ = run(frame.as_mut_ptr());
         assert!(CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
     }
 
-    // A CAR proof dominates the CDR expansion on the same value. The general
-    // guard pass forwards CDR's refined input to CAR's guard result.
+    // Each expansion's cons proof sits in its own arm past a NIL test, so a
+    // CAR proof no longer dominates a later CDR on the same value: both guards
+    // survive the general guard pass (bliss-jmwqr).
     let both = bytecode_fn(
         "car-then-cdr",
         vec![
@@ -1208,8 +1216,8 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     pm.run(&mut f);
     assert_eq!(
         guard_count(&f, false),
-        1,
-        "CAR and CDR share one dominating cons guard"
+        2,
+        "each cons proof stays inside its own NIL-checked arm"
     );
     assert_eq!(guard_count(&f, true), 0, "fixed bindings need no runtime binding guards");
     verify(&f).expect("optimized CAR/CDR IR verifies");
@@ -1233,6 +1241,9 @@ fn car_cdr_metadata_emit_guarded_field_loads_and_share_the_cons_proof() {
     frame[0] = cons.0;
     CONS_ACCESS_DEOPTED.store(false, Ordering::SeqCst);
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.cdr);
+    assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
+    frame[0] = NIL.0;
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
     assert!(!CONS_ACCESS_DEOPTED.load(Ordering::SeqCst));
 }
 
@@ -1316,7 +1327,7 @@ fn constant_typep_operands_execute_in_native_code() {
 
 #[cfg(all(target_arch = "x86_64", unix))]
 #[test]
-fn post_inline_guard_elimination_merges_independent_callee_proofs() {
+fn post_inline_guard_elimination_keeps_callee_proofs_in_their_nil_arms() {
     use std::sync::Arc;
     use egcl_compiler::t2::build::build_from_bytecode_with_inline_options;
     use egcl_compiler::t2::emit::emit_framed;
@@ -1387,10 +1398,12 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     pm.add(Box::new(Dce));
     pm.run(&mut f);
     verify(&f).expect("post-inline guard elimination preserves valid SSA/deopt state");
+    // Each cloned proof is reached only past its own NIL test, so neither
+    // dominates the other (bliss-jmwqr).
     assert_eq!(
         cons_guard_count(&f),
-        1,
-        "the dominating proof eliminates the guard cloned by the second call"
+        2,
+        "a proof inside one callee's cons arm cannot eliminate the other's"
     );
 
     let framed = emit_framed(&f, 0, 0, 0, 0, 0, 0, 0,
@@ -1406,6 +1419,8 @@ fn post_inline_guard_elimination_merges_independent_callee_proofs() {
     let mut frame = vec![NIL.0; usize::from(caller_body.num_slots() + framed.shadow_root_slots)];
     frame[0] = cons.0;
     assert_eq!(EgclVal(run(frame.as_mut_ptr())), cell.car);
+    frame[0] = NIL.0;
+    assert_eq!(EgclVal(run(frame.as_mut_ptr())), NIL);
 }
 
 /// `(lambda () 42)` — the smallest real function: push a constant, return it.

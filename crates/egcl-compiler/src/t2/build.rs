@@ -801,6 +801,7 @@ impl<'a> Builder<'a> {
         self.process_blocks()?;
         self.capture_osr_entries();
         self.simplify_trivial_phis();
+        admit_nil_list_loads(&mut self.f);
         Ok(self.f)
     }
 
@@ -2914,9 +2915,11 @@ impl<'a> Builder<'a> {
         if matches!(intrinsic, IntrinsicId::Car | IntrinsicId::Cdr) {
             // Keep the type proof as an ordinary SSA guard.  CAR and CDR use
             // the same proof identity, so the general dominator-based guard
-            // pass can reuse a CAR proof for a later CDR (and vice versa).
-            // NIL deliberately takes the deopt path: CL defines (CAR NIL) and
-            // (CDR NIL) as NIL, which the generic semantic path preserves.
+            // pass can reuse one proof where it dominates another.
+            // CL defines (CAR NIL) and (CDR NIL) as NIL; `admit_nil_list_loads`
+            // later routes NIL around this pair once the CFG is complete, so
+            // only a non-list operand reaches the deopt path. That puts each
+            // proof inside its own cons arm, where it rarely dominates another.
             let fs = self.build_frame_state(block, stack, bcp as u32);
             let cons = stack
                 .pop()
@@ -3236,6 +3239,149 @@ fn runtime_call_flags() -> InstFlags {
         call: true,
         safepoint: true,
         ..InstFlags::default()
+    }
+}
+
+/// Give every expanded CAR/CDR an explicit NIL arm (bliss-jmwqr).
+///
+/// The intrinsic expansion is `Guard(CONS)` immediately followed by its field
+/// load. NIL is an ordinary list operand -- `(CDDR '(1))` takes `(CDR NIL)` --
+/// but it fails that tag guard, and each deopt counts toward the per-function
+/// blacklist that returns the function to T0 for good. So split the block at
+/// every such pair:
+///
+/// ```text
+///   B:    ...; nil = ConstNil; t = GenericEq(x, nil); Brif t -> NilArm, ConsArm
+///   NilArm:  Jump Join(nil)
+///   ConsArm: g = Guard(x, CONS); r = Car/Cdr(g); Jump Join(r)
+///   Join(r'): <rest of B, uses of r renamed to r'>
+/// ```
+///
+/// The guard keeps its FrameState, so any other non-list operand still
+/// deopts to the generic CL call, which signals the type error. Runs on the
+/// finished CFG, where the guard has exactly one use and no later pass has
+/// shared its proof; an operand whose type already excludes NULL is left alone.
+/// New blocks are laid out after the split block, preserving the builder's
+/// defs-before-uses layout order.
+fn admit_nil_list_loads(f: &mut Function) {
+    let mut uses: HashMap<Value, usize> = HashMap::new();
+    let mut count = |value: Value| *uses.entry(value).or_insert(0) += 1;
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            data.args.iter().copied().for_each(&mut count);
+            for target in &data.targets {
+                target.args.iter().copied().for_each(&mut count);
+            }
+        }
+    }
+    for (_, state) in f.frame_states.iter() {
+        let sources = state
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.locals.iter().chain(&scope.stack))
+            .chain(state.remat.iter().flat_map(|recipe| &recipe.inputs));
+        for source in sources {
+            if let ValueSource::Value { value, .. } = source {
+                count(*value);
+            }
+        }
+    }
+
+    let site = |f: &Function, block: Block| {
+        let insts = &f.block(block).insts;
+        insts.windows(2).position(|pair| {
+            let (guard, load) = (f.inst(pair[0]), f.inst(pair[1]));
+            guard.opcode == Opcode::Guard
+                && guard.flags.guard
+                && matches!(guard.aux, AuxData::TypeTag(t) if t.bits == TypeBits::CONS)
+                && matches!(load.opcode, Opcode::Car | Opcode::Cdr)
+                && guard.results.len() == 1
+                && load.args == guard.results
+                && uses.get(&guard.results[0]) == Some(&1)
+                && f.value(guard.args[0]).ty.bits.contains(TypeBits::NULL)
+        })
+    };
+    let mut renamed = HashMap::new();
+    let mut cons_exits = Vec::new();
+    let mut work: Vec<Block> = f.block_order().to_vec();
+    while let Some(block) = work.pop() {
+        let Some(pos) = site(f, block) else {
+            continue;
+        };
+        let insts = &f.block(block).insts;
+        let (guard, load) = (insts[pos], insts[pos + 1]);
+        let operand = f.inst(guard).args[0];
+        let loaded = f.inst(load).results[0];
+        let source_pos = f.inst(load).source_pos;
+        // Inserted in reverse, so the layout reads B, NilArm, ConsArm, Join.
+        let join = f.make_block_after(block);
+        let cons_arm = f.make_block_after(block);
+        let nil_arm = f.make_block_after(block);
+        let rest = f.block_mut(block).insts.split_off(pos + 2);
+        f.block_mut(join).insts = rest;
+        let pair = f.block_mut(block).insts.split_off(pos);
+        f.block_mut(cons_arm).insts = pair;
+        let loaded_data = f.value(loaded).clone();
+        let merged = f.add_block_param(join, loaded_data.ty, loaded_data.repr);
+        renamed.insert(loaded, merged);
+
+        let tagged = |ty| (ty, ValueRepresentation::Tagged);
+        let at = |opcode, args| InstData {
+            opcode,
+            args,
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags::default(),
+            targets: vec![],
+            frame_state: None,
+            source_pos,
+        };
+        let (_, nil) = f.push_inst(
+            block,
+            at(Opcode::ConstNil, vec![]),
+            &[tagged(IRType::of(TypeBits::NULL))],
+        );
+        // Pinned so GVN keeps each test private to its own branch. A shared
+        // test would stay live from an earlier access, across a loop header
+        // whose FrameState does not name it (so that OSR entry is declined),
+        // and could no longer fuse into its Brif as a single cmp/jcc.
+        let pinned = InstFlags {
+            effectful: true,
+            ..InstFlags::default()
+        };
+        let (_, is_nil) = f.push_inst(
+            block,
+            InstData {
+                flags: pinned,
+                ..at(Opcode::GenericEq, vec![operand, nil[0]])
+            },
+            &[tagged(IRType::TOP)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                source_pos,
+                ..brif(is_nil[0], nil_arm, cons_arm)
+            },
+        );
+        let to_join = |value| InstData {
+            source_pos,
+            targets: vec![crate::t2::ir::BlockCall {
+                block: join,
+                args: vec![value],
+            }],
+            ..jump(join)
+        };
+        f.set_terminator(nil_arm, to_join(nil[0]));
+        // The cons edge must carry the load's own result, so it is added only
+        // after the uses are renamed below.
+        cons_exits.push((cons_arm, to_join(loaded)));
+        work.push(join);
+    }
+    f.replace_values(&renamed);
+    for (cons_arm, exit) in cons_exits {
+        f.set_terminator(cons_arm, exit);
     }
 }
 
