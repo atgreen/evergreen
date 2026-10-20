@@ -207,6 +207,10 @@ pub struct RuntimeCalls {
     pub environment: super::emit::EnvironmentCalls,
 }
 
+/// Arguments a register entry accepts, one per ABI argument register the
+/// entry prologue moves home. Beyond this a caller must use the activation.
+pub const REGISTER_ENTRY_ARGS_MAX: usize = 3;
+
 fn calls_runtime(opcode: Opcode) -> bool {
     matches!(
         opcode,
@@ -448,6 +452,27 @@ impl Emitter<'_> {
                     } else {
                         (13, argument_base)
                     };
+                    let direct = self.direct_native_for(symbol, data.args.len());
+                    // A callee with a register entry wants its arguments in
+                    // r2.. and builds no EgclStack frame, so that path reads
+                    // them straight from their homes and never stages them.
+                    // Emit it before the staging loop the fallback needs
+                    // (bliss-y1rx3).
+                    let register_target = direct
+                        .as_ref()
+                        .filter(|target| {
+                            target.register_entry != 0
+                                && data.args.len() <= REGISTER_ENTRY_ARGS_MAX
+                        })
+                        .cloned();
+                    if let Some(target) = &register_target {
+                        let slow = self.asm.label();
+                        let join = self.asm.label();
+                        self.direct_register_entry_call(target, &data.args, slow)?;
+                        self.asm.branch(15, join);
+                        self.asm.bind(slow);
+                        direct_join = Some(join);
+                    }
                     for (index, &arg) in data.args.iter().enumerate() {
                         self.load(arg, 2)?;
                         self.asm.store(2, args_reg, args_base + index as i32 * 8);
@@ -455,7 +480,9 @@ impl Emitter<'_> {
                     // A native callee the runtime resolved for this site is
                     // entered directly; its guards fall through to the slice
                     // adapter below (bliss-6j6pk).
-                    if let Some(target) = self.direct_native_for(symbol, data.args.len()) {
+                    if register_target.is_none()
+                        && let Some(target) = direct
+                    {
                         let slow = self.asm.label();
                         let join = self.asm.label();
                         self.direct_native_call(&target, args_reg, args_base, slow);
@@ -679,6 +706,45 @@ impl Emitter<'_> {
     /// allocates; afterwards the caller's fp and sp_offset are restored and
     /// the result is in r2, exactly where the slow path leaves it. The
     /// callee's entry preserves r6-r15, so the homes and r13 survive it.
+    /// Enter a resolved callee through its register entry: the arguments go
+    /// in r2.. and the callee owns no activation, so this skips the whole
+    /// EgclStack frame push [`Self::direct_native_call`] emits and the
+    /// callee's slot-to-home copies. Guarded exactly as the other two direct
+    /// paths are -- native stack headroom first, so runaway recursion is
+    /// still a STORAGE-CONDITION rather than a crash, then the direct-call
+    /// generation -- and falls through to `slow` when either fails, where the
+    /// staged arguments and the slice adapter are waiting.
+    ///
+    /// The collector cannot see r2.., but it does not need to: a body only
+    /// publishes a register entry when it has no shadow roots, which means
+    /// no tagged value of its own -- parameters included -- is live across an
+    /// allocation inside it. Values the CALLER still needs are already in its
+    /// shadow slots by the time this runs.
+    fn direct_register_entry_call(
+        &mut self,
+        target: &super::emit::DirectNativeTarget,
+        args: &[Value],
+        slow: Label,
+    ) -> Result<(), EmitError> {
+        self.asm.imm64(1, egcl_rt::stack::native_stack_limit_addr());
+        self.asm.load(1, 1, 0);
+        self.asm.compare(15, 1);
+        self.asm.branch(12, slow);
+        self.asm.imm64(1, target.generation_addr);
+        self.asm.load(4, 1, 0);
+        self.asm.imm64(5, target.generation);
+        self.asm.compare(4, 5);
+        self.asm.branch(6, slow);
+        // Homes are callee-saved registers r6-r12 or frame slots, so loading
+        // into r2.. can never clobber an argument not yet moved.
+        for (index, &argument) in args.iter().enumerate() {
+            self.load(argument, 2 + index as u8)?;
+        }
+        self.asm.imm64(1, target.register_entry);
+        self.asm.call_reg(1);
+        Ok(())
+    }
+
     fn direct_native_call(
         &mut self,
         target: &super::emit::DirectNativeTarget,
@@ -1749,10 +1815,20 @@ pub fn emit_framed_with_runtime(
         .map(|data| data.args.len())
         .max()
         .unwrap_or(0);
-    let has_reg_entry = emitter.runtime.self_sym.is_some()
+    // Publishing the entry makes a body use the in-frame staging form for
+    // its own calls (see `in_frame`), which costs `call_slice_rooted` and
+    // the direct-builtin shortcut. For a self-caller that trade already paid
+    // for itself; for a body the runtime merely resolves, take it only when
+    // the body makes no calls at all, so the broader publication is free
+    // (bliss-y1rx3). Leaf accessors and predicates are the hot case anyway.
+    let makes_calls = instructions().any(|data| data.opcode == Opcode::Call);
+    // What gates the entry either way is the activation-less contract -- no
+    // shadow roots, so nothing in the body needs the caller's r13 -- which
+    // install-time validation re-checks before these bytes ever run.
+    let has_reg_entry = (emitter.runtime.self_sym.is_some() || !makes_calls)
         && std::env::var_os("EGCL_NO_DIRECT_SELF_CALL").is_none()
         && !function.is_variadic()
-        && entry_params.len() <= 3
+        && entry_params.len() <= REGISTER_ENTRY_ARGS_MAX
         && !entry_params
             .iter()
             .any(|&param| function.is_entry_param_checked(param))
@@ -2252,6 +2328,110 @@ mod tests {
                 assert_eq!(STORED.with(|stored| stored.get()), (BODY, 3, 0x4001));
                 assert_eq!(result, if return_loaded { 0x9001 } else { 0x5001 });
             }
+        }
+    }
+
+    /// A resolved callee that published a register entry is entered with its
+    /// arguments in r2.. and no EgclStack frame at all.
+    ///
+    /// The fixture deliberately gives the target no usable activation entry
+    /// (`entry` and `code_info` are zero) and wires the slice adapter to a
+    /// sentinel, so this passes only if the register path runs: emitting the
+    /// frame-building direct call instead faults on the null entry, and
+    /// reaching the guarded fallback returns SENTINEL rather than 42.
+    #[test]
+    fn a_resolved_callee_with_a_register_entry_is_entered_without_a_frame() {
+        const SENTINEL: u64 = 0x5ced_0001;
+        const GENERATION: u64 = 0x1234;
+        static BAKED_GENERATION: u64 = GENERATION;
+
+        extern "C" fn slice(_: u64, _: u64, _: *const EgclVal, _: u64) -> u64 {
+            SENTINEL
+        }
+
+        let mut f = Function::new("z-direct-register");
+        let block = f.entry();
+        let x = f.add_block_param(block, IRType::TOP, ValueRepresentation::Tagged);
+        let (_, result) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::Call,
+                args: vec![x],
+                results: vec![],
+                aux: AuxData::CallTarget(71),
+                flags: InstFlags {
+                    call: true,
+                    safepoint: true,
+                    effectful: true,
+                    ..Default::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+            &[(IRType::TOP, ValueRepresentation::Tagged)],
+        );
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Return,
+                args: vec![result[0]],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos: 0,
+            },
+        );
+
+        // The callee honours the register-entry convention and nothing else:
+        // one argument in r2, its result in r2, no frame of its own.
+        let callee = {
+            let mut a = Asm::new();
+            a.add_imm(2, 1);
+            a.ret();
+            a.finish().unwrap()
+        };
+        #[cfg(all(target_arch = "s390x", unix))]
+        let callee = egcl_rt::jit::JitBuffer::new(&callee).unwrap();
+        let callee_address = callee.as_ptr() as u64;
+
+        let target = crate::t2::emit::DirectNativeTarget {
+            symbol: 71,
+            nargs: 1,
+            entry: 0,
+            code_info: 0,
+            num_slots: 1,
+            generation: GENERATION,
+            generation_addr: std::ptr::from_ref(&BAKED_GENERATION) as u64,
+            frame_flags: 0,
+            register_entry: callee_address,
+        };
+        let compiled = emit_framed_with_runtime(
+            &f,
+            0,
+            1,
+            RuntimeCalls {
+                call_slice: slice as *const () as u64,
+                direct_natives: vec![target],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // The site keeps its guarded fallback, so the slice adapter is still
+        // reachable; what must not happen is reaching it on the fast path.
+        assert_eq!(compiled.emitted_safepoints, 1);
+        #[cfg(all(target_arch = "s390x", unix))]
+        {
+            let code = egcl_rt::jit::JitBuffer::new(&compiled.code).unwrap();
+            // SAFETY: the buffer owns the generated activation entry, and the
+            // slots include every shadow word the emitter advertised.
+            let entry: unsafe extern "C" fn(*mut u64) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            let mut slots = vec![0u64; 1 + compiled.shadow_root_slots as usize];
+            slots[0] = 41;
+            assert_eq!(unsafe { entry(slots.as_mut_ptr()) }, 42);
         }
     }
 
