@@ -46,8 +46,8 @@
   `COUNT` family no longer build a closure for each call. Counting over a
   100-element sequence is about 45x faster (`COUNT-IF` about 12x) and `FIND`
   about 2x faster. None of these functions is refused native compilation for
-  a closure environment any more; their keyword arguments still keep them
-  interpreted for now
+  a closure environment any more, and with keyword functions now compiling
+  natively they reach T1 and T2 when hot
   ([#465](https://github.com/atgreen/evergreen/pull/465)).
 - Methods hot by call count compile to native code on x86-64 Linux. A
   method's compiled body is named `(METHOD ...)`, which the T1 compiler tried
